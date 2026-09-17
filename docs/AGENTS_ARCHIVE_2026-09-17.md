@@ -812,3 +812,196 @@ Code: `litebox_platform_windows_userland/src/lib.rs` (`shared_heap_cursor`,
 `shared_heap_export` gate, around line 1658). No test files added; this represents the
 atomic-cursor fix plus the reverted (opt-in, not default) gate, both cargo build-verified and
 live-verified per the ladder above.
+
+## Step 2 -- real `GlobalState` create-vs-attach: DONE, LIVE-VERIFIED, but does NOT close XVFB_FAILED/DBUS_FAILED (follow-up session, same day)
+
+Picked up step-1's `SharedArc<T>` (isolated-probe-verified) exactly where it left off: designed
+`litebox::platform::SharedKernelStateProvider` (alongside `RawMutexProvider`/
+`ForkChildVerificationProvider`, `litebox/src/platform/mod.rs`) -- `SharedKernelStateSlot`
+(`LiteBoxX`/`ShimGlobalState`) names which singleton; `is_shared_kernel_state_attach_child`/
+`create_shared_kernel_state`/`attach_shared_kernel_state<T>` are the create-vs-attach surface,
+associated GAT `Handle<T>: Clone + Deref<Target=T> + Send + Sync + 'static` mirrors `Arc<T>`'s own
+ergonomics so call sites need only a type swap. Trivial `Arc::new` default implemented on every
+platform with real per-process OS isolation: `LinuxUserland`, `MacOsUserland`,
+`litebox_platform_linux_kernel::LinuxKernel<Host>`, `litebox_platform_lvbs::LinuxKernel<Host>`,
+`litebox::platform::mock::MockPlatform` (test-only). Real `SharedArc`-backed impl on
+`WindowsUserland`: `is_shared_kernel_state_attach_child` itself calls `init_shared_kernel_heap()`
+(critical fix mid-pass -- see "first attempt failed" below) then reads
+`SHARED_KERNEL_HEAP_INHERITED_CHILD` (new `AtomicBool`, set `true` only by
+`init_shared_kernel_heap`'s inherited-section SUCCESS branch); `create_shared_kernel_state` calls
+`SharedArc::new` and caches the resulting `arena_offset` in a per-slot static
+(`SHARED_LITEBOXX_OFFSET`/`SHARED_GLOBALSTATE_OFFSET`); `attach_shared_kernel_state` reads the
+matching env var (`LITEBOX_INTERNAL_FORK_CHILD_{LITEBOXX,GLOBALSTATE}_OFFSET`, allocation-free via
+`raw_env_read_usize`) and calls `unsafe SharedArc::<T>::attach`, ALSO re-caching the offset into
+the same per-slot static so a mid-tree attach-only process can re-export to its OWN children
+(transitive composition, matching `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s existing property).
+
+**`process_fork.rs`'s shared-heap-section export is now unconditional** for every real
+`LITEBOX_PROCESS_FORK=1` child spawn (previously gated behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT`,
+essentially never exercised outside the diagnostic `SharedArc` probe) -- safe because that gate's
+entire original purpose (protecting against the REVERTED "route all `GlobalAlloc` through the
+shared heap" OOM regression) does not apply to this narrower, always-bounded-64MiB-arena use;
+ordinary allocations still never touch this heap at all. Also exports both real slot offset env
+vars whenever this process has created OR attached to a slot (`shared_kernel_state_offset`
+getter).
+
+**`litebox_shim_linux::GlobalState` refactor**: renamed the original 22-field struct to
+`GlobalStateX`, added a new `pub(crate) struct GlobalStateHandle<Platform, FS>(
+Platform::Handle<GlobalStateX<Platform, FS>>)` with `Clone`/`Deref` -- mirrors
+`litebox::LiteBox`'s existing `Arc<LiteBoxX<Platform>>`-wrapping shape exactly. Every one of the
+~10 call sites across `lib.rs`/`transport.rs`/`syscalls/{unix,pty}.rs` that held
+`Arc<GlobalState<Platform, FS>>` needed ONLY a type-name swap to `GlobalStateHandle<Platform, FS>`
+-- every `.clone()` call site was already using method syntax (never `Arc::clone(&x)` explicitly),
+so zero of those needed touching; `Deref` makes every existing `global.field`/`global.method()`
+call resolve exactly as before. `LinuxShimBuilder::build` now does the real branch: attach via
+`SharedKernelStateSlot::ShimGlobalState` if eligible, else construct fresh exactly as always
+(matches every non-Windows platform's default, and the root of any fork family). Confirmed by
+running the FULL `litebox_shim_linux` unit test suite unchanged: **187/187 pass**.
+
+**First attempt at the decisive proof FAILED, root-caused, fixed**: the first
+`LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1` run showed the child observing `next_thread_id=2` (a
+fresh, unattached `GlobalState`) despite the section being correctly inherited elsewhere. Root
+cause: `is_shared_kernel_state_attach_child` read `SHARED_KERNEL_HEAP_INHERITED_CHILD` WITHOUT
+first calling `init_shared_kernel_heap()` -- and nothing else implicitly calls that function
+anymore (ordinary `GlobalAlloc` traffic was fully decoupled from it in the earlier revert), so the
+flag was always still at its untouched default `false` the first time this check ran in a fresh
+process. Fixed by making `is_shared_kernel_state_attach_child` call `init_shared_kernel_heap()`
+itself first (idempotent, matching `attach_shared_kernel_state`'s own pre-existing identical call
+and `shared_arc_probe_child_attach`'s precedent).
+
+**`litebox::LiteBox`/`LiteBoxX` deliberately reverted out of this trait mid-pass** -- the original
+plan (per this file's own earlier step-2 pickup note) was to thread `SharedKernelStateProvider`
+through BOTH `LiteBox<Platform>` and `litebox_shim_linux::GlobalState`. Attempting the `LiteBox`
+half first surfaced 235 `cargo check` errors across `litebox/src/{fs,mm,net,pipes.rs,...}` --
+every generic function anywhere in the platform-generic `litebox` crate that takes
+`Platform: RawSyncPrimitivesProvider` and touches a `LiteBox<Platform>` (calls
+`descriptor_table()`/`descriptor_table_mut()`, or just holds one) needed the extra bound added too,
+since `LiteBox<Platform>`'s own struct definition would require it. Correctness-neutral (every
+real platform already implements the trivial default) but a much wider mechanical propagation than
+this pass's actual goal needed -- reverted `litebox.rs` back to its original `Arc<LiteBoxX<Platform>>`
+shape (with a doc comment recording why and pointing at the trait for a future session that wants
+to take this on), and scoped the REAL wiring to `GlobalState` alone, which is what the decisive
+test and the `XVFB_FAILED` gap both actually depend on (`LiteBoxX::descriptors` is the shim-wide
+open-file-description table -- real, but secondary to the AF_UNIX/futex/pid-allocator state that
+lives in `GlobalState`).
+
+**Known narrower gap, `proc_self_info`/`pts_registry`**: these two `GlobalStateX` fields are
+`Arc<RwLock<...>>` handed to `default_fs`/`default_fs_multi_layer`'s mounted `/proc/self`/
+`/dev/pts` backends BEFORE `build()`'s create-vs-attach decision even runs -- so an attaching
+cross-process-fork child's own mounted backends keep referencing ITS OWN freshly-constructed
+tables (built in `LinuxShimBuilder::new`), while `GlobalStateX.proc_self_info`/`.pts_registry`
+(reachable through the now-attached handle) are whichever ones the ROOT process made. Documented
+in-code on both fields. Fix needs the attach decision moved one layer earlier, into
+`LinuxShimBuilder::new` itself, with two more `SharedKernelStateSlot` variants -- not attempted
+this pass, does not affect the decisive proof (uses a field with no such entanglement).
+
+**Decisive live proof, exact numbers**: `LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1
+LITEBOX_PROCESS_FORK=1`, real `debian:stable-slim` cheap-repro fork (`echo parent-pid=$$; (echo
+child-pid=$$) & wait; OUTER_EXIT=$?; echo done`). `syscalls::process::Task::try_cross_process_fork`
+instrumented with two sentinel bumps to `self.global.next_thread_id`
+(`core::sync::atomic::AtomicI32`): +100,000 immediately BEFORE calling
+`spawn_cross_process_fork_child`, and +7 immediately AFTER it returns (i.e. strictly after the
+real, separate child OS process already exists). `litebox_runner_linux_on_windows_userland`'s
+`diag_process_fork_globalstate_probe` (the child's own real `GlobalState`-construction call site)
+reads `shim.diag_next_thread_id()` (new diagnostic-only pub method on `LinuxShim`) right after its
+own `shim_builder.build()` returns. Result: parent log lines `before=... after=...` (first bump)
+and `after=...` (second, post-spawn bump) followed by child log line
+`next_thread_id=100010` (base value 3 -- 2 initial + 1 for the bootstrap process's own thread
+allocation -- plus 100,000 plus 7). **Only explicable if the child's `GlobalState` is the exact
+same live allocation the parent kept mutating AFTER the fork point**: a frozen fork-time snapshot
+would show 3 (pre-either-bump); an independent copy at a merely-consistent fixed address would
+show 2 (`GlobalStateX`'s own `next_thread_id: 2.into()` initializer, never touched). Zero crash,
+zero corruption, zero leaked process both runs. **Step 2 is done: the create-vs-attach protocol
+for `GlobalState` genuinely works.**
+
+**`.wfgy/webtop_stack.sh` re-run under `LITEBOX_PROCESS_FORK=1` with this landed** (same flags as
+every prior attempt this session: `--gui=hidden -p 8080:3000 --env
+GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image
+docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar -- /bin/bash
+/webtop_stack.sh`, `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error`):
+`[s] NGINX_CONFIGURED` -> `[s] NGINX_STARTED supervisor_pid=20` -> `[s] NGINX_SELFTEST_FAILED
+last_code= after 20s` (the same pre-existing, separately-tracked nginx issue every prior session
+hit at this exact point, unrelated to fork sharing) -> `[s] XVFB_FAILED` -> `[s] DBUS_FAILED` ->
+`[s] DE_FAILED`. **Identical terminal sequence to the pre-this-pass baseline** (the step-3 entry
+above: "reached `NGINX_CONFIGURED` -> `NGINX_STARTED` -> `NGINX_SELFTEST_FAILED` -> `XVFB_FAILED`").
+Genuinely-shared `GlobalState` does not move this needle at all.
+
+**Root cause of why it doesn't, established this pass, not merely hypothesized**:
+`SharedArc<T>::new` places exactly `size_of::<SharedArcInner<T>>()` bytes -- the literal, inline
+representation of `T` -- into the arena. For `T = GlobalStateX<Platform, FS>` this genuinely
+shares every scalar field stored INLINE (proven live above) and every lock's own inline
+synchronization word (already cross-process-capable per the earlier `RawMutex` rewrite). It does
+NOT share anything reached through a POINTER stored inside those inline bytes. Checked every
+registry field's real type:
+- `unix_addr_table: RwLock<Platform, UnixAddrTable<Platform, FS>>` where
+  `type UnixAddrTable<Platform, FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<Platform, FS>>`
+  (`litebox_shim_linux/src/syscalls/unix.rs:1984`) -- a real heap-allocated B-tree.
+- `pty_registry`, `daemon_pty_masters`: `RwLock<Platform, BTreeMap<u32, PtyFd<Platform>>>`.
+- `flock_registry`: `Mutex<Platform, FlockRegistry<Platform>>` (internally keyed maps).
+- `fifo_registry`: `RwLock<Platform, BTreeMap<(usize, usize), FifoPipe<Platform>>>`.
+- `sysv_shm`, `memfds`, `shared_files`, `elf_patch_cache`, `segment_scan_cache`,
+  `exec_ranges_cache`: all `Mutex<Platform, BTreeMap<...>>` or an equivalent map type.
+- `litebox: litebox::LiteBox<Platform>` itself embeds `Arc<LiteBoxX<Platform>>` (per the
+  "deliberately reverted" note above) -- exactly the same shape.
+
+Every one of these is a plain Rust collection/`Arc` allocated via the ORDINARY per-process private
+heap (`WindowsUserland::alloc`/`SLAB_ALLOC`, confirmed still private-`VirtualAlloc2`-per-process
+post-revert, no fixed base guaranteed across processes -- unlike the arena, which does have one).
+Being a field of a `SharedArc`-placed struct shares only that field's OWN inline bytes (for a
+`BTreeMap`, its root pointer/length; for an `Arc`, its raw pointer) -- the pointee (the B-tree's
+actual nodes, the `Arc`'s actual `LiteBoxX`) lives at whatever address the CREATING process's
+allocator happened to choose, which is meaningless (almost certainly unmapped, or mapped to
+something unrelated) in a DIFFERENT, attaching process's own address space. This is exactly why
+Xvfb's own unix-socket registration (created inside whichever process actually runs Xvfb --
+`comm==Xvfb` is itself refused cross-process-fork eligibility per the "Eligibility" section, so it
+runs thread-based, within whatever process's address space that fork landed in) is unreachable to
+a LATER, cross-process-attached client process (e.g. a plain `xset`/curl-style probe) trying to
+look it up through the shared `unix_addr_table`: the `BTreeMap` node holding that entry was never
+placed anywhere the attaching process's own address space can resolve.
+
+**Not a quick fix, scoped precisely for a follow-up PRD
+(`globalstate-nested-collections-not-actually-shared`)**: closing this needs either (a) a
+shared-memory-aware allocator routing every such collection's node allocations through
+`shared_kernel_arena_alloc` instead of the private heap (blocked on stable Rust's `allocator_api`
+being unstable -- `SharedArc`'s own doc comment already established this same constraint is why it
+couldn't just be `std::sync::Arc`), or (b) hand-rolling shared-memory-native replacements for every
+one of these registries individually (a `SharedArc`-of-fixed-capacity-table instead of a
+`BTreeMap`, per registry) -- both materially larger than a single-session scope.
+
+**Separate, lower-priority observation from the SAME run, not conclusively attributed**: with the
+shared-heap-section export now unconditional, many of the script's own small utility forks
+(`mkdir`, `cp`, `sed`, `chmod`, `ln`, `sleep`...) showed up as `bash: ... N Killed ...` in the
+combined log, and one run additionally hit a genuine `thread 'main' (PID) has overflowed its
+stack`. Every dying child's own preceding log lines show `GlobalState constructed successfully, no
+crash/hang/error` -- i.e. the create-vs-attach machinery itself completed without incident in every
+case; whatever kills the child happens afterward (real guest resume, or possibly the extra,
+now-unconditional `init_shared_kernel_heap()`/section-map Win32 work every such fork now performs
+that it previously skipped entirely). This is not a novel failure class: `overflowed its stack`
+has been an intermittently-reproducing signature since at least 2026-09-03 (multiple independent
+sightings, root-caused in some cases to undersized reused-thread stacks after `execve()`, in others
+left open), and "3/10 hit `[shared_kernel_heap] FATAL CreateFileMappingW ... win32_err=0x5aa`
+(`ERROR_NO_SYSTEM_RESOURCES`) -> Killed -> `OUTER_EXIT=137`" under concurrent forks was already
+disclosed earlier THIS SAME DAY, before this pass's change. No A/B re-run against the
+pre-this-pass binary was performed (would cost a full extra rebuild+200s boot cycle) to establish
+whether this pass's unconditional export measurably increased the FREQUENCY of either signature --
+left as an honest open question, not claimed either way. The boot reached the identical terminal
+state as baseline regardless, so this noise did not change this pass's actual finding.
+
+**Files touched**: `litebox/src/platform/mod.rs` (`SharedKernelStateProvider`,
+`SharedKernelStateSlot`), `litebox/src/litebox.rs` (doc-comment-only, reverted to original shape),
+`litebox/src/platform/mock.rs`, `litebox_platform_{linux_userland,macos_userland,linux_kernel,
+lvbs}/src/lib.rs` (trivial `Arc::new` impls), `litebox_platform_windows_userland/src/lib.rs` (real
+impl, `SHARED_LITEBOXX_OFFSET`/`SHARED_GLOBALSTATE_OFFSET`/`SHARED_KERNEL_HEAP_INHERITED_CHILD`,
+`shared_kernel_state_slot_env_var`/`shared_kernel_state_offset`), `.../src/process_fork.rs`
+(unconditional export + per-slot env var push), `litebox_shim_linux/src/lib.rs`
+(`GlobalStateX`/`GlobalStateHandle`, `LinuxShimBuilder::build`, `LinuxShim::diag_next_thread_id`),
+`.../src/syscalls/process.rs` (the decisive-proof sentinel bumps in `try_cross_process_fork`),
+`.../src/syscalls/{unix,pty}.rs`, `.../src/transport.rs` (type-name swaps only),
+`litebox_runner_linux_on_windows_userland/src/lib.rs` (child-side probe read). No test files added.
+All 187 `litebox_shim_linux` unit tests pass; `litebox`/`litebox_shim_linux`/
+`litebox_platform_windows_userland`/`litebox_platform_linux_userland`/
+`litebox_platform_macos_userland`(partial, blocked by unrelated seccompiler/libc cross-target
+issues)/`litebox_platform_linux_kernel`/`litebox_platform_lvbs`/
+`litebox_runner_linux_on_windows_userland` all `cargo check` clean. Host processes killed cleanly
+after the webtop test; free RAM recovered to the same ~4.5-4.6M KB baseline this machine shows
+between runs, zero leaked processes.

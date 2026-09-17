@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-16)
+# litebox — current state (2026-09-17)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -262,72 +262,60 @@ mechanism re-verified live at the new size (parent-side init+map+commit+sentinel
 correctly at `base+64MiB-0x1000`); the opt-in `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` fork-export path
 is untouched and still gated off by default.
 
-### `SharedArc<T>` -- DESIGNED, BUILT, LIVE-VERIFIED cross-process 2026-09-17 (ADVISORY-002 3.3 step 3's final piece)
+### `SharedArc<T>` and real `GlobalState` create-vs-attach -- BOTH DONE and LIVE-VERIFIED 2026-09-17; does NOT close XVFB_FAILED/DBUS_FAILED
 
-`litebox_platform_windows_userland/src/lib.rs` (`SharedArcInner`/`SharedArc`, just above
-`impl MemoryProvider for WindowsUserland`): a hand-rolled shared-ownership smart pointer over
-`shared_kernel_arena_alloc` bytes -- **not `std::sync::Arc`**, whose `ArcInner` layout is a
-private std implementation detail (`Arc::from_raw` over manually-placed bytes is unsound), and
-stable Rust has no `allocator_api`/`Box::new_in` either. Own `#[repr(C)]` control block
-(`strong: AtomicUsize` only -- no `weak`, nothing needs one yet, YAGNI). `SharedArc::new(value)`
-returns `(handle, arena_offset)`; `unsafe SharedArc::attach(offset)` (cross-process: a child with
-the SAME arena section mapped at the SAME address) increments `strong` and returns an independent
-owning handle. `Clone`/`Deref` match `Arc<T>` ergonomics for minimal call-site churn.
-**`Drop` deliberately never reclaims or runs `T`'s destructor** (confirmed, not an oversight): (1)
-the arena is a pure bump allocator with no free list at all, so freeing bytes is not an available
-option regardless; (2) a kernel singleton like `GlobalState`/`LiteBoxX` may embed real per-process
-`HANDLE`s/fds, and running its `Drop` from whichever process happens to observe `strong == 0`
-would close whatever unrelated handle number is live THERE -- unsound in a multi-process world.
-Strong count is still tracked (verification value), reaching zero intentionally does nothing
-further -- correct because these singletons are meant to outlive every process in the fork family
-for the whole guest session and never really reach zero live anyway.
+`litebox_platform_windows_userland/src/lib.rs`'s `SharedArc<T>` (hand-rolled, not `std::sync::Arc`
+-- its `ArcInner` layout is a private std detail, unsound to place by hand; stable Rust also has no
+`allocator_api`) places `value` plus a `strong: AtomicUsize` control block into the bounded 64 MiB
+`shared_kernel_arena_alloc` region. `SharedArc::new` -> `(handle, arena_offset)`;
+`unsafe SharedArc::attach(offset)` increments `strong` and returns an independent owning handle
+sharing the exact same physical bytes. `Drop` deliberately never reclaims/runs `T`'s destructor
+(bump allocator has no free list; a kernel singleton's `Drop` running from an arbitrary OTHER
+process would close whatever unrelated `HANDLE` number is live there). Isolated-probe proof
+(`LITEBOX_DIAG_SHARED_ARC_PROBE=1`): exact expected strong counts (1->2->3->4->3) and a
+byte-identical magic value across a real fork boundary.
 
-**Live cross-process proof** (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1 LITEBOX_DIAG_SHARED_ARC_PROBE=1
-LITEBOX_PROCESS_FORK=1`, isolated `SharedArcProbeData{magic, counter: AtomicUsize}` test struct,
-riding the existing shared-heap-inherit env-var handoff --
-`shared_arc_probe_parent_prepare`/`shared_arc_probe_child_attach`, wired at
-`litebox_runner_linux_on_windows_userland/src/lib.rs`'s vmem-adopt-probe-to-task-resume-probe
-handoff since ordinary `GlobalAlloc` traffic no longer touches `init_shared_kernel_heap` at all
-post-revert, so the child must call it explicitly): real `debian:stable-slim` cheap-repro fork,
-one real cross-process child. Parent: `new` -> strong=1, `clone` -> strong=2. Child: `attach` ->
-strong=3, `magic` read back byte-identical (`0x5ac55ac55ac55ac5`, proves the child sees the
-PARENT's `ptr::write` through the wrapper, not a private copy), `counter.fetch_add` 0->1 (proves
-mutation through `Deref`'s interior atomic lands in the SAME physical memory), child `clone` ->
-strong=4, child drops that clone -> strong=3. Every number exactly as expected; zero crash, zero
-corruption, zero leaked process, host RAM unchanged after run. **Step 1 (ADVISORY-002 3.3) is
-done.**
+`litebox::platform::SharedKernelStateProvider` (alongside `RawMutexProvider`/
+`ForkChildVerificationProvider`) turns that primitive into the real create-vs-attach protocol:
+`SharedKernelStateSlot::{LiteBoxX,ShimGlobalState}` names which singleton,
+`is_shared_kernel_state_attach_child`/`create_shared_kernel_state`/`attach_shared_kernel_state<T>`
+(GAT `Handle<T>` mirrors `Arc<T>`) are the surface. Trivial `Arc::new` default on every platform
+with real per-process OS isolation (`LinuxUserland`, `MacOsUserland`, `LinuxKernel<Host>` x2,
+`MockPlatform`); real impl on `WindowsUserland`. `litebox_shim_linux::GlobalState` is now
+`GlobalStateHandle<Platform, FS>` (`Platform::Handle<GlobalStateX<Platform, FS>>`, `GlobalStateX`
+= the renamed original struct, unchanged fields/logic) -- `LinuxShimBuilder::build` does the real
+attach-or-create branch. `litebox::LiteBox`/`LiteBoxX` deliberately NOT threaded through this
+trait (would cascade `+ SharedKernelStateProvider` onto 200+ generic call sites across the
+platform-generic `litebox` crate for no payoff `GlobalState` doesn't already cover).
 
-**Step 2 -- create-vs-attach protocol for the REAL `GlobalState`/`LiteBoxX` -- NOT started this
-pass, deliberately** (explicit scope call: prove the wrapper first, don't force the migration
-unverified). Precisely scoped for the next session: `LiteBox::new` (`litebox/src/litebox.rs:72`)
-and `LinuxShimBuilder::build` (`litebox_shim_linux/src/lib.rs:474`) are platform-generic code
-shared by every runner (Linux native, macOS, optee, snp, lvbs) -- confirmed live 2026-09-17 that
-EVERY process in a fork family, parent and every child alike, independently calls
-`shim_builder.build::<DefaultFS<Platform>>()` at its own startup
-(`litebox_runner_linux_on_windows_userland/src/lib.rs`'s `diag_process_fork_globalstate_probe`,
-the same call site the `[process_fork_diag] globalstate-probe (child): GlobalState constructed
-successfully` log line comes from -- this is why merely placing the allocation in shared memory
-was never sufficient by itself). Needed: (a) a new trait (alongside `RawMutexProvider`) threaded
-through `litebox`/`litebox_shim_linux`'s generic `Platform` bound, real `SharedArc`-backed impl
-for `WindowsUserland`, no-op default (ordinary `Arc::new`) for every other platform; (b) a
-create-vs-attach branch at that construction call site -- the very first process in a fork family
-(never itself a fork child) creates fresh via the new trait/`SharedArc::new`, every
-cross-process-fork child instead detects it has an inherited shared-heap section
-(`SHARED_KERNEL_HEAP_SECTION_HANDLE`-style env vars already flow today) and `SharedArc::attach`s
-to the offset the root process exported, instead of building its own; (c) live proof the SAME
-shape as this pass's isolated-struct probe, but for real `GlobalState` -- parent registers
-something in a real registry field, a child FORKED AFTERWARD observes it (not a frozen
-pre-fork snapshot); (d) only then re-attempt `.wfgy/webtop_stack.sh` under
-`LITEBOX_PROCESS_FORK=1` and check whether `XVFB_FAILED`/`DBUS_FAILED` finally resolve. Track as
-its own PRD; the arena + `SharedArc` alone do not close the "GlobalState cross-process visibility"
-goal, only remove its last soundness blocker.
+**Decisive live proof** (`LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1 LITEBOX_PROCESS_FORK=1`): parent
+bumps `next_thread_id` by +100,000 immediately BEFORE `spawn_cross_process_fork_child`, then +7
+immediately AFTER it returns (child process already exists); child reads back `next_thread_id`
+right after its own `build()` and observes exactly `100010` (base 3). Only possible if the child's
+`GlobalState` is the SAME live allocation the parent kept mutating after the fork point -- rules
+out both a frozen snapshot and an independent copy at a merely-consistent address. **The
+create-vs-attach protocol genuinely works.**
 
-`XVFB_FAILED`/`DBUS_FAILED` (guest processes share no AF_UNIX/loopback/FIFO namespace -- see "A real
-desktop renders in a browser"'s "Open here" note) is UNCHANGED by this pass, exactly as expected:
-this fix closes the capacity/OOM regression, not the AF_UNIX-sharing gap, which needs the
-create-vs-attach protocol above, not just bytes-in-shared-memory. Full narrative, elimination
-trails, both live webtop-boot logs (broken-everything-shared vs. this session's reverted+bounded
-run): `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**`.wfgy/webtop_stack.sh` re-run under `LITEBOX_PROCESS_FORK=1` with this landed: `XVFB_FAILED`/
+`DBUS_FAILED`/`DE_FAILED` all UNCHANGED** -- identical terminal sequence to the pre-this-pass
+baseline (`NGINX_CONFIGURED` -> `NGINX_STARTED` -> `NGINX_SELFTEST_FAILED`, pre-existing unrelated
+nginx issue -> `XVFB_FAILED` -> `DBUS_FAILED` -> `DE_FAILED`). **Root cause, precisely
+characterized, not just hypothesized**: `SharedArc<T>::new` places only `T`'s literal inline bytes
+in the arena -- genuinely sufficient for plain scalars (proven above) and for a lock's own inline
+sync word, but every `GlobalState` REGISTRY (`unix_addr_table`, `pty_registry`,
+`daemon_pty_masters`, `flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`, `shared_files`, the
+3 caches) is a `BTreeMap`/similar whose NODES are heap-allocated via the ordinary per-process
+private allocator (`WindowsUserland::alloc`, not the arena) -- an attaching process's copy of the
+map's root pointer refers to a node address that is meaningless in its own address space. This is
+exactly why Xvfb's own unix-socket registration is unreachable to a later attaching client through
+the (structurally shared, but not really content-shared for this field) `unix_addr_table`. Not a
+quick fix: needs either a shared-memory-aware allocator (blocked on unstable `allocator_api`) or
+hand-rolled shared-memory-native registries, both bigger than a single-session scope. Follow-up
+PRD: `globalstate-nested-collections-not-actually-shared`. Full evidence, every registry's exact
+type, the `proc_self_info`/`pts_registry` mount-ordering caveat, and a lower-priority
+fork-density-noise observation (`bash: N Killed`/one stack-overflow sighting, same pre-existing
+signature class as 2026-09-03/today's earlier `ERROR_NO_SYSTEM_RESOURCES` note, not conclusively
+attributed to this pass): `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
