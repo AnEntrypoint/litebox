@@ -1475,6 +1475,14 @@ fn diag_process_fork_vmem_adopt_probe(
         );
     }
 
+    // Live cross-process `SharedArc<T>` proof (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`), a no-op
+    // otherwise: this child process's own startup never implicitly touches the shared kernel
+    // arena anymore (ordinary `GlobalAlloc` traffic was reverted off it -- see `SLAB_ALLOC`'s doc
+    // comment in `litebox_platform_windows_userland`), so this explicit call is what actually
+    // exercises `SharedArc::attach` on the child side. Self-gated; see
+    // `shared_arc_probe_child_attach`'s own doc comment for why it must be called explicitly here
+    // rather than from inside the shared-heap init path.
+    litebox_platform_windows_userland::shared_arc_probe_child_attach();
     diag_elapsed!("vmem-adopt-probe verification done, handing off to task-resume-probe");
     diag_process_fork_task_resume_probe(platform, shim, fs, page_manager, relocations, t0);
 }

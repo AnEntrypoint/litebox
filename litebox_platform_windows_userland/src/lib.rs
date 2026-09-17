@@ -10438,6 +10438,360 @@ pub(crate) fn shared_kernel_arena_alloc(layout: &std::alloc::Layout) -> Option<(
     Some((addr, size))
 }
 
+/// Hand-rolled control block for [`SharedArc`], placed immediately before `T` in the same
+/// [`shared_kernel_arena_alloc`] allocation. **Deliberately NOT `std::sync::Arc`'s `ArcInner`** --
+/// that layout is a private, unstable std implementation detail (no `#[repr(C)]`, no stability
+/// guarantee), so `Arc::from_raw` over manually-placed bytes in a shared section would rely on
+/// undocumented layout and is unsound. Every field here is defined by this codebase, `#[repr(C)]`
+/// for a stable cross-process layout, and touched only through `core::sync::atomic` (which compile
+/// to plain `lock`-prefixed x86-64 instructions -- CPU cache-coherency primitives, not OS
+/// constructs -- so they are correctly atomic across the shared section exactly as
+/// [`shared_heap_cursor`]'s doc comment already establishes for the arena's own bump cursor).
+///
+/// **No `weak` field.** `std::sync::Arc<T>`'s split strong/weak scheme exists to let a `Weak<T>`
+/// observe "has the value been dropped" without keeping it alive. Nothing in this codebase needs a
+/// non-owning cross-process reference to a kernel singleton yet -- every real call site (a planned
+/// future `GlobalState`/`LiteBoxX` migration) wants ordinary shared ownership, matching how
+/// `Arc<T>` is already used at those sites today. Adding an unused `Weak` mechanism now would be
+/// speculative generality with no caller (YAGNI); if a real need for one shows up, it is a small,
+/// additive change to this struct, not a redesign.
+#[repr(C)]
+struct SharedArcInner<T> {
+    /// Number of live [`SharedArc<T>`] handles across every process attached to this allocation.
+    /// Incremented by [`SharedArc::new`]/[`SharedArc::clone`]/[`SharedArc::attach`], decremented by
+    /// [`SharedArc::drop`].
+    strong: core::sync::atomic::AtomicUsize,
+    value: T,
+}
+
+/// Hand-rolled, cross-process-safe shared-ownership smart pointer over a value placed in the
+/// fixed-base [`shared_kernel_arena_alloc`] arena (`advisor/ADVISORY-002-d-zero-fork.md` section
+/// 3.3, Track B step 3's final piece). Ergonomically mirrors `std::sync::Arc<T>` (`Clone`, `Drop`,
+/// `Deref`) as closely as possible to minimize churn at the call sites a future pass migrates onto
+/// it (`LiteBoxX`/`GlobalState`, both currently plain `Arc::new(...)`) -- but see the "No real
+/// deallocation" note on [`SharedArc::drop`] below for the one place this type's semantics
+/// deliberately diverge from `Arc<T>`'s.
+///
+/// # Why not `std::sync::Arc`
+/// See [`SharedArcInner`]'s doc comment: `Arc::from_raw` over manually-placed bytes relies on an
+/// unstable, private layout and is unsound. Stable Rust also has no `allocator_api`/`Box::new_in`,
+/// so `Arc::new_in` is not an option either -- a hand-rolled control block is the only sound
+/// mechanism.
+///
+/// # Cross-process attach protocol
+/// [`SharedArc::new`] (called once, by whichever process creates the value) returns both the
+/// handle and its [`SharedArc::arena_offset`] -- a BYTE OFFSET from the shared arena's own base
+/// ([`SHARED_KERNEL_HEAP_ACTUAL_BASE`]), not an absolute address, because the arena's actual
+/// landing address can differ per process on the fixed-address-collision fallback path (see
+/// [`SHARED_KERNEL_HEAP_BASE`]'s doc comment) -- an offset stays valid in every process that DID
+/// land at the true shared base, and is cheap to hand to a child the same way the section
+/// handle/base pair already travel today (an env var the parent sets before `CreateProcessW`,
+/// read allocation-free via [`raw_env_read_usize`]-style parsing, see
+/// [`FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`] for the existing precedent this mirrors). A child
+/// that has the SAME arena section mapped at the SAME fixed address (i.e. reached
+/// [`init_shared_kernel_heap`]'s inherited-section branch) then calls [`SharedArc::attach`] with
+/// that plain `usize` offset to obtain its own independently-owned handle to the SAME `T`.
+struct SharedArc<T> {
+    ptr: core::ptr::NonNull<SharedArcInner<T>>,
+}
+
+// SAFETY: `SharedArc<T>` provides the same cross-thread/cross-process shared-access guarantees as
+// `std::sync::Arc<T>` -- every mutation of the control block goes through `core::sync::atomic`,
+// and `T` itself is required to be `Sync` (readable concurrently through `Deref`) and `Send`
+// (its destructor, were one ever run, could run on a different thread/process than the one that
+// last touched it) for exactly the reasons `Arc<T>`'s own `unsafe impl` requires them.
+unsafe impl<T: Sync + Send> Send for SharedArc<T> {}
+unsafe impl<T: Sync + Send> Sync for SharedArc<T> {}
+
+impl<T> SharedArc<T> {
+    /// Places `value` plus a fresh [`SharedArcInner`] control block (`strong = 1`) into the shared
+    /// kernel arena via [`shared_kernel_arena_alloc`], and returns the new handle together with
+    /// its [`arena_offset`](SharedArc::arena_offset) -- the value a caller must hand to any other
+    /// process that will [`SharedArc::attach`] to this same allocation. Returns `None` on arena
+    /// exhaustion (the same bounded-64-MiB-pool OOM every other `shared_kernel_arena_alloc` caller
+    /// can hit), leaving nothing partially constructed.
+    fn new(value: T) -> Option<(Self, usize)> {
+        let layout = std::alloc::Layout::new::<SharedArcInner<T>>();
+        let (addr, _size) = shared_kernel_arena_alloc(&layout)?;
+        let inner_ptr = addr as *mut SharedArcInner<T>;
+        // SAFETY: `shared_kernel_arena_alloc` just returned `addr` as a freshly, exclusively
+        // claimed (via its internal atomic-cursor CAS) and committed sub-range of the shared
+        // arena, sized and aligned for at least `layout` (`SharedArcInner<T>`'s own layout, which
+        // `Layout::new` computes correctly including `T`'s alignment) -- no other code anywhere
+        // can be reading or writing these bytes yet, so a raw `ptr::write` of the fully-formed
+        // control block is sound and does not need to (and must not, being uninitialized memory)
+        // drop any previous value.
+        unsafe {
+            inner_ptr.write(SharedArcInner {
+                strong: core::sync::atomic::AtomicUsize::new(1),
+                value,
+            });
+        }
+        let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+        let offset = inner_ptr as usize - base;
+        // SAFETY: `inner_ptr` was just derived from a non-null `addr` above (`shared_kernel_arena_alloc`
+        // never returns a null address for a `Some` result -- it aborts the process instead on any
+        // commit failure).
+        let ptr = unsafe { core::ptr::NonNull::new_unchecked(inner_ptr) };
+        Some((SharedArc { ptr }, offset))
+    }
+
+    /// Attaches to an existing [`SharedArc<T>`] allocation created by [`SharedArc::new`] in
+    /// (typically) another process, given the BYTE OFFSET that process's own `arena_offset`
+    /// returned. Atomically increments the shared strong count, so the returned handle is a fully
+    /// independent owning reference -- dropping the ORIGINAL creator's handle first does not
+    /// invalidate this one.
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - This process has already reached [`init_shared_kernel_heap`]'s inherited-section
+    ///   success path (i.e. [`SHARED_KERNEL_HEAP_STATE`] is `_READY` AND this process mapped the
+    ///   SAME underlying section at the SAME address as the creator -- never the
+    ///   private-fallback path, which contains none of the creator's data).
+    /// - `offset` genuinely came from a real [`SharedArc::<T>::new`] call for THIS SAME `T` (a
+    ///   wrong offset, or the right offset with the wrong `T`, reads/mutates arbitrary shared
+    ///   bytes as if they were a valid `SharedArcInner<T>` -- there is no tag or runtime
+    ///   type-check, exactly as `Arc::from_raw` itself has none).
+    /// - The allocation `offset` names has not been (and never will be) reclaimed -- always true
+    ///   today, since [`shared_kernel_arena_alloc`] never reclaims (see [`SharedArc::drop`]).
+    unsafe fn attach(offset: usize) -> Self {
+        let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+        let inner_ptr = (base + offset) as *mut SharedArcInner<T>;
+        // SAFETY: caller contract above.
+        let inner = unsafe { &*inner_ptr };
+        // `Relaxed` suffices for the increment itself (matches `Arc::clone`'s own reasoning: no
+        // memory operation needs to happen-before this one -- the new handle cannot be used until
+        // after this call returns on this same thread, which is already ordered).
+        inner.strong.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `inner_ptr` is non-null (derived from a non-zero `base` plus an in-range
+        // `offset`, both preconditions of this function per its own safety doc).
+        let ptr = unsafe { core::ptr::NonNull::new_unchecked(inner_ptr) };
+        SharedArc { ptr }
+    }
+
+    /// This handle's byte offset from the shared arena's base -- the value to hand to another
+    /// process's [`SharedArc::attach`]. See [`SharedArc::new`]'s doc comment for why this is an
+    /// offset, not an absolute address.
+    fn arena_offset(&self) -> usize {
+        let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+        self.ptr.as_ptr() as usize - base
+    }
+
+    /// Current strong count, diagnostic/verification use only (matches `Arc::strong_count`'s own
+    /// "racy in the presence of concurrent clones/drops" caveat -- reading it is never itself
+    /// unsound, just not linearizable with concurrent mutators).
+    fn strong_count(&self) -> usize {
+        // SAFETY: `self.ptr` always names a live `SharedArcInner<T>` for as long as `self` exists
+        // (this handle itself holds one of the counted strong references).
+        unsafe { self.ptr.as_ref() }
+            .strong
+            .load(Ordering::Acquire)
+    }
+}
+
+impl<T> Clone for SharedArc<T> {
+    fn clone(&self) -> Self {
+        // SAFETY: see `strong_count`'s identical reasoning.
+        unsafe { self.ptr.as_ref() }
+            .strong
+            .fetch_add(1, Ordering::Relaxed);
+        SharedArc { ptr: self.ptr }
+    }
+}
+
+impl<T> core::ops::Deref for SharedArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: `self.ptr` always names a live, fully-initialized `SharedArcInner<T>` for as
+        // long as `self` exists.
+        &unsafe { self.ptr.as_ref() }.value
+    }
+}
+
+impl<T> Drop for SharedArc<T> {
+    /// **No real deallocation/reclaim, by design -- confirmed, not an oversight.** Two independent
+    /// reasons, both specific to this type's actual use case (long-lived kernel singletons like
+    /// `GlobalState`/`LiteBoxX`, never a general-purpose dynamically-allocated object):
+    ///
+    /// 1. [`shared_kernel_arena_alloc`] is a pure bump allocator with no free list (see its own
+    ///    doc comment) -- there is no mechanism to give bytes back to the arena even if this were
+    ///    the very last handle anywhere, so "reclaim the memory" is not an available option here
+    ///    regardless of refcount semantics.
+    /// 2. Running `T`'s destructor from whichever process happens to observe `strong == 0` would
+    ///    be actively unsound for the intended `T`s: `GlobalState`/`LiteBoxX` are expected to
+    ///    embed real per-process OS resources (`HANDLE`s, fds) at some fields, and a `HANDLE`
+    ///    value is only meaningful in the process that owns it -- running a `Drop` impl that
+    ///    closes such a handle from an arbitrary OTHER process in the fork family would close
+    ///    whatever unrelated handle number happens to be live there instead. A kernel singleton
+    ///    is, by this project's own design intent (`docs/AGENTS_ARCHIVE_2026-09-17.md`'s "Shared
+    ///    kernel heap" section), meant to outlive every process in the fork family for the whole
+    ///    guest session -- i.e. never actually reach `strong == 0` while the guest is alive at
+    ///    all -- so a correct, non-reclaiming `Drop` costs nothing in practice for this use case.
+    ///
+    /// The strong count is still decremented on every drop (diagnostic/verification value, and
+    /// keeps [`SharedArc::strong_count`] meaningful for live cross-process proof), but reaching
+    /// zero intentionally does nothing further: no destructor call, no arena reclaim. This mirrors
+    /// the arena's own established "bump allocator, dead-in-practice on exit" philosophy
+    /// (`WindowsUserland::free`'s doc comment) rather than building a general-purpose refcounted
+    /// allocator no real caller of this type needs.
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` always names a live `SharedArcInner<T>` until this very call.
+        unsafe { self.ptr.as_ref() }
+            .strong
+            .fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Isolated test payload for the live cross-process [`SharedArc<T>`] proof
+/// (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`) -- unrelated to any real guest-visible state, exactly
+/// mirroring how [`SHARED_HEAP_PROBE_MAGIC`]'s sentinel proof is kept separate from production
+/// data. `magic` proves the child observes the PARENT's `ptr::write`d bytes through the wrapper;
+/// `counter` proves a child-side mutation (through `Deref`, via its own interior `AtomicUsize` --
+/// `SharedArc<T>` itself only ever hands out `&T`, matching `Arc<T>`) is a write to the SAME
+/// physical memory the parent can also observe, not a private copy.
+#[repr(C)]
+struct SharedArcProbeData {
+    magic: usize,
+    counter: core::sync::atomic::AtomicUsize,
+}
+
+const SHARED_ARC_PROBE_MAGIC: usize = 0x5AC5_5AC5_5AC5_5AC5;
+
+/// Env var carrying the DECIMAL [`SharedArc::arena_offset`] of this run's probe allocation --
+/// sibling of [`FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`]/[`FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR`],
+/// set at the same call site in `process_fork::spawn_process_fork_child`, read the same
+/// allocation-free way from [`init_shared_kernel_heap`]'s inherited-section branch.
+pub(crate) const FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR: &str =
+    "LITEBOX_INTERNAL_FORK_CHILD_SHARED_ARC_PROBE_OFFSET";
+
+/// This process's own probe handle plus one extra `Clone` of it, kept alive for the process's
+/// whole lifetime so `strong_count` stays meaningful across every child this parent forks during
+/// one diagnostic run (never dropped mid-run) -- created at most once (`OnceLock`), reused by
+/// every subsequent fork.
+static SHARED_ARC_PROBE_PARENT: OnceLock<(SharedArc<SharedArcProbeData>, SharedArc<SharedArcProbeData>)> =
+    OnceLock::new();
+
+/// Diagnostic-only (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`), called from the PARENT side of
+/// `process_fork::spawn_process_fork_child` right before spawning a real cross-process-fork child.
+/// On this process's first call, creates the probe allocation (`strong` -> 1) and immediately
+/// `Clone`s it once more (`strong` -> 2) to prove same-process `Clone` works before any
+/// cross-process attach is involved; every call (first or not) prints the current strong count and
+/// returns the allocation's `arena_offset` for the caller to hand to the child. Requires the
+/// shared-heap-inherit gate to already be exporting a section to the child (this probe rides on
+/// that same section, it does not create its own).
+pub(crate) fn shared_arc_probe_parent_prepare() -> usize {
+    let (first, _clone) = SHARED_ARC_PROBE_PARENT.get_or_init(|| {
+        let (arc, offset) = SharedArc::new(SharedArcProbeData {
+            magic: SHARED_ARC_PROBE_MAGIC,
+            counter: core::sync::atomic::AtomicUsize::new(0),
+        })
+        .expect("shared_arc_probe: arena_alloc failed for probe struct");
+        eprintln!(
+            "[shared_arc_probe] parent CREATED offset=0x{offset:x} strong={}",
+            arc.strong_count()
+        );
+        let cloned = arc.clone();
+        eprintln!(
+            "[shared_arc_probe] parent CLONED strong={} (expect 2)",
+            cloned.strong_count()
+        );
+        (arc, cloned)
+    });
+    let offset = first.arena_offset();
+    eprintln!(
+        "[shared_arc_probe] parent pre-fork strong={} offset=0x{offset:x}",
+        first.strong_count()
+    );
+    offset
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`) counterpart to
+/// [`shared_arc_probe_parent_prepare`] -- `pub` (not `pub(crate)`) because the child process's own
+/// startup lives in the separate `litebox_runner_linux_on_windows_userland` crate, which calls
+/// this explicitly once early in a resumed cross-process-fork child's life (see that crate's
+/// `diag_process_fork_task_resume_probe`, right before handing off to the real task-resume probe).
+/// That explicit call is necessary, not merely a convenience: unlike the earlier `LiteBoxX`/
+/// `GlobalState`-routed-through-the-shared-heap design this superseded, ordinary `GlobalAlloc`
+/// traffic no longer touches [`init_shared_kernel_heap`] AT ALL post-revert (see [`SLAB_ALLOC`]'s
+/// doc comment) -- so nothing implicitly initializes/inherits the shared arena in a plain
+/// cross-process-fork child anymore, and this function calls [`init_shared_kernel_heap`] itself
+/// (idempotent, safe to call from ordinary non-reentrant code -- the reentrancy constraint only
+/// binds callers reachable from `WindowsUserland::alloc` itself) rather than relying on being
+/// invoked from inside it.
+pub fn shared_arc_probe_child_attach() {
+    if !raw_env_is_set(b"LITEBOX_DIAG_SHARED_ARC_PROBE\0") {
+        return;
+    }
+    init_shared_kernel_heap();
+    if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+        diag_raw_print(
+            b"[shared_arc_probe] child: shared kernel heap not READY, skipping",
+            0,
+            b"",
+            0,
+        );
+        return;
+    }
+    let Some(offset) = raw_env_read_usize(b"LITEBOX_INTERNAL_FORK_CHILD_SHARED_ARC_PROBE_OFFSET\0")
+    else {
+        diag_raw_print(
+            b"[shared_arc_probe] child: no offset env var set, skipping",
+            0,
+            b"",
+            0,
+        );
+        return;
+    };
+    // SAFETY: gated on `LITEBOX_DIAG_SHARED_ARC_PROBE` being explicitly opted into by the
+    // operator running this exact diagnostic, `offset` came from this run's own
+    // `shared_arc_probe_parent_prepare` (the only writer of the env var this reads), and this
+    // function is only reachable from `init_shared_kernel_heap`'s inherited-section branch, which
+    // already confirmed `landed == base` (this process mapped the SAME section at the SAME
+    // address as the parent that created the probe).
+    let attached = unsafe { SharedArc::<SharedArcProbeData>::attach(offset) };
+    diag_raw_print(
+        b"[shared_arc_probe] child ATTACHED strong=0x",
+        attached.strong_count(),
+        b" magic=0x",
+        attached.magic,
+    );
+    let magic_ok = attached.magic == SHARED_ARC_PROBE_MAGIC;
+    diag_raw_print(
+        b"[shared_arc_probe] child magic_match=0x",
+        usize::from(magic_ok),
+        b" counter_before=0x",
+        attached.counter.load(Ordering::Acquire),
+    );
+    let observed = attached.counter.fetch_add(1, Ordering::AcqRel) + 1;
+    diag_raw_print(
+        b"[shared_arc_probe] child counter_after_fetch_add=0x",
+        observed,
+        b" strong=0x",
+        attached.strong_count(),
+    );
+    let extra = attached.clone();
+    diag_raw_print(
+        b"[shared_arc_probe] child CLONED strong=0x",
+        extra.strong_count(),
+        b" counter=0x",
+        extra.counter.load(Ordering::Acquire),
+    );
+    drop(extra);
+    diag_raw_print(
+        b"[shared_arc_probe] child DROPPED clone strong=0x",
+        attached.strong_count(),
+        b" counter=0x",
+        attached.counter.load(Ordering::Acquire),
+    );
+    // `attached` itself is intentionally leaked here (never dropped): this diagnostic child
+    // process is short-lived and about to continue into normal guest startup, and the whole
+    // point of the probe is to demonstrate the handle stays valid and correctly counted for the
+    // rest of this process's life, exactly the real `GlobalState`/`LiteBoxX` usage shape a future
+    // migration needs -- an artificial extra drop here would prove nothing further.
+    core::mem::forget(attached);
+}
+
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(

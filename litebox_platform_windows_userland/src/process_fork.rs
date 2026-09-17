@@ -1698,6 +1698,18 @@ pub fn spawn_process_fork_child(
         // sentinel the child reads back once it maps the same section, the most direct live proof
         // that this mechanism genuinely shares content and not just address layout.
         crate::shared_kernel_heap_probe_parent_write(base);
+        // Live cross-process `SharedArc<T>` proof (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`), riding on
+        // this same shared-heap-inherit export: creates (once per parent process) an isolated
+        // `SharedArc<SharedArcProbeData>` test allocation and hands the child its arena offset, so
+        // the child can attach, read the parent's write through the wrapper, and exercise
+        // clone/drop -- see `shared_arc_probe_parent_prepare`'s doc comment.
+        if std::env::var_os("LITEBOX_DIAG_SHARED_ARC_PROBE").is_some() {
+            let arc_offset = crate::shared_arc_probe_parent_prepare();
+            child_env.push((
+                crate::FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR,
+                arc_offset.to_string(),
+            ));
+        }
     }
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(

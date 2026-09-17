@@ -37,13 +37,13 @@ warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error` by ref
 - **No WSL or hypervisor, ever** — always run under the matching runner
   (`litebox_runner_linux_on_windows_userland.exe`/`litebox_runner_linux_userland`); cross-compiling FOR
   Linux is fine, running the result in a VM defeats the premise.
-- **`fork_verify.rs`'s stale-pointer-healing bug class is Windows-only** (real `fork()` gives the child
-  identical addresses) — never port such a fix to another platform's crate.
+- **`fork_verify.rs`'s stale-pointer-healing bug class is Windows-only** (real `fork()` gives the
+  child identical addresses) — never port to another platform's crate.
 - **Never `bcdedit /debug on`** without a kernel debugger already attached — two full-host freezes
   needing a power-cycle.
-- **Never run two full-stack verifications concurrently**, peer sessions included — starves both, and
-  the failure looks exactly like a real hang. Kill every `litebox_runner` between runs; watch
-  `FreePhysicalMemory` and kill on a falling trend, not a fixed RSS number.
+- **Never run two full-stack verifications concurrently** — starves both, looks exactly like a real
+  hang. Kill every `litebox_runner` between runs; watch `FreePhysicalMemory`, kill on a falling
+  trend not a fixed RSS number.
 - **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check**, never
   `PrintWindow`/`CopyFromScreen`. A pixel count alone never identifies WHO painted a frame — decode
   frame structure (`advisor/probes/decode_frame.py`) and correlate against `DIAG_TIMELINE execve`'s
@@ -68,8 +68,8 @@ warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error` by ref
   tar-listing, or a live in-guest `/usr/bin` listing.
 - **Never record a test count you did not just watch run to completion**, and never leave a suite red
   for an environmental reason. No counts are recorded here on purpose.
-- **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`, gitignored);
-  untrack anything `git add -A` sweeps in by mistake.
+- **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`,
+  gitignored); untrack anything `git add -A` sweeps in.
 - Procedural know-how is in the archive's "Working practices": freestanding guest binaries built on the
   HOST, probe injection via a small `--resume-from` overlay tar, mature libraries over hand-rolled code.
 - **Guest-reachable code returns an errno, never a panic** — the host process IS the entire guest
@@ -95,10 +95,9 @@ a pipe end/path-recorded regular file/eventfd/close-on-exec (overridable by
 the only remaining blocking kind is `unix-socket` — 5 refused forks of 34, down from 34/34. Per-kind
 deviations: archive.
 
-**Per-fork cost** was ~3.5-5s, now ~1.2s; a full `webtop_stack.sh` boot reaches `NGINX_STARTED` in under a
-minute versus never in 15+. Older rootfs-re-merge/writable-layer-growth cost explanations are
-**measured wrong**. Use `LITEBOX_DIAG_FORK_TIMING=1` for the next cost question. Three correctness
-bugs this exposed are fixed; detail: archive.
+**Per-fork cost** was ~3.5-5s, now ~1.2s; a full `webtop_stack.sh` boot reaches `NGINX_STARTED` in
+under a minute versus never in 15+. Older cost explanations were measured wrong. Use
+`LITEBOX_DIAG_FORK_TIMING=1` for the next cost question. Three correctness bugs fixed; detail: archive.
 
 **Reading a cross-process log** — the `fork_verify` "stale CODE pointer" noise-vs-signal read: archive.
 
@@ -185,25 +184,13 @@ of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
-Nine ACK-stall-kill candidates investigated total, all refuted or fixed: a livelock gap (`b6ddf43`),
-the python3/ET_EXEC collision (`0x600000`→`0x1000000`, 9/9 clean vs 10/10 pre-fix), the
-video-never-arrives readiness-gate race (real browser client, Applications-menu → Terminal Emulator
-opens in 1-2s), and the backpressure gate itself. **Backpressure fix (`478e640`) — RESOLVED,
-live-verified.** Real blocker was the guest-side patcher silently crashing on `shutil.copy2()`'s
-`copystat()`→`os.listxattr()` (litebox's Linux shim has no `listxattr`) before ever patching
-`selkies.py` — every earlier "trigger/lift works, timeout still happens" read was against unpatched
-code. Fixed via `shutil.copyfile()`; also fixed a real backlog-check gap (compared backlog before the
-new frame, not after: now `backlog_bytes + len(data_chunk) > threshold`, cap 256KiB→128KiB).
-Live-verified: 60+s with zero `keepalive ping timeout` under a clean download-only throttle, vs ~19s
-pre-fix. **Port-8081 double-bind — CLOSED as an honest terminal state, not a live fire+recover
-confirmation.** Fix (drop the `kill -0` stall-counter pre-check, add `SELKIES_BIND_WATCHDOG_TICK`
-tracing) is code-verified correct and instrumentation-confirmed live across two sessions (17 boot
-cycles). The underlying double-bind race itself did not recur even under an escalated reconnect-storm
-stress test (up to 6000 WebSocket opens/window vs. the prior session's 40) — consistent with its
-documented very-sparse historical hit rate. A live fire+kill+recover cycle remains unwitnessed;
-re-open only with a materially different trigger. RAM was the hard ceiling both sessions; every kill
-fully recovered host RAM within seconds, zero leaks/orphans. Full session detail (boot-cycle/RAM
-accounting, stress-test numbers, Wake Lock/`Slow 3G` refutation history): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+Nine ACK-stall-kill candidates investigated, all refuted or fixed; real blocker was the guest-side
+patcher silently crashing on `shutil.copy2()`'s `copystat()`→`os.listxattr()` (no `listxattr` shim)
+before ever patching `selkies.py`, fixed via `shutil.copyfile()` plus a backlog-check-ordering fix
+(`478e640`) — live-verified 60+s with zero `keepalive ping timeout`. Port-8081 double-bind fix
+code-verified + instrumentation-confirmed live (17 boot cycles); the race itself did not recur even
+under an escalated 6000-connection stress test. RAM fully recovered on every kill, zero leaks. Full
+detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -235,29 +222,21 @@ popped-waiter count (was always `0` -- a pure improvement, not a behaviour requi
 Full internals (queue/lock-ordering, timeout-race resolution): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 **Cross-process half is real code, not a stub, but genuinely untaken today**: every
-`WaiterRecord` carries the waiter's pid; same-pid (always true today, since `RawMutex` still lives
-in per-process heap) uses the handle directly, a different pid would use `DuplicateHandle`
-(already proven live cross-process, non-admin) cached in `remote_waiter_handles`. Deliberately a
-DIFFERENT design from `xproc_sync.rs`'s single named-per-mutex event (that one needs a section
-offset to key its side-table by, i.e. step 3) -- `RawMutex` needed a design that works BEFORE
-step 3 exists, per ADVISORY-002 §3.2.
+`WaiterRecord` carries the waiter's pid; same-pid (always true today) uses the handle directly, a
+different pid would use `DuplicateHandle` (already proven live cross-process, non-admin) cached in
+`remote_waiter_handles`. Deliberately different from `xproc_sync.rs`'s single named-per-mutex
+event (needs a section offset to key its side-table by, i.e. step 3).
 
 **Live-verified** (release build, default thread-based fork, no test files): `yes hello | head -c
-5000000 | wc -c` -- exact `5000000`, proving correct blocking-pipe reads/writes. `seq 1 3000000 |
-sort --parallel=4 -n | tail -3` -- exact correct output, proving `sort`'s real multi-threaded
-pthread mutex/condvar contention completes correctly: no hang, no deadlock, no missed wakeup, no
-corrupted merge. Host RAM identical before/after, no leaked processes.
+5000000 | wc -c` -- exact `5000000`. `seq 1 3000000 | sort --parallel=4 -n | tail -3` -- exact
+correct output, proving `sort`'s real multi-threaded pthread mutex/condvar contention completes
+with no hang/deadlock/missed-wakeup/corrupted-merge. Host RAM identical before/after.
 
-**3-stage-pipeline SIGPIPE: relay EXONERATED 2026-09-16; fault is upstream in guest execution
-correctness, not the relay.** `seq 1 200000 | sort -n | tail -3` under `LITEBOX_PROCESS_FORK=1`
-needed the `VEH_FRAME_STRIDE` fix below just to reach this repro. Every `CloseHandle` site in both
-pumps, instrumented across ~9 live runs, showed `total_read == total_written` every time -- the relay
-never misbehaves. `seq` stops early instead: once a real `SIGPIPE` (the original report), other times
-a silent clean exit with truncated output (`13300/13301/13302`, not `199998/199999/200000`). Only the
-5000-line repro completes correctly (4/4); 200000-line never has, 9/9 attempts. Likely shares root
-cause with the open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` row. PRD
+**3-stage-pipeline SIGPIPE: relay EXONERATED 2026-09-16** -- `seq 1 200000 | sort -n | tail -3`
+under `LITEBOX_PROCESS_FORK=1` truncates upstream of the relay (guest execution correctness, not
+the relay: `total_read == total_written` every time, ~9 live runs). PRD
 `process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
-`LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Methodology: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+`LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Full repro/evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Shared kernel heap -- SELECTIVE-ROUTING CORRECTION LANDED 2026-09-17 (ADVISORY-002 §3.3)
 
@@ -283,25 +262,65 @@ mechanism re-verified live at the new size (parent-side init+map+commit+sentinel
 correctly at `base+64MiB-0x1000`); the opt-in `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` fork-export path
 is untouched and still gated off by default.
 
-**Why `LiteBoxX`/`GlobalState` are NOT yet wired to `shared_kernel_arena_alloc`, precisely scoped
-for the next session**: `Arc<T>`'s layout is a private std implementation detail (`Arc::from_raw`
-over manually-placed bytes is unsound) and Rust stable has no `allocator_api`/`Box::new_in`, so
-`Arc::new` can never be told to use a non-default allocator. The only sound mechanism is a
-hand-rolled `SharedArc<T>`-style wrapper (manual refcount, `ptr::write` into raw
-`shared_kernel_arena_alloc` bytes, custom `Drop` that runs the destructor but never reclaims the
-backing bytes, matching this codebase's existing bump-allocator philosophy). `LiteBox::new`
-(`litebox/src/litebox.rs`) and `LinuxShimBuilder::build` (`litebox_shim_linux/src/lib.rs`) are
-platform-generic code shared by every runner (Linux native, macOS, optee, snp, lvbs), so that
-wrapper needs a new trait (alongside `RawMutexProvider`) with a real impl for `WindowsUserland` and
-a no-op default (ordinary `Arc::new`) for every other platform -- real, scoped, multi-file work, not
-started this pass. Separately and even after that: today's design has EVERY process (parent and
-every CreateProcess-based "fork" child alike) call `LinuxShimBuilder::new().build()` unconditionally at
-its own startup, constructing its OWN fresh `GlobalState`/`LiteBoxX` -- so merely placing those
-allocations in shared memory does not by itself give a forked child the PARENT's already-open
-pipes/futexes/AF_UNIX table; that needs a create-vs-attach protocol (first process creates, later
-ones in the family detect and attach to the existing instance at a known shared offset) that does
-not exist in this codebase in any form yet. This is the real remaining size of the "GlobalState
-cross-process visibility" goal -- track it as its own PRD, do not assume the arena alone closes it.
+### `SharedArc<T>` -- DESIGNED, BUILT, LIVE-VERIFIED cross-process 2026-09-17 (ADVISORY-002 3.3 step 3's final piece)
+
+`litebox_platform_windows_userland/src/lib.rs` (`SharedArcInner`/`SharedArc`, just above
+`impl MemoryProvider for WindowsUserland`): a hand-rolled shared-ownership smart pointer over
+`shared_kernel_arena_alloc` bytes -- **not `std::sync::Arc`**, whose `ArcInner` layout is a
+private std implementation detail (`Arc::from_raw` over manually-placed bytes is unsound), and
+stable Rust has no `allocator_api`/`Box::new_in` either. Own `#[repr(C)]` control block
+(`strong: AtomicUsize` only -- no `weak`, nothing needs one yet, YAGNI). `SharedArc::new(value)`
+returns `(handle, arena_offset)`; `unsafe SharedArc::attach(offset)` (cross-process: a child with
+the SAME arena section mapped at the SAME address) increments `strong` and returns an independent
+owning handle. `Clone`/`Deref` match `Arc<T>` ergonomics for minimal call-site churn.
+**`Drop` deliberately never reclaims or runs `T`'s destructor** (confirmed, not an oversight): (1)
+the arena is a pure bump allocator with no free list at all, so freeing bytes is not an available
+option regardless; (2) a kernel singleton like `GlobalState`/`LiteBoxX` may embed real per-process
+`HANDLE`s/fds, and running its `Drop` from whichever process happens to observe `strong == 0`
+would close whatever unrelated handle number is live THERE -- unsound in a multi-process world.
+Strong count is still tracked (verification value), reaching zero intentionally does nothing
+further -- correct because these singletons are meant to outlive every process in the fork family
+for the whole guest session and never really reach zero live anyway.
+
+**Live cross-process proof** (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1 LITEBOX_DIAG_SHARED_ARC_PROBE=1
+LITEBOX_PROCESS_FORK=1`, isolated `SharedArcProbeData{magic, counter: AtomicUsize}` test struct,
+riding the existing shared-heap-inherit env-var handoff --
+`shared_arc_probe_parent_prepare`/`shared_arc_probe_child_attach`, wired at
+`litebox_runner_linux_on_windows_userland/src/lib.rs`'s vmem-adopt-probe-to-task-resume-probe
+handoff since ordinary `GlobalAlloc` traffic no longer touches `init_shared_kernel_heap` at all
+post-revert, so the child must call it explicitly): real `debian:stable-slim` cheap-repro fork,
+one real cross-process child. Parent: `new` -> strong=1, `clone` -> strong=2. Child: `attach` ->
+strong=3, `magic` read back byte-identical (`0x5ac55ac55ac55ac5`, proves the child sees the
+PARENT's `ptr::write` through the wrapper, not a private copy), `counter.fetch_add` 0->1 (proves
+mutation through `Deref`'s interior atomic lands in the SAME physical memory), child `clone` ->
+strong=4, child drops that clone -> strong=3. Every number exactly as expected; zero crash, zero
+corruption, zero leaked process, host RAM unchanged after run. **Step 1 (ADVISORY-002 3.3) is
+done.**
+
+**Step 2 -- create-vs-attach protocol for the REAL `GlobalState`/`LiteBoxX` -- NOT started this
+pass, deliberately** (explicit scope call: prove the wrapper first, don't force the migration
+unverified). Precisely scoped for the next session: `LiteBox::new` (`litebox/src/litebox.rs:72`)
+and `LinuxShimBuilder::build` (`litebox_shim_linux/src/lib.rs:474`) are platform-generic code
+shared by every runner (Linux native, macOS, optee, snp, lvbs) -- confirmed live 2026-09-17 that
+EVERY process in a fork family, parent and every child alike, independently calls
+`shim_builder.build::<DefaultFS<Platform>>()` at its own startup
+(`litebox_runner_linux_on_windows_userland/src/lib.rs`'s `diag_process_fork_globalstate_probe`,
+the same call site the `[process_fork_diag] globalstate-probe (child): GlobalState constructed
+successfully` log line comes from -- this is why merely placing the allocation in shared memory
+was never sufficient by itself). Needed: (a) a new trait (alongside `RawMutexProvider`) threaded
+through `litebox`/`litebox_shim_linux`'s generic `Platform` bound, real `SharedArc`-backed impl
+for `WindowsUserland`, no-op default (ordinary `Arc::new`) for every other platform; (b) a
+create-vs-attach branch at that construction call site -- the very first process in a fork family
+(never itself a fork child) creates fresh via the new trait/`SharedArc::new`, every
+cross-process-fork child instead detects it has an inherited shared-heap section
+(`SHARED_KERNEL_HEAP_SECTION_HANDLE`-style env vars already flow today) and `SharedArc::attach`s
+to the offset the root process exported, instead of building its own; (c) live proof the SAME
+shape as this pass's isolated-struct probe, but for real `GlobalState` -- parent registers
+something in a real registry field, a child FORKED AFTERWARD observes it (not a frozen
+pre-fork snapshot); (d) only then re-attempt `.wfgy/webtop_stack.sh` under
+`LITEBOX_PROCESS_FORK=1` and check whether `XVFB_FAILED`/`DBUS_FAILED` finally resolve. Track as
+its own PRD; the arena + `SharedArc` alone do not close the "GlobalState cross-process visibility"
+goal, only remove its last soundness blocker.
 
 `XVFB_FAILED`/`DBUS_FAILED` (guest processes share no AF_UNIX/loopback/FIFO namespace -- see "A real
 desktop renders in a browser"'s "Open here" note) is UNCHANGED by this pass, exactly as expected:
