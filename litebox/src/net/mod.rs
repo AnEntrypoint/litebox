@@ -436,6 +436,50 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
+    /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
+    /// construction time to the CALLING process's own, always-correct equivalent.
+    ///
+    /// `Network`'s smoltcp `socket_set`/`interface`/`closing_in_background`/`queued_for_closure`
+    /// are genuinely, correctly shared across an entire cross-process-fork family -- one virtual
+    /// NIC for the whole guest, same as `futex_manager`/`pipes`/every registry in `GlobalState`.
+    /// Two of its OTHER fields are different in kind -- each is a raw pointer captured once by
+    /// whichever process happened to construct `GlobalState`/`Network` first, then placed inline
+    /// in the cross-process-shared arena; every OTHER process in the fork family, including every
+    /// cross-process-fork child that ATTACHES to this same shared `Network` instance, inherits
+    /// that first process's raw pointer bytes verbatim -- meaningless (and, once that first
+    /// process has since exited, genuinely dangling) in its own address space:
+    ///
+    /// - `litebox: LiteBox<Platform>` exists only so this struct's own methods
+    ///   (`close_pending_sockets`, `drain_all_socket_channel_buffers`, `bind`, `connect`, ...) can
+    ///   reach `descriptor_table()`/`descriptor_table_mut()` -- and `Descriptors` is a PER-PROCESS
+    ///   table (each process now constructs its own fresh, local `LiteBox` -- see this crate's own
+    ///   `LiteBox::new` doc comment, "2026-09-17 create-vs-attach note", and
+    ///   `litebox_shim_linux::GlobalStateHandle`'s doc comment for why `GlobalState` itself carries
+    ///   no `litebox` field). Live-caught: a real `STATUS_ACCESS_VIOLATION` (0xc0000005) inside
+    ///   `Descriptors::iter_mut`'s closure, reached via `close_pending_sockets`, on a plain `mkdir`
+    ///   fork child with zero sockets of its own -- `close_pending_sockets`/
+    ///   `drain_all_socket_channel_buffers` run as unconditional per-tick housekeeping over the
+    ///   WHOLE shared `Network`, regardless of which process is currently holding the lock.
+    /// - `device: phy::Device<Platform>` holds `platform: &'static Platform` (`phy::Device`'s own
+    ///   field) -- the SAME defect one level deeper still, caught live IMMEDIATELY after the
+    ///   `litebox` fix above landed: `STATUS_ACCESS_VIOLATION` inside
+    ///   `litebox_platform_windows_userland::net::receive_ip_packet`, called through
+    ///   `Device::receive`'s `self.platform.receive_ip_packet(...)`. `phy::Device` carries no other
+    ///   state worth preserving across a rebind (`receive_buffer`/`send_buffer` are transient
+    ///   smoltcp-poll-cycle scratch space, never held across a lock release), so it is cheaper and
+    ///   safer to reconstruct it wholesale than to reach in and patch one field.
+    ///
+    /// The fix: every caller that locks `GlobalState.net` rebinds both fields to ITS OWN
+    /// already-correct, per-process state (`GlobalStateHandle::net_lock`) before touching anything
+    /// -- same shadow-field pattern as `litebox`/`proc_self_info`/`pts_registry`/`elf_patch_cache`/
+    /// `exec_ranges_cache`/`segment_scan_cache`, applied one (for `litebox`) or two (for `device`)
+    /// levels deeper because these particular stale pointers live inside a struct that is itself
+    /// correctly, genuinely shared rather than at `GlobalState`'s own top level.
+    pub fn rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>) {
+        self.device = phy::Device::new(litebox.x.platform);
+        self.litebox = litebox.clone();
+    }
+
     /// Sets the interaction with the outside world to `platform_interaction`.
     ///
     /// If this is set to automatic, then a user of the network does not need to worry about

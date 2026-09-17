@@ -994,7 +994,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        self.0.net_lock().perform_platform_interaction()
     }
 
     /// Establish a TCP connection to the given address.
@@ -1488,8 +1488,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     drop(rds);
                     let _ = self
                         .global
-                        .net
-                        .lock()
+                        .net_lock()
                         .close(&fd, litebox::net::CloseBehavior::Immediate);
                 }
             } else {
@@ -2810,6 +2809,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> core::ops::Deref for GlobalStateHandle<
     }
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
+    /// Lock the shared `Network` and rebind its process-relative fields (`litebox`, `device`) to
+    /// THIS process's own, always-locally-valid state before handing out the guard -- sixth and
+    /// seventh instances of the SAME cross-process-stale-pointer defect class documented on this
+    /// struct's own doc comment, found one (or two) levels deeper than the `GlobalState` fields
+    /// above: `Network` itself is genuinely, correctly meant to be shared across the whole fork
+    /// family (one virtual NIC for the whole guest), but two of its OWN fields are raw pointers
+    /// captured once by whichever process constructed `GlobalState` first, meaningless (or, after
+    /// that process exits, genuinely dangling) in every other process's address space. Every call
+    /// site that used to reach `GlobalState.net.lock()` directly must go through this instead --
+    /// see `litebox::net::Network::rebind_per_process_fields`'s own doc comment for the live crash
+    /// evidence (first `STATUS_ACCESS_VIOLATION` inside `Descriptors::iter_mut`, reached via
+    /// `close_pending_sockets`; second, immediately after that fix landed, inside
+    /// `litebox_platform_windows_userland::net::receive_ip_packet` via `phy::Device::receive` --
+    /// both on a plain `mkdir` fork child with zero sockets of its own).
+    pub(crate) fn net_lock(
+        &self,
+    ) -> litebox::sync::MutexGuard<'_, Platform, litebox::net::Network<Platform>> {
+        let mut guard = self.net.lock();
+        guard.rebind_per_process_fields(&self.litebox);
+        guard
+    }
+}
+
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
@@ -3065,7 +3088,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// adds to them, narrowly, for the one thing this crate owns that they don't: its own
     /// shim-wide locks.
     fn with_shimwide_locks_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _net = self.net.lock();
+        let _net = self.net_lock();
         let _unix_addr_table = self.unix_addr_table.write();
         let _elf_patch_cache = self.elf_patch_cache.lock();
         let _segment_scan_cache = self.segment_scan_cache.lock();

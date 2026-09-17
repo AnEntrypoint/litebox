@@ -289,70 +289,92 @@ With the stack overflow gone, boots progressed further and hit the SAME root cau
 time -- each isolated with a minimal `-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir -p
 ...'` repro under `LITEBOX_PROCESS_FORK=1` (much cheaper than a full webtop boot per iteration),
 fixed with the SAME `GlobalStateHandle`-shadow-field pattern as `litebox`/`proc_self_info`/
-`pts_registry`, rebuilt, re-verified live after each:
+`pts_registry`, rebuilt, re-verified live after each. Full panic signatures and mechanism per fix:
+archive. Summary:
 
-- **`elf_patch_cache`** (`BTreeMap<(pid,fd), ElfPatchState>`): real panic,
-  `alloc::collections::btree::node.rs:1232:35`, inside `.entry(...).or_insert(...)`. Keyed by
-  `(pid, fd)` already -- no call site reads another process's entry, and `ElfPatchState` holds
-  absolute per-process addresses anyway, so per-process storage is CORRECT, not just safe.
-- **`exec_ranges_cache`** (`BTreeMap<(dev,ino), Arc<Vec<Range<u64>>>>`): same panic signature,
-  next field down, once the above was fixed. Values are a pure function of a file's own ELF
-  section headers -- per-process storage just re-derives them; only cross-process cache reuse is
-  lost.
+- **`elf_patch_cache`** (`BTreeMap<(pid,fd), ElfPatchState>`): real panic in `.entry().or_insert()`.
+  Keyed by `(pid, fd)` already, holds absolute per-process addresses -- per-process storage is
+  CORRECT, not just safe.
+- **`exec_ranges_cache`** (`BTreeMap<(dev,ino), Arc<Vec<Range<u64>>>>`): same panic signature, next
+  field down. Values are a pure function of a file's own ELF headers -- only cache reuse is lost.
 - **`segment_scan_cache`** (`BTreeMap<SegmentScanKey, Arc<SegmentScanTemplate>>`): with the above
-  two fixed, the repro stopped panicking but HUNG instead (host CPU climbing, zero new log
-  output) -- a corrupted `BTreeMap` can walk into a long/cyclic chain instead of an
-  out-of-bounds `unwrap`. Same fix; re-verified past this cache.
-- **Trampoline placement** (not a `GlobalState` registry -- a genuinely different subsystem, found
-  immediately after the three caches above stopped blocking ELF loading): `maybe_patch_exec_segment`'s
-  fallback, when `MAP_FIXED_NOREPLACE` at the ELF-computed preferred trampoline address fails
-  (common in a cross-process-fork child, whose adopted VMA layout starts far denser than a fresh
-  process's), called `do_mmap_anonymous(None, ...)` -- discarding the proximity hint entirely.
-  `Vmem::get_unmmaped_area` has no "nearby" concept for an occupied non-fixed hint (silently
-  ignored, falls through to a fully generic top-down/gap search -- see its own "1.5 HELD BACK"
-  comment, a related but different, deliberately-still-disabled fix), so the chosen address could
-  land anywhere in the guest's whole address space -- live-caught landing ~127 TiB from the code
-  segment, `distance > 0x7FFF_0000` (JMP rel32 range), triggering `apply_trap_fallback` (poisons
-  every `syscall` in that segment to a crash trap) and killing the guest the moment it executed
-  one. Fixed by `Task::probe_nearby_trampoline_slot` (`litebox_shim_linux/src/syscalls/mm.rs`): a
-  LOCAL, bounded probe (real `MAP_FIXED_NOREPLACE` attempts at exponentially-increasing offsets on
-  alternating sides of the preferred address, capped at 24 rounds) scoped to just this one call
-  site, not a change to the shared `get_unmmaped_area` every `mmap()` goes through. Live-verified:
-  zero `trampoline too far` occurrences over a 5-iteration mkdir loop that previously hit it on
-  literally every single `execve` (100% occurrence rate before the fix).
+  two fixed, stopped panicking but HUNG instead (corrupted `BTreeMap` walking a cyclic chain). Same
+  fix.
+- **Trampoline placement** (not a registry -- found right after the three caches above stopped
+  blocking ELF loading): `maybe_patch_exec_segment`'s `MAP_FIXED_NOREPLACE` fallback discarded its
+  proximity hint entirely on failure, landing a trampoline up to ~127 TiB away (`distance >
+  0x7FFF_0000`, past JMP rel32 range) and poisoning the segment's syscalls. Fixed by
+  `Task::probe_nearby_trampoline_slot` (`litebox_shim_linux/src/syscalls/mm.rs`): a local, bounded
+  probe at exponentially-increasing offsets, capped at 24 rounds. Zero recurrence over 5 iterations
+  (was 100%).
 
-**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`. Real next blocker, NOT YET root-caused (unlike the
-four fixes above, which all have an exact panic backtrace or a 100%-vs-0% before/after measurement)**:
-with all four landed, both the minimal mkdir repro AND a full `.wfgy/webtop_stack.sh` boot show a
-NEW failure shape -- intermittent, no panic, no host AV diagnostic:
-- Some forked children complete cleanly (`run_thread returned (guest thread terminated)`, clean
-  exit).
-- Some are silently killed mid-syscall with zero diagnostic output of any kind (live-caught:
-  `mkdir`'s own guest tid, mid a `sys_read` loop over an mmap'd library file at climbing 4096-byte
-  offsets -- reads simply stop, no error, no panic, shell reports `Killed`).
-- Some hang instead: `entering real guest execution` logged, then zero further output while host
-  CPU climbs continuously (same signature as the `segment_scan_cache` hang above, before it was
-  fixed) -- reproduced both on the minimal mkdir repro's later fork iterations AND on the full
-  webtop boot's very FIRST `/webtop_stack.sh` guest thread (before any `[s]` marker), each killed
-  manually after CPU kept climbing with no new log line.
+**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`.** The intermittent silent-kill/hang shape above is now
+diagnosed with real evidence (WER events, `llvm-symbolizer`, live `cdb -p` attach). The "six
+remaining registries" hypothesis this file previously carried was WRONG for the silent-kill case and
+UNCONFIRMED for the hang -- real root causes below. `pty_registry`/`flock_registry`/etc. remain
+real, still-open follow-on work but were NOT what plain `mkdir` was hitting.
 
-**Leading hypothesis, not yet confirmed**: one of the six registries still genuinely shared and
-still real per-process-heap `BTreeMap`s -- `pty_registry`, `daemon_pty_masters`, `flock_registry`,
-`fifo_registry`, `sysv_shm`, `memfds`, `shared_files` (full type list: this file's "Shared kernel
-heap" section below) -- now being reached for the first time now that ELF loading no longer blocks
-earlier. **Unlike the four fixes above, these genuinely NEED real cross-process sharing for correct
-Linux semantics** (a pty id, a file lock, a FIFO, a SysV shm segment, a `MAP_SHARED` file mapping
-must be visible to the rest of the fork family) -- the `GlobalStateHandle`-shadow-field pattern used
-above is WRONG for them; each needs the SAME flat, pointer-free redesign
-`SharedUnixAddrPresenceTable` already proves out (below), separate engineering work per registry.
-Plain `mkdir` does not obviously touch any of these, so this hypothesis is NOT confirmed -- the
-intermittent, no-diagnostic nature (vs. the four fixes above's deterministic, exact panics) suggests
-a corrupted `BTreeMap` reached only via a racy/address-layout-dependent path, OR a different
-mechanism entirely. **Next session: get an exact backtrace or crash signature for THIS failure
-before fixing anything** -- same discipline that made the four fixes above fast and certain, don't
-guess which registry this time. `RUST_BACKTRACE=1` did not catch it (no panic fires); a live
-debugger attach or a narrower bisection (bisect by disabling one registry's real use at a time,
-same technique used to find `litebox` originally) is the likely next tool needed.
+## Silent-kill mechanism -- ROOT-CAUSED AND FIXED 2026-09-17 (seventh and eighth instances of the SAME defect class)
+
+`Get-WinEvent -LogName Application -Id 1000` showed real `0xc0000005` host faults at the exact
+moments a guest `mkdir` fork was reported `Killed` with zero litebox diagnostic (no `diag-unrecov-av`
+lines anywhere -- VEH did not intervene; not investigated further). `llvm-symbolizer
+--relative-address` against the WER `Fault offset` (matching on-disk binary+pdb) resolved two real
+symbols: `Descriptors::iter_mut::<Network<WindowsUserland>>`'s closure (via
+`Network::close_pending_sockets`) and `litebox_platform_windows_userland::net::receive_ip_packet`
+(via `phy::Device::receive`). Root cause: **seventh and eighth instances of the identical
+cross-process-stale-pointer defect** fixed six times already (`litebox`/`proc_self_info`/
+`pts_registry`/`elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`), found one level deeper --
+inside `litebox::net::Network`, which IS itself genuinely, correctly shared (one virtual NIC for the
+whole guest) via `GlobalState.net: Mutex<Network<Platform>>`, but whose OWN `litebox: LiteBox<Platform>`
+(captured once at `Network::new`, used to reach the PER-PROCESS `descriptor_table()`) and `device:
+phy::Device<Platform>` (holds `platform: &'static Platform`) fields are raw pointers an attaching
+cross-process-fork child inherits verbatim from the first creator.
+
+Fix: `Network::rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>)`
+(`litebox/src/net/mod.rs`) resets both to the calling process's own valid state (`device` rebuilt
+wholesale via `phy::Device::new` -- cheap, no state worth preserving across a rebind).
+`GlobalStateHandle::net_lock(&self)` (`litebox_shim_linux/src/lib.rs`) locks `GlobalState.net` and
+calls this before returning the guard; all ~34 call sites that used `GlobalState.net.lock()`
+directly now go through `net_lock()` (one test-only site in `syscalls/tests.rs` deliberately left
+alone). `Network`'s OTHER fields (`socket_set`, `interface`) remain genuinely shared -- do NOT reset
+them, they hold the guest's actual live connections. Live-verified: the same repro that hit both
+crash sites no longer hits either after the fix -- the failure surface moved two layers deeper, to
+the two mechanisms below. Full investigation trail, including a `cargo build`/`tail`-pipe exit-code
+pitfall hit while verifying: archive.
+
+## Two deeper, CONFIRMED, NOT-YET-FIXED mechanisms found immediately behind the fix above (2026-09-17)
+
+Both found via the SAME 10-sequential-`mkdir` repro against the fixed binary; both are separate from
+each other and from every fix above. Neither was fixed this session -- both need real design work,
+not a quick shadow-field patch, and guessing wrong here risks a silent correctness bug rather than a
+crash (this file's own standing caution). Get an exact mechanism before touching either.
+
+**A. `RawMutex::resolve_waiter_event` cross-process branch is broken -- causes a genuine lost-wakeup
+hang (LOW/FLAT host CPU).** Real panic, `litebox_platform_windows_userland/src/lib.rs:6209`:
+`OpenProcess(PROCESS_DUP_HANDLE) on waiter process 8 failed: 87` -- PID 8 is not a real litebox
+process. This is the "Cross-process-capable `RawMutex`" work's own cross-process branch, documented
+as untaken until real multi-process contention exists -- it now does, and this is its first live
+exercise. Plausibly a ninth instance of the nested-collection stale-pointer class
+(`RawMutex.waiters: Mutex<Vec<WaiterRecord>>` is private-heap-backed like the others), but NOT
+confirmed to that precision (the read didn't crash, which a wild pointer normally would). Confirmed
+IMPACT via live `cdb -p`: a separate thread genuinely blocked in `RawMutex::block` via
+`ThreadProvider::with_fork_duplicate_claim_owner` -> `do_clones` (real fork sync code), never woken
+-- the panicking thread was almost certainly the one that would have delivered that wakeup.
+
+**B. A separate host allocator livelock (CLIMBING CPU), confirmed via live `cdb -p` on a different
+hung fork child.** Two threads stuck inside `SafeZoneAllocator::alloc` (`#[global_allocator]`,
+`SpinMutex<ZoneAllocator>`-backed, private per-process heap). One reached it from INSIDE
+`slabmalloc::ZoneAllocator::deallocate`'s own panic-formatting path (a real `panic!()` fired during
+`deallocate`, and formatting that message re-enters the same allocator). Leading, UNCONFIRMED
+hypothesis: the fork snapshot (`PageManager::duplicate`/`copy_one_group`) can capture the parent's
+heap while its allocator `SpinMutex` is HELD by a thread whose call stack isn't part of what the
+child resumes -- the child inherits a permanently-locked spinlock nothing will ever unlock.
+
+Neither fixed this session -- both need real design work (fork-time allocator quiescence or a
+different snapshot strategy for B; the same flat, pointer-free redesign as
+`SharedUnixAddrPresenceTable` for A), not a shadow-field patch. Full stacks, reasoning and a
+concrete next-session repro/verification plan: archive.
 
 ## Closed — do not re-attempt without a genuinely new approach
 

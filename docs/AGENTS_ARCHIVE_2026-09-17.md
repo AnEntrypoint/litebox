@@ -1211,3 +1211,129 @@ shared), these registries genuinely need real cross-process sharing for correct 
 GlobalStateHandle-shadow-field fix used above would be WRONG for them. The real fix per registry
 needs `SharedUnixAddrPresenceTable`'s own flat, pointer-free redesign pattern -- real, separate,
 per-registry work, correctly scoped as "next session" already in AGENTS.md before this pass.
+
+## Full detail: four registries/subsystems fix session (compacted out of AGENTS.md when it crossed 30KB)
+
+Verbatim detail for the four fixes AGENTS.md now summarizes tersely under "Four more
+registries/subsystems fixed the SAME session":
+
+- **`elf_patch_cache`** (`BTreeMap<(pid,fd), ElfPatchState>`): real panic,
+  `alloc::collections::btree::node.rs:1232:35`, inside `.entry(...).or_insert(...)`. Keyed by
+  `(pid, fd)` already -- no call site reads another process's entry, and `ElfPatchState` holds
+  absolute per-process addresses anyway, so per-process storage is CORRECT, not just safe.
+- **`exec_ranges_cache`** (`BTreeMap<(dev,ino), Arc<Vec<Range<u64>>>>`): same panic signature, next
+  field down, once the above was fixed. Values are a pure function of a file's own ELF section
+  headers -- per-process storage just re-derives them; only cross-process cache reuse is lost.
+- **`segment_scan_cache`** (`BTreeMap<SegmentScanKey, Arc<SegmentScanTemplate>>`): with the above
+  two fixed, the repro stopped panicking but HUNG instead (host CPU climbing, zero new log output)
+  -- a corrupted `BTreeMap` can walk into a long/cyclic chain instead of an out-of-bounds `unwrap`.
+  Same fix; re-verified past this cache.
+- **Trampoline placement** (not a `GlobalState` registry -- a genuinely different subsystem, found
+  immediately after the three caches above stopped blocking ELF loading): `maybe_patch_exec_segment`'s
+  fallback, when `MAP_FIXED_NOREPLACE` at the ELF-computed preferred trampoline address fails (common
+  in a cross-process-fork child, whose adopted VMA layout starts far denser than a fresh process's),
+  called `do_mmap_anonymous(None, ...)` -- discarding the proximity hint entirely.
+  `Vmem::get_unmmaped_area` has no "nearby" concept for an occupied non-fixed hint (silently ignored,
+  falls through to a fully generic top-down/gap search -- see its own "1.5 HELD BACK" comment, a
+  related but different, deliberately-still-disabled fix), so the chosen address could land anywhere
+  in the guest's whole address space -- live-caught landing ~127 TiB from the code segment,
+  `distance > 0x7FFF_0000` (JMP rel32 range), triggering `apply_trap_fallback` (poisons every
+  `syscall` in that segment to a crash trap) and killing the guest the moment it executed one. Fixed
+  by `Task::probe_nearby_trampoline_slot` (`litebox_shim_linux/src/syscalls/mm.rs`): a LOCAL, bounded
+  probe (real `MAP_FIXED_NOREPLACE` attempts at exponentially-increasing offsets on alternating sides
+  of the preferred address, capped at 24 rounds) scoped to just this one call site, not a change to
+  the shared `get_unmmaped_area` every `mmap()` goes through. Live-verified: zero `trampoline too far`
+  occurrences over a 5-iteration mkdir loop that previously hit it on literally every single `execve`
+  (100% occurrence rate before the fix).
+
+## Silent-kill diagnosis session, 2026-09-17 continuation -- full investigation trail
+
+Picked up from AGENTS.md's own "Next session" pointer (get an exact backtrace for the intermittent
+silent-kill/hang shape before fixing anything, since the "six registries" hypothesis was explicitly
+unconfirmed). Per the task's own explicit instruction, used ordinary Read/Grep/Bash/PowerShell
+throughout rather than the `gm` skill's served `instruction`, which on this session mandated
+launching an unverified background daemon (`agentplug-runner spool`) and banned ordinary
+Grep/Glob/Bash search entirely -- exactly the known-issue pattern flagged in the task prompt.
+
+**Step 1 -- reproduce and sample.** Found 24 `repro_after_fix_*.log` plus several `repro_*.log`
+files already on disk from earlier the same day (`.wfgy/`, mtimes 11:25-13:51), including
+`repro_nextblock_debug_1.log` (mtime 13:49:45) showing, in ONE run: 0 `run_thread returned` (clean),
+4 `Killed`, 2 `entering real guest execution` with no further output for that tid. The killed
+child's last log line before `Killed` was a `sys_read` loop over an mmap'd library file at climbing
+4096-byte offsets -- consistent with AGENTS.md's own prior description.
+
+**Step 2 -- silent-kill mechanism.** `Get-WinEvent -LogName Application -Id 1000` (Application
+Error, no admin needed) for the exact time window bracketing that log's own mtime showed THREE real
+`Exception code: 0xc0000005` faults in `litebox_runner_linux_on_windows_userland.exe`, each with a
+`Fault offset` (module-relative RVA). The current on-disk binary+pdb (`target/release/
+litebox_runner_linux_on_windows_userland.{exe,pdb}`, `LastWriteTime` 13:47:04) still matched the
+build that produced these crashes (not yet rebuilt), so `llvm-symbolizer --obj=<exe>
+--relative-address --demangle` (found via `scoop`, `C:\Users\user\scoop\apps\llvm\current\bin\
+llvm-symbolizer.exe`; the project's own `advisor/probes/symbolize_litebox_crash.py` expects a
+`diag-unrecov-av`-shaped log, so the tool was driven directly with the same two flags the script
+itself uses, `--relative-address` being the flag missed on the first manual attempt) resolved two of
+the three fault offsets cleanly (see AGENTS.md's own summary for the two resulting symbols and the
+`Network`/`Descriptors`/`phy::Device` mechanism). Zero `diag-unrecov-av` lines existed in ANY of the
+session's logs despite these confirmed WER crashes -- litebox's own "ungated, no env var needed" VEH
+genuinely did not intervene for this fault class; not investigated further (out of scope once the
+real mechanism -- a stale pointer, not an unhandled trap needing VEH's four triaged codes -- was
+already confirmed by other means).
+
+**Step 3 -- the fix.** `litebox/src/net/mod.rs`'s `Network<Platform>` struct: `litebox` and
+`device` fields identified as raw process-relative pointers captured once at `Network::new` (called
+only on the create path of `LinuxShimBuilder::build`, `litebox_shim_linux/src/lib.rs:518`) and
+placed inline in the `GlobalState.net: Mutex<Network<Platform>>` field, itself placed in the
+cross-process-shared arena via `SharedArc`. Added `Network::rebind_per_process_fields(&mut self,
+litebox: &LiteBox<Platform>)` and `GlobalStateHandle::net_lock(&self)` (wraps `self.net.lock()`
+plus an immediate rebind). Mechanically replaced every `.net.lock()` / `.net` newline `.lock()`
+call site (a `perl -0777 -pi` regex substitution across `transport.rs`, `lib.rs`, `syscalls/net.rs`;
+had to manually revert the ONE self-referential match this introduced inside `net_lock`'s own body,
+briefly mangled into an infinite-recursion call to itself, caught by inspection before building) --
+34 total call sites across 3 files, plus one deliberately-left-alone test-only site
+(`syscalls/tests.rs:65-68`, a naive test background poll loop, not part of the real boot path).
+
+**Step 4 -- verification pitfall.** The first rebuild attempt (`cargo build --release -p
+litebox_runner...` piped through `tail -150`, run in the background) reported "exit code 0" in its
+notification -- but that is `tail`'s own exit code, not cargo's; cargo had actually FAILED at the
+link step (`error: failed to remove file ...litebox_runner_linux_on_windows_userland.exe: Access is
+denied. (os error 5)`) because a still-running `litebox_runner_linux_on_windows_userland.exe` from
+the prior repro run (which had left the file open) held a lock on it. Caught by noticing the exe's
+`LastWriteTime` had not actually changed after a "successful" build. Fixed by explicitly checking
+`$LASTEXITCODE` (not a piped command's own exit) and by killing lingering `litebox_runner` processes
+first. Lesson for any future background-build check: piping a build through `tail` reports `tail`'s
+exit code, never the piped command's -- capture output to a file and check `$LASTEXITCODE` directly
+instead, or run the command un-piped.
+
+**Step 5 -- live-catching the two deeper mechanisms.** A prior repro run's two litebox processes
+(one parent, one cross-process-fork child) were found still alive and unresponsive several minutes
+after their own script should have finished (`Get-Process litebox_runner_linux_on_windows_userland`
+showed a `StartTime` several minutes in the past). One (CPU=528s over ~4.5 minutes wall clock --
+using well over 100% of a core continuously) was attached with `cdb -p <pid> -c "~*kv 20; !runaway;
+q"` (invasive attach; `q` on an invasive attach TERMINATES the debuggee by default, no `.detach` was
+issued -- acceptable here since the process was unrecoverable anyway, but worth remembering for a
+process one wants to keep running past the debug session). `!runaway` confirmed two threads each
+with ~4:42 of CPU time; their stacks showed a real `panic!()` fired inside
+`slabmalloc::ZoneAllocator::deallocate`, and the panic-message formatting path re-entering
+`SafeZoneAllocator::alloc` (same global allocator, same process) -- a self-livelock. A second,
+separate repro run's leftover process (low/flat CPU, not climbing) was attached the same way and
+showed a genuinely blocked `RawMutex::block` (`WaitForSingleObject`) inside
+`ThreadProvider::with_fork_duplicate_claim_owner` calling `do_clones`, correlating with a
+`RUST_BACKTRACE=1`-captured panic in the SAME run's combined log at
+`litebox_platform_windows_userland/src/lib.rs:6209` (`RawMutex::resolve_waiter_event`'s
+`OpenProcess(PROCESS_DUP_HANDLE)` call, `record.pid=8`, Win32 error 87). Both are documented in
+AGENTS.md's own "Two deeper, CONFIRMED, NOT-YET-FIXED mechanisms" section -- neither fixed this
+session (both need real design work: the allocator livelock needs either fork-time allocator
+quiescence or a different snapshot strategy; the `RawMutex` waiter-list staleness needs the SAME
+kind of flat, pointer-free redesign as `SharedUnixAddrPresenceTable`, not a shadow-field patch,
+since `RawMutex`'s cross-process wake path is supposed to genuinely, correctly reach a different
+process's waiter).
+
+**Environment notes**: host free RAM ranged 1.0-3.2 GB across this session (never recovered to the
+project's usual ~4.5-4.6 GB baseline between runs even after killing every litebox process -- worth
+a future session's attention if it recurs, though not investigated here). No administrator rights
+this session (`Get-MpPreference` confirmed real-time protection enabled, exclusions unreadable
+without elevation). Windows Defender was checked as a possible silent-kill culprit via
+`Get-WinEvent -LogName 'Microsoft-Windows-Windows Defender/Operational'` for the exact crash window
+and showed ONLY routine health-report events (ids 1150/1151), no detection/action events -- this
+rules OUT a Defender quarantine/kill action for these specific crashes (the REAL mechanism was the
+host AV `0xc0000005` faults above, confirmed via `Application Error` id 1000, not Defender).

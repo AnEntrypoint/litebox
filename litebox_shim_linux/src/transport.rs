@@ -32,8 +32,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<Platform,
     fn close(&mut self) {
         let _ = self
             .global
-            .net
-            .lock()
+            .net_lock()
             .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
     }
 }
@@ -68,8 +67,7 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
         let sockfd = global
-            .net
-            .lock()
+            .net_lock()
             .socket(litebox::net::Protocol::Tcp)
             .map_err(Errno::from)?;
 
@@ -79,7 +77,7 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
         // 3. Initiate the TCP connection.
         let mut check_progress = false;
         loop {
-            match global.net.lock().connect(&sockfd, &addr, check_progress) {
+            match global.net_lock().connect(&sockfd, &addr, check_progress) {
                 Ok(()) => break,
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     core::hint::spin_loop();

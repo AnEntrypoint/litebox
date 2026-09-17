@@ -321,7 +321,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         assert!(old.is_none());
         drop(dt);
 
-        if !self.net.lock().set_socket_proxy(fd, proxy.clone()) {
+        if !self.net_lock().set_socket_proxy(fd, proxy.clone()) {
             unreachable!("failed to set socket proxy for a newly-created socket");
         }
         proxy
@@ -462,7 +462,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             })?;
             // Apply deferred TCP option after releasing the descriptor table write lock.
             if let Some(tcp_data) = deferred_tcp_option
-                && let Err(err) = self.net.lock().set_tcp_option(fd, tcp_data)
+                && let Err(err) = self.net_lock().set_tcp_option(fd, tcp_data)
             {
                 match err {
                     litebox::net::errors::SetTcpOptionError::InvalidFd => {
@@ -530,7 +530,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         .to_owned_slice::<Platform>(TCP_CONGESTION_NAME_MAX.min(optlen))
                         .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
-                    self.net.lock().set_tcp_option(
+                    self.net_lock().set_tcp_option(
                         fd,
                         match name {
                             "reno" | "cubic" => {
@@ -559,8 +559,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         // CORK is the opposite of NODELAY
                         val == 0
                     };
-                    self.net
-                        .lock()
+                    self.net_lock()
                         .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
                 }
                 TcpOption::KEEPINTVL => {
@@ -569,8 +568,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                         return Err(Errno::EINVAL);
                     }
-                    self.net
-                        .lock()
+                    self.net_lock()
                         .set_tcp_option(
                             fd,
                             litebox::net::TcpOptionData::KEEPALIVE(Some(
@@ -692,8 +690,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 match tcpopt {
                     TcpOption::CONGESTION => {
                         let TcpOptionData::CONGESTION(congestion) = self
-                            .net
-                            .lock()
+                            .net_lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::CONGESTION)?
                         else {
                             unreachable!()
@@ -715,8 +712,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     }
                     TcpOption::KEEPINTVL => {
                         let TcpOptionData::KEEPALIVE(interval) = self
-                            .net
-                            .lock()
+                            .net_lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
                         else {
                             unreachable!()
@@ -725,8 +721,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
                         let TcpOptionData::NODELAY(nodelay) = self
-                            .net
-                            .lock()
+                            .net_lock()
                             .get_tcp_option(fd, litebox::net::TcpOptionName::NODELAY)?
                         else {
                             unreachable!()
@@ -749,7 +744,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         fd: &SocketFd<Platform>,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd<Platform>, TryOpError<Errno>> {
-        self.net.lock().accept(fd, peer).map_err(|e| match e {
+        self.net_lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
@@ -776,7 +771,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     }
 
     fn bind(&self, fd: &SocketFd<Platform>, sockaddr: SocketAddr) -> Result<(), Errno> {
-        self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
+        self.net_lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
 
     fn connect(
@@ -797,7 +792,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || match self.net.lock().connect(fd, &sockaddr, check_progress) {
+            || match self.net_lock().connect(fd, &sockaddr, check_progress) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     check_progress = true;
@@ -813,12 +808,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     }
 
     fn listen(&self, fd: &SocketFd<Platform>, backlog: u16) -> Result<(), Errno> {
-        self.net.lock().listen(fd, backlog).map_err(Errno::from)
+        self.net_lock().listen(fd, backlog).map_err(Errno::from)
     }
 
     fn shutdown(&self, fd: &SocketFd<Platform>, how: ShutdownHow) -> Result<(), Errno> {
-        self.net
-            .lock()
+        self.net_lock()
             .shutdown(fd, how.is_shutdown_write())
             .map_err(Errno::from)
     }
@@ -844,7 +838,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             && proxy.local_port() == 0
         {
             // UDP socket is unbound - bind to an ephemeral port
-            let mut net = self.net.lock();
+            let mut net = self.net_lock();
             // Bind with port 0 to get an ephemeral port
             if let Err(err) = net.bind(
                 fd,
@@ -1019,7 +1013,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || match self.net.lock().close(&fd, behavior) {
+            || match self.net_lock().close(&fd, behavior) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::CloseError::DataPending) => Err(TryOpError::TryAgain),
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
@@ -1030,8 +1024,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         ) {
             Ok(()) => Ok(()),
             Err(TryOpError::WaitError(WaitError::TimedOut)) => self
-                .net
-                .lock()
+                .net_lock()
                 .close(&fd, CloseBehavior::Immediate)
                 .map_err(Errno::from),
             Err(e) => Err(e.into()),
@@ -1137,7 +1130,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     _ => unimplemented!(),
                 };
-                let socket = self.global.net.lock().socket(protocol)?;
+                let socket = self.global.net_lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
                 files.insert_raw_fd(socket).map_err(|socket| {
                     // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
@@ -1152,8 +1145,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // reporting `EMFILE`.
                     let _ = self
                         .global
-                        .net
-                        .lock()
+                        .net_lock()
                         .close(&socket, CloseBehavior::Immediate);
                     Errno::EMFILE
                 })?
@@ -1561,8 +1553,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // leaking it, before reporting `EMFILE`.
                         let _ = self
                             .global
-                            .net
-                            .lock()
+                            .net_lock()
                             .close(&accepted_file, CloseBehavior::Immediate);
                         Errno::EMFILE
                     })?;
@@ -2633,8 +2624,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             sockfd,
             |fd| {
                 self.global
-                    .net
-                    .lock()
+                    .net_lock()
                     .get_local_addr(fd)
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
@@ -2666,8 +2656,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             sockfd,
             |fd| {
                 self.global
-                    .net
-                    .lock()
+                    .net_lock()
                     .get_remote_addr(fd)
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
