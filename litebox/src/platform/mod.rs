@@ -337,6 +337,23 @@ pub trait RawMutex: Send + Sync + 'static {
     /// The `unlock` counterpart of [`Self::note_locked`] -- called right before this raw mutex's
     /// underlying atomic transitions back to unlocked. No-op by default.
     fn note_unlocked(&self) {}
+
+    /// Reads and clears, in one atomic step, whether a dead-holder recovery has forced this raw
+    /// mutex back open since the last call. `false` by default, including on every platform that
+    /// never performs such recovery in the first place (only `litebox_platform_windows_userland`'s
+    /// `RawMutex` does today -- see its own `poisoned` field doc comment for the full defect this
+    /// exists to surface: a dead holder's in-flight critical section can leave the data this mutex
+    /// protects mid-mutation/torn, which forcing the LOCK back open does nothing by itself to
+    /// repair).
+    ///
+    /// Deliberately NOT wired into ordinary [`crate::sync::Mutex::lock`] for every caller -- most
+    /// `Mutex<Platform, T>` instances in this codebase have no well-defined "safe default" to reset
+    /// `T` to, and unconditionally discarding their state on every dead-holder recovery would be
+    /// its own correctness regression. [`crate::sync::Mutex::lock_recovering_poison`] is the one
+    /// opt-in call site that consults this.
+    fn take_poison(&self) -> bool {
+        false
+    }
 }
 
 /// Identifies WHICH shared-kernel-singleton a [`SharedKernelStateProvider::create_shared_kernel_state`]/

@@ -637,6 +637,72 @@ where
         self.litebox = litebox.clone();
     }
 
+    /// Resets every mutable networking collection back to the same safe, empty starting point
+    /// [`Self::new`] itself establishes -- `socket_set`, `closing_in_background`,
+    /// `queued_for_closure`, and `local_port_allocator`'s refcount table -- WITHOUT reallocating
+    /// `socket_set`'s shared-kernel-arena backing storage (that arena is an append-only bump
+    /// allocator with no free list, see [`alloc_shared_socket_storage`]'s own doc comment, so
+    /// re-running [`Self::new`] on every call here would slowly exhaust the bounded 64 MiB arena
+    /// over a long-lived boot that hits this path repeatedly under a fork-heavy workload).
+    ///
+    /// # When to call this
+    ///
+    /// Exactly when a lock acquisition on the `Mutex<Platform, Network<Platform>>` wrapping this
+    /// `Network` reports it was forced open by dead-holder recovery (`litebox::sync::Mutex::
+    /// lock_recovering_poison`, itself backed by `platform::RawMutex::take_poison`) -- see
+    /// `RawMutex`'s own `poisoned` field doc comment (`litebox_platform_windows_userland`) for the
+    /// full defect class this exists to close: a lock holder that dies mid-mutation (a
+    /// cross-process-fork child killed while its `net_worker` thread held this same lock, the
+    /// concrete case that motivated this) leaves whichever of the fields above it was touching
+    /// possibly torn -- e.g. a handle already removed from `socket_set` but still recorded in
+    /// `closing_in_background`, or vice versa -- so a LATER, entirely unrelated caller can panic
+    /// deep in `smoltcp` (`"handle does not refer to a valid socket"`) on a handle some field still
+    /// names but whose backing slot something else already emptied. `SocketHandle` in this crate's
+    /// `smoltcp` dependency (0.12) is a bare slot index with no generation counter (see
+    /// `smoltcp::iface::socket_set::SocketSet`'s own source), so there is no cheaper way to tell a
+    /// stale handle apart from a live one short of wiping every field that could hold one.
+    ///
+    /// # What this does NOT fix
+    ///
+    /// `interface`'s own smoltcp-internal state (ARP/route caches) is left untouched -- it holds no
+    /// per-socket handles and is not implicated in this bug class. A [`SocketFd`]/[`LocalPort`]
+    /// token some OTHER, still-alive process minted before this reset and continues to hold becomes
+    /// stale the instant this runs (its handle/port no longer names anything real) -- using it
+    /// afterward can still panic exactly as before. This is the accepted, disclosed trade-off: a
+    /// real loss of in-flight connections for whatever was live at the moment of the crash, in
+    /// exchange for every FUTURE caller of this `Network` (the vast majority, since a `socket`/
+    /// `bind`/`connect` sequence completes in microseconds relative to `LIVENESS_CHECK_INTERVAL`)
+    /// seeing self-consistent state instead of inheriting the crash's own torn snapshot forever.
+    pub fn reset_after_poisoning(&mut self) {
+        let stale_handles: Vec<smoltcp::iface::SocketHandle> =
+            self.socket_set.iter().map(|(handle, _)| handle).collect();
+        for handle in stale_handles {
+            // `SocketSet::remove` clears the slot back to its `SocketStorage::EMPTY` starting
+            // state and hands back the `Socket` value -- `core::mem::forget`, deliberately NOT a
+            // normal drop, is the whole point here, and was itself a real, live-caught bug the
+            // first version of this function shipped with: a `tcp`/`udp`/`icmp` socket's own RX/TX
+            // ring buffers (`vec![0u8; SOCKET_BUFFER_SIZE]` at creation time, `Network::socket`)
+            // are ordinary private-per-process-heap allocations, made by WHICHEVER process
+            // originally called `socket()` for that handle -- the exact same possibly-dead process
+            // this whole reset exists to recover from. Letting the returned `Socket` drop normally
+            // runs its buffers' `Vec` destructor, which calls THIS process's global allocator
+            // (`buddy_system_allocator::LockedHeapWithRescue::dealloc`) on a pointer that names
+            // memory in a DIFFERENT process's (possibly already-exited) address space -- live
+            // `cdb`-confirmed: a thread frozen indefinitely inside exactly that `dealloc` call,
+            // reached from this function via `smoltcp::socket::Socket`'s drop glue, immediately
+            // after the first version of this fix landed. `mem::forget` intentionally abandons
+            // that (already being discarded, per this whole function's own contract) buffer memory
+            // instead of touching it -- safe and correct because it is never reachable through
+            // `Network` again after this loop, and because it was never THIS process's allocation
+            // to free in the first place: Windows itself reclaims it in bulk, for free, whenever
+            // the process that actually owns that address space exits.
+            core::mem::forget(self.socket_set.remove(handle));
+        }
+        self.closing_in_background = [None; MAX_SOCKETS];
+        self.queued_for_closure.clear();
+        self.local_port_allocator.reset_after_poisoning();
+    }
+
     /// Sets the interaction with the outside world to `platform_interaction`.
     ///
     /// If this is set to automatic, then a user of the network does not need to worry about
@@ -719,13 +785,28 @@ where
     }
 
     /// Remove dead sockets that were closing in the background
+    ///
+    /// `closing_in_background` is genuinely cross-process-shared (see its own field doc comment):
+    /// `close_handle` lets ANY process's socket land here, and this function runs as unconditional
+    /// per-tick housekeeping from EVERY process's own `internal_perform_platform_interaction`
+    /// (`GlobalStateHandle::net_lock`'s doc comment), specifically so a socket one process closed
+    /// still gets reaped once its FIN/RST sequence finishes even if that process has since exited.
+    /// That means the `Socket` this reaps was very often created (and its RX/TX ring buffers
+    /// heap-allocated, `Network::socket`'s `vec![0u8; SOCKET_BUFFER_SIZE]`) by a DIFFERENT process
+    /// than whichever one's tick happens to observe it as ready here -- `core::mem::forget`
+    /// (instead of a normal drop) is required for the exact same reason
+    /// [`Self::reset_after_poisoning`] needs it: a private-per-process-heap buffer pointer is
+    /// meaningless (or dangling, if the creating process already exited) in the reaping process's
+    /// own address space, and running its `Vec` destructor through THIS process's global allocator
+    /// hangs indefinitely inside `dealloc` -- live `cdb`-confirmed, a thread frozen inside exactly
+    /// that call, reached from here, before this fix.
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
             let Some(handle) = *slot else { continue };
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
-                self.socket_set.remove(handle);
+                core::mem::forget(self.socket_set.remove(handle));
                 *slot = None;
             }
         }

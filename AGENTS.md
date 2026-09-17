@@ -152,26 +152,57 @@ reached `NGINX_STARTED` with sane, distributed multi-process CPU (no thread ever
 over several real minutes; thread/process counts fluctuated 4-19 = real fork churn, not one stuck
 thread) — the specific livelock this pass chased is confirmed gone, live, not just by code reading.
 
-**Third issue found on re-verify, NOT yet fixed — distinct mechanism, real follow-on.** After both
-fixes, occasional panics still occur: `smoltcp::iface::socket_set.rs:103`, `"handle does not refer
-to a valid socket"` (a valid-RANGE but stale/removed handle — NOT the same garbage-pointer shape as
-above), each immediately preceded in the log by `RawMutex::poll_until_value_changes: recorded
-holder process is dead -- recovering orphaned lock`. Root cause, read live in
-`litebox_platform_windows_userland/src/lib.rs`'s `try_recover_from_dead_holder_unregistered`:
-dead-holder recovery (landed `e1d6e56`, earlier the same day) resets ONLY the lock's own
-bookkeeping (`inner` CAS + `holder_pid`) — it does nothing to repair whatever `Network`/`socket_set`
-mutation the dead holder was mid-way through, so a later reader can find a handle recorded
-somewhere (e.g. `closing_in_background`, `server_socket.socket_set_handles`) whose underlying
-`socket_set` slot was already removed, or vice versa. Plausibly only surfaces now BECAUSE `e1d6e56`
-lets execution proceed past where it used to just hang forever. Same non-fatal
-"panic kills the process, supervisor respawns" shape as the historical `tuple.unwrap()` pattern,
-not (on this evidence) a re-introduction of the livelock above. Deliberately NOT rushed into an
-unverified fix (matches this file's own established practice for `socket_set`/`interface`'s
-still-open redesign) — real fix needs either idempotent/resumable `Network` critical sections or a
-poison-on-dead-holder scheme, both larger than a one-line patch. **Next pickup**: debugger-root-
-cause which specific mutation gets interrupted; browser/terminal/apps milestone still not reached
-past this. Full transcript, cdb samples, disassembly, and both boot logs:
-`.wfgy/cpu_profile_session/` (gitignored, not committed).
+**Poison-on-dead-holder scheme for `Network` — DESIGNED, IMPLEMENTED, and LIVE-VERIFIED
+(eleventh pass, 2026-09-17).** Closes the "third issue" above. `RawMutex` gained a `poisoned:
+AtomicBool`, set (unconditional `store`) by `try_recover_from_dead_holder_unregistered` on every
+dead-holder recovery, read-and-cleared by new `take_poison()`
+(`litebox_platform_windows_userland/src/lib.rs`); `litebox::sync::Mutex` got one opt-in method,
+`lock_recovering_poison() -> (MutexGuard, bool)`, deliberately NOT wired into ordinary `lock()` (no
+general poisoning concept for every `Mutex<Platform, T>`, by design). `GlobalStateHandle::net_lock`
+is the ONE call site that opts in: on `true`, calls new `Network::reset_after_poisoning`
+(`litebox/src/net/mod.rs`) before handing out the guard — wholesale-resets `socket_set` (reusing the
+existing shared-arena storage, not a second allocation), `closing_in_background`, `queued_for_closure`,
+`local_port_allocator`. `smoltcp::iface::SocketHandle` is a bare `usize` index (no generation
+counter), so there is no cheaper way to tell stale from live short of wiping every field that could
+hold one — option (a) from the task brief, narrowly scoped to `Network`.
+
+**Two more instances of a DISTINCT, pre-existing bug found and fixed the same pass, both live
+`cdb`-caught (thread frozen bit-for-bit at the same RIP across 6 rapid re-samples, inside
+`buddy_system_allocator::LockedHeapWithRescue::dealloc`):** letting a `SocketSet::remove`d `Socket`
+drop normally runs its RX/TX ring buffers' `Vec` destructor through the CURRENT process's allocator
+on a pointer that names a DIFFERENT (often already-dead) process's private heap — `Network::socket`
+allocates those buffers on whichever process's heap called it. Hit in `reset_after_poisoning` itself
+(first version) and, independently and unrelated to any poisoning event, in `remove_dead_sockets`
+(routine per-tick housekeeping over the genuinely cross-process-shared `closing_in_background`
+array). Fix both: `core::mem::forget` the removed `Socket` instead of dropping it — correct because
+that memory was never this process's to free; Windows reclaims it wholesale when the owning process
+exits. `close_handle`'s/`listen`'s own `socket_set.remove` sites are SAFE unchanged — every handle
+they touch came from THIS process's own private, non-shared descriptor table (sockets are never
+fork-carried), so remover == allocator always there.
+
+**Live verification, five `LITEBOX_PROCESS_FORK=1` boots.** Runs 1-2 failed the WRONG way (own
+mistake: `Start-Process -RedirectStandardOutput/-RedirectStandardError`, the silent-exit artifact
+this file already warns about — corrected to `& .\runner.exe ... *> log` after). Run 3 (pre-`mem::
+forget` binary) `cdb`-confirmed the new livelock above, killed, root-caused, fixed. Runs 4 and 5
+(post-both-fixes binary): real dead-holder-recovery fired live in BOTH (`holder_pid=12996` and
+`=10908`, unrelated events), both correctly triggered `reset_after_poisoning`, ZERO panic-cascade
+either time. Run 4 reached `SELKIES_PORT_UP` + `DE_LAUNCHED` — the furthest point reached in this
+entire day's investigation — with exactly one `"handle does not refer to a valid socket"` panic
+(the accepted, disclosed residual: a DIFFERENT still-live process's already-minted `SocketFd`/
+`LocalPort` token goes stale the instant an unrelated reset runs; non-fatal,
+"panic kills the process, supervisor respawns", did not block progress). Run 5: same pattern, one
+more live recovery + one more residual panic, reached `SELKIES_SUPERVISOR: giving up after 30
+attempts` before this session ended it (timing variance vs. run 4, not a regression — steady log
+growth throughout, no livelock signature). Full per-run transcripts, `cdb` samples, symbolized
+stacks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+
+**Does NOT reach the browser/terminal/apps milestone — squarely the SEPARATE, ALREADY-DOCUMENTED
+Track B Xvfb/dbus thread-based-fork corruption class below, not this pass's bug or responsibility.**
+`SELKIES_SUPERVISOR` exhausts 30 respawn attempts (`rc=2` every time); `curl` to port 8080 got
+`Empty reply from server`, port 8081 (selkies) refused the connection outright. Boot reaches its
+stable `HOLD t=` steady state afterward rather than crash-looping. **Real next pickup for the
+browser milestone**: Track B step 3 (fixed-base shared kernel heap) making `Xvfb`/`dbus-daemon`
+themselves cross-process-fork-eligible — separate, larger, already-scoped work.
 
 **`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
 ~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
@@ -193,9 +224,15 @@ Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: 
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(1) Debugger-root-cause the dead-holder-recovery data-inconsistency panic (this file's current
-Track B entry above, "Third issue found on re-verify") — likely highest value, currently the
-actual blocker on the browser/terminal/apps milestone; (2) debugger-root-cause
+(1) ~~Debugger-root-cause the dead-holder-recovery data-inconsistency panic~~ — DONE, eleventh pass
+(poison-on-dead-holder scheme, this file's current Track B entry above); the actual remaining
+blocker on the browser/terminal/apps milestone is now squarely the separate `XVFB_FAILED`/
+`DBUS_FAILED`/selkies-thread-based-fork item below, not this one. (1b) `queued_for_closure`'s own
+still-open cross-process-Vec hazard (distinct from the two `mem::forget` fixes above — nothing yet
+converts its STORAGE to a fixed pointer-free array the way `closing_in_background`/`socket_set`
+already were) remains a live risk for a future pass: any process reading/pushing it while attached
+rather than constructing could still hit the stale-pointer class on the Vec header itself, not just
+the drop-ownership issue just fixed; (2) debugger-root-cause
 `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most
 frequent panic historically, NOT yet debugger-confirmed — do not patch blind); (3) root-cause the
 `/tmp/empty` writable-layer cross-child-visibility gap behind `DBUS_FAILED`; (4) finish the

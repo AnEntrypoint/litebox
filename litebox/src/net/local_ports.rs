@@ -131,6 +131,20 @@ impl LocalPortAllocator {
             self.deallocate(LocalPort { port });
         }
     }
+
+    /// Resets every port back to free (refcount 0), the same starting point [`Self::new`] itself
+    /// establishes, without touching `rng` (no correctness reason to re-seed it). Part of
+    /// [`crate::net::Network::reset_after_poisoning`] -- see that method's own doc comment for why
+    /// this exists: a dead lock holder can die mid-`allocate`/`deallocate`, leaving some slot's
+    /// refcount not matching the real number of live [`LocalPort`] tokens still referencing it, in
+    /// either direction. This does not by itself fix a *pre-existing* [`LocalPort`] token minted
+    /// before the crash later hitting this module's own `unreachable!()`s on a refcount that no
+    /// longer matches (that token's issuing `Network` state is itself being wholesale reset by the
+    /// same caller) -- it only guarantees every NEW allocation after this point starts from a
+    /// clean, self-consistent table.
+    pub(crate) fn reset_after_poisoning(&mut self) {
+        self.refcount = [0; Self::PORT_COUNT];
+    }
 }
 
 /// A token expressing ownership over a specific local port.

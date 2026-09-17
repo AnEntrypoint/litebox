@@ -2862,10 +2862,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// `close_pending_sockets`; second, immediately after that fix landed, inside
     /// `litebox_platform_windows_userland::net::receive_ip_packet` via `phy::Device::receive` --
     /// both on a plain `mkdir` fork child with zero sockets of its own).
+    ///
+    /// Also the sole call site that consults [`litebox::sync::Mutex::lock_recovering_poison`] for
+    /// this particular lock: if acquiring it required forcing open a lock whose recorded holder
+    /// was confirmed dead mid-hold (`platform::RawMutex::take_poison`, set by
+    /// `litebox_platform_windows_userland`'s `try_recover_from_dead_holder_unregistered`), the
+    /// `Network` this guard protects may be torn -- some handle removed from `socket_set` but
+    /// still named in `closing_in_background`, or vice versa -- so it is wholesale reset to a safe
+    /// empty state (`Network::reset_after_poisoning`, see its own doc comment for the full defect
+    /// and the accepted, disclosed loss of in-flight connections this trades for) before this
+    /// guard is ever handed to a caller. Live evidence this closes: every occurrence of
+    /// `smoltcp::iface::socket_set.rs:103`'s `"handle does not refer to a valid socket"` panic seen
+    /// so far was immediately preceded in the log by exactly this dead-holder-recovery warning.
     pub(crate) fn net_lock(
         &self,
     ) -> litebox::sync::MutexGuard<'_, Platform, litebox::net::Network<Platform>> {
-        let mut guard = self.net.lock();
+        let (mut guard, recovered_from_dead_holder) = self.net.lock_recovering_poison();
+        if recovered_from_dead_holder {
+            litebox_util_log::warn!(
+                "GlobalStateHandle::net_lock: acquired a Network lock recovered from a dead holder -- resetting Network to a safe empty state to avoid reading torn socket_set/closing_in_background/local_port_allocator state"
+            );
+            guard.reset_after_poisoning();
+        }
         guard.rebind_per_process_fields(&self.litebox);
         guard
     }

@@ -246,6 +246,25 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
         }
     }
 
+    /// Same as [`Self::lock`], but additionally reports whether the underlying raw mutex was just
+    /// forced open by dead-holder recovery (see [`crate::platform::RawMutex::take_poison`]) --
+    /// i.e. whether the data this guard protects may have been left mid-mutation by a holder that
+    /// died without releasing normally.
+    ///
+    /// Deliberately a SEPARATE method from [`Self::lock`], never changing that method's own return
+    /// type or behavior: most `Mutex<Platform, T>` call sites in this codebase have no sensible
+    /// "reset to a safe default" for their particular `T`, and this codebase's `Mutex` explicitly
+    /// carries no general poisoning concept (see this struct's own doc comment) -- only a caller
+    /// that DOES have such a reset (`litebox::net::Network`'s `GlobalStateHandle::net_lock`, see
+    /// its own doc comment) opts in by calling this instead of `lock`.
+    #[inline]
+    #[track_caller]
+    pub fn lock_recovering_poison(&self) -> (MutexGuard<'_, Platform, T>, bool) {
+        let guard = self.lock();
+        let recovered = self.raw.raw.take_poison();
+        (guard, recovered)
+    }
+
     /// Returns a mutable reference to the underlying data.
     ///
     /// This is safe because we have `&mut self`, so no other threads can access

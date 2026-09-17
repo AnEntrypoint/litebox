@@ -6338,6 +6338,17 @@ pub struct RawMutex {
     /// anywhere, so it has no waiter event to report, and none is needed -- a waiter that decides
     /// to recover only needs to know whether this pid is still alive, never to signal it directly.
     holder_pid: AtomicU32,
+    /// Set by [`Self::try_recover_from_dead_holder_unregistered`] when it forces this lock back
+    /// open because its recorded holder was confirmed dead. Forcing the `inner` word back to
+    /// unlocked is necessary so no thread waits forever, but it does nothing to repair whatever
+    /// the dead holder's own critical section was mid-way through mutating -- that data can be
+    /// left torn (partially-applied) with no general way for `RawMutex` itself (generic over
+    /// every `litebox::sync::Mutex<Platform, T>` in the codebase, with no idea what `T` is) to
+    /// repair it. This flag is the hand-off: [`Self::take_poison`] lets the specific caller that
+    /// DOES know how to reset its own `T` to a safe default (currently only `Network`'s
+    /// `GlobalStateHandle::net_lock`, see its own doc comment) find out it must do so, exactly
+    /// once per recovery event.
+    poisoned: core::sync::atomic::AtomicBool,
 }
 
 /// Process-local cache of cross-process handle duplications [`RawMutex::resolve_waiter_event`] has
@@ -6359,6 +6370,7 @@ impl RawMutex {
             inner: AtomicU32::new(0),
             waiters: WaiterQueue::new(),
             holder_pid: AtomicU32::new(0),
+            poisoned: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -6738,7 +6750,27 @@ impl RawMutex {
         let _ =
             self.holder_pid
                 .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
+        // Unconditional `store`, not a CAS: unlike `inner`/`holder_pid` above (which must not
+        // clobber a legitimate new holder/value), poisoning is monotonic within one recovery
+        // event -- once this recovery happened, the protected data really may be torn, and that
+        // fact must survive even if another thread's concurrent recovery attempt (extremely
+        // unlikely, but see the comments above) already cleared/reset `holder_pid` first. Losing a
+        // poison signal would let a caller trust torn state; a spurious extra one only costs a
+        // single unnecessary safe reset.
+        self.poisoned.store(true, Ordering::Release);
         true
+    }
+
+    /// Atomically reads and clears the poison flag [`Self::try_recover_from_dead_holder_unregistered`]
+    /// sets on a dead-holder recovery -- see [`Self::poisoned`]'s own doc comment for the defect
+    /// this exists to hand off. `swap` (not `load` then `store`) so the read-and-clear is one
+    /// atomic step: at most one caller ever observes `true` for a given poisoning event, matching
+    /// the exclusivity the mutex itself already guarantees inside an ordinary critical section --
+    /// whichever thread's `lock()` call is the first to win the CAS race after recovery is the one
+    /// that must reset the protected data, and every OTHER concurrent locker must NOT also reset
+    /// it out from under that thread's fresh, already-safe state.
+    fn take_poison(&self) -> bool {
+        self.poisoned.swap(false, Ordering::AcqRel)
     }
 
     /// Fallback for the (extremely rare, see `WaiterQueue`'s doc comment) case where
@@ -6920,6 +6952,15 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn note_unlocked(&self) {
         self.holder_pid.store(0, Ordering::Release);
+    }
+
+    fn take_poison(&self) -> bool {
+        // Method resolution prefers the inherent `take_poison` (defined alongside `poisoned` and
+        // `try_recover_from_dead_holder_unregistered`) over this trait method of the same name, so
+        // `self.take_poison()` here reaches that inherent one rather than recursing into this trait
+        // impl -- kept as a real method there rather than inlined here so it stays next to the
+        // field/recovery logic it reads.
+        self.take_poison()
     }
 }
 

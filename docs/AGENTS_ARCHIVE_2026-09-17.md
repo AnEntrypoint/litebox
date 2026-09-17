@@ -2478,3 +2478,263 @@ not spinning.
 
 (Design/mechanism detail for `MAX_SOCKETS`/`shared_kernel_arena_alloc_bytes` itself stays in
 AGENTS.md's main entry, unchanged -- only this verification-transcript paragraph moved here.)
+
+## Poison-on-dead-holder scheme for `Network` -- full design, both fixes, and five-boot transcript (eleventh pass, 2026-09-17)
+
+Full text of the pass condensed in AGENTS.md's own current entry -- read that first for the
+compact summary; this is the complete narrative.
+
+### The design
+
+`RawMutex::poisoned: AtomicBool` (`litebox_platform_windows_userland/src/lib.rs`) sits alongside
+the existing `holder_pid: AtomicU32`. `try_recover_from_dead_holder_unregistered` -- the SAME
+function `e1d6e56` added earlier the same day to force a lock back open once its recorded holder is
+confirmed dead (`OpenProcess`/`GetExitCodeProcess`) -- now also does `self.poisoned.store(true,
+Ordering::Release)` right before returning `true`. Deliberately a plain `store`, not the
+`compare_exchange` the `inner`/`holder_pid` resets next to it use: poisoning must be monotonic
+within one recovery event and survive even if a concurrent recovery from another thread already
+cleared `holder_pid` first (losing the poison signal would let a later caller trust torn state; a
+spurious extra poisoning only costs one unnecessary safe reset). A new `take_poison(&self) -> bool`
+reads-and-clears via `swap(false, Ordering::AcqRel)` -- one atomic step, so at most one subsequent
+locker ever observes `true` for a given event, matching the exclusivity the mutex itself already
+guarantees inside an ordinary critical section.
+
+`litebox::platform::RawMutex` (the trait every platform's raw mutex implements,
+`litebox/src/platform/mod.rs`) grew a matching `take_poison(&self) -> bool { false }` default --
+every OTHER platform, which never performs this recovery, pays nothing. `litebox::sync::Mutex`
+(`litebox/src/sync/mutex.rs`) grew exactly one new method, `lock_recovering_poison(&self) ->
+(MutexGuard<'_, Platform, T>, bool)`, calling `self.lock()` then `self.raw.raw.take_poison()`.
+Deliberately NOT folded into `lock()` itself: this codebase's `Mutex` explicitly carries no general
+poisoning concept (its own doc comment says so), and most of the ~15 other `Mutex<Platform, T>`
+instances in this codebase (`Pipes`, `FutexManager`, `ElfPatchCache`, `ExecRangesCache`,
+`SegmentScanCache`, ...) have no well-defined "safe default" to reset their `T` to -- unconditionally
+discarding their state on every dead-holder recovery would be its own correctness regression. Only a
+caller that DOES have such a reset opts in.
+
+`GlobalStateHandle::net_lock` (`litebox_shim_linux/src/lib.rs`) is that one caller -- already the
+established single choke point for the `Network` lock (every prior stale-per-process-pointer fix
+routed through it too, via `rebind_per_process_fields`). It now does:
+
+```rust
+let (mut guard, recovered_from_dead_holder) = self.net.lock_recovering_poison();
+if recovered_from_dead_holder {
+    litebox_util_log::warn!("...resetting Network to a safe empty state...");
+    guard.reset_after_poisoning();
+}
+guard.rebind_per_process_fields(&self.litebox);
+guard
+```
+
+`Network::reset_after_poisoning` (`litebox/src/net/mod.rs`) wholesale-resets every mutable
+collection `Network` owns back to `Self::new`'s own starting point:
+- `socket_set`: collects every currently-occupied `smoltcp::iface::SocketHandle` via `.iter()`,
+  then `SocketSet::remove`s each one -- NOT a second `alloc_shared_socket_storage` call (that would
+  slowly exhaust the bounded 64 MiB shared-kernel arena, a bump allocator with no free list, on
+  every poisoning event over a long-lived boot); reusing the existing storage and just emptying its
+  slots is free.
+- `closing_in_background`: `[None; MAX_SOCKETS]`.
+- `queued_for_closure`: `.clear()` (checked safe -- see below).
+- `local_port_allocator`: new `LocalPortAllocator::reset_after_poisoning` (`litebox/src/net/
+  local_ports.rs`), `refcount = [0; PORT_COUNT]`, `rng` untouched (no correctness reason to reseed).
+
+Why wipe everything rather than something narrower: `smoltcp::iface::socket_set::SocketHandle` in
+this codebase's pinned smoltcp version (0.12.0, checked directly in the vendored source,
+`socket_set.rs`) is a bare `struct SocketHandle(usize)` -- a flat index into the storage slice, with
+NO generation counter at all. `remove`/`get`/`get_mut` all just check whether `sockets[handle.0]` is
+`Some`/`None`; there is no way to distinguish "this index still names the socket I created" from
+"this index was reused by something else" cheaper than tracking full generation numbers ourselves
+(a bigger redesign than this pass's scope) or accepting that ANY torn handle anywhere in `Network`
+could alias a NOW-valid slot and read/mutate the wrong socket silently (worse than a panic). Given
+that, resetting the WHOLE structure on a confirmed-possible-tear is the only sound cheap option --
+matches the task's own option (a), "poison flag + reset-to-safe-default", explicitly preferred over
+inventing a general framework this specific field doesn't need.
+
+`queued_for_closure: Vec<SocketFd<Platform>>` (`litebox::net::SocketFd<Platform>` = `litebox::fd::
+TypedFd<Subsystem>`, wrapping a private `OwnedFd`) was checked before assuming `.clear()` is safe:
+`OwnedFd::drop` (`litebox/src/fd/mod.rs`) only checks/optionally panics behind the
+`panic_on_unclosed_fd_drop` Cargo feature (declared, not enabled by any Cargo.toml in this
+workspace, confirmed by grep) -- no cross-process pointer touched, no side effect on any shared
+state. Safe as shipped.
+
+### The second bug, found live, not part of the original design
+
+The FIRST version of `reset_after_poisoning` let `SocketSet::remove`'s returned `Socket` value drop
+normally at the end of the `for` loop body. Caught live via `cdb -pv -p <pid> -c "~*k;qd"` (the
+same poor-man's-sampler technique the tenth-pass CPU-livelock investigation used): boot log stopped
+growing entirely (`wc -c` static across multiple checks a few seconds apart) while `Get-Process`
+showed the parent's cumulative CPU climbing continuously (55s -> 128s -> 248s over about 3 minutes
+real time). A `!runaway` dump pinned one specific thread at nearly 2 minutes of user CPU time alone.
+Five rapid `~~[<tid>]kb 20;qd` re-samples, spaced a few seconds apart, all showed the IDENTICAL top
+frame, symbolized (after pointing `_NT_SYMBOL_PATH` at `target/release`, matching the exact
+just-built `.pdb`):
+
+```
+litebox_runner_linux_on_windows_userland!<buddy_system_allocator::LockedHeapWithRescue<22> as
+  core::alloc::GlobalAlloc>::dealloc+0xe1
+  <- <core::ptr::drop_in_place<smoltcp::socket::Socket>>+0x15d
+  <- Network<WindowsUserland>::reset_after_poisoning+0x9f
+  <- GlobalStateHandle<...>::net_lock+0x246
+```
+
+RIP bit-for-bit identical across all 5 samples, several seconds apart -- not "executing very fast
+and happening to land at the same spot" (implausible for a busy loop sampled at real, non-uniform
+intervals across separate cdb attach/detach cycles), but a genuine hang: the allocator's own
+internal lock/free-list-search logic spinning or blocked forever on a buddy-system heap structure
+that doesn't actually describe the pointer it was asked to free, because that pointer names a
+DIFFERENT process's address space entirely. Root cause: `Network::socket`
+(`litebox/src/net/mod.rs`) allocates each socket's RX/TX ring buffers via ordinary
+`vec![0u8; SOCKET_BUFFER_SIZE]`/`PacketBuffer::new(vec![...], vec![...])` -- ordinary
+`alloc::vec::Vec`, backed by THIS codebase's own private-per-process `SLAB_ALLOC`
+(`buddy_system_allocator`-based, `VirtualAlloc2`-backed, NOT the shared kernel arena --
+`litebox_platform_windows_userland/src/lib.rs`'s "Shared kernel heap" section, ADVISORY-002 §3.3,
+already documents this reversion). Only `socket_set`'s STORAGE slice itself
+(`alloc_shared_socket_storage`) and the `Network`/`GlobalState` struct shells are arena-placed; each
+individual socket's actual buffer bytes are exactly as private-per-process as any other ordinary
+heap allocation in this codebase. `reset_after_poisoning` runs precisely because a DIFFERENT process
+(the one recovering the dead holder's lock) is now the one touching these sockets -- so dropping the
+`Socket` value there runs `Vec`'s destructor through the WRONG process's allocator on a buffer
+pointer that process never allocated.
+
+Fix: `core::mem::forget(self.socket_set.remove(handle))` instead of a bare
+`self.socket_set.remove(handle);`. This is correct, not merely a workaround: that memory was never
+this process's allocation to free in the first place, and Windows reclaims the WHOLE address space
+(including that leaked allocation) in one shot, for free, whenever the process that actually owns it
+exits -- exactly the same "never reclaimed, and that's fine" argument already used for the shared
+arena's own bump-allocator design (`alloc_shared_socket_storage`'s own doc comment).
+
+### The third instance, pre-existing, unrelated to poisoning at all
+
+Killed and rebuilt with the `mem::forget` fix above, re-ran the identical boot -- hit the IDENTICAL
+symptom again (log stopped growing, one thread's CPU climbing, `cdb` showed the same `dealloc`-hang
+shape) but this time via a DIFFERENT call path, confirmed by a fresh symbolized `~~[<tid>]kb 20`
+sample:
+
+```
+...dealloc+0xe1
+  <- <core::ptr::drop_in_place<...>>  (LLVM ICF-merged symbol, misleading name, real identity is a
+       smoltcp Socket drop via a structurally-identical generated function)
+  <- Network<WindowsUserland>::internal_perform_platform_interaction+0x24e
+  <- Network<WindowsUserland>::perform_platform_interaction+0x1b
+```
+
+No `reset_after_poisoning` frame anywhere in this stack, and no "recovering orphaned lock" line
+anywhere in that run's log up to this point -- this is NOT a poisoning-path bug at all.
+`Network::remove_dead_sockets` (`litebox/src/net/mod.rs`, called unconditionally from
+`internal_perform_platform_interaction` on every tick, by every process, per `GlobalStateHandle::
+net_lock`'s own doc comment: "`close_pending_sockets`/`drain_all_socket_channel_buffers` run as
+unconditional per-tick housekeeping over the WHOLE shared `Network`, regardless of which process is
+currently holding the lock") iterates the genuinely cross-process-shared `closing_in_background`
+array and, for each entry whose TCP socket has finished its close sequence, calls
+`self.socket_set.remove(handle)` and drops the result the same unsafe way. Traced the producer side
+too: `Network::close_handle` (called from `close_pending_sockets`, itself scoped to the CURRENT
+process's own private descriptor table -- confirmed safe, see below) pushes a just-closed socket's
+handle into the SHARED `closing_in_background` array specifically so ANY process's later tick can
+finish reaping it, including after the CLOSING process itself has exited. That is: process A opens
+and closes a TCP socket (buffers on A's own heap), marks it in shared `closing_in_background`;
+process B's routine housekeeping tick later reaps it and, pre-fix, tried to free A's buffer through
+B's own allocator. This bug is entirely independent of dead-holder recovery -- it is a plain,
+deterministic hazard any time process B's ordinary tick reaps a socket process A (whether alive or
+already exited) closed. Same fix: `core::mem::forget` in `remove_dead_sockets` too.
+
+Checked every OTHER `self.socket_set.remove(...)` call site in `litebox/src/net/mod.rs`
+(`close_handle`'s three sites, `listen`'s backlog-shrink site) and confirmed they are all safe
+unchanged: each operates on a `handle`/`SocketHandle` value read out of `self.litebox.
+descriptor_table()` or passed in as a function argument sourced the same way -- and
+`self.litebox`/`Descriptors` are per-process by construction (each process constructs its own fresh,
+empty `Descriptors` table; `GlobalState` itself deliberately carries no shared `litebox` field, see
+that struct's own doc comment; sockets are never fork-carried, `AGENTS.md`'s own standing lesson).
+So any socket handle reachable through a process's OWN descriptor table was necessarily created by
+that SAME process's own `Network::socket()` call -- remover and allocator are always the same
+process at those sites, no `mem::forget` needed, no bug possible.
+
+### Five-boot live transcript
+
+All under `LITEBOX_PROCESS_FORK=1`, `target/release/litebox_runner_linux_on_windows_userland.exe
+--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar --
+/bin/bash /webtop_stack.sh`, `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error`,
+`RUST_BACKTRACE=1`.
+
+- **Runs 1-2**: launched via PowerShell `Start-Process -RedirectStandardOutput/-RedirectStandardError`
+  -- exactly the invocation AGENTS.md's own "cheap repro" section already warns makes the runner
+  exit with zero guest output and no crash dump/event-log entry. Run 1 ran for ~7 real minutes,
+  produced substantial log output (including a real, live dead-holder-recovery + successful
+  `reset_after_poisoning` -- the very first live confirmation this pass got that the mechanism
+  fires correctly) before vanishing with no trace (`Get-Process` empty, no Application-log crash
+  event, log file simply stops mid-stream); run 2 was the immediate retry using the SAME bad
+  invocation, also silently vanished. Both discarded as environmental, not evidence of any code
+  defect -- corrected to `& .\runner.exe ... *> boot_poisonfix_N.combined.log` (the mandated form)
+  for every run after.
+- **Run 3** (correct invocation, binary still had the FIRST version of `reset_after_poisoning`,
+  before the `mem::forget` fix): reached `NGINX_STARTED`, log then went completely static
+  (`wc -c` identical across repeated checks over ~90s) while `Get-Process` CPU kept climbing.
+  `cdb -pv` (poor-man's sampler, admin-gated WPR/WPA unavailable, same technique as the tenth-pass
+  livelock investigation) confirmed the second bug above. Killed
+  (`Stop-Process -Force`), fixed, rebuilt.
+- **Run 4** (post-both-fixes binary): reached `NGINX_STARTED`, then a REAL dead-holder recovery
+  fired live (`holder_pid=12996`) TWICE within the same run (~425s apart -- very likely a Windows
+  PID-reuse coincidence: a second, genuinely different process later reused the exact same OS pid
+  number, died in turn, and got independently detected as dead by the identical
+  `OpenProcess`/`GetExitCodeProcess` check, not a repeat detection of the first event). BOTH times,
+  `net_lock` correctly logged "acquired a Network lock recovered from a dead holder -- resetting
+  Network to a safe empty state" and the boot continued cleanly immediately after -- zero
+  panic-cascade, in sharp contrast to the routine crash-loop this exact log signature used to
+  produce before this pass. Progressed through `NGINX_SELFTEST_FAILED` -> `XVFB_FAILED` ->
+  `DBUS_FAILED` (all three the ALREADY-characterized, unrelated, Track-B thread-based-fork
+  corruption class -- see the dedicated section elsewhere in this file/AGENTS.md, not re-litigated
+  here) -> `SELKIES_BACKPRESSURE_PATCH_STAGE_DONE` -> `SELKIES_LAUNCHED_LAST` ->
+  `SELKIES_BIND_WATCHDOG_STARTED` -> **`SELKIES_PORT_UP`** -> **`DE_LAUNCHED`** -- matching/exceeding
+  the best point any prior pass this whole day reached. Exactly ONE `"handle does not refer to a
+  valid socket"` panic fired in this run, ~425s in, immediately after the SECOND dead-holder
+  recovery -- backtrace confirms it came from `internal_perform_platform_interaction` in an
+  UNRELATED, concurrently-running fork child (`winpid=5052`/`(20512)`), NOT from `net_lock`'s own
+  reset path -- the accepted, disclosed residual `Network::reset_after_poisoning`'s own doc comment
+  names: a `SocketFd`/`LocalPort` token some OTHER, still-alive process minted before this
+  particular reset ran becomes stale the instant it runs, and using it afterward can still panic.
+  Same non-fatal "panic kills the process, supervisor respawns" shape this file already documents
+  for every other guest-reachable panic -- did not block forward progress (the very next `[s]`
+  markers were `SELKIES_PORT_UP` and `DE_LAUNCHED`). `SELKIES_SUPERVISOR` itself separately kept
+  respawning (`rc=2` x30, "giving up after 30 attempts") and `DE_FAILED` eventually fired -- the
+  ALREADY-DOCUMENTED selkies-bind/Xvfb/dbus corruption class, unrelated to and unblocked by
+  anything this pass touched. `curl` to port 8080 got `Empty reply from server` (nginx self-test
+  still genuinely broken); port 8081 (selkies) refused the connection outright (selkies never
+  bound) -- so the actual browser/terminal/apps witness step was attempted and confirmed NOT
+  reachable this pass, for a reason entirely outside this pass's scope. Boot settled into its
+  stable `HOLD t=20s/40s/60s...` loop afterward, not a hang/crash-loop.
+- **Run 5** (repeat, same binary): reached `NGINX_STARTED`, `NGINX_SELFTEST_FAILED`, `XVFB_FAILED`,
+  `DBUS_FAILED`, `SELKIES_LAUNCHED_LAST`, `SELKIES_BIND_WATCHDOG_STARTED` -- same trajectory as run
+  4. A real dead-holder recovery fired again (`holder_pid=10908`, a different, independent event
+  from run 4's), correctly triggered `reset_after_poisoning`, and again exactly one residual
+  `"handle does not refer to a valid socket"` panic followed in an unrelated concurrent child --
+  same accepted, non-fatal shape, zero cascade. `SELKIES_SUPERVISOR` again exhausted 30 attempts.
+  This run's log kept growing steadily (`wc -c` monotonically increasing on every check, no static
+  window, no `cdb`-confirmed frozen-RIP signature) all the way to and past "giving up after 30
+  attempts" without this session observing `DE_LAUNCHED`/`HOLD` markers before ending the run for
+  time -- plausibly just slower interleaving of the script's DE-launch branch against this run's
+  particular fork-churn timing (`webtop_stack.sh` runs the selkies-supervisor loop and the
+  DE-launch sequence as separate, not strictly ordered, concurrent stages) rather than a
+  regression; no livelock evidence (steady growth, no runaway single-thread CPU signature) was
+  observed in this run at any point.
+- Every run's own combined boot log lives at `.wfgy/boot_poisonfix_{1..5}.combined.log`
+  (gitignored, not committed); `cdb` samples and symbolized dumps at
+  `.wfgy/cdb_poisonfix_sample*.log`, `.wfgy/cdb_run{2,3}_*.log`, `.wfgy/cdb_symbolized*.log`,
+  `.wfgy/cdb_rapid_samples.log` (all gitignored).
+- Host `FreePhysicalMemory` stayed in the 2.3-5.0GB range across the whole session (15.99GB total),
+  never trending down run-over-run after each `Stop-Process -Force` cleanup -- no leak evidence,
+  consistent with this file's own standing "host RAM unrelated to litebox" finding.
+
+### Verification, non-live
+
+`cargo build --release` clean across `litebox`, `litebox_platform_windows_userland`,
+`litebox_shim_linux`, `litebox_runner_linux_on_windows_userland` (the pre-existing, unrelated
+`dev_bench`/`litebox_runner_snp` `seccompiler` Windows build failure this file already lists under
+"Closed -- do not re-attempt" persists, untouched by this pass). All 25 pre-existing `litebox` net
+unit tests pass unchanged; one new test added,
+`net::tests::test_reset_after_poisoning_clears_torn_state_and_frees_ports` (`litebox/src/net/
+tests.rs`) -- creates a bound+listening TCP socket (simulating the exact torn state a dead holder
+can leave: a live socket occupying both a `socket_set` slot and a `local_port_allocator` entry),
+calls `reset_after_poisoning`, then asserts `socket_set` is fully empty, the just-used port is free
+again (a fresh `bind` to the same address succeeds -- would fail with `AlreadyInUse` if
+`local_port_allocator` weren't reset), and a full connect/accept cycle works normally afterward on
+the freshly-reset state (proves the reset doesn't just clear counters while leaving `socket_set`/
+`interface` internally inconsistent). All 26 tests pass.
