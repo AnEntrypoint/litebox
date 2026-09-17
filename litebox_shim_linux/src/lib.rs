@@ -493,6 +493,23 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // "Second instance of the SAME defect" section.
         let my_proc_self_info = self.proc_self_info.clone();
         let my_pts_registry = self.pts_registry.clone();
+        // Same reasoning as `my_litebox`/`my_proc_self_info` above -- see `GlobalStateHandle`'s
+        // doc comment's "Third instance of the SAME defect" section. Unlike those two, nothing
+        // needs to see this before `build()` runs, so it is constructed fresh right here rather
+        // than threaded through `LinuxShimBuilder`.
+        let my_elf_patch_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning as `my_elf_patch_cache` above -- see `GlobalStateHandle`'s doc comment's
+        // "Fourth instance of the SAME defect" section.
+        let my_exec_ranges_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning as `my_exec_ranges_cache` above -- see `GlobalStateHandle`'s doc
+        // comment's "Fifth instance of the SAME defect" section.
+        let my_segment_scan_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -514,15 +531,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             syscalls::unix::UnixAddrTable::new(),
                         ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
-                        elf_patch_cache: litebox::sync::Mutex::new(
-                            alloc::collections::BTreeMap::new(),
-                        ),
-                        segment_scan_cache: litebox::sync::Mutex::new(
-                            alloc::collections::BTreeMap::new(),
-                        ),
-                        exec_ranges_cache: litebox::sync::Mutex::new(
-                            alloc::collections::BTreeMap::new(),
-                        ),
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
                         flock_registry: litebox::sync::Mutex::new(
@@ -549,6 +557,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: my_litebox,
             proc_self_info: my_proc_self_info,
             pts_registry: my_pts_registry,
+            elf_patch_cache: my_elf_patch_cache,
+            exec_ranges_cache: my_exec_ranges_cache,
+            segment_scan_cache: my_segment_scan_cache,
         })
     }
 }
@@ -2738,11 +2749,43 @@ struct FifoPipe<Platform: ShimPlatform> {
 /// Fixed the same way as `litebox`: `GlobalStateHandle` keeps its own copies, populated from
 /// `LinuxShimBuilder`'s per-process fields (the SAME instances `default_fs`/`default_fs_multi_
 /// layer` already mounted), never from `GlobalState`'s shared/cross-process-stale ones.
+///
+/// # Third instance of the SAME defect: `elf_patch_cache`
+///
+/// Live-diagnosed 2026-09-17, same session as `unix_addr_table` presence sharing: with the
+/// `litebox`/`proc_self_info`/`pts_registry` fixes above landed, a cross-process-fork boot
+/// progressed to the first `execve` of a plain external command (`mkdir`, reproduced equally by
+/// any exec) and hit a real `alloc::collections::btree::node.rs` panic ("range end index ... out
+/// of range for slice of length ...") inside `BTreeMap::entry(...).or_insert(...)` on
+/// `GlobalState::elf_patch_cache` -- a corrupted-node read exactly like the `litebox` stack
+/// overflow, just one field deeper. Unlike `unix_addr_table` et al., this field does not need a
+/// `SharedUnixAddrPresenceTable`-style flat rebuild: every key is `(pid, fd)` and no call site
+/// ever looks up another process's entry (see `GlobalState`'s own removed-field note above), so
+/// it is fixed the SAME way as `litebox`/`proc_self_info`/`pts_registry`: `GlobalStateHandle`
+/// carries its own `elf_patch_cache`, freshly constructed once per process in
+/// `LinuxShimBuilder::build`, attach or create alike, shadowing `GlobalState`'s (now removed)
+/// field for every existing `self.global.elf_patch_cache` call site with no further change.
+///
+/// # Fourth instance of the SAME defect: `exec_ranges_cache`
+///
+/// Live-diagnosed 2026-09-17, immediately after the `elf_patch_cache` fix above unblocked the
+/// next `execve`: fixed the identical way, for a performance-only (not per-process-identity)
+/// reason -- see `GlobalState`'s own removed-field note for `exec_ranges_cache`.
+///
+/// # Fifth instance of the SAME defect: `segment_scan_cache`
+///
+/// Live-diagnosed 2026-09-17, immediately after the `exec_ranges_cache` fix above: the same
+/// mkdir repro stopped panicking but started HANGING instead (host CPU climbing, zero new log
+/// output) -- see `GlobalState`'s own removed-field note for `segment_scan_cache` for why a
+/// corrupted `BTreeMap` can hang instead of panicking. Fixed the identical way.
 pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     inner: Platform::Handle<GlobalState<Platform, FS>>,
     litebox: litebox::LiteBox<Platform>,
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+    elf_patch_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>>,
+    exec_ranges_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>>,
+    segment_scan_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -2752,6 +2795,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             litebox: self.litebox.clone(),
             proc_self_info: self.proc_self_info.clone(),
             pts_registry: self.pts_registry.clone(),
+            elf_patch_cache: self.elf_patch_cache.clone(),
+            exec_ranges_cache: self.exec_ranges_cache.clone(),
+            segment_scan_cache: self.segment_scan_cache.clone(),
         }
     }
 }
@@ -2798,24 +2844,59 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// for free -- no second `SharedKernelStateProvider` slot needed, unlike `unix_addr_table`
     /// itself, whose `BTreeMap` nodes remain private-heap-allocated regardless.
     unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable,
-    /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
-    /// One syscall-rewriter scan per FILE, shared by every mapping of it in every guest process.
-    ///
-    /// Keyed by content identity -- see [`syscalls::mm::SegmentScanKey`] -- never by `(pid, fd)`
-    /// like [`Self::elf_patch_cache`] beside it, because the scan is a pure function of the bytes
-    /// and nothing about it is per-process. Repeatedly `dlopen`-ing one library is ordinary,
-    /// page-cache-cheap behaviour on Linux and mesa does it constantly while probing DRI drivers;
-    /// without this, each repeat re-disassembled the whole segment. `xfwm4` mapped `libLLVM`
-    /// (130 MB) 74 times and spent 225.9 s patching, never finishing its own startup. See
-    /// `litebox_syscall_rewriter::SegmentScanTemplate`.
-    segment_scan_cache: litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>,
-    /// Which file-offset ranges of a file hold executable CODE, keyed by `(device, inode)`.
-    ///
-    /// Read from the ELF's own section headers once per file; see
-    /// `litebox_syscall_rewriter::executable_section_file_ranges` for why a `PROT_EXEC` mapping is
-    /// not itself a safe thing to rewrite.
-    exec_ranges_cache: litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>,
+    // NOTE: this struct deliberately has NO `elf_patch_cache` field -- THIRD instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment (`litebox`/`proc_self_info`/`pts_registry`), live-diagnosed 2026-09-17: an attaching
+    // cross-process-fork child's copy of this `BTreeMap<(pid, fd), ElfPatchState>`'s root pointer
+    // is the FIRST creator's, meaningless in its own address space (real panic:
+    // `alloc::collections::btree::node.rs` `insert_recursing`, "range end index ... out of range
+    // for slice of length ...", from `Task::do_mmap_file`'s `elf_patch_cache.entry(...)
+    // .or_insert(...)` on the very first `execve` any cross-process-fork child performs). Unlike
+    // `unix_addr_table` et al., this one genuinely does NOT need true cross-process visibility to
+    // begin with: every key is `(self.pid.get(), fd)` (see `Task::elf_patch_key`) and no call site
+    // ever looks up another pid's entry -- the doc comment on `syscalls::mm::ElfPatchKey` explains
+    // the `pid` component exists only to stop two DIFFERENT processes' entries from colliding on
+    // one fd number, not to let one process observe another's state. `ElfPatchState` itself also
+    // holds absolute per-process addresses (`trampoline_addr`, `file_mappings`, `patched_ranges`)
+    // that are meaningless outside the process that produced them, and re-running the patcher on
+    // already-patched code is documented as idempotent/safe (`ElfPatchState`'s own doc comment on
+    // `patched_ranges`) -- so a fork child starting with an empty local cache is safe by
+    // construction, exactly like `litebox`/`proc_self_info`/`pts_registry` above.
+    // `GlobalStateHandle` carries its own, always-freshly-constructed `elf_patch_cache` field
+    // instead (populated once per process in `LinuxShimBuilder::build`, attach or create alike) --
+    // do not re-add a field with this name here.
+    // NOTE: this struct deliberately has NO `segment_scan_cache` field either -- FIFTH instance of
+    // the SAME defect class, live-diagnosed 2026-09-17 immediately after the `exec_ranges_cache`
+    // fix above: with that fix landed, the identical minimal `mkdir` repro no longer panicked but
+    // instead HUNG (host CPU climbing with zero new log output for 90+s, no crash) -- a corrupted-
+    // BTreeMap symptom one step worse than a clean `navigate.rs`/`node.rs` panic (a garbage root
+    // pointer can just as easily walk into a long or cyclic chain as into an out-of-bounds
+    // `unwrap`/slice index), inside `do_mmap_file`'s `segment_scan_cache.get(&key)`/`.insert(...)`
+    // -- the only other shared `BTreeMap` still on this file's hot path for every fresh `execve`.
+    // Originally kept shared for a real performance reason (was: "shared by every mapping of it in
+    // every guest process... `xfwm4` mapped `libLLVM` 130 MB 74 times and spent 225.9s patching"),
+    // but that reuse is dominated by REPEATED mappings of the same big library WITHIN one process
+    // (a single process's own `dlopen` probing loop), which a per-process cache still fully
+    // captures -- only cross-PROCESS reuse of an already-scanned file is lost, a real but strictly
+    // secondary regression next to a live hang. `GlobalStateHandle` carries its own, always-
+    // freshly-constructed `segment_scan_cache` field instead, same as `elf_patch_cache`/
+    // `exec_ranges_cache` above -- do not re-add a field with this name here. Restoring genuine
+    // cross-process reuse (a flat, pointer-free `SharedUnixAddrPresenceTable`-style redesign, or a
+    // real shared-`Arc`-capable allocator) is real, separate, follow-on performance work.
+    // NOTE: this struct deliberately has NO `exec_ranges_cache` field -- FOURTH instance of the
+    // SAME defect class, live-diagnosed 2026-09-17 immediately after the `elf_patch_cache` fix
+    // above unblocked the next `execve`: real panic `alloc::collections::btree::node.rs`
+    // `insert_recursing`, "range end index ... out of range for slice of length ...", inside
+    // `BTreeMap<(u64, u64), Arc<Vec<Range<u64>>>>::insert` -- the exact type of
+    // `syscalls::mm::ExecRangesCache` -- from the ELF-load path's exec-ranges lookup/insert.
+    // Unlike `segment_scan_cache` just above (kept shared: performance-critical across processes,
+    // per its own doc comment, not yet fixed), this cache's correctness does not depend on
+    // cross-process sharing -- every value is a pure, deterministic function of the keyed file's
+    // own on-disk section headers (`litebox_syscall_rewriter::executable_section_file_ranges`), so
+    // a fork child starting with an empty local cache simply re-derives it correctly on first use,
+    // exactly as safe as `elf_patch_cache`'s fix above, just for a performance-only reason instead
+    // of a per-process-identity one. `GlobalStateHandle` carries its own, always-freshly-
+    // constructed `exec_ranges_cache` field instead -- do not re-add a field with this name here.
     /// System V shared-memory segments, keyed by `shmid`.
     ///
     /// Shim-wide because SysV shm is a global namespace by definition -- any process that knows
