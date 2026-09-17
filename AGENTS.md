@@ -107,19 +107,20 @@ the perf work exposed are all fixed; mechanisms/repros/cost history: archive.
 symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
 146-152`). Do not cite the separate curl-self-test stall as live open work: that one is fixed.
 
-**Fork-after-Xorg PERMANENT freeze — reproduced, narrowed, NOT fixed (2026-09-16).** Forking any new
-process (e.g. `xfconfd`) shortly after a real `Xorg :0 -novtswitch -sharevts` starts on litebox's
-virtual DRM device permanently hangs the guest (CPU flat ~11s, RSS ~1.35GB, never recovers — distinct
-from the older transient stall class). A full invasive `cdb -p <pid>` attach (not `-pv`) read all 11
-threads cleanly: 10 are ordinary idle waits (epoll/RawMutex/named-pipe/sleep, none pathological, and
-none touching the new cross-process `RawMutex` work from `6c09213`); one thread alone burned the
-process's entire lifetime CPU and is pinned mid-instruction in ordinary rewritten guest syscall-return
-code (not a stale/unmapped pointer, not a lock wait) — pointing at `fork_verify.rs`'s single-step
-healing state machine / `vectored_exception_handler` interaction for that one thread as the real
-mechanism, never fully proven to converge-or-not from a single post-mortem snapshot. Full repro script,
-thread-by-thread dump, disassembly and next-step plan (attach BEFORE the freeze, check EFLAGS.TF across
-repros): `docs/AGENTS_ARCHIVE_2026-09-16.md`. `cdb.exe`/`WinDbgX.exe` are already installed on this host
-(Windows Kits + the WinDbg Store app) — no ProcDump download needed for this class of investigation.
+**Fork-after-Xorg PERMANENT freeze — did NOT reproduce today (2026-09-17); live evidence says it is
+thread-based-fork-only.** The 2026-09-16 post-mortem (11-thread invasive `cdb` dump, mechanism
+narrowed to `fork_verify`'s single-step/AV-heal state machine, never proven live) could not be
+re-run: the archived repro now hits the ALREADY-DOCUMENTED "second glibc corruption class" (`double
+free or corruption (out)`, see "still open" above) on 8/8 forks across 2 attempts before Xorg
+survives long enough to reach the freeze precondition — worse than the archived "2/2 deterministic",
+likely because that session used a since-deleted prebuilt `--initial-files` tar, not `--oci-image`.
+**Decisive substitute test**: the identical script with `LITEBOX_PROCESS_FORK=1` as a real host env
+var (today's build, post `e8e1ad4`) completed cleanly 2/2 — zero freeze, zero double-free,
+`task-resume-probe` diagnostics confirm real cross-process execution. Consistent with the freeze
+being thread-path-specific (an identity/`D==0` child's `on_single_step` case (1) has
+`translate(rip) == rip`, a trivial fixed point, never a livelock). No breakpoint was ever set — the
+freeze never recurred to attach before. Full evidence, both repro logs, and a NEW disclosed ENOMEM
+finding under concurrent cross-process forks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Container images and OCI loading
 
@@ -331,10 +332,16 @@ on-demand per-allocation commit) is a larger hot-path change, deliberately not a
 (SIGPIPE) on `script` itself ~6s in (`n_orphans=1` -- a fork DID survive) -- a different bug from
 the plain-stdio fix above; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
 
-**Full webtop boot NOT attempted**: the still-unfixed "Fork-after-Xorg PERMANENT freeze" (below)
-sits directly in `.wfgy/webtop_stack.sh`'s boot path and would make this a near-certain
-irrecoverable hang unrelated to either fix, not a meaningful mixed-workload test -- fix that freeze
-first. `LITEBOX_PROCESS_FORK=1` remains NOT set in the standing boot recipe. Full repro commands,
+**Full webtop boot ATTEMPTED 2026-09-17: blocked, but NOT by the freeze.** The freeze itself no
+longer reproduces (see below) so this was attempted; it stalled at the very first heavy-fork
+stage (`NGINX_STARTED`'s supervisor retry loop) instead, hitting `[shared_kernel_heap] FATAL
+CreateFileMappingW failed after retries win32_err=0x5af` (`ERROR_COMMITMENT_LIMIT`) on essentially
+every subsequent fork once host system commit charge (`Win32_PerfFormattedData_PerfOS_Memory
+.PercentCommittedBytesInUse`) hit 96% -- each cross-process child's own 8GiB eager `SEC_COMMIT`
+shared-kernel-heap section adds up fast under real fork density, and today's own repeated test
+runs in this same session materially contributed to that 96%. `LITEBOX_PROCESS_FORK=1` remains NOT
+set in the standing boot recipe; the real fix is the already-tracked `SEC_RESERVE`+lazy-commit PRD,
+now with live full-boot evidence of its severity, not a config workaround. Full repro commands,
 debug-log evidence, live-run counts: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Presenter-process split (`docs/presenter-process-design.md`) -- done, fully verified live end-to-end, 2026-09-16

@@ -261,3 +261,158 @@ lesson` (10 tracked probe-artifact/scratch-file violations `git rm --cached`, `.
 widened, commits `a4d4759`/`a37773d`); `windows-reserve-and-commit-64kib-granularity-noaccess-
 flanks` (documented the ~60KiB reserved-but-uncommitted flank as an intentional CoW guard, no code
 change, commit `936714f`).
+
+## Fork-after-Xorg freeze: live-attach-before-freeze attempted, freeze did not recur under either fork path (2026-09-17, session xorg-freeze-live-attach-7f3a2c)
+
+Task: reproduce the 2026-09-16 "fork-after-Xorg permanent freeze" live, attach BEFORE it happens
+(breakpoints at `fork_verify::on_single_step`/`vectored_exception_handler`), and prove the real
+non-convergence mechanism instead of the prior session's post-mortem-only characterization.
+
+**Could not get past step 1 (reproduce) on today's build.** Ran the archived minimal repro
+verbatim (`dbus-daemon --nofork --print-address &`, `sleep 1`, `seatd &`, `sleep 1`,
+`XKB_CONFIG_ROOT=/usr/share/X11/xkb Xorg :0 -nolisten tcp -noreset -novtswitch -sharevts &`,
+`sleep 3`, `/usr/lib/xfce4/xfconf/xfconfd &`, `sleep 2`, `sleep 20`) via `--gui=hidden --env
+GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image
+docker.io/linuxserver/webtop:debian-xfce`, default (thread-based) fork, `LITEBOX_LOG=warn,
+litebox_platform_windows_userland::fork_verify=error` as a real host env var. Two attempts, 8/8
+individual forks (dbus-daemon, seatd, Xorg itself, xfconfd, both runs) hit `double free or
+corruption (out)` → `SIGABRT`/`SIGSEGV` within 1-3s of each fork — the already-documented,
+still-unfixed "second glibc corruption class" from the earlier 2026-09-17 session (not the freeze).
+Xorg itself never survived long enough to establish the freeze's precondition (a live Xorg plus a
+subsequent fork). This is worse than the archived "2/2 deterministic" repro; the likeliest
+explanation is that the 2026-09-16 session used a since-deleted prebuilt `--initial-files` tar
+(`.wfgy/webtop-dxfce/webtop-debian-xfce.tar`) rather than `--oci-image`'s runtime in-memory
+pull+rewrite path, and something about that path's memory layout/timing makes the already-known,
+historically-probabilistic corruption class fire on effectively every fork today rather than
+sparing Xorg's own. Not root-caused further (out of this session's scope — this is the
+already-tracked "second glibc corruption class" PRD, not a new bug).
+
+**Decisive substitute experiment: the identical script under `LITEBOX_PROCESS_FORK=1`.** Since the
+default path could not even reach the freeze precondition, and since ADVISORY-002's whole premise
+is that cross-process fork removes the THREAD-based relocating-fork mechanism (`fork_verify`'s
+single-step/AV-heal state machine) that the freeze was attributed to, this session tested the exact
+same script with `LITEBOX_PROCESS_FORK=1` set as a real host env var (today's build, i.e. AFTER the
+stdio-handle fix and the shared-kernel-heap `CreateFileMappingW` retry, `e8e1ad4`). Two clean runs:
+`XORG_START` → (two graceful fork failures, see below) → `XORG_UP` → `XFCONFD_FORKED` →
+`REPRO_DONE`, zero freeze, zero double-free, `[process_fork_diag] task-resume-probe` lines confirm
+real cross-process children ran guest code to completion and exited normally both times — this
+project's own documented bar for proving a run genuinely took the cross-process path (AGENTS.md's
+"Proving a run took the cross-process fork path" lesson), not just the shim's eligibility log.
+
+**New, disclosed, non-fatal finding: two of the four forks failed both runs, gracefully.** At
+t≈2.4-2.65s (immediately after Xorg's own fork, right before `dbus-daemon`'s and `seatd`'s):
+```
+ERROR litebox_platform_windows_userland: allocate_pages: VirtualAlloc2(RESERVE|COMMIT) failed,
+reporting OutOfMemory size=2013196288 os_error=The paging file is too small for this operation to
+complete. (os error ...)
+ERROR litebox_shim_linux::syscalls::process: failed to duplicate address space for fork() err=failed
+```
+`size=2013196288` is ~1.875 GiB — a real guest-address-space-duplication allocation, not the 8 GiB
+shared-kernel-heap section itself, but very plausibly pressured by it: each cross-process child is
+a genuinely separate Windows process that also runs `init_shared_kernel_heap()`, so with Xorg's own
+child plus two more children forking within ~250ms of each other, 3+ concurrent 8 GiB `SEC_COMMIT`
+sections (see `e8e1ad4`'s own commit message: `CreateFileMappingW` charges the FULL 8 GiB at
+section-creation time, not lazily) can plausibly exhaust real pagefile commit headroom even when
+every other memory counter looks fine — the same class of transient contention `e8e1ad4`'s bounded
+retry already fixed for `CreateFileMappingW` itself, just manifesting on a DIFFERENT allocation
+(`VirtualAlloc2` for guest address-space duplication) that has no equivalent retry. This is a
+disclosed ENOMEM-path failure, not a hang or crash: the guest's `fork()` call fails cleanly, the
+script's `&`-backgrounded launch just doesn't start that one process, and the rest of the script
+(including `XORG_UP` and the actual target `xfconfd` fork) proceeds and completes normally. Not
+fixed this session (out of scope — flagged for whoever next touches
+`shared-kernel-heap-eager-full-commit-not-lazy-reserve`, since the real `SEC_RESERVE` fix that PRD
+already calls for would remove this pressure source too).
+
+**Conclusion on the freeze mechanism**: could NOT be proven live this session (no breakpoint was
+ever set, because the freeze never recurred to attach before). But the live evidence gathered points
+strongly at the mechanism being specific to the THREAD-based fork path: an identity/`D==0` child's
+`fork_verify::on_single_step` case (1) has `relocations.translate(rip) == rip` (source and
+destination ranges are the SAME range for an identity child, per the module's own doc comments),
+so the "livelock" shape that plausibly explains the freeze (the AV-path's deeper healers in
+`vectored_exception_handler` — `translate_stale_source_memory_operand_registers`/
+`translate_stale_source_indirect_call_target`/`translate_stale_source_register_indirect_call_target`
+— have no `AV_RIP_LIVELOCK_THRESHOLD`-equivalent bound of their own once the shallow case's
+threshold is exceeded, `lib.rs` ~2529-2657) cannot arise the same way when every translation is a
+no-op fixed point. **Practical recommendation for the standing boot recipe**: since the freeze
+does not reproduce under `LITEBOX_PROCESS_FORK=1` (2/2) and the default path's OWN already-known
+corruption class now reproduces at least as reliably as the freeze did, `LITEBOX_PROCESS_FORK=1`
+is the more promising path forward for the standing `.wfgy/webtop_stack.sh` recipe, not a
+config/workaround to defer until after a thread-path fix that Track B's own prior sessions already
+concluded is architecturally the wrong direction anyway (see "still open" section above).
+
+**Cleanup**: all `litebox_runner_linux_on_windows_userland.exe`/`litebox_packager.exe` processes
+launched for the minimal repro above were force-killed or exited on their own before this entry was
+written; no `litebox-presenter.exe` was spawned by the minimal repro (`--gui=hidden` first spawns
+one on the FULL boot attempt below). Host free RAM/disk not observed to trend down across the
+minimal-repro portion of the session.
+
+## Full webtop desktop boot attempted under LITEBOX_PROCESS_FORK=1 -- blocked by shared-kernel-heap commit exhaustion, NOT the freeze (same session)
+
+Since the freeze itself would not reproduce (above), and the task's real motivating goal was
+reachable if it didn't, this session attempted step 5: boot `.wfgy/webtop_stack.sh` (the full XFCE
+desktop, unmodified) with `LITEBOX_PROCESS_FORK=1` set. The script has no shebang and depends on
+the base image's own `/defaults/*`, so it was placed into the guest via a small hand-built
+`--resume-from` seed tar (`tar -cf webtop_seed.tar webtop_stack.sh`, guest root) rather than inlined
+via `-c` (a 773-line script full of `"$VAR"`-style double-quoting would be corrupted crossing into
+the child's Win32 command line per this project's own standing quoting gotcha). Launch:
+`--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar --
+/bin/bash /webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`/`LITEBOX_LOG=warn,...fork_verify=error` as
+real host env vars. (A prebuilt `--initial-files` tar via `litebox_packager` was attempted first
+for lower per-fork cost, per the archived "~1.2s/fork" figure, but was abandoned after several
+minutes with no output progress to avoid burning the whole session on packaging; `--oci-image`
+already proven to work for cross-process children in the minimal repro above was used instead.)
+
+**Result: reached `NGINX_STARTED`, then stalled — blocked by a DIFFERENT bug than the freeze.**
+`NGINX_CONFIGURED`/`NGINX_STARTED` printed normally, but every subsequent fork (the nginx
+supervisor's retry-on-crash loop, up to 30 attempts) hit:
+```
+[shared_kernel_heap] FATAL CreateFileMappingW failed after retries win32_err=0x5af requested_size=0x200000000
+```
+(`0x5af` = `ERROR_COMMITMENT_LIMIT`, "the paging file is too small for this operation to
+complete") — repeatedly, on essentially every fork after the first two or three, unlike the
+minimal repro's two GRACEFUL `VirtualAlloc2` ENOMEM failures. `NGINX_SELFTEST_FAILED` followed;
+the boot never reached `XVFB_UP`/`DBUS_UP`, let alone `DE_UP` or a live browser connection.
+
+**Root cause, confirmed via live host counters, not guessed**: `Get-CimInstance
+Win32_PerfFormattedData_PerfOS_Memory` showed system commit charge at **96%** of the commit limit
+(`CommittedBytes=63.4GB` of `CommitLimit=65.4GB`) at the time of the failures, despite
+`Win32_PageFileUsage` showing the pagefile itself only 3% used (1.4GB of 44.5GB allocated) --
+i.e. genuinely a Windows *commit-charge* exhaustion (RAM + pagefile promise ceiling), not a
+disk-space or pagefile-sizing problem. After killing every litebox process, the commit LIMIT
+itself dropped to 32.7GB (Windows had dynamically grown the pagefile to ~44.5GB to accommodate
+the demand, then shrank it back) and committed bytes fell to 33% -- confirming litebox's OWN
+processes (this session's repeated test runs, each launching a parent PLUS every cross-process
+child, every one independently committing a full 8GiB `SEC_COMMIT` shared-kernel-heap section via
+`init_shared_kernel_heap`, `e8e1ad4`'s commit message: charged eagerly at `CreateFileMappingW`
+time, not lazily) were the proximate driver of the 96% figure, not unrelated host activity. This is
+the SAME root cause as the minimal repro's graceful `VirtualAlloc2` ENOMEM finding above and the
+already-tracked `shared-kernel-heap-eager-full-commit-not-lazy-reserve` PRD, just manifesting far
+more severely (FATAL abort on nearly every fork, not two graceful failures) under a real desktop
+boot's much higher sustained fork density (nginx's own crash-retry loop alone can fork up to 30
+times) versus the minimal repro's 4 total forks.
+
+**Conclusion**: `LITEBOX_PROCESS_FORK=1` for the FULL desktop boot is currently blocked, but not by
+the freeze this session set out to investigate -- that mechanism appears genuinely gone under
+cross-process fork (see above). It is blocked by the shared-kernel-heap's eager-full-commit design
+under real fork density, a pre-existing, already-disclosed, already-tracked gap now confirmed live
+at full-boot scale for the first time. The real fix remains the PRD's own `SEC_RESERVE` +
+on-demand-commit change (reserve the 8GiB address range, commit pages lazily on first touch,
+matching this same file's existing `copy_one_group`/`try_allocate_cow_pages` pattern) -- a bounded
+retry (already landed, `e8e1ad4`) only buys a few hundred milliseconds against a TRANSIENT
+contention blip, not sustained systemic commit pressure from dozens of concurrent 8GiB sections.
+Not attempted this session (out of scope -- a hot-path allocator change, not a quick fix). New PRD
+row: `cross-process-fork-virtualalloc2-enomem-under-concurrent-8gib-heap-sections`.
+
+**Terminal-emulator click-through test: NOT reached.** The full boot never got past
+`NGINX_SELFTEST_FAILED`/the stuck nginx retry loop, so `XVFB_UP`, `DBUS_UP`, `DE_UP`, a live
+browser connection, and the Applications-menu/Terminal-Emulator click were all unreachable this
+session. This remains the concrete next step once the shared-kernel-heap commit-exhaustion gap is
+fixed (or once a session with materially lower starting host commit-charge attempts the same boot
+-- the failure threshold (96%) suggests a host with more free commit headroom at boot time might
+get further even without the fix, worth a quick retry before assuming the fix is required).
+
+**Cleanup**: `litebox_runner_linux_on_windows_userland.exe` (stuck retrying nginx indefinitely,
+would have run for hours per the script's own 8-hour hold loop) and any `litebox-presenter.exe`
+were force-killed. Host commit charge confirmed recovered to 33% and free physical RAM to ~8.6GB
+within seconds of the kill -- no leaked processes, no lingering commit pressure.
