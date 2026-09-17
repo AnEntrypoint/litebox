@@ -2538,39 +2538,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
         }
 
-        // Xvfb and dbus-daemon are excluded here, by name, from a cross-process child no matter
-        // how eligible their fds otherwise look. Both hold a unix-domain LISTENING socket
-        // (X11's `/tmp/.X11-unix/X<n>`, the session bus) that every OTHER guest process spawned
-        // for the REST OF THE SESSION connects to -- not a one-shot artifact a filesystem
-        // snapshot can carry, but live, ongoing, multi-client connectivity. A cross-process
-        // child gets its OWN writable-layer snapshot at fork time (see
-        // `spawn_cross_process_fork_child`'s `--resume-from`/`--export-writable-layer` handoff);
-        // that is exactly right for a plain fork+exec utility (`mkdir`, `cp`, `which`, and
-        // crucially `xfce4-session`'s own GUI children `xfdesktop`/`xfce4-panel`, none of which
-        // need anything from the rest of the guest beyond files already on disk by the time they
-        // start) and exactly wrong for a server the whole session keeps dialing back into.
-        // Measured live: with `LITEBOX_PROCESS_FORK=1` unconditionally, Xvfb's own fork was
-        // accepted as eligible and the child spawned, but `xset q` never came up (`XVFB_FAILED`)
-        // -- consistent with exactly this: a live X11 listener that no longer has any client
-        // able to reach it once cross-process migrated. Everything else in this boot -- the
-        // actual source of the thread-based relocating fork's glibc tcache/fastbin safe-linking
-        // corruption crashing `mkdir`/`cp`/`which`/`xfdesktop`/`xfce4-panel` (see
-        // `advisor/ADVISORY-001-fundamentals.md` section 3N) -- has no such requirement and
-        // belongs on the cross-process path, which is real-`fork()`-correct by construction.
-        const THREAD_BASED_FORK_ONLY: &[&[u8]] = &[b"Xvfb", b"dbus-daemon"];
-        let comm = self.comm.get();
-        if THREAD_BASED_FORK_ONLY
-            .iter()
-            .any(|name| comm.starts_with(name) && comm.get(name.len()).is_none_or(|b| *b == 0))
-        {
-            litebox_util_log::debug!(
-                tid:% = self.tid.get(),
-                comm:? = alloc::string::String::from_utf8_lossy(&comm);
-                "clone: cross-process fork() excluded by name -- this process's listening socket \
-                 needs live, ongoing connectivity a fork-time filesystem snapshot cannot provide"
-            );
-            return None;
-        }
+        // Xvfb/dbus-daemon used to be excluded here by name, unconditionally, before the
+        // fd-eligibility scan even ran: both hold a unix-domain LISTENING socket (X11's
+        // `/tmp/.X11-unix/X<n>`, the session bus) that every OTHER guest process connects to for
+        // the rest of the session, and a cross-process child's fork-time filesystem/fd snapshot
+        // could not serve that live, ongoing connectivity. That reasoning was sound AT THE TIME
+        // (`4bad287`) but rested on a since-fixed precondition: back then `Network::socket_set`/
+        // `interface` were still private-per-process-heap-backed, so even a successfully
+        // cross-process-forked Xvfb would have been unreachable from sibling fork children
+        // regardless of the exclusion. `Network::socket_set`, `LocalPortAllocator::refcount`,
+        // and `closing_in_background` are now genuinely shared-arena-native (`d1ff9d2`,
+        // `6fc102c`) with live-verified cross-process TCP behaviour, so the by-name exclusion is
+        // removed here and Xvfb/dbus-daemon now fall through to the same fd-eligibility gate
+        // (below) as every other comm -- re-tested 2026-09-17, see AGENTS.md's Track B entry for
+        // the result. The `unix-socket` fd kind itself is still refused by the ordinary
+        // eligibility scan below (unchanged), so this alone does not make listening sockets
+        // fork-carriable; it only stops rejecting Xvfb/dbus-daemon before that scan runs.
 
         // None of this shim's seven fd subsystems is backed by an inheritable Windows HANDLE, so
         // a cross-process child cannot carry anything past the 0/1/2 stdio slots `CreateProcessW`

@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-17)
+# litebox — current state (2026-09-18)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -88,12 +88,12 @@ scaffolding for a missing syscall.
 thread-based default's 100% tcache-corruption rate on the same repro (ADVISORY-001 §3N is the
 **thread-based** path's defect only).
 
-**Eligibility** — refused only for `comm` == `Xvfb`/`dbus-daemon` (a live unix listening socket can't be
-served from a fork-time filesystem snapshot), an already-borrowed fd table, a beyond-stdio fd that isn't
-a pipe end/path-recorded regular file/eventfd/close-on-exec (overridable by
-`LITEBOX_PROCESS_FORK_IGNORE_FDS`), or an unsanitizable `fs_base`/context. On a real `debian-xfce` boot
-the only remaining blocking kind is `unix-socket` — 5 refused forks of 34, down from 34/34. Per-kind
-deviations: archive.
+**Eligibility** — an already-borrowed fd table, a beyond-stdio fd that isn't a pipe end/path-recorded
+regular file/eventfd/close-on-exec (overridable by `LITEBOX_PROCESS_FORK_IGNORE_FDS`), or an
+unsanitizable `fs_base`/context. The old unconditional-by-`comm`-name refusal for `Xvfb`/
+`dbus-daemon` is REMOVED as of the twelfth pass (below) — both now go through this same scan like
+everything else. On a real `debian-xfce` boot the only remaining blocking kind is `unix-socket` — 5
+refused forks of 34, down from 34/34 (pre-twelfth-pass baseline). Per-kind deviations: archive.
 
 **Per-fork cost** was ~3.5-5s, now ~1.2s; a full `webtop_stack.sh` boot reaches `NGINX_STARTED` in
 under a minute versus never in 15+. Older cost explanations were measured wrong. Use
@@ -117,106 +117,111 @@ private-heap `Vec`. A/B-confirmed (ninth pass) this genuinely fixed that panic (
 crash-loops 8x on it, new binary zero) and, in doing so, newly exposed a downstream stall the old
 binary could never reach (it crashed first). Full narrative: archive.
 
-**Post-`NGINX_STARTED` CPU livelock — ROOT-CAUSED and FIXED (tenth pass, 2026-09-17).** Real
-mechanism, found via a live CPU-sampling profiler (WPR/WPA needs admin, unavailable — used cdb's
-`-pv` poor-man's sampler instead: 15 rapid `~*k` stack samples over ~5s plus `!runaway`, in
-`.wfgy/cpu_profile_session`): **NOT** the previously-flagged, never-confirmed `SafeZoneAllocator`
-spinlock — that code never appeared in any sample. `!runaway` showed ONE thread (of 8) burning
-100% of a core continuously (0 → 732s user CPU over ~12 real minutes; every other thread stayed
-under 1s), always sampled inside `LocalPortAllocator::ephemeral_port`/`deallocate` — RIP moving
-across samples (genuinely executing, not frozen), disassembly confirming real `hashbrown` SIMD
-probe code (`pcmpeqb`/`pmovmskb`/`tzcnt`) that never terminates. Root cause: `LocalPortAllocator`
-(embedded inline in `Network`, itself embedded in the shared-arena `GlobalState`) stored its ports
-in a `HashMap` — whose backing table is a **private-per-process-heap allocation reachable only via
-a raw pointer**. A cross-process-fork child (confirmed via the log: `winpid=5060` explicitly
-tagged `(child)`) that attaches to (rather than constructs) the shared `GlobalState` inherits the
-constructing process's pointer value, meaningless in its own address space — the exact same
-"stale cross-process pointer" bug class already fixed a dozen times today for other fields, just
-not yet audited for this nested one. **Fixed**: `LocalPortAllocator::refcount` converted from
-`HashMap<NonZeroU16, NonZeroU16>` to a fixed, pointer-free `[u16; 65535]` array
-(`litebox/src/net/local_ports.rs`), same pattern as `socket_set`'s `MAX_SOCKETS` array.
-
-**Second instance of the same bug class found immediately on live re-verify, also fixed.** Past
-`NGINX_STARTED` with the fix above, a forked child panicked `index out of bounds: the len is 256
-but the index is 3414407380873671541` in smoltcp's `SocketSet::retain`, from
-`Network::remove_dead_sockets` over `closing_in_background` — identical mechanism, one of the four
-instances this file already named as still-open (`socket_set`/`interface`/`closing_in_background`/
-`queued_for_closure`, see `Network::rebind_per_process_fields`'s doc comment). **Fixed**:
-`closing_in_background` converted `Vec<SocketHandle>` → fixed `[Option<SocketHandle>; MAX_SOCKETS]`
-(self-contained, `litebox/src/net/mod.rs`). `interface` and `queued_for_closure` remain open —
-the latter additionally touches the shared `DescriptorTable::drain_entries_full_covered_by` API.
-
-**Verification**: `cargo build --release` clean; all 25 `litebox` net unit tests pass unchanged.
-Live: re-ran the identical `webtop_stack.sh` repro twice against the fixed binary. Both times
-reached `NGINX_STARTED` with sane, distributed multi-process CPU (no thread ever exceeded ~25s
-over several real minutes; thread/process counts fluctuated 4-19 = real fork churn, not one stuck
-thread) — the specific livelock this pass chased is confirmed gone, live, not just by code reading.
+**Post-`NGINX_STARTED` CPU livelock — ROOT-CAUSED and FIXED (tenth pass, 2026-09-17).** cdb `-pv`
+poor-man's sampler (WPR/WPA needs admin, unavailable): one thread burning 100% of a core
+continuously (0 → 732s user CPU over ~12 real minutes), always inside `LocalPortAllocator::
+ephemeral_port`/`deallocate` — genuinely executing `hashbrown` SIMD probe code that never
+terminates, **not** the then-unconfirmed `SafeZoneAllocator` spinlock (live-caught for real in a
+different call path in the twelfth pass, see above). Root cause: `LocalPortAllocator::refcount`
+was a `HashMap` whose backing table is private-per-process-heap, reachable only via a raw pointer
+meaningless to an attaching fork child — the same stale-cross-process-pointer class fixed a dozen
+times today, not yet audited for this nested field. **Fixed**: converted to a fixed, pointer-free
+`[u16; 65535]` array (`litebox/src/net/local_ports.rs`), same pattern as `socket_set`'s
+`MAX_SOCKETS` array. **Second instance found immediately on re-verify**: `closing_in_background`
+(`Vec<SocketHandle>`, same mechanism) hit an `index out of bounds` panic in smoltcp's
+`SocketSet::retain` — fixed the same way, converted to `[Option<SocketHandle>; MAX_SOCKETS]`
+(`litebox/src/net/mod.rs`). `interface`/`queued_for_closure` remain open (the latter also touches
+`DescriptorTable::drain_entries_full_covered_by`). Verified: `cargo build --release` clean, 25
+net unit tests pass; two live re-runs reached `NGINX_STARTED` with sane distributed CPU, livelock
+confirmed gone.
 
 **Poison-on-dead-holder scheme for `Network` — DESIGNED, IMPLEMENTED, and LIVE-VERIFIED
-(eleventh pass, 2026-09-17).** Closes the "third issue" above. `RawMutex` gained a `poisoned:
-AtomicBool`, set (unconditional `store`) by `try_recover_from_dead_holder_unregistered` on every
-dead-holder recovery, read-and-cleared by new `take_poison()`
-(`litebox_platform_windows_userland/src/lib.rs`); `litebox::sync::Mutex` got one opt-in method,
-`lock_recovering_poison() -> (MutexGuard, bool)`, deliberately NOT wired into ordinary `lock()` (no
-general poisoning concept for every `Mutex<Platform, T>`, by design). `GlobalStateHandle::net_lock`
-is the ONE call site that opts in: on `true`, calls new `Network::reset_after_poisoning`
-(`litebox/src/net/mod.rs`) before handing out the guard — wholesale-resets `socket_set` (reusing the
-existing shared-arena storage, not a second allocation), `closing_in_background`, `queued_for_closure`,
-`local_port_allocator`. `smoltcp::iface::SocketHandle` is a bare `usize` index (no generation
-counter), so there is no cheaper way to tell stale from live short of wiping every field that could
-hold one — option (a) from the task brief, narrowly scoped to `Network`.
+(eleventh pass, 2026-09-17).** `RawMutex` gained a `poisoned: AtomicBool`, set by
+`try_recover_from_dead_holder_unregistered` on every dead-holder recovery, read-and-cleared by
+`take_poison()`; `litebox::sync::Mutex::lock_recovering_poison()` is an opt-in method (NOT wired
+into ordinary `lock()`). `GlobalStateHandle::net_lock` is the one call site that opts in: on
+poison, `Network::reset_after_poisoning` wholesale-resets `socket_set`, `closing_in_background`,
+`queued_for_closure`, `local_port_allocator` before handing out the guard — `SocketHandle` is a
+bare `usize` with no generation counter, so wiping every field that could hold one is the only way
+to tell stale from live. **Two more instances of a distinct, pre-existing bug found and fixed the
+same pass** (live `cdb`-caught, frozen bit-for-bit across 6 re-samples in
+`buddy_system_allocator::LockedHeapWithRescue::dealloc`): a `SocketSet::remove`d `Socket`'s normal
+`Drop` ran its RX/TX ring buffers' `Vec` destructor through the CURRENT process's allocator on a
+pointer naming a DIFFERENT (often dead) process's private heap. Fix: `core::mem::forget` the
+removed `Socket` instead of dropping it — that memory was never this process's to free; Windows
+reclaims it when the owning process exits. `close_handle`/`listen`'s own `socket_set.remove` sites
+are unaffected (sockets are never fork-carried, remover == allocator always there).
 
-**Two more instances of a DISTINCT, pre-existing bug found and fixed the same pass, both live
-`cdb`-caught (thread frozen bit-for-bit at the same RIP across 6 rapid re-samples, inside
-`buddy_system_allocator::LockedHeapWithRescue::dealloc`):** letting a `SocketSet::remove`d `Socket`
-drop normally runs its RX/TX ring buffers' `Vec` destructor through the CURRENT process's allocator
-on a pointer that names a DIFFERENT (often already-dead) process's private heap — `Network::socket`
-allocates those buffers on whichever process's heap called it. Hit in `reset_after_poisoning` itself
-(first version) and, independently and unrelated to any poisoning event, in `remove_dead_sockets`
-(routine per-tick housekeeping over the genuinely cross-process-shared `closing_in_background`
-array). Fix both: `core::mem::forget` the removed `Socket` instead of dropping it — correct because
-that memory was never this process's to free; Windows reclaims it wholesale when the owning process
-exits. `close_handle`'s/`listen`'s own `socket_set.remove` sites are SAFE unchanged — every handle
-they touch came from THIS process's own private, non-shared descriptor table (sockets are never
-fork-carried), so remover == allocator always there.
+**Live verification, five `LITEBOX_PROCESS_FORK=1` boots.** Runs 1-2 failed the WRONG way (`Start-
+Process` silent-exit artifact, already warned about above). Run 3 `cdb`-confirmed the new livelock
+above, killed, root-caused, fixed. Runs 4-5 (post-fix binary): real dead-holder-recovery fired live
+in both, zero panic-cascade; run 4 reached `SELKIES_PORT_UP`+`DE_LAUNCHED` (furthest point that
+day) with one disclosed non-fatal residual panic (stale `SocketFd`/`LocalPort` token after an
+unrelated reset); run 5 reached `SELKIES_SUPERVISOR: giving up after 30 attempts`, same pattern,
+no livelock. Full per-run transcripts/`cdb` samples: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-**Live verification, five `LITEBOX_PROCESS_FORK=1` boots.** Runs 1-2 failed the WRONG way (own
-mistake: `Start-Process -RedirectStandardOutput/-RedirectStandardError`, the silent-exit artifact
-this file already warns about — corrected to `& .\runner.exe ... *> log` after). Run 3 (pre-`mem::
-forget` binary) `cdb`-confirmed the new livelock above, killed, root-caused, fixed. Runs 4 and 5
-(post-both-fixes binary): real dead-holder-recovery fired live in BOTH (`holder_pid=12996` and
-`=10908`, unrelated events), both correctly triggered `reset_after_poisoning`, ZERO panic-cascade
-either time. Run 4 reached `SELKIES_PORT_UP` + `DE_LAUNCHED` — the furthest point reached in this
-entire day's investigation — with exactly one `"handle does not refer to a valid socket"` panic
-(the accepted, disclosed residual: a DIFFERENT still-live process's already-minted `SocketFd`/
-`LocalPort` token goes stale the instant an unrelated reset runs; non-fatal,
-"panic kills the process, supervisor respawns", did not block progress). Run 5: same pattern, one
-more live recovery + one more residual panic, reached `SELKIES_SUPERVISOR: giving up after 30
-attempts` before this session ended it (timing variance vs. run 4, not a regression — steady log
-growth throughout, no livelock signature). Full per-run transcripts, `cdb` samples, symbolized
-stacks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**Did NOT reach the browser/terminal/apps milestone (runs 4-5, eleventh pass)** — `SELKIES_SUPERVISOR`
+exhausted 30 respawn attempts, port 8081 refused connections, boot settled into stable `HOLD t=`
+rather than crash-looping. At the time this was attributed to the Xvfb/dbus by-name exclusion
+below; **that attribution is now superseded** — see the twelfth-pass entry just below, which
+removed the exclusion and found the real remaining blocker is one layer deeper.
 
-**Does NOT reach the browser/terminal/apps milestone — squarely the SEPARATE, ALREADY-DOCUMENTED
-Track B Xvfb/dbus thread-based-fork corruption class below, not this pass's bug or responsibility.**
-`SELKIES_SUPERVISOR` exhausts 30 respawn attempts (`rc=2` every time); `curl` to port 8080 got
-`Empty reply from server`, port 8081 (selkies) refused the connection outright. Boot reaches its
-stable `HOLD t=` steady state afterward rather than crash-looping. **Real next pickup for the
-browser milestone**: Track B step 3 (fixed-base shared kernel heap) making `Xvfb`/`dbus-daemon`
-themselves cross-process-fork-eligible — separate, larger, already-scoped work.
+**`XVFB_FAILED`/`DBUS_FAILED` under the OLD by-name exclusion (fifth pass) — historical, exclusion
+since removed.** `xset q` itself got killed (signal) immediately before `[s] XVFB_FAILED`, not
+Xvfb failing to start — likely a false negative, since the boot still reached `SELKIES_PORT_UP`/
+`DE_LAUNCHED` after, which needs a real X display. Cause at the time: `Xvfb`/`dbus-daemon` were
+refused cross-process-fork eligibility by name, so they ran the THREAD-based path (ADVISORY-001
+§3N tcache class). Superseded by the twelfth-pass entry below, which removed that exclusion.
 
-**`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
-~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
-/dev/null 2>&1` immediately before `[s] XVFB_FAILED` — the liveness-check `xset` itself got
-killed (signal), not Xvfb failing to start. `Xvfb`/`dbus-daemon` (and anything they spawn) are
-refused cross-process-fork eligibility, so they run the THREAD-based path — the ALREADY-
-DOCUMENTED, still-open ADVISORY-001 §3N tcache/heap-corruption class that `GLIBC_TUNABLES` only partially
-mitigates ("Track B territory, not a tunable-coverage gap", `docs/AGENTS_ARCHIVE_2026-09-16.md`) —
-consistent with, not a new defect. Likely a FALSE NEGATIVE on Xvfb's actual health: the boot
-reached `SELKIES_PORT_UP`/`DE_LAUNCHED` afterward, which needs a real working X display for selkies
-to capture from, so `XVFB_FAILED` most likely means "the `xset` liveness probe crashed", not
-"Xvfb itself never started". Real fix is the same Track B step-3 fixed-base-shared-heap work that
-would let `Xvfb`/`dbus-daemon` themselves become cross-process-fork-eligible, eliminating the
-thread-based path (and its tcache corruption class) for them entirely — not attempted this pass.
+**By-name exclusion relaxed and re-tested (twelfth pass, 2026-09-17/18) — new, precisely-characterized blocker found.** `try_cross_process_fork`
+(`litebox_shim_linux/src/syscalls/process.rs`) unconditionally refused any `comm` matching
+`Xvfb`/`dbus-daemon` before the fd-eligibility scan even ran (added `4bad287`, when `Network`
+internals were still private-per-process-heap, so a cross-process-forked Xvfb would have been
+unreachable regardless). That precondition is now false (`d1ff9d2`, `6fc102c`), so the by-name
+block was removed, letting both comms fall through to the SAME fd-eligibility gate as everything
+else (the `unix-socket` fd-kind refusal itself is untouched). Live-verified, `LITEBOX_PROCESS_FORK=1`
++ `.wfgy/webtop_stack.sh`: Xvfb DOES now genuinely cross-process-fork (direct log proof, not
+inferred: a same-run WARN shows a DIFFERENT guest pid than the connecting client owning the bound
+X11 socket — `[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid ...
+self_pid=17392 owner_pid=16756`). `XVFB_FAILED`/`DBUS_FAILED` still fire, but for a NEW, DIFFERENT,
+now-precisely-characterized reason, not the old thread-based tcache class: `unix_addr_table`'s
+`Backlog`/`Channel` connection DATA (as opposed to the presence side-index already shared per
+"`unix_addr_table` presence sharing" above) is still real per-process-heap, so a client in a
+DIFFERENT cross-process-forked guest process gets ECONNREFUSED even though the listener is
+genuinely alive and bound — the exact gap this file's "Open here" section already named
+("guest processes share no AF_UNIX/loopback/FIFO namespace"), now hit by name for the first time.
+Safety: zero crash/corruption from the relaxation itself — boot reached its stable `HOLD t=`
+steady state both after `XVFB_FAILED`+`DBUS_FAILED`+`DE_FAILED` (run 1) and separately in a second
+boot (run 2, independently confirmed safe, though that run's own progress was gated by an unrelated
+finding below). **Next real pickup for the browser milestone**: extend the `unix_addr_table`
+presence-sharing PATTERN (flat, fixed-slot, lock-free) from presence-only to the actual
+`Backlog`/`Channel` connection data — separate, larger, not attempted this pass.
+
+**`SafeZoneAllocator::dealloc` spinlock livelock — LIVE-CAUGHT for the first time (twelfth pass,
+run 2), previously only theorized ("Previously-recorded allocator livelock (`SafeZoneAllocator::
+alloc`) not re-investigated this pass -- still open" — RawMutex section above).** Unrelated to the
+Xvfb/dbus relaxation above (hit deep in a `[process_fork_diag] globalstate-probe (child)`
+diagnostic's own `std::process::exit()` call, present since before this pass). Two live `cdb -pv`
+samples ~27s apart, symbolized against the matching same-timestamp `.pdb` (`-y <dir>`, required —
+raw offsets alone mis-suggested `ntdll!RtlFreeActivationContextStack`/`ntdll!LdrShutdownProcess`
+internals until symbolized), showed a single thread bit-identical at the same leaf instruction
+(`test al,al` in `SafeZoneAllocator::<WindowsUserland as GlobalAlloc>::dealloc+0x59`, disassembly
+confirms a classic `lock cmpxchg`+`pause`-backoff spin loop) while its User Mode CPU time climbed
+continuously (9:22 → 9:49 and counting) — genuinely spinning, not blocked. Call chain:
+`diag_process_fork_globalstate_probe_inner` → `std::process::exit` → Rust's own TLS-destructor
+cleanup (`std::sys::thread_local::guard::windows::cleanup`/`destructors::list::run`) → freeing a
+TLS-held `Vec<String>`/`Option<..>` → `SafeZoneAllocator::dealloc` spins forever acquiring its
+internal `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) — a raw external-crate spinlock
+with NO dead-holder recovery, unlike `RawMutex` (which got exactly this recovery mechanism earlier
+today). Consistent with a thread/process elsewhere dying while holding this global-allocator lock,
+permanently starving every future `alloc`/`dealloc` in that process. **Notable operational
+side-effect**: the stuck process resisted `Stop-Process -Force`/`taskkill /F` for roughly two
+minutes (repeated attempts, `Get-Process` kept reporting it alive with climbing CPU); only
+`Invoke-CimMethod -MethodName Terminate` (WMI) actually killed it. Not root-caused further this
+pass (out of scope for the Xvfb/dbus task) — real fix is giving `SafeZoneAllocator`'s spinlock the
+same dead-holder-recovery treatment `RawMutex` already has, or routing it through `RawMutex`
+itself; high blast radius (global allocator, every allocation in every process) — deserves its own
+dedicated, carefully-scoped pass, not a rushed change here.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
@@ -224,22 +229,23 @@ Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: 
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(1) ~~Debugger-root-cause the dead-holder-recovery data-inconsistency panic~~ — DONE, eleventh pass
-(poison-on-dead-holder scheme, this file's current Track B entry above); the actual remaining
-blocker on the browser/terminal/apps milestone is now squarely the separate `XVFB_FAILED`/
-`DBUS_FAILED`/selkies-thread-based-fork item below, not this one. (1b) `queued_for_closure`'s own
-still-open cross-process-Vec hazard (distinct from the two `mem::forget` fixes above — nothing yet
-converts its STORAGE to a fixed pointer-free array the way `closing_in_background`/`socket_set`
-already were) remains a live risk for a future pass: any process reading/pushing it while attached
-rather than constructing could still hit the stale-pointer class on the Vec header itself, not just
-the drop-ownership issue just fixed; (2) debugger-root-cause
-`litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most
-frequent panic historically, NOT yet debugger-confirmed — do not patch blind); (3) root-cause the
-`/tmp/empty` writable-layer cross-child-visibility gap behind `DBUS_FAILED`; (4) finish the
-`Network` shared-arena redesign (`interface`, `queued_for_closure` remain — `closing_in_background`
-and `socket_set`'s slot array are done, see current Track B entry; `litebox/src/net/mod.rs`'s
-`MAX_SOCKETS` doc comment has the design); (5) after (1)-(4), `timerfd`/`signalfd` are the
-next-cheapest carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
+(0) **TOP PRIORITY, twelfth pass**: extend `unix_addr_table`'s presence-sharing PATTERN (flat,
+fixed-slot, lock-free) from presence-only to the real `Backlog`/`Channel` connection data — this is
+now the ONE thing standing between the boot and the browser/terminal/apps milestone (Xvfb/dbus
+themselves cross-process-fork fine as of this pass; clients just can't complete a connection to
+them yet). (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`)
+needs the same dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever
+in `dealloc` this pass, high blast radius, own dedicated pass. (1) ~~Debugger-root-cause the
+dead-holder-recovery data-inconsistency panic~~ — DONE, eleventh pass. (1b) `queued_for_closure`'s
+own still-open cross-process-Vec hazard (nothing yet converts its STORAGE to a fixed pointer-free
+array the way `closing_in_background`/`socket_set` already were) remains a live risk: any process
+reading/pushing it while attached rather than constructing could still hit the stale-pointer class
+on the Vec header itself; (2) debugger-root-cause `litebox/src/event/wait.rs:224`'s
+`unreachable!()` on garbage thread state (dozens per boot, most frequent panic historically, NOT
+yet debugger-confirmed — do not patch blind); (3) root-cause the `/tmp/empty` writable-layer
+cross-child-visibility gap; (4) finish the `Network` shared-arena redesign (`interface`,
+`queued_for_closure` remain); (5) after (0)-(4), `timerfd`/`signalfd` are the next-cheapest
+carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
 
 ## Container images and OCI loading
 
@@ -291,36 +297,22 @@ Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fo
 below closes. Selkies also needs `--clipboard-enabled=false` (its clipboard monitor re-triggers the
 same corruption every tick).
 
-**Sixth pass (2026-09-17) — did NOT reach `DE_LAUNCHED`, new stall past
-`SELKIES_BIND_WATCHDOG_STARTED`** (writable-layer-adoption race on a late fork child); browser
-never reached, killed clean, no RAM-leak evidence. Archive.
-
-**Seventh pass (2026-09-17) — writable-layer-adoption race ROOT-CAUSED and FIXED, two bugs, both
-landed, `DE_LAUNCHED`/`SELKIES_PORT_UP` now reached deterministically (5/5 repro boots).**
-`CONTAINER_FS_SNAPSHOT_ENV_VAR` (`litebox-container-fs-<pid>.tar`) is ONE canonical path shared by
-the whole boot tree, but two consumers still carried stale single-consumer assumptions -- (1) the
-importing fork child deleted it right after import (true before the canonical-path design, false
-after: several children in the same fork-heavy window share the identical path, so the first
-importer race-deletes it out from under the rest -- the exact sixth-pass `could not adopt ...
-(os error 2)` symptom); (2) the exiting child's export-back path published via a raw, non-atomic
-`std::fs::copy` onto the same canonical path, letting a concurrent importer read a torn tar
-mid-overwrite (`failed to read tar entry: numeric field was not a number`, caught live once in
-~180 adopts). Fix: stopped the premature delete; routed the exit-time publish through the
-already-correct atomic-rename primitive (`publish_as_container_fs_snapshot`, widened to `pub`)
-instead of a raw copy -- a lifecycle/synchronization fix, kept as a plain on-disk file, not moved
-into the shared kernel arena. Live-verified: 5 consecutive `LITEBOX_PROCESS_FORK=1` boots, ~800+
-combined adopt/export cycles, one failure total (bug 2, in the run before its own fix landed),
-zero recurrence after both fixes were live; all 5 reached `DE_LAUNCHED`+`SELKIES_PORT_UP`
-(previously non-deterministic, never reached at all the pass before). Browser/terminal/apps still
-blocked, **not by this bug**: `NGINX_SELFTEST_FAILED`/`XVFB_FAILED`/`DBUS_FAILED`/`DE_FAILED`
-still fire every run, the already-documented Track B Xvfb/dbus corruption class (above). Full
-mechanism, both fixes, and the 5-boot transcript: archive (newest entry).
+**Sixth pass** — writable-layer-adoption race on a late fork child stalled past
+`SELKIES_BIND_WATCHDOG_STARTED`, never reached `DE_LAUNCHED`. **Seventh pass — ROOT-CAUSED and
+FIXED, two bugs** (a shared `CONTAINER_FS_SNAPSHOT_ENV_VAR` path race-deleted by the first of
+several importers, and a non-atomic `std::fs::copy` export letting a concurrent importer read a
+torn tar) — fix: stopped the premature delete, routed the export through the existing atomic-rename
+primitive (`publish_as_container_fs_snapshot`, widened to `pub`). Live-verified 5/5 boots,
+~800+ adopt/export cycles, zero recurrence, all reaching `DE_LAUNCHED`+`SELKIES_PORT_UP`
+deterministically for the first time. Full mechanism/transcript: archive.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. An intermittent host AV ends
 some runs (host-allocator region fault) — separate non-determinism from the ACK-stall-kill below.
 Architectural gap: **guest processes share no AF_UNIX/loopback/FIFO namespace**, so a cross-process fork
-gives zero AVs but Xvfb is unreachable from its own clients — one shared host-side transport would put
-the whole desktop on the crash-free path (`docs/fork-fs-veh-2026-09-08.md:128-144`).
+gives zero AVs but Xvfb is unreachable from its own clients — precisely confirmed and named
+(`unix_addr_table`'s `Backlog`/`Channel` connection data) in the twelfth-pass entry above; one
+shared host-side transport, or extending that table's presence-sharing pattern to real connection
+data, would put the whole desktop on the crash-free path (`docs/fork-fs-veh-2026-09-08.md:128-144`).
 
 **The glibc/tcache crash class still sporadically hits selkies** on the THREAD-based fork path,
 separately from the ACK-stall-kill (a DPI-fork on rapid reconnect SIGSEGVs, ADVISORY-001 §3N) --
@@ -417,31 +409,27 @@ live proof (two keys registered before/after the fork, both observed by the chil
 ## Cross-process fork: twelve registry/pointer/lock fixes, all now landed, 2026-09-17
 
 Root pattern (instances 1-11): a raw `Arc`/`Box` pointer captured once by whichever process
-constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless (or dangling) in
-every other attaching process -- found and fixed one layer deeper each time, isolated with a minimal
-`-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir ...'` repro under `LITEBOX_PROCESS_FORK=1`.
-Fix pattern: shadow the field with a fresh per-process copy (state that doesn't need cross-process
-visibility -- `litebox`, `proc_self_info`/`pts_registry`, `elf_patch_cache`/`exec_ranges_cache`/
-`segment_scan_cache`, `futex_manager`), or rebind via a locking accessor (state genuinely meant to
-be shared -- `Network`'s two fields via `net_lock`, `Pipes.litebox` via `pipes()`), or (instance 9)
-replace a process-private-heap `Vec` with a fixed-slot pointer-free array. Instance 12 (`net_lock`
-left permanently locked by an exiting fork-child) was DIFFERENT -- a lock-liveness/owner-death-
-recovery gap, not a stale pointer -- fixed below. Does NOT close `XVFB_FAILED`/`DBUS_FAILED`;
-`pty_registry`/`flock_registry`/etc. remain real, still-open follow-on work. Full detail: archive.
+constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless/dangling in
+every other attaching process. Fix pattern: shadow with a fresh per-process copy (`litebox`,
+`proc_self_info`/`pts_registry`, `elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`,
+`futex_manager`), rebind via a locking accessor (`Network` via `net_lock`, `Pipes.litebox` via
+`pipes()`), or replace a private-heap `Vec` with a fixed-slot pointer-free array. Instance 12
+(`net_lock` left permanently locked by an exiting fork-child) was a lock-liveness/owner-death gap,
+not a stale pointer — fixed below. Does NOT close `XVFB_FAILED`/`DBUS_FAILED`; `pty_registry`/
+`flock_registry`/etc. remain real, still-open. Full detail: archive.
 
 ## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, and cross-process-fork lock-orphaning -- ALL FOUR FIXED 2026-09-17
 
-Four fixes, all live-verified, all landed: (A) `RawMutex::resolve_waiter_event`'s cross-process
-branch panicked on a stale pid instead of signaling the real waiter -- `waiters` is now a
-fixed-32-slot pointer-free `WaiterQueue`. (B) `Pipes.litebox`'s stale pointer crashed a killed
-fork child's stdio teardown -- now interior-mutable, rebound via `GlobalStateHandle::pipes()`
-same as `net_lock`. (C) `FutexManager` cross-process sharing hung on `LoanList` entries that can
-be stack-allocated (fork-family-identical only for the forking thread) -- resolved by giving each
-process its own fresh `FutexManager`. (D) A cross-process-fork child's un-shutdown `net_worker`
-thread could be killed mid-hold of the shared `net_lock`, orphaning it forever -- fixed with
-`RawMutex` owner-death recovery (`OpenProcess`/`GetExitCodeProcess`-confirmed-dead force-recovery).
-Full mechanism and live evidence: archive. Previously-recorded allocator livelock
-(`SafeZoneAllocator::alloc`) not re-investigated this pass -- still open, distinct from D.
+Four fixes, live-verified, landed: (A) `RawMutex::resolve_waiter_event`'s cross-process branch
+panicked on a stale pid instead of signaling the real waiter — `waiters` is now a fixed-32-slot
+pointer-free `WaiterQueue`. (B) `Pipes.litebox`'s stale pointer crashed a killed fork child's
+stdio teardown — now rebound via `GlobalStateHandle::pipes()` same as `net_lock`. (C)
+`FutexManager` cross-process sharing hung on stack-allocated `LoanList` entries — resolved by
+giving each process its own fresh `FutexManager`. (D) A cross-process-fork child's un-shutdown
+`net_worker` thread could be killed mid-hold of `net_lock`, orphaning it — fixed with `RawMutex`
+owner-death recovery (`OpenProcess`/`GetExitCodeProcess`-confirmed-dead force-recovery). Full
+mechanism: archive. `SafeZoneAllocator::alloc`'s spinlock livelock (flagged here as still-open,
+distinct from D) was LIVE-CAUGHT for the first time in the twelfth pass — see that entry above.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
