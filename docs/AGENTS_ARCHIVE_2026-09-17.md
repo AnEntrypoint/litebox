@@ -1782,3 +1782,120 @@ the hang, and read `GlobalState.net`'s embedded `RawMutex` bytes directly (`inne
 offset 0, `holder_pid: AtomicU32` near the end of the struct -- see
 `litebox_platform_windows_userland/src/lib.rs`'s `RawMutex` definition for the exact layout) to
 settle starvation-vs-lost-wake conclusively before attempting any fix.
+
+## Re-investigated 2026-09-17 (third pass): direct raw-memory read of `net_lock` -- starvation
+## hypothesis REFUTED; fix D's recovery reconfirmed working; new pipe-handle-leak hypothesis
+
+Picked up exactly where the previous pass left off: computed `net_lock`'s live address and read
+its raw bytes with `cdb -pv`/`qd`, rather than trusting any more LTO-merged stack-frame symbol
+names. Repro identical: `.wfgy/webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`, launch command
+unchanged from the prior two passes (`--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=...
+--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar --
+/bin/bash /webtop_stack.sh`). Reached `NGINX_STARTED` at the same ~6647-line log position as
+both prior passes, then froze -- reconfirmed genuinely stuck via an until-loop condition-poll
+(never a blind sleep) showing zero line growth over 65s+ after the freeze point, on top of the
+~150s+ total elapsed since `NGINX_STARTED`.
+
+**Deriving `net_lock`'s exact live address (all three offsets from real `cdb` disassembly, not
+source-order guesswork -- `RawMutex` is NOT `#[repr(C)]`, so the compiler is free to reorder its
+fields, and it did):**
+
+1. `litebox_platform_windows_userland!...GlobalStateHandle...net_lock` is a real compiled
+   function (`x` found it directly by symbol). Disassembling it (`u ... L40`) shows: `mov
+   rbx, qword ptr [rcx]` (deref `GlobalStateHandle.inner`, i.e. the `SharedArc<GlobalState>`
+   pointer -- this IS the absolute `GlobalState` address in this process, no further
+   indirection); `lea rsi,[rbx+228h]` (the embedded `RawMutex`'s own address = `GlobalState`
+   base + `0x228`, i.e. the `net` field's offset within `GlobalState`); the fast-path CAS is
+   `lock cmpxchg dword ptr [rbx+430h],ecx` -- so `inner` (`RawMutex::underlying_atomic()`) sits
+   at `GlobalState_base + 0x430`, i.e. `RawMutex_base + 0x208`. Since `WaiterQueue` (32 fixed
+   inline slots of `{pid: AtomicU32, event: AtomicIsize}`, naturally padded to 16 bytes each)
+   is exactly `0x208` (520) bytes, this proves the compiler placed `waiters` at `RawMutex`
+   offset 0 and `inner` right after it -- the reverse of their declaration order in
+   `litebox_platform_windows_userland/src/lib.rs`.
+2. Disassembling `RawMutex::note_locked`/`note_unlocked` (`u ... L15`/`L10`) shows both write
+   `dword ptr [self+20Ch]` -- `holder_pid` is at `RawMutex_base + 0x20C`, i.e.
+   `GlobalState_base + 0x434`.
+3. `GlobalState`'s own absolute base is `SHARED_KERNEL_HEAP_ACTUAL_BASE` (confirmed live via the
+   log's own `[shared_kernel_heap] INHERITED section mapped at parent's address=0x7ff800000000`
+   line) plus this process's own `SHARED_GLOBALSTATE_OFFSET` -- a real, symbol-addressable
+   `static AtomicUsize` (`litebox_platform_windows_userland/src/lib.rs:11060`), NOT a compile-
+   time constant (env-var-propagated per fork, see `shared_kernel_state_slot_env_var`/
+   `attach_shared_kernel_state`). Found its mangled symbol via `x
+   litebox_runner_linux_on_windows_userland!*GLOBALSTATE_OFFSET*` and read it directly (`dq`) in
+   BOTH live guest-executing processes (winpid 12956 and 20744): both read `0x1000` identically
+   (as expected -- exported by the creator, inherited by every fork descendant), confirming a
+   single, consistent value across the whole fork family, not a per-process guess.
+4. Net result: `net_lock` address = `0x7ff800000000 + 0x1000 + 0x228` = `0x7ff800001228`;
+   `inner` @ `0x7ff800001430`; `holder_pid` @ `0x7ff800001434`.
+
+**The direct read** (`dd 0x7ff800001420 L8`, both processes map the same shared section at the
+same address so either process's `cdb` session sees identical bytes): `inner=0`, `holder_pid=0`
+at the frozen state -- genuinely **unlocked and uncontended**, not held by anyone, not the
+blocker for this hang. This directly refutes the previous pass's leading (explicitly marked
+unconfirmed) hypothesis that `SpinEnabledRawMutex`'s lack of fairness lets a hot-looping
+`net_worker` thread starve a waiter on `net_lock` indefinitely -- there is no live contention on
+this lock at all at hang time.
+
+**Fix D reconfirmed working, not implicated**: the log for this SAME run shows
+`RawMutex::block_or_maybe_timeout: recorded holder process is dead -- recovering orphaned lock
+holder_pid=20372 val=2` firing twice, at elapsed 3.823s and 46.064s (inside winpid 20372's own
+process-relative clock) -- i.e. `net_lock` WAS genuinely orphaned earlier in this same run (a
+cross-process-fork child, winpid 20372, died while holding it) and the owner-death recovery
+mechanism from `4e417d7` correctly detected and cleared it, twice, exactly as designed. By the
+time of the later freeze this session investigated, that recovery had long since completed and
+left the lock idle -- consistent with the direct read above.
+
+**Process inventory at hang time** (`Get-Process`): five survivors this pass (one more than the
+prior pass's four) -- winpid 6476/13156/17364 (near-zero CPU, watchdog-shaped), winpid 12956 and
+20744 (both slowly growing CPU, ~1-1.5%/5s -- consistent with periodic ~2s
+`LIVENESS_CHECK_INTERVAL` wake/re-sleep cycles inside `RawMutex::block_or_maybe_timeout`, not a
+hot spin). winpid 20372 (the process whose death fix D recovered from) had ALREADY exited by
+hang time and does not appear in this list.
+
+**New leading (unconfirmed) hypothesis for the actual current blocker**: full `~*k;qd` dumps of
+both winpid 12956 and 20744 (`cdb -pv`) show:
+- 20744 (top-level, pid 1): thread `5108.18b4` blocked in `Pipes::read` -> `run_on_raw_fd`/
+  `sys_read` -> `wait_on_events` -> `RawMutex::block` (a DIFFERENT `RawMutex` instance from
+  `net_lock` -- the pipe's own wait primitive) -- genuinely still waiting for EOF on the
+  self-test's `$(curl ...)` command-substitution pipe, matching both prior passes' own reading
+  exactly. A second thread (`5108.52d4`, `spawn_fork_child_pipe_pump`) is blocked in a raw
+  `NtReadFile` on the OS-pipe bridge for that same fd.
+- The log's own `task-resume-probe` lines show TWO separate cross-process-fork children entered
+  guest execution close together: winpid 12956 (line 6569, `guest fd 255 reopened on
+  /webtop_stack.sh` -- a bash-interpreter-shaped resume, no fd 3/4 pipe mentioned for it) and,
+  several lines later, winpid 20372 (line 6642, WITH `guest fd 3 rebuilt over inherited Windows
+  pipe handle 0x404 (child writes)` / `guest fd 4 ... 0x49c (child reads)` -- this is the actual
+  self-test pipe's writer). 20372 is confirmed dead (fix D recovered its orphaned `net_lock`
+  above); on ordinary Windows process exit ALL its handles close, including 0x404, which should
+  deliver EOF to 20744's reader -- unless a THIRD process also holds an inherited duplicate of
+  the same underlying pipe object open. winpid 12956 is alive at hang time, was NOT shown
+  inheriting fd 3/4 in the log (its own `task-resume-probe` line predates the self-test pipe's
+  creation), so a simple "12956 also got fd 3/4 explicitly" explanation does not fit the log
+  order directly -- but Windows handle inheritance at `CreateProcess` is normally "every
+  currently-inheritable open handle in the parent", not a curated list, so if the pipe was
+  created by the TOP-LEVEL shell (20744) before either fork and never marked
+  non-inheritable, BOTH 12956 and 20372 (and any other sibling forked in the same window) would
+  silently receive their own duplicate of the write end regardless of whether either one's own
+  guest-visible fd table records it -- exactly the shape of bug that would keep the pipe's
+  write end alive (and EOF undelivered) even after the "real" writer (20372) exits.
+- **Not confirmed this pass**: a `cdb -pv -p 12956 -c "!handle 0 f File; qd"` enumeration was
+  started to look for a duplicate handle to the same pipe kernel object 20744 holds open, but
+  `!handle`'s non-invasive full enumeration ran long and had to be killed (along with all
+  `litebox_runner`/`cdb` processes) when host free memory dropped to ~785MB (from this run's TWO
+  full in-memory 17-layer OCI rootfs rebuilds, one per fork child, each including a 2.5GB and a
+  736MB layer -- expected per "Runtime in-memory loading"'s own design, not a leak; memory
+  recovered to ~1.8GB free within seconds of `Stop-Process -Force` on every `litebox_runner`/
+  `cdb`, no leaked processes).
+
+**Pickup for next session**: re-run the repro, and as soon as `NGINX_STARTED` appears, promptly
+`cdb -pv -p <the winpid that inherits fd 3/4>` (identify it from the `task-resume-probe` log
+lines live, don't wait for the freeze) and enumerate its handles / compare kernel object
+addresses against every OTHER live fork sibling's handle table for the same pipe, OR instrument
+(`LITEBOX_DIAG_...`) the pipe-creation/fork-spawn code path to log every handle actually marked
+inheritable at each `CreateProcess` call, to catch an over-broad-inheritance leak directly rather
+than via a slow post-hoc `!handle` scan. If confirmed, the fix is scoping the pipe's write-end
+handle to non-inheritable (`SetHandleInformation`/`bInheritHandles` narrowing) or an explicit
+handle list at every cross-process-fork `CreateProcess` call, not another `RawMutex`/lock-layer
+change -- this hang is unrelated to the `net_lock`/`SpinEnabledRawMutex` mechanism entirely, per
+the direct memory evidence above. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser/terminal/apps were NOT
+reached this pass either. Host memory recovered cleanly, no leaked processes.

@@ -106,22 +106,20 @@ symptom this investigation began from, genuinely not root-caused (`docs/track-b-
 146-152`). The TOP-LEVEL parent's curl-self-test stall (`sys_wait4(pid=-1)` not checking
 `cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
 
-**Still reliably reaches `NGINX_STARTED` under `LITEBOX_PROCESS_FORK=1` (past the
-shared-kernel-heap commit-exhaustion wall, separately fixed), then wedges in the nginx
-self-test retry loop — NOT fixed, and the mechanism first written down here (a nested
-`prepare_for_exit`/`wait4` reap) is RETRACTED, unconfirmed on re-investigation.** A later
-2026-09-17 pass re-ran the identical repro and, using `cdb`'s `-pv`/`qd` non-invasive attach
-correctly, found the actual block site is `RawMutex::block` inside `curl`'s own
-`LinuxShim::perform_network_interaction()` call (contending for the cross-process-shared
-`net_lock`), not `wait4` — the earlier "prepare_for_exit" attribution traced to this optimized
-binary's LTO-driven symbol merging (the same generic `RawMutex::block` call site resolved to
-several different, unrelated-looking enclosing symbols across threads in one dump). Leading
-unconfirmed candidate: `SpinEnabledRawMutex` has no fairness, and each cross-process-fork
-child's own hot-looping `net_worker` thread can win every re-lock race against a freshly-woken
-waiter, starving it indefinitely — not yet confirmed via a direct memory read of `net_lock`'s
-`holder_pid`/`inner`, so no fix was attempted. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser were NOT
-reached. Full mechanism, both passes' cdb evidence, and the process-hygiene lesson (`cdb -p
-<pid>` alone is INVASIVE — a bare `q` KILLS the debuggee; always use `-pv`/`qd`): archive.
+**Still reliably reaches `NGINX_STARTED` under `LITEBOX_PROCESS_FORK=1`, then wedges in the
+nginx self-test retry loop — NOT fixed.** The `SpinEnabledRawMutex`-starvation hypothesis
+recorded here previously is **REFUTED by a direct raw memory read of `net_lock`**
+(2026-09-17, third pass): its live address (base+`0x1000`(`SHARED_GLOBALSTATE_OFFSET`)+`0x228`,
+`inner`@`+0x430`, `holder_pid`@`+0x434`, all `cdb`-disassembly-derived not guessed) reads
+`inner=0, holder_pid=0` at the frozen state — unlocked, uncontended; not the blocker. Fix D's
+owner-death recovery (`4e417d7`) fired correctly twice earlier in the same run (dead
+`holder_pid=20372`, recovered at 3.8s/46s) — also not implicated. New, unconfirmed leading
+hypothesis: top-level's `Pipes::read` awaits EOF on the self-test's `$(curl)` pipe; its writer
+(winpid 20372) already exited, but a different live fork child (winpid 12956) may hold a
+stray inherited duplicate of that pipe's write handle open (over-broad Windows handle
+inheritance). Not confirmed (a `cdb !handle` scan of 12956 was killed unfinished for host
+memory pressure); `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser NOT reached. Full derivation and
+evidence: archive.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
