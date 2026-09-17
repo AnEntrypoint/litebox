@@ -576,3 +576,126 @@ same-base loading; fd/HANDLE indirection and `beyond_stdio` both unstarted):
    cross-process-invalid without same-base RUNNER image loading (ASLR is still on for the runner
    binary) -- a real blocker for migrating fd-table state specifically, separate from the cursor
    fix, per ADVISORY-002 §3.3's own "Trait-object vtables" note.
+
+## Track B step 5: shared-heap cursor made cross-process atomic; default flip attempted, then reverted (2026-09-17, follow-up session)
+
+Picked up pickup-note 1 above verbatim: moved `SHARED_KERNEL_HEAP_NEXT_FREE` into the shared
+section itself as `shared_heap_cursor()` (`lib.rs`), reading/advancing an `AtomicUsize` living at
+`SHARED_KERNEL_HEAP_CURSOR_OFFSET` (`0`, the section's first 8 bytes) instead of a process-local
+`static`. The creator process commits and initializes that one metadata page
+(`SHARED_KERNEL_HEAP_DATA_OFFSET = 0x1000`) eagerly, before `SHARED_KERNEL_HEAP_STATE` goes
+`_READY`; an inheriting child does NOT re-initialize it (the old bug: resetting a live shared
+cursor back to the base). Confirmed `core::sync::atomic::AtomicUsize::compare_exchange` is the
+right primitive here rather than a raw `InterlockedCompareExchange` FFI call: both compile to the
+identical `lock cmpxchg` on x86-64, a CPU cache-coherency-protocol instruction that is correct
+against any physical memory two cores share (including a cross-process section) with zero OS
+involvement -- fundamentally different from `WaitOnAddress`/keyed events, which fail cross-process
+because THEY key a waiter by OS-tracked identity, not because atomic RMW instructions are
+themselves process-scoped. No raw FFI needed.
+
+**Verification ladder, in order:**
+
+1. Basic sentinel repro (must still pass): host env vars `LITEBOX_PROCESS_FORK=1`,
+   `LITEBOX_DIAG_SHARED_HEAP_PROBE=1`, `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`, guest command
+   `(echo child_forked) ; OUTER_EXIT=$?` against `docker.io/library/debian:stable-slim` -- exit 0,
+   parent-WROTE/child-OBSERVED exact sentinel match (`0xc0ffee00deadf01f`), re-confirmed again
+   after the later revert below (`0xc0ffee00deada833`).
+2. Concurrent-pressure escalation (new this pass): a 20-parallel-job `yes hi | head -c 20000`
+   pipeline stress HUNG (log froze, 102 live host processes, host free RAM fell to roughly 1.3 GiB)
+   -- killed after about 200s with zero progress. Not chased further: this shape (heavy piped I/O
+   under cross-process fork) matches the ALREADY-DOCUMENTED "don not rely on
+   `LITEBOX_PROCESS_FORK=1` for heavy-iteration guests" pipe-relay fragility (see the
+   3-stage-pipeline SIGPIPE entry above), a pre-existing, separate issue class, not touched by this
+   pass's cursor change. Switched to a lighter design avoiding sustained pipes: ten parallel
+   subshells, each running five sequential `/bin/true` forks, then `wait`, then an ALL_DONE marker.
+   Result: exit 0, all ten done markers plus ALL_DONE present, 71 real cross-process forks (by
+   built-Task-count), ALL 71 mapping the genuinely INHERITED section (zero private-fallback), zero
+   ACCESS_VIOLATION/corruption/panic/FATAL/abort markers. This is the live proof the cursor fix is
+   correct under real concurrent cross-process allocation pressure: 71 processes, many running
+   genuinely in parallel across ten backgrounded subshells, all bump-allocating through the SAME
+   shared atomic cursor, zero corruption, zero colliding offsets.
+3. Flipped the gate in `process_fork.rs` to unconditional-on (`LITEBOX_PROCESS_FORK=1` alone, no
+   diag flag) and re-ran steps 1-2 -- both still passed identically. Looked safe to ship as the
+   default.
+4. Real-world test: booted `.wfgy/webtop_stack.sh` (flags: `--gui=hidden`, `-p 8080:3000`, `--env
+   GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`, `--oci-image
+   docker.io/linuxserver/webtop:debian-xfce`, `--resume-from .wfgy/webtop_seed.tar`, guest command
+   `/bin/bash /webtop_stack.sh`; `LITEBOX_PROCESS_FORK=1` and
+   `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error` as real host env vars)
+   with the gate now defaulting on. Reached NGINX_CONFIGURED/NGINX_STARTED normally, then during the
+   nginx supervisor's own retry loop and the Xvfb-launch area, EVERY forked plain external command
+   (sed, ln, mkdir, sleep, and so on) began failing with a genuine HOST-side Rust allocation error:
+   "memory allocation of 181493744 bytes failed" (about 173 MiB), repeating (218 occurrences in a
+   roughly 1600-line log before the run was killed), well before Xvfb or dbus ever started. Traced
+   to the exact log line immediately preceding each failure: a `globalstate-probe (child)` line
+   reporting it is rebuilding the rootfs from the OCI image `docker.io/linuxserver/webtop:debian-xfce`
+   -- i.e. this specific child path reconstructs a FULL in-memory merged rootfs from the 17-layer
+   OCI cache (one layer alone is 736142848 bytes) for EVERY plain command exec, and that
+   reconstruction's own large buffer is what gets allocated through `WindowsUserland::alloc`, i.e.
+   the SAME shared 8 GiB heap now that sharing is on.
+
+   Root cause: with sharing OFF (the pre-existing default), each such short-lived process's entire
+   8 GiB heap reservation -- rootfs buffer included -- is a PRIVATE section that Windows reclaims
+   the instant that process exits, so cumulative capacity across a long boot with hundreds of plain
+   execs is effectively unbounded. With sharing ON, every one of those processes maps the SAME ONE
+   8 GiB section, which stays mapped for as long as the eldest ancestor (this boot's PID 1) is
+   alive, and `WindowsUserland::free` is a documented no-op (`SafeZoneAllocator` never calls it;
+   freed pages return to that allocator's own PROCESS-LOCAL free list, never back to the shared
+   pool) -- so nothing a forked child allocates is EVER returned to the shared pool, even after
+   that child exits. At roughly 173 MiB or more per plain exec, about 45 to 90 of them permanently
+   exhaust an 8 GiB pool -- and a real debian-xfce webtop boot needs well over that many before
+   Xvfb/dbus even start. This is WORSE than the sharing-off default, which (per the step-3 entry
+   above) reaches NGINX_STARTED and NGINX_SELFTEST_FAILED without ever hitting this failure class.
+
+   Host impact while this ran: process count briefly reached 100+ concurrent litebox_runner
+   instances, free RAM fell to roughly 3.5 GiB from a roughly 4.2-4.4 GiB baseline (not itself
+   critical, but the run was going nowhere -- every subsequent forked command was aborting on the
+   same allocation failure). Killed via a forced process stop; RAM recovered fully to baseline
+   within seconds, zero leaked processes.
+
+5. Reverted the gate in `process_fork.rs` back to requiring the explicit opt-in
+   (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`), NOT the default. Rebuilt; re-ran the plain
+   `LITEBOX_PROCESS_FORK=1`-alone smoke test (debian:stable-slim, the OUTER_EXIT repro) and
+   confirmed byte-for-byte unchanged behavior: zero INHERITED-section-mapped occurrences, exit 0,
+   child_forked printed -- the private-per-process-heap default this whole investigation started
+   from is untouched. Re-ran the opt-in sentinel repro (step 1) once more post-revert to confirm the
+   mechanism itself still works when explicitly requested: exact match, exit 0.
+
+Net result this pass: the atomic-cursor fix is real, correct, and proven under genuine concurrent
+cross-process allocation pressure (the 71-fork test) -- the specific bug it targeted
+(`SHARED_KERNEL_HEAP_NEXT_FREE` racing across processes) is closed. But real cross-process content
+sharing is NOT safe to make the default yet, for a DIFFERENT reason than before: a bump-allocate-
+only heap with no reclaim mechanism, shared for the lifetime of an entire fork family, cannot
+sustain a real multi-exec workload's cumulative allocation the way N independent per-process heaps
+(each reclaimed whole by the OS at that process's exit) could. XVFB_FAILED/DBUS_FAILED remain
+genuinely UNTESTED this pass -- the boot never got far enough to reach Xvfb at all.
+
+Next steps, precisely scoped (supersedes step-4's pickup note 3, which assumed the cursor fix alone
+would be sufficient to flip the default -- it was necessary but not sufficient):
+
+1. Either implement a real reclaim path (when a cross-process-fork child that mapped the INHERITED
+   section exits, decommit/return the exact byte-range it claimed back to the shared pool -- needs
+   a free-list or generation-counted allocator over the shared region, not just a bump cursor, a
+   materially bigger design than this pass's scope), or keep the bulk `WindowsUserland::alloc`
+   heap sharing but route specifically the one-shot rootfs-rebuild/writable-layer buffer (the
+   rebuilding-rootfs-from-OCI-image path) through a PRIVATE, non-shared allocation regardless of the
+   sharing gate, since nothing about that specific buffer needs cross-process visibility in the
+   first place (only real, long-lived, actually-shared subsystem state does).
+2. Whichever fix lands, re-test against THIS SAME real workload (debian-xfce webtop_stack.sh, not a
+   lighter image) before re-flipping the default -- the 71-fork /bin/true stress and the
+   single-layer debian:stable-slim sentinel repro both passed cleanly under the broken default too
+   (their cumulative allocation stayed well under 8 GiB), so neither is sufficient evidence on its
+   own; only the real multi-layer image workload exposed this bug.
+3. Once a fix for this lands and the default is safely flipped, THEN re-attempt the
+   XVFB_FAILED/DBUS_FAILED question this whole investigation chain has been aimed at -- still
+   completely open, neither confirmed nor refuted by any session to date.
+4. Pickup notes 2 and 4 from the step-4 entry above (GlobalState's 22 fields not migrated;
+   trait-object vtables cross-process-invalid without same-base loading) are unaffected by this
+   pass and still apply verbatim.
+
+Code: `litebox_platform_windows_userland/src/lib.rs` (`shared_heap_cursor`,
+`SHARED_KERNEL_HEAP_CURSOR_OFFSET`, `SHARED_KERNEL_HEAP_DATA_OFFSET`, `init_shared_kernel_heap`,
+`WindowsUserland::alloc`), `litebox_platform_windows_userland/src/process_fork.rs` (the
+`shared_heap_export` gate, around line 1658). No test files added; this represents the
+atomic-cursor fix plus the reverted (opt-in, not default) gate, both cargo build-verified and
+live-verified per the ladder above.

@@ -9729,12 +9729,63 @@ const SHARED_KERNEL_HEAP_STATE_READY: u8 = 2;
 static SHARED_KERNEL_HEAP_STATE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(SHARED_KERNEL_HEAP_STATE_UNINIT);
 
-/// Bump-allocation cursor into the single, whole-process-lifetime shared-heap mapping. Every
-/// [`WindowsUserland::alloc`] call claims a sub-range by atomically advancing this past its
-/// requested size; nothing ever moves it backward (see that function and `free`'s doc comment for
-/// why per-allocation release is neither needed nor safe here).
-static SHARED_KERNEL_HEAP_NEXT_FREE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+/// Byte offset, within the shared kernel heap mapping itself, of the bump-allocation cursor
+/// (Track B step 5, ADVISORY-002 3.3). **Deliberately NOT a process-local `static`** -- that was
+/// the root cause of the `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` parent-crash regression documented
+/// in AGENTS.md's "Real cross-process content sharing" section: with the cursor per-process, a
+/// cross-process-fork CHILD that mapped the PARENT's own section still bump-allocated from an
+/// independent starting point through the SAME physical pages the parent's live heap objects
+/// already occupied, corrupting the parent. Putting the cursor itself inside the shared section,
+/// at this fixed offset, means every process in the fork family -- creator and every inheriting
+/// child alike -- reads and advances the exact SAME memory location, so a single atomic
+/// read-modify-write is sufficient to make allocation itself single-writer-safe across processes.
+///
+/// `core::sync::atomic::AtomicUsize::compare_exchange`/`fetch_add` compile to `lock cmpxchg`/`lock
+/// xadd` on x86-64 -- CPU cache-coherency-protocol instructions, not OS constructs. They are
+/// correctly atomic against any physical memory two cores can see through cache coherency,
+/// including the pages backing a cross-process shared section, with zero OS involvement -- the
+/// same principle POSIX/SysV shared-memory IPC and libraries like Boost.Interprocess rely on for
+/// lock-free shared-memory atomics on every platform. This is a fundamentally different primitive
+/// from `WaitOnAddress`/keyed events (see the "hard platform constraint" note elsewhere in this
+/// file): those fail cross-process because they key a WAITER by an OS-tracked identity, not
+/// because CPU atomic instructions are themselves process-scoped. A raw `InterlockedCompareExchange`
+/// FFI call would compile to the identical instruction on this target, so there is no correctness
+/// reason to bypass `core::sync::atomic` here.
+const SHARED_KERNEL_HEAP_CURSOR_OFFSET: usize = 0;
+
+/// First byte of actual bump-allocatable space: one page after the section's base, that first
+/// page reserved for the cursor at [`SHARED_KERNEL_HEAP_CURSOR_OFFSET`]. Committed eagerly by
+/// whichever process FIRST creates the section (see `init_shared_kernel_heap`), since the cursor
+/// must be writable before the very first real allocation that would otherwise commit its own
+/// range lazily. Windows shares commit state across every view of the same pagefile-backed
+/// section (already relied on, and live-verified, by `shared_kernel_heap_probe_child_read`'s
+/// cross-process read of a page the PARENT alone committed), so an inheriting child never needs
+/// to commit this page itself.
+const SHARED_KERNEL_HEAP_DATA_OFFSET: usize = 0x1000;
+
+/// Returns a reference to the cross-process bump-allocation cursor living AT a fixed offset
+/// inside THIS process's own mapping of the shared kernel heap section (see
+/// [`SHARED_KERNEL_HEAP_CURSOR_OFFSET`]). Every process in a fork family computes the identical
+/// address here, because [`SHARED_KERNEL_HEAP_ACTUAL_BASE`] is only ever set to an address a real
+/// mapping landed at -- for an inheriting child, `init_shared_kernel_heap` only accepts the
+/// mapping at all when `landed == base` (the parent's own landing address), so this pointer names
+/// the same physical page in every process in the family, never a look-alike private copy.
+///
+/// # Panics / safety
+/// Must only be called once [`SHARED_KERNEL_HEAP_STATE`] is `_READY` (guaranteed by every caller
+/// in this file, which all call [`init_shared_kernel_heap`] first) -- until then
+/// `SHARED_KERNEL_HEAP_ACTUAL_BASE` is `0` and the metadata page may not be committed yet.
+fn shared_heap_cursor() -> &'static core::sync::atomic::AtomicUsize {
+    let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+    debug_assert_ne!(base, 0, "shared_heap_cursor() called before heap init");
+    // SAFETY: see function doc comment -- `base + SHARED_KERNEL_HEAP_CURSOR_OFFSET` names a
+    // committed, `AtomicUsize`-sized, naturally-aligned range inside this process's own live
+    // mapping of the shared section, backed by the SAME physical pages in every process sharing
+    // this section.
+    unsafe {
+        &*((base + SHARED_KERNEL_HEAP_CURSOR_OFFSET) as *const core::sync::atomic::AtomicUsize)
+    }
+}
 
 /// The address this process's mapping actually landed at -- normally [`SHARED_KERNEL_HEAP_BASE`],
 /// but see [`init_shared_kernel_heap`]'s fallback: `SHARED_KERNEL_HEAP_BASE` is a high, sparse
@@ -9860,7 +9911,14 @@ fn init_shared_kernel_heap() {
             );
             SHARED_KERNEL_HEAP_SECTION_HANDLE.store(handle_val, Ordering::Release);
             SHARED_KERNEL_HEAP_ACTUAL_BASE.store(landed, Ordering::Release);
-            SHARED_KERNEL_HEAP_NEXT_FREE.store(landed, Ordering::Release);
+            // Deliberately NOT initializing the cursor here (unlike the fresh-section-creation
+            // path below): the cursor at `SHARED_KERNEL_HEAP_CURSOR_OFFSET` lives INSIDE this
+            // inherited section's own shared pages, already initialized (and quite possibly
+            // already advanced past the base by real live allocations) by whichever process
+            // first created it -- see `SHARED_KERNEL_HEAP_CURSOR_OFFSET`'s doc comment. Resetting
+            // it to `landed` here is exactly the previous parent-crashing bug: it would rewind a
+            // live shared cursor back to the base, handing out addresses the creator's own heap
+            // objects already occupy.
             SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
             shared_kernel_heap_probe_child_read(landed, true);
             return;
@@ -10089,7 +10147,46 @@ fn init_shared_kernel_heap() {
     // OWN fork children later -- see `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s doc comment.
     SHARED_KERNEL_HEAP_SECTION_HANDLE.store(section as usize, Ordering::Release);
     SHARED_KERNEL_HEAP_ACTUAL_BASE.store(landed, Ordering::Release);
-    SHARED_KERNEL_HEAP_NEXT_FREE.store(landed, Ordering::Release);
+
+    // This process is the FIRST to create this section (never true for an inherited child, which
+    // returned earlier above), so it alone is responsible for committing and initializing the
+    // cursor page at `SHARED_KERNEL_HEAP_CURSOR_OFFSET` before ANY real allocation (including this
+    // very function's own caller) can touch it. Committed eagerly, unlike the rest of the heap's
+    // on-demand commit, precisely because the cursor itself must be writable before the first
+    // lazy-commit allocation that would otherwise depend on reading it.
+    //
+    // SAFETY: `landed` is this process's own just-mapped, page-aligned view base; one page (0x1000
+    // bytes) is well within `SHARED_KERNEL_HEAP_SIZE`, and nothing else in the process can reach
+    // this heap yet (`SHARED_KERNEL_HEAP_STATE` is still `_INITIALIZING`, every other thread spins
+    // above).
+    let cursor_page_committed = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            landed as *mut c_void,
+            SHARED_KERNEL_HEAP_DATA_OFFSET,
+            Win32_Memory::MEM_COMMIT,
+            Win32_Memory::PAGE_READWRITE,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if cursor_page_committed.is_null() {
+        // Same allocation-free-failure-path constraint as every other FATAL branch in this
+        // function -- see the `CreateFileMappingW` failure comment above.
+        diag_raw_print(
+            b"[shared_kernel_heap] FATAL VirtualAlloc2(MEM_COMMIT) on cursor page failed win32_err=0x",
+            unsafe { GetLastError() } as usize,
+            b" addr=0x",
+            landed,
+        );
+        std::process::abort();
+    }
+    // SAFETY: the cursor page was just committed above, is page-aligned, and no other thread in
+    // this brand-new section can be reading/writing it yet.
+    unsafe {
+        (*((landed + SHARED_KERNEL_HEAP_CURSOR_OFFSET) as *const core::sync::atomic::AtomicUsize))
+            .store(landed + SHARED_KERNEL_HEAP_DATA_OFFSET, Ordering::Release);
+    }
     SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
 }
 
@@ -10257,19 +10354,20 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         // such sizes -- stays page-aligned throughout, matching every real caller's alignment
         // expectation without extra rounding.
         let actual_base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
-        let mut cur = SHARED_KERNEL_HEAP_NEXT_FREE.load(Ordering::Acquire);
+        // Cross-process-safe cursor: lives INSIDE the shared section itself (see
+        // `shared_heap_cursor`'s doc comment), not a process-local `static`, so a
+        // cross-process-fork child sharing this section via inherited handle advances the exact
+        // SAME cursor the parent (and every sibling) sees, via one atomic CAS loop -- correct
+        // regardless of which process actually performs the allocation.
+        let cursor = shared_heap_cursor();
+        let mut cur = cursor.load(Ordering::Acquire);
         let addr = loop {
             let next = cur.checked_add(size)?;
             if next > actual_base + SHARED_KERNEL_HEAP_SIZE {
                 // Exhausted the reservation; surfaces as an ordinary allocator OOM.
                 return None;
             }
-            match SHARED_KERNEL_HEAP_NEXT_FREE.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match cursor.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break cur,
                 Err(actual) => cur = actual,
             }

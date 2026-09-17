@@ -93,34 +93,26 @@ served from a fork-time filesystem snapshot), an already-borrowed fd table, a be
 a pipe end/path-recorded regular file/eventfd/close-on-exec (overridable by
 `LITEBOX_PROCESS_FORK_IGNORE_FDS`), or an unsanitizable `fs_base`/context. On a real `debian-xfce` boot
 the only remaining blocking kind is `unix-socket` — 5 refused forks of 34, down from 34/34. Per-kind
-deviations: archive — read before assuming real `fork()` semantics.
+deviations: archive.
 
 **Per-fork cost** was ~3.5-5s, now ~1.2s; a full `webtop_stack.sh` boot reaches `NGINX_STARTED` in under a
 minute versus never in 15+. Older rootfs-re-merge/writable-layer-growth cost explanations are
-**measured wrong**. Use `LITEBOX_DIAG_FORK_TIMING=1` for the next cost question. Three correctness bugs
-the perf work exposed are all fixed; mechanisms/repros/cost history: archive.
+**measured wrong**. Use `LITEBOX_DIAG_FORK_TIMING=1` for the next cost question. Three correctness
+bugs this exposed are fixed; detail: archive.
 
-**Reading a cross-process log** — the `fork_verify` "stale CODE pointer" noise-vs-signal read is archived
-(`docs/AGENTS_ARCHIVE_2026-09-15.md`).
+**Reading a cross-process log** — the `fork_verify` "stale CODE pointer" noise-vs-signal read: archive.
 
 **Still open**: nginx's own SSL-cert generation fails on its first real startup attempt — the original
 symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
 146-152`). Do not cite the separate curl-self-test stall as live open work: that one is fixed.
 
-**Fork-after-Xorg PERMANENT freeze — did NOT reproduce today (2026-09-17); live evidence says it is
-thread-based-fork-only.** The 2026-09-16 post-mortem (11-thread invasive `cdb` dump, mechanism
-narrowed to `fork_verify`'s single-step/AV-heal state machine, never proven live) could not be
-re-run: the archived repro now hits the ALREADY-DOCUMENTED "second glibc corruption class" (`double
-free or corruption (out)`, see "still open" above) on 8/8 forks across 2 attempts before Xorg
-survives long enough to reach the freeze precondition — worse than the archived "2/2 deterministic",
-likely because that session used a since-deleted prebuilt `--initial-files` tar, not `--oci-image`.
-**Decisive substitute test**: the identical script with `LITEBOX_PROCESS_FORK=1` as a real host env
-var (today's build, post `e8e1ad4`) completed cleanly 2/2 — zero freeze, zero double-free,
-`task-resume-probe` diagnostics confirm real cross-process execution. Consistent with the freeze
-being thread-path-specific (an identity/`D==0` child's `on_single_step` case (1) has
-`translate(rip) == rip`, a trivial fixed point, never a livelock). No breakpoint was ever set — the
-freeze never recurred to attach before. Full evidence, both repro logs, and a NEW disclosed ENOMEM
-finding under concurrent cross-process forks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; live evidence says it is
+thread-based-fork-only.** The archived repro now hits the ALREADY-DOCUMENTED "second glibc
+corruption class" (`double free or corruption (out)`, see "still open" above) before Xorg survives
+long enough to reach the freeze precondition. **Decisive substitute test**: the identical script
+with `LITEBOX_PROCESS_FORK=1` as a real host env var completed cleanly 2/2 — zero freeze, zero
+double-free, consistent with the freeze being thread-path-specific. Full evidence, both repro logs,
+and a disclosed ENOMEM finding under concurrent cross-process forks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Container images and OCI loading
 
@@ -284,44 +276,52 @@ gap (guest processes share no AF_UNIX/loopback/FIFO namespace -- see "A real des
 browser"'s "Open here" note), not a new bug. Full narrative, both bugs' elimination trails, PRDs:
 `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-## Real cross-process content sharing (Track B step 4, ADVISORY-002 §3.3) -- basic mechanism landed 2026-09-17, gated OFF by default
+## Real cross-process content sharing (Track B steps 4-5, ADVISORY-002 §3.3) -- cursor fixed+proven, still gated OFF: NEW capacity blocker found 2026-09-17
 
-Step 3's own gap -- "the section handle is never duplicated to a child" -- is closed at the
-MECHANISM level: `spawn_process_fork_child` (`litebox_platform_windows_userland/src/process_fork.rs`)
-can hand a fork CHILD a real handle to the PARENT's own shared-kernel-heap section via ordinary
-Windows handle INHERITANCE (mark inheritable + `CreateProcessW(bInheritHandles=TRUE)`, no
-`DuplicateHandle`/pid-discovery round trip needed since this parent already calls `CreateProcessW`
-for the child directly); the child (`init_shared_kernel_heap`, `lib.rs`) reads the handle
-value/base address from two env vars via the same allocation-free raw-Win32 mechanism
-`diag_alloc_enabled` uses, and `MapViewOfFile3`s the INHERITED section at the parent's exact
-address instead of creating its own.
+Step 4 (handle-inheritance mechanism, sentinel proof) unchanged -- see archive. Step 5 (this pass)
+moved the bump-allocation cursor (`shared_heap_cursor`, `SHARED_KERNEL_HEAP_CURSOR_OFFSET`,
+`lib.rs`) OUT of a process-local `static` and INTO the shared section itself, advanced by one
+atomic CAS: `AtomicUsize::compare_exchange` compiles to `lock cmpxchg`, a CPU cache-coherency
+instruction correct against any physical memory two cores share, cross-process section included --
+not an OS construct like `WaitOnAddress` (which fails cross-process for a different reason, see
+"hard platform constraint" above). This closes the exact bug that used to crash the parent
+(`STATUS_ACCESS_VIOLATION`) when step 4's inherit path went unconditional.
 
-**Live-verified with a direct sentinel write/read proof** (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`): the
-parent writes a known value near the end of its mapping; the child reads the SAME offset back after
-mapping the inherited section -- exact match, twice, on a real cross-process fork. This is genuine
-content sharing through the SAME physical pages, not merely address-consistent private copies.
+**Live-verified correct under real concurrent pressure**: the prior sentinel write/read repro still
+passes byte-for-byte with the cursor fix in place; a NEW escalation -- 10 parallel subshells x 5
+sequential `/bin/true` forks each, 71 real cross-process forks total, all genuinely mapping the SAME
+inherited section (zero private-fallback) -- completed exit 0, all markers present, zero
+corruption/crash/colliding-offset evidence. The cursor mechanism itself is correct.
 
-**GATED OFF by default (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` to enable) -- NOT yet safe as the
-default.** Enabling it unconditionally live-crashed the PARENT (`STATUS_ACCESS_VIOLATION`, silent,
-no VEH trace) on the same trivial repro that exits 0 with it off -- isolated via `git stash`
-before/after comparison, a genuine regression, root-caused: `SHARED_KERNEL_HEAP_NEXT_FREE` (the
-bump-allocation cursor) is still a per-process `static`, so once the child's own real allocations
-start, its cursor independently bump-allocates from the SAME base the parent's live heap objects
-already occupy -- two processes writing the SAME physical pages, corrupting the parent's own heap.
-With the gate off, default `LITEBOX_PROCESS_FORK=1` behavior is unchanged byte-for-byte (confirmed).
-**`XVFB_FAILED`/`DBUS_FAILED` do NOT resolve this pass** -- not attempted live against the full
-`webtop_stack.sh` boot: off, nothing changed by design; on, real fork density (nginx forks up to 30
-times) would hit the cursor-corruption bug on the first or second fork, before any AF_UNIX-dependent
-process could benefit regardless -- judged not worth the wall-clock for a foregone conclusion.
+**NOT flipped to the default -- live-booting the real target workload found a separate regression
+first.** Making export/inherit unconditional under `LITEBOX_PROCESS_FORK=1`, then booting
+`.wfgy/webtop_stack.sh` (`debian-xfce`, 17 layers, one alone 736 MiB), surfaced a capacity bug
+distinct from the fixed correctness bug: every plain external command the script execs (`sed`,
+`ln`, `mkdir`, ...) reconstructs its OWN full in-memory merged rootfs from the OCI layer cache
+(`globalstate-probe (child): rebuilding rootfs from OCI image ...`) -- a single ~173 MiB+ allocation
+through the SAME shared heap. Sharing off: each such process's whole 8 GiB reservation is a PRIVATE
+section Windows reclaims the instant that process exits. Sharing on: every one draws from the SAME
+ONE 8 GiB pool for as long as the eldest ancestor (this boot's PID 1) stays alive, and this bump
+allocator never frees/decommits a claimed range on any exit (`WindowsUserland::free`'s own "dead in
+practice" comment) -- so ~45-90 plain execs into a real `debian-xfce` boot the shared pool is
+permanently exhausted and every later forked command aborts (live: `memory allocation of
+181493744 bytes failed`, repeating, well before Xvfb/dbus start) -- **worse** than sharing-off,
+which reaches `NGINX_STARTED`/`NGINX_SELFTEST_FAILED` and beyond without this class. Reverted the
+gate to opt-in (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`); confirmed byte-for-byte that plain
+`LITEBOX_PROCESS_FORK=1` is unchanged (0 inherited-section events, clean exit 0).
 
-**Next step, precisely scoped**: move `SHARED_KERNEL_HEAP_NEXT_FREE` INTO the shared section itself
-and advance it with a cross-process-visible interlocked op instead of a process-local `AtomicUsize`
--- the one fix that unblocks flipping the gate to the default and re-testing the AF_UNIX question
-for real. `GlobalState`'s 22 fields are NOT migrated to live in the shared heap yet -- this pass
-proves only the section-sharing MECHANISM, not that any real litebox subsystem state uses it.
-Trait-object vtables (`DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>`) remain
-cross-process-invalid without same-base runner-image loading (ASLR still on), a separate blocker.
-Full mechanism detail, exact repro command, and pickup notes: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**`XVFB_FAILED`/`DBUS_FAILED` remain genuinely untested** -- this boot died from heap exhaustion
+during the nginx-config stage, well before Xvfb ever launches, so the AF_UNIX-sharing question this
+investigation was aimed at is still open, neither confirmed nor refuted.
+
+**Next step, precisely scoped**: needs either (a) a reclaim mechanism -- decommit/return a
+process's claimed byte-range on its exit (nothing does this today, in- or cross-process), or (b)
+routing the one-shot rootfs-rebuild buffer through a private, non-shared allocation instead of this
+heap -- before unconditional sharing is safe for a real multi-exec workload. Do not re-flip the
+default without re-testing this SAME `debian-xfce webtop_stack.sh` boot, not just the lighter repros
+above. `GlobalState`'s 22 fields still are NOT migrated to live in the shared heap; trait-object
+vtables remain cross-process-invalid without same-base loading (ASLR still on) -- both separate,
+still-open blockers. Full evidence, byte accounting, both repro logs: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -391,8 +391,6 @@ Cargo build/fmt-verified, no boot needed. Full detail: `docs/AGENTS_ARCHIVE_2026
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
   `drm_flip_probe.c`, `clone_probe.c`) plus `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`. OCI-pull
   Python scripts there are retired.
-- `.gm/memories/`: `mem-c62454fedb1baef8-2714` (RtlpUnwindPrologue), `mem-e5107049137fcf43-1303`
-  (browser witness), `mem-7cb09e839ca086f2-4223` (XFCE/MATE/weston), `mem-6c4697ac568ea7be-4487`
-  (packager OOM), `mem-136ae2ce29bc28a4-3133` (image tags), `mem-b709a7d784b98110-1430` (cross-process
-  sync), `mem-f17269d5777055d3-3326` (2026-09-07 defects), `mem-3e13872ce1ffe95e-2814` (CoW),
-  `mem-3c4a9980a884604b-1031` (GUI protocol).
+- `.gm/memories/` holds older per-topic notes (RtlpUnwindPrologue, browser witness, XFCE/MATE/weston,
+  packager OOM, image tags, cross-process sync, CoW, GUI protocol) — superseded by this file/archives
+  wherever they overlap.

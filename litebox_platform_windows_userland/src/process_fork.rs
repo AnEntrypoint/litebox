@@ -1655,22 +1655,35 @@ pub fn spawn_process_fork_child(
     // preserves the exact numeric handle value into the child's own handle table, so the decimal
     // value read back from this env var in the child is already correct with no further IPC.
     //
-    // GATED behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`, deliberately NOT the unconditional
-    // production default yet: live-verified this session (sentinel write/read round-trip byte for
-    // byte correct through the genuinely-shared section) that the HANDLE-DUPLICATION/MAPPING
-    // mechanism itself is fully correct, but also live-reproduced a SEPARATE, real corruption this
-    // exposes -- `SHARED_KERNEL_HEAP_NEXT_FREE`'s bump-allocation cursor is still a process-local
-    // static, so once the child's own `GlobalState`/`Task` reconstruction starts making REAL heap
-    // allocations, it independently bump-allocates from the SAME starting address the parent's own
-    // live heap objects already occupy -- two processes writing through the SAME physical pages at
-    // the SAME offsets, corrupting the parent's own heap (observed live: the parent, previously
-    // exiting 0 on this exact repro, crashed with an unhandled `STATUS_ACCESS_VIOLATION` and no
-    // VEH trace once this path went unconditional). That cursor needs to move INTO the shared
-    // section itself and be advanced with a cross-process atomic (or an equivalent single-writer
-    // protocol) before this can be the default -- explicitly the next gap, not silently papered
-    // over. Until then, the DEFAULT (`LITEBOX_PROCESS_FORK=1` alone) keeps today's existing,
-    // already-working behavior byte-for-byte: every process still reserves its own private,
-    // address-consistent-but-content-independent section, exactly as before this pass.
+    // STILL GATED behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`, deliberately NOT the unconditional
+    // production default, despite Track B step 5 (ADVISORY-002 3.3) closing the bug this gate was
+    // ORIGINALLY added for: the bump-allocation cursor (`shared_heap_cursor` in `lib.rs`) now
+    // lives INSIDE the shared section itself and is advanced with a single cross-process-visible
+    // atomic CAS, and that fix IS live-verified correct under real concurrent allocation pressure
+    // from both parent and child simultaneously (71 real cross-process forks, zero corruption, zero
+    // crash, zero colliding offsets -- see AGENTS.md's "Real cross-process content sharing"
+    // section). But making it the default and then live-booting the actual target workload
+    // (`.wfgy/webtop_stack.sh`, `docker.io/linuxserver/webtop:debian-xfce`, 17 layers, one alone
+    // 736 MiB) surfaced a SEPARATE, real regression this fix does not touch: every plain external
+    // command this script execs (`sed`, `ln`, `mkdir`, ...) reconstructs its own full in-memory
+    // merged rootfs from the OCI layer cache (`globalstate-probe (child): rebuilding rootfs from
+    // OCI image ...`), a single ~173 MiB-plus host allocation THROUGH THIS SAME shared heap. With
+    // sharing OFF, each such process's entire 8 GiB reservation (rootfs buffer included) is a
+    // PRIVATE section Windows reclaims the instant that short-lived process exits -- effectively
+    // unlimited cumulative capacity across a long boot. With sharing ON, all of them draw from the
+    // SAME ONE 8 GiB pool for as long as the eldest ancestor (this whole boot's PID 1) stays alive,
+    // and this bump allocator never frees/decommits a claimed range on ANY process's exit (see
+    // `WindowsUserland::free`'s own "dead in practice" doc comment) -- so roughly 45-90 plain execs
+    // into a real `debian-xfce` webtop boot, the shared pool is permanently exhausted and every
+    // subsequent forked command aborts with a genuine host-side Rust allocation failure (live
+    // log: `memory allocation of 181493744 bytes failed`, repeating, well before Xvfb/dbus even
+    // start) -- WORSE than the sharing-off default, which reaches `NGINX_STARTED`/
+    // `NGINX_SELFTEST_FAILED` and beyond without ever hitting this class. Real per-process content
+    // sharing therefore still needs either a reclaim mechanism (decommit/return a process's claimed
+    // ranges back to the shared pool on its exit) or routing the one-shot rootfs-rebuild buffer
+    // through a private, non-shared allocation instead of this shared heap, before it is safe as
+    // the default for a real multi-exec workload -- neither exists yet. Full evidence, exact repro,
+    // and the precise byte accounting: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
     let shared_heap_export = std::env::var_os("LITEBOX_DIAG_SHARED_HEAP_INHERIT")
         .is_some()
         .then(crate::shared_kernel_heap_export_for_fork_child)
