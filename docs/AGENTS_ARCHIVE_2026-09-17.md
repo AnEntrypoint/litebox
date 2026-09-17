@@ -2333,3 +2333,25 @@ unrelated to the writable-layer mechanism this pass fixed. Reaching a real brows
 witness needs that separate, larger, already-scoped follow-on (Track B step 3, fixed-base shared
 heap, letting `Xvfb`/`dbus-daemon` themselves become cross-process-fork-eligible) -- not attempted
 this pass, out of scope for a writable-layer lifecycle bug.
+
+## `Network::socket_set` made shared-arena-native -- full verification detail (eighth pass), archived from AGENTS.md to stay under 30KB
+
+Full text moved here verbatim from AGENTS.md's now-compressed entry (ninth pass A/B section
+supersedes the "not yet diagnosed" ending):
+
+`cargo check`/`build --release` clean across `litebox`, `litebox_platform_windows_userland`,
+`litebox_shim_linux`, `litebox_runner_linux_on_windows_userland`; all 25 `litebox` net unit tests
+pass unchanged (incl. full bidirectional-TCP flow through `Network::new`/`socket`/`connect`/
+`accept`/close). Live boot (`webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`, release binary): reached
+`NGINX_STARTED` (matching prior best), zero occurrences of the `tuple.unwrap()` panic across the
+whole run (previously reproduced routinely), and a direct `curl`/`Invoke-WebRequest` to the
+published port showed a genuinely different, more-advanced signature than before -- TCP connects
+and the HTTP request is sent and held open, timing out waiting for a response, vs. the
+previously-documented `http_code=000`/"accepted then torn down" -- consistent with (not proof of)
+the socket-state-sharing fix actually taking effect. The run then stalled with no further `[s]`
+markers and no log growth; a non-invasive `cdb -pv -p <pid> -c "~*k;qd"` sample of the
+longest-lived nginx-tree process found every visible thread blocked in `WaitForSingleObjectEx`,
+not spinning.
+
+(Design/mechanism detail for `MAX_SOCKETS`/`shared_kernel_arena_alloc_bytes` itself stays in
+AGENTS.md's main entry, unchanged -- only this verification-transcript paragraph moved here.)

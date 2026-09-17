@@ -132,28 +132,86 @@ arena allocation would exhaust the bump-allocated, never-freed arena under real 
 follow-ons; the former also touches the shared `DescriptorTable::drain_entries_full_covered_by`
 API). `litebox/src/net/mod.rs`'s own `MAX_SOCKETS` doc comment has the full design and rationale.
 
-**Verification**: `cargo check`/`build --release` clean across `litebox`, `litebox_platform_
-windows_userland`, `litebox_shim_linux`, `litebox_runner_linux_on_windows_userland`; all 25
-`litebox` net unit tests pass unchanged (incl. full bidirectional-TCP flow through `Network::new`/
-`socket`/`connect`/`accept`/close). Live boot (`webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`,
-release binary): reached `NGINX_STARTED` (matching prior best), **zero occurrences of the
-`tuple.unwrap()` panic across the whole run** (previously reproduced routinely), and a direct
-`curl`/`Invoke-WebRequest` to the published port now shows a genuinely different, more-advanced
-signature than before — TCP connects and the HTTP request is sent and held open, timing out
-waiting for a response, vs. the previously-documented `http_code=000`/"accepted then torn down"
-— consistent with (not proof of) the socket-state-sharing fix actually taking effect. The run then
-stalled with no further `[s]` markers and no log growth; a non-invasive `cdb -pv -p <pid> -c
-"~*k;qd"` sample of the longest-lived nginx-tree process found every visible thread blocked in
-`WaitForSingleObjectEx`, not spinning. **Not diagnosed further this pass** — this is very likely
-the SAME pre-existing, not-yet-root-caused nginx self-test/Xvfb stall this file already tracks
-below ("Still open: nginx's own SSL-cert generation fails..." / the prior pass's "wedges
-permanently" curl-retry finding), not a new defect from this fix, but that is not yet PROVEN
-(no repro was run on the pre-fix binary in the same sitting for a controlled A/B). **Next
-pickup step: re-run the identical repro on the pre-fix commit to confirm the stall itself is
-unchanged, then root-cause the stall itself** (likely inside nginx's self-test loop or the
-Xvfb/dbus thread-fork path, per the existing open items below) — the browser/terminal/apps
-milestone is still not reached. Full transcript and command line: this pass's own session (no
-separate archive entry needed — the design/verification above is complete and self-contained).
+**Verification**: `cargo check`/`build --release` clean across all four affected crates; all 25
+`litebox` net unit tests pass unchanged. Live boot: reached `NGINX_STARTED` with **zero**
+`tuple.unwrap()` panics (previously routine), and a direct `curl` to the published port showed a
+materially more-advanced signature (TCP connects, request sent, times out waiting for a response)
+than the old `http_code=000`/instant-teardown. Full transcript: archive. The run then stalled with
+no further `[s]` markers — root-caused further in the very next entry below.
+
+**A/B CONFIRMED (ninth pass, same day): this is a NEW, post-fix-only stall, NOT the same
+pre-existing issue.** Built the immediate parent commit (`4bad287`, pre-`socket_set`-fix) in an
+isolated worktree (shared `CARGO_TARGET_DIR` with the main tree for incremental-build speed —
+**caution**: doing this concurrently with an in-progress different-commit build corrupts cargo's
+cache across the two commits' differing trait shapes, `error[E0407]`; always `cargo clean -p
+<crate>` for every crate whose trait/impl surface differs before rebuilding after a worktree
+build shared the same target dir) and ran the byte-identical repro
+(`--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar --
+/bin/bash /webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`). Old binary reaches `NGINX_STARTED` at the
+identical log position (~6490 vs. new binary's ~6489/6504 across repeated runs), then panics
+**8 times** with the exact routine `tuple.unwrap()` at `smoltcp-0.12.0/src/socket/tcp.rs:2126`,
+each time respawned by `NGINX_SUPERVISOR`'s retry loop — it never reaches a stable stalled state,
+it crash-loops. New (post-fix) binary reaches the same point with **zero** panics and then
+stalls indefinitely with no further `[s]` markers — a state the old binary structurally cannot
+reach (it crashes first). **Conclusion: today's `Network::socket_set` fix is genuinely correct
+(the panic is gone, confirmed 2/2 A/B runs) and has newly EXPOSED a different, previously-unreachable
+stall** — not introduced a regression in the sense of breaking something that worked before,
+but uncovering something that was always broken further downstream, previously masked by the
+routine crash.
+
+**Root-cause progress (same pass): one real, scoped bug found, fixed, and verified NOT to be
+the (sole) cause of the reproduced stall.** Live symbolized `cdb -pv` (`-y <dir-with-matching-
+correctly-named .pdb>` — the debug directory embeds the ORIGINAL build filename, so a renamed
+copy of the exe needs a same-named-as-original `.pdb` alongside it, not just a same-content one
+under any name, or symbol loading silently falls back to raw offsets) on the newest surviving
+guest fork-child after the stall found: one thread frozen (bit-identical RIP/stack across 3+
+independent re-attaches spanning real wall-clock minutes) deep in `Network::connect`'s
+`LocalPortAllocator::ephemeral_port`/`deallocate`, two more blocked in `RawMutex::block`
+(reached via a blocking `detached_pipe_read` and via a `Process` `Weak::drop`), while the
+process's TOTAL CPU time climbs continuously and substantially (measured 36s → 70s → 84s → 103s+
+over about two real minutes) — a genuine sustained CPU burn, not a clean idle block, but from a
+mechanism not fully localized to any single sampled thread (thread-churn and a `SafeZoneAllocator`
+spinlock livelock were both considered and NOT confirmed; see "Closed" below for what WAS
+confirmed). The boot log separately showed `RawMutex::block_or_maybe_timeout: waiter queue full,
+falling back to polling` **4 times** after `NGINX_STARTED` on the new binary and **zero** times
+on the old — direct evidence that today's `socket_set` sharing creates enough real cross-process
+lock contention to overflow the pre-existing fixed 32-slot `WaiterQueue` (`MAX_INLINE_WAITERS`,
+landed `1ba3c7a`, earlier the same day) for the first time in a real boot. Reading that fallback
+(`RawMutex::poll_until_value_changes`) found it had **no dead-holder/orphan-recovery check at
+all**, unlike every registered waiter on the same mutex (`try_recover_from_dead_holder`, checked
+every `LIVENESS_CHECK_INTERVAL`) — a real, independent gap in the earlier `1ba3c7a` fix's
+coverage. **Fixed** (`e1d6e56`): factored the core liveness-probe-and-CAS-reset logic out into
+`try_recover_from_dead_holder_unregistered`, called periodically from
+`poll_until_value_changes` too. `cargo check` + full release build clean.
+
+**Re-tested against the SAME real workload after the fix, per this project's own standing
+practice — the fix is real but does NOT resolve the reproduced stall.** A fourth full boot (fixed
+binary) reached `NGINX_STARTED` again, stalled again in the identical way (same frozen-thread/
+rising-CPU signature, confirmed live via `cdb` on the newest fork-child, CPU climbing 36s→103s+),
+and critically **the "waiter queue full" warning never fired at all in this run** — proof this
+specific stall instance does not even go through the code path just fixed. The fix is correct and
+worth keeping (it closes a genuine, real defect that WILL matter whenever that queue does
+overflow), but it is not THE cause of this reproduction. **Ruled out this pass**: a thread-spawn
+storm (repeated `~` thread-ID listings taken seconds apart show a stable, unchanging 6-thread set,
+not churn); an obviously-broken/no-op `sleep` in the guest self-test loop (~21 fork-child
+respawn cycles observed in the stalled window is roughly consistent with the script's own coded
+~1-4s-per-iteration cadence, not obviously anomalous). **Still genuinely open**: what mechanism
+produces the sustained, substantial, continuously-rising CPU on a process whose every sampled
+thread's stack looks static between samples. Leading unexamined hypothesis for next pickup:
+the already-known, already-flagged, never-yet-fixed `SafeZoneAllocator::alloc` livelock
+(`spin::SpinMutex`-protected global allocator, referenced but "not re-investigated" in this
+file's own cross-process-fork section above) — today's `shared_kernel_arena_alloc_bytes` call
+adds a new allocation into this exact boot's critical path for the first time, a plausible new
+trigger for a previously-dormant class of bug, structurally distinct from (and not yet checked
+against) the arena bump-allocator's own separate CAS loop (`shared_kernel_arena_alloc`, which is
+NOT global-allocator-protected and was read this pass — no obvious unbounded-retry shape found
+there). **Next pickup, precise**: attach a live kernel/ETW-level CPU sampling profiler (not
+point-in-time `cdb` snapshots, which cannot distinguish "truly frozen with CPU spent elsewhere in
+the process" from "moving too fast/too locally to catch between samples") to the specific hot
+PID next time this reproduces, to find exactly which thread and instruction the CPU is actually
+going to — the browser/terminal/apps milestone is still not reached. Full transcript, cdb dumps
+and both A/B boot logs: this pass's own session (`.wfgy/ab_*` — gitignored, not committed).
 
 **`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
 ~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
@@ -203,14 +261,14 @@ was received but never forwarded to `spawn_process_fork_child` — fixed, same e
 to hold a non-cloexec eventfd at their `fork()` call site).
 
 **Pickup, precise**: (1) debugger-root-cause `wait.rs:224` before touching it — highest-value,
-most frequent panic; (2) root-cause the `/tmp/empty` writable-layer-visibility gap; (3) root-cause
-the post-`NGINX_STARTED` stall this file's "`socket_set` made shared-arena-native" entry above
-just re-confirmed (curl connects/sends/times-out, no `[s]` marker progress, all sampled nginx-tree
-threads blocked not spinning) — likely the SAME nginx self-test/Xvfb class as (1)/(2), confirm via
-A/B against the pre-fix commit before assuming so; (4) finish the `Network` shared-arena redesign
-(`queued_for_closure`/`closing_in_background`, then per-socket buffer payload bytes — see
-`litebox/src/net/mod.rs`'s `MAX_SOCKETS` doc comment); (5) after (1)-(4), `timerfd`/`signalfd` are
-the next-cheapest carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
+most frequent panic; (2) root-cause the `/tmp/empty` writable-layer-visibility gap; (3) **A/B now
+DONE, see the "A/B CONFIRMED (ninth pass)" entry above** — root-cause the sustained-CPU-rise
+mechanism it left open (leading hypothesis: `SafeZoneAllocator::alloc` livelock, needs a real
+CPU-sampling profiler, not point-in-time `cdb` snapshots) rather than re-deriving the A/B answer;
+(4) finish the `Network` shared-arena redesign (`queued_for_closure`/`closing_in_background`, then
+per-socket buffer payload bytes — see `litebox/src/net/mod.rs`'s `MAX_SOCKETS` doc comment);
+(5) after (1)-(4), `timerfd`/`signalfd` are the next-cheapest carriable fd kinds before attempting
+`socket`/`unix-socket`/`pty`/`epoll`.
 
 ## Container images and OCI loading
 
