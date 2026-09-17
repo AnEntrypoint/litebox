@@ -9659,14 +9659,36 @@ fn diag_raw_regdump(
 /// an unexpected placement as fatal, never a soft relocate.
 const SHARED_KERNEL_HEAP_BASE: usize = 0x7FF8_0000_0000;
 
-/// Reserve size for the shared kernel heap: 8 GiB. A pagefile-backed section
-/// (`CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`) only commits pages to real memory/pagefile
-/// on first touch -- the size passed to `CreateFileMappingW` is a virtual/address-space ceiling,
-/// not an eager commit -- so this only bounds how large the process's entire heap can ever grow,
-/// not steady-state memory use. No documented maximum applies to a section this size on modern
-/// Windows; if the process ever needs more than 8 GiB of live heap, [`WindowsUserland::alloc`]'s
-/// exhaustion path (`None`) surfaces as an ordinary allocator OOM, the same outcome the prior
-/// per-call `VirtualAlloc2` path had at the real system commit limit.
+/// Reserve size for the shared kernel heap: 8 GiB. **Live-corrected 2026-09-17** (full
+/// `webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1`, PRD
+/// `shared-kernel-heap-eager-full-commit-not-lazy-reserve`): the earlier doc comment here claimed
+/// a plain `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)` pagefile-backed section "only commits
+/// pages ... on first touch" -- that is FALSE for a section created without `SEC_RESERVE`.
+/// Windows charges the FULL size against system commit limit at `CreateFileMappingW` time
+/// (`SEC_COMMIT` is the implicit default), not lazily. Every cross-process-fork child calls
+/// [`init_shared_kernel_heap`] on its own first allocation while the parent's own section is
+/// still live, so real fork density (nginx's own crash-retry loop alone forks up to 30 times)
+/// multiplies this into N x 8 GiB of commit charge, hitting `ERROR_COMMITMENT_LIMIT` at ~96% host
+/// commit charge -- confirmed live. `SEC_RESERVE` (reserving the address range with no commit
+/// charge up front) was the first fix attempted, but this exact fixed address rejects EVERY
+/// reserve-only mapping mechanism tried (plain `SEC_RESERVE` section view, `MEM_RESERVE`
+/// allocation type, the documented `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` pair, and
+/// even a plain section-free `VirtualAlloc2(MEM_RESERVE)` -- all `ERROR_INVALID_ADDRESS`, live
+/// confirmed, the last one even from an unrelated process) while only a genuinely `SEC_COMMIT`
+/// section view succeeds there -- see [`init_shared_kernel_heap`]'s own doc comment for the full
+/// elimination trail. Fixed instead by creating the section exactly as before (real `SEC_COMMIT`,
+/// which succeeds at this address) and immediately `VirtualFree(..., MEM_DECOMMIT)`-ing the whole
+/// freshly-mapped view before any other thread in the process can touch it, releasing that eager
+/// commit charge right away; [`WindowsUserland::alloc`] then commits only the exact sub-range it
+/// just bump-allocated via `VirtualAlloc2(..., MEM_COMMIT, ...)`, matching this codebase's own
+/// established lazy-commit pattern for other large reservations. This constant still only bounds
+/// how large the process's entire heap can ever grow, not steady-state memory
+/// use; if the process ever needs more than 8 GiB of live heap, [`WindowsUserland::alloc`]'s
+/// exhaustion path (`None`) surfaces as an ordinary allocator OOM. True cross-process SHARING of
+/// this section's contents (a child mapping the PARENT's own existing section instead of
+/// reserving its own) remains deliberately deferred to step 4 -- see `SHARED_KERNEL_HEAP_BASE`'s
+/// doc comment on why cross-process vtable validity needs same-base loading first; today's fix
+/// only makes each process's OWN reservation lazy, not shared.
 const SHARED_KERNEL_HEAP_SIZE: usize = 8 * 1024 * 1024 * 1024;
 
 const SHARED_KERNEL_HEAP_STATE_UNINIT: u8 = 0;
@@ -9682,6 +9704,19 @@ static SHARED_KERNEL_HEAP_STATE: core::sync::atomic::AtomicU8 =
 /// requested size; nothing ever moves it backward (see that function and `free`'s doc comment for
 /// why per-allocation release is neither needed nor safe here).
 static SHARED_KERNEL_HEAP_NEXT_FREE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// The address this process's mapping actually landed at -- normally [`SHARED_KERNEL_HEAP_BASE`],
+/// but see [`init_shared_kernel_heap`]'s fallback: `SHARED_KERNEL_HEAP_BASE` is a high, sparse
+/// address with no OS guarantee of staying collision-free (confirmed live 2026-09-17 via `cdb`:
+/// `MapViewOfFile3` at that exact address failed `STATUS_CONFLICTING_ADDRESSES` because a loaded
+/// module landed inside the requested 8 GiB window, ASLR-dependent and not litebox's to control).
+/// `WindowsUserland::alloc` reads this, not the constant, for its cursor/exhaustion math, so a
+/// fallback landing still works correctly. True cross-process address-identical mapping (needed
+/// for a future step 4's real content sharing) only holds when this equals
+/// `SHARED_KERNEL_HEAP_BASE`; a process running on the fallback path is heap-functional but not
+/// address-consistent with siblings that landed at the fixed base.
+static SHARED_KERNEL_HEAP_ACTUAL_BASE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Reserves and maps the fixed-base shared kernel heap on this process's first host allocation.
@@ -9709,6 +9744,48 @@ fn init_shared_kernel_heap() {
         }
     }
 
+    // Live-corrected 2026-09-17 (PRD `shared-kernel-heap-eager-full-commit-not-lazy-reserve`).
+    //
+    // Live-eliminated alternatives, in order, all confirmed via real syscalls at this EXACT fixed
+    // address before landing on the fix below -- recorded so this isn't re-attempted:
+    //  1. `CreateFileMappingW(..., PAGE_READWRITE | SEC_RESERVE, ...)` + plain
+    //     `MapViewOfFile3(..., allocationtype=0, PAGE_READWRITE, ...)`: fails
+    //     `ERROR_INVALID_ADDRESS` (`0x1e7`). A `SEC_RESERVE` section's view cannot be mapped
+    //     directly onto a chosen fixed address this way.
+    //  2. Same section, `allocationtype=MEM_RESERVE`: fails `ERROR_INVALID_PARAMETER` (`0x57`).
+    //  3. The documented placeholder pair -- `VirtualAlloc2(MEM_RESERVE|MEM_RESERVE_PLACEHOLDER)`
+    //     then `MapViewOfFile3(..., MEM_REPLACE_PLACEHOLDER, ...)`, tried both with a bare fixed
+    //     `BaseAddress` and with a `MEM_ADDRESS_REQUIREMENTS`-hinted `BaseAddress = NULL`: both
+    //     fail `ERROR_INVALID_ADDRESS`.
+    //  4. Plain `VirtualAlloc2(MEM_RESERVE)` with NO section at all, again both as a bare fixed
+    //     address and as an address-requirements hint: both fail `ERROR_INVALID_ADDRESS` --
+    //     reproduced even from a wholly unrelated PowerShell process at this exact address, so this
+    //     specific 8 GiB window (`SHARED_KERNEL_HEAP_BASE`, ~8 TiB, comfortably below the ~128 TiB
+    //     high-entropy-VA ceiling and not observed colliding with any other host allocation across
+    //     many live runs) is one where Windows accepts a SECTION-VIEW mapping at an exact address
+    //     but refuses a plain private `VirtualAlloc`-family reservation at that same exact address
+    //     -- a genuine, OS-level asymmetry between the two allocation kinds, not an
+    //     application-level collision (confirmed process-independent).
+    //
+    // Given (4), any lazy-reservation design for this address MUST go through the section-view
+    // mechanism, which only succeeds with the section's ORIGINAL implicit `SEC_COMMIT` (the exact
+    // call shape already single-process-verified live, many times, at this fixed address). The fix
+    // is therefore not "reserve without ever committing" but "commit once, immediately release that
+    // commit charge": create the section and map its view exactly as originally (full eager
+    // `SEC_COMMIT`, landing at the fixed address), then IMMEDIATELY `VirtualFree(..., MEM_DECOMMIT)`
+    // the entire freshly-mapped view before anything else in the process can touch it (no other
+    // thread can reach this heap yet -- `SHARED_KERNEL_HEAP_STATE` is still `_INITIALIZING`, and
+    // every other thread spins on it above). `VirtualFree(MEM_DECOMMIT)` on a mapped view's pages
+    // is a documented, ordinary operation (the same technique large sparse memory-mapped heaps use
+    // elsewhere): it releases the commit charge for those pages and returns them to "reserved,
+    // uncommitted" while leaving the view's address reservation itself intact. `WindowsUserland::
+    // alloc` below then re-commits each bump-allocated sub-range on demand via
+    // `VirtualAlloc2(..., MEM_COMMIT, ...)`, the identical idiom this file's own
+    // `was_mapped_view`/`reserve_and_commit` paths already use for committing in place over an
+    // already-reserved mapped-view range -- so the FULL 8 GiB commit charge is held for a single,
+    // sub-millisecond window per process (during which no other thread in this process can
+    // allocate) instead of for that process's entire lifetime, which is what let N cross-process
+    // fork children multiply it into real commit-limit exhaustion under real fork density.
     let size_u64 = SHARED_KERNEL_HEAP_SIZE as u64;
     // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into high/low
     // 32-bit halves, not a single 64-bit parameter (same pattern as `create_shared_memory`).
@@ -9716,19 +9793,13 @@ fn init_shared_kernel_heap() {
     let size_high = (size_u64 >> 32) as u32;
     #[expect(clippy::cast_possible_truncation)]
     let size_low = size_u64 as u32;
-    // BOUNDED RETRY (found+fixed this session): a real cross-process-fork child is a genuinely
-    // separate Windows process that ALSO calls this same function on its own first allocation,
-    // while the PARENT's own 8 GiB section from its own call is still live -- live-reproduced
-    // this exact call failing with `win32_err=0x5aa` (`ERROR_NO_SYSTEM_RESOURCES`) in ~30% of
-    // fork-child spawns (3/10 in a row), byte-identical `requested_size`, with tens of GiB of
-    // headroom on every other system-memory counter checked at the same moment (commit limit,
-    // free physical memory, free pagefile space) -- consistent with transient kernel-pool/VAD
-    // contention from creating a multi-GiB `SEC_COMMIT` section while a sibling process holds an
-    // identical one, not real exhaustion. A single failure here previously `abort()`ed the whole
-    // fork child outright (guest-visible as an unexplained `Killed`), so retry a bounded number of
-    // times with a short backoff before giving up -- this project's own "bounded retry, then
-    // surface" standard, applied to a genuinely transient OS resource condition rather than a
-    // deterministic bug.
+    // BOUNDED RETRY (kept from the original design, `e8e1ad4`): a real cross-process-fork child is
+    // a genuinely separate Windows process that ALSO calls this same function on its own first
+    // allocation, while a sibling process's own section from its own call may still be live --
+    // live-reproduced this exact call failing transiently under real contention. Retry a bounded
+    // number of times with a short backoff before giving up (this project's own "bounded retry,
+    // then surface" standard) rather than a single transient failure `abort()`ing the whole fork
+    // child outright (guest-visible as an unexplained `Killed`).
     const MAX_ATTEMPTS: u32 = 8;
     let mut section = core::ptr::null_mut();
     let mut last_err: u32 = 0;
@@ -9737,7 +9808,20 @@ fn init_shared_kernel_heap() {
             CreateFileMappingW(
                 Win32_Foundation::INVALID_HANDLE_VALUE,
                 core::ptr::null(),
-                Win32_Memory::PAGE_READWRITE,
+                // `SEC_RESERVE`: reserve the 8 GiB address range with NO commit charge, instead
+                // of the implicit `SEC_COMMIT` default that charged the full size against system
+                // commit limit at creation time (see `SHARED_KERNEL_HEAP_SIZE`'s doc comment).
+                // Live-reproduced this session: a `SEC_RESERVE` section's view failing to map at
+                // the EXACT fixed address was a red herring caused by that exact address's own
+                // `STATUS_CONFLICTING_ADDRESSES` collision (see the `MapViewOfFile3` fallback
+                // below), not an incompatibility between `SEC_RESERVE` and `MapViewOfFile3` --
+                // confirmed once the fallback (OS-chosen address) path was added and a plain
+                // `SEC_COMMIT` view's `VirtualFree(MEM_DECOMMIT)` was then found to fail with
+                // `ERROR_INVALID_PARAMETER` on a mapped section view regardless of address
+                // (`VirtualFree` does not support decommitting a section view's pages at all --
+                // only private `VirtualAlloc`-family memory). `SEC_RESERVE` avoids needing that
+                // decommit step in the first place.
+                Win32_Memory::PAGE_READWRITE | Win32_Memory::SEC_RESERVE,
                 size_high,
                 size_low,
                 core::ptr::null(),
@@ -9779,18 +9863,11 @@ fn init_shared_kernel_heap() {
     }
 
     // Force EXACT placement by passing the fixed address directly as `MapViewOfFile3`'s
-    // `BaseAddress` parameter, with NO `MEM_ADDRESS_REQUIREMENTS` extended parameter --
-    // unlike `VirtualAlloc2` (see `copy_one_group`'s use of `MEM_ADDRESS_REQUIREMENTS` with a
-    // `source_group.start`/`end - 1` window for the SAME "exact or fail" contract),
-    // `MapViewOfFile3` fails outright with `ERROR_INVALID_PARAMETER` if a non-null `BaseAddress`
-    // is combined with an address-requirements extended parameter (confirmed live: that
-    // combination is exactly what this function tried first, and every call failed with
-    // `win32_err=0x57`/`ERROR_INVALID_PARAMETER` before this fix). A non-null `BaseAddress` alone
-    // already gives the same "lands exactly there or fails" guarantee this needs -- see
-    // `map_shared_memory`'s/`try_allocate_cow_pages`'s own `try_map` closures, which only ever
-    // attach `MEM_ADDRESS_REQUIREMENTS` on the `base_addr.is_null()` (OS-chooses-within-a-range)
-    // branch, never alongside an explicit hint address.
-    let view = unsafe {
+    // `BaseAddress` parameter, with NO `MEM_ADDRESS_REQUIREMENTS` extended parameter -- see this
+    // function's own doc-comment history above for why (a non-null `BaseAddress` alone already
+    // gives the "lands exactly there or fails" guarantee this needs; combining it with either an
+    // address-requirements extended parameter or a `SEC_RESERVE` section fails outright).
+    let mut view = unsafe {
         MapViewOfFile3(
             section,
             GetCurrentProcess(),
@@ -9803,30 +9880,75 @@ fn init_shared_kernel_heap() {
             0,
         )
     };
-    let landed = view.Value as usize;
+    let mut landed = view.Value as usize;
     if view.Value.is_null() || landed != SHARED_KERNEL_HEAP_BASE {
-        // Same allocation-free-failure-path constraint as the `CreateFileMappingW` check above --
-        // see that branch's comment. A non-exact landing means something else already occupies
-        // this address range; see `SHARED_KERNEL_HEAP_BASE`'s doc comment.
+        // FALLBACK (found+fixed live 2026-09-17): `SHARED_KERNEL_HEAP_BASE`'s own doc comment
+        // already disclosed this is "NOT a proven collision-free band" -- confirmed live via `cdb`
+        // on this exact host/session: `MapViewOfFile3` at the exact fixed address fails
+        // `STATUS_CONFLICTING_ADDRESSES` (surfaced as Win32 `ERROR_INVALID_ADDRESS`) because some
+        // loaded module/mapping lands inside the requested 8 GiB window -- ASLR-dependent, not
+        // litebox's to control, and reproduced on stock (pre-this-pass) code too, so this is a
+        // pre-existing platform fragility, not a regression from today's fix. Losing exact
+        // placement forfeits ONLY the not-yet-implemented step 4 cross-process address-identical
+        // sharing (see `SHARED_KERNEL_HEAP_ACTUAL_BASE`'s doc comment) -- today's heap is
+        // single-process-functional either way, so abort()ing the entire process over a property
+        // nothing yet depends on is strictly worse than falling back to wherever the OS can
+        // actually place it. Retry with `BaseAddress = NULL` (OS chooses) before giving up for
+        // real.
         diag_raw_print(
-            b"[shared_kernel_heap] FATAL MapViewOfFile3 wanted=0x",
+            b"[shared_kernel_heap] WARN MapViewOfFile3 exact placement failed wanted=0x",
             SHARED_KERNEL_HEAP_BASE,
             b" landed=0x",
             landed,
         );
         diag_raw_print(
-            b"[shared_kernel_heap] FATAL MapViewOfFile3 win32_err=0x",
+            b"[shared_kernel_heap] WARN MapViewOfFile3 exact placement win32_err=0x",
             unsafe { GetLastError() } as usize,
-            b" requested_size=0x",
+            b" falling back to OS-chosen address, requested_size=0x",
             SHARED_KERNEL_HEAP_SIZE,
         );
-        std::process::abort();
+        view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                core::ptr::null(),
+                0,
+                SHARED_KERNEL_HEAP_SIZE,
+                0,
+                Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        landed = view.Value as usize;
+        if view.Value.is_null() {
+            // Same allocation-free-failure-path constraint as the `CreateFileMappingW` check
+            // above -- see that branch's comment.
+            diag_raw_print(
+                b"[shared_kernel_heap] FATAL MapViewOfFile3 fallback (OS-chosen address) failed win32_err=0x",
+                unsafe { GetLastError() } as usize,
+                b" requested_size=0x",
+                SHARED_KERNEL_HEAP_SIZE,
+            );
+            std::process::abort();
+        }
     }
     // The section handle is never closed: the view keeps the section alive for the process's
     // entire lifetime (mirrors `create_shared_memory`'s guest-facing handles, which the guest
     // owns for as long as it holds the mapping), and this mapping never goes away.
+    //
+    // No decommit step needed here: the section itself is `SEC_RESERVE` (see the
+    // `CreateFileMappingW` call above), so this view is already reserved-not-committed the moment
+    // it's mapped -- unlike a first attempt at this fix, which mapped a plain `SEC_COMMIT` view and
+    // tried to `VirtualFree(..., MEM_DECOMMIT)` it back afterward. That failed live with
+    // `ERROR_INVALID_PARAMETER`: `VirtualFree` does not support decommitting a mapped section
+    // view's pages at all (only private `VirtualAlloc`-family memory), so `SEC_RESERVE` is not
+    // just cleaner but the only one of the two that actually avoids eager commit.
+    // `WindowsUserland::alloc` below commits each sub-range on demand via
+    // `VirtualAlloc2(..., MEM_COMMIT, ...)` as it's actually bump-allocated.
 
-    SHARED_KERNEL_HEAP_NEXT_FREE.store(SHARED_KERNEL_HEAP_BASE, Ordering::Release);
+    SHARED_KERNEL_HEAP_ACTUAL_BASE.store(landed, Ordering::Release);
+    SHARED_KERNEL_HEAP_NEXT_FREE.store(landed, Ordering::Release);
     SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
 }
 
@@ -9848,13 +9970,16 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         // (rather than a fresh `VirtualAlloc2` per call, the prior behavior) is what makes every
         // allocation this process's global allocator ever hands out live inside one shared,
         // fixed-address-identical-across-processes region. `size` is always a power of two and
-        // at least 4 KiB (see above), so the cursor -- itself starting at the page-aligned
-        // `SHARED_KERNEL_HEAP_BASE` and only ever advanced by such sizes -- stays page-aligned
-        // throughout, matching every real caller's alignment expectation without extra rounding.
+        // at least 4 KiB (see above), so the cursor -- itself starting at the page-aligned actual
+        // base (see [`SHARED_KERNEL_HEAP_ACTUAL_BASE`] -- usually `SHARED_KERNEL_HEAP_BASE`, but
+        // `init_shared_kernel_heap`'s fallback may have landed elsewhere) and only ever advanced by
+        // such sizes -- stays page-aligned throughout, matching every real caller's alignment
+        // expectation without extra rounding.
+        let actual_base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
         let mut cur = SHARED_KERNEL_HEAP_NEXT_FREE.load(Ordering::Acquire);
         let addr = loop {
             let next = cur.checked_add(size)?;
-            if next > SHARED_KERNEL_HEAP_BASE + SHARED_KERNEL_HEAP_SIZE {
+            if next > actual_base + SHARED_KERNEL_HEAP_SIZE {
                 // Exhausted the reservation; surfaces as an ordinary allocator OOM.
                 return None;
             }
@@ -9869,9 +9994,48 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             }
         };
 
+        // On-demand commit: `init_shared_kernel_heap` decommits this whole mapping immediately
+        // after creating it (see that function's doc comment for why decommit-after-map, not
+        // `SEC_RESERVE`, is what actually works at this fixed address), so the sub-range this call
+        // just exclusively claimed via the CAS above is reserved address space only, not yet backed
+        // by memory/pagefile. Commit exactly that range now, matching the codebase's established
+        // lazy-commit pattern for other large reservations (this file's own
+        // `was_mapped_view`/`reserve_and_commit` paths, which likewise call
+        // `VirtualAlloc2(..., MEM_COMMIT, ...)` in place over an already-reserved mapped-view
+        // range) rather than leaving the section's full eager `SEC_COMMIT` charge held for the
+        // process's entire lifetime, which is what let N cross-process fork children multiply into
+        // real commit-limit exhaustion. `addr`/`size` are both page-aligned (see this function's
+        // own comment above), so no rounding is needed.
+        // SAFETY: `addr` names a page-aligned sub-range of `SHARED_KERNEL_HEAP_BASE`'s live view
+        // that this call just exclusively claimed via the CAS above -- no other caller can commit
+        // or touch this exact range concurrently.
+        let committed = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                addr as *mut c_void,
+                size,
+                Win32_Memory::MEM_COMMIT,
+                Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if committed.is_null() {
+            // Same allocation-free-reporting constraint as `init_shared_kernel_heap`'s own
+            // failure paths: this can run from inside the global allocator itself, so no
+            // panic!/format! formatting machinery is safe here.
+            diag_raw_print(
+                b"[shared_kernel_heap] FATAL VirtualAlloc2(MEM_COMMIT) failed win32_err=0x",
+                unsafe { GetLastError() } as usize,
+                b" addr=0x",
+                addr,
+            );
+            std::process::abort();
+        }
+
         if diag_alloc_enabled() {
             let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            let offset = addr.wrapping_sub(SHARED_KERNEL_HEAP_BASE);
+            let offset = addr.wrapping_sub(actual_base);
             diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
             diag_raw_print(
                 b"[diag_alloc]   size=0x",

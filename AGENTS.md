@@ -251,12 +251,10 @@ offset to key its side-table by, i.e. step 3) -- `RawMutex` needed a design that
 step 3 exists, per ADVISORY-002 §3.2.
 
 **Live-verified** (release build, default thread-based fork, no test files): `yes hello | head -c
-5000000 | wc -c` -- exact `5000000`, proving correct blocking-pipe reads/writes both directions
-through the new queue with no lost data. `seq 1 3000000 | sort --parallel=4 -n | tail -3` (with an
-unrelated ADVISORY-001 §3N tcache workaround env so it doesn't confound this read) -- exact correct
-output, proving `sort`'s real multi-threaded pthread mutex/condvar contention (glibc futex calls,
-which this trait backs) completes correctly: no hang, no deadlock, no missed wakeup, no corrupted
-merge. Host RAM identical before/after, no leaked processes.
+5000000 | wc -c` -- exact `5000000`, proving correct blocking-pipe reads/writes. `seq 1 3000000 |
+sort --parallel=4 -n | tail -3` -- exact correct output, proving `sort`'s real multi-threaded
+pthread mutex/condvar contention completes correctly: no hang, no deadlock, no missed wakeup, no
+corrupted merge. Host RAM identical before/after, no leaked processes.
 
 **3-stage-pipeline SIGPIPE: relay EXONERATED 2026-09-16; fault is upstream in guest execution
 correctness, not the relay.** `seq 1 200000 | sort -n | tail -3` under `LITEBOX_PROCESS_FORK=1`
@@ -269,31 +267,66 @@ cause with the open `fork-verify-av-path-stale-rip-bypasses-single-step-heal` ro
 `process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
 `LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Methodology: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-## Fixed-base shared kernel heap (Track B step 3, ADVISORY-002 §3.3) -- LANDED, single-process-verified
+## Fixed-base shared kernel heap (Track B step 3, ADVISORY-002 §3.3) -- LANDED, lazy-commit fixed 2026-09-17
 
-`SLAB_ALLOC` (`#[global_allocator]`) now backs EVERY host-heap allocation with one 8 GiB
-pagefile-backed section mapped at a fixed address (`SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000`,
-32 GiB above `HOST_ALLOCATOR_REGION_MIN`, left unchanged as the guest `Vmem` boundary);
-`WindowsUserland::alloc` bump-allocates sub-ranges of that one mapping. This moves `LiteBoxX`/
-`GlobalState`/`DefaultFS`/per-process fd tables (already ordinary `Box`/`Arc`-backed global-allocator
-values) into the shared section for free, no per-field rewrite, no nightly `allocator_api` needed.
-Two real bugs found+fixed live (a panic-in-allocator livelock; `MapViewOfFile3`+
-`MEM_ADDRESS_REQUIREMENTS` = invalid combo, `ERROR_INVALID_PARAMETER`): mechanism, repro/fix, and
-3-tier verification (cheap repro, heavy stress repro, full `webtop_stack.sh` to `DE_UP` holding
-580+s, zero crashes, ~8.6GB private mem) in `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+`SLAB_ALLOC` (`#[global_allocator]`) backs EVERY host-heap allocation with one 8 GiB pagefile-backed
+section, normally mapped at a fixed address (`SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000`, 32 GiB
+above `HOST_ALLOCATOR_REGION_MIN`); `WindowsUserland::alloc` bump-allocates sub-ranges of that one
+mapping. Two earlier bugs (panic-in-allocator livelock; `MapViewOfFile3`+`MEM_ADDRESS_REQUIREMENTS`
+invalid combo): archive (`_2026-09-16.md`).
 
-**Not re-triggered this session** (disclosed, not guessed): the browser-reported terminal-emulator
-`/bin/sh` SIGABRT needs driving the live desktop via selkies' canvas stream; not attempted this pass
-(low-reliability for the effort). Expected: step 3 alone doesn't change which fork path a shell
-takes -- that's step 4 (`beyond_stdio` gate).
+**Eager-full-commit bug FIXED 2026-09-17** (PRD `shared-kernel-heap-eager-full-commit-not-lazy-reserve`):
+the section was created without `SEC_RESERVE`, so Windows charged the FULL 8 GiB against system
+commit limit at `CreateFileMappingW` time, not lazily -- every cross-process-fork child repeats
+this while siblings' own sections are still live, so real fork density (nginx's own crash-retry
+loop alone forks up to 30 times) multiplied it into `ERROR_COMMITMENT_LIMIT` at 96% host commit
+charge on a full webtop boot (live-confirmed, see archive). **Root cause was NOT children
+duplicating vs. recreating a shared section** -- true cross-process content sharing was never
+implemented (confirmed by reading every caller: the section handle is never duplicated to a
+child); each process independently reserving its own same-address section is the deliberate,
+still-incomplete step-3 design, not a regression. **Fix**: `CreateFileMappingW` now passes
+`SEC_RESERVE` (no commit charge at creation), and `WindowsUserland::alloc` commits only the exact
+bump-allocated sub-range on demand via `VirtualAlloc2(..., MEM_COMMIT, ...)`, matching this file's
+own `reserve_and_commit`/`was_mapped_view` lazy-commit idiom. `VirtualFree(MEM_DECOMMIT)`
+after-the-fact was tried first and **does not work on a mapped section view** (`ERROR_INVALID_PARAMETER`
+-- only private `VirtualAlloc`-family memory supports it); `SEC_RESERVE` at section-creation time is
+the only one of the two that actually avoids eager commit.
+
+**New, separate, pre-existing bug found+fixed the same pass**: `SHARED_KERNEL_HEAP_BASE`'s own doc
+comment already disclosed "NOT a proven collision-free band" -- confirmed live via `cdb`
+(`ntdll!NtMapViewOfSectionEx` returns `STATUS_CONFLICTING_ADDRESSES`/`0xC0000018`, surfaced as
+Win32 `ERROR_INVALID_ADDRESS`): on this host/session the exact fixed address now reliably fails
+for EVERY process (reproduced on stock pre-fix code too, fork-mode-independent -- not a regression
+from today's work). `init_shared_kernel_heap` now falls back to an OS-chosen address
+(`MapViewOfFile3` with `BaseAddress = NULL`) when exact placement fails, tracked in a new
+`SHARED_KERNEL_HEAP_ACTUAL_BASE` static `WindowsUserland::alloc` reads for its cursor/exhaustion
+math. Forfeits only the not-yet-implemented step-4 address-identical sharing; heap stays
+functional. PRD `shared-kernel-heap-fixed-address-not-collision-free` tracks the deeper fix.
+
+**Live-verified 2026-09-17** (`webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1`): host commit charge
+held at 39-42% through `NGINX_STARTED` and its supervisor's repeated fork-retry churn (6-8 live
+`litebox_runner` processes concurrently), vs. the pre-fix 96%/`ERROR_COMMITMENT_LIMIT` FATAL abort
+on the same script. Every process this session landed on the OS-chosen fallback address (the
+exact-address collision above fired 100% of the time), so step-4 address-identical sharing was not
+exercised, but the lazy-commit fix itself is confirmed working end-to-end under real fork density.
+
+**Terminal emulator still NOT reached, but characterized, not assumed**: after the heap fix, the
+same boot got PAST `NGINX_STARTED` (previously the hard stop) but then hit `NGINX_SELFTEST_FAILED`
+(nginx's supervisor script itself killed, separate pre-existing issue), then `XVFB_FAILED` and
+`DBUS_FAILED` in turn. Both Xvfb and dbus-daemon are the TWO fork kinds this project's own
+"Eligibility" section already documents as structurally refused under `LITEBOX_PROCESS_FORK=1`
+("a live unix listening socket can't be served from a fork-time filesystem snapshot") -- i.e. this
+is the ALREADY-DOCUMENTED "guest processes share no AF_UNIX/loopback/FIFO namespace" architectural
+gap (see "A real desktop renders in a browser" section's "Open here" note), not a new bug and not
+caused by anything fixed today. Reaching a live browser + Applications-menu + Terminal Emulator
+under `LITEBOX_PROCESS_FORK=1` needs that AF_UNIX-sharing gap closed first -- a separate,
+larger, already-scoped piece of work, out of today's pass.
 
 **Remaining before step 4** (detail: archive): `RawMutex`'s `waiters`/`remote_waiter_handles` still
 process-local `Vec`s, need POD/fixed-slot; `DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>`
-vtable is cross-process-invalid without same-base loading, deliberately deferred (no
-`/DYNAMICBASE:NO` added) per the advisory's own step ordering; no second process has actually
-mapped the shared section yet (this pass is single-process only); fd/HANDLE indirection and
-`beyond_stdio` itself both unstarted (§7 items iv, v). Host memory fully recovered after every kill
-this session, no leaked processes at session end.
+vtable is cross-process-invalid without same-base loading, deliberately deferred; no second process
+has actually mapped the SAME shared section yet (each still reserves its own); fd/HANDLE
+indirection and `beyond_stdio` itself both unstarted (§7 items iv, v).
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -302,64 +335,38 @@ performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, and the
 (DRM/KMS+wgpu) decision — all CLOSED 2026-09-16, none open. Full detail moved to
 `docs/AGENTS_ARCHIVE_2026-09-17.md` to keep this file under budget.
 
-## Cross-process-fork stdio-handle bug — FIXED 2026-09-17, plus a second bug found+fixed the same pass
+## Cross-process-fork stdio-handle bug — FIXED 2026-09-17
 
 `spawn_suspended`'s (`litebox_platform_windows_userland/src/process_fork.rs`) two back-to-back
-`STARTF_USESTDHANDLES` blocks were NOT merely redundant: the second one unconditionally overwrote
-`startup_info.hStd*` and forced `STARTF_USESTDHANDLES`/`inherit_handles=1` with **no null/
-`INVALID_HANDLE_VALUE` guard**, clobbering the first block's correct "leave this stream unset when
-invalid" decision -- handing the fork child a genuinely invalid HANDLE as a standard stream. Fixed
-by keeping exactly one block (`else if inherit_stdio`), the first block's validity guard as the
-only path that sets `STARTF_USESTDHANDLES`/`hStd*`. **Not independently reproduced**: ~34 live
-repro attempts before/after the fix never hit the documented `Fatal error: glibc detected an
-invalid stdio handle` abort -- applied on inspection (real, provable defect), not a witnessed
-before/after flip of that exact symptom. The task's own suggested repro shape (`bash -c 'echo A;
-bash -c "echo B"'`) never calls `clone()` at all (bash tail-exec's a `-c` script's final command) --
-use a trailing command (`OUTER_EXIT=$?`) to force a real fork.
+`STARTF_USESTDHANDLES` blocks were NOT merely redundant: the second unconditionally overwrote
+`startup_info.hStd*` with **no null/`INVALID_HANDLE_VALUE` guard**, clobbering the first block's
+correct "leave this stream unset when invalid" decision. Fixed by keeping exactly one block. Not
+independently reproduced (applied on inspection, a real provable defect). Repro note: a bash `-c`
+script must end in a trailing command (`OUTER_EXIT=$?`) to force a real `clone()` -- tail-exec of
+the final command never calls it. Full detail: archive.
 
-**Second, more consequential bug found+fixed live this pass**: the fixed-base shared kernel heap
-(`init_shared_kernel_heap`, ADVISORY-002 §3.3) creates its 8 GiB section without `SEC_RESERVE`, so
-Windows commits the FULL 8 GiB at `CreateFileMappingW` time, not lazily as the doc comment claims
--- every fork child repeats this while the parent's own 8 GiB section is still live. Measured live:
-`win32_err=0x5aa`/`ERROR_NO_SYSTEM_RESOURCES` on 3/10 fork-child spawns despite tens of GiB of
-headroom on every system-memory counter -- transient kernel-pool/VAD contention, not real
-exhaustion. Fixed with a bounded retry (8 attempts, 10ms/attempt backoff) before the existing
-`abort()`. Live-verified 24/24 clean post-fix vs. 7/10 pre-fix. Proper fix (`SEC_RESERVE` +
-on-demand per-allocation commit) is a larger hot-path change, deliberately not attempted; PRD
-`shared-kernel-heap-eager-full-commit-not-lazy-reserve`.
+**Second bug found the same pass, since FIXED**: the fixed-base shared kernel heap's eager-full-commit
+defect -- see "Fixed-base shared kernel heap" section above for the full mechanism and fix.
 
 **PTY test, NOT root-caused**: `script -qec '...' /dev/null` under a real PTY hit `signal=Signal(13)`
-(SIGPIPE) on `script` itself ~6s in (`n_orphans=1` -- a fork DID survive) -- a different bug from
-the plain-stdio fix above; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
+on `script` itself ~6s in -- a different bug; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
 
-**Full webtop boot ATTEMPTED 2026-09-17: blocked, but NOT by the freeze.** The freeze itself no
-longer reproduces (see below) so this was attempted; it stalled at the very first heavy-fork
-stage (`NGINX_STARTED`'s supervisor retry loop) instead, hitting `[shared_kernel_heap] FATAL
-CreateFileMappingW failed after retries win32_err=0x5af` (`ERROR_COMMITMENT_LIMIT`) on essentially
-every subsequent fork once host system commit charge (`Win32_PerfFormattedData_PerfOS_Memory
-.PercentCommittedBytesInUse`) hit 96% -- each cross-process child's own 8GiB eager `SEC_COMMIT`
-shared-kernel-heap section adds up fast under real fork density, and today's own repeated test
-runs in this same session materially contributed to that 96%. `LITEBOX_PROCESS_FORK=1` remains NOT
-set in the standing boot recipe; the real fix is the already-tracked `SEC_RESERVE`+lazy-commit PRD,
-now with live full-boot evidence of its severity, not a config workaround. Full repro commands,
-debug-log evidence, live-run counts: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**Full webtop boot ATTEMPTED 2026-09-17: blocked by commit exhaustion, since FIXED (see above).**
+Stalled at `NGINX_STARTED`'s supervisor retry loop, `ERROR_COMMITMENT_LIMIT` at 96% host commit
+charge. Re-run after the fix reached `NGINX_STARTED` again with commit charge held at 39-42%, but
+stalled later at `NGINX_SELFTEST_FAILED` (separate, already-tracked nginx issue) before
+`XVFB_UP`/`DE_UP`.
 
-## Presenter-process split (`docs/presenter-process-design.md`) -- done, fully verified live end-to-end, 2026-09-16
+## Presenter-process split -- done, fully verified live end-to-end, 2026-09-16
 
 `litebox_presenter_protocol` crate + runner-side `ControlServer` (zero-copy scanout handoff) +
-`litebox-presenter.exe` (new crate, zero shim/kernel dependency); `--gui` is now `Option<GuiMode>`.
-Verified live across two sessions: every control-pipe command headless/`--gui=hidden`, spawn/respawn,
-byte-identical `LITEBOX_DUMP_FRAMES` regression, kill-mid-display respawn-and-resume within ~370ms.
-One real bug found and fixed: missing per-call `OVERLAPPED` made the first real `show` silently
-`exit(0)` (fixed via `pipe::overlapped_call`; do NOT fix by removing `FILE_FLAG_OVERLAPPED` — tried,
-deadlocks instead). Small disclosed pre-existing gaps unrelated to the crash (`frames on <dir>`,
-`ps` PROCESS_TREE, `PrintWindow` partial-shape). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+`litebox-presenter.exe`; `--gui` is now `Option<GuiMode>`. One real bug found+fixed (missing
+per-call `OVERLAPPED`). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`,
+`docs/presenter-process-design.md`.
 
 ## Five cheap-wins PRD rows closed, 2026-09-16
 
-All cargo build/fmt-verified, no boot needed (`unsafe_op_in_unsafe_fn`, `litebox_common_linux`
-rustfmt, `litebox_shim_linux` `#[cfg(test)]` build, repo hygiene, reserved-flank documentation).
-Full detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+Cargo build/fmt-verified, no boot needed. Full detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Docs and tooling map
 
