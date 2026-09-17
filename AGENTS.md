@@ -205,7 +205,28 @@ same corruption every tick).
 
 **Sixth pass (2026-09-17) — did NOT reach `DE_LAUNCHED`, new stall past
 `SELKIES_BIND_WATCHDOG_STARTED`** (writable-layer-adoption race on a late fork child); browser
-never reached, killed clean, no RAM-leak evidence. Archive (newest entry).
+never reached, killed clean, no RAM-leak evidence. Archive.
+
+**Seventh pass (2026-09-17) — writable-layer-adoption race ROOT-CAUSED and FIXED, two bugs, both
+landed, `DE_LAUNCHED`/`SELKIES_PORT_UP` now reached deterministically (5/5 repro boots).**
+`CONTAINER_FS_SNAPSHOT_ENV_VAR` (`litebox-container-fs-<pid>.tar`) is ONE canonical path shared by
+the whole boot tree, but two consumers still carried stale single-consumer assumptions -- (1) the
+importing fork child deleted it right after import (true before the canonical-path design, false
+after: several children in the same fork-heavy window share the identical path, so the first
+importer race-deletes it out from under the rest -- the exact sixth-pass `could not adopt ...
+(os error 2)` symptom); (2) the exiting child's export-back path published via a raw, non-atomic
+`std::fs::copy` onto the same canonical path, letting a concurrent importer read a torn tar
+mid-overwrite (`failed to read tar entry: numeric field was not a number`, caught live once in
+~180 adopts). Fix: stopped the premature delete; routed the exit-time publish through the
+already-correct atomic-rename primitive (`publish_as_container_fs_snapshot`, widened to `pub`)
+instead of a raw copy -- a lifecycle/synchronization fix, kept as a plain on-disk file, not moved
+into the shared kernel arena. Live-verified: 5 consecutive `LITEBOX_PROCESS_FORK=1` boots, ~800+
+combined adopt/export cycles, one failure total (bug 2, in the run before its own fix landed),
+zero recurrence after both fixes were live; all 5 reached `DE_LAUNCHED`+`SELKIES_PORT_UP`
+(previously non-deterministic, never reached at all the pass before). Browser/terminal/apps still
+blocked, **not by this bug**: `NGINX_SELFTEST_FAILED`/`XVFB_FAILED`/`DBUS_FAILED`/`DE_FAILED`
+still fire every run, the already-documented Track B Xvfb/dbus corruption class (above). Full
+mechanism, both fixes, and the 5-boot transcript: archive (newest entry).
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. An intermittent host AV ends
 some runs (host-allocator region fault) — separate non-determinism from the ACK-stall-kill below.
@@ -242,10 +263,9 @@ frames from disassembly not guesswork, and no longer lets the watchdog kill a re
 **Cross-process sync on Windows is a hard platform constraint**: every native address/TID-based wait is
 process-local (`WaitOnAddress`, keyed events, `NtAlertThreadByThreadId`=ACCESS_DENIED); only a shared
 kernel object crosses processes. `litebox_platform_windows_userland/src/xproc_sync.rs` is a
-live-verified NAMED-event mutex primitive, still unwired (its own doc comment: it wants Track B step
-3's fixed-base shared section first, to key its side-table by section offset rather than address).
-`RawMutex` (the trait every shim subsystem's synchronization bottoms out in) is rewired as of this pass
--- see "Cross-process-capable `RawMutex`" below, a different mechanism from `xproc_sync.rs`.
+live-verified NAMED-event mutex primitive, still unwired (wants Track B step 3's fixed-base shared
+section first). `RawMutex` (every shim subsystem's synchronization bottoms out in this trait) is
+rewired as of this pass -- see "Cross-process-capable `RawMutex`" below, a different mechanism.
 
 ## Cross-process-capable `RawMutex` -- done, live-verified (detail: archive)
 
@@ -281,9 +301,8 @@ no free list; a kernel singleton must outlive the whole fork family). `SharedKer
 protocol: trivial `Arc::new` default everywhere with real OS process isolation, real impl on
 `WindowsUserland`. `litebox_shim_linux::GlobalState` is now `GlobalStateHandle<Platform, FS>` =
 `Platform::Handle<GlobalStateX<...>>`; `LinuxShimBuilder::build` does the real attach-or-create
-branch. **Decisive live proof**: parent bumps `next_thread_id` by a sentinel delta both before AND
-after `spawn_cross_process_fork_child` returns; the child's own post-`build()` read observes both
-bumps -- only possible if it is the SAME live allocation, not a snapshot or an independent copy.
+branch. Decisive live proof (sentinel writes before/after `spawn_cross_process_fork_child`, both
+observed by the child's own post-`build()` read): archive.
 
 **Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: root cause precisely characterized.** `SharedArc::new`
 places only `T`'s literal inline bytes in the arena -- but every `GlobalState` REGISTRY
@@ -304,10 +323,8 @@ new `SharedKernelStateProvider` slot needed): zero pointer indirection, inherits
 datagram `bind`/`Drop`) plus an always-on diagnostic on every real `ECONNREFUSED`. **This is the
 reusable flat-table PATTERN the still-genuinely-shared registries below (`pty_registry` et al.)
 need next** — `unix_addr_table`'s own full `BTreeMap` (the `Backlog`/`Channel` connection data,
-not just presence) remains real per-process-heap and unconverted, same as those others.
-Decisive live proof: parent registers one key immediately before `spawn_cross_process_fork_child`,
-a second strictly after; child observes both right after its own `build()` -- proves genuine live
-sharing, not a snapshot.
+not just presence) remains real per-process-heap and unconverted, same as those others. Decisive
+live proof (two keys registered before/after the fork, both observed by the child): archive.
 
 ## Cross-process fork: twelve registry/pointer/lock fixes, all now landed, 2026-09-17
 
@@ -315,17 +332,14 @@ Root pattern (instances 1-11): a raw `Arc`/`Box` pointer captured once by whiche
 constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless (or dangling) in
 every other attaching process -- found and fixed one layer deeper each time, isolated with a minimal
 `-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir ...'` repro under `LITEBOX_PROCESS_FORK=1`.
-Fix pattern: shadow the field on `GlobalStateHandle` with a fresh per-process copy (state that
-doesn't need cross-process visibility -- `litebox`, `proc_self_info`/`pts_registry`,
-`elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`, `futex_manager`), or rebind it in place
-via a locking accessor (state that IS genuinely meant to be shared -- `Network`'s two fields via
-`net_lock`, `Pipes.litebox` via `pipes()`), or (`RawMutex.waiters`, instance 9) replace a
-process-private-heap `Vec` with a fixed-slot pointer-free array. Instance 12 (`net_lock`'s Mutex left
-permanently locked by an exiting fork-child process) was a DIFFERENT shape -- not a stale pointer, a
-lock-liveness/owner-death-recovery gap -- now also FIXED; see the section immediately below.
-Does NOT close `XVFB_FAILED`/`DBUS_FAILED`; `pty_registry`/`flock_registry`/etc. remain real,
-still-open follow-on work. Full panic signatures, bisection transcripts, WER/symbolizer evidence and
-per-fix detail: archive (`docs/AGENTS_ARCHIVE_2026-09-17.md`, newest entries at the bottom).
+Fix pattern: shadow the field with a fresh per-process copy (state that doesn't need cross-process
+visibility -- `litebox`, `proc_self_info`/`pts_registry`, `elf_patch_cache`/`exec_ranges_cache`/
+`segment_scan_cache`, `futex_manager`), or rebind via a locking accessor (state genuinely meant to
+be shared -- `Network`'s two fields via `net_lock`, `Pipes.litebox` via `pipes()`), or (instance 9)
+replace a process-private-heap `Vec` with a fixed-slot pointer-free array. Instance 12 (`net_lock`
+left permanently locked by an exiting fork-child) was DIFFERENT -- a lock-liveness/owner-death-
+recovery gap, not a stale pointer -- fixed below. Does NOT close `XVFB_FAILED`/`DBUS_FAILED`;
+`pty_registry`/`flock_registry`/etc. remain real, still-open follow-on work. Full detail: archive.
 
 ## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, and cross-process-fork lock-orphaning -- ALL FOUR FIXED 2026-09-17
 
@@ -335,13 +349,11 @@ fixed-32-slot pointer-free `WaiterQueue`. (B) `Pipes.litebox`'s stale pointer cr
 fork child's stdio teardown -- now interior-mutable, rebound via `GlobalStateHandle::pipes()`
 same as `net_lock`. (C) `FutexManager` cross-process sharing hung on `LoanList` entries that can
 be stack-allocated (fork-family-identical only for the forking thread) -- resolved by giving each
-process its own fresh `FutexManager`, matching its own pre-existing "private futexes only" doc
-comment. (D) A cross-process-fork child's un-shutdown `net_worker` thread could be killed mid-hold
-of the shared `net_lock`, orphaning it forever -- fixed with `RawMutex` owner-death recovery
-(`note_locked`/`note_unlocked` + `OpenProcess`/`GetExitCodeProcess`-confirmed-dead force-recovery).
-Full mechanism, live evidence, and the reverted wrong-shape fix for D: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
-Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`) not re-investigated this pass
--- still open, distinct from D (flat CPU, not spinning).
+process its own fresh `FutexManager`. (D) A cross-process-fork child's un-shutdown `net_worker`
+thread could be killed mid-hold of the shared `net_lock`, orphaning it forever -- fixed with
+`RawMutex` owner-death recovery (`OpenProcess`/`GetExitCodeProcess`-confirmed-dead force-recovery).
+Full mechanism and live evidence: archive. Previously-recorded allocator livelock
+(`SafeZoneAllocator::alloc`) not re-investigated this pass -- still open, distinct from D.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -350,38 +362,31 @@ performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, the GUI
 (DRM/KMS+wgpu) decision, five cheap-wins PRD rows (cargo build/fmt-verified, no boot needed) — all
 CLOSED, none open. Also closed: **cross-process-fork stdio-handle bug** (`spawn_suspended`'s two
 back-to-back `STARTF_USESTDHANDLES` blocks clobbered each other, no null guard on the second; PTY
-test hit a separate, NOT-root-caused `signal=Signal(13)`, PRD
-`cross-process-fork-pty-sigpipe-in-script-relay`) and **presenter-process split** (`litebox_
-presenter_protocol` crate + runner-side `ControlServer` zero-copy scanout handoff +
+test hit a separate, NOT-root-caused `signal=Signal(13)`) and **presenter-process split**
+(`litebox_presenter_protocol` crate + runner-side `ControlServer` zero-copy scanout handoff +
 `litebox-presenter.exe`, `--gui` now `Option<GuiMode>`, one real bug found+fixed: missing per-call
-`OVERLAPPED`; `docs/presenter-process-design.md`). Full detail on all of the above:
-`docs/AGENTS_ARCHIVE_2026-09-17.md` / `_2026-09-16.md`.
+`OVERLAPPED`; `docs/presenter-process-design.md`). Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-17.md` (terminal-emulator shell-crash live investigation:
-  `LITEBOX_PROCESS_FORK=1` refuted as a one-line fix, cross-process-fork stdio-handle bug found;
-  closed-items detail moved out of AGENTS.md), `_2026-09-16.md` (popup-menu re-test,
-  `spawn_exec_collision_child` fix, Track A audit, RawMutex/presenter mechanism detail), `_2026-09-15.md`
-  (ACK-stall-kill detail),
-  `_2026-09-10.md` (fork fd eligibility, cost history, OCI cache, s6-boot, browser config, crash-dump/
-  VEH, CoW, working practices). Older: `_2026-09-03.md`, `_2026-09-05.md`.
+- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-17.md` (shell-crash investigation, stdio-handle bug,
+  twelve registry/pointer/lock fixes, writable-layer-race fix + 5-boot verification, newest at
+  bottom), `_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child` fix, Track A audit,
+  RawMutex/presenter detail), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md` (fork fd
+  eligibility, cost history, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW, practices).
+  Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
-  `advisor/ADVISORY-001-fundamentals.md` (§3N tcache, Appendix D presenter case).
-  `docs/veh-exception-handler-design.md` — canonical VEH narrative, read before touching the handler.
+  `advisor/ADVISORY-001-fundamentals.md` (§3N tcache, Appendix D presenter). `docs/veh-exception-
+  handler-design.md` — canonical VEH narrative, read before touching the handler.
 - Desktop logs: `docs/webtop-debian-selkies-2026-09-06.md`, `webtop-alpine-mate-2026-09-07.md`,
-  `webtop-debian-xfce-2026-09-08.md`, `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`.
+  `webtop-debian-xfce-2026-09-08.md`, `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`
 - Consult before deriving: `docs/premade-library-research.md`, `docs/drm-dumb-buffer-ioctl-reference.md`
-  (kernel UAPI for DRM syscalls), `docs/diag-timeline-field-semantics.md` (before any `DIAG_TIMELINE`
-  `comm`-field hypothesis — two investigations mis-traced it).
-- `docs/macos.md` — port state; Apple Silicon guest-execution context switch is a stub, stays
-  deferred (PRD `macos-aarch64-guest-execution-context-switch-is-not-implemented`).
-- Designs NOT implemented: `docs/session-daemon-design.md` (`litebox_termemu`'s VT100-emulator
-  slice IS implemented; the daemon/IPC layer is not), `docs/fork-region-grouping-design.md` (still
-  a diagnostic probe).
+  (DRM syscall UAPI), `docs/diag-timeline-field-semantics.md` (before any `DIAG_TIMELINE` `comm`-field
+  hypothesis — two investigations mis-traced it).
+- `docs/macos.md` — port state; Apple Silicon guest-execution context switch is a stub, deferred.
+- Designs NOT implemented: `docs/session-daemon-design.md` (VT100-emulator slice done; daemon/IPC
+  layer isn't), `docs/fork-region-grouping-design.md` (still a diagnostic probe).
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
   `drm_flip_probe.c`, `clone_probe.c`) plus `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`. OCI-pull
   Python scripts there are retired.
-- `.gm/memories/` holds older per-topic notes (RtlpUnwindPrologue, browser witness, XFCE/MATE/weston,
-  packager OOM, image tags, cross-process sync, CoW, GUI protocol) — superseded by this file/archives
-  wherever they overlap.
+- `.gm/memories/` — older per-topic notes, superseded by this file/archives wherever they overlap.

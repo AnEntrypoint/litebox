@@ -799,7 +799,19 @@ pub const FORK_CHILD_PIPE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PIPE_
 /// `s6-linux-init-maker` in the NEXT child died with `unable to mkdir /run/s6/basedir: No such
 /// file or directory`, because its rootfs had never heard of `/run/s6`.
 ///
-/// The child deletes the file once it has imported it. Never guest-visible.
+/// The importing child must NOT delete this path after reading it: since
+/// [`export_parent_writable_layer_for_child`] started routing every export through
+/// [`publish_as_container_fs_snapshot`], the path this variable carries is almost always the ONE
+/// canonical, well-known [`CONTAINER_FS_SNAPSHOT_ENV_VAR`] file shared by the entire boot tree, not
+/// a fresh single-consumer temp file -- several children spawned in the same narrow window are
+/// routinely hex-identical on this path, and a deleting importer race-deletes the file out from
+/// under every sibling/cousin that has not yet gotten around to opening it, producing `The system
+/// cannot find the file specified. (os error 2)`. Confirmed live 2026-09-17 (seventh pass): the
+/// importer used to `remove_file` it on the mistaken assumption ("Single-use, and this child is
+/// its only reader") that predates the shared-canonical-path mechanism. The file is safe to leave
+/// on disk indefinitely -- every future exporter atomically replaces it in place (`rename` or
+/// `copy` over the same path), exactly like `--resume-from` at the top-level `run()`, which never
+/// deleted it either. Never guest-visible.
 pub const FORK_CHILD_PARENT_LAYER_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_LAYER";
 
 /// Carries the regular-file fds a cross-process `fork()` child must come up holding, as
@@ -880,7 +892,20 @@ pub const CONTAINER_FS_SNAPSHOT_ENV_VAR: &str = "LITEBOX_INTERNAL_CONTAINER_FS_S
 /// so a concurrent reader of the shared path never observes a half-written file -- at worst,
 /// under genuinely concurrent exports, the LAST rename to land wins, this mechanism's disclosed,
 /// bounded limitation, not silent corruption.
-pub(crate) fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::path::PathBuf {
+///
+/// `pub`, not `pub(crate)`: the runner crate's own exiting-child export path (`task-resume-probe`)
+/// used to publish via a raw `std::fs::copy(export_path, shared)` directly onto this same
+/// canonical path instead of going through here -- `copy` is NOT atomic (it overwrites the
+/// destination's bytes in place over real wall-clock time), so a sibling concurrently importing
+/// `shared` could open it mid-copy and read a torn file: part old content, part new, which
+/// `import_writable_layer`'s tar reader then reports as `failed to read tar entry: numeric field
+/// was not a number` rather than a clean success or a clean "file missing". Confirmed live
+/// 2026-09-17 (seventh pass), one occurrence in ~180 adopts across a repro run, immediately
+/// following an exiting child's copy-based publish. Callers outside this crate must route their
+/// publish through this function (copying to a fresh scratch path first, `written_to`, then
+/// calling this) rather than writing to [`CONTAINER_FS_SNAPSHOT_ENV_VAR`]'s path directly, so
+/// every writer shares the one atomic-rename discipline.
+pub fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::path::PathBuf {
     let Some(shared) = std::env::var_os(CONTAINER_FS_SNAPSHOT_ENV_VAR) else {
         return written_to;
     };

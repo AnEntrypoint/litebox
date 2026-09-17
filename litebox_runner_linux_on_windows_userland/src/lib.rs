@@ -1365,8 +1365,18 @@ fn diag_process_fork_globalstate_probe_inner() {
             "writable layer imported (size={} bytes)",
             writable_layer_size.unwrap_or(0)
         ));
-        // Single-use, and this child is its only reader.
-        let _ = std::fs::remove_file(&parent_layer);
+        // Do NOT delete `parent_layer`: it is (almost always) the ONE canonical
+        // `CONTAINER_FS_SNAPSHOT_ENV_VAR` path shared by the whole boot tree, not a fresh
+        // single-consumer temp file -- see `FORK_CHILD_PARENT_LAYER_ENV_VAR`'s own doc comment.
+        // Several children spawned in the same narrow window are routinely handed the identical
+        // path; deleting it here after just ONE of them imports race-deletes the file out from
+        // under every other sibling/cousin still waiting to open it (`could not adopt the
+        // parent's writable layer ...: The system cannot find the file specified. (os error 2)`,
+        // confirmed live 2026-09-17). The old "single-use, this child is its only reader" premise
+        // predates `publish_as_container_fs_snapshot` centralizing every export onto one
+        // canonical path; it no longer holds. Leaving the file in place is safe and matches
+        // `run()`'s own `--resume-from` import above, which never deleted it either -- every
+        // future exporter atomically replaces it in place (`rename`/`copy` over the same path).
     }
 
     // `default_fs` is `default_fs_multi_layer` with a one-element list, so a tar and an OCI layer
@@ -1985,14 +1995,31 @@ fn diag_process_fork_task_resume_probe(
                 // Also publish as the boot tree's shared "latest" snapshot -- see
                 // `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment -- so a LATER sibling
                 // (fork or exec-collision, anywhere in the tree) sees this child's writes even
-                // if the parent's own `wait4` has not yet reaped it. A COPY, not the usual
-                // `publish_as_container_fs_snapshot` rename: `export_path` itself must survive
-                // intact for the PARENT's own later `wait4`-time read (`cross_process_writable_
-                // export_path` recomputes this exact deterministic path from this child's pid).
-                if let Ok(shared) = std::env::var(
+                // if the parent's own `wait4` has not yet reaped it. `export_path` itself must
+                // survive intact for the PARENT's own later `wait4`-time read
+                // (`cross_process_writable_export_path` recomputes this exact deterministic path
+                // from this child's pid), so this copies to a fresh scratch path first and lets
+                // `publish_as_container_fs_snapshot` perform the actual publish via its atomic
+                // rename -- NOT a raw `std::fs::copy` straight onto the shared path, which used to
+                // let a concurrent importer (another fork child's `globalstate-probe`) open the
+                // shared file mid-overwrite and read a torn tar (`failed to read tar entry:
+                // numeric field was not a number`, confirmed live 2026-09-17, one occurrence in
+                // ~180 adopts). See `publish_as_container_fs_snapshot`'s own doc comment for why
+                // every writer of this shared path must route through it.
+                if std::env::var_os(
                     litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR,
-                ) {
-                    let _ = std::fs::copy(&export_path, shared);
+                )
+                .is_some()
+                {
+                    let scratch = std::env::temp_dir().join(format!(
+                        "litebox-container-fs-publish-{}.tar",
+                        std::process::id()
+                    ));
+                    if std::fs::copy(&export_path, &scratch).is_ok() {
+                        let _ = litebox_platform_windows_userland::process_fork::publish_as_container_fs_snapshot(scratch);
+                    } else {
+                        let _ = std::fs::remove_file(&scratch);
+                    }
                 }
             }
             Err(e) => eprintln!(

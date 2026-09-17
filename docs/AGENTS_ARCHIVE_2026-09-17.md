@@ -2213,3 +2213,123 @@ logged in any prior pass's archived evidence) or was previously masked/silent; (
 `socket_set`/`interface` shared-arena-native redesign (AGENTS.md, still not attempted) and the
 browser/terminal/apps witness both remain the real end goals, both still blocked -- now by two
 potentially-separate issues (this stall, then `socket_set` if the boot gets past it).
+
+## Seventh pass (2026-09-17) -- writable-layer-adoption race, full mechanism, fix, and verification
+
+Picked up the sixth pass's pickup item (1)/(2) directly from the code rather than needing a live
+`cdb` attach: the mechanism was fully legible from a read, and confirmed by direct repro.
+
+**Root mechanism.** `export_parent_writable_layer_for_child` (`litebox_platform_windows_userland/
+src/process_fork.rs`) was changed at some earlier point to route every fork-child hand-off through
+`publish_as_container_fs_snapshot`'s ONE canonical, whole-boot-tree-shared path
+(`CONTAINER_FS_SNAPSHOT_ENV_VAR` = `litebox-container-fs-<top-level-pid>.tar`, set once by `run()`
+and inherited by every descendant) instead of handing each child a fresh, unique, single-consumer
+temp file (`litebox-forkparent-<pid>-<seq>.tar`, which the exporter still writes to FIRST, then
+`rename`s onto the canonical path). This centralization is real, load-bearing infrastructure --
+its own doc comment on `CONTAINER_FS_SNAPSHOT_ENV_VAR` explains it exists because long-lived
+sibling processes (s6-svscan's supervision children) need to see a later sibling's writes, not a
+snapshot frozen at their own spawn time. But two consumers of the resulting path still carried the
+OLD single-consumer-unique-file assumptions, each a real, independent bug:
+
+**Bug 1 -- premature delete-after-import (the sixth pass's exact symptom).** The importing child
+(`diag_process_fork_globalstate_probe`, `litebox_runner_linux_on_windows_userland/src/lib.rs`,
+~line 1369) called `std::fs::remove_file(&parent_layer)` immediately after a successful import,
+commented "Single-use, and this child is its only reader." That was TRUE before the canonical-path
+change (each child got its own never-shared file) and FALSE after it (the canonical path is
+handed, byte-identical, to every child spawned in the same narrow fork-heavy window -- a real
+webtop boot has dozens of forks landing within single-digit seconds of each other). The FIRST
+importer to finish deletes the file out from under every sibling/cousin still waiting to open it:
+`[process_fork_diag] globalstate-probe (child): could not adopt the parent's writable layer from
+...litebox-container-fs-<pid>.tar: failed to open ...: The system cannot find the file specified.
+(os error 2)` -- the exact sixth-pass log line, followed by the exact sixth-pass secondary symptom
+(`could not reopen /webtop_stack.sh at guest fd 255`, since the same missing-file class of failure
+also hits the resumed-script-fd machinery that depends on the same import). Whether this specific
+missing-file failure was ALSO the sixth pass's permanent stall (vs. merely a symptom alongside it)
+was not re-confirmed by stack-walk this pass, because the fix eliminates the failure outright
+regardless of which theory was right.
+
+**Bug 2 -- non-atomic publish on the exit path (found only after fixing bug 1, live, in ~180
+adopts).** The EXITING child's own export-back-to-parent path (`diag_process_fork_task_resume_
+probe`, same file, ~line 1992) published to the canonical path with a raw `std::fs::copy(
+&export_path, shared)`. Unlike `publish_as_container_fs_snapshot`'s `rename` (atomic: a concurrent
+reader either sees the fully-old or fully-new file, never a mix -- that function's own doc comment
+states this explicitly and correctly), `copy` overwrites the destination's bytes in place over
+real wall-clock time. A concurrent importer that opens the canonical path while a `copy` is
+mid-flight reads a torn file: part the old tar's bytes, part the new one's, at whatever byte
+offset the copy had reached. The tar reader doesn't see this as "file missing" -- it sees a
+structurally-plausible-looking tar with a corrupted field, and fails with `failed to read tar
+entry: numeric field was not a number:  when getting cksum for  "x": { "type": "button", "index":
+2 }, ...` (the garbage being a fragment of some unrelated JSON -- gamepad config -- that happened
+to land at that byte offset in the OLD tar's data, now visible through the NEW tar's structure
+because the two were torn together mid-copy). One occurrence in ~180 adopts, immediately after an
+exiting child's copy-based publish -- present with bug 1 fixed and bug 2 not yet fixed, absent
+across three subsequent full boots (~540 more combined adopts) once bug 2 was also fixed.
+
+**Why this is a lifecycle/synchronization bug, not a stale-pointer bug (unlike the day's other
+thirteen fixes).** Every other 2026-09-17 cross-process-sharing fix was a raw pointer captured once
+and frozen into shared bytes, meaningless in an attaching process's own address space -- fixed by
+shadowing, rebinding, or flattening to a pointer-free layout. This one is different in kind: it is
+a plain on-disk file, correctly reasoned about as "the one canonical shared resource" by the design
+that introduced `CONTAINER_FS_SNAPSHOT_ENV_VAR`, but with two of its several writers/readers not
+actually following that design's own stated discipline (atomic rename, no premature delete). The
+fix is NOT "move it into the shared kernel arena" -- it isn't in-process shared memory in that
+sense, it's a real cross-OS-process file hand-off, and a file is the right-sized mechanism for
+that; the fix is making every writer and reader actually honor the existing, already-correct
+atomic-rename design instead of quietly opting out of it in two places.
+
+**The fix, both parts landed.**
+1. `litebox_runner_linux_on_windows_userland/src/lib.rs`, `diag_process_fork_globalstate_probe`:
+   deleted the `remove_file` call after import; updated its own comment and
+   `FORK_CHILD_PARENT_LAYER_ENV_VAR`'s doc comment (`process_fork.rs`) to state the corrected
+   invariant -- the path must NOT be deleted by an importer, exactly like `run()`'s own
+   `--resume-from` import (which never deleted it, and was already correct).
+2. `litebox_platform_windows_userland/src/process_fork.rs`: widened `publish_as_container_fs_
+   snapshot` from `pub(crate)` to `pub` (it was already the correct atomic-rename primitive, used
+   internally by `export_parent_writable_layer_for_child`) and documented that every writer of
+   `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s path must route through it. `litebox_runner_linux_on_windows_
+   userland/src/lib.rs`'s exit-time export now copies to a fresh, uniquely-named scratch path
+   first (`litebox-container-fs-publish-<pid>.tar`, never itself shared/racy since each exiting
+   child has a distinct pid) and calls `publish_as_container_fs_snapshot` on THAT, letting its
+   existing atomic rename (plus its own already-correct non-regression size-comparison guard)
+   perform the actual publish -- `export_path` itself is left untouched, still readable intact by
+   the parent's own later `wait4`-time reap, exactly as the original (buggy) code's own comment
+   said it needed to be, just via a safe intermediate copy instead of a racy direct one.
+
+**Live verification, 5 consecutive `LITEBOX_PROCESS_FORK=1` boots** (`target/release/litebox_
+runner_linux_on_windows_userland.exe --gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.
+tcache_count=0:glibc.malloc.mxfast=0 --oci-image docker.io/linuxserver/webtop:debian-xfce
+--resume-from .wfgy/webtop_seed.tar -- /bin/bash /webtop_stack.sh`, `RUST_BACKTRACE=1`):
+- Boot 1 (bug 1 fixed, bug 2 not yet found/fixed): 0 `could not adopt` across the whole run,
+  reached `DE_LAUNCHED` -> `SELKIES_PORT_UP` -> sustained `HOLD t=` loop (a new best point,
+  further than the sixth pass ever reached). Confirmed bug 1's fix works.
+- Boot 2 (same code): reached `DE_LAUNCHED` again, but ONE `failed to read tar entry` (bug 2,
+  not yet known at the time this boot was launched) -- this run is what surfaced bug 2.
+- Bug 2 fixed, rebuilt (`cargo build --release -p litebox_runner_linux_on_windows_userland -p
+  litebox_platform_windows_userland`, clean, only pre-existing unrelated warnings).
+- Boot 3: 178 adopts, 0 failures of either signature, reached `DE_LAUNCHED`+`SELKIES_PORT_UP`.
+- Boot 4: 174 adopts, 0 failures, reached `DE_LAUNCHED`+`SELKIES_PORT_UP`.
+- Boot 5: 186 adopts, 0 failures, reached `HOLD t=20s` (past `DE_LAUNCHED`+`SELKIES_PORT_UP`).
+- Total across all 5: ~800+ combined adopt/export cycles, exactly one failure, entirely explained
+  by bug 2 in the one boot launched before bug 2's fix landed. Zero recurrence of either signature
+  in ~540 combined adopts across the three boots after both fixes were live.
+- Every boot's `[s]` milestone sequence was otherwise identical: `NGINX_CONFIGURED` ->
+  `NGINX_STARTED` -> `NGINX_SELFTEST_FAILED` -> `XVFB_FAILED` -> `DBUS_FAILED` -> selkies
+  backpressure-patch stage -> `SELKIES_LAUNCHED_LAST` -> `SELKIES_BIND_WATCHDOG_STARTED` ->
+  `SELKIES_PORT_UP` -> `DE_LAUNCHED` -- all five of these ALREADY-DOCUMENTED, separately-tracked
+  failures/milestones (this section's own earlier entries, and the "Track B territory" note above)
+  fired every single run, unrelated to and unaffected by this pass's fix.
+- Each boot cleaned up with `taskkill /F /IM litebox_runner_linux_on_windows_userland.exe /T`,
+  confirmed zero remaining processes via `Get-Process` immediately after, before starting the
+  next. Host `FreePhysicalMemory` stayed in the 3.4-5.1GB range across the whole session, never
+  trending down run-over-run -- no leak evidence.
+
+**Still blocked, NOT this bug: the browser/terminal/apps witness.** `curl` to the published host
+port (8080, proxying to guest nginx port 3000) returned connection-refused/reset in every run this
+pass, because `NGINX_SELFTEST_FAILED`/`XVFB_FAILED`/`DBUS_FAILED`/`DE_FAILED` (`DE_VIA_STARTWM=no`
+-> `DE_FALLBACK_LAUNCHED` -> `DE_FAILED`, then the `HOLD` loop) all still fire every run -- this is
+the ALREADY-DOCUMENTED, still-open thread-based-fork Xvfb/dbus/glibc-tcache corruption class
+("Track B territory, not a tunable-coverage gap", `docs/AGENTS_ARCHIVE_2026-09-16.md`), completely
+unrelated to the writable-layer mechanism this pass fixed. Reaching a real browser/terminal/apps
+witness needs that separate, larger, already-scoped follow-on (Track B step 3, fixed-base shared
+heap, letting `Xvfb`/`dbus-daemon` themselves become cross-process-fork-eligible) -- not attempted
+this pass, out of scope for a writable-layer lifecycle bug.
