@@ -9309,6 +9309,36 @@ fn raw_env_is_set(name: &[u8]) -> bool {
     }
 }
 
+/// Allocation-free: reads a `LITEBOX_INTERNAL_FORK_CHILD_*` environment variable set by a
+/// cross-process-fork PARENT (see [`FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`]/
+/// [`FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR`]) and parses it as an unsigned decimal `usize`, or
+/// returns `None` if unset, empty, too long for the fixed buffer, or not all-decimal-digits. Uses
+/// the same raw `GetEnvironmentVariableA` mechanism [`diag_alloc_enabled`]/[`raw_env_is_set`]
+/// already rely on for the identical allocation-free-on-the-process's-very-first-host-allocation
+/// constraint -- see [`diag_alloc_enabled`]'s doc comment for why `std::env::var`/`var_os` cannot
+/// be used here instead. `name` must be NUL-terminated.
+fn raw_env_read_usize(name: &[u8]) -> Option<usize> {
+    let mut buf = [0u8; 24];
+    let len = unsafe {
+        windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
+            name.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if len == 0 || len as usize >= buf.len() {
+        return None;
+    }
+    let mut value: usize = 0;
+    for &b in &buf[..len as usize] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+    }
+    Some(value)
+}
+
 /// Set once the process has written (or failed to write) its crash dump, so a fault cascade cannot
 /// try again from a second thread while the first attempt is still running.
 static CRASH_DUMP_ATTEMPTED: core::sync::atomic::AtomicBool =
@@ -9719,6 +9749,47 @@ static SHARED_KERNEL_HEAP_NEXT_FREE: core::sync::atomic::AtomicUsize =
 static SHARED_KERNEL_HEAP_ACTUAL_BASE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Raw Win32 `HANDLE` value (as `usize`) of the section backing THIS process's shared-kernel-heap
+/// view -- either the section [`init_shared_kernel_heap`] created itself, or one inherited from a
+/// cross-process-fork PARENT (see [`shared_kernel_heap_export_for_fork_child`] and
+/// [`FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`]). Recorded so that if THIS process later becomes a
+/// fork PARENT itself, it can hand the very same underlying section on to its own children --
+/// content-sharing composes transitively across nested forks this way, rather than resetting to a
+/// fresh private section at every fork level. `0` means "not yet initialized".
+static SHARED_KERNEL_HEAP_SECTION_HANDLE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Env var a cross-process-fork PARENT sets (via [`shared_kernel_heap_export_for_fork_child`],
+/// consumed by `process_fork::spawn_process_fork_child`) carrying the DECIMAL value of its own
+/// shared-kernel-heap section `HANDLE`. Never read via `std::env::var` (would allocate, recursing
+/// into this very allocator on the child's first host allocation) -- see
+/// [`raw_env_read_usize`]. Relies on Windows handle INHERITANCE (`CreateProcessW`'s
+/// `bInheritHandles=TRUE` plus the handle itself marked inheritable) to make this same numeric
+/// value valid, as a handle to the SAME kernel section object, in the child's own handle table --
+/// no `DuplicateHandle`/pid-discovery round-trip is needed the way the presenter's scanout
+/// handshake (`control_server.rs`) needs one, because this parent already calls `CreateProcessW`
+/// for the child directly.
+pub(crate) const FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR: &str =
+    "LITEBOX_INTERNAL_FORK_CHILD_SHARED_HEAP_SECTION";
+
+/// Env var carrying the DECIMAL virtual address the PARENT's shared-kernel-heap view actually
+/// landed at ([`SHARED_KERNEL_HEAP_ACTUAL_BASE`]) -- the child must `MapViewOfFile3` the inherited
+/// section at this EXACT address (not necessarily [`SHARED_KERNEL_HEAP_BASE`] itself, if the
+/// parent hit the fixed-address collision fallback) for the two processes' pointers into this
+/// region to mean the same thing. Sibling of
+/// [`FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`], read the same allocation-free way.
+pub(crate) const FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR: &str =
+    "LITEBOX_INTERNAL_FORK_CHILD_SHARED_HEAP_BASE";
+
+/// Sentinel value [`shared_kernel_heap_probe_parent_write`]/[`shared_kernel_heap_probe_child_read`]
+/// use for the `LITEBOX_DIAG_SHARED_HEAP_PROBE=1` live cross-process content-sharing proof: the
+/// parent XORs this with its own pid and writes it near the far end of the shared region; the
+/// child reads the same offset back. A match (visible in the child's own inherited-stdio log line,
+/// since `spawn_process_fork_child` wires the child's stderr into the parent's) is the most direct
+/// possible evidence the two processes are looking at the SAME physical pages through this
+/// section, not two independent copies.
+const SHARED_HEAP_PROBE_MAGIC: usize = 0xC0FF_EE00_DEAD_BEEF_u64 as usize;
+
 /// Reserves and maps the fixed-base shared kernel heap on this process's first host allocation.
 ///
 /// Allocation-free and reentrancy-safe by construction (raw atomics only, no `OnceLock`/`Mutex`):
@@ -9742,6 +9813,73 @@ fn init_shared_kernel_heap() {
                 core::hint::spin_loop();
             }
         }
+    }
+
+    // Track B step 4 (ADVISORY-002 3.3): if a PARENT process exported an inheritable section
+    // handle to THIS process (see `shared_kernel_heap_export_for_fork_child` and
+    // `process_fork::spawn_process_fork_child`'s call site), map that SAME section at the SAME
+    // address instead of reserving a private, content-independent one -- this is the actual
+    // cross-process CONTENT sharing step that was previously entirely unimplemented (confirmed by
+    // reading every caller as of `0ced320`: a section handle was never duplicated to a child, so
+    // every process's fixed-base mapping was address-consistent but privately backed). Read via
+    // the same allocation-free raw Win32 mechanism `diag_alloc_enabled` uses, since this can run
+    // on the process's very first host allocation, before `std::env::var` is safe to call.
+    if let (Some(handle_val), Some(base)) = (
+        raw_env_read_usize(b"LITEBOX_INTERNAL_FORK_CHILD_SHARED_HEAP_SECTION\0"),
+        raw_env_read_usize(b"LITEBOX_INTERNAL_FORK_CHILD_SHARED_HEAP_BASE\0"),
+    ) {
+        let inherited_section = handle_val as Win32_Foundation::HANDLE;
+        // SAFETY: `inherited_section` is, if the env vars above were genuinely set by a real
+        // parent `spawn_process_fork_child` call, a handle this process inherited at
+        // `CreateProcessW` time (Windows handle inheritance preserves the numeric value, which is
+        // exactly why `handle_val` -- read from an env var the PARENT populated with ITS OWN
+        // value -- is already correct here with no `DuplicateHandle` step). A stale/bogus value
+        // (e.g. a manually-set env var, or a value from a process this one is not actually a
+        // fork child of) simply fails `MapViewOfFile3` below, handled the same as any other
+        // mapping failure -- never trusted blindly.
+        let view = unsafe {
+            MapViewOfFile3(
+                inherited_section,
+                GetCurrentProcess(),
+                base as *const c_void,
+                0,
+                SHARED_KERNEL_HEAP_SIZE,
+                0,
+                Win32_Memory::PAGE_READWRITE,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        let landed = view.Value as usize;
+        if !view.Value.is_null() && landed == base {
+            diag_raw_print(
+                b"[shared_kernel_heap] INHERITED section mapped at parent's address=0x",
+                landed,
+                b" handle=0x",
+                handle_val,
+            );
+            SHARED_KERNEL_HEAP_SECTION_HANDLE.store(handle_val, Ordering::Release);
+            SHARED_KERNEL_HEAP_ACTUAL_BASE.store(landed, Ordering::Release);
+            SHARED_KERNEL_HEAP_NEXT_FREE.store(landed, Ordering::Release);
+            SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
+            shared_kernel_heap_probe_child_read(landed, true);
+            return;
+        }
+        diag_raw_print(
+            b"[shared_kernel_heap] WARN inherited-section MapViewOfFile3 FAILED wanted_base=0x",
+            base,
+            b" landed=0x",
+            landed,
+        );
+        diag_raw_print(
+            b"[shared_kernel_heap] WARN inherited-section win32_err=0x",
+            unsafe { GetLastError() } as usize,
+            b" falling back to a private section (heap-functional, not content-shared), requested_size=0x",
+            SHARED_KERNEL_HEAP_SIZE,
+        );
+        // Falls through to the normal, private-section creation path below -- matches the
+        // existing fixed-address-collision fallback philosophy (never abort over a lost
+        // cross-process property when a functional, if non-shared, heap is still available).
     }
 
     // Live-corrected 2026-09-17 (PRD `shared-kernel-heap-eager-full-commit-not-lazy-reserve`).
@@ -9947,9 +10085,152 @@ fn init_shared_kernel_heap() {
     // `WindowsUserland::alloc` below commits each sub-range on demand via
     // `VirtualAlloc2(..., MEM_COMMIT, ...)` as it's actually bump-allocated.
 
+    // Recorded (not just left as a local) so this process can hand the SAME section on to its
+    // OWN fork children later -- see `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s doc comment.
+    SHARED_KERNEL_HEAP_SECTION_HANDLE.store(section as usize, Ordering::Release);
     SHARED_KERNEL_HEAP_ACTUAL_BASE.store(landed, Ordering::Release);
     SHARED_KERNEL_HEAP_NEXT_FREE.store(landed, Ordering::Release);
     SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
+}
+
+/// Ensures this process's shared kernel heap is initialized (idempotent and reentrancy-safe, see
+/// [`init_shared_kernel_heap`]) and returns `(section_handle, actual_base)` for handing to a
+/// cross-process-fork CHILD -- either the section this process created itself, or one it already
+/// inherited from ITS OWN parent (real content-sharing composes transitively across nested forks
+/// this way). Marks the handle inheritable (idempotent to call more than once across many
+/// children) so a subsequent `CreateProcessW(bInheritHandles=TRUE)` actually carries it into the
+/// child's handle table at the SAME numeric value. Returns `None` if the heap could not be
+/// initialized at all (should not happen in practice -- this process has certainly already made
+/// at least one host allocation by the time it is old enough to `fork()`) or the handle could not
+/// be marked inheritable, in which case the caller falls back to letting the child create its own
+/// private section, exactly as it did before this pass.
+pub(crate) fn shared_kernel_heap_export_for_fork_child() -> Option<(usize, usize)> {
+    if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+        init_shared_kernel_heap();
+    }
+    if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+        return None;
+    }
+    let handle_val = SHARED_KERNEL_HEAP_SECTION_HANDLE.load(Ordering::Acquire);
+    let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+    if handle_val == 0 {
+        return None;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    // SAFETY: `handle_val` is this process's own live section handle (either just created or
+    // already inherited from an earlier fork), never closed for the process's lifetime -- see
+    // `init_shared_kernel_heap`'s own "the section handle is never closed" comment.
+    let ok = unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            handle_val as Win32_Foundation::HANDLE,
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    };
+    if ok == 0 {
+        diag_raw_print(
+            b"[shared_kernel_heap] WARN SetHandleInformation(INHERIT) failed handle=0x",
+            handle_val,
+            b" win32_err=0x",
+            unsafe { GetLastError() } as usize,
+        );
+        return None;
+    }
+    Some((handle_val, base))
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`), allocation-free: writes a known sentinel
+/// value to a fixed offset in the LAST page of THIS process's shared-kernel-heap mapping --
+/// deliberately as far as possible from anything [`WindowsUserland::alloc`]'s forward-growing bump
+/// cursor could reach in a short verification run -- committing that one page first. Gives the
+/// CHILD side of the same `fork()` call ([`shared_kernel_heap_probe_child_read`]) something
+/// concrete to read back: the most direct possible live proof that two processes are looking at
+/// the SAME physical pages through this section, not two independent copies (the exact gap this
+/// pass closes -- see AGENTS.md's "the confirmed gap"). Never called except when the operator
+/// opts in; a no-op otherwise, so it changes nothing about the production path's behavior or
+/// memory footprint.
+pub(crate) fn shared_kernel_heap_probe_parent_write(base: usize) {
+    if !raw_env_is_set(b"LITEBOX_DIAG_SHARED_HEAP_PROBE\0") {
+        return;
+    }
+    let probe_addr = base + SHARED_KERNEL_HEAP_SIZE - 0x1000;
+    // SAFETY: `probe_addr` is a page-aligned address inside this process's own live
+    // shared-kernel-heap reservation (`base + SIZE - 0x1000 < base + SIZE`); `VirtualAlloc2`
+    // with `MEM_COMMIT` on an already-reserved section view is the same idiom
+    // `WindowsUserland::alloc` itself uses for every real bump-allocated sub-range.
+    let committed = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            probe_addr as *const c_void,
+            0x1000,
+            Win32_Memory::MEM_COMMIT,
+            Win32_Memory::PAGE_READWRITE,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if committed.is_null() {
+        diag_raw_print(
+            b"[shared_kernel_heap_probe] parent VirtualAlloc2(MEM_COMMIT) FAILED addr=0x",
+            probe_addr,
+            b" win32_err=0x",
+            unsafe { GetLastError() } as usize,
+        );
+        return;
+    }
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() } as usize;
+    let sentinel = SHARED_HEAP_PROBE_MAGIC ^ pid;
+    // SAFETY: `probe_addr` was just committed above, is page-aligned, and this diagnostic is the
+    // only writer of this specific offset anywhere in the codebase.
+    unsafe {
+        core::ptr::write_volatile(probe_addr as *mut usize, sentinel);
+    }
+    diag_raw_print(
+        b"[shared_kernel_heap_probe] parent WROTE sentinel at addr=0x",
+        probe_addr,
+        b" value=0x",
+        sentinel,
+    );
+}
+
+/// Diagnostic-only (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`) counterpart to
+/// [`shared_kernel_heap_probe_parent_write`], called from the CHILD side once its own shared
+/// kernel heap mapping (inherited or, on the negative-control fallback path, private) is
+/// established. Guards the read with `VirtualQuery` rather than reading blindly: on the private
+/// (non-shared) fallback path this offset was never committed by anyone in THIS process, and a
+/// raw read would fault the child's own startup -- logging a clean "not committed" line there is
+/// itself a meaningful, correct diagnostic result (proof the fallback path is genuinely NOT
+/// content-shared), not a condition to crash on.
+pub(crate) fn shared_kernel_heap_probe_child_read(base: usize, inherited: bool) {
+    if !raw_env_is_set(b"LITEBOX_DIAG_SHARED_HEAP_PROBE\0") {
+        return;
+    }
+    let probe_addr = base + SHARED_KERNEL_HEAP_SIZE - 0x1000;
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let q = unsafe {
+        Win32_Memory::VirtualQuery(
+            probe_addr as *const c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if q == 0 || mbi.State != Win32_Memory::MEM_COMMIT {
+        diag_raw_print(
+            b"[shared_kernel_heap_probe] child addr=0x",
+            probe_addr,
+            b" NOT COMMITTED, inherited=0x",
+            usize::from(inherited),
+        );
+        return;
+    }
+    // SAFETY: `VirtualQuery` just confirmed this page is `MEM_COMMIT`.
+    let observed = unsafe { core::ptr::read_volatile(probe_addr as *const usize) };
+    diag_raw_print(
+        b"[shared_kernel_heap_probe] child OBSERVED at addr=0x",
+        probe_addr,
+        b" value=0x",
+        observed,
+    );
 }
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {

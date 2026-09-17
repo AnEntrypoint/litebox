@@ -1645,6 +1645,47 @@ pub fn spawn_process_fork_child(
             .join(",");
         child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
     }
+    // Track B step 4 (ADVISORY-002 3.3): hand the child a real, live handle to the SAME shared
+    // kernel heap section this process itself maps, instead of letting it reserve its own,
+    // content-independent 8 GiB mapping (the deliberate, previously-incomplete step-3 shape --
+    // see `SHARED_KERNEL_HEAP_BASE`'s own doc comment in `lib.rs`). No `DuplicateHandle`/
+    // pid-discovery round-trip needed here (unlike the presenter's scanout handshake in
+    // `control_server.rs`): this parent already calls `CreateProcessW` for the child directly, and
+    // ordinary Windows handle INHERITANCE (`spawn_suspended`'s `force_inherit_handles` below)
+    // preserves the exact numeric handle value into the child's own handle table, so the decimal
+    // value read back from this env var in the child is already correct with no further IPC.
+    //
+    // GATED behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`, deliberately NOT the unconditional
+    // production default yet: live-verified this session (sentinel write/read round-trip byte for
+    // byte correct through the genuinely-shared section) that the HANDLE-DUPLICATION/MAPPING
+    // mechanism itself is fully correct, but also live-reproduced a SEPARATE, real corruption this
+    // exposes -- `SHARED_KERNEL_HEAP_NEXT_FREE`'s bump-allocation cursor is still a process-local
+    // static, so once the child's own `GlobalState`/`Task` reconstruction starts making REAL heap
+    // allocations, it independently bump-allocates from the SAME starting address the parent's own
+    // live heap objects already occupy -- two processes writing through the SAME physical pages at
+    // the SAME offsets, corrupting the parent's own heap (observed live: the parent, previously
+    // exiting 0 on this exact repro, crashed with an unhandled `STATUS_ACCESS_VIOLATION` and no
+    // VEH trace once this path went unconditional). That cursor needs to move INTO the shared
+    // section itself and be advanced with a cross-process atomic (or an equivalent single-writer
+    // protocol) before this can be the default -- explicitly the next gap, not silently papered
+    // over. Until then, the DEFAULT (`LITEBOX_PROCESS_FORK=1` alone) keeps today's existing,
+    // already-working behavior byte-for-byte: every process still reserves its own private,
+    // address-consistent-but-content-independent section, exactly as before this pass.
+    let shared_heap_export = std::env::var_os("LITEBOX_DIAG_SHARED_HEAP_INHERIT")
+        .is_some()
+        .then(crate::shared_kernel_heap_export_for_fork_child)
+        .flatten();
+    if let Some((section_handle, base)) = shared_heap_export {
+        child_env.push((
+            crate::FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR,
+            section_handle.to_string(),
+        ));
+        child_env.push((crate::FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR, base.to_string()));
+        // Diagnostic-only (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`), a no-op otherwise: writes a known
+        // sentinel the child reads back once it maps the same section, the most direct live proof
+        // that this mechanism genuinely shares content and not just address layout.
+        crate::shared_kernel_heap_probe_parent_write(base);
+    }
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] pre-spawn exe_wide len={} cap={} ptr={:p}",
@@ -1653,7 +1694,15 @@ pub fn spawn_process_fork_child(
             exe_wide.as_ptr()
         );
     }
-    let spawn_result = spawn_suspended(&mut exe_wide, false, false, true, &child_env);
+    // Only forced when the shared-heap gate above actually exported a handle -- an unconditional
+    // `bInheritHandles=TRUE` would inherit every OTHER currently-inheritable handle in this
+    // process into the child too, a behavior change to the DEFAULT path this pass has no reason
+    // to make when there is nothing new for the child to inherit.
+    let spawn_result = if shared_heap_export.is_some() {
+        spawn_suspended_forcing_handle_inheritance(&mut exe_wide, &child_env)
+    } else {
+        spawn_suspended(&mut exe_wide, false, false, true, &child_env)
+    };
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] post-spawn exe_wide len={} cap={} ptr={:p}",
@@ -3392,6 +3441,40 @@ fn spawn_suspended(
     inherit_stdio: bool,
     extra_env: &[(&str, String)],
 ) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_impl(
+        exe_wide,
+        want_stdout_pipe,
+        want_stdin_pipe,
+        inherit_stdio,
+        extra_env,
+        false,
+    )
+}
+
+/// Production counterpart of [`spawn_suspended`] that additionally forces `bInheritHandles=TRUE`
+/// on the `CreateProcessW` call regardless of what `inherit_stdio`'s own stdio-handle wiring
+/// happened to decide -- needed because [`spawn_process_fork_child`] marks the shared-kernel-heap
+/// section handle inheritable and relies on THIS process's handle inheritance (not any
+/// `DuplicateHandle` step) to carry it into the child at the same numeric value (see that
+/// function's own doc comment on `FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`). Without this, a run
+/// whose real stdio handles all happened to be invalid/non-inheritable (e.g. fully redirected to
+/// `NUL`) would silently leave `inherit_handles` at `0` and drop the shared-heap handle on the
+/// floor even though `spawn_process_fork_child` had already set it up.
+fn spawn_suspended_forcing_handle_inheritance(
+    exe_wide: &mut [u16],
+    extra_env: &[(&str, String)],
+) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_impl(exe_wide, false, false, true, extra_env, true)
+}
+
+fn spawn_suspended_impl(
+    exe_wide: &mut [u16],
+    want_stdout_pipe: bool,
+    want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
+    force_inherit_handles: bool,
+) -> Result<SpawnSuspendedResult, String> {
     // Built up-front so the pointer handed to `CreateProcessW` stays valid for the whole call.
     let mut env_block = build_child_environment_block(extra_env);
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
@@ -3557,6 +3640,13 @@ fn spawn_suspended(
     // else (`!want_stdout_pipe && !inherit_stdio`): the diagnostic memory-copy-only probe's own
     // explicit request -- leave the child's stdio completely unset (fresh console/NUL default),
     // matching its documented intent instead of silently overriding it.
+
+    if force_inherit_handles {
+        // See `spawn_suspended_forcing_handle_inheritance`'s doc comment: the shared-kernel-heap
+        // section handle must be inherited even on a run whose own stdio handles happened not to
+        // be inheritable.
+        inherit_handles = 1;
+    }
 
     // `CREATE_NO_WINDOW`: every caller of this function redirects the child's stdio itself
     // (`want_stdout_pipe`/`want_stdin_pipe`'s pipes, or `inherit_stdio`'s inherited handles) --

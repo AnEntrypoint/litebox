@@ -416,3 +416,163 @@ get further even without the fix, worth a quick retry before assuming the fix is
 would have run for hours per the script's own 8-hour hold loop) and any `litebox-presenter.exe`
 were force-killed. Host commit charge confirmed recovered to 33% and free physical RAM to ~8.6GB
 within seconds of the kill -- no leaked processes, no lingering commit pressure.
+
+## Fixed-base shared kernel heap (Track B step 3) -- full detail (moved verbatim from AGENTS.md 2026-09-17)
+
+`SLAB_ALLOC` (`#[global_allocator]`) backs EVERY host-heap allocation with one 8 GiB pagefile-backed
+section, normally mapped at a fixed address (`SHARED_KERNEL_HEAP_BASE = 0x7FF8_0000_0000`, 32 GiB
+above `HOST_ALLOCATOR_REGION_MIN`); `WindowsUserland::alloc` bump-allocates sub-ranges of that one
+mapping. Two earlier bugs (panic-in-allocator livelock; `MapViewOfFile3`+`MEM_ADDRESS_REQUIREMENTS`
+invalid combo): `_2026-09-16.md`.
+
+**Eager-full-commit bug FIXED 2026-09-17** (PRD `shared-kernel-heap-eager-full-commit-not-lazy-reserve`):
+the section was created without `SEC_RESERVE`, so Windows charged the FULL 8 GiB against system
+commit limit at `CreateFileMappingW` time, not lazily -- every cross-process-fork child repeats
+this while siblings' own sections are still live, so real fork density (nginx's own crash-retry
+loop alone forks up to 30 times) multiplied it into `ERROR_COMMITMENT_LIMIT` at 96% host commit
+charge on a full webtop boot (live-confirmed). **Root cause was NOT children duplicating vs.
+recreating a shared section** -- true cross-process content sharing was never implemented
+(confirmed by reading every caller: the section handle is never duplicated to a child); each
+process independently reserving its own same-address section was the deliberate, still-incomplete
+step-3 design, not a regression. **Fix**: `CreateFileMappingW` now passes `SEC_RESERVE` (no commit
+charge at creation), and `WindowsUserland::alloc` commits only the exact bump-allocated sub-range
+on demand via `VirtualAlloc2(..., MEM_COMMIT, ...)`, matching this file's own
+`reserve_and_commit`/`was_mapped_view` lazy-commit idiom. `VirtualFree(MEM_DECOMMIT)`
+after-the-fact was tried first and **does not work on a mapped section view**
+(`ERROR_INVALID_PARAMETER` -- only private `VirtualAlloc`-family memory supports it); `SEC_RESERVE`
+at section-creation time is the only one of the two that actually avoids eager commit.
+
+**New, separate, pre-existing bug found+fixed the same pass**: `SHARED_KERNEL_HEAP_BASE`'s own doc
+comment already disclosed "NOT a proven collision-free band" -- confirmed live via `cdb`
+(`ntdll!NtMapViewOfSectionEx` returns `STATUS_CONFLICTING_ADDRESSES`/`0xC0000018`, surfaced as
+Win32 `ERROR_INVALID_ADDRESS`): on this host/session the exact fixed address now reliably fails
+for EVERY process (reproduced on stock pre-fix code too, fork-mode-independent -- not a regression
+from that pass's work). `init_shared_kernel_heap` falls back to an OS-chosen address
+(`MapViewOfFile3` with `BaseAddress = NULL`) when exact placement fails, tracked in
+`SHARED_KERNEL_HEAP_ACTUAL_BASE`, which `WindowsUserland::alloc` reads for its cursor/exhaustion
+math. PRD `shared-kernel-heap-fixed-address-not-collision-free` tracks the deeper fix.
+
+**Live-verified 2026-09-17** (`webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1`): host commit charge
+held at 39-42% through `NGINX_STARTED` and its supervisor's repeated fork-retry churn (6-8 live
+`litebox_runner` processes concurrently), vs. the pre-fix 96%/`ERROR_COMMITMENT_LIMIT` FATAL abort
+on the same script. Every process that session landed on the OS-chosen fallback address (the
+exact-address collision above fired 100% of the time), so step-4 address-identical sharing was not
+exercised there, but the lazy-commit fix itself was confirmed working end-to-end under real fork
+density.
+
+**Terminal emulator still NOT reached that pass, but characterized, not assumed**: after the heap
+fix, the same boot got PAST `NGINX_STARTED` (previously the hard stop) but then hit
+`NGINX_SELFTEST_FAILED` (nginx's supervisor script itself killed, separate pre-existing issue),
+then `XVFB_FAILED` and `DBUS_FAILED` in turn. Both Xvfb and dbus-daemon are the TWO fork kinds this
+project's own "Eligibility" section already documents as structurally refused under
+`LITEBOX_PROCESS_FORK=1` ("a live unix listening socket can't be served from a fork-time
+filesystem snapshot") -- i.e. this is the ALREADY-DOCUMENTED "guest processes share no
+AF_UNIX/loopback/FIFO namespace" architectural gap, not a new bug.
+
+## Real cross-process content sharing (Track B step 4, ADVISORY-002 §3.3) -- basic mechanism landed 2026-09-17, gated OFF by default
+
+Full narrative for AGENTS.md's compact "Real cross-process content sharing" pointer. The step-3
+gap step 3's own notes named explicitly -- "the section handle is never duplicated to a child" --
+is now closed at the MECHANISM level.
+
+**What was built**: `shared_kernel_heap_export_for_fork_child`/`shared_kernel_heap_probe_parent_write`/
+`shared_kernel_heap_probe_child_read` (`litebox_platform_windows_userland/src/lib.rs`, next to
+`init_shared_kernel_heap`) plus the call site in `spawn_process_fork_child`
+(`litebox_platform_windows_userland/src/process_fork.rs`). The parent marks its live section
+handle inheritable (`SetHandleInformation(..., HANDLE_FLAG_INHERIT, ...)`) and passes its numeric
+value plus its own landed address through two new env vars
+(`LITEBOX_INTERNAL_FORK_CHILD_SHARED_HEAP_SECTION`/`_BASE`) baked into the child's
+`CreateProcessW` environment block; `spawn_suspended_forcing_handle_inheritance` forces
+`bInheritHandles=TRUE` so the handle actually crosses. No `DuplicateHandle`/pid-discovery round
+trip is needed (unlike the presenter's `control_server.rs` scanout handshake) because this parent
+already calls `CreateProcessW` for the child directly, and ordinary Windows handle inheritance
+preserves the exact numeric handle value into the child's table. The child side
+(`init_shared_kernel_heap`) reads the two env vars via the same allocation-free raw
+`GetEnvironmentVariableA`-based mechanism `diag_alloc_enabled`/`raw_env_is_set` already use (a new
+`raw_env_read_usize` helper) -- required because this can run on the process's very first host
+allocation, before `std::env::var`/`var_os` is safe to call (would recurse into this same
+allocator). If both vars parse, the child `MapViewOfFile3`s the INHERITED section at the exact
+parent-landed address instead of creating its own; on any failure it falls back to the pre-existing
+private-section path, logged, never a hard abort.
+
+**Live-verified with a direct write/read proof** (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`, a new,
+diagnostic-only, allocation-free pair of functions): the parent writes a sentinel
+(`SHARED_HEAP_PROBE_MAGIC ^ pid`) to a fixed offset in the LAST page of its 8 GiB mapping (as far
+as possible from anything the bump allocator could reach in a short run), committing that page
+first; the child reads the SAME offset back after mapping the inherited section. Exact
+byte-for-byte match confirmed on a real cross-process fork (host repro:
+`LITEBOX_PROCESS_FORK=1 LITEBOX_DIAG_SHARED_HEAP_PROBE=1 LITEBOX_DIAG_SHARED_HEAP_INHERIT=1
+.\target\release\litebox_runner_linux_on_windows_userland.exe -Z --oci-image
+docker.io/library/debian:stable-slim -- /bin/bash -c '(echo child_forked) ; OUTER_EXIT=$?'`):
+```
+[shared_kernel_heap_probe] parent WROTE sentinel at addr=0x224b5e0f000 value=0xc0ffee00deadff77
+[shared_kernel_heap] INHERITED section mapped at parent's address=0x222b5e10000 handle=0x14
+[shared_kernel_heap_probe] child OBSERVED at addr=0x224b5e0f000 value=0xc0ffee00deadff77
+```
+(A second, independent run produced a different pid-derived sentinel, `0xc0ffee00dead8f63`,
+also matching exactly -- not a one-off coincidence.) This is genuine content sharing through the
+SAME physical pages, not merely address-consistent private copies -- the exact gap step 3's own
+notes left open, closed here at the mechanism level for the first time.
+
+**GATED OFF by default (`LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` required to enable), NOT yet safe as
+the default -- a real corruption bug found and root-caused live this session**: the FIRST version
+of this change made the export/inherit path unconditional whenever `LITEBOX_PROCESS_FORK=1` was
+set. On the identical trivial one-fork repro that exits 0 with the gate off, the PARENT process
+crashed with an unhandled `STATUS_ACCESS_VIOLATION` (exit `-1073741819` / `0xC0000005`) and no VEH
+trace at all, immediately after the child's own clean exit. Isolated by `git stash`-ing the change,
+rebuilding, and re-running the SAME repro against pre-change code: clean exit 0, proving this was a
+genuine regression, not a pre-existing flake. Root cause: `SHARED_KERNEL_HEAP_NEXT_FREE` (the
+bump-allocation cursor `WindowsUserland::alloc` advances) is still a per-process `static`. Once a
+child that mapped the INHERITED section starts making its own real allocations (its
+`GlobalState`/`Task` reconstruction allocates heavily via `Box`/`Vec`/`BTreeMap`), its own cursor
+starts bump-allocating from the SAME base address the parent's own, still-live heap objects already
+occupy -- two processes independently claiming and writing through the SAME physical pages at the
+SAME offsets, corrupting the parent's own live heap the moment the child writes there. This is
+exactly the shared-bump-cursor race anticipated during design and explicitly the reason this pass
+scoped itself to a basic write/read proof rather than trusting a full `GlobalState` migration.
+
+**Fix applied**: gated the entire export/inherit call site behind a NEW, separate diagnostic env
+var, `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` (distinct from `LITEBOX_DIAG_SHARED_HEAP_PROBE`, which
+only controls the sentinel write/read and is meaningless without the inherit gate also being on).
+`spawn_suspended`'s `bInheritHandles` forcing is ALSO conditional on the gate (only forced when
+`shared_heap_export.is_some()`), so a default `LITEBOX_PROCESS_FORK=1` run changes NOTHING about
+handle inheritance either. Confirmed byte-for-byte with the gate off: identical exit 0 on the same
+repro, pre- and post-change. Confirmed with the gate on: the sentinel proof still reproduces
+exactly (see above), and the SAME corruption crash still reproduces too (expected, not yet fixed --
+see next steps).
+
+**`XVFB_FAILED`/`DBUS_FAILED` do NOT resolve this pass.** Not attempted live against the full
+`webtop_stack.sh` boot: with the gate off, nothing about the default path changed (by design, see
+above -- would just reproduce the already-known `NGINX_SELFTEST_FAILED`/`XVFB_FAILED`/`DBUS_FAILED`
+sequence from the step-3 entry above, unchanged). With the gate on, real fork density (nginx alone
+forks up to 30 times) would hit the cursor-corruption bug on essentially the first or second real
+fork -- the minimal repro above already crashed on the FIRST fork under the exact same mechanism --
+before any AF_UNIX-dependent process could benefit from real sharing regardless. Re-running the
+full stack under the broken gate was judged not worth the wall-clock: the outcome (an early crash,
+for the already-identified reason) was not expected to produce new information beyond what the
+minimal repro already conclusively demonstrates, and burning the session on a guaranteed-uninformative
+multi-minute boot would trade real remaining budget for a foregone conclusion.
+
+**Pickup notes for the next session** (also see step-3's own "Remaining before step 4" list, which
+still applies verbatim: `RawMutex`'s `waiters`/`remote_waiter_handles` still process-local `Vec`s;
+`DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>` vtable cross-process-invalid without
+same-base loading; fd/HANDLE indirection and `beyond_stdio` both unstarted):
+
+1. Move `SHARED_KERNEL_HEAP_NEXT_FREE` INTO the shared section itself (e.g. reserve its first 8
+   bytes as the real cursor) and advance it with a cross-process-visible atomic
+   (`InterlockedCompareExchange` on the mapped memory itself works across processes sharing the
+   same physical pages -- no named kernel object needed for the cursor specifically, unlike
+   general mutual exclusion) instead of a process-local `AtomicUsize`. This is the ONE fix that
+   unblocks flipping `LITEBOX_DIAG_SHARED_HEAP_INHERIT` to the default.
+2. `GlobalState`'s 22 fields are NOT migrated to live IN the shared heap at all yet -- this pass
+   only proves the SECTION-SHARING MECHANISM (two processes can genuinely see each other's raw
+   writes through the same pages), not that any real litebox subsystem state uses it. Do not claim
+   futex/pipe/AF_UNIX state is shared until that migration happens and is independently verified
+   the same way (a direct read/write check on the actual field, not just "the section maps").
+3. Once (1) is fixed, flip the gate to the default and re-run `webtop_stack.sh` per the
+   `XVFB_FAILED`/`DBUS_FAILED` question above -- that is the actual, still-open test of whether
+   real sharing closes the AF_UNIX gap.
+4. Trait-object vtables (`DescriptorEntry`'s `Box<dyn FdEnabledSubsystemEntry>`) remain
+   cross-process-invalid without same-base RUNNER image loading (ASLR is still on for the runner
+   binary) -- a real blocker for migrating fd-table state specifically, separate from the cursor
+   fix, per ADVISORY-002 §3.3's own "Trait-object vtables" note.
