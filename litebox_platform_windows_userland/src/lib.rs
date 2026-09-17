@@ -6095,6 +6095,22 @@ const WAITER_SLOT_EMPTY: u32 = 0;
 /// on a single specific mutex is already an extreme contention scenario for one guest.
 const MAX_INLINE_WAITERS: usize = 32;
 
+/// How long [`RawMutex::block_or_maybe_timeout`] lets a wait run with no wake before checking
+/// whether the recorded holder ([`RawMutex::holder_pid`]) is still alive. Deliberately generous --
+/// this is a "genuinely stuck" threshold, not a normal contention latency budget: a live holder,
+/// however slow, is never disturbed by this, only queried, so the only cost of a larger value here
+/// is how long a genuinely orphaned lock (the holder process already dead) stays stuck before a
+/// waiter notices; the only cost of a smaller one is a few more harmless `OpenProcess`/
+/// `GetExitCodeProcess` calls per still-live long wait. See [`RawMutex::holder_pid`]'s doc comment
+/// for the live orphaned-lock defect this interval exists to bound.
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Windows' `STILL_ACTIVE` sentinel (`GetExitCodeProcess` returns this as the "exit code" for a
+/// process that has not yet terminated) -- duplicated from `process_fork.rs`'s own identically-
+/// named, identically-valued local constant rather than shared, matching that constant's own doc
+/// comment on why: this crate's `windows_sys` version does not export it.
+const STILL_ACTIVE: u32 = 259;
+
 struct WaiterSlot {
     pid: AtomicU32,
     event: core::sync::atomic::AtomicIsize,
@@ -6313,6 +6329,15 @@ pub struct RawMutex {
     /// kernel arena, e.g. `GlobalState.net`); see [`WaiterQueue`]'s doc comment for the real,
     /// live-confirmed bug that design change fixes.
     waiters: WaiterQueue,
+    /// The Windows process id of whichever thread most recently ran
+    /// [`litebox::platform::RawMutex::note_locked`] on this instance, or `0` if unlocked/unknown.
+    /// Written only by the current holder (`note_locked`/`note_unlocked`), read only by a blocked
+    /// waiter in [`Self::block_or_maybe_timeout`]'s periodic liveness check -- see that method's
+    /// doc comment for the orphaned-lock defect this exists to recover from. Deliberately just a
+    /// pid, not a `WaiterRecord`-style `(pid, event)` pair: the holder is not necessarily blocked
+    /// anywhere, so it has no waiter event to report, and none is needed -- a waiter that decides
+    /// to recover only needs to know whether this pid is still alive, never to signal it directly.
+    holder_pid: AtomicU32,
 }
 
 /// Process-local cache of cross-process handle duplications [`RawMutex::resolve_waiter_event`] has
@@ -6333,6 +6358,7 @@ impl RawMutex {
         Self {
             inner: AtomicU32::new(0),
             waiters: WaiterQueue::new(),
+            holder_pid: AtomicU32::new(0),
         }
     }
 
@@ -6499,52 +6525,54 @@ impl RawMutex {
             }
         }
 
-        // Compute timeout in ms
-        let timeout_ms = match timeout {
-            None => Win32_Threading::INFINITE, // no timeout
-            Some(timeout) => {
-                let ms = timeout.as_millis();
-                ms.min(u128::from(Win32_Threading::INFINITE - 1)).trunc()
+        // Wait in bounded chunks -- never longer than `LIVENESS_CHECK_INTERVAL` -- even for a
+        // caller-requested infinite/no-timeout wait (`timeout == None`, i.e. every call reached
+        // via `litebox::platform::RawMutex::block`, which `litebox::sync::mutex::
+        // SpinEnabledRawMutex::lock_contended` uses for EVERY genuinely contended lock acquisition
+        // in this whole codebase). This is what lets `try_recover_from_dead_holder` ever run at
+        // all for a `block()` caller; see `holder_pid`'s doc comment for the live orphaned-lock
+        // defect this recovers from. It changes nothing about how promptly a genuine wake is
+        // observed: `WaitForSingleObject` still returns the instant a concurrent `wake_many` calls
+        // `SetEvent`, regardless of chunk size -- chunking only matters once a whole
+        // `LIVENESS_CHECK_INTERVAL` has passed with no wake at all.
+        let overall_deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let result = loop {
+            let remaining = overall_deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            if remaining == Some(Duration::ZERO) {
+                break self.finish_real_timeout(record, event);
             }
-        };
+            let chunk = remaining.map_or(LIVENESS_CHECK_INTERVAL, |r| r.min(LIVENESS_CHECK_INTERVAL));
+            let chunk_ms = chunk
+                .as_millis()
+                .min(u128::from(Win32_Threading::INFINITE - 1))
+                .trunc();
 
-        // SAFETY: `event` is this thread's own valid, owned-for-its-lifetime event handle.
-        let rc = unsafe { Win32_Threading::WaitForSingleObject(event, timeout_ms) };
+            // SAFETY: `event` is this thread's own valid, owned-for-its-lifetime event handle.
+            let rc = unsafe { Win32_Threading::WaitForSingleObject(event, chunk_ms) };
 
-        let result = match rc {
-            Win32_Foundation::WAIT_OBJECT_0 => Ok(UnblockedOrTimedOut::Unblocked),
-            Win32_Foundation::WAIT_TIMEOUT => {
-                // Race with a concurrent `wake_many`: it may have already popped `record` (and
-                // therefore committed to signaling `event`) in the gap between the wait timing
-                // out internally and this thread reacquiring `self.waiters`. Resolve it under
-                // the same lock, so the two operations are mutually exclusive.
-                let still_queued = self.waiters.with_lock(|queue| queue.remove_locked(record));
-                if still_queued {
-                    Ok(UnblockedOrTimedOut::TimedOut)
-                } else {
-                    // `wake_many` already removed us from the queue, which under its own
-                    // implementation happens only as part of unconditionally signaling `event`
-                    // (see its doc comment) -- so this wait cannot race that signal, only
-                    // possibly precede its delivery. Consuming it here, rather than leaving it
-                    // pending on a per-thread event this thread will reuse for an unrelated
-                    // future wait, is what makes that reuse across calls safe.
-                    // SAFETY: `event` is this thread's own valid, owned event handle.
-                    let rc2 = unsafe {
-                        Win32_Threading::WaitForSingleObject(event, Win32_Threading::INFINITE)
-                    };
-                    assert_eq!(
-                        rc2,
-                        Win32_Foundation::WAIT_OBJECT_0,
-                        "waiter event not signaled after wake_many committed to signaling it"
-                    );
-                    Ok(UnblockedOrTimedOut::Unblocked)
+            match rc {
+                Win32_Foundation::WAIT_OBJECT_0 => break Ok(UnblockedOrTimedOut::Unblocked),
+                Win32_Foundation::WAIT_TIMEOUT => {
+                    let real_deadline_passed = overall_deadline
+                        .is_some_and(|deadline| deadline <= std::time::Instant::now());
+                    if real_deadline_passed {
+                        break self.finish_real_timeout(record, event);
+                    }
+                    // Not a real (caller-requested) timeout yet -- just one more
+                    // `LIVENESS_CHECK_INTERVAL` chunk elapsing with no wake. Recover only if the
+                    // recorded holder is POSITIVELY CONFIRMED dead; otherwise keep waiting exactly
+                    // as an infinite wait always did before this change.
+                    if self.try_recover_from_dead_holder(val, record) {
+                        break Ok(UnblockedOrTimedOut::Unblocked);
+                    }
                 }
+                Win32_Foundation::WAIT_FAILED => {
+                    let err = unsafe { GetLastError() };
+                    panic!("Unexpected error={err} for WaitForSingleObject")
+                }
+                other => panic!("Unexpected WaitForSingleObject return {other:#x}"),
             }
-            Win32_Foundation::WAIT_FAILED => {
-                let err = unsafe { GetLastError() };
-                panic!("Unexpected error={err} for WaitForSingleObject")
-            }
-            other => panic!("Unexpected WaitForSingleObject return {other:#x}"),
         };
 
         if let Some(start) = start {
@@ -6563,6 +6591,127 @@ impl RawMutex {
         }
 
         result
+    }
+
+    /// Handles a REAL (caller-requested, via `block_or_timeout`) timeout expiring in
+    /// `block_or_maybe_timeout`'s wait loop -- factored out so the loop's periodic internal
+    /// `LIVENESS_CHECK_INTERVAL` chunk timeouts (which are not real timeouts at all, see that
+    /// loop's own comment) share this exact, pre-existing race-resolution logic with the real one,
+    /// unchanged from before this method was split out.
+    fn finish_real_timeout(
+        &self,
+        record: WaiterRecord,
+        event: Win32_Foundation::HANDLE,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // Race with a concurrent `wake_many`: it may have already popped `record` (and
+        // therefore committed to signaling `event`) in the gap between the wait timing
+        // out internally and this thread reacquiring `self.waiters`. Resolve it under
+        // the same lock, so the two operations are mutually exclusive.
+        let still_queued = self.waiters.with_lock(|queue| queue.remove_locked(record));
+        if still_queued {
+            Ok(UnblockedOrTimedOut::TimedOut)
+        } else {
+            // `wake_many` already removed us from the queue, which under its own
+            // implementation happens only as part of unconditionally signaling `event`
+            // (see its doc comment) -- so this wait cannot race that signal, only
+            // possibly precede its delivery. Consuming it here, rather than leaving it
+            // pending on a per-thread event this thread will reuse for an unrelated
+            // future wait, is what makes that reuse across calls safe.
+            // SAFETY: `event` is this thread's own valid, owned event handle.
+            let rc2 =
+                unsafe { Win32_Threading::WaitForSingleObject(event, Win32_Threading::INFINITE) };
+            assert_eq!(
+                rc2,
+                Win32_Foundation::WAIT_OBJECT_0,
+                "waiter event not signaled after wake_many committed to signaling it"
+            );
+            Ok(UnblockedOrTimedOut::Unblocked)
+        }
+    }
+
+    /// Checked every [`LIVENESS_CHECK_INTERVAL`] by a thread that has been blocked in
+    /// [`Self::block_or_maybe_timeout`] without a wake for that whole interval: is the process
+    /// recorded in [`Self::holder_pid`] (the most recent [`litebox::platform::RawMutex::
+    /// note_locked`] caller) still alive? If it is confirmably dead (`OpenProcess` fails, or
+    /// `GetExitCodeProcess` reports anything other than `STILL_ACTIVE`), this `RawMutex` is
+    /// orphaned -- exactly the live, `cdb`-confirmed defect [`Self::holder_pid`]'s own doc comment
+    /// describes: a cross-process-fork child's fast `ExitProcess` exit path is documented
+    /// (`litebox_runner_linux_on_windows_userland::main`) to skip ordinary `Drop`-based unlocking,
+    /// so a child killed while its own `net_worker` thread held a genuinely cross-process-shared
+    /// `litebox::sync::Mutex` (`GlobalStateHandle::net_lock`'s, in the reproduced 10-sequential-
+    /// `mkdir`-cross-process-fork repro) leaves that mutex's `inner` word permanently at `val` (1
+    /// or 2) with no live thread anywhere ever going to call `unlock()` on it again -- confirmed
+    /// live via `cdb -p`, two snapshots ~18s apart showing the identical stuck stack (`run::
+    /// {closure#0}` -> `Mutex::lock_contended` -> `RawMutex::block` -> `WaitForSingleObjectEx`),
+    /// with every other thread in the process idle-waiting or independently progressing, never the
+    /// lock holder.
+    ///
+    /// Recovery here is deliberately conservative: `holder_pid == 0` (never recorded, or already
+    /// cleared by a normal `unlock()`) is treated as "unknown, do not guess" and never recovered --
+    /// only a POSITIVELY CONFIRMED-DEAD recorded holder is ever forced open. A holder confirmed
+    /// still alive is left completely alone: this never steals a lock out from under a live,
+    /// legitimately slow holder (heavy real contention, or a slow first-time `NatGateway` init) --
+    /// doing so would be a correctness disaster (two threads/processes believing they hold the same
+    /// critical section at once), not a fix. This is also why recovery is gated behind a multi-
+    /// second `LIVENESS_CHECK_INTERVAL` rather than firing immediately on first contention: the
+    /// common case (a live, busy holder) must never pay for this at all, only a wait that has
+    /// already gone on unusually long does.
+    ///
+    /// Returns `true` if it recovered the lock (the caller should stop waiting on `event` and let
+    /// the normal CAS retry loop in `litebox::sync::mutex::SpinEnabledRawMutex::lock_contended`
+    /// re-attempt acquisition, exactly as it would after any other spurious wake), `false` if the
+    /// holder is confirmed alive or unknown (the caller should keep waiting).
+    fn try_recover_from_dead_holder(&self, val: u32, record: WaiterRecord) -> bool {
+        let holder = self.holder_pid.load(Ordering::Acquire);
+        if holder == 0 {
+            return false;
+        }
+        // SAFETY: liveness probe only, minimum access requested.
+        let handle = unsafe {
+            Win32_Threading::OpenProcess(
+                Win32_Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                holder,
+            )
+        };
+        let dead = if handle.is_null() {
+            true
+        } else {
+            let mut exit_code: u32 = 0;
+            // SAFETY: `handle` was just successfully opened above.
+            let ok = unsafe { Win32_Threading::GetExitCodeProcess(handle, &raw mut exit_code) };
+            // SAFETY: `handle` is a valid, owned handle not used again after this point.
+            unsafe {
+                Win32_Foundation::CloseHandle(handle);
+            }
+            ok != 0 && exit_code != STILL_ACTIVE
+        };
+        if !dead {
+            return false;
+        }
+        litebox_util_log::warn!(
+            holder_pid:% = holder, val:% = val;
+            "RawMutex::block_or_maybe_timeout: recorded holder process is dead -- recovering orphaned lock"
+        );
+        // Best-effort: force the stuck value back to unlocked so the normal CAS retry loop can
+        // proceed. A `compare_exchange` (not a plain `store`) so a concurrent recovery by another
+        // waiter, or the (extremely unlikely, but not impossible) case that the real holder's
+        // process id was reused by an unrelated new process between the read above and here,
+        // cannot clobber a value someone else has already legitimately changed.
+        let _ = self
+            .inner
+            .compare_exchange(val, 0, Ordering::AcqRel, Ordering::Relaxed);
+        // Only clear `holder_pid` if it is still the same dead pid just confirmed -- never clobber
+        // a DIFFERENT holder that may have legitimately acquired the lock in the interim.
+        let _ =
+            self.holder_pid
+                .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
+        // Remove this thread's own registration: it is no longer going to wait on `event` for this
+        // call, so a later, unrelated `wake_many` must not find and signal a stale record for it.
+        // Best-effort (a concurrent `wake_many` may already have popped it, which is fine -- see
+        // `finish_real_timeout`'s identical race handling for the real-timeout case).
+        self.waiters.with_lock(|queue| queue.remove_locked(record));
+        true
     }
 
     /// Fallback for the (extremely rare, see `WaiterQueue`'s doc comment) case where
@@ -6721,6 +6870,16 @@ impl litebox::platform::RawMutex for RawMutex {
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(timeout))
+    }
+
+    fn note_locked(&self) {
+        // SAFETY: reading the calling thread's own process id; no preconditions.
+        let pid = unsafe { Win32_Threading::GetCurrentProcessId() };
+        self.holder_pid.store(pid, Ordering::Release);
+    }
+
+    fn note_unlocked(&self) {
+        self.holder_pid.store(0, Ordering::Release);
     }
 }
 

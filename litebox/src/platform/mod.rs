@@ -318,6 +318,25 @@ pub trait RawMutex: Send + Sync + 'static {
         val: u32,
         time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
+
+    /// Best-effort hook: called by [`crate::sync::Mutex`] right after this raw mutex's underlying
+    /// atomic transitions from unlocked to locked (by the thread that just acquired it), before any
+    /// of the data it protects is touched. No-op by default.
+    ///
+    /// Exists for a platform whose `RawMutex` can be embedded directly in memory shared across a
+    /// process boundary (`litebox_platform_windows_userland`'s Track B shared kernel arena is the
+    /// only one today): such a platform can use this, together with [`Self::note_unlocked`], to
+    /// record enough about the current holder (e.g. its process id) that a later waiter stuck long
+    /// enough to suspect the holder died mid-hold -- the exit path of a cross-process-fork child
+    /// skips ordinary `Drop`-based unlocking by design, see that platform's own `RawMutex::block`
+    /// doc comment for the live `cdb`-confirmed orphaned-lock evidence this exists to recover from
+    /// -- can tell a genuinely-dead holder apart from one that is merely slow, without requiring
+    /// every platform (most of which have no such holder-death hazard at all) to pay for it.
+    fn note_locked(&self) {}
+
+    /// The `unlock` counterpart of [`Self::note_locked`] -- called right before this raw mutex's
+    /// underlying atomic transitions back to unlocked. No-op by default.
+    fn note_unlocked(&self) {}
 }
 
 /// Identifies WHICH shared-kernel-singleton a [`SharedKernelStateProvider::create_shared_kernel_state`]/

@@ -1514,3 +1514,79 @@ Candidate fixes, none attempted -- next session should read the actual code befo
 Repro/evidence used this pass (not preserved as files -- rerun `.wfgy`'s cheap repro under
 `LITEBOX_PROCESS_FORK=1` with a 3-10 iteration `mkdir` loop, `cdb -p <pid> -c "~*k; qd"` twice ~15-20s
 apart on the surviving `litebox_runner_linux_on_windows_userland.exe` PID after `ALL_DONE` prints).
+
+## Twelfth instance FIXED: exact mechanism confirmed, one wrong fix tried and reverted, real fix landed
+
+**Exact mechanism, confirmed (candidate fix 1's audit, done properly).** Every cross-process-fork
+CHILD's own bootstrap (`litebox_runner_linux_on_windows_userland::diag_process_fork_task_resume_probe`,
+`lib.rs` ~line 1884) spawns its own `net_worker` thread -- required since pass 156 (a forked child's
+guest DNS/socket traffic is never pumped without it). Its doc comment at the time claimed to mirror
+`run()`'s own `net_worker` "verbatim", but did not: `run()`'s copy (`lib.rs` ~line 862) has a
+`shutdown: Arc<AtomicBool>` the child's copy silently dropped in favor of a bare `loop {}`. That
+thread calls `perform_network_interaction()` -> `GlobalStateHandle::net_lock()` -- the one
+genuinely cross-process-shared `litebox::sync::Mutex` guarding `Network` for the whole fork family
+-- in a loop with no yield besides `wait_on_tun`'s sub-millisecond timeout, so it spends a large
+fraction of its life holding that lock, with NO shutdown signal, right up until this process's own
+fast exit (`std::process::exit` -> `ExitProcess`, which `main.rs`'s own doc comment already
+documents skips C-runtime `atexit`/Rust `Drop` entirely). `ExitProcess` terminates every thread in
+the process instantaneously wherever it happens to be, so a bad-timing exit catches this thread
+inside `net_lock()`, holding it, and kills it there -- orphaning the shared lock's raw state word (1
+or 2, "locked") permanently: a plain `AtomicU32` has no OS-level release the way `BootLock`'s kernel
+file handle does, and `RawMutex` (`advisor/ADVISORY-002-d-zero-fork.md` section 3.2: a shared state
+word plus a per-waiter kernel `Event`, nothing more) had no owner-death recovery. A later
+`net_lock()` call anywhere in the fork family then blocks in `RawMutex::block` forever, exactly
+matching the original evidence above.
+
+**Fix attempt #1 (candidate 1, graceful shutdown+join before the child's `std::process::exit`) --
+WRONG, live-tested, reverted.** Gave the child's `net_worker` the same `shutdown` flag `run()`'s
+copy has, and joined it before `std::process::exit`. Compiled clean, looked correct, matched the
+codebase's own established pattern (`run()` already does exactly this for its own `net_worker`) --
+but a live 10-mkdir run under it took the host process 4m45s to exit, and it was finally killed by
+`STATUS_FATAL_APP_EXIT` (0xC000041D via `process_fork.rs`'s external fault-terminate watchdog, which
+kills any process it is tracking after a sustained zero-CPU-progress grace period), not a clean
+`exit 0` -- and every single `mkdir` child in the run was itself killed (`/bin/bash: ... N Killed
+mkdir -p /tmp/d$i`) rather than printing `OKn`. Root cause of the regression: requiring a
+fast-exiting child to first re-acquire the shared `net_lock` (to observe its own shutdown flag)
+forces it to contend against the PARENT's OWN `net_worker`, which runs continuously for the entire
+top-level guest program's life and re-acquires the same lock via a cheap, same-process spin/CAS
+loop -- a slow cross-process waiter (kernel wait + `DuplicateHandle` + `SetEvent` round trip) can
+lose that race for a very long time, i.e. real starvation, not a bug in the join logic itself.
+**Lesson for any future attempt at this shape of fix: do not make a fast-exiting process wait for a
+busy, live, cross-process-shared lock to become free before it can exit -- that trades a rare
+orphaned-lock hang for a much-more-likely lock-starvation hang.** Reverted via `git checkout --`
+before landing anything.
+
+**Fix attempt #2 (candidate 2, robust-mutex owner-death recovery) -- landed.** `litebox::platform::
+RawMutex` gained two new trait methods with empty default bodies (`note_locked`/`note_unlocked`),
+called by `litebox::sync::mutex::SpinEnabledRawMutex` right after a successful lock acquisition
+(`try_lock`'s CAS success, and both success arms of `lock_contended`) and right before `unlock`'s
+atomic release -- every platform but Windows is unaffected (the calls compile to nothing).
+`litebox_platform_windows_userland::RawMutex` is the only real override: a new `holder_pid:
+AtomicU32` field records the current holder's Windows pid (`note_locked`/`note_unlocked` just
+store/clear it). `block_or_maybe_timeout` now waits in bounded `LIVENESS_CHECK_INTERVAL` (2s) chunks
+instead of one `INFINITE`/caller-timeout `WaitForSingleObject` call -- including for an ostensibly-
+infinite `block()` wait, which is every genuinely contended lock acquisition in the whole codebase.
+This changes nothing about how fast a genuine wake is observed (`SetEvent` still returns the wait
+immediately, independent of chunk size); it only matters once a whole interval passes with no wake
+at all. On each such internal timeout, a new `try_recover_from_dead_holder` helper checks
+`holder_pid` via `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess`:
+`holder_pid == 0` (never recorded, or already cleared by a normal `unlock()`) is left alone
+("unknown, don't guess"), and -- the safety-critical case -- a holder CONFIRMED still alive is also
+left completely alone, however slow, so this can never steal a lock out from a live holder (would be
+a correctness disaster: two threads/processes believing they hold the same critical section at
+once). Only a POSITIVELY CONFIRMED-DEAD holder is forced open: `inner` `compare_exchange`'d from
+`val` back to `0`, `holder_pid` `compare_exchange`'d from the confirmed-dead pid back to `0`, this
+thread's own `WaiterRecord` removed from the queue so a later unrelated `wake_many` cannot find and
+signal a stale slot for it.
+
+**Live-verified, 4 independent full runs, all exit 0 in ~6.7-7.3s** (`LITEBOX_PROCESS_FORK=1`, the
+10-mkdir repro): every run printed `OK1` through `OK10` and `ALL_DONE`, and every run hit the
+recovery path exactly twice -- `"RawMutex::block_or_maybe_timeout: recorded holder process is dead
+-- recovering orphaned lock holder_pid=<pid> val=2"`, once partway through the loop and once during
+the parent/bootstrap process's own final teardown (the exact spot the original evidence's `cdb`
+snapshots caught stuck) -- direct, repeated confirmation both that the orphaning is real and
+reliably reproducing on this exact repro, AND that it is now recovered every single time rather than
+hanging. Zero `Killed` guest processes across all 4 runs (a clean contrast with fix attempt #1's
+run, which killed every `mkdir` child). Files changed: `litebox/src/platform/mod.rs` (trait),
+`litebox/src/sync/mutex.rs` (call sites), `litebox_platform_windows_userland/src/lib.rs` (`RawMutex`
+struct/impl). `git log`: the commit immediately after this doc's own recording commit.

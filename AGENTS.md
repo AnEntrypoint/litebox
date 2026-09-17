@@ -261,7 +261,7 @@ Decisive live proof: parent registers one key immediately before `spawn_cross_pr
 a second strictly after; child observes both right after its own `build()` -- proves genuine live
 sharing, not a snapshot.
 
-## Cross-process fork: twelve registry/pointer/lock fixes converging on one root pattern, 2026-09-17
+## Cross-process fork: twelve registry/pointer/lock fixes, all now landed, 2026-09-17
 
 Root pattern (instances 1-11): a raw `Arc`/`Box` pointer captured once by whichever process
 constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless (or dangling) in
@@ -273,13 +273,13 @@ doesn't need cross-process visibility -- `litebox`, `proc_self_info`/`pts_regist
 via a locking accessor (state that IS genuinely meant to be shared -- `Network`'s two fields via
 `net_lock`, `Pipes.litebox` via `pipes()`), or (`RawMutex.waiters`, instance 9) replace a
 process-private-heap `Vec` with a fixed-slot pointer-free array. Instance 12 (`net_lock`'s Mutex left
-permanently locked by an exiting fork-child process) is a DIFFERENT shape -- not a stale pointer, a
-lock-liveness gap -- see the section immediately below for full detail, still open.
+permanently locked by an exiting fork-child process) was a DIFFERENT shape -- not a stale pointer, a
+lock-liveness/owner-death-recovery gap -- now also FIXED; see the section immediately below.
 Does NOT close `XVFB_FAILED`/`DBUS_FAILED`; `pty_registry`/`flock_registry`/etc. remain real,
 still-open follow-on work. Full panic signatures, bisection transcripts, WER/symbolizer evidence and
 per-fix detail: archive (`docs/AGENTS_ARCHIVE_2026-09-17.md`, newest entries at the bottom).
 
-## RawMutex lost-wakeup and Pipes stale-pointer -- BOTH FIXED 2026-09-17; FutexManager sharing gap FIXED; a NEW cross-process-fork lock-orphaning hang found, NOT fixed
+## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, and cross-process-fork lock-orphaning -- ALL FOUR FIXED 2026-09-17
 
 **A. `RawMutex::resolve_waiter_event` cross-process branch -- FIXED.** Was: `RawMutex.waiters:
 Mutex<Vec<WaiterRecord>>`'s `Vec` buffer is process-private-heap, so a `RawMutex` embedded in
@@ -321,21 +321,23 @@ shadowing `GlobalState`'s (now removed) field. Live-verified: 10 sequential exte
 cross-process forks now complete cleanly (`OK1..OK10` + a final marker), across two independent
 runs -- previously hung permanently partway through the loop.
 
-**D. NEW, found live immediately after C landed, NOT fixed: a genuinely-shared
-`litebox::sync::Mutex` (standing candidate: `GlobalStateHandle::net_lock`'s) is left permanently
-LOCKED once some cross-process-fork child that acquired it exits.** Twelfth instance, a different
-shape again -- not a stale pointer, a lock-liveness/ownership-recovery gap in a mutex correctly,
-genuinely meant to be one shared instance for the whole fork family. With C fixed, the 10-mkdir
-repro now completes (`OK1..OK10`/`ALL_DONE` all print), but the runner's own host process then never
-calls `std::process::exit` afterward: confirmed genuine (not slow) via two `cdb -p` snapshots ~18s
-apart, same thread at the identical PC both times (`run::{closure#0}` -> litebox `Mutex::
-lock_contended` -> `RawMutex::block` -> `WaitForSingleObjectEx`), with no other thread in the
-process plausibly holding it (all others idle-waiting or, for the NAT-gateway thread, independently
-confirmed progressing, not stuck). Confirmed specific to `LITEBOX_PROCESS_FORK=1` (thread-based fork
-exits clean in <10s on the identical repro). Leading hypothesis: a fork child's `std::process::exit`
--equivalent teardown (`main.rs`'s own doc comment: `ExitProcess` skips C-runtime `atexit` handlers)
-skipped a live `MutexGuard::drop`, leaving `RawMutex.inner` stuck locked with no "owner died"
-recovery path. Candidate fixes and full cdb evidence, none attempted yet: archive.
+**D. Cross-process-fork lock-orphaning hang -- FIXED.** Twelfth instance. Root cause, confirmed
+live: a cross-process-fork CHILD's own `net_worker` thread (`lib.rs` ~1884) had no shutdown signal
+(unlike `run()`'s own copy at ~862, despite a doc comment claiming a "verbatim" mirror) and spends a
+large fraction of its life holding the one genuinely cross-process-shared `net_lock`; this child's
+fast `ExitProcess` exit (skips `Drop` entirely, `main.rs`) can and does kill that thread mid-hold,
+orphaning the lock permanently for the rest of the fork family -- a plain `AtomicU32` has no
+OS-level "owner died" release. A graceful shutdown+join fix was tried first and was WRONG: it forces
+the exiting child to contend for the shared lock against the ever-running parent's own `net_worker`,
+which live-tested as a 4m45s stall ending in an external-watchdog `STATUS_FATAL_APP_EXIT` kill, worse
+than the original bug -- reverted, do not retry that shape of fix. Real fix: robust-mutex owner-death
+recovery on `RawMutex` itself -- new `note_locked`/`note_unlocked` trait hooks (default no-op on
+every platform but Windows) record the holder's pid; `block_or_maybe_timeout` waits in bounded 2s
+chunks and, only once a recorded holder is POSITIVELY CONFIRMED dead via `OpenProcess`+
+`GetExitCodeProcess` (never a merely-slow-but-alive one), force-recovers the lock. Live-verified: 4
+independent full 10-mkdir runs under `LITEBOX_PROCESS_FORK=1`, all exit 0 in ~7s, every run hitting
+the recovery path exactly twice. Full mechanism, the reverted attempt's evidence, and file list:
+archive.
 
 Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
 CLIMBING CPU) not re-investigated this pass -- still open, full detail: archive. Distinct from D
