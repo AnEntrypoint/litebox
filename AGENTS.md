@@ -103,7 +103,21 @@ under a minute versus never in 15+. Older cost explanations were measured wrong.
 
 **Still open**: nginx's own SSL-cert generation fails on its first real startup attempt — the original
 symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
-146-152`). Do not cite the separate curl-self-test stall as live open work: that one is fixed.
+146-152`). The TOP-LEVEL parent's curl-self-test stall (`sys_wait4(pid=-1)` not checking
+`cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
+
+**NEW, found live 2026-09-17, full `.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` (a
+new best: reliably reaches `NGINX_STARTED`, past the shared-kernel-heap commit-exhaustion wall
+which is now separately fixed), NOT fixed: a nested variant of the already-fixed curl-self-test
+stall.** Top-level pid 1 blocks reading the `$(curl ...)` self-test's pipe forever; the writer (a
+cross-process-fork child that already finished its own script-visible work) is itself stuck one
+level deeper, inside its own `prepare_for_exit()` reaping ITS OWN (thread-based-forked) child,
+blocked in `RawMutex::block` forever. `6e86a40`'s fix only covers the TOP-LEVEL parent's own
+`wait4`; this is a cross-process child's OWN nested wait4, a locus that fix never touched. Not
+root-caused (two live candidate leads, undistinguished); `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser were
+NOT reached this session as a direct result. Full mechanism, cdb evidence, and a process-hygiene
+lesson (`cdb -p <pid>` alone is INVASIVE — a bare `q` KILLS the debuggee; always use `-pv`/`qd`):
+archive.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.

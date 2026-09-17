@@ -1590,3 +1590,99 @@ hanging. Zero `Killed` guest processes across all 4 runs (a clean contrast with 
 run, which killed every `mkdir` child). Files changed: `litebox/src/platform/mod.rs` (trait),
 `litebox/src/sync/mutex.rs` (call sites), `litebox_platform_windows_userland/src/lib.rs` (`RawMutex`
 struct/impl). `git log`: the commit immediately after this doc's own recording commit.
+
+## Full `.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1`, same pass, after the `net_lock`
+## fix landed -- reaches a NEW best point (`NGINX_STARTED`), then a NEW nested-wait4 hang, NOT fixed
+
+With the twelfth defect (`net_lock` orphaning) fixed and committed, this pass pushed on to the
+session's actual end goal: `.wfgy/webtop_stack.sh` (the full stock XFCE desktop, unmodified) under
+`LITEBOX_PROCESS_FORK=1`. Launch (PowerShell, `& .\runner.exe ... *> log.txt`, NEVER `Start-Process
+-RedirectStandardOutput/-RedirectStandardError` -- see the process-hygiene note below, re-confirmed
+live this pass): `--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=
+0:glibc.malloc.mxfast=0 --oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from
+.wfgy/webtop_seed.tar -- /bin/bash /webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`/`LITEBOX_LOG=warn,
+litebox_platform_windows_userland::fork_verify=error` as real host env vars.
+
+**Result: reaches `NGINX_CONFIGURED`/`NGINX_STARTED` reliably (2/2 independent runs, identical
+~6647-line log position both times) -- a new best for this exact flag combination, past the
+shared-kernel-heap commit-exhaustion wall this same day's earlier session hit and which is now
+separately fixed (see "Fixed-base shared kernel heap" section). Then wedges permanently** in the
+nginx self-test's `curl` retry loop, confirmed genuine via zero log growth across 60s+ and 120s+
+observation windows on two independent runs (not merely slow).
+
+**Mechanism, confirmed live via non-invasive `cdb -pv -p <pid> -c "~*k;qd"` (see process-hygiene
+note below for why `-pv`/`qd` specifically)**:
+
+1. Top-level pid 1's own bash (in the parent `litebox_runner_linux_on_windows_userland.exe`
+   process) blocks in `Pipes::read`, via `run_on_raw_fd`/`sys_read`, waiting for EOF on the
+   `$(curl -s -o /dev/null -m 3 -w "%{http_code}" http://127.0.0.1:3000/ ...)` self-test's
+   command-substitution pipe (`litebox::platform::ForkPipeBridge::Sink`'s parent-side drain loop,
+   `spawn_fork_child_pipe_pump` in `litebox_platform_windows_userland/src/lib.rs`).
+2. The WRITER is a genuine cross-process-fork child (confirmed via its own diagnostic line:
+   `[process_fork_diag] task-resume-probe (child): exiting with encoded status 0xc0de0000`) --
+   its own script-visible work is done. But `Get-Process` shows its Windows PID still alive, same
+   `StartTime`, indefinitely after that line prints.
+3. Attaching directly to THAT child's own PID (same `-pv`/`qd` technique) shows its own guest
+   thread stuck inside `prepare_for_exit()` -> a `sys_wait4()`-equivalent reap of ITS OWN child
+   (curl itself, or an intermediate subshell) -- that reap blocks forever in `RawMutex::block` via
+   `litebox::event::wait::WaitContext::wait_until` (`ThreadHandle::interrupt` in the stack, an
+   auto-reset-event wait that is never getting signaled).
+4. No THIRD Windows PID ever appears anywhere in the process list for the innermost grandchild (curl
+   itself), so it took the THREAD-based fork fallback (not cross-process) -- consistent with it
+   being a plain, cheap `fork()`+`exec()` the cross-process eligibility scan let through as
+   thread-based for whatever reason (not determined this pass).
+
+**Why this is NOT the already-fixed curl-self-test stall (`6e86a40`, `docs/track-b-fork-fix-
+progress.md`)**: that fix made the TOP-LEVEL PARENT's own `sys_wait4(pid=-1)` check
+`cross_process_children` before falling into the thread-based-only polling loop. This hang is one
+level deeper: it is a CROSS-PROCESS-FORK CHILD's own nested `wait4`-equivalent, reaping ITS OWN
+(thread-based) child, that never wakes -- a locus `6e86a40`'s fix never touched or exercised (its
+own verification was specifically the top-level parent reaping curl directly). Genuinely a new
+finding, not a regression of the old one.
+
+**Not root-caused further this pass (out of session budget).** Two live candidate explanations,
+not yet distinguished:
+- (a) `spawn_cross_process_exit_notifier`/the `060ccc3` SIGCHLD-delivery-on-cross-process-exit
+  mechanism (`litebox/src/platform/mod.rs`, wired via `arm_cross_process_exit_notifier` in
+  `litebox_shim_linux/src/syscalls/process.rs`) may only be armed/wired for the TOP-LEVEL parent's
+  own `do_clone` call sites, not for a nested cross-process child's own subsequent forks -- if so,
+  a THREAD-based child forked from INSIDE a cross-process child might have no working wake path
+  for its own parent's `wait4` at all, matching this symptom exactly and independent of the
+  `net_lock`/mutex-orphaning class entirely.
+- (b) This may be the SAME already-documented, already-open "thread-based fork's own SECOND
+  glibc/tcache corruption class" (`AGENTS.md`'s selkies section: "a SECOND, different corruption
+  signature under heavy fork load... hitting bin paths `GLIBC_TUNABLES` deliberately leaves
+  enabled" -- explicitly marked "Track B territory, do not re-attempt a tunable-coverage fix
+  without evidence of a THIRD mechanism") -- manifesting here as a hang (corrupted wait/event
+  state) rather than the more commonly observed crash, for this specific nested-fork shape.
+  `GLIBC_TUNABLES` was correctly passed as a runner `--env` flag this pass (confirmed via the many
+  successful cross-process forks earlier in the same log), so this would not be a tunables-
+  coverage gap if true -- consistent with (b)'s own framing.
+
+Distinguishing (a) from (b) needs either: tracing whether `arm_cross_process_exit_notifier` is
+ever called from a cross-process CHILD's own `do_clone` (not just the top-level parent's), or a
+narrower purpose-built repro (a fake nginx that backgrounds a `sleep &` inside an ALREADY-cross-
+process-forked child, so the nested wait4 is reached in under a second) with `cdb`-attached
+BEFORE the hang, to inspect the exact wait/event state the blocked `RawMutex::block` call is
+sitting on.
+
+**`XVFB_UP`/`DBUS_UP`/`DE_UP`/a live browser connection, the terminal-emulator click-through, and
+the other Applications-menu apps were NOT reached this session** as a direct consequence -- this is
+the precise, current blocker standing between this project and its stated end goal under
+`LITEBOX_PROCESS_FORK=1`.
+
+**Process-hygiene lesson, learned the hard way this exact pass**: `cdb -p <pid>` alone is an
+INVASIVE attach -- issuing a bare `q` (quit) at the end TERMINATES the debuggee, it does not merely
+detach from it. An early debugging pass in this same investigation used `cdb -p <pid> -c "~*k;q"`
+against the parent process under live investigation and killed it outright, which was initially
+almost misread as a new litebox bug (the sudden process-count drop and total log-growth stop)
+before the mistake was traced to the debugger command itself and corrected. Every `cdb` attach to a
+process that must stay alive for further observation must use `-pv` (non-invasive attach) and end
+with `qd` (quit-and-detach) instead of a bare `q`. The relaunched, cleanly-observed second attempt
+(this section's own evidence above) used `-pv`/`qd` throughout and the process under investigation
+was confirmed still alive and progressing normally after each inspection.
+
+Host memory: recovered cleanly to ~4.5GB free / 15.6GB total after killing all `litebox_runner`
+processes at the end of this investigation (`Stop-Process -Force`, not `cdb`) -- no leaked
+processes, no lingering commit pressure, consistent with every prior session's same cleanup
+discipline.
