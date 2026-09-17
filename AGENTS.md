@@ -105,13 +105,9 @@ under a minute versus never in 15+. Older cost explanations were measured wrong.
 symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
 146-152`). Do not cite the separate curl-self-test stall as live open work: that one is fixed.
 
-**Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; live evidence says it is
-thread-based-fork-only.** The archived repro now hits the ALREADY-DOCUMENTED "second glibc
-corruption class" (`double free or corruption (out)`, see "still open" above) before Xorg survives
-long enough to reach the freeze precondition. **Decisive substitute test**: the identical script
-with `LITEBOX_PROCESS_FORK=1` as a real host env var completed cleanly 2/2 — zero freeze, zero
-double-free, consistent with the freeze being thread-path-specific. Full evidence, both repro logs,
-and a disclosed ENOMEM finding under concurrent cross-process forks: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
+`LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
+Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: archive.
 
 ## Container images and OCI loading
 
@@ -169,16 +165,12 @@ Architectural gap: **guest processes share no AF_UNIX/loopback/FIFO namespace**,
 gives zero AVs but Xvfb is unreachable from its own clients — one shared host-side transport would put
 the whole desktop on the crash-free path (`docs/fork-fs-veh-2026-09-08.md:128-144`).
 
-**The glibc/tcache crash class still sporadically hits selkies**, separately from the ACK-stall-kill:
-live-captured once despite the `--env` tunables flag being passed correctly (a DPI-fork on a client's
-5th rapid reconnect SIGSEGVs) — genuinely ADVISORY-001 §3N on selkies' own fork; not yet re-verified
-crash-free over many cycles (the ACK-stall-kill dominates the symptom in practice). **2026-09-16:
-`GLIBC_TUNABLES` propagation through `spawn_exec_collision_child` has NO gap** (live-proven, true on
-every collision including selkies' own python3 re-exec) — **the recurring crash is a SECOND, different
-corruption signature under heavy fork load** (`double free or corruption (out)` SIGABRT, not §3N's
-`REVEAL_PTR` XOR SIGSEGV), hitting bin paths the tunables deliberately leave enabled. **Track B
-territory, not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix without evidence
-of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**The glibc/tcache crash class still sporadically hits selkies** on the THREAD-based fork path,
+separately from the ACK-stall-kill (a DPI-fork on rapid reconnect SIGSEGVs, ADVISORY-001 §3N) --
+**a SECOND, different corruption signature under heavy fork load** (`double free or corruption
+(out)` SIGABRT), hitting bin paths `GLIBC_TUNABLES` deliberately leaves enabled. **Track B
+territory, not a tunable-coverage gap** — do not re-attempt a `GLIBC_TUNABLES`/env fix without
+evidence of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
@@ -207,41 +199,24 @@ live-verified NAMED-event mutex primitive, still unwired (its own doc comment: i
 `RawMutex` (the trait every shim subsystem's synchronization bottoms out in) is rewired as of this pass
 -- see "Cross-process-capable `RawMutex`" below, a different mechanism from `xproc_sync.rs`.
 
-## Cross-process-capable `RawMutex` (Track B step 2, ADVISORY-002 §3.2) -- done, live-verified
+## Cross-process-capable `RawMutex` -- done, live-verified (detail: archive)
 
-`litebox_platform_windows_userland/src/lib.rs`'s `RawMutex` no longer calls
-`WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN, see "hard platform constraint"
-above) -- replaced with a manual wait queue plus one auto-reset kernel `Event` per OS thread. Same
-trait/`underlying_atomic()`/`INIT` contract, no caller changed; `wake_many` now returns the real
-popped-waiter count (was always `0` -- a pure improvement, not a behaviour requirement change).
-Full internals (queue/lock-ordering, timeout-race resolution): `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+`RawMutex` no longer calls `WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) --
+replaced with a manual wait queue plus one auto-reset kernel `Event` per OS thread; cross-process
+half is real code (`DuplicateHandle`-based) but genuinely untaken today (same-pid always true so
+far). Live-verified: `yes hello | head -c 5000000 | wc -c`, `sort --parallel=4` multithreaded
+contention, both exact/correct, no hang/deadlock. `process-fork-pipe-relay-sigpipe-above-4kb`
+(3-stage pipeline SIGPIPE) resolved 2026-09-16, don't rely on `LITEBOX_PROCESS_FORK=1` for
+heavy-iteration guests. Full internals: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-**Cross-process half is real code, not a stub, but genuinely untaken today**: every
-`WaiterRecord` carries the waiter's pid; same-pid (always true today) uses the handle directly, a
-different pid would use `DuplicateHandle` (already proven live cross-process, non-admin) cached in
-`remote_waiter_handles`. Deliberately different from `xproc_sync.rs`'s single named-per-mutex
-event (needs a section offset to key its side-table by, i.e. step 3).
+## Shared kernel heap -- selective-routing correction landed (ADVISORY-002 §3.3)
 
-**Live-verified** (release build, default thread-based fork, no test files): `yes hello | head -c
-5000000 | wc -c` -- exact `5000000`. `seq 1 3000000 | sort --parallel=4 -n | tail -3` -- exact
-correct output, proving `sort`'s real multi-threaded pthread mutex/condvar contention completes
-with no hang/deadlock/missed-wakeup/corrupted-merge. Host RAM identical before/after.
-
-**3-stage-pipeline SIGPIPE: relay EXONERATED 2026-09-16** -- `seq 1 200000 | sort -n | tail -3`
-under `LITEBOX_PROCESS_FORK=1` truncates upstream of the relay (guest execution correctness, not
-the relay: `total_read == total_written` every time, ~9 live runs). PRD
-`process-fork-pipe-relay-sigpipe-above-4kb` resolved (redirected); don't rely on
-`LITEBOX_PROCESS_FORK=1` for heavy-iteration guests. Full repro/evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
-
-## Shared kernel heap -- SELECTIVE-ROUTING CORRECTION LANDED 2026-09-17 (ADVISORY-002 §3.3)
-
-**The "route everything through one shared section" design (Track B steps 3-5, `c08182d`..`3d661d2`)
-is REVERTED.** `SLAB_ALLOC` (`#[global_allocator]`, `lib.rs`) is back to the pre-`c08182d` private
-per-process `VirtualAlloc2` mechanism for every ordinary host-heap allocation. Routing everything
-through the shared bump allocator (no reclaim) was live-proven to exhaust an 8 GiB pool after 45-90
-real execs (`memory allocation ... failed`, 218 occurrences) -- worse than not sharing at all;
-**live-verified fixed**, zero such failures on an identical re-run. The fixed-base/atomic-cursor/
-handle-inherit machinery is NOT deleted -- it now backs a small **64 MiB, standalone, bounded**
+**The "route everything through one shared section" design is REVERTED.** `SLAB_ALLOC`
+(`#[global_allocator]`, `lib.rs`) is back to the private per-process `VirtualAlloc2` mechanism for
+every ordinary host-heap allocation -- routing everything through the shared bump allocator (no
+reclaim) was live-proven to exhaust an 8 GiB pool after 45-90 real execs, worse than not sharing at
+all; **live-verified fixed**. The fixed-base/atomic-cursor/handle-inherit machinery is NOT deleted
+-- it now backs a small **64 MiB, standalone, bounded**
 arena (`shared_kernel_arena_alloc`, `lib.rs`), deliberately NOT wired to `GlobalAlloc`, reserved for
 `LiteBoxX`/`GlobalState`-only placement. Full mechanism/history: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
@@ -257,129 +232,141 @@ no free list; a kernel singleton must outlive the whole fork family). `SharedKer
 protocol: trivial `Arc::new` default everywhere with real OS process isolation, real impl on
 `WindowsUserland`. `litebox_shim_linux::GlobalState` is now `GlobalStateHandle<Platform, FS>` =
 `Platform::Handle<GlobalStateX<...>>`; `LinuxShimBuilder::build` does the real attach-or-create
-branch. **Decisive live proof**: parent bumps `next_thread_id` by a sentinel delta both immediately
-before AND strictly after `spawn_cross_process_fork_child` returns; the child's own post-`build()`
-read observes both bumps -- only possible if it is the SAME live allocation, not a frozen snapshot
-or a merely-consistent-address independent copy.
+branch. **Decisive live proof**: parent bumps `next_thread_id` by a sentinel delta both before AND
+after `spawn_cross_process_fork_child` returns; the child's own post-`build()` read observes both
+bumps -- only possible if it is the SAME live allocation, not a snapshot or an independent copy.
 
 **Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: root cause precisely characterized.** `SharedArc::new`
-places only `T`'s literal inline bytes in the arena -- fine for plain scalars/an inline sync word,
-but every `GlobalState` REGISTRY (`unix_addr_table`, `pty_registry`, `daemon_pty_masters`,
-`flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`, `shared_files`, 3 caches) is a
+places only `T`'s literal inline bytes in the arena -- but every `GlobalState` REGISTRY
+(`unix_addr_table`, `pty_registry`, `daemon_pty_masters`, `flock_registry`, `fifo_registry`,
+`sysv_shm`, `memfds`, `shared_files`, plus originally 3 caches -- now down to 0, see below) is a
 `BTreeMap`/similar whose NODES live on the ordinary private per-process heap -- an attaching
 process's copy of the root pointer is meaningless in its own address space. Follow-up PRD:
-`globalstate-nested-collections-not-actually-shared` (**`unix_addr_table` specifically since
-partly closed -- see the section below**). Full mechanism, every registry's exact type, the
-`proc_self_info`/`pts_registry` mount-ordering caveat: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+`globalstate-nested-collections-not-actually-shared`. Full mechanism: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-## `unix_addr_table` presence sharing -- landed and live-verified; does NOT close `XVFB_FAILED`
-## (real blocker identified: a pervasive, PRE-EXISTING, load-scaling stack-overflow crash)
+## `unix_addr_table` presence sharing -- landed and live-verified (real blocker was elsewhere)
 
-Scoped follow-up, JUST `unix_addr_table` (other 5 registries: still untouched).
 `litebox_shim_linux/src/syscalls/unix.rs`'s `SharedUnixAddrPresenceTable`: fixed-256-slot, pure-
-`core::sync::atomic` (zero `unsafe`, zero `RawMutex` -- its bookkeeping `Mutex<Vec<..>>` is itself
-per-process, not actually cross-process-safe today, see archive), lock-free side-index recording
-`(kind, key bytes <=108, owner guest pid)` per bind/listen, mirrored alongside (never replacing)
-each process's real `unix_addr_table` `BTreeMap`. A plain `GlobalState` field (`unix_addr_presence`,
-no new `SharedKernelStateProvider` slot needed): zero pointer indirection, so it inherits whatever
-sharing `GlobalState` itself already has for free, same mechanism as `next_thread_id`. Wired at all
-4 call sites (stream `listen`/`Drop`, datagram `bind`/`Drop`) plus an always-on diagnostic on every
-real `ECONNREFUSED`, distinguishing "nothing listening" from "listening, in a DIFFERENT guest pid,
-not yet reachable" (`[unix_addr_presence]` log line).
-
-**Decisive live proof** (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`, mirrors `GLOBALSTATE_SHARE_PROBE`
-exactly): parent registers one key immediately before `spawn_cross_process_fork_child`, a SECOND
-key strictly AFTER it returns; child looks up both right after its own `build()`. Live result:
-`child observed before=Some(1) after=Some(1)` -- proves genuine live sharing, not a snapshot.
+`core::sync::atomic` (zero `unsafe`, zero `RawMutex`), lock-free side-index recording `(kind, key
+bytes <=108, owner guest pid)` per bind/listen, mirrored alongside (never replacing) each
+process's real `unix_addr_table` `BTreeMap`. A plain `GlobalState` field (`unix_addr_presence`, no
+new `SharedKernelStateProvider` slot needed): zero pointer indirection, inherits whatever sharing
+`GlobalState` itself already has for free. Wired at all 4 call sites (stream `listen`/`Drop`,
+datagram `bind`/`Drop`) plus an always-on diagnostic on every real `ECONNREFUSED`. **This is the
+reusable flat-table PATTERN the still-genuinely-shared registries below (`pty_registry` et al.)
+need next** — `unix_addr_table`'s own full `BTreeMap` (the `Backlog`/`Channel` connection data,
+not just presence) remains real per-process-heap and unconverted, same as those others.
+Decisive live proof: parent registers one key immediately before `spawn_cross_process_fork_child`,
+a second strictly after; child observes both right after its own `build()` -- proves genuine live
+sharing, not a snapshot.
 
 ## Cross-process-fork stack-overflow class -- ROOT-CAUSED AND FIXED 2026-09-17
 
 The pre-existing, load-scaling `thread '<unknown>' has overflowed its stack` crash above (122
-occurrences by `XVFB_FAILED`, previously blamed on `xset q`/X11 specifically and suspected
-host-memory-pressure-driven) is **NOT** stack-size, `fork_verify` single-stepping, or memory
-pressure -- live bisection (temporary log markers, since removed) proved EVERY cross-process fork
-child after the first (trivial `mkdir`/`rm -rf` as readily as `xset q`) died inside
-`GlobalStateHandle`'s `litebox: LiteBox<Platform>` field's `descriptor_table_mut()`/`RwLock`
-machinery. Real mechanism: `LiteBox<Platform>` is `Platform::Handle<LiteBoxX<Platform>>` (an `Arc`
-pointer); `GlobalState.litebox` used to place that pointer's literal bytes inline in the
-cross-process-shared kernel arena at CREATE time. A LATER cross-process-fork child that ATTACHES
-(every fork after the family's first) read back the FIRST creator's pointer VALUE -- meaningless
-in its own address space -- and chasing its garbage `RwLock` internals is what actually consumed
-the stack (unbounded, since the "loop" is walking corrupted memory, not bounded guest work), not
-guest instruction count. Same defect class already documented below for `unix_addr_table` et al.,
-just never previously found in `litebox` itself.
-
-**Fix** (`litebox_shim_linux/src/lib.rs`): `GlobalState` no longer has a `litebox` field (nor
-`proc_self_info`/`pts_registry`, a second, doc-comment-predicted instance of the identical defect
--- `default_fs`/`default_fs_multi_layer` mounts `/proc/self`+`/dev/pts` with `LinuxShimBuilder`'s
-own per-process copies BEFORE `build()`'s attach-or-create decision, so an attaching child's
-`GlobalState` copy was likewise always the wrong, foreign-process one). `GlobalStateHandle` now
-carries its own `litebox`/`proc_self_info`/`pts_registry` fields, populated from THIS process's own
-`LinuxShimBuilder` fields on every path (attach or create) -- Rust's field resolution tries the
-receiver's own concrete type before auto-`Deref`ing, so this SHADOWS the removed `GlobalState`
-fields transparently; no external call site (185+ `xxx.litebox`/`.proc_self_info`/`.pts_registry`
-uses across `epoll.rs`/`net.rs`/`pipe.rs`/`pty.rs`/`file.rs`/`unix.rs`) needed to change beyond
-widening their `&GlobalState<Platform, FS>` parameter/`impl` types to `&GlobalStateHandle<Platform,
-FS>` (a pure widening -- `GlobalStateHandle` derefs to `GlobalState`, so every other field/method
-access on those same parameters is unaffected). `litebox::LiteBox::clone` widened from
-`pub(crate)` to `pub` (litebox_shim_linux is a legitimate, now-documented user, not the "outside
-user" that visibility was guarding against).
+occurrences by `XVFB_FAILED`) is **NOT** stack-size, `fork_verify` single-stepping, or memory
+pressure -- every cross-process fork child after the family's first died chasing
+`GlobalStateHandle`'s `litebox: LiteBox<Platform>` field: `LiteBox<Platform>` is
+`Platform::Handle<LiteBoxX<Platform>>` (an `Arc` pointer), and `GlobalState.litebox` placed that
+pointer's literal bytes inline in the cross-process-shared arena at CREATE time -- an ATTACHing
+child read back the FIRST creator's pointer VALUE, meaningless in its own address space, and
+chasing its garbage `RwLock` internals is what consumed the stack. **This is THE pattern reused
+for every fix below**: `GlobalState` loses the field entirely; `GlobalStateHandle` carries its own
+copy instead, populated from THIS process's own per-process source on every path (attach or
+create) -- Rust's field resolution tries the receiver's own concrete type before auto-`Deref`ing,
+so this SHADOWS the removed `GlobalState` field transparently; no external call site needs to
+change beyond widening its parameter type from `&GlobalState<..>` to `&GlobalStateHandle<..>`.
+Also fixed same-session, same pattern: `proc_self_info`/`pts_registry` (a second,
+doc-comment-predicted instance -- `default_fs` mounts `/proc/self`+`/dev/pts` with
+`LinuxShimBuilder`'s own per-process copies before `build()`'s attach-or-create decision).
 
 **Live-verified fixed**: two independent full `.wfgy/webtop_stack.sh` boots under
 `LITEBOX_PROCESS_FORK=1`, zero `overflowed its stack` occurrences in either (previously 122+ by
-`XVFB_FAILED` alone) -- confirmed by `grep -c` over each full log. `fork_verify` wiring unchanged
-(an A/B with it disabled entirely hit the identical crash, ruling it out). The 32 MiB
-guest-execution thread wrap in `diag_process_fork_globalstate_probe` (matching every other
-guest-executing thread's stack-size pattern) is kept -- independently correct even though it
-wasn't sufficient alone. Full bisection transcript, both ruled-out hypotheses: archive.
+`XVFB_FAILED` alone). Full bisection transcript: archive.
 
-**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: a DIFFERENT, already-documented gap is next.** With
-the stack overflow gone, boots now progress substantially further before hitting the SAME root
-cause this section already names below for `unix_addr_table` et al. -- a clean, host-diagnosed
-`STATUS_ACCESS_VIOLATION` in `<litebox::fs::procfs::ProcSelfTable>::set` on the FIRST run (before
-the `proc_self_info` fix landed) and, after it, a `BTreeMap` navigation panic
-(`alloc::collections::btree::navigate.rs`, `Option::unwrap()` on `None`) in one of the remaining
-shared registries (`unix_addr_table`/`pty_registry`/`daemon_pty_masters`/`flock_registry`/
-`fifo_registry`/`sysv_shm`/`memfds`/`shared_files`/2 caches -- exact field not yet isolated).
-**Unlike `litebox`/`proc_self_info`/`pts_registry`, these registries genuinely NEED real
-cross-process sharing for correct Linux semantics** (a listening AF_UNIX socket, a file lock, a pty
-registration must be visible to the rest of the fork family) -- the `GlobalStateHandle`-shadow-
-field fix used above is WRONG for them (it would silently make them non-shared, reintroducing the
-exact bugs today's `unix_addr_table` presence-table work exists to fix). The real fix per registry
-needs the SAME flat, pointer-free redesign `SharedUnixAddrPresenceTable` already proves out (below)
--- real, separate, per-registry engineering work, correctly scoped as "next session" already.
+## Four more registries/subsystems fixed the SAME session, 2026-09-17 (`34129ed`, `33bc57f`)
 
-**Next session, in order**: (1) identify exactly which registry's `BTreeMap` panicked (temporary
-per-registry access logging, same bisection technique used to find `litebox` above); (2) apply the
-`SharedUnixAddrPresenceTable` flat-table pattern to it; (3) repeat for the remaining registries one
-at a time, live-testing `.wfgy/webtop_stack.sh` after each; (4) only once ALL of them are
-genuinely shared does a live desktop/browser/Terminal-Emulator/Thunar test become meaningful.
-Full bisection methodology, live proof transcripts: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+With the stack overflow gone, boots progressed further and hit the SAME root cause one field at a
+time -- each isolated with a minimal `-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir -p
+...'` repro under `LITEBOX_PROCESS_FORK=1` (much cheaper than a full webtop boot per iteration),
+fixed with the SAME `GlobalStateHandle`-shadow-field pattern as `litebox`/`proc_self_info`/
+`pts_registry`, rebuilt, re-verified live after each:
+
+- **`elf_patch_cache`** (`BTreeMap<(pid,fd), ElfPatchState>`): real panic,
+  `alloc::collections::btree::node.rs:1232:35`, inside `.entry(...).or_insert(...)`. Keyed by
+  `(pid, fd)` already -- no call site reads another process's entry, and `ElfPatchState` holds
+  absolute per-process addresses anyway, so per-process storage is CORRECT, not just safe.
+- **`exec_ranges_cache`** (`BTreeMap<(dev,ino), Arc<Vec<Range<u64>>>>`): same panic signature,
+  next field down, once the above was fixed. Values are a pure function of a file's own ELF
+  section headers -- per-process storage just re-derives them; only cross-process cache reuse is
+  lost.
+- **`segment_scan_cache`** (`BTreeMap<SegmentScanKey, Arc<SegmentScanTemplate>>`): with the above
+  two fixed, the repro stopped panicking but HUNG instead (host CPU climbing, zero new log
+  output) -- a corrupted `BTreeMap` can walk into a long/cyclic chain instead of an
+  out-of-bounds `unwrap`. Same fix; re-verified past this cache.
+- **Trampoline placement** (not a `GlobalState` registry -- a genuinely different subsystem, found
+  immediately after the three caches above stopped blocking ELF loading): `maybe_patch_exec_segment`'s
+  fallback, when `MAP_FIXED_NOREPLACE` at the ELF-computed preferred trampoline address fails
+  (common in a cross-process-fork child, whose adopted VMA layout starts far denser than a fresh
+  process's), called `do_mmap_anonymous(None, ...)` -- discarding the proximity hint entirely.
+  `Vmem::get_unmmaped_area` has no "nearby" concept for an occupied non-fixed hint (silently
+  ignored, falls through to a fully generic top-down/gap search -- see its own "1.5 HELD BACK"
+  comment, a related but different, deliberately-still-disabled fix), so the chosen address could
+  land anywhere in the guest's whole address space -- live-caught landing ~127 TiB from the code
+  segment, `distance > 0x7FFF_0000` (JMP rel32 range), triggering `apply_trap_fallback` (poisons
+  every `syscall` in that segment to a crash trap) and killing the guest the moment it executed
+  one. Fixed by `Task::probe_nearby_trampoline_slot` (`litebox_shim_linux/src/syscalls/mm.rs`): a
+  LOCAL, bounded probe (real `MAP_FIXED_NOREPLACE` attempts at exponentially-increasing offsets on
+  alternating sides of the preferred address, capped at 24 rounds) scoped to just this one call
+  site, not a change to the shared `get_unmmaped_area` every `mmap()` goes through. Live-verified:
+  zero `trampoline too far` occurrences over a 5-iteration mkdir loop that previously hit it on
+  literally every single `execve` (100% occurrence rate before the fix).
+
+**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`. Real next blocker, NOT YET root-caused (unlike the
+four fixes above, which all have an exact panic backtrace or a 100%-vs-0% before/after measurement)**:
+with all four landed, both the minimal mkdir repro AND a full `.wfgy/webtop_stack.sh` boot show a
+NEW failure shape -- intermittent, no panic, no host AV diagnostic:
+- Some forked children complete cleanly (`run_thread returned (guest thread terminated)`, clean
+  exit).
+- Some are silently killed mid-syscall with zero diagnostic output of any kind (live-caught:
+  `mkdir`'s own guest tid, mid a `sys_read` loop over an mmap'd library file at climbing 4096-byte
+  offsets -- reads simply stop, no error, no panic, shell reports `Killed`).
+- Some hang instead: `entering real guest execution` logged, then zero further output while host
+  CPU climbs continuously (same signature as the `segment_scan_cache` hang above, before it was
+  fixed) -- reproduced both on the minimal mkdir repro's later fork iterations AND on the full
+  webtop boot's very FIRST `/webtop_stack.sh` guest thread (before any `[s]` marker), each killed
+  manually after CPU kept climbing with no new log line.
+
+**Leading hypothesis, not yet confirmed**: one of the six registries still genuinely shared and
+still real per-process-heap `BTreeMap`s -- `pty_registry`, `daemon_pty_masters`, `flock_registry`,
+`fifo_registry`, `sysv_shm`, `memfds`, `shared_files` (full type list: this file's "Shared kernel
+heap" section below) -- now being reached for the first time now that ELF loading no longer blocks
+earlier. **Unlike the four fixes above, these genuinely NEED real cross-process sharing for correct
+Linux semantics** (a pty id, a file lock, a FIFO, a SysV shm segment, a `MAP_SHARED` file mapping
+must be visible to the rest of the fork family) -- the `GlobalStateHandle`-shadow-field pattern used
+above is WRONG for them; each needs the SAME flat, pointer-free redesign
+`SharedUnixAddrPresenceTable` already proves out (below), separate engineering work per registry.
+Plain `mkdir` does not obviously touch any of these, so this hypothesis is NOT confirmed -- the
+intermittent, no-diagnostic nature (vs. the four fixes above's deterministic, exact panics) suggests
+a corrupted `BTreeMap` reached only via a racy/address-layout-dependent path, OR a different
+mechanism entirely. **Next session: get an exact backtrace or crash signature for THIS failure
+before fixing anything** -- same discipline that made the four fixes above fast and certain, don't
+guess which registry this time. `RUST_BACKTRACE=1` did not catch it (no panic fires); a live
+debugger attach or a narrower bisection (bisect by disabling one registry's real use at a time,
+same technique used to find `litebox` originally) is the likely next tool needed.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
 VEH_FRAME_STRIDE canary guard, `dev_bench`/`litebox_runner_snp` Windows build failures, CoW-mmap
-performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, and the GUI-protocol
-(DRM/KMS+wgpu) decision — all CLOSED 2026-09-16, none open. Full detail moved to
-`docs/AGENTS_ARCHIVE_2026-09-17.md` to keep this file under budget.
-
-## Cross-process-fork stdio-handle bug — FIXED 2026-09-17
-
-`spawn_suspended`'s two back-to-back `STARTF_USESTDHANDLES` blocks clobbered each other (no null
-guard on the second); fixed by keeping exactly one. PTY test (`script -qec ...`) hit a separate,
-NOT-root-caused `signal=Signal(13)` -- PRD `cross-process-fork-pty-sigpipe-in-script-relay`. Full
-detail, including the commit-exhaustion boot attempt this pass also fixed: archive.
-
-## Presenter-process split -- done, fully verified live end-to-end, 2026-09-16
-
-`litebox_presenter_protocol` crate + runner-side `ControlServer` (zero-copy scanout handoff) +
-`litebox-presenter.exe`; `--gui` is now `Option<GuiMode>`. One real bug found+fixed (missing
-per-call `OVERLAPPED`). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`,
-`docs/presenter-process-design.md`.
-
-## Five cheap-wins PRD rows closed, 2026-09-16
-
-Cargo build/fmt-verified, no boot needed. Full detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, the GUI-protocol
+(DRM/KMS+wgpu) decision, five cheap-wins PRD rows (cargo build/fmt-verified, no boot needed) — all
+CLOSED, none open. Also closed: **cross-process-fork stdio-handle bug** (`spawn_suspended`'s two
+back-to-back `STARTF_USESTDHANDLES` blocks clobbered each other, no null guard on the second; PTY
+test hit a separate, NOT-root-caused `signal=Signal(13)`, PRD
+`cross-process-fork-pty-sigpipe-in-script-relay`) and **presenter-process split** (`litebox_
+presenter_protocol` crate + runner-side `ControlServer` zero-copy scanout handoff +
+`litebox-presenter.exe`, `--gui` now `Option<GuiMode>`, one real bug found+fixed: missing per-call
+`OVERLAPPED`; `docs/presenter-process-design.md`). Full detail on all of the above:
+`docs/AGENTS_ARCHIVE_2026-09-17.md` / `_2026-09-16.md`.
 
 ## Docs and tooling map
 
@@ -398,14 +385,11 @@ Cargo build/fmt-verified, no boot needed. Full detail: `docs/AGENTS_ARCHIVE_2026
 - Consult before deriving: `docs/premade-library-research.md`, `docs/drm-dumb-buffer-ioctl-reference.md`
   (kernel UAPI for DRM syscalls), `docs/diag-timeline-field-semantics.md` (before any `DIAG_TIMELINE`
   `comm`-field hypothesis — two investigations mis-traced it).
-- `docs/macos.md` — port state; the Apple Silicon guest-execution context switch is a stub, stays
-  deferred (PRD `macos-aarch64-guest-execution-context-switch-is-not-implemented`,
-  `gui-macos-presentation-runner-and-guest-entry-blocked`). Probe crates: `docs/wayland-drm-backend-probe/`,
-  `docs/linux-native-drm-gui-probe/`.
-- `docs/presenter-process-design.md` -- IMPLEMENTED and fully live-verified 2026-09-16; see this file's
-  own "Presenter-process split" section above. Designs NOT implemented: `docs/session-daemon-design.md`
-  (`litebox_termemu`'s VT100-emulator slice IS implemented; the daemon/IPC layer is not),
-  `docs/fork-region-grouping-design.md` (still a diagnostic probe).
+- `docs/macos.md` — port state; Apple Silicon guest-execution context switch is a stub, stays
+  deferred (PRD `macos-aarch64-guest-execution-context-switch-is-not-implemented`).
+- Designs NOT implemented: `docs/session-daemon-design.md` (`litebox_termemu`'s VT100-emulator
+  slice IS implemented; the daemon/IPC layer is not), `docs/fork-region-grouping-design.md` (still
+  a diagnostic probe).
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
   `drm_flip_probe.c`, `clone_probe.c`) plus `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`. OCI-pull
   Python scripts there are retired.
