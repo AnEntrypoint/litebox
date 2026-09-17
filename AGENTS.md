@@ -107,33 +107,22 @@ symptom this investigation began from, genuinely not root-caused (`docs/track-b-
 `cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
 
 **The nginx-self-test pipe-EOF wedge (fourth pass, 2026-09-17) — CONFIRMED and FIXED.** Root
-cause: broad `bInheritHandles=TRUE` on `spawn_process_fork_child`'s `CreateProcessW` calls leaked
-a sibling fork child's own inheritable bridge-pipe handle into unrelated children racing the same
-window, keeping the pipe's kernel object alive past its real writer's exit so the reader never
-saw EOF. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit per-call handle allow-list
-(`process_fork.rs`, `spawn_suspended_impl`). Live-verified fixed. Full mechanism: archive.
+cause: broad `bInheritHandles=TRUE` leaked a sibling fork child's inheritable bridge-pipe handle
+into unrelated children racing the same window. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit
+per-call handle allow-list (`process_fork.rs`, `spawn_suspended_impl`). Live-verified. Archive.
 
-**That BTreeMap panic — IDENTIFIED, NOT one of the six registries (fifth pass, 2026-09-17).**
-Symbolizing `rip=0x7ff630c77dd0`/`rva=0x1e7dd0` resolved to `ExecRangesCache`'s
-`insert_recursing` — already fixed hours earlier (`34129ed`, before `a270ccc`); almost certainly
-an ICF/COMDAT symbol collision with `flock_registry`'s byte-identical-layout type. Re-ran with
-`RUST_BACKTRACE=1` (host env var; `child_env` already inherits the parent's environment, no code
-change needed) instead of guessing further: the CURRENT live panic is neither hypothesis, nor any
-of the six registries — it's `litebox::net::Network`'s `socket_set`/`interface`/
-`queued_for_closure`/`closing_in_background` (`litebox/src/net/mod.rs`), still `Vec`-backed and
-NOT cross-process-safe despite `rebind_per_process_fields`'s prior doc comment claiming otherwise
-(corrected this pass) — only `litebox`/`device`, TWO of Network's nine fields, were ever actually
-rebound. Real panic, reproduced twice identically: `smoltcp-0.12.0/src/socket/tcp.rs:2126:46`,
-`Socket::seq_to_transmit`, `self.tuple.unwrap()` on a `None` — a live connection's real state
-reading back as garbage in an attaching process, same stale-cross-process-pointer symptom as
-every other fix today, one level deeper. **NOT a hard blocker**: the crashing fork child died,
-the s6 supervisor respawned it, and the boot reached `DE_LAUNCHED (image startwm.sh)` anyway — a
-new best point. **Deliberately NOT fixed this pass**: unlike the six registries, `Network` can't
-be safely per-process-shadowed — nginx and selkies are separate fork children that must see the
-SAME `socket_set` for smoltcp's virtual loopback `127.0.0.1:8081` routing to resolve (see "A real
-desktop renders in a browser" below); the correct fix is a shared-arena-native redesign (fixed
-socket-count cap, arena-backed rx/tx buffers), real separate follow-on work. Full evidence
-including the six-registry elimination and ICF reasoning: archive.
+**That BTreeMap panic — IDENTIFIED, NOT one of the six registries (fifth pass).** The live panic
+is `litebox::net::Network`'s `socket_set`/`interface`/`queued_for_closure`/`closing_in_background`
+(`litebox/src/net/mod.rs`), still `Vec`-backed and NOT cross-process-safe — only `litebox`/
+`device`, two of Network's nine fields, are rebound. Reproduces as
+`smoltcp-0.12.0/src/socket/tcp.rs:2126:46` `self.tuple.unwrap()` on `None`. **Not a hard
+blocker**: the crashing child dies, s6 respawns it, boot reaches `DE_LAUNCHED` anyway.
+**Deliberately not fixed**: `Network` can't be per-process-shadowed like the other six registries
+— nginx/selkies are separate fork children that must see the SAME `socket_set` for smoltcp's
+virtual loopback `127.0.0.1:8081` routing; the fix is a shared-arena-native redesign (fixed
+socket-count cap, arena-backed rx/tx buffers via smoltcp's `Managed<'a, [u8]>`), real separate
+follow-on work, **confirmed still the actual blocker to a browser witness** by direct 2026-09-17
+evidence below ("Track B step 4"). Archive.
 
 **`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
 ~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
@@ -152,6 +141,48 @@ thread-based path (and its tcache corruption class) for them entirely — not at
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
 Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: archive.
+
+### Track B step 4 (`beyond_stdio` gate relaxation) — investigated, one real bug fixed, browser
+### witness NOT reached, 2026-09-17 (full evidence: archive, newest entry)
+
+**Not an fd-gate problem.** Xvfb/dbus-daemon are excluded from cross-process fork by **comm
+name**, unconditionally, before fd complexity is even measured (`try_cross_process_fork`,
+`process.rs` ~2560) — already tried unconditionally-relaxed in an earlier pass and measured NOT
+to work, because even a successfully-forked Xvfb would be unreachable from sibling fork children
+while `Network`'s `socket_set` stays unshared (previous section). The fd-count gate itself is
+already mostly relaxed (pipes/files/eventfds carry, cloexec drops harmlessly); only
+`socket`/`unix-socket`/`pty`/`epoll`/`netlink` remain uncarriable. **The `Network` shared-arena
+redesign, not a gate tweak, is the real next unlock** — confirmed again live this pass (`curl
+127.0.0.1:8080` got `http_code=000` both before and after this pass's fix, TCP accepted then
+torn down, no HTTP — direct confirmation nginx/selkies still can't resolve their loopback route
+across separate fork children); still correctly out of safe single-pass scope.
+
+**Two fresh boots, evidence refining prior hypotheses (full detail: archive)**: Xvfb is
+genuinely signal-killed, not just the `xset` probe (refines the fifth-pass "false negative"
+read). `DBUS_FAILED`'s real cause in both runs was `/tmp/empty: No such file or directory` — a
+writable-layer cross-child-visibility gap, distinct from the already-fixed adoption race
+(`cc2ec83`), not root-caused. **New panic class**: `litebox/src/event/wait.rs:224`
+`ThreadHandle::interrupt`'s `unreachable!()` fires on garbage state (e.g. `UNKNOWN(994464581)`),
+dozens per boot, same stale-cross-process-pointer shape as everywhere else today but NOT
+debugger-confirmed, and there's already a separate unrelated open candidate
+(`SafeZoneAllocator::alloc` livelock) — do not patch blind, root-cause first. Both boots reached
+`DE_LAUNCHED` 2/2, matching the seventh pass.
+
+**One real bug found and FIXED**: `spawn_cross_process_fork_child`'s `inherited_eventfds` param
+(since pass 116) was received but never forwarded — `FORK_CHILD_EVENTFDS_ENV_VAR` was fully
+documented and the child-side consumer already worked, but nothing set the env var, so every
+fork accepted as eligible for carrying only eventfd(s) resumed its child with that fd silently
+missing. Fixed in `spawn_process_fork_child` (`litebox_platform_windows_userland/src/
+process_fork.rs` + its one call site in `lib.rs`), same encode shape as `inherited_files`.
+Builds clean; 2/2 post-fix boots still reach `DE_LAUNCHED` (no regression). Not yet observed
+exercised live (zero "recreated as an eventfd" lines in either boot) — this workload's eligible
+forks never happen to hold a non-cloexec eventfd at their `fork()` call site.
+
+**Pickup, precise**: (1) debugger-root-cause `wait.rs:224` before touching it — highest-value,
+most frequent panic; (2) root-cause the `/tmp/empty` writable-layer-visibility gap; (3) the
+`Network` shared-arena redesign is the real unlock, large/separate; (4) after (1)-(3),
+`timerfd`/`signalfd` are the next-cheapest carriable fd kinds (same shape as eventfd) before
+attempting `socket`/`unix-socket`/`pty`/`epoll`.
 
 ## Container images and OCI loading
 

@@ -12069,6 +12069,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             relocations_line,
             &child_pipe_handles,
             &inherited_files,
+            &inherited_eventfds,
         ) {
             Ok(Some((pid, handle))) => {
                 litebox_util_log::debug!(

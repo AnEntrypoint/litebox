@@ -1589,6 +1589,7 @@ pub fn spawn_process_fork_child(
     relocations_line: String,
     child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
     inherited_files: &[litebox::platform::ForkInheritedFile],
+    inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
 ) -> Result<Option<(u32, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1663,6 +1664,22 @@ pub fn spawn_process_fork_child(
             .collect::<Vec<_>>()
             .join(",");
         child_env.push((FORK_CHILD_FILE_FDS_ENV_VAR, spec));
+    }
+    // Bug found live 2026-09-17 (Track B step 4 investigation): `spawn_cross_process_fork_child`
+    // has received `inherited_eventfds` since pass 116 and the runner-side child already knows how
+    // to consume `FORK_CHILD_EVENTFDS_ENV_VAR` (`litebox_runner_linux_on_windows_userland::main`,
+    // `install_eventfd_at_fd`) -- but nothing on the PARENT side ever set the env var, so every
+    // fork the gate accepted as eligible because it carried only eventfds beyond stdio still
+    // resumed the child with that fd simply missing. A guest process whose GLib main loop wakes
+    // itself via an eventfd (the common case for every desktop daemon in the XFCE/D-Bus path) then
+    // hit `EBADF` on first use. Same encode-as-hex-triples shape as `inherited_files` above.
+    if !inherited_eventfds.is_empty() {
+        let spec = inherited_eventfds
+            .iter()
+            .map(|e| format!("{:x}:{:x}:{:x}", e.fd, e.count, e.flags))
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_EVENTFDS_ENV_VAR, spec));
     }
     if !child_pipe_handles.is_empty() {
         let spec = child_pipe_handles
