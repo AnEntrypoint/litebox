@@ -96,10 +96,17 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
+    /// Clones the handle (a cheap `Arc::clone`, same underlying `LiteBoxX`) -- deliberately not
+    /// the ordinary `Clone` trait, to keep this call site-visible/greppable rather than an
+    /// implicit `.clone()` a reader could mistake for a real duplication. `pub`, not
+    /// `pub(crate)`: `litebox_shim_linux::GlobalStateHandle` legitimately needs its OWN clone of
+    /// THIS process's `LiteBox` handle alongside the (possibly cross-process-shared)
+    /// `GlobalState` it wraps -- see that struct's doc comment and this struct's own
+    /// "2026-09-17 create-vs-attach note" above for why `LiteBox` itself must stay a plain,
+    /// per-process `Arc`, never routed through `SharedKernelStateProvider`. Still deliberately
+    /// not a blanket `#[derive(Clone)]`: external users outside this trust boundary should keep
+    /// constructing a `LiteBox` only via [`Self::new`].
+    pub fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
         }

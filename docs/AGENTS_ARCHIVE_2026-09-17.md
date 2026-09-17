@@ -1106,3 +1106,108 @@ needs either a shared-memory-native fixed-capacity ring buffer (mirroring this s
 slot-table technique) wired into `Backlog`/`UnixConnectedStream` specifically, or `xproc_sync.rs`'s
 real cross-process wake wired in first so a shared ring buffer's blocked reader/writer can actually
 be woken from a different OS process -- both bigger than this session's scope.
+
+## Cross-process-fork stdio-handle bug -- FIXED 2026-09-17 (trimmed from AGENTS.md)
+
+`spawn_suspended`'s (`litebox_platform_windows_userland/src/process_fork.rs`) two back-to-back
+`STARTF_USESTDHANDLES` blocks were NOT merely redundant: the second unconditionally overwrote
+`startup_info.hStd*` with no null/`INVALID_HANDLE_VALUE` guard, clobbering the first block's
+correct "leave this stream unset when invalid" decision. Fixed by keeping exactly one block. Not
+independently reproduced (applied on inspection, a real provable defect). Repro note: a bash -c
+script must end in a trailing command (`OUTER_EXIT=$?`) to force a real `clone()` -- tail-exec of
+the final command never calls it.
+
+Second bug found the same pass, since FIXED: the shared kernel heap's eager-full-commit defect --
+see AGENTS.md's "Shared kernel heap" section for the full mechanism and fix.
+
+PTY test, NOT root-caused: `script -qec '...' /dev/null` under a real PTY hit `signal=Signal(13)`
+on `script` itself ~6s in -- a different bug; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
+
+Full webtop boot ATTEMPTED 2026-09-17: blocked by commit exhaustion, since FIXED. Stalled at
+`NGINX_STARTED`'s supervisor retry loop, `ERROR_COMMITMENT_LIMIT` at 96 percent host commit
+charge. Re-run after the fix reached `NGINX_STARTED` again with commit charge held at 39-42
+percent, but stalled later at `NGINX_SELFTEST_FAILED` (separate, already-tracked nginx issue)
+before `XVFB_UP`/`DE_UP`.
+
+## GlobalStateHandle litebox / proc_self_info / pts_registry stack-overflow root cause -- full
+## bisection transcript (2026-09-17)
+
+Live bisection of the pre-existing, load-scaling "thread has overflowed its stack" crash (122
+occurrences by `XVFB_FAILED` in every prior session's boot, previously attributed to `xset q`/X11
+client-library depth or host-memory-pressure-driven guard-page commit failure). Methodology:
+temporary numbered log markers inserted at successively finer granularity around each step of the
+cross-process fork child's own startup (`diag_process_fork_globalstate_probe` then
+`diag_process_fork_vmem_adopt_probe` then `diag_process_fork_task_resume_probe` then
+`LinuxShim::adopt_forked_process` then `FilesState::initialize_stdio_in_shared_descriptors_table`),
+rebuilding and re-running `.wfgy/webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1` after each
+narrowing step, all markers removed before the final commit.
+
+Ruled out, with live A/B evidence, before the real cause was found:
+- Undersized cross-process-fork-child stack: wrapping `diag_process_fork_globalstate_probe`'s
+  entire body in a large-stack spawned thread (matching `INITIAL_GUEST_THREAD_STACK_SIZE`'s
+  existing pattern everywhere else in this codebase) did NOT stop the overflow -- identical crash,
+  same location, just now inside the new 32 MiB thread instead of the process's ~1 MiB default
+  main thread. Kept anyway: independently correct, just not sufficient alone.
+- `fork_verify` single-step verification machinery: hypothesized because `fork_verify::
+  on_single_step`'s own doc comments already record needing `VEH_FRAME_STRIDE`/`VEH_DEPTH_CAP`
+  tuning specifically for "every guest instruction fetch" on this exact cross-process/identity-
+  relocation code path. A live A/B -- calling plain `run_thread` with `fork_verify` never armed
+  at all, vs. the real `run_thread_with_fork_verification` -- produced the identical overflow,
+  same location, proving this was not the cause. Reverted back to the real, verifying entry point.
+
+Found via bisection: crash always landed inside `initialize_stdio_in_shared_descriptors_table`,
+specifically inside `global.litebox.descriptor_table_mut()`'s first real use -- and ONLY from the
+SECOND cross-process fork child onward in a boot; the first always completed that function
+cleanly. That asymmetry pointed directly at `GlobalState`'s create-vs-attach split: the first fork
+child in a family always takes the CREATE branch (its own state, correct by construction); every
+later one ATTACHES to the shared instance the first one created.
+
+Root cause: `GlobalState.litebox` (a `LiteBox<Platform>`, effectively an Arc pointer) was a plain
+field of the `GlobalState` struct that `LinuxShimBuilder::build()` places, byte for byte, into the
+cross-process shared kernel arena on the CREATE path. `SharedArc`/`create_shared_kernel_state`
+place only a value's literal inline bytes in the arena, never what a contained pointer points to
+(the same defect class already documented for `unix_addr_table`/`pty_registry`/etc, just never
+previously found in `litebox` itself). A cross-process-fork child that ATTACHES therefore reads
+back the FIRST creator's private-heap Arc pointer value, meaningless in its own address space.
+Dereferencing it is what actually consumed the stack, unbounded, because the work being done is
+walking corrupted memory, not bounded by guest instruction count.
+
+A pre-existing doc comment already predicted the second instance of this exact defect:
+`GlobalState.proc_self_info`'s own doc comment (written before this session) already named this
+"known cross-process-attach gap" -- because `LinuxShimBuilder::default_fs`/
+`default_fs_multi_layer` mounts the `/proc/self`/`/dev/pts` backends with a clone of
+`LinuxShimBuilder`'s own per-process `proc_self_info`/`pts_registry` fields BEFORE `build()`'s
+attach-or-create decision ever runs. Live-confirmed the same session, immediately after the
+`litebox` fix alone: the second cross-process-forked guest process to ever call execve hit a
+clean, host-diagnosed access violation inside `ProcSelfTable::set`, symbolized via
+`advisor/probes/symbolize_litebox_crash.py` against the exact build that produced the log.
+
+Fix, applied to all three fields identically: `GlobalState` no longer has `litebox`/
+`proc_self_info`/`pts_registry` fields at all. `GlobalStateHandle` (previously a bare tuple struct
+wrapping the shared handle) is now a named-field struct also carrying its own `litebox`/
+`proc_self_info`/`pts_registry` fields, populated in `LinuxShimBuilder::build()` from this
+process's own `LinuxShimBuilder` fields on every path, attach or create alike. Rust's field-
+resolution rules try the receiver's own concrete type's fields before auto-deref, so giving
+`GlobalStateHandle` its own fields of the same name shadows the removed `GlobalState` fields
+transparently for every existing call site (185+ external uses across epoll.rs, net.rs, pipe.rs,
+pty.rs, file.rs, unix.rs) -- none needed to change their bodies, only widen a `&GlobalState`
+parameter/impl type to `&GlobalStateHandle` where one existed directly (a pure widening, since
+`GlobalStateHandle` still derefs to `GlobalState` for every other field/method access).
+`LiteBox::clone` widened from `pub(crate)` to `pub` for this legitimate cross-crate use.
+
+Live-verified fixed: two independent full `.wfgy/webtop_stack.sh` boots under
+`LITEBOX_PROCESS_FORK=1` after the complete fix, zero "overflowed its stack" occurrences in
+either full log, versus 122+ before `XVFB_FAILED` alone in every prior session's boot. Host
+memory watched throughout (fluctuated 0.76-4.1 GB free of 16 GB across the two runs and several
+rebuild cycles; always recovered after each taskkill, no leak observed).
+
+Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: with the stack overflow gone, boots progress further
+before hitting the already-documented "GlobalState nested collections not actually shared" gap
+for the remaining registries (unix_addr_table/pty_registry/daemon_pty_masters/flock_registry/
+fifo_registry/sysv_shm/memfds/shared_files/2 caches) -- observed live as a BTreeMap navigation
+panic (`Option::unwrap()` on `None`) in one of them (exact field not yet isolated). Unlike
+litebox/proc_self_info/pts_registry (inherently per-process-scoped state that was wrongly being
+shared), these registries genuinely need real cross-process sharing for correct semantics -- the
+GlobalStateHandle-shadow-field fix used above would be WRONG for them. The real fix per registry
+needs `SharedUnixAddrPresenceTable`'s own flat, pointer-free redesign pattern -- real, separate,
+per-registry work, correctly scoped as "next session" already in AGENTS.md before this pass.

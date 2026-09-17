@@ -31,7 +31,7 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    FileFd, GlobalState, GlobalStateHandle, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut,
+    FileFd, GlobalStateHandle, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -1824,7 +1824,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn setsockopt(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         optname: SocketOptionName,
         optval: UserPtr<u8>,
         optlen: usize,
@@ -1890,7 +1890,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     }
     pub(super) fn getsockopt(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         optname: SocketOptionName,
         optval: UserPtrMut<u8>,
         len: u32,

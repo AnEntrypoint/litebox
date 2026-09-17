@@ -483,7 +483,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
     (master, slave)
 }
 
-impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalStateHandle<Platform, FS> {
     /// Handle `open("/dev/ptmx")`: allocate a new pty pair, register the slave side (never
     /// installed into any process's own fd table directly -- see [`Self::pts_open`]), and
     /// return `(master_fd, id)`, where `id` is what `TIOCGPTN`/`/dev/pts/<id>` should use.

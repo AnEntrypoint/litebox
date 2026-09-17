@@ -21,7 +21,7 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 
 use super::file::FilesState;
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform, FS: ShimFS>(
     core::marker::PhantomData<(Platform, FS)>,
@@ -150,7 +150,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
     /// observer is provided.
     fn poll(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
@@ -305,7 +305,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     pub(crate) fn wait(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
         diag_tid: i32,
@@ -382,7 +382,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// currently ready -- see [`Self::wait`]'s doc comment for why both fd kinds need bounded
     /// periodic re-polling instead of relying solely on the observer-notification wakeup every
     /// other fd kind gets.
-    fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalState<Platform, FS>) -> bool {
+    fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalStateHandle<Platform, FS>) -> bool {
         self.interests.lock().values().any(|entry| {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 return false;
@@ -405,7 +405,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// become readable. Called after each bounded repoll interval elapses in [`Self::wait`].
     fn repoll_stdin_and_timerfd_interests(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         diag_tid: i32,
         diag_epfd: u32,
     ) {
@@ -438,7 +438,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     pub(crate) fn epoll_ctl(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
@@ -459,7 +459,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     fn add_interest(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
@@ -504,7 +504,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     fn mod_interest(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
@@ -640,7 +640,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         self.inner.lock().data
     }
 
-    fn poll(&self, global: &GlobalState<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
+    fn poll(&self, global: &GlobalStateHandle<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -713,7 +713,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
 
     fn pop_multiple(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
@@ -819,7 +819,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
 
     fn scan_once<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         files: &FilesState<Platform, FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
@@ -871,7 +871,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     /// Scans the poll set for ready fds once.
     pub fn scan<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         files: &FilesState<Platform, FS>,
     ) {
         self.scan_once(global, files, None);
@@ -906,7 +906,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     /// exchange for closing the missed-wakeup window entirely.
     pub fn wait<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {

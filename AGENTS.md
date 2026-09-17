@@ -126,11 +126,9 @@ images (multi-GB, 100K+ entries) pack fine now; residual risk is host-memory con
 bug. `tar_ro.rs`'s multi-layer index is built ONCE at mount, not per read (was O(entries²), 17.3s →
 0.35s fixed). Cache internals and the four fixed OOM bugs: archive.
 
-**A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** — sized from a
-byte-pair count instead of a one-page guess, capped 4MiB (full detail archived). **Tags, verified live,
-never from the name** (full detail archived): `linuxserver/webtop:alpine-mate` ships MATE not XFCE;
-`alpine-xfce` doesn't exist; `debian-xfce`/`ubuntu-xfce` ship real XFCE; `edgelevel/alpine-xfce-vnc` is
-Alpine 3.16.0.
+**A trampoline-extension failure used to poison a whole segment's syscalls, now fixed** (archived).
+**Tags, verified live, never from the name** (archived): `linuxserver/webtop:alpine-mate` ships MATE
+not XFCE; `alpine-xfce` doesn't exist; `debian-xfce`/`ubuntu-xfce` ship real XFCE.
 
 **X server choice**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` — litebox's
 virtual DRM device is legacy-KMS + dumb-buffer + XRGB8888 only, no atomic modeset/GBM/EGL, so a GBM-first
@@ -184,13 +182,10 @@ of a THIRD mechanism. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
-Nine ACK-stall-kill candidates investigated, all refuted or fixed; real blocker was the guest-side
-patcher silently crashing on `shutil.copy2()`'s `copystat()`→`os.listxattr()` (no `listxattr` shim)
-before ever patching `selkies.py`, fixed via `shutil.copyfile()` plus a backlog-check-ordering fix
-(`478e640`) — live-verified 60+s with zero `keepalive ping timeout`. Port-8081 double-bind fix
-code-verified + instrumentation-confirmed live (17 boot cycles); the race itself did not recur even
-under an escalated 6000-connection stress test. RAM fully recovered on every kill, zero leaks. Full
-detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+Real blocker was the guest-side patcher silently crashing on `shutil.copy2()`'s `copystat()`
+(no `listxattr` shim) before ever patching `selkies.py`; fixed (`478e640`), live-verified 60+s
+zero `keepalive ping timeout`. Port-8081 double-bind fix live-verified over 17 boot cycles + a
+6000-connection stress test, zero recurrence, zero RAM leaks. Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -297,26 +292,69 @@ exactly): parent registers one key immediately before `spawn_cross_process_fork_
 key strictly AFTER it returns; child looks up both right after its own `build()`. Live result:
 `child observed before=Some(1) after=Some(1)` -- proves genuine live sharing, not a snapshot.
 
-**`.wfgy/webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1`: `XVFB_FAILED`/`DBUS_FAILED`/`DE_FAILED`
-still all occur, UNCHANGED -- but for a DIFFERENT reason than this fix targets.** The new
-`[unix_addr_presence]` diagnostic never fired: the log shows `xset q`'s own forked process hit
-`thread 'main' (PID) has overflowed its stack` and got killed BEFORE reaching `connect()` at all.
-**That stack-overflow class (122 occurrences by `XVFB_FAILED`, 205+ over a full boot) is PROVEN, via
-a controlled `git stash`/rebuild/re-run A/B, to be COMPLETELY UNRELATED to this session's code** --
-patched and clean-`main` builds hit `XVFB_FAILED` with the identical 122-occurrence count. Upgrades
-the prior "one sighting, not conclusively attributed" note to a confirmed, load-scaling, pre-
-existing defect, plausibly host-memory-pressure-driven (`FreePhysicalMemory` cycled 900MB-2.5GB of
-16GB across both runs; Windows stack growth needs a guard-page commit, which can fail under
-pressure) -- NOT root-caused this pass, genuinely bigger than the AF_UNIX task.
+## Cross-process-fork stack-overflow class -- ROOT-CAUSED AND FIXED 2026-09-17
 
-**Next session, in order**: (1) root-cause the stack-overflow-under-load class itself -- it, not
-the AF_UNIX registry, is what's actually preventing any live webtop-integration test of this
-session's fix; (2) once forked children reliably survive, re-run `[unix_addr_presence]` for real;
-(3) only then does `Backlog`/`crate::channel::Channel`/`Pollee`'s OWN data-plane sharing gap
-(`Mutex<VecDeque<UnixConnectedStream>>` and each stream's ring buffer are themselves further
-private-heap-resident -- confirmed by reading the real fields, the identical problem one level
-deeper) become the real next blocker. Full design, proof transcripts, A/B methodology:
-`docs/AGENTS_ARCHIVE_2026-09-17.md`.
+The pre-existing, load-scaling `thread '<unknown>' has overflowed its stack` crash above (122
+occurrences by `XVFB_FAILED`, previously blamed on `xset q`/X11 specifically and suspected
+host-memory-pressure-driven) is **NOT** stack-size, `fork_verify` single-stepping, or memory
+pressure -- live bisection (temporary log markers, since removed) proved EVERY cross-process fork
+child after the first (trivial `mkdir`/`rm -rf` as readily as `xset q`) died inside
+`GlobalStateHandle`'s `litebox: LiteBox<Platform>` field's `descriptor_table_mut()`/`RwLock`
+machinery. Real mechanism: `LiteBox<Platform>` is `Platform::Handle<LiteBoxX<Platform>>` (an `Arc`
+pointer); `GlobalState.litebox` used to place that pointer's literal bytes inline in the
+cross-process-shared kernel arena at CREATE time. A LATER cross-process-fork child that ATTACHES
+(every fork after the family's first) read back the FIRST creator's pointer VALUE -- meaningless
+in its own address space -- and chasing its garbage `RwLock` internals is what actually consumed
+the stack (unbounded, since the "loop" is walking corrupted memory, not bounded guest work), not
+guest instruction count. Same defect class already documented below for `unix_addr_table` et al.,
+just never previously found in `litebox` itself.
+
+**Fix** (`litebox_shim_linux/src/lib.rs`): `GlobalState` no longer has a `litebox` field (nor
+`proc_self_info`/`pts_registry`, a second, doc-comment-predicted instance of the identical defect
+-- `default_fs`/`default_fs_multi_layer` mounts `/proc/self`+`/dev/pts` with `LinuxShimBuilder`'s
+own per-process copies BEFORE `build()`'s attach-or-create decision, so an attaching child's
+`GlobalState` copy was likewise always the wrong, foreign-process one). `GlobalStateHandle` now
+carries its own `litebox`/`proc_self_info`/`pts_registry` fields, populated from THIS process's own
+`LinuxShimBuilder` fields on every path (attach or create) -- Rust's field resolution tries the
+receiver's own concrete type before auto-`Deref`ing, so this SHADOWS the removed `GlobalState`
+fields transparently; no external call site (185+ `xxx.litebox`/`.proc_self_info`/`.pts_registry`
+uses across `epoll.rs`/`net.rs`/`pipe.rs`/`pty.rs`/`file.rs`/`unix.rs`) needed to change beyond
+widening their `&GlobalState<Platform, FS>` parameter/`impl` types to `&GlobalStateHandle<Platform,
+FS>` (a pure widening -- `GlobalStateHandle` derefs to `GlobalState`, so every other field/method
+access on those same parameters is unaffected). `litebox::LiteBox::clone` widened from
+`pub(crate)` to `pub` (litebox_shim_linux is a legitimate, now-documented user, not the "outside
+user" that visibility was guarding against).
+
+**Live-verified fixed**: two independent full `.wfgy/webtop_stack.sh` boots under
+`LITEBOX_PROCESS_FORK=1`, zero `overflowed its stack` occurrences in either (previously 122+ by
+`XVFB_FAILED` alone) -- confirmed by `grep -c` over each full log. `fork_verify` wiring unchanged
+(an A/B with it disabled entirely hit the identical crash, ruling it out). The 32 MiB
+guest-execution thread wrap in `diag_process_fork_globalstate_probe` (matching every other
+guest-executing thread's stack-size pattern) is kept -- independently correct even though it
+wasn't sufficient alone. Full bisection transcript, both ruled-out hypotheses: archive.
+
+**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: a DIFFERENT, already-documented gap is next.** With
+the stack overflow gone, boots now progress substantially further before hitting the SAME root
+cause this section already names below for `unix_addr_table` et al. -- a clean, host-diagnosed
+`STATUS_ACCESS_VIOLATION` in `<litebox::fs::procfs::ProcSelfTable>::set` on the FIRST run (before
+the `proc_self_info` fix landed) and, after it, a `BTreeMap` navigation panic
+(`alloc::collections::btree::navigate.rs`, `Option::unwrap()` on `None`) in one of the remaining
+shared registries (`unix_addr_table`/`pty_registry`/`daemon_pty_masters`/`flock_registry`/
+`fifo_registry`/`sysv_shm`/`memfds`/`shared_files`/2 caches -- exact field not yet isolated).
+**Unlike `litebox`/`proc_self_info`/`pts_registry`, these registries genuinely NEED real
+cross-process sharing for correct Linux semantics** (a listening AF_UNIX socket, a file lock, a pty
+registration must be visible to the rest of the fork family) -- the `GlobalStateHandle`-shadow-
+field fix used above is WRONG for them (it would silently make them non-shared, reintroducing the
+exact bugs today's `unix_addr_table` presence-table work exists to fix). The real fix per registry
+needs the SAME flat, pointer-free redesign `SharedUnixAddrPresenceTable` already proves out (below)
+-- real, separate, per-registry engineering work, correctly scoped as "next session" already.
+
+**Next session, in order**: (1) identify exactly which registry's `BTreeMap` panicked (temporary
+per-registry access logging, same bisection technique used to find `litebox` above); (2) apply the
+`SharedUnixAddrPresenceTable` flat-table pattern to it; (3) repeat for the remaining registries one
+at a time, live-testing `.wfgy/webtop_stack.sh` after each; (4) only once ALL of them are
+genuinely shared does a live desktop/browser/Terminal-Emulator/Thunar test become meaningful.
+Full bisection methodology, live proof transcripts: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -327,25 +365,10 @@ performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, and the
 
 ## Cross-process-fork stdio-handle bug — FIXED 2026-09-17
 
-`spawn_suspended`'s (`litebox_platform_windows_userland/src/process_fork.rs`) two back-to-back
-`STARTF_USESTDHANDLES` blocks were NOT merely redundant: the second unconditionally overwrote
-`startup_info.hStd*` with **no null/`INVALID_HANDLE_VALUE` guard**, clobbering the first block's
-correct "leave this stream unset when invalid" decision. Fixed by keeping exactly one block. Not
-independently reproduced (applied on inspection, a real provable defect). Repro note: a bash `-c`
-script must end in a trailing command (`OUTER_EXIT=$?`) to force a real `clone()` -- tail-exec of
-the final command never calls it. Full detail: archive.
-
-**Second bug found the same pass, since FIXED**: the shared kernel heap's eager-full-commit
-defect -- see "Shared kernel heap" section above for the full mechanism and fix.
-
-**PTY test, NOT root-caused**: `script -qec '...' /dev/null` under a real PTY hit `signal=Signal(13)`
-on `script` itself ~6s in -- a different bug; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
-
-**Full webtop boot ATTEMPTED 2026-09-17: blocked by commit exhaustion, since FIXED (see above).**
-Stalled at `NGINX_STARTED`'s supervisor retry loop, `ERROR_COMMITMENT_LIMIT` at 96% host commit
-charge. Re-run after the fix reached `NGINX_STARTED` again with commit charge held at 39-42%, but
-stalled later at `NGINX_SELFTEST_FAILED` (separate, already-tracked nginx issue) before
-`XVFB_UP`/`DE_UP`.
+`spawn_suspended`'s two back-to-back `STARTF_USESTDHANDLES` blocks clobbered each other (no null
+guard on the second); fixed by keeping exactly one. PTY test (`script -qec ...`) hit a separate,
+NOT-root-caused `signal=Signal(13)` -- PRD `cross-process-fork-pty-sigpipe-in-script-relay`. Full
+detail, including the commit-exhaustion boot attempt this pass also fixed: archive.
 
 ## Presenter-process split -- done, fully verified live end-to-end, 2026-09-16
 

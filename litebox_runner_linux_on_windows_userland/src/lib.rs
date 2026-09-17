@@ -1175,6 +1175,49 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// and never in a way that feeds back into the real, unmodified thread-based `do_clone` fork
 /// path this crate's normal execution still uses exclusively.
 pub fn diag_process_fork_globalstate_probe() {
+    // ROOT-CAUSE FIX (2026-09-17): everything this function goes on to do -- rebuilding the
+    // rootfs, constructing `GlobalState`, adopting the parent's `PageManager`, and above all
+    // `run_thread_with_fork_verification`'s real guest execution (every syscall emulated on this
+    // same call stack, including whatever host-side call frames X11 client-library init incurs
+    // for something like `xset q`) -- used to run inline on whatever OS thread called this
+    // function. Per `main()`'s dispatch, that is THIS PROCESS'S OWN PRIMARY THREAD for a
+    // `CreateProcessW`-spawned cross-process-fork child, whose stack is Windows' ordinary main-
+    // thread default (~1 MiB), never widened by anything analogous to `INITIAL_GUEST_THREAD_
+    // STACK_SIZE`'s explicit `std::thread::Builder::stack_size` call on the ordinary (non-fork)
+    // guest-launch path (see that constant's doc comment for the identical defect, already fixed
+    // there: "the very first guest program's initial thread ran inline on whatever OS thread
+    // called `run()`... whose real stack is Rust's ~1 MiB Windows default"). This function's own
+    // heavier, syscall-emulation-heavy guest execution never got the same fix.
+    //
+    // Live-confirmed root cause of the pre-existing, load-scaling stack-overflow class
+    // `AGENTS.md`'s "unix_addr_table presence sharing" section documents: a real
+    // `.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` hit `xset q`'s forked process
+    // dying with a genuine host `STATUS_STACK_OVERFLOW` (Rust's own "thread 'main' has overflowed
+    // its stack" guard-page message) BEFORE it ever reached `connect()` -- 122 identical
+    // occurrences by `XVFB_FAILED`, proven via a controlled `git stash`/rebuild/re-run A/B to be
+    // completely unrelated to any same-session code (patched and clean-`main` builds hit the
+    // identical count). Every other guest-work-capable thread in this codebase already gets
+    // `INITIAL_GUEST_THREAD_STACK_SIZE`/`GUEST_THREAD_STACK_SIZE` (32 MiB) via an explicit
+    // `.stack_size()` call; this was the one guest-execution path in the entire cross-process-fork
+    // machinery that never got it, because it runs on a freshly `CreateProcessW`-spawned
+    // process's own primary thread rather than a `std::thread::Builder`-spawned one.
+    //
+    // Fix: spawn a dedicated thread with the same stack size every other guest-executing thread
+    // gets, and block this call until it finishes. `diag_process_fork_task_resume_probe`'s success
+    // path calls `std::process::exit` directly, which terminates the WHOLE process regardless of
+    // which thread calls it -- so `.join()`'s return value is only ever actually observed on an
+    // early-return/error path that never reached real guest execution (missing rootfs env vars,
+    // a failed rootfs rebuild, etc.), matching this function's pre-existing early-return contract
+    // exactly.
+    std::thread::Builder::new()
+        .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
+        .spawn(diag_process_fork_globalstate_probe_inner)
+        .expect("failed to spawn cross-process fork child's guest-execution thread")
+        .join()
+        .expect("cross-process fork child's guest-execution thread panicked");
+}
+
+fn diag_process_fork_globalstate_probe_inner() {
     if !litebox_platform_windows_userland::process_fork::diag_process_fork_globalstate_enabled() {
         return;
     }
@@ -1878,6 +1921,13 @@ fn diag_process_fork_task_resume_probe(
     // Use that dedicated entry point instead, which arms fork_verify at exactly the right point in
     // the sequence -- after TLS install, before the guest is ever resumed.
     let process = entrypoints.process();
+    // NOTE (2026-09-17 investigation): a live A/B (this call vs. plain `run_thread` with
+    // `fork_verify` never armed at all) proved `fork_verify`'s single-step machinery is NOT the
+    // cause of this session's stack-overflow investigation (identical overflow, same location,
+    // with or without it) -- the real root cause was `GlobalStateHandle.litebox` reading a
+    // cross-process-stale pointer (see that struct's doc comment). `fork_verify` stays wired
+    // exactly as pass 143 designed it: it does real, live-needed stale-pointer healing for
+    // whatever the group-relocations copy doesn't cover, independent of this fix.
     unsafe {
         litebox_platform_windows_userland::run_thread_with_fork_verification(
             entrypoints,

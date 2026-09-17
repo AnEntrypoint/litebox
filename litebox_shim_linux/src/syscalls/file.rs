@@ -28,7 +28,8 @@ use litebox_common_linux::{
 use thiserror::Error;
 
 use crate::{
-    GlobalState, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut, syscalls::signal,
+    GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
+    syscalls::signal,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2996,13 +2997,13 @@ where
 
 pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
+    global: &GlobalStateHandle<Platform, FS>,
     files: &FilesState<Platform, FS>,
 ) -> Result<FileDescriptorFlags, Errno> {
     // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
     // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
     fn get_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: &TypedFd<S>,
     ) -> FileDescriptorFlags {
         global
@@ -3027,12 +3028,12 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
 
 fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
+    global: &GlobalStateHandle<Platform, FS>,
     files: &FilesState<Platform, FS>,
     flags: FileDescriptorFlags,
 ) -> Result<(), Errno> {
     fn set_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {

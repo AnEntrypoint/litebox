@@ -17,7 +17,7 @@ use litebox::{
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 /// Matches real Linux's default pipe capacity before any `fcntl(F_SETPIPE_SZ)`
 /// resize (16 pages on a 4KiB-page system -- see `man 7 pipe`). The previous
@@ -42,7 +42,7 @@ pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) writer: PipeFd<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     pub(crate) fn create_linux_pipe(
         &self,
         flags: OFlags,

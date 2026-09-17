@@ -484,6 +484,15 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
         let platform = self.platform;
         let slot = litebox::platform::SharedKernelStateSlot::ShimGlobalState;
+        // Captured BEFORE the create-vs-attach branch below (which may move `self.litebox` into
+        // the shared struct on the create path): this process's OWN `litebox` is what
+        // `GlobalStateHandle` uses from here on, regardless of which branch runs -- see that
+        // struct's own doc comment for why `GlobalState.litebox` itself must never be read again.
+        let my_litebox = self.litebox.clone();
+        // Same reasoning as `my_litebox` above -- see `GlobalStateHandle`'s doc comment's
+        // "Second instance of the SAME defect" section.
+        let my_proc_self_info = self.proc_self_info.clone();
+        let my_pts_registry = self.pts_registry.clone();
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -501,7 +510,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-                        litebox: self.litebox,
                         unix_addr_table: litebox::sync::RwLock::new(
                             syscalls::unix::UnixAddrTable::new(),
                         ),
@@ -533,12 +541,15 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         evdev: syscalls::evdev::EvdevSubsystem::new(),
                         memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                         shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                        proc_self_info: self.proc_self_info,
-                        pts_registry: self.pts_registry,
                     },
                 )
             });
-        LinuxShim(GlobalStateHandle(inner))
+        LinuxShim(GlobalStateHandle {
+            inner,
+            litebox: my_litebox,
+            proc_self_info: my_proc_self_info,
+            pts_registry: my_pts_registry,
+        })
     }
 }
 
@@ -912,19 +923,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let shared_pending = Arc::new(litebox::sync::Mutex::new(
             syscalls::signal::PendingSignals::new(),
         ));
+        let thread_state = syscalls::process::ThreadState::new_process(
+            pid,
+            Arc::new(pm),
+            false,
+            None,
+            shared_pending.clone(),
+            None,
+        );
 
         LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: RefCell::new(syscalls::process::ThreadState::new_process(
-                    pid,
-                    Arc::new(pm),
-                    false,
-                    None,
-                    shared_pending.clone(),
-                    None,
-                )),
+                thread: RefCell::new(thread_state),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
@@ -1298,7 +1310,11 @@ impl Default for TermiosState {
 pub(crate) struct ForegroundPgid(pub(crate) i32);
 
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform, FS>) {
+    /// Takes `&GlobalStateHandle`, deliberately NOT `&GlobalState` -- `global.litebox` below must
+    /// resolve to `GlobalStateHandle`'s own, always-locally-valid `litebox` field (see that
+    /// struct's doc comment), not `GlobalState`'s shared/cross-process-unsafe one (which no
+    /// longer exists as a field at all, precisely to make that mistake impossible here).
+    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalStateHandle<Platform, FS>) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
@@ -2672,13 +2688,71 @@ struct FifoPipe<Platform: ShimPlatform> {
 /// named type since `GlobalState` is referenced across many files/fields in this crate the same
 /// way `Arc<GlobalState<Platform, FS>>` was referenced before this trait existed -- every such
 /// call site needs no further change: `Clone`/`Deref` below give it identical ergonomics.
-pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS>(
-    Platform::Handle<GlobalState<Platform, FS>>,
-);
+///
+/// # ROOT-CAUSE FIX (2026-09-17): `litebox` is a SEPARATE, always-locally-valid field here, not
+/// read from the shared `GlobalState.litebox` field it shadows
+///
+/// `GlobalState`'s own `litebox: LiteBox<Platform>` field is placed INLINE in the cross-process
+/// shared kernel arena by `create_shared_kernel_state` (see `LinuxShimBuilder::build`) -- but
+/// `LiteBox<Platform>` is `Platform::Handle<LiteBoxX<Platform>>` (effectively an `Arc` pointer):
+/// `SharedArc::new`/`create_shared_kernel_state` places only the pointer's literal inline bytes,
+/// never what it points to (see `AGENTS.md`'s "Does NOT close XVFB_FAILED/DBUS_FAILED" section --
+/// the SAME defect class already documented for `unix_addr_table`/`pty_registry`/etc: "an
+/// attaching process's copy of the root pointer is meaningless in its own address space"). A
+/// cross-process-fork child that ATTACHES (rather than creates) the shared `GlobalState` was
+/// therefore reading the FIRST creator's private-heap `LiteBox` pointer value -- meaningless, and
+/// dereferencing effectively garbage memory in the attaching child's own address space.
+///
+/// Live-confirmed root cause of the pre-existing, load-scaling stack-overflow class this session
+/// was tasked with root-causing: bisection (temporary `[bisect1..5]` diagnostic logging, since
+/// removed) proved the very FIRST cross-process fork child in a boot always completes cleanly (it
+/// takes the CREATE branch, so its own `litebox` value is genuinely its own), while every
+/// SUBSEQUENT one -- deterministically, regardless of guest program complexity, reproduced by
+/// `mkdir`/`rm -rf` as readily as `xset q` -- died with a real host `STATUS_STACK_OVERFLOW` inside
+/// `initialize_stdio_in_shared_descriptors_table`'s very first `descriptor_table_mut()`/
+/// `set_entry_metadata` call, i.e. the first real use of the ATTACHED, cross-process-garbage
+/// `litebox` pointer's `RwLock`. Chasing that garbage pointer's lock/wait-queue bookkeeping is
+/// what actually consumed the stack, not guest instruction count or fork-verify single-stepping
+/// (both independently ruled out live before this was found).
+///
+/// Fix: `GlobalStateHandle` keeps its OWN `litebox` field, populated from THIS process's own
+/// `LinuxShimBuilder::litebox` (always freshly, validly constructed in `LinuxShimBuilder::new`,
+/// every process, attach or create alike) rather than ever reading `GlobalState`'s shared copy.
+/// Rust's field-resolution rules try the receiver's own concrete type before auto-`Deref`ing, so
+/// this SHADOWS `GlobalState.litebox` transparently for every one of this crate's existing
+/// `xxx.litebox` call sites -- none of them needed to change.
+/// # Second instance of the SAME defect, fixed the SAME way: `proc_self_info`/`pts_registry`
+///
+/// `GlobalState`'s own doc comments already named this "known cross-process-attach gap" (2026-
+/// 09-17 create-vs-attach pass) before this session started: `LinuxShimBuilder::default_fs`/
+/// `default_fs_multi_layer` mounts the `/proc/self` and `/dev/pts` backends with a clone of
+/// `LinuxShimBuilder::proc_self_info`/`pts_registry` BEFORE `build()` (and hence before the
+/// create-vs-attach decision) ever runs -- so an attaching child's own mounted FS backend keeps
+/// pointing at ITS OWN fresh, per-process table while a `proc_self_info`/`pts_registry` field on
+/// the shared `GlobalState` struct would be whichever one the ORIGINAL creator made, exactly
+/// like `litebox` above. Live-confirmed THIS session: with the `litebox` fix above alone, the
+/// SECOND cross-process-forked guest process to ever call `execve` (i.e. the second real command
+/// in a boot) hit a clean, host-diagnosed `STATUS_ACCESS_VIOLATION` (`addr=0xffffffffffffffff`)
+/// inside `<litebox::fs::procfs::ProcSelfTable>::set`, called from `Task::load_program` through
+/// `self.global.proc_self_info` -- the exact mechanism this pre-existing doc comment predicted.
+/// Fixed the same way as `litebox`: `GlobalStateHandle` keeps its own copies, populated from
+/// `LinuxShimBuilder`'s per-process fields (the SAME instances `default_fs`/`default_fs_multi_
+/// layer` already mounted), never from `GlobalState`'s shared/cross-process-stale ones.
+pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
+    inner: Platform::Handle<GlobalState<Platform, FS>>,
+    litebox: litebox::LiteBox<Platform>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+}
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
     fn clone(&self) -> Self {
-        GlobalStateHandle(self.0.clone())
+        GlobalStateHandle {
+            inner: self.inner.clone(),
+            litebox: self.litebox.clone(),
+            proc_self_info: self.proc_self_info.clone(),
+            pts_registry: self.pts_registry.clone(),
+        }
     }
 }
 
@@ -2686,15 +2760,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> core::ops::Deref for GlobalStateHandle<
     type Target = GlobalState<Platform, FS>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
-    /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
+    // NOTE: this struct deliberately has NO `litebox` field. `LiteBox<Platform>` is
+    // `Platform::Handle<LiteBoxX<Platform>>` (effectively an `Arc` pointer); a value placed here
+    // would be copied byte-for-byte into the cross-process shared kernel arena on the CREATE
+    // path, and a later ATTACHing cross-process-fork child would read back the FIRST creator's
+    // pointer -- meaningless in its own address space (the same defect class already documented
+    // for `unix_addr_table`/`pty_registry`/etc, see `docs/AGENTS_ARCHIVE_2026-09-17.md`), root-
+    // caused THIS session as the actual mechanism behind a genuine, load-scaling, live host
+    // `STATUS_STACK_OVERFLOW`. Every reader of "the shim-wide `LiteBox`" instead goes through
+    // `GlobalStateHandle`'s own separate, always-locally-valid `litebox` field (see its doc
+    // comment) -- do not re-add a field with this name here.
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -2847,38 +2929,14 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `syscalls::mm::try_shared_file_mmap` for why this exists and what it deliberately does not
     /// do. Same entry shape as a memfd's, hence the shared type.
     shared_files: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
-    /// Backing cell for the guest-visible `/proc/self/*` synthesis (see
-    /// `litebox::fs::procfs::ProcSelf`), updated on every `execve` (see
-    /// `Task::load_program`). Shared (not owned solely by the mounted backend) so
-    /// `Task::load_program` -- which has no reference to the mounted `Backend` trait object, only
-    /// to `GlobalState` -- can update it.
-    ///
-    /// **Known cross-process-attach gap (2026-09-17 create-vs-attach pass):** unlike every other
-    /// field of this struct, this one is NOT genuinely re-shared by a `SharedKernelStateSlot::
-    /// ShimGlobalState` attach -- `LinuxShimBuilder::default_fs`/`default_fs_multi_layer` mounts
-    /// the `/proc/self` backend with a clone of `LinuxShimBuilder::proc_self_info` BEFORE
-    /// `build()` (and hence before the create-vs-attach decision) ever runs, so an attaching
-    /// cross-process-fork child's own mounted backend keeps pointing at ITS OWN fresh,
-    /// per-process table while `GlobalState.proc_self_info` (reachable through the attached
-    /// handle) is whichever one the ORIGINAL creator made. Not yet fixed: doing so needs
-    /// `LinuxShimBuilder::new`'s own construction of this field to attach-or-create BEFORE
-    /// `default_fs` mounts it, i.e. two more `SharedKernelStateSlot` variants threaded one layer
-    /// earlier than `GlobalState` itself. Left as scoped follow-up (`docs/AGENTS_ARCHIVE_2026-09-17.md`'s
-    /// create-vs-attach section) -- does not affect the decisive `next_thread_id`-style
-    /// live-sharing proof, which uses a field with no such pre-`build()` entanglement.
-    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
-    /// The mirror `litebox::fs::devices::PtsDevices` reads to answer `open("/dev/pts",
-    /// O_DIRECTORY)` and its `getdents64` listing. `syscalls::pty::GlobalState::ptmx_open`/
-    /// `ptmx_closed`/`attach_pty_stdio` update this alongside `pty_registry` at each of their
-    /// three call sites -- see `PtsRegistry`'s own doc comment for why this can't just BE
-    /// `pty_registry` shared directly.
-    ///
-    /// **Same known cross-process-attach gap as [`Self::proc_self_info`]** (same root cause:
-    /// mounted by `default_fs`/`default_fs_multi_layer` before `build()`'s attach decision).
-    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+    // NOTE: this struct deliberately has NO `proc_self_info`/`pts_registry` fields either, for
+    // the SAME reason it has no `litebox` field above -- see `GlobalStateHandle`'s doc comment's
+    // "Second instance of the SAME defect" section. `GlobalStateHandle` carries its OWN, always
+    // per-process-correct copies (the same instances `LinuxShimBuilder::default_fs`/
+    // `default_fs_multi_layer` already mounted the `/proc/self`/`/dev/pts` backends with).
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// Runs `f` with every shim-WIDE lock held, for the one caller that genuinely needs it:
     /// [`syscalls::process::Task::try_cross_process_fork`]'s native-`fork()` path (see
     /// [`litebox::platform::ForkChildVerificationProvider::native_fork`]'s doc comment).

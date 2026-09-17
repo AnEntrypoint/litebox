@@ -33,7 +33,7 @@ use litebox_common_linux::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::unix::{AnyDupFd, AnyDupFds, CSockUnixAddr, UnixSocket, UnixSocketAddr};
-use crate::{GlobalState, ShimFS, ShimPlatform, Task};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
@@ -95,7 +95,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
     fn with_socket<R>(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd<Platform>) -> Result<R, Errno>,
         unix_op: impl FnOnce(&UnixSocket<Platform, FS>) -> Result<R, Errno>,
@@ -112,7 +112,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// environment.
     fn with_socket_netlink<R>(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd<Platform>) -> Result<R, Errno>,
         unix_op: impl FnOnce(&UnixSocket<Platform, FS>) -> Result<R, Errno>,
@@ -279,7 +279,7 @@ pub(super) enum SocketOptionValue {
 /// so that they can access `net` and the litebox descriptor table. This might
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     pub(crate) fn initialize_socket(
         &self,
         fd: &SocketFd<Platform>,
