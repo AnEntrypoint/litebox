@@ -6662,6 +6662,38 @@ impl RawMutex {
     /// re-attempt acquisition, exactly as it would after any other spurious wake), `false` if the
     /// holder is confirmed alive or unknown (the caller should keep waiting).
     fn try_recover_from_dead_holder(&self, val: u32, record: WaiterRecord) -> bool {
+        if !self.try_recover_from_dead_holder_unregistered(val) {
+            return false;
+        }
+        // Remove this thread's own registration: it is no longer going to wait on `event` for this
+        // call, so a later, unrelated `wake_many` must not find and signal a stale record for it.
+        // Best-effort (a concurrent `wake_many` may already have popped it, which is fine -- see
+        // `finish_real_timeout`'s identical race handling for the real-timeout case).
+        self.waiters.with_lock(|queue| queue.remove_locked(record));
+        true
+    }
+
+    /// Core of [`Self::try_recover_from_dead_holder`] (see that function's own doc comment for the
+    /// full defect this recovers from, and why recovery is conservative -- only a
+    /// positively-confirmed-dead recorded holder is ever forced open), factored out so
+    /// [`Self::poll_until_value_changes`] -- the `QueueFull` fallback for a caller that could not
+    /// register in [`Self::waiters`] at all, and therefore has no [`WaiterRecord`] to later remove
+    /// -- can also run it.
+    ///
+    /// Before this existed, `poll_until_value_changes` had NO liveness check at all: unlike every
+    /// registered waiter on the same `RawMutex` (which gets this same dead-holder check every
+    /// [`LIVENESS_CHECK_INTERVAL`] via [`Self::try_recover_from_dead_holder`]), a thread that
+    /// overflowed the 32-slot [`WaiterQueue`] and fell back to this function would poll
+    /// `self.inner` forever with no way to ever detect or recover an orphaned lock -- silently
+    /// reintroducing, for exactly this one fallback path, the same permanent-orphan defect
+    /// `try_recover_from_dead_holder` itself was written to fix for every other waiter. Live,
+    /// `cdb`-confirmed 2026-09-17 (Track B, post-`Network::socket_set` shared-arena fix pass):
+    /// making socket state genuinely cross-process-shared created enough real contention on a
+    /// single `RawMutex` (`webtop_stack.sh`'s nginx self-test) to overflow this queue for the
+    /// first time in a real boot (`RawMutex::block_or_maybe_timeout: waiter queue full, falling
+    /// back to polling`, 4 occurrences, zero on the pre-fix binary in an identical A/B boot), with
+    /// the boot then stalling permanently past `NGINX_STARTED`.
+    fn try_recover_from_dead_holder_unregistered(&self, val: u32) -> bool {
         let holder = self.holder_pid.load(Ordering::Acquire);
         if holder == 0 {
             return false;
@@ -6691,7 +6723,7 @@ impl RawMutex {
         }
         litebox_util_log::warn!(
             holder_pid:% = holder, val:% = val;
-            "RawMutex::block_or_maybe_timeout: recorded holder process is dead -- recovering orphaned lock"
+            "RawMutex::poll_until_value_changes: recorded holder process is dead -- recovering orphaned lock (queue-full fallback path)"
         );
         // Best-effort: force the stuck value back to unlocked so the normal CAS retry loop can
         // proceed. A `compare_exchange` (not a plain `store`) so a concurrent recovery by another
@@ -6706,11 +6738,6 @@ impl RawMutex {
         let _ =
             self.holder_pid
                 .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
-        // Remove this thread's own registration: it is no longer going to wait on `event` for this
-        // call, so a later, unrelated `wake_many` must not find and signal a stale record for it.
-        // Best-effort (a concurrent `wake_many` may already have popped it, which is fine -- see
-        // `finish_real_timeout`'s identical race handling for the real-timeout case).
-        self.waiters.with_lock(|queue| queue.remove_locked(record));
         true
     }
 
@@ -6718,8 +6745,14 @@ impl RawMutex {
     /// `block_or_maybe_timeout` could not register in the waiter queue at all: polls `inner`
     /// directly rather than relying on any wake delivery. Correct by construction (immune to any
     /// bug in the wake path, at the cost of latency/CPU while polling), never loses a wakeup.
+    ///
+    /// Also runs [`Self::try_recover_from_dead_holder_unregistered`] every
+    /// [`LIVENESS_CHECK_INTERVAL`] -- see that function's own doc comment for why this loop must
+    /// not be a bare `inner`-changed check: without it, this path has no way to ever detect or
+    /// recover an orphaned lock, unlike every registered waiter on the same `RawMutex`.
     fn poll_until_value_changes(&self, val: u32, timeout: Option<Duration>) -> UnblockedOrTimedOut {
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut last_liveness_check = std::time::Instant::now();
         loop {
             if self.inner.load(Ordering::SeqCst) != val {
                 return UnblockedOrTimedOut::Unblocked;
@@ -6727,6 +6760,13 @@ impl RawMutex {
             if let Some(deadline) = deadline {
                 if std::time::Instant::now() >= deadline {
                     return UnblockedOrTimedOut::TimedOut;
+                }
+            }
+            let now = std::time::Instant::now();
+            if now.duration_since(last_liveness_check) >= LIVENESS_CHECK_INTERVAL {
+                last_liveness_check = now;
+                if self.try_recover_from_dead_holder_unregistered(val) {
+                    return UnblockedOrTimedOut::Unblocked;
                 }
             }
             std::thread::sleep(Duration::from_micros(200));
