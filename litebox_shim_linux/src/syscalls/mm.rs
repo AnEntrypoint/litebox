@@ -1808,6 +1808,71 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         (true, header.file_offset, header.vaddr, header.trampoline_size)
     }
 
+    /// Probe for a free address within JMP rel32 range (`0x7FFF_0000`) of a code segment
+    /// (`code_addr..code_end`), by trying real `MAP_FIXED_NOREPLACE` attempts at
+    /// exponentially-increasing offsets on alternating sides of `preferred_addr` -- the
+    /// ELF-computed "just past this file's last `PT_LOAD`" hint that a plain
+    /// `MAP_FIXED_NOREPLACE` at that exact address has already failed for (some other mapping
+    /// occupies it; common in a cross-process-fork child, whose adopted VMA layout starts far
+    /// denser than a freshly-booted process's).
+    ///
+    /// Exists because `Vmem::get_unmmaped_area`'s own "let the VM choose" fallback (what the
+    /// caller reaches for next if this returns `Err`) has NO notion of "nearby": a `suggested_
+    /// address` that is occupied and not `MAP_FIXED` is silently ignored, and the fully generic
+    /// top-down/gap search that runs instead returns the first free gap ANYWHERE in the guest's
+    /// address space, which can land billions of bytes away from `preferred_addr` with nothing
+    /// to stop it (live-diagnosed 2026-09-17: a freshly cross-process-forked child's very first
+    /// `execve`, e.g. plain `mkdir`, landed a library's trampoline ~140 TB from its code segment,
+    /// `distance > 0x7FFF_0000`, triggering `apply_trap_fallback` -- which poisons every `syscall`
+    /// in that segment to a crash trap -- and the guest died the first time it actually executed
+    /// one). Deliberately a LOCAL probe scoped to just this one caller, not a change to
+    /// `get_unmmaped_area` itself (used by every `mmap()` in the system): each candidate is a
+    /// real, cheap-on-failure syscall (no side effects beyond the attempt itself), and the
+    /// exponential step (doubling each round, both directions) bounds the total probe count to
+    /// `PROBE_ROUNDS * 2` regardless of how far a usable gap turns out to be, rather than a linear
+    /// scan that could need hundreds of thousands of steps to cross a multi-GB packed region.
+    fn probe_nearby_trampoline_slot(
+        &self,
+        preferred_addr: usize,
+        code_addr: usize,
+        code_end: usize,
+        size: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        const JMP_REL32_RANGE: usize = 0x7FFF_0000;
+        const PROBE_ROUNDS: u32 = 24;
+        let mut step = size.next_power_of_two().max(PAGE_SIZE);
+        for _ in 0..PROBE_ROUNDS {
+            for candidate in [
+                preferred_addr.checked_add(step),
+                preferred_addr.checked_sub(step),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // Stay within JMP rel32 range of BOTH ends of the code segment -- matches the
+                // real check the caller applies to whatever address this returns.
+                if candidate.abs_diff(code_addr) > JMP_REL32_RANGE
+                    || candidate.abs_diff(code_end) > JMP_REL32_RANGE
+                {
+                    continue;
+                }
+                if let Ok(addr) = self.do_mmap_anonymous(
+                    Some(candidate),
+                    size,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                ) {
+                    return Ok(addr);
+                }
+            }
+            let Some(next_step) = step.checked_mul(2) else {
+                break;
+            };
+            step = next_step;
+        }
+        Err(MappingError::OutOfMemory)
+    }
+
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
     /// instructions with traps (`ICEBP;HLT`), then restore RX.
     ///
@@ -2033,9 +2098,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .min(MAX_INITIAL_TRAMPOLINE_SIZE);
 
             // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
+            // trampoline address is available. If that fails, probe nearby
+            // addresses within JMP rel32 range (see `probe_nearby_trampoline_slot`'s
+            // own doc comment for why this step exists: the generic "let the VM
+            // manager choose" fallback below has no notion of "nearby" and can
+            // land anywhere in the guest's address space). Only if EVERY nearby
+            // candidate is also occupied does this fall through to that fully
+            // generic choice, still re-validated against the JMP rel32 range below.
+            let far_end_hint = addr_usize.saturating_add(len);
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
@@ -2043,6 +2113,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 )
+                .or_else(|_| {
+                    self.probe_nearby_trampoline_slot(
+                        tramp_addr,
+                        addr_usize,
+                        far_end_hint,
+                        initial_tramp_size,
+                    )
+                })
                 .or_else(|_| {
                     self.do_mmap_anonymous(
                         None,
