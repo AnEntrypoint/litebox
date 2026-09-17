@@ -505,6 +505,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         unix_addr_table: litebox::sync::RwLock::new(
                             syscalls::unix::UnixAddrTable::new(),
                         ),
+                        unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         elf_patch_cache: litebox::sync::Mutex::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -553,6 +554,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         self.0
             .next_thread_id
             .load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Diagnostic-only insert into `unix_addr_presence` (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`'s
+    /// decisive live cross-process presence-table proof -- see
+    /// `syscalls::process::Task::try_cross_process_fork`'s matching parent-side inserts, mirroring
+    /// `diag_next_thread_id`'s own `GLOBALSTATE_SHARE_PROBE` pattern exactly). `kind` is
+    /// [`syscalls::unix::UNIX_ADDR_KIND_PATH`]/[`syscalls::unix::UNIX_ADDR_KIND_ABSTRACT`].
+    pub fn diag_unix_addr_presence_insert(&self, kind: u32, key: &[u8], owner_pid: u32) -> bool {
+        self.0.unix_addr_presence.insert(kind, key, owner_pid)
+    }
+
+    /// Diagnostic-only lookup into `unix_addr_presence`, the child-side half of the same proof.
+    pub fn diag_unix_addr_presence_lookup(&self, kind: u32, key: &[u8]) -> Option<u32> {
+        self.0.unix_addr_presence.lookup(kind, key)
     }
 
     /// Build a `WaitContext` for host-side pipe I/O.
@@ -2693,6 +2708,14 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
+    /// Cross-process-visible companion to `unix_addr_table` above (see
+    /// `syscalls::unix::SharedUnixAddrPresenceTable`'s own doc comment for exactly what it does
+    /// and does not close): a plain, no-pointer-indirection fixed-size field of this SAME struct,
+    /// so it inherits whatever cross-process sharing `GlobalState` itself already gets (real on
+    /// `WindowsUserland`'s cross-process-fork path, an ordinary unshared value everywhere else)
+    /// for free -- no second `SharedKernelStateProvider` slot needed, unlike `unix_addr_table`
+    /// itself, whose `BTreeMap` nodes remain private-heap-allocated regardless.
+    unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
     /// One syscall-rewriter scan per FILE, shared by every mapping of it in every guest process.

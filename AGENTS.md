@@ -242,80 +242,81 @@ the relay: `total_read == total_written` every time, ~9 live runs). PRD
 
 **The "route everything through one shared section" design (Track B steps 3-5, `c08182d`..`3d661d2`)
 is REVERTED.** `SLAB_ALLOC` (`#[global_allocator]`, `lib.rs`) is back to the pre-`c08182d` private
-per-process `VirtualAlloc2` mechanism for EVERY ordinary host-heap allocation -- exactly as it was
-before Track B started. Routing everything (including one-shot buffers like the OCI
-rootfs-reconstruction allocation every plain guest exec makes) through the shared bump allocator,
-which has no reclaim, was live-proven to exhaust an 8 GiB pool after 45-90 real execs under
-`webtop_stack.sh` (`memory allocation of 181493744 bytes failed`, 218 occurrences) -- worse than not
-sharing at all. That regression is now gone: **live-verified**, the identical real
-`debian-xfce webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` (default flags, sharing gate left
-off) ran 200+s, many concurrent forked children, reached `NGINX_STARTED` then the
-ALREADY-DOCUMENTED `XVFB_FAILED` architectural gap (below) with **zero** `memory allocation ...
-failed` lines (was 218), zero panics/FATAL/abort, host RAM fully recovered on kill.
-
-The fixed-base/atomic-cursor/handle-inherit machinery (`SHARED_KERNEL_HEAP_BASE`,
-`shared_heap_cursor`, `shared_kernel_heap_export_for_fork_child`, all live-verified correct in prior
-sessions -- 71 concurrent cross-process forks, zero corruption) is NOT deleted: it now backs a small
-**64 MiB, standalone, bounded** arena (`shared_kernel_arena_alloc`, `lib.rs`) deliberately NOT wired
-to `GlobalAlloc`, reserved for a follow-up session's `LiteBoxX`/`GlobalState`-only migration. Basic
-mechanism re-verified live at the new size (parent-side init+map+commit+sentinel-write landed
-correctly at `base+64MiB-0x1000`); the opt-in `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1` fork-export path
-is untouched and still gated off by default.
+per-process `VirtualAlloc2` mechanism for every ordinary host-heap allocation. Routing everything
+through the shared bump allocator (no reclaim) was live-proven to exhaust an 8 GiB pool after 45-90
+real execs (`memory allocation ... failed`, 218 occurrences) -- worse than not sharing at all;
+**live-verified fixed**, zero such failures on an identical re-run. The fixed-base/atomic-cursor/
+handle-inherit machinery is NOT deleted -- it now backs a small **64 MiB, standalone, bounded**
+arena (`shared_kernel_arena_alloc`, `lib.rs`), deliberately NOT wired to `GlobalAlloc`, reserved for
+`LiteBoxX`/`GlobalState`-only placement. Full mechanism/history: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ### `SharedArc<T>` and real `GlobalState` create-vs-attach -- BOTH DONE and LIVE-VERIFIED 2026-09-17; does NOT close XVFB_FAILED/DBUS_FAILED
 
-`litebox_platform_windows_userland/src/lib.rs`'s `SharedArc<T>` (hand-rolled, not `std::sync::Arc`
--- its `ArcInner` layout is a private std detail, unsound to place by hand; stable Rust also has no
-`allocator_api`) places `value` plus a `strong: AtomicUsize` control block into the bounded 64 MiB
-`shared_kernel_arena_alloc` region. `SharedArc::new` -> `(handle, arena_offset)`;
-`unsafe SharedArc::attach(offset)` increments `strong` and returns an independent owning handle
-sharing the exact same physical bytes. `Drop` deliberately never reclaims/runs `T`'s destructor
-(bump allocator has no free list; a kernel singleton's `Drop` running from an arbitrary OTHER
-process would close whatever unrelated `HANDLE` number is live there). Isolated-probe proof
-(`LITEBOX_DIAG_SHARED_ARC_PROBE=1`): exact expected strong counts (1->2->3->4->3) and a
-byte-identical magic value across a real fork boundary.
+`litebox_platform_windows_userland/src/lib.rs`'s `SharedArc<T>` (hand-rolled, not `std::sync::Arc`,
+whose `ArcInner` layout is a private std detail unsound to place by hand; stable Rust also has no
+`allocator_api`) places `value` plus a `strong: AtomicUsize` in the bounded 64 MiB
+`shared_kernel_arena_alloc` region; `new` -> `(handle, arena_offset)`, `attach(offset)` gets an
+independent handle to the SAME bytes. `Drop` never reclaims/runs `T`'s destructor (bump allocator,
+no free list; a kernel singleton must outlive the whole fork family). `SharedKernelStateProvider`
+(`SharedKernelStateSlot::{LiteBoxX,ShimGlobalState}`) turns this into a real create-or-attach
+protocol: trivial `Arc::new` default everywhere with real OS process isolation, real impl on
+`WindowsUserland`. `litebox_shim_linux::GlobalState` is now `GlobalStateHandle<Platform, FS>` =
+`Platform::Handle<GlobalStateX<...>>`; `LinuxShimBuilder::build` does the real attach-or-create
+branch. **Decisive live proof**: parent bumps `next_thread_id` by a sentinel delta both immediately
+before AND strictly after `spawn_cross_process_fork_child` returns; the child's own post-`build()`
+read observes both bumps -- only possible if it is the SAME live allocation, not a frozen snapshot
+or a merely-consistent-address independent copy.
 
-`litebox::platform::SharedKernelStateProvider` (alongside `RawMutexProvider`/
-`ForkChildVerificationProvider`) turns that primitive into the real create-vs-attach protocol:
-`SharedKernelStateSlot::{LiteBoxX,ShimGlobalState}` names which singleton,
-`is_shared_kernel_state_attach_child`/`create_shared_kernel_state`/`attach_shared_kernel_state<T>`
-(GAT `Handle<T>` mirrors `Arc<T>`) are the surface. Trivial `Arc::new` default on every platform
-with real per-process OS isolation (`LinuxUserland`, `MacOsUserland`, `LinuxKernel<Host>` x2,
-`MockPlatform`); real impl on `WindowsUserland`. `litebox_shim_linux::GlobalState` is now
-`GlobalStateHandle<Platform, FS>` (`Platform::Handle<GlobalStateX<Platform, FS>>`, `GlobalStateX`
-= the renamed original struct, unchanged fields/logic) -- `LinuxShimBuilder::build` does the real
-attach-or-create branch. `litebox::LiteBox`/`LiteBoxX` deliberately NOT threaded through this
-trait (would cascade `+ SharedKernelStateProvider` onto 200+ generic call sites across the
-platform-generic `litebox` crate for no payoff `GlobalState` doesn't already cover).
+**Does NOT close `XVFB_FAILED`/`DBUS_FAILED`: root cause precisely characterized.** `SharedArc::new`
+places only `T`'s literal inline bytes in the arena -- fine for plain scalars/an inline sync word,
+but every `GlobalState` REGISTRY (`unix_addr_table`, `pty_registry`, `daemon_pty_masters`,
+`flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`, `shared_files`, 3 caches) is a
+`BTreeMap`/similar whose NODES live on the ordinary private per-process heap -- an attaching
+process's copy of the root pointer is meaningless in its own address space. Follow-up PRD:
+`globalstate-nested-collections-not-actually-shared` (**`unix_addr_table` specifically since
+partly closed -- see the section below**). Full mechanism, every registry's exact type, the
+`proc_self_info`/`pts_registry` mount-ordering caveat: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-**Decisive live proof** (`LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1 LITEBOX_PROCESS_FORK=1`): parent
-bumps `next_thread_id` by +100,000 immediately BEFORE `spawn_cross_process_fork_child`, then +7
-immediately AFTER it returns (child process already exists); child reads back `next_thread_id`
-right after its own `build()` and observes exactly `100010` (base 3). Only possible if the child's
-`GlobalState` is the SAME live allocation the parent kept mutating after the fork point -- rules
-out both a frozen snapshot and an independent copy at a merely-consistent address. **The
-create-vs-attach protocol genuinely works.**
+## `unix_addr_table` presence sharing -- landed and live-verified; does NOT close `XVFB_FAILED`
+## (real blocker identified: a pervasive, PRE-EXISTING, load-scaling stack-overflow crash)
 
-**`.wfgy/webtop_stack.sh` re-run under `LITEBOX_PROCESS_FORK=1` with this landed: `XVFB_FAILED`/
-`DBUS_FAILED`/`DE_FAILED` all UNCHANGED** -- identical terminal sequence to the pre-this-pass
-baseline (`NGINX_CONFIGURED` -> `NGINX_STARTED` -> `NGINX_SELFTEST_FAILED`, pre-existing unrelated
-nginx issue -> `XVFB_FAILED` -> `DBUS_FAILED` -> `DE_FAILED`). **Root cause, precisely
-characterized, not just hypothesized**: `SharedArc<T>::new` places only `T`'s literal inline bytes
-in the arena -- genuinely sufficient for plain scalars (proven above) and for a lock's own inline
-sync word, but every `GlobalState` REGISTRY (`unix_addr_table`, `pty_registry`,
-`daemon_pty_masters`, `flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`, `shared_files`, the
-3 caches) is a `BTreeMap`/similar whose NODES are heap-allocated via the ordinary per-process
-private allocator (`WindowsUserland::alloc`, not the arena) -- an attaching process's copy of the
-map's root pointer refers to a node address that is meaningless in its own address space. This is
-exactly why Xvfb's own unix-socket registration is unreachable to a later attaching client through
-the (structurally shared, but not really content-shared for this field) `unix_addr_table`. Not a
-quick fix: needs either a shared-memory-aware allocator (blocked on unstable `allocator_api`) or
-hand-rolled shared-memory-native registries, both bigger than a single-session scope. Follow-up
-PRD: `globalstate-nested-collections-not-actually-shared`. Full evidence, every registry's exact
-type, the `proc_self_info`/`pts_registry` mount-ordering caveat, and a lower-priority
-fork-density-noise observation (`bash: N Killed`/one stack-overflow sighting, same pre-existing
-signature class as 2026-09-03/today's earlier `ERROR_NO_SYSTEM_RESOURCES` note, not conclusively
-attributed to this pass): `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+Scoped follow-up, JUST `unix_addr_table` (other 5 registries: still untouched).
+`litebox_shim_linux/src/syscalls/unix.rs`'s `SharedUnixAddrPresenceTable`: fixed-256-slot, pure-
+`core::sync::atomic` (zero `unsafe`, zero `RawMutex` -- its bookkeeping `Mutex<Vec<..>>` is itself
+per-process, not actually cross-process-safe today, see archive), lock-free side-index recording
+`(kind, key bytes <=108, owner guest pid)` per bind/listen, mirrored alongside (never replacing)
+each process's real `unix_addr_table` `BTreeMap`. A plain `GlobalState` field (`unix_addr_presence`,
+no new `SharedKernelStateProvider` slot needed): zero pointer indirection, so it inherits whatever
+sharing `GlobalState` itself already has for free, same mechanism as `next_thread_id`. Wired at all
+4 call sites (stream `listen`/`Drop`, datagram `bind`/`Drop`) plus an always-on diagnostic on every
+real `ECONNREFUSED`, distinguishing "nothing listening" from "listening, in a DIFFERENT guest pid,
+not yet reachable" (`[unix_addr_presence]` log line).
+
+**Decisive live proof** (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`, mirrors `GLOBALSTATE_SHARE_PROBE`
+exactly): parent registers one key immediately before `spawn_cross_process_fork_child`, a SECOND
+key strictly AFTER it returns; child looks up both right after its own `build()`. Live result:
+`child observed before=Some(1) after=Some(1)` -- proves genuine live sharing, not a snapshot.
+
+**`.wfgy/webtop_stack.sh` under `LITEBOX_PROCESS_FORK=1`: `XVFB_FAILED`/`DBUS_FAILED`/`DE_FAILED`
+still all occur, UNCHANGED -- but for a DIFFERENT reason than this fix targets.** The new
+`[unix_addr_presence]` diagnostic never fired: the log shows `xset q`'s own forked process hit
+`thread 'main' (PID) has overflowed its stack` and got killed BEFORE reaching `connect()` at all.
+**That stack-overflow class (122 occurrences by `XVFB_FAILED`, 205+ over a full boot) is PROVEN, via
+a controlled `git stash`/rebuild/re-run A/B, to be COMPLETELY UNRELATED to this session's code** --
+patched and clean-`main` builds hit `XVFB_FAILED` with the identical 122-occurrence count. Upgrades
+the prior "one sighting, not conclusively attributed" note to a confirmed, load-scaling, pre-
+existing defect, plausibly host-memory-pressure-driven (`FreePhysicalMemory` cycled 900MB-2.5GB of
+16GB across both runs; Windows stack growth needs a guard-page commit, which can fail under
+pressure) -- NOT root-caused this pass, genuinely bigger than the AF_UNIX task.
+
+**Next session, in order**: (1) root-cause the stack-overflow-under-load class itself -- it, not
+the AF_UNIX registry, is what's actually preventing any live webtop-integration test of this
+session's fix; (2) once forked children reliably survive, re-run `[unix_addr_presence]` for real;
+(3) only then does `Backlog`/`crate::channel::Channel`/`Pollee`'s OWN data-plane sharing gap
+(`Mutex<VecDeque<UnixConnectedStream>>` and each stream's ring buffer are themselves further
+private-heap-resident -- confirmed by reading the real fields, the identical problem one level
+deeper) become the real next blocker. Full design, proof transcripts, A/B methodology:
+`docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Closed — do not re-attempt without a genuinely new approach
 

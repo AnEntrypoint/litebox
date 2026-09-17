@@ -1369,6 +1369,22 @@ pub fn diag_process_fork_globalstate_probe() {
             shim.diag_next_thread_id()
         );
     }
+    // Diagnostic-only (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`), the child-side half of the
+    // decisive live cross-process `SharedUnixAddrPresenceTable` proof -- see
+    // `litebox_shim_linux::syscalls::process::Task::try_cross_process_fork`'s matching parent-side
+    // inserts. `before` is expected `Some(parent_pid)` even for a plain independent copy (the
+    // parent registered it before spawning); `after` is the decisive one -- only a genuinely
+    // ATTACHED (not merely consistently-addressed) table observes a key the parent registered
+    // AFTER this child process already existed. `0` is `UNIX_ADDR_KIND_PATH` (kept as a bare
+    // literal here since `litebox_shim_linux`'s presence-table internals are deliberately
+    // `pub(crate)`, not exported to this diagnostic-only caller).
+    if std::env::var_os("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE").is_some() {
+        let before = shim.diag_unix_addr_presence_lookup(0, b"PRESENCE_PROBE_BEFORE");
+        let after = shim.diag_unix_addr_presence_lookup(0, b"PRESENCE_PROBE_AFTER");
+        eprintln!(
+            "[unix_addr_presence_probe] child observed before={before:?} after={after:?}"
+        );
+    }
     diag_elapsed!("GlobalState built, handing off to vmem-adopt-probe");
 
     diag_process_fork_vmem_adopt_probe(platform, &shim, fs, t0);

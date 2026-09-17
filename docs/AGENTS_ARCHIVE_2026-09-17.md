@@ -1005,3 +1005,104 @@ issues)/`litebox_platform_linux_kernel`/`litebox_platform_lvbs`/
 `litebox_runner_linux_on_windows_userland` all `cargo check` clean. Host processes killed cleanly
 after the webtop test; free RAM recovered to the same ~4.5-4.6M KB baseline this machine shows
 between runs, zero leaked processes.
+
+## `unix_addr_table` presence sharing (scoped follow-up session, JUST this one registry)
+
+`litebox_shim_linux/src/syscalls/unix.rs`'s `SharedUnixAddrPresenceTable`: fixed-256-slot,
+pure-`core::sync::atomic` (zero `unsafe`, zero `RawMutex`), lock-free side-index recording
+`(kind: Path|Abstract, key bytes <=108, owner guest pid)` for every bind/listen, mirrored (never
+replacing) each process's own real `unix_addr_table` `BTreeMap`. Added as a genuinely plain field
+of `GlobalState` (`unix_addr_presence`) rather than a second `SharedKernelStateProvider` slot: this
+type has NO pointer/`Vec`/`Box` anywhere, so its entire live state is its own inline bytes --
+placing it as an ordinary field of the already-`SharedArc`-placed `GlobalState` gives it real
+cross-process content sharing for free, the same mechanism `next_thread_id`'s plain `AtomicI32`
+already proved, with zero new create/attach plumbing. Slot layout: `state: AtomicU32`
+(Empty/Writing/Occupied tri-state, CAS-claimed then `Release`-published so a reader that observes
+Occupied also observes every byte the inserter wrote), `kind`/`len`/`owner_pid: AtomicU32`,
+`bytes: [AtomicU8; 108]`. Wired at all 4 real call sites: stream `listen()` (`UnixInitStream::listen`)
+inserts and stores `owner_pid` on the returned `UnixListenStream` for its `Drop` to remove by;
+datagram `bind()` (`UnixDatagramInner::bind`) inserts and extends `BoundDatagramAddr` to a 3-tuple
+(`addr, global, owner_pid`) for the same reason on `Drop`. Plus a new always-on diagnostic
+(`log_cross_process_presence_miss`, called from both `lookup()` functions) on every real
+`ECONNREFUSED` a lookup miss was already about to return: distinguishes "nothing is listening
+anywhere" (presence lookup also misses, no log) from "something IS listening, in a DIFFERENT guest
+pid, not yet reachable" (`[unix_addr_presence]` warn-level log line with both pids).
+
+**Why `RawMutex` was deliberately NOT used**: `litebox_platform_windows_userland`'s `RawMutex` (the
+"Cross-process-capable RawMutex" section) is cross-process-safe ONLY for the parts that go through
+`core::sync::atomic`/kernel `Event`s -- its OWN bookkeeping (`waiters: Mutex<Vec<WaiterRecord>>`,
+`remote_waiter_handles`) is a plain `std::sync::Mutex` guarding a heap-`Vec`, both themselves
+per-process constructs (a `std::sync::Mutex`'s internal futex word is subject to the exact same
+`WaitOnAddress`-is-process-local constraint this whole design works around; its `Vec`'s buffer is an
+ordinary private-heap allocation). Placing a `RawMutex` in shared memory and contending it from two
+real OS processes today would silently hang or corrupt, not merely underperform -- not yet fixed
+(needs `xproc_sync.rs`'s own per-mutex named-event scheme wired to a section-offset-keyed side
+table, i.e. still "step 3" per that module's own doc comment). So this table uses ONLY plain atomics
+with a claim-by-CAS/publish-by-Release-store protocol, mirroring `SharedArc`'s own reasoning for why
+raw atomics (not an OS primitive) are what actually crosses a Windows process boundary correctly
+today.
+
+**Decisive live proof** (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1 LITEBOX_PROCESS_FORK=1`, mirrors
+the `GLOBALSTATE_SHARE_PROBE` pattern exactly, same call sites in `Task::try_cross_process_fork`):
+parent registers `PRESENCE_PROBE_BEFORE` immediately before `spawn_cross_process_fork_child`, then
+`PRESENCE_PROBE_AFTER` strictly AFTER it returns (child process already exists); child looks up both
+immediately after its own `build()`, using the cheap-repro one-liner (`(true) & wait; OUTER_EXIT=$?`)
+against `docker.io/library/debian:stable-slim`. Live result: `child observed before=Some(1)
+after=Some(1)` -- the child (a genuinely separate OS process) sees an address the parent registered
+strictly after the fork already happened. Basic correctness proven, not just hypothesized. Runner
+exited 0, guest script completed (`OUTER_EXIT=0`), no panic/FATAL in the log.
+
+**The real target test**: `.wfgy/webtop_stack.sh` (`docker.io/linuxserver/webtop:debian-xfce`,
+`--resume-from .wfgy/webtop_seed.tar`, `--env GLIBC_TUNABLES=...`, `LITEBOX_PROCESS_FORK=1` +
+`LITEBOX_LOG=warn,...fork_verify=error`, exactly the already-verified recipe from the
+create-vs-attach pass above) under `LITEBOX_PROCESS_FORK=1`: `XVFB_FAILED` / `DBUS_FAILED` /
+`DE_FAILED` still all occur, UNCHANGED. But the reason is now precisely characterized and is
+DIFFERENT from what this fix targets: the new `[unix_addr_presence]` diagnostic never fired even
+once around the `XVFB_FAILED` line -- the log shows `xset q`'s own forked host process hit
+`thread 'main' (PID) has overflowed its stack` and got killed BEFORE ever reaching the `connect()`
+call this fix's lookup path instruments (`/webtop_stack.sh: line 280: N Killed xset q > /dev/null
+2>&1` immediately preceded by the overflow line, then `[s] XVFB_FAILED`). The AF_UNIX cross-process
+visibility gap was never actually exercised in this run; a separate, larger, pre-existing crash
+pre-empts it.
+
+**That stack-overflow pattern is real, pervasive (122 occurrences by the time `XVFB_FAILED` prints,
+205+ over a full boot to `DE_FAILED` + the script's own steady-state `HOLD` loop), and PROVEN, via a
+controlled A/B, to be COMPLETELY UNRELATED to this pass's code change.** Method: `git stash` (reverts
+this session's `unix_addr_presence` field addition to plain `main`), `cargo build --release -p
+litebox_runner_linux_on_windows_userland`, identical command line, identical warm `.litebox-cache`
+(zero image-pull variance), then `git stash pop` to restore. Result: the patched run and the clean-
+`main` baseline rebuild both hit `[s] XVFB_FAILED` with the EXACT SAME 122 `overflowed its stack`
+occurrences counted up to that exact line in each log. This upgrades the prior "one sighting, not
+conclusively attributed" note (this file's earlier section) to a CONFIRMED, load-scaling,
+pre-existing defect independent of any registry-sharing work -- plausibly host-memory-pressure-
+driven (`Get-CimInstance Win32_OperatingSystem`'s `FreePhysicalMemory` observed cycling
+~900MB-2.5GB out of 16GB total across both runs, recovering fully after each kill; a Windows
+thread's stack needs to COMMIT fresh guard pages to grow, which can fail under tight system-wide
+memory pressure and manifests as exactly this "stack overflow" fault even for an unremarkable call
+depth) rather than a single deep-recursion bug -- but NOT root-caused this pass: genuinely out of
+scope for the AF_UNIX-table task and larger than it (would need e.g. per-fork-child stack-size
+instrumentation, a memory-headroom-vs-overflow-rate correlation across several runs, or reducing
+concurrent fork density during a boot).
+
+**Precise scope for the next session**: this pre-existing stack-overflow-under-load defect, not the
+AF_UNIX registry, is the actual blocker standing between today's state and ever LIVE-testing whether
+`unix_addr_presence`'s foreign-pid diagnostic fires for a real Xvfb/xset pair in the full webtop
+boot -- so many forked children die before reaching their target syscall that the specific
+interaction this session's fix targets essentially never gets to run there (it DOES work, per the
+isolated decisive proof above, just not exercised in this particular integration test). Suggested
+order: (1) root-cause the stack-overflow class itself; (2) once forked children reliably survive to
+their target syscalls, re-run the `[unix_addr_presence]` diagnostic in the full boot and see whether
+it fires and with what owner pid; (3) only if it fires, the OTHER 5 registries' and
+`crate::channel::Channel`/`Pollee`'s own data-plane sharing gap becomes the actual next blocker --
+confirmed by reading the real code, not assumed: `Backlog` (stream listen-socket state) is
+`Mutex<BacklogState>` where `BacklogState.sockets: VecDeque<UnixConnectedStream>` heap-allocates its
+buffer via the ordinary private per-process allocator regardless of where the outer `Backlog` lives,
+and each `UnixConnectedStream`'s actual byte transport (`recv_channel`/`connected_send_channel:
+crate::channel::{ReadEnd,WriteEnd}<Platform, Message<...>>`, backed by `crate::channel::Channel`,
+plus a `Pollee` for epoll-wake) is itself a further private-heap-resident ring buffer + observer
+list -- exactly the same "outer struct shared, nested allocation node private" problem one level
+deeper than `unix_addr_table`'s own `BTreeMap`, not a simplifying special case. Closing it for real
+needs either a shared-memory-native fixed-capacity ring buffer (mirroring this session's own
+slot-table technique) wired into `Backlog`/`UnixConnectedStream` specifically, or `xproc_sync.rs`'s
+real cross-process wake wired in first so a shared ring buffer's blocked reader/writer can actually
+be woken from a different OS process -- both bigger than this session's scope.

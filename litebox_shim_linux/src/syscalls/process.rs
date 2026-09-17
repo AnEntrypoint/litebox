@@ -2993,6 +2993,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
+        // Diagnostic-only (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`), a no-op otherwise: the
+        // decisive live cross-process `SharedUnixAddrPresenceTable` proof, mirroring the
+        // `GLOBALSTATE_SHARE_PROBE` block immediately above at the exact same two call sites (the
+        // ordering guarantee that already makes THAT probe decisive -- see its own doc comment --
+        // applies equally here, since this insert rides the identical parent-side control flow
+        // point). Registers a sentinel key BEFORE spawning the child; see
+        // `litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe`'s
+        // matching child-side lookup for the other half.
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE")
+        {
+            let owner_pid = self.pid.get() as u32;
+            let inserted = self.global.unix_addr_presence.insert(
+                crate::syscalls::unix::UNIX_ADDR_KIND_PATH,
+                b"PRESENCE_PROBE_BEFORE",
+                owner_pid,
+            );
+            litebox_util_log::warn!(
+                owner_pid:% = owner_pid, inserted:% = inserted;
+                "[unix_addr_presence_probe] parent registered PRESENCE_PROBE_BEFORE immediately before spawning cross-process fork child"
+            );
+        }
+
         let handle = self.global.platform.spawn_cross_process_fork_child(
             &relocations,
             full_gprs,
@@ -3021,6 +3046,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::warn!(
                 after:% = after;
                 "[globalstate_share_probe] parent bumped next_thread_id AGAIN, strictly after spawn_cross_process_fork_child returned"
+            );
+        }
+
+        // Second half of the presence-table probe: registers a SECOND sentinel key strictly
+        // AFTER the child process already exists -- the actual decisive case the task set out to
+        // prove ("parent registers an address AFTER the child has already been forked; the child
+        // subsequently looks it up and finds it"), not merely "an independent copy happened to
+        // start with the same pre-fork data".
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE")
+        {
+            let owner_pid = self.pid.get() as u32;
+            let inserted = self.global.unix_addr_presence.insert(
+                crate::syscalls::unix::UNIX_ADDR_KIND_PATH,
+                b"PRESENCE_PROBE_AFTER",
+                owner_pid,
+            );
+            litebox_util_log::warn!(
+                owner_pid:% = owner_pid, inserted:% = inserted;
+                "[unix_addr_presence_probe] parent registered PRESENCE_PROBE_AFTER strictly after spawn_cross_process_fork_child returned"
             );
         }
 

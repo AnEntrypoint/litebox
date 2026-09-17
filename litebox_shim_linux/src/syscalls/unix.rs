@@ -4,7 +4,7 @@
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -263,6 +263,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         let key = addr.to_key();
         let cred = task.peer_cred();
         let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, cred));
+        let owner_pid = task.pid.get() as u32;
+        let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+        global
+            .unix_addr_presence
+            .insert(presence_kind, presence_bytes, owner_pid);
         global
             .unix_addr_table
             .write()
@@ -270,6 +275,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         Ok(UnixListenStream {
             backlog,
             global: global.clone(),
+            owner_pid,
         })
     }
 
@@ -415,6 +421,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
 struct UnixListenStream<Platform: ShimPlatform, FS: ShimFS> {
     backlog: Arc<Backlog<Platform, FS>>,
     global: GlobalStateHandle<Platform, FS>,
+    /// The guest pid that registered this address in `global.unix_addr_presence` -- carried so
+    /// `Drop` can remove exactly that entry (see `SharedUnixAddrPresenceTable::remove`'s
+    /// same-owner-only contract).
+    owner_pid: u32,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixListenStream<Platform, FS> {
@@ -448,6 +458,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixListenStream<Platform, FS>
             && Arc::ptr_eq(backlog, &self.backlog)
         {
             table.remove(&key);
+            let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+            self.global
+                .unix_addr_presence
+                .remove(presence_kind, presence_bytes, self.owner_pid);
         }
     }
 }
@@ -928,6 +942,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             return Err(Errno::EINVAL);
         };
         let Some(entry) = guard.get(&key) else {
+            log_cross_process_presence_miss(task, &key);
             return Err(Errno::ECONNREFUSED);
         };
         match &entry.0 {
@@ -1255,9 +1270,11 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
     }
 }
 
-/// The local address of a bound datagram socket together with the global state
-/// it was registered in (used to deregister the address on drop).
-type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, GlobalStateHandle<Platform, FS>);
+/// The local address of a bound datagram socket together with the global state it was registered
+/// in (used to deregister the address on drop), and the guest pid that registered it in
+/// `global.unix_addr_presence` (see `SharedUnixAddrPresenceTable::remove`'s same-owner-only
+/// contract).
+type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, GlobalStateHandle<Platform, FS>, u32);
 
 struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     /// The local address this socket is bound to, if any.
@@ -1279,7 +1296,7 @@ struct UnixDatagram<Platform: ShimPlatform, FS: ShimFS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixDatagramInner<Platform, FS> {
     fn drop(&mut self) {
-        if let Some((addr, global)) = self.addr.take() {
+        if let Some((addr, global, owner_pid)) = self.addr.take() {
             let key = addr.to_key();
             let mut table = global.unix_addr_table.write();
             // Only remove the entry if it matches the current socket
@@ -1288,6 +1305,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixDatagramInner<Platform, FS
                 && send_channel.is_pair(recv_channel)
             {
                 table.remove(&key);
+                let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+                global
+                    .unix_addr_presence
+                    .remove(presence_kind, presence_bytes, owner_pid);
             }
         }
     }
@@ -1305,6 +1326,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
 
         let bound_addr = addr.bind(task, true)?;
         let key = bound_addr.to_key();
+        let owner_pid = task.pid.get() as u32;
+        let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+        task.global
+            .unix_addr_presence
+            .insert(presence_kind, presence_bytes, owner_pid);
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
         let (send_channel, recv_channel) =
@@ -1314,7 +1340,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
             .unix_addr_table
             .write()
             .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
-        self.addr = Some((bound_addr, task.global.clone()));
+        self.addr = Some((bound_addr, task.global.clone(), owner_pid));
         if self.read_shutdown {
             recv_channel.shutdown();
         }
@@ -1404,6 +1430,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             return Err(Errno::EINVAL);
         };
         let Some(entry) = guard.get(&key) else {
+            log_cross_process_presence_miss(task, &key);
             return Err(Errno::ECONNREFUSED);
         };
         // check if we can bind to the address
@@ -1512,7 +1539,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             .read()
             .addr
             .as_ref()
-            .map_or(UnixSocketAddr::Unnamed, |(addr, _)| {
+            .map_or(UnixSocketAddr::Unnamed, |(addr, _, _)| {
                 UnixSocketAddr::from(addr)
             })
     }
@@ -1982,3 +2009,209 @@ enum UnixEntryInner<Platform: ShimPlatform, FS: ShimFS> {
 
 /// Type alias for the global Unix socket address table.
 pub(crate) type UnixAddrTable<Platform, FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<Platform, FS>>;
+
+/// Matches Linux's `sockaddr_un.sun_path` byte capacity -- the longest key
+/// [`SharedUnixAddrPresenceTable`] ever needs to store (a `Path` key's UTF-8 bytes, or an
+/// `Abstract` key's raw bytes).
+pub(crate) const UNIX_ADDR_KEY_MAX: usize = 108;
+
+/// Realistic upper bound on simultaneously bound AF_UNIX addresses in one guest session (the X11
+/// display socket, D-Bus system + session bus, at most a handful of application IPC sockets) --
+/// sized generously rather than exactly, since an unused slot costs only a few dozen bytes and
+/// this table is a single fixed-size allocation, never grown.
+pub(crate) const UNIX_ADDR_PRESENCE_CAPACITY: usize = 256;
+
+const PRESENCE_SLOT_EMPTY: u32 = 0;
+const PRESENCE_SLOT_WRITING: u32 = 1;
+const PRESENCE_SLOT_OCCUPIED: u32 = 2;
+
+/// `UnixSocketAddrKey`'s two variants, recorded numerically so a presence-table slot can compare
+/// against a key without depending on that enum's own (non-`Copy`, heap-owning) representation.
+pub(crate) const UNIX_ADDR_KIND_PATH: u32 = 0;
+pub(crate) const UNIX_ADDR_KIND_ABSTRACT: u32 = 1;
+
+/// One slot of [`SharedUnixAddrPresenceTable`]. Every field is a plain fixed-width atomic --
+/// deliberately no `Vec`/`Box`/pointer anywhere in this type, unlike [`UnixAddrTable`]'s
+/// `BTreeMap` -- so the WHOLE slot's live state is its own inline bytes, with no separately
+/// heap-allocated node for a cross-process attacher to fail to resolve. This is what lets placing
+/// [`SharedUnixAddrPresenceTable`] as an ordinary field of `GlobalState` (itself placed in the
+/// shared kernel arena on `WindowsUserland`'s cross-process-fork path, see
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md`'s "Shared kernel heap"/`SharedArc` sections) give it real
+/// cross-process content sharing for free, the same way `next_thread_id`'s plain `AtomicI32`
+/// already does -- without needing a second `SharedKernelStateProvider` slot, a second
+/// create-or-attach protocol, or any `unsafe` at all.
+struct UnixAddrPresenceSlot {
+    /// [`PRESENCE_SLOT_EMPTY`] / [`PRESENCE_SLOT_WRITING`] / [`PRESENCE_SLOT_OCCUPIED`]. Every
+    /// other field is only meaningful once this is [`PRESENCE_SLOT_OCCUPIED`] -- `Acquire`-loaded
+    /// before reading them, `Release`-stored after writing them, so a reader that observes
+    /// `PRESENCE_SLOT_OCCUPIED` also observes every byte a concurrent inserter wrote before its
+    /// own `Release` store (the same publish pattern `SharedArc::new`'s doc comment already
+    /// establishes for this codebase's other lock-free cross-process structures).
+    state: AtomicU32,
+    /// [`UNIX_ADDR_KIND_PATH`] / [`UNIX_ADDR_KIND_ABSTRACT`].
+    kind: AtomicU32,
+    /// Number of valid leading bytes in `bytes` (`<= UNIX_ADDR_KEY_MAX`).
+    len: AtomicU32,
+    /// The guest pid ([`Task::pid`], globally unique across the whole fork family via the
+    /// already-cross-process-shared `next_thread_id` allocator -- not the host OS pid, which no
+    /// platform-agnostic code in this `no_std` crate can read) that inserted this entry.
+    owner_pid: AtomicU32,
+    bytes: [AtomicU8; UNIX_ADDR_KEY_MAX],
+}
+
+impl UnixAddrPresenceSlot {
+    fn new_empty() -> Self {
+        Self {
+            state: AtomicU32::new(PRESENCE_SLOT_EMPTY),
+            kind: AtomicU32::new(0),
+            len: AtomicU32::new(0),
+            owner_pid: AtomicU32::new(0),
+            bytes: core::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+
+    fn matches(&self, kind: u32, key: &[u8]) -> bool {
+        self.kind.load(Ordering::Relaxed) == kind
+            && self.len.load(Ordering::Relaxed) as usize == key.len()
+            && key
+                .iter()
+                .enumerate()
+                .all(|(i, b)| self.bytes[i].load(Ordering::Relaxed) == *b)
+    }
+}
+
+/// Cross-process-visible AF_UNIX address presence table: a fixed-capacity, lock-free (pure
+/// `core::sync::atomic`, no `RawMutex`/OS wait primitive -- see [`UnixAddrPresenceSlot`]'s doc
+/// comment for why none is needed) side-index recording WHICH addresses are currently
+/// bound/listening and by which guest pid, kept alongside (never instead of) each process's own
+/// real [`UnixAddrTable`].
+///
+/// # Scope -- what this table does NOT do
+///
+/// This closes only the "is address K bound anywhere in this fork family" visibility gap
+/// (`docs/AGENTS_ARCHIVE_2026-09-17.md`'s `globalstate-nested-collections-not-actually-shared`
+/// PRD). It deliberately does NOT attempt to make a cross-process `connect()` actually complete: a
+/// `Backlog`'s pending-connection queue and a connected stream's `crate::channel::Channel`
+/// byte-transport buffers are themselves further heap-allocated (`VecDeque`/ring-buffer internals
+/// on the ordinary private per-process heap), so even a slot that names a REAL, currently-occupied
+/// address cannot safely hand back a dereferenceable `Arc<Backlog>` to a DIFFERENT process's
+/// `connect()` call -- that needs a genuinely new shared-memory-native channel/pollee
+/// implementation, out of scope here (see call sites of [`SharedUnixAddrPresenceTable::lookup`]
+/// for the precise diagnostic this enables instead: distinguishing "nothing is listening" from
+/// "something is listening, in a different process, not yet reachable").
+pub(crate) struct SharedUnixAddrPresenceTable {
+    slots: [UnixAddrPresenceSlot; UNIX_ADDR_PRESENCE_CAPACITY],
+}
+
+impl SharedUnixAddrPresenceTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| UnixAddrPresenceSlot::new_empty()),
+        }
+    }
+
+    /// Registers `key` (of the given `kind`) as owned by `owner_pid`. Returns `false` -- never
+    /// panics, this is a guest-reachable path -- if `key` exceeds [`UNIX_ADDR_KEY_MAX`] or every
+    /// slot is occupied; both degrade only THIS side table's diagnostic value, never the real
+    /// per-process [`UnixAddrTable`] insert a caller already performed first.
+    pub(crate) fn insert(&self, kind: u32, key: &[u8], owner_pid: u32) -> bool {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return false;
+        }
+        for slot in &self.slots {
+            if slot
+                .state
+                .compare_exchange(
+                    PRESENCE_SLOT_EMPTY,
+                    PRESENCE_SLOT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                for (i, b) in key.iter().enumerate() {
+                    slot.bytes[i].store(*b, Ordering::Relaxed);
+                }
+                slot.len.store(key.len() as u32, Ordering::Relaxed);
+                slot.kind.store(kind, Ordering::Relaxed);
+                slot.owner_pid.store(owner_pid, Ordering::Relaxed);
+                slot.state.store(PRESENCE_SLOT_OCCUPIED, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes the occupied slot matching `(kind, key, owner_pid)` exactly, if any. Only ever
+    /// called by the same process that inserted it (bind/listen and its own `Drop` always run in
+    /// the same process), so this plain `Acquire` scan + `Release` store back to
+    /// [`PRESENCE_SLOT_EMPTY`] cannot race with a concurrent remover of the SAME logical entry.
+    pub(crate) fn remove(&self, kind: u32, key: &[u8], owner_pid: u32) {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == PRESENCE_SLOT_OCCUPIED
+                && slot.owner_pid.load(Ordering::Relaxed) == owner_pid
+                && slot.matches(kind, key)
+            {
+                slot.state.store(PRESENCE_SLOT_EMPTY, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    /// Looks up `key`; returns the owning guest pid if occupied by ANY process in the fork
+    /// family, including the caller's own.
+    pub(crate) fn lookup(&self, kind: u32, key: &[u8]) -> Option<u32> {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return None;
+        }
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == PRESENCE_SLOT_OCCUPIED
+                && slot.matches(kind, key)
+            {
+                return Some(slot.owner_pid.load(Ordering::Relaxed));
+            }
+        }
+        None
+    }
+}
+
+/// Numeric kind plus raw key bytes for [`SharedUnixAddrPresenceTable`], derived from a real
+/// [`UnixSocketAddrKey`] so every call site shares one conversion instead of matching the enum
+/// itself repeatedly.
+pub(crate) fn presence_kind_and_bytes(key: &UnixSocketAddrKey) -> (u32, &[u8]) {
+    match key {
+        UnixSocketAddrKey::Path(path) => (UNIX_ADDR_KIND_PATH, path.as_bytes()),
+        UnixSocketAddrKey::Abstract(bytes) => (UNIX_ADDR_KIND_ABSTRACT, bytes.as_slice()),
+    }
+}
+
+/// Called on every real (non-diagnostic) `unix_addr_table` lookup miss -- i.e. every
+/// `ECONNREFUSED` this module was already about to return -- to distinguish, with real evidence
+/// instead of a hypothesis, the two cases `docs/AGENTS_ARCHIVE_2026-09-17.md`'s
+/// `globalstate-nested-collections-not-actually-shared` finding could not previously tell apart
+/// from a log alone: "nothing is listening at this address anywhere" (real `ECONNREFUSED`,
+/// `unix_addr_presence` also misses) vs. "something IS listening, in a DIFFERENT process, just
+/// not yet reachable from this one" (`unix_addr_presence` hits with a foreign `owner_pid` --
+/// [`SharedUnixAddrPresenceTable`]'s own doc comment explains why this table cannot yet also fix
+/// the connection itself). Always-on, not gated behind an env var: this fires only on an already-
+/// failing path, at most once per failed `connect`/`sendto`, so its cost is negligible.
+fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
+    task: &Task<Platform, FS>,
+    key: &UnixSocketAddrKey,
+) {
+    let (presence_kind, presence_bytes) = presence_kind_and_bytes(key);
+    match task.global.unix_addr_presence.lookup(presence_kind, presence_bytes) {
+        Some(owner_pid) if owner_pid != task.pid.get() as u32 => {
+            litebox_util_log::warn!(
+                self_pid:% = task.pid.get(), owner_pid:% = owner_pid;
+                "[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid -- \
+                 cross-process AF_UNIX data-plane sharing gap (unix_addr_table's Backlog/Channel \
+                 values are not yet shared-memory-native), not a genuinely absent listener"
+            );
+        }
+        _ => {}
+    }
+}
