@@ -124,8 +124,23 @@ where
     platform_interaction: PlatformInteraction,
     /// FDs that are queued for eventual closure
     queued_for_closure: Vec<SocketFd<Platform>>,
-    /// Sockets that are closing in the background
-    closing_in_background: Vec<smoltcp::iface::SocketHandle>,
+    /// Sockets that are closing in the background. A fixed, pointer-free, `MAX_SOCKETS`-capacity
+    /// array of slots (`None` == empty), NOT a `Vec` (as this used to be) -- `Network`, including
+    /// this field inline within it, lives in the cross-process shared kernel arena
+    /// (`GlobalState`'s `net: Mutex<Network<Platform>>`, placed via
+    /// `SharedKernelStateProvider::create_shared_kernel_state`/`ShimGlobalState`). A `Vec`'s
+    /// backing buffer is a SEPARATE allocation on the constructing process's private heap,
+    /// reachable only through a raw pointer stored inline in the `Vec` -- a cross-process-forked
+    /// child that ATTACHES to (rather than constructs) the shared `GlobalState` reads that same
+    /// pointer VALUE, meaningless in its own address space, so `Vec::retain`/`push` read/write
+    /// garbage as `SocketHandle`s. Confirmed live (2026-09-17): a forked child panicked
+    /// `index out of bounds: the len is 256 but the index is 3414407380873671541` in
+    /// `smoltcp::iface::socket_set::SocketSet::retain` (`litebox/src/net/local_ports.rs`'s
+    /// `LocalPortAllocator::refcount` doc comment covers the identical bug class, found and fixed
+    /// the same pass; `queued_for_closure` above is the same still-open shape but additionally
+    /// touches the shared `DescriptorTable::drain_entries_full_covered_by` API, so it is left for
+    /// a dedicated follow-on rather than folded into this fix).
+    closing_in_background: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
 }
 
 impl<Platform> Network<Platform>
@@ -186,7 +201,7 @@ where
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: vec![],
-            closing_in_background: vec![],
+            closing_in_background: [None; MAX_SOCKETS],
         }
     }
 }
@@ -543,6 +558,13 @@ where
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
     ///
+    /// **UPDATE (2026-09-17, later same day still): `socket_set`'s slot array and
+    /// `closing_in_background` are now both fixed, pointer-free, shared-arena-native storage --
+    /// see `Network::socket_set`'s `alloc_shared_socket_storage` and the `closing_in_background`
+    /// field's own doc comment for each fix and its live-caught evidence. `interface` (routes/
+    /// neighbor-cache) and `queued_for_closure` remain the still-open instances of this doc
+    /// comment's defect class.**
+    ///
     /// `Network`'s smoltcp `socket_set`/`interface`/`closing_in_background`/`queued_for_closure`
     /// need to be genuinely shared across the whole cross-process-fork family for real guest
     /// behavior (nginx's own reverse proxy to selkies over `127.0.0.1:8081` -- see
@@ -698,17 +720,15 @@ where
 
     /// Remove dead sockets that were closing in the background
     fn remove_dead_sockets(&mut self) {
-        self.closing_in_background.retain(|socket_handle| {
-            let handle = *socket_handle;
+        for slot in &mut self.closing_in_background {
+            let Some(handle) = *slot else { continue };
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
                 self.socket_set.remove(handle);
-                false
-            } else {
-                true
+                *slot = None;
             }
-        });
+        }
     }
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
@@ -1175,7 +1195,16 @@ where
                 } else {
                     tcp_socket.close();
                 }
-                self.closing_in_background.push(handle);
+                let slot = self
+                    .closing_in_background
+                    .iter_mut()
+                    .find(|slot| slot.is_none())
+                    .expect(
+                        "closing_in_background has MAX_SOCKETS slots, one per possible live \
+                         socket_set entry -- a socket being closed here always currently \
+                         occupies one, so a free slot always exists",
+                    );
+                *slot = Some(handle);
             }
         }
         if let Some(proxy) = proxy {

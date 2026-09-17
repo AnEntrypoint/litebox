@@ -3,6 +3,129 @@
 Trimmed out of `AGENTS.md` to keep it under the 30KB working-set budget. Read this for the trail;
 `AGENTS.md` keeps only the current-state pointer.
 
+## Track B ninth/tenth pass -- `socket_set` shared-arena fix, A/B confirmation, and the post-NGINX_STARTED CPU-livelock hunt (superseded detail, attribution: lanmower)
+
+Drained from `AGENTS.md` once the livelock this section chases was root-caused and fixed (tenth
+pass, see AGENTS.md's current Track B entry for the outcome). Kept here for the trail.
+
+**`Network::socket_set` made shared-arena-native (eighth pass).** The `tuple.unwrap()` panic's
+root cause (`socket_set: smoltcp::iface::SocketSet::new(vec![])` -- an ordinary `Vec`,
+private-heap-backed even though `Network` itself is embedded in the shared `GlobalState` arena) is
+fixed: `smoltcp::iface::SocketSet`/`RingBuffer`/`PacketBuffer` are all backed by
+`managed::ManagedSlice`, which supports a caller-supplied FIXED `&'static mut [T]` slice as well as
+`Vec` (confirmed by reading vendored smoltcp 0.12.0 source, not assumed) -- so `socket_set` now
+gets a 256-slot (`litebox::net::MAX_SOCKETS`) array allocated once, at `Network::new` time, via a
+new `SharedKernelStateProvider::shared_kernel_arena_alloc_bytes` trait method (default: ordinary
+global alloc; real impl on `WindowsUserland`, reusing `shared_kernel_arena_alloc`). Because the
+arena is fixed-base, the resulting pointer is the SAME valid address in every attaching process --
+no per-process rebind needed, unlike `litebox`/`device`. This makes every INLINE per-socket field
+(state machine, sequence numbers, the `tuple` field from the panic, `Meta`) correctly shared.
+Does NOT cover each socket's own rx/tx ring/packet-buffer PAYLOAD bytes (`tcp::Socket`/
+`udp::Socket` still build those via `RingBuffer::new(vec![...])`) -- real, separately-scoped
+follow-on work, needs a fixed buffer POOL reused across a slot's lifecycle (a naive per-socket
+arena allocation would exhaust the bump-allocated, never-freed arena under real connection churn).
+`queued_for_closure`/`closing_in_background` also remained `Vec`-backed at this point in the
+narrative (smaller, self-contained follow-ons; the former also touches the shared
+`DescriptorTable::drain_entries_full_covered_by` API) -- `closing_in_background` was fixed two
+passes later (see AGENTS.md's current entry); `queued_for_closure` remains open.
+`litebox/src/net/mod.rs`'s own `MAX_SOCKETS` doc comment has the full design and rationale.
+
+Verification: `cargo check`/`build --release` clean across all four affected crates; all 25
+`litebox` net unit tests pass unchanged. Live boot: reached `NGINX_STARTED` with zero
+`tuple.unwrap()` panics (previously routine), and a direct `curl` to the published port showed a
+materially more-advanced signature (TCP connects, request sent, times out waiting for a response)
+than the old `http_code=000`/instant-teardown. The run then stalled with no further `[s]` markers
+-- root-caused further below.
+
+**A/B CONFIRMED (ninth pass, same day): this is a NEW, post-fix-only stall, NOT the same
+pre-existing issue.** Built the immediate parent commit (`4bad287`, pre-`socket_set`-fix) in an
+isolated worktree (shared `CARGO_TARGET_DIR` with the main tree for incremental-build speed --
+caution: doing this concurrently with an in-progress different-commit build corrupts cargo's
+cache across the two commits' differing trait shapes, `error[E0407]`; always `cargo clean -p
+<crate>` for every crate whose trait/impl surface differs before rebuilding after a worktree
+build shared the same target dir) and ran the byte-identical repro
+(`--gui=hidden -p 8080:3000 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar --
+/bin/bash /webtop_stack.sh`, `LITEBOX_PROCESS_FORK=1`). Old binary reaches `NGINX_STARTED` at the
+identical log position (~6490 vs. new binary's ~6489/6504 across repeated runs), then panics
+8 times with the exact routine `tuple.unwrap()` at `smoltcp-0.12.0/src/socket/tcp.rs:2126`,
+each time respawned by `NGINX_SUPERVISOR`'s retry loop -- it never reaches a stable stalled state,
+it crash-loops. New (post-fix) binary reaches the same point with zero panics and then
+stalls indefinitely with no further `[s]` markers -- a state the old binary structurally cannot
+reach (it crashes first). Conclusion: the `Network::socket_set` fix is genuinely correct
+(the panic is gone, confirmed 2/2 A/B runs) and has newly EXPOSED a different, previously-unreachable
+stall -- not introduced a regression in the sense of breaking something that worked before,
+but uncovering something that was always broken further downstream, previously masked by the
+routine crash.
+
+**Root-cause progress (same pass): one real, scoped bug found, fixed, and verified NOT to be
+the (sole) cause of the reproduced stall.** Live symbolized `cdb -pv` (`-y <dir-with-matching-
+correctly-named .pdb>` -- the debug directory embeds the ORIGINAL build filename, so a renamed
+copy of the exe needs a same-named-as-original `.pdb` alongside it, not just a same-content one
+under any name, or symbol loading silently falls back to raw offsets) on the newest surviving
+guest fork-child after the stall found: one thread frozen (bit-identical RIP/stack across 3+
+independent re-attaches spanning real wall-clock minutes) deep in `Network::connect`'s
+`LocalPortAllocator::ephemeral_port`/`deallocate`, two more blocked in `RawMutex::block`
+(reached via a blocking `detached_pipe_read` and via a `Process` `Weak::drop`), while the
+process's TOTAL CPU time climbs continuously and substantially (measured 36s -> 70s -> 84s -> 103s+
+over about two real minutes) -- a genuine sustained CPU burn, not a clean idle block, but from a
+mechanism not fully localized to any single sampled thread (thread-churn and a `SafeZoneAllocator`
+spinlock livelock were both considered and NOT confirmed at this point in the investigation --
+both were later definitively REFUTED, see AGENTS.md's current entry for the real mechanism). The
+boot log separately showed `RawMutex::block_or_maybe_timeout: waiter queue full, falling back to
+polling` 4 times after `NGINX_STARTED` on the new binary and zero times on the old -- direct
+evidence that the `socket_set` sharing creates enough real cross-process lock contention to
+overflow the pre-existing fixed 32-slot `WaiterQueue` (`MAX_INLINE_WAITERS`, landed `1ba3c7a`,
+earlier the same day) for the first time in a real boot. Reading that fallback
+(`RawMutex::poll_until_value_changes`) found it had no dead-holder/orphan-recovery check at
+all, unlike every registered waiter on the same mutex (`try_recover_from_dead_holder`, checked
+every `LIVENESS_CHECK_INTERVAL`) -- a real, independent gap in the earlier `1ba3c7a` fix's
+coverage. Fixed (`e1d6e56`): factored the core liveness-probe-and-CAS-reset logic out into
+`try_recover_from_dead_holder_unregistered`, called periodically from
+`poll_until_value_changes` too. `cargo check` + full release build clean.
+
+**Re-tested against the SAME real workload after the fix, per this project's own standing
+practice -- the fix is real but does NOT resolve the reproduced stall.** A fourth full boot (fixed
+binary) reached `NGINX_STARTED` again, stalled again in the identical way (same frozen-thread/
+rising-CPU signature, confirmed live via `cdb` on the newest fork-child, CPU climbing 36s->103s+),
+and critically the "waiter queue full" warning never fired at all in this run -- proof this
+specific stall instance does not even go through the code path just fixed. The fix is correct and
+worth keeping (it closes a genuine, real defect that WILL matter whenever that queue does
+overflow), but it is not THE cause of this reproduction. Ruled out this pass: a thread-spawn
+storm (repeated `~` thread-ID listings taken seconds apart show a stable, unchanging 6-thread set,
+not churn); an obviously-broken/no-op `sleep` in the guest self-test loop (~21 fork-child
+respawn cycles observed in the stalled window is roughly consistent with the script's own coded
+~1-4s-per-iteration cadence, not obviously anomalous).
+
+## Track B step 4 (`beyond_stdio` gate relaxation) -- full pass detail (attribution: lanmower)
+
+Drained from AGENTS.md's "Track B step 4" section once its pickup list was superseded by later
+passes (see AGENTS.md's current Track B entry for what's still open).
+
+**Not an fd-gate problem.** Xvfb/dbus-daemon are excluded from cross-process fork by comm
+name, unconditionally, before fd complexity is even measured (`try_cross_process_fork`,
+`process.rs` ~2560) -- already tried unconditionally-relaxed in an earlier pass and measured NOT
+to work, because even a successfully-forked Xvfb would be unreachable from sibling fork children
+while `Network`'s `socket_set` stayed unshared. The fd-count gate itself is already mostly relaxed
+(pipes/files/eventfds carry, cloexec drops harmlessly); only `socket`/`unix-socket`/`pty`/`epoll`/
+`netlink` remain uncarriable. The `Network` shared-arena redesign, not a gate tweak, was the real
+next unlock -- confirmed live this pass (`curl 127.0.0.1:8080` got `http_code=000`, TCP accepted
+then torn down, no HTTP). `socket_set`'s own half of that redesign has since landed -- a same-day
+re-test after the fix saw a materially different signature (TCP connects, request sent, times out
+waiting for a response, no more instant teardown) but still no working HTTP response at that point.
+
+**Two fresh boots, evidence refining prior hypotheses**: Xvfb genuinely signal-killed, not just
+the `xset` probe. `DBUS_FAILED`'s real cause: `/tmp/empty: No such file or directory`, a
+writable-layer cross-child-visibility gap, not root-caused. New panic class:
+`litebox/src/event/wait.rs:224` `ThreadHandle::interrupt`'s `unreachable!()` on garbage state
+(e.g. `UNKNOWN(994464581)`), dozens per boot, NOT debugger-confirmed -- do not patch blind,
+root-cause first. Both boots reached `DE_LAUNCHED` 2/2.
+
+**One real bug found and FIXED**: `spawn_cross_process_fork_child`'s `inherited_eventfds` param
+was received but never forwarded to `spawn_process_fork_child` -- fixed, same encode shape as
+`inherited_files`. Not yet observed exercised live (this workload's eligible forks never happen
+to hold a non-cloexec eventfd at their `fork()` call site).
+
 ## Shared-kernel-heap selective-routing correction -- session detail (attribution: lanmower)
 
 Full evidence trail for the "Shared kernel heap -- SELECTIVE-ROUTING CORRECTION LANDED 2026-09-17"
