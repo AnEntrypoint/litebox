@@ -261,29 +261,25 @@ Decisive live proof: parent registers one key immediately before `spawn_cross_pr
 a second strictly after; child observes both right after its own `build()` -- proves genuine live
 sharing, not a snapshot.
 
-## Cross-process fork: eight registry/pointer fixes converging on one root pattern, 2026-09-17
+## Cross-process fork: twelve registry/pointer/lock fixes converging on one root pattern, 2026-09-17
 
-All eight are the SAME defect class -- a raw `Arc`/`Box` pointer captured once by whichever process
+Root pattern (instances 1-11): a raw `Arc`/`Box` pointer captured once by whichever process
 constructs `GlobalState` first, frozen into cross-process-shared bytes, meaningless (or dangling) in
 every other attaching process -- found and fixed one layer deeper each time, isolated with a minimal
 `-Z --oci-image debian:stable-slim -- /bin/bash -c 'mkdir ...'` repro under `LITEBOX_PROCESS_FORK=1`.
-The fix pattern throughout: either shadow the field on `GlobalStateHandle` with a fresh per-process
-copy (correct when the state genuinely doesn't need cross-process visibility), or rebind it in place
-via a locking accessor (`net_lock`/`pipes()`) when it does. In order found: **1-2** `litebox: LiteBox
-<Platform>` (root-caused the load-scaling `overflowed its stack` crash, 122+ occurrences) and
-`proc_self_info`/`pts_registry` -- shadowed on `GlobalStateHandle`. **3-5** `elf_patch_cache`/
-`exec_ranges_cache`/`segment_scan_cache` (`BTreeMap`s, real panics/hangs in ELF-load) -- shadowed,
-same pattern; plus an unrelated same-session fix, trampoline placement (`maybe_patch_exec_segment`'s
-`MAP_FIXED_NOREPLACE` fallback could land a trampoline outside JMP rel32 range; fixed via
-`Task::probe_nearby_trampoline_slot`). **6-7** `Network.litebox`/`Network.device` (real WER
-`0xc0000005` faults, `Descriptors::iter_mut`/`receive_ip_packet`) -- `Network` itself is genuinely
-shared, so these two fields are REBOUND via `Network::rebind_per_process_fields`, called from
-`GlobalStateHandle::net_lock`. **8** (this session) `RawMutex.waiters`/`Pipes.litebox` -- see below.
+Fix pattern: shadow the field on `GlobalStateHandle` with a fresh per-process copy (state that
+doesn't need cross-process visibility -- `litebox`, `proc_self_info`/`pts_registry`,
+`elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`, `futex_manager`), or rebind it in place
+via a locking accessor (state that IS genuinely meant to be shared -- `Network`'s two fields via
+`net_lock`, `Pipes.litebox` via `pipes()`), or (`RawMutex.waiters`, instance 9) replace a
+process-private-heap `Vec` with a fixed-slot pointer-free array. Instance 12 (`net_lock`'s Mutex left
+permanently locked by an exiting fork-child process) is a DIFFERENT shape -- not a stale pointer, a
+lock-liveness gap -- see the section immediately below for full detail, still open.
 Does NOT close `XVFB_FAILED`/`DBUS_FAILED`; `pty_registry`/`flock_registry`/etc. remain real,
-still-open follow-on work. Full panic signatures, bisection transcripts and WER/symbolizer evidence
-per fix: archive.
+still-open follow-on work. Full panic signatures, bisection transcripts, WER/symbolizer evidence and
+per-fix detail: archive (`docs/AGENTS_ARCHIVE_2026-09-17.md`, newest entries at the bottom).
 
-## RawMutex lost-wakeup and Pipes stale-pointer -- BOTH FIXED 2026-09-17; FutexManager sharing gap found, NOT fixed
+## RawMutex lost-wakeup and Pipes stale-pointer -- BOTH FIXED 2026-09-17; FutexManager sharing gap FIXED; a NEW cross-process-fork lock-orphaning hang found, NOT fixed
 
 **A. `RawMutex::resolve_waiter_event` cross-process branch -- FIXED.** Was: `RawMutex.waiters:
 Mutex<Vec<WaiterRecord>>`'s `Vec` buffer is process-private-heap, so a `RawMutex` embedded in
@@ -306,21 +302,45 @@ is now interior-mutable (`litebox::sync::Mutex`-wrapped); `GlobalStateHandle::pi
 every access, same shape as `net_lock`. Live-verified: the same repro's `d1` now exits cleanly
 (`exiting with encoded status 0xc0de0000`) instead of crashing. Full mechanism: archive.
 
-**C. `FutexManager` cross-process sharing -- CONFIRMED live via `cdb -p`, NOT fixed, real design
-work needed.** With A and B both fixed, the identical repro still hangs one step later:
-`FutexManager::wake` -> `LoanList::extract_if` -> `RawMutex::block`, permanently blocked (second
-thread blocked the same way as A, via `do_clone`). Eleventh instance at the outer level
+**C. `FutexManager` cross-process sharing -- FIXED (`30d4608`).** With A and B both fixed, the
+identical repro still hung one step later: `FutexManager::wake` -> `LoanList::extract_if` ->
+`RawMutex::block`, permanently blocked (second thread blocked the same way as A, via
+`do_clone`/`with_fork_duplicate_claim_owner`). Eleventh instance at the outer level
 (`FutexManager.table: Box<[LoanList<...>; N]>` is process-private-heap), but `LoanList` itself is
 structurally deeper: entries are "allocated once by the caller, potentially on the stack" (its own
 doc comment) -- a `FutexEntry` a guest thread registers is commonly stack-allocated, which has NO
-"move it to the shared arena" fix (unlike every prior instance this session). Genuine cross-process
-futex sharing likely needs a different wait-registration mechanism entirely (a flat, fixed-slot,
-copy-not-borrow registry, or scoping cross-process futex support to `FUTEX_PRIVATE_FLAG`-only and
-falling back to thread-based fork otherwise) -- not attempted, needs its own investigation. Full
-mechanism and live evidence: archive.
+"move it to the shared arena" fix (unlike every prior instance this session): a stack address is
+fork-family-identical only for the ONE thread that actually called `fork()`, so any other thread's
+stack-resident entry, or lock state a non-forking thread held at fork time, is permanently
+unrecoverable garbage to every other process. Resolved the same way as `elf_patch_cache`/etc
+instead: `FutexManager`'s own pre-existing doc comment already scopes it to "private"
+(single-process) futexes only, so giving each process its own fresh `FutexManager` is the
+already-documented intended semantics, not a workaround -- `GlobalStateHandle` carries its own
+`Arc<FutexManager<Platform>>`, freshly constructed once per process in `LinuxShimBuilder::build`,
+shadowing `GlobalState`'s (now removed) field. Live-verified: 10 sequential external `/bin/mkdir`
+cross-process forks now complete cleanly (`OK1..OK10` + a final marker), across two independent
+runs -- previously hung permanently partway through the loop.
+
+**D. NEW, found live immediately after C landed, NOT fixed: a genuinely-shared
+`litebox::sync::Mutex` (standing candidate: `GlobalStateHandle::net_lock`'s) is left permanently
+LOCKED once some cross-process-fork child that acquired it exits.** Twelfth instance, a different
+shape again -- not a stale pointer, a lock-liveness/ownership-recovery gap in a mutex correctly,
+genuinely meant to be one shared instance for the whole fork family. With C fixed, the 10-mkdir
+repro now completes (`OK1..OK10`/`ALL_DONE` all print), but the runner's own host process then never
+calls `std::process::exit` afterward: confirmed genuine (not slow) via two `cdb -p` snapshots ~18s
+apart, same thread at the identical PC both times (`run::{closure#0}` -> litebox `Mutex::
+lock_contended` -> `RawMutex::block` -> `WaitForSingleObjectEx`), with no other thread in the
+process plausibly holding it (all others idle-waiting or, for the NAT-gateway thread, independently
+confirmed progressing, not stuck). Confirmed specific to `LITEBOX_PROCESS_FORK=1` (thread-based fork
+exits clean in <10s on the identical repro). Leading hypothesis: a fork child's `std::process::exit`
+-equivalent teardown (`main.rs`'s own doc comment: `ExitProcess` skips C-runtime `atexit` handlers)
+skipped a live `MutexGuard::drop`, leaving `RawMutex.inner` stuck locked with no "owner died"
+recovery path. Candidate fixes and full cdb evidence, none attempted yet: archive.
 
 Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
-CLIMBING CPU) not re-investigated this pass -- still open, full detail: archive.
+CLIMBING CPU) not re-investigated this pass -- still open, full detail: archive. Distinct from D
+above (D's snapshots show flat CPU, no thread spinning -- a lock left locked forever, not a
+livelock).
 
 ## Closed — do not re-attempt without a genuinely new approach
 

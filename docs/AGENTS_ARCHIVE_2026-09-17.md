@@ -1441,3 +1441,76 @@ VALUES inline rather than pinning caller-owned memory, or explicitly scoping cro
 support out via FUTEX_PRIVATE_FLAG-only semantics and falling back to thread-based fork for anything
 that needs more) -- real design work, not a shadow-field patch, and guessing wrong here risks silent
 futex mis-wakes rather than a crash. Not attempted this session; needs its own investigation.
+
+## FutexManager/LoanList fix landed, and a twelfth instance found immediately after (new session pass)
+
+**Fixed** (`30d4608`): the eleventh-instance analysis above was correct, and the resolution is
+exactly the "scoping cross-process futex support out via FUTEX_PRIVATE_FLAG-only semantics" option
+it names -- `FutexManager`'s own pre-existing doc comment already says it "only supports 'private'
+futexes, since it assumes only a single process", so a fresh per-process `FutexManager` is the
+already-documented intended behavior, not a workaround. `GlobalStateHandle` now carries its own
+`Arc<FutexManager<Platform>>`, constructed fresh once per process in `LinuxShimBuilder::build`
+(same place/shape as `elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`), shadowing the
+field removed from `GlobalState`. Every `self.global.futex_manager` call site in
+`litebox_shim_linux/src/syscalls/process.rs` needed no change (Rust field resolution tries the
+receiver's own concrete type before auto-`Deref`ing to `GlobalState`).
+
+Live proof: `-Z --oci-image debian:stable-slim -- /bin/bash -c 'for i in 1..10: mkdir -p /tmp/d$i &&
+echo OK$i; done; echo ALL_DONE'` under `LITEBOX_PROCESS_FORK=1` -- previously hung permanently
+partway through (confirmed via `cdb -p`, `FutexManager::wake` -> `LoanList::extract_if` ->
+`RawMutex::block`). With the fix: `OK1` through `OK10` and `ALL_DONE` all print, across two
+independent runs.
+
+**Twelfth instance, found immediately after, NOT fixed.** With the loop now completing, the RUNNER
+process itself never calls `std::process::exit` afterward -- confirmed genuine (not slow) via two
+`cdb -p` snapshots ~18s apart with the SAME thread parked at the IDENTICAL PC both times:
+
+```
+ntdll!NtWaitForSingleObject
+KERNELBASE!WaitForSingleObjectEx
+litebox_platform_windows_userland (inlined wait-on-Event code, symbol misattributed to a nearby
+  exported symbol due to release-build inlining)
+litebox_platform_windows_userland!RawMutex::block+0xf
+litebox::sync::mutex::Mutex<SpinEnabledRawMutex, WindowsUserland>::lock_contended
+litebox_runner_linux_on_windows_userland!run::{closure#0}   <- the initial guest thread `main` joins
+```
+
+Of the other ~12 threads in the process at both snapshots, none is the lock holder: two background
+service threads legitimately sleeping/polling (`fault_terminate_watchdog_thread_body`,
+`control_server::spawn_header_publisher`), several idle Windows threadpool/IOCP workers, the
+dedicated NAT-gateway thread (`NatGateway::new`'s spawned `loop { state.drive(); sleep(5ms) }`)
+alternately captured mid-allocation once and in a paced `high_precision_sleep` the second time (i.e.
+genuinely progressing, not stuck -- this thread is a red herring, not the blocker), and the
+presenter control-server's named-pipe accept loop permanently parked in `GetOverlappedResult`
+waiting for a presenter client that never connects in this headless run (expected/normal). Confirmed
+specific to `LITEBOX_PROCESS_FORK=1`: the byte-identical repro with the default thread-based fork
+instead exits cleanly (`EXIT CODE: 0`) in under 10 seconds every time.
+
+Leading hypothesis, NOT yet confirmed by directly inspecting the lock owner (ran out of session
+budget before getting there): a cross-process-fork CHILD process (each `mkdir` child ends its run via
+a `std::process::exit`-equivalent teardown -- `main.rs`'s own doc comment already notes `ExitProcess`
+does not run registered C-runtime `atexit` handlers) acquired a genuinely cross-process-shared
+`litebox::sync::Mutex` (standing candidate: `GlobalStateHandle::net_lock`'s, since
+`GatewayState`/`NatGateway`-adjacent frames dominate the surrounding stack context, though that
+specific thread was independently ruled out as the CURRENT blocker above -- it may still be what
+originally took the lock before exiting) and exited while still holding it, with no RAII
+`MutexGuard::drop` ever running to flip `RawMutex.inner` back to unlocked. A plain `AtomicU32` lock
+byte has no "owning process died, recover" semantics the way a real Windows kernel `Mutex` object
+would -- unlike instances A-C (and the eight before them), this is not a pointer-into-shared-bytes
+defect; it is a lock-liveness/ownership-recovery gap in a mutex that is correctly, genuinely meant to
+be one shared instance for the whole fork family.
+
+Candidate fixes, none attempted -- next session should read the actual code before picking one:
+1. Audit every cross-process-fork child exit path for a live `MutexGuard` still on the stack at the
+   moment `std::process::exit` runs, and make sure it is dropped (unlocked) first.
+2. Give `RawMutex` orphan-detection: record the owning pid alongside `inner`, and have a blocked
+   waiter that times out (or a periodic check) call `OpenProcess` on the recorded owner and forcibly
+   clear the lock if that process is gone -- the same "owner process may legitimately be gone"
+   handling `resolve_waiter_event` (fix A above) already has for the WAIT QUEUE, just needed for the
+   LOCK BYTE itself too.
+3. Narrower, if it is confirmed to be specifically `net_lock()`: stop routing final child-process
+   network teardown through the shared `Network` Mutex at all.
+
+Repro/evidence used this pass (not preserved as files -- rerun `.wfgy`'s cheap repro under
+`LITEBOX_PROCESS_FORK=1` with a 3-10 iteration `mkdir` loop, `cdb -p <pid> -c "~*k; qd"` twice ~15-20s
+apart on the surviving `litebox_runner_linux_on_windows_userland.exe` PID after `ALL_DONE` prints).
