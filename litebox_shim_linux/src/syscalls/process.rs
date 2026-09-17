@@ -2961,15 +2961,70 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags,
         );
 
-        self.global
+        // Diagnostic-only (`LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1`), a no-op otherwise: the
+        // decisive live cross-process `GlobalState` create-vs-attach proof (2026-09-17
+        // create-vs-attach pass), mirroring the earlier isolated `SharedArc<SharedArcProbeData>`
+        // proof's shape but against a REAL `GlobalState` field. Bumps `next_thread_id` by a large,
+        // unmistakable sentinel delta immediately before spawning the child -- if the child's own
+        // `GlobalState` (built moments later, in a genuinely separate process, by
+        // `LinuxShimBuilder::build`'s create-vs-attach branch) is truly the SAME live instance
+        // (not a frozen pre-fork snapshot nor an independent copy), it observes THIS bumped value,
+        // not the pristine `next_thread_id: 2.into()` a fresh `GlobalState` would start from. See
+        // `litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe`'s own
+        // matching read for the other half of this proof.
+        if self
+            .global
             .platform
-            .spawn_cross_process_fork_child(
-                &relocations,
-                full_gprs,
-                inherited_pipes,
-                inherited_files,
+            .env_flag("LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE")
+        {
+            const SENTINEL_DELTA: i32 = 100_000;
+            let before = self
+                .global
+                .next_thread_id
+                .load(core::sync::atomic::Ordering::SeqCst);
+            let after = self
+                .global
+                .next_thread_id
+                .fetch_add(SENTINEL_DELTA, core::sync::atomic::Ordering::SeqCst)
+                + SENTINEL_DELTA;
+            litebox_util_log::warn!(
+                before:% = before, after:% = after;
+                "[globalstate_share_probe] parent bumped next_thread_id immediately before spawning cross-process fork child"
+            );
+        }
+
+        let handle = self.global.platform.spawn_cross_process_fork_child(
+            &relocations,
+            full_gprs,
+            inherited_pipes,
+            inherited_files,
             inherited_eventfds,
-            )
+        );
+
+        // Second half of the same probe: a THIRD write, strictly AFTER `spawn_cross_process_fork_
+        // child` has returned (i.e. after the child process has already been created) -- matching
+        // the exact "parent registers something, fork happens, parent registers ANOTHER thing,
+        // forked-before-that child should still observe it" shape, distinguishing genuine live
+        // sharing from a frozen fork-time snapshot, not just from an independent copy (the
+        // pre-spawn bump above already rules out the latter on its own).
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE")
+        {
+            const POST_SPAWN_SENTINEL_DELTA: i32 = 7;
+            let after = self
+                .global
+                .next_thread_id
+                .fetch_add(POST_SPAWN_SENTINEL_DELTA, core::sync::atomic::Ordering::SeqCst)
+                + POST_SPAWN_SENTINEL_DELTA;
+            litebox_util_log::warn!(
+                after:% = after;
+                "[globalstate_share_probe] parent bumped next_thread_id AGAIN, strictly after spawn_cross_process_fork_child returned"
+            );
+        }
+
+        handle
     }
 
     #[cfg(not(target_arch = "x86_64"))]

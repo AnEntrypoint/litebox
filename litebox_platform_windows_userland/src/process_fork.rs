@@ -1684,10 +1684,19 @@ pub fn spawn_process_fork_child(
     // through a private, non-shared allocation instead of this shared heap, before it is safe as
     // the default for a real multi-exec workload -- neither exists yet. Full evidence, exact repro,
     // and the precise byte accounting: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
-    let shared_heap_export = std::env::var_os("LITEBOX_DIAG_SHARED_HEAP_INHERIT")
-        .is_some()
-        .then(crate::shared_kernel_heap_export_for_fork_child)
-        .flatten();
+    // Unconditional (no longer gated behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT`, unlike this
+    // export's original Track B step 4/5 purpose): that gate existed solely because routing
+    // EVERY ordinary host-heap allocation through this shared section regressed real multi-exec
+    // boots into commit-limit exhaustion (see `SLAB_ALLOC`'s doc comment) -- a regression that no
+    // longer applies, since that routing was fully reverted and ordinary `GlobalAlloc` traffic
+    // no longer touches `init_shared_kernel_heap` at all. The ONLY remaining consumer of this
+    // export is the small, bounded `shared_kernel_arena_alloc`/`SharedArc<T>` mechanism backing
+    // `litebox::platform::SharedKernelStateProvider`'s real create-vs-attach protocol for
+    // `LiteBoxX`/`GlobalState` (2026-09-17 pass) -- every cross-process-fork child needs this
+    // section mapped at the SAME address as its ancestor for that protocol's `attach` calls to
+    // have anything to attach to, so exporting it is now simply part of spawning such a child at
+    // all, not an opt-in diagnostic.
+    let shared_heap_export = crate::shared_kernel_heap_export_for_fork_child();
     if let Some((section_handle, base)) = shared_heap_export {
         child_env.push((
             crate::FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR,
@@ -1709,6 +1718,23 @@ pub fn spawn_process_fork_child(
                 crate::FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR,
                 arc_offset.to_string(),
             ));
+        }
+        // Real (non-diagnostic) `SharedKernelStateProvider` create-vs-attach export: hand the
+        // child THIS process's own `SharedArc` offset for every slot this process has actually
+        // CREATED (never one it only attached to -- an attaching child re-exports the SAME
+        // offset it itself attached with, transitively propagating the root's allocation down
+        // an arbitrarily deep fork tree, exactly like `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s own
+        // "content-sharing composes transitively across nested forks" property above).
+        for slot in [
+            litebox::platform::SharedKernelStateSlot::LiteBoxX,
+            litebox::platform::SharedKernelStateSlot::ShimGlobalState,
+        ] {
+            if let Some(offset) = crate::shared_kernel_state_offset(slot) {
+                child_env.push((
+                    crate::shared_kernel_state_slot_env_var(slot),
+                    offset.to_string(),
+                ));
+            }
         }
     }
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {

@@ -320,6 +320,113 @@ pub trait RawMutex: Send + Sync + 'static {
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
 }
 
+/// Identifies WHICH shared-kernel-singleton a [`SharedKernelStateProvider::create_shared_kernel_state`]/
+/// [`SharedKernelStateProvider::attach_shared_kernel_state`] call is for.
+///
+/// A platform backing this with a small, fixed number of named/env-var-carried offsets (today:
+/// `litebox_platform_windows_userland`'s `SharedArc<T>`, one arena allocation per slot) needs a
+/// stable identifier distinguishing [`crate::litebox::LiteBox`]'s own `LiteBoxX` singleton from
+/// `litebox_shim_linux::GlobalState`'s, since a bare generic `T` carries no runtime identity and
+/// both are created once per process, at two different call sites, at two different times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedKernelStateSlot {
+    /// [`crate::litebox::LiteBox`]'s own inner `LiteBoxX`.
+    LiteBoxX,
+    /// `litebox_shim_linux::GlobalState`'s inner singleton.
+    ShimGlobalState,
+}
+
+/// A provider of "create-or-attach" shared kernel state across a cross-process fork family.
+///
+/// LiteBox's top-level "kernel singleton" structures ([`crate::litebox::LiteBox`]'s own inner
+/// `LiteBoxX`, `litebox_shim_linux::GlobalState`) are ordinary `Arc`-refcounted, process-local
+/// heap allocations by default -- correct on a host with a real `fork()` (a native `fork()`
+/// already gives every child an automatic, correct COPY of the parent's whole address space,
+/// including that `Arc`'s backing allocation -- see [`ForkChildVerificationProvider`]'s own doc
+/// comment for the analogous point about stale pointers staying valid there) and correct on a
+/// host with no cross-process fork mechanism at all.
+///
+/// A platform whose emulated `fork()` can produce a genuinely SEPARATE OS process (Windows
+/// userland's `LITEBOX_PROCESS_FORK=1` cross-process fork child; see
+/// `litebox_platform_windows_userland`'s `SharedArc<T>`) cannot rely on that automatic
+/// copy-on-fork behavior: each such process independently calls `LiteBox::new`/
+/// `LinuxShimBuilder::build` at its own startup and would otherwise construct its OWN, private
+/// singleton -- a "consistent fixed-address placement, independent copy" that merely LOOKS
+/// shared (both processes may even land the allocation at the identical address) but silently
+/// diverges the moment either side mutates it, since each is really backed by separate physical
+/// pages. This trait lets such a platform instead hand every process in the fork family a
+/// genuinely shared, live instance: the root process of a fork family (never itself a fork
+/// child) creates it via [`Self::create_shared_kernel_state`]; an attach-eligible descendant
+/// instead calls [`Self::attach_shared_kernel_state`] to obtain its own independently-owned
+/// handle to the SAME live allocation the root created.
+///
+/// Mirrors [`ForkChildVerificationProvider`]'s "correct-but-unverified by default" shape: every
+/// method here has a default that is always sound. [`Self::is_shared_kernel_state_attach_child`]
+/// defaults to `false`, so a platform that never overrides anything here gets EXACTLY today's
+/// existing "always construct fresh" behavior -- unconditionally correct on every platform with
+/// real per-process OS isolation (a native `fork()`, or no cross-process fork at all); see
+/// [`ForkChildVerificationProvider`]'s own doc comment for why platforms with genuine
+/// per-guest-process OS-level memory isolation need no analogous mechanism at all.
+pub trait SharedKernelStateProvider {
+    /// An owning handle to a `T` that may be backed by genuinely shared cross-process memory on
+    /// a platform that supports it. Mirrors `alloc::sync::Arc<T>`'s ergonomics (`Clone`,
+    /// `Deref`) exactly, so call sites need no further changes beyond swapping which type
+    /// constructs the handle.
+    type Handle<T: Send + Sync + 'static>: Clone + core::ops::Deref<Target = T> + Send + Sync + 'static;
+
+    /// Whether the CALLING process should [`Self::attach_shared_kernel_state`] to an ancestor's
+    /// already-existing shared allocation for `slot`, rather than
+    /// [`Self::create_shared_kernel_state`] a fresh one of its own.
+    ///
+    /// `true` only for a cross-process fork child on a platform that both supports shared
+    /// attach AND has confirmed (by whatever platform-specific means, e.g. an inherited
+    /// fixed-base shared section landing at the expected address) that it can actually reach
+    /// the SAME allocation its ancestor created. Every other case -- the very first process in
+    /// a fork family, an ordinary same-process (thread-based) fork child, any process on a
+    /// platform with a real native `fork()` (which already gives correct, isolated per-process
+    /// state for free, see [`Self::create_shared_kernel_state`]'s own doc comment), or an
+    /// attach attempt that could not be confirmed safe -- returns `false`, the default.
+    #[expect(unused_variables, reason = "slot unused by the correct-but-unshared default")]
+    fn is_shared_kernel_state_attach_child(&self, slot: SharedKernelStateSlot) -> bool {
+        false
+    }
+
+    /// Places `value` into a fresh, potentially cross-process-shared allocation for `slot` and
+    /// returns an owning handle to it. Called by whichever process is the root of its fork
+    /// family (or by every process, on a platform that never returns `true` from
+    /// [`Self::is_shared_kernel_state_attach_child`] -- the default implementation here is an
+    /// ordinary `Arc::new`, correct on every such platform and identical to what every call site
+    /// did before this trait existed).
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T>;
+
+    /// Attaches to an existing `slot` allocation a prior [`Self::create_shared_kernel_state`]
+    /// call (in an ancestor process) produced, per whatever platform-specific handoff mechanism
+    /// that platform already uses to carry its shared-memory section from parent to child. Only
+    /// ever called when [`Self::is_shared_kernel_state_attach_child`] returned `true` for this
+    /// SAME `slot`, in the SAME fork family.
+    ///
+    /// Returns `None` if the attach cannot be completed (e.g. no handoff value was found for
+    /// this slot, or the shared section was not actually inherited) -- callers must fall back to
+    /// [`Self::create_shared_kernel_state`] exactly as if this process were not an attach child
+    /// at all. The default implementation always returns `None`, matching platforms that never
+    /// return `true` from [`Self::is_shared_kernel_state_attach_child`] (they never call this at
+    /// all).
+    #[expect(
+        unused_variables,
+        reason = "slot unused by the always-None correct-but-unshared default"
+    )]
+    fn attach_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: SharedKernelStateSlot,
+    ) -> Option<Self::Handle<T>> {
+        None
+    }
+}
+
 /// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
 /// value).
 #[derive(Debug)]

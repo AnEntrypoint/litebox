@@ -18,6 +18,24 @@ use crate::{
 /// For now, we assume that synchronization support (and the ability to exit) is a hard requirement
 /// in every LiteBox based system. In the future, this may be relaxed. Other requirements from the
 /// platform are dependent on the particular subsystems.
+///
+/// **2026-09-17 create-vs-attach note**: `x` stays a plain `Arc` here, deliberately NOT threaded
+/// through `litebox::platform::SharedKernelStateProvider` the way
+/// `litebox_shim_linux::GlobalState` now is. This crate is the shared, platform-generic base for
+/// EVERY runner (Linux native, macOS, optee, snp, lvbs, and the Windows userland cross-process
+/// fork target), and adding that bound to `LiteBox<Platform>` itself forces `Platform:
+/// SharedKernelStateProvider` onto every generic `Platform: RawSyncPrimitivesProvider` bound
+/// throughout this crate that touches `LiteBox` (confirmed live: over 200 downstream
+/// `cargo check` errors across `fs/`, `mm/`, `net/`, `pipes.rs`, ...) -- a correctness-neutral
+/// (every real platform already implements the trivial default) but very wide mechanical
+/// propagation, out of scope for this pass. `LiteBoxX::descriptors` (the shim-wide open-file-
+/// description table) therefore stays a per-process-fresh `Arc` even for a
+/// `LITEBOX_PROCESS_FORK=1` cross-process fork child; `litebox_shim_linux::GlobalState` (its own,
+/// far more contained crate) is where the real create-vs-attach wiring landed instead -- see that
+/// crate's `GlobalStateHandle`/`LinuxShimBuilder::build` for the live mechanism and
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md` for the full scoping rationale. The
+/// `SharedKernelStateProvider`/`SharedKernelStateSlot::LiteBoxX` trait/slot already exist in
+/// `crate::platform` for a follow-up pass that wants to take on this wider propagation.
 pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }

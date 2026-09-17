@@ -31,7 +31,7 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    FileFd, GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut,
+    FileFd, GlobalState, GlobalStateHandle, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -255,7 +255,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         self,
         task: &Task<Platform, FS>,
         backlog: u16,
-        global: &Arc<GlobalState<Platform, FS>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<UnixListenStream<Platform, FS>, (Self, Errno)> {
         let Some(addr) = self.addr else {
             return Err((self, Errno::EINVAL));
@@ -414,7 +414,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
 /// Represents a Unix stream socket in listening state.
 struct UnixListenStream<Platform: ShimPlatform, FS: ShimFS> {
     backlog: Arc<Backlog<Platform, FS>>,
-    global: Arc<GlobalState<Platform, FS>>,
+    global: GlobalStateHandle<Platform, FS>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixListenStream<Platform, FS> {
@@ -898,7 +898,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         &self,
         task: &Task<Platform, FS>,
         backlog: u16,
-        global: &Arc<GlobalState<Platform, FS>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
@@ -1257,7 +1257,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
 
 /// The local address of a bound datagram socket together with the global state
 /// it was registered in (used to deregister the address on drop).
-type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, Arc<GlobalState<Platform, FS>>);
+type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, GlobalStateHandle<Platform, FS>);
 
 struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     /// The local address this socket is bound to, if any.
@@ -1613,7 +1613,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         &self,
         task: &Task<Platform, FS>,
         backlog: u16,
-        global: &Arc<GlobalState<Platform, FS>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.listen(task, backlog, global),

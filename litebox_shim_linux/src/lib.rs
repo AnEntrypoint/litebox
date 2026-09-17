@@ -93,6 +93,7 @@ pub trait ShimPlatform:
     + litebox::platform::CrngProvider
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ForkChildVerificationProvider
+    + litebox::platform::SharedKernelStateProvider
     + litebox::platform::StdioProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
@@ -113,6 +114,7 @@ impl<T> ShimPlatform for T where
         + litebox::platform::CrngProvider
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ForkChildVerificationProvider
+        + litebox::platform::SharedKernelStateProvider
         + litebox::platform::StdioProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
@@ -468,46 +470,91 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     }
 
     /// Build the shim.
+    ///
+    /// **Create-vs-attach** (`litebox::platform::SharedKernelStateProvider`,
+    /// `SharedKernelStateSlot::ShimGlobalState`): the very first process in a fork family (or any
+    /// process on a platform that never returns `true` from
+    /// `is_shared_kernel_state_attach_child`) constructs a fresh `GlobalState` exactly as this
+    /// always did before this trait existed. A cross-process-fork child that this platform has
+    /// confirmed can reach its ancestor's existing allocation instead ATTACHES to that SAME live
+    /// instance -- so every field below (`futex_manager`, `pipes`, `net`, the pid/tid allocator,
+    /// every registry) becomes genuinely, live, shared across the whole fork family, not merely
+    /// placed at a consistent address. See `Self::proc_self_info`'s own doc comment for the one
+    /// known exception.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new(&self.litebox);
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-        let global = Arc::new(GlobalState {
-            platform: self.platform,
-            bootstrap_process: once_cell::race::OnceBox::new(),
-            futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
-            net: litebox::sync::Mutex::new(net),
-            boot_time: self.platform.now(),
-            next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
-            unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
-            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            segment_scan_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            exec_ranges_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
-            next_shmid: core::sync::atomic::AtomicI32::new(1),
-            flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
-            pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            next_pty_id: core::sync::atomic::AtomicU32::new(0),
-            fifo_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
-            next_memfd_id: core::sync::atomic::AtomicU64::new(0),
-            drm: syscalls::drm::DrmSubsystem::new(),
-            evdev: syscalls::evdev::EvdevSubsystem::new(),
-            memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            proc_self_info: self.proc_self_info,
-            pts_registry: self.pts_registry,
-        });
-        LinuxShim(global)
+        let platform = self.platform;
+        let slot = litebox::platform::SharedKernelStateSlot::ShimGlobalState;
+        let inner = platform
+            .is_shared_kernel_state_attach_child(slot)
+            .then(|| platform.attach_shared_kernel_state(slot))
+            .flatten()
+            .unwrap_or_else(|| {
+                let mut net = Network::new(&self.litebox);
+                net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+                platform.create_shared_kernel_state(
+                    slot,
+                    GlobalState {
+                        platform: self.platform,
+                        bootstrap_process: once_cell::race::OnceBox::new(),
+                        futex_manager: FutexManager::new(),
+                        pipes: Pipes::new(&self.litebox),
+                        net: litebox::sync::Mutex::new(net),
+                        boot_time: self.platform.now(),
+                        next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+                        litebox: self.litebox,
+                        unix_addr_table: litebox::sync::RwLock::new(
+                            syscalls::unix::UnixAddrTable::new(),
+                        ),
+                        elf_patch_cache: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        segment_scan_cache: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        exec_ranges_cache: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
+                        next_shmid: core::sync::atomic::AtomicI32::new(1),
+                        flock_registry: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+                        pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+                        daemon_pty_masters: litebox::sync::RwLock::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        next_pty_id: core::sync::atomic::AtomicU32::new(0),
+                        fifo_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+                        next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
+                        next_memfd_id: core::sync::atomic::AtomicU64::new(0),
+                        drm: syscalls::drm::DrmSubsystem::new(),
+                        evdev: syscalls::evdev::EvdevSubsystem::new(),
+                        memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                        shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                        proc_self_info: self.proc_self_info,
+                        pts_registry: self.pts_registry,
+                    },
+                )
+            });
+        LinuxShim(GlobalStateHandle(inner))
     }
 }
 
-pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
+pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(GlobalStateHandle<Platform, FS>);
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// Diagnostic-only read of the shim-wide `next_thread_id` allocator (`LITEBOX_DIAG_
+    /// GLOBALSTATE_SHARE_PROBE=1`'s decisive live cross-process `GlobalState` create-vs-attach
+    /// proof -- see `syscalls::process::Task::try_cross_process_fork`'s matching parent-side
+    /// bump). Not gated itself (a plain atomic load is cheap and side-effect-free); the
+    /// PARENT-side bump this is meant to observe is what's gated.
+    pub fn diag_next_thread_id(&self) -> i32 {
+        self.0
+            .next_thread_id
+            .load(core::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Build a `WaitContext` for host-side pipe I/O.
     ///
     /// A pump thread has no `Task` to borrow one from, and `WaitState` is deliberately per-thread
@@ -2604,6 +2651,30 @@ struct FifoPipe<Platform: ShimPlatform> {
     writer: litebox::pipes::PipeFd<Platform>,
 }
 
+/// Cross-process-shareable handle to the shim-wide [`GlobalState`] singleton (see
+/// `litebox::platform::SharedKernelStateProvider`'s own doc comment) -- mirrors
+/// `litebox::LiteBox`'s own `Platform::Handle<LiteBoxX<Platform>>`-wrapping shape exactly, as a
+/// named type since `GlobalState` is referenced across many files/fields in this crate the same
+/// way `Arc<GlobalState<Platform, FS>>` was referenced before this trait existed -- every such
+/// call site needs no further change: `Clone`/`Deref` below give it identical ergonomics.
+pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS>(
+    Platform::Handle<GlobalState<Platform, FS>>,
+);
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
+    fn clone(&self) -> Self {
+        GlobalStateHandle(self.0.clone())
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> core::ops::Deref for GlobalStateHandle<Platform, FS> {
+    type Target = GlobalState<Platform, FS>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
@@ -2758,12 +2829,29 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `Task::load_program`). Shared (not owned solely by the mounted backend) so
     /// `Task::load_program` -- which has no reference to the mounted `Backend` trait object, only
     /// to `GlobalState` -- can update it.
+    ///
+    /// **Known cross-process-attach gap (2026-09-17 create-vs-attach pass):** unlike every other
+    /// field of this struct, this one is NOT genuinely re-shared by a `SharedKernelStateSlot::
+    /// ShimGlobalState` attach -- `LinuxShimBuilder::default_fs`/`default_fs_multi_layer` mounts
+    /// the `/proc/self` backend with a clone of `LinuxShimBuilder::proc_self_info` BEFORE
+    /// `build()` (and hence before the create-vs-attach decision) ever runs, so an attaching
+    /// cross-process-fork child's own mounted backend keeps pointing at ITS OWN fresh,
+    /// per-process table while `GlobalState.proc_self_info` (reachable through the attached
+    /// handle) is whichever one the ORIGINAL creator made. Not yet fixed: doing so needs
+    /// `LinuxShimBuilder::new`'s own construction of this field to attach-or-create BEFORE
+    /// `default_fs` mounts it, i.e. two more `SharedKernelStateSlot` variants threaded one layer
+    /// earlier than `GlobalState` itself. Left as scoped follow-up (`docs/AGENTS_ARCHIVE_2026-09-17.md`'s
+    /// create-vs-attach section) -- does not affect the decisive `next_thread_id`-style
+    /// live-sharing proof, which uses a field with no such pre-`build()` entanglement.
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
     /// The mirror `litebox::fs::devices::PtsDevices` reads to answer `open("/dev/pts",
     /// O_DIRECTORY)` and its `getdents64` listing. `syscalls::pty::GlobalState::ptmx_open`/
     /// `ptmx_closed`/`attach_pty_stdio` update this alongside `pty_registry` at each of their
     /// three call sites -- see `PtsRegistry`'s own doc comment for why this can't just BE
     /// `pty_registry` shared directly.
+    ///
+    /// **Same known cross-process-attach gap as [`Self::proc_self_info`]** (same root cause:
+    /// mounted by `default_fs`/`default_fs_multi_layer` before `build()`'s attach decision).
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 }
 
@@ -2832,7 +2920,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
+    global: GlobalStateHandle<Platform, FS>,
     /// Unlike [`Self::pid`]/[`Self::thread`]/[`Self::signals`], this does NOT need to become
     /// replaceable for a native fork() child: it describes THIS HOST THREAD's own park/wake
     /// primitives, which a real `fork()` leaves completely unaffected -- only which GUEST
@@ -2897,12 +2985,9 @@ mod test_utils {
     extern crate std;
     use super::*;
 
-    impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+    impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(
-            self: Arc<Self>,
-            fs: alloc::sync::Arc<FS>,
-        ) -> Task<Platform, FS> {
+        pub(crate) fn new_test_task(self, fs: alloc::sync::Arc<FS>) -> Task<Platform, FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);

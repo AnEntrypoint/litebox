@@ -189,6 +189,21 @@ impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
 }
 
+/// Test-only platform: no cross-process fork exists here at all, so this is the trivial,
+/// always-correct "construct fresh" default -- see
+/// [`crate::platform::SharedKernelStateProvider`]'s own doc comment.
+impl crate::platform::SharedKernelStateProvider for MockPlatform {
+    type Handle<T: Send + Sync + 'static> = alloc::sync::Arc<T>;
+
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        _slot: crate::platform::SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T> {
+        alloc::sync::Arc::new(value)
+    }
+}
+
 impl IPInterfaceProvider for MockPlatform {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError> {
         self.ip_packets.write().unwrap().push_back(packet.into());

@@ -2074,6 +2074,22 @@ impl litebox::platform::TimerHandle for TimerHandle {
     }
 }
 
+/// Real Linux `fork()` already gives every guest process an automatic, correct, isolated COPY of
+/// the parent's whole address space (see [`litebox::platform::SharedKernelStateProvider`]'s own
+/// doc comment) -- so this is the trivial, always-correct "construct fresh" default: an ordinary
+/// `Arc::new`, identical to what every call site did before this trait existed.
+impl litebox::platform::SharedKernelStateProvider for LinuxUserland {
+    type Handle<T: Send + Sync + 'static> = std::sync::Arc<T>;
+
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        _slot: litebox::platform::SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T> {
+        std::sync::Arc::new(value)
+    }
+}
+
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 

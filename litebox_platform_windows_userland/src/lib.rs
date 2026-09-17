@@ -9939,6 +9939,7 @@ fn init_shared_kernel_heap() {
             // live shared cursor back to the base, handing out addresses the creator's own heap
             // objects already occupy.
             SHARED_KERNEL_HEAP_STATE.store(SHARED_KERNEL_HEAP_STATE_READY, Ordering::Release);
+            SHARED_KERNEL_HEAP_INHERITED_CHILD.store(true, Ordering::Release);
             shared_kernel_heap_probe_child_read(landed, true);
             return;
         }
@@ -10491,7 +10492,7 @@ struct SharedArcInner<T> {
 /// that has the SAME arena section mapped at the SAME fixed address (i.e. reached
 /// [`init_shared_kernel_heap`]'s inherited-section branch) then calls [`SharedArc::attach`] with
 /// that plain `usize` offset to obtain its own independently-owned handle to the SAME `T`.
-struct SharedArc<T> {
+pub struct SharedArc<T> {
     ptr: core::ptr::NonNull<SharedArcInner<T>>,
 }
 
@@ -10640,6 +10641,159 @@ impl<T> Drop for SharedArc<T> {
         unsafe { self.ptr.as_ref() }
             .strong
             .fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// This process's own `SharedArc::arena_offset` for [`litebox::platform::SharedKernelStateSlot::
+/// LiteBoxX`]/[`ShimGlobalState`](litebox::platform::SharedKernelStateSlot::ShimGlobalState),
+/// set the one time [`WindowsUserland::create_shared_kernel_state`] actually creates (never
+/// attaches) an allocation for that slot -- read by `process_fork::spawn_process_fork_child` when
+/// exporting this process's shared kernel state to a cross-process-fork child, the real
+/// (non-diagnostic) counterpart to [`FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR`]'s isolated
+/// probe struct. `usize::MAX` means "not yet created in this process" (never a valid offset:
+/// [`shared_kernel_arena_alloc`] never hands out the arena's own final byte as a fresh
+/// allocation's base).
+static SHARED_LITEBOXX_OFFSET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+static SHARED_GLOBALSTATE_OFFSET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set by [`init_shared_kernel_heap`]'s inherited-section success path: `true` exactly when THIS
+/// process mapped the SAME shared-kernel-heap section at the SAME address as an ancestor (i.e.
+/// this process is a `LITEBOX_PROCESS_FORK=1` cross-process-fork child that can genuinely reach
+/// its ancestor's `SharedArc` allocations), `false` for the process that first creates the
+/// section (including the root of a fork family) and for the fixed-address-collision fallback
+/// path (heap-functional but NOT content-shared -- see [`SHARED_KERNEL_HEAP_ACTUAL_BASE`]'s doc
+/// comment). Backs [`WindowsUserland::is_shared_kernel_state_attach_child`].
+static SHARED_KERNEL_HEAP_INHERITED_CHILD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Real (non-diagnostic) per-[`litebox::platform::SharedKernelStateSlot`] env var carrying the
+/// DECIMAL [`SharedArc::arena_offset`] a cross-process-fork PARENT exports for that slot --
+/// siblings of [`FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR`], read the same allocation-free way.
+pub(crate) fn shared_kernel_state_slot_env_var(
+    slot: litebox::platform::SharedKernelStateSlot,
+) -> &'static str {
+    match slot {
+        litebox::platform::SharedKernelStateSlot::LiteBoxX => {
+            "LITEBOX_INTERNAL_FORK_CHILD_LITEBOXX_OFFSET"
+        }
+        litebox::platform::SharedKernelStateSlot::ShimGlobalState => {
+            "LITEBOX_INTERNAL_FORK_CHILD_GLOBALSTATE_OFFSET"
+        }
+    }
+}
+
+/// This process's own `arena_offset` for `slot`, if [`WindowsUserland::create_shared_kernel_state`]
+/// has created one (never true for a process that only ever ATTACHED to an ancestor's). Read by
+/// `process_fork::spawn_process_fork_child` to decide what (if anything) to export to a
+/// cross-process-fork child for this slot.
+pub(crate) fn shared_kernel_state_offset(
+    slot: litebox::platform::SharedKernelStateSlot,
+) -> Option<usize> {
+    let cell = match slot {
+        litebox::platform::SharedKernelStateSlot::LiteBoxX => &SHARED_LITEBOXX_OFFSET,
+        litebox::platform::SharedKernelStateSlot::ShimGlobalState => &SHARED_GLOBALSTATE_OFFSET,
+    };
+    let v = cell.load(Ordering::Acquire);
+    (v != usize::MAX).then_some(v)
+}
+
+/// Real (non-diagnostic, production) counterpart to the isolated `SharedArc<SharedArcProbeData>`
+/// proof above (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`): backs `litebox::platform::
+/// SharedKernelStateProvider` for `litebox::LiteBox`'s own `LiteBoxX` singleton and
+/// `litebox_shim_linux::GlobalState`, so a `LITEBOX_PROCESS_FORK=1` cross-process fork child can
+/// genuinely ATTACH to its ancestor's live instance instead of every process in the fork family
+/// independently constructing its own private copy -- see that trait's own doc comment for the
+/// full "consistent address, independent copy" problem this closes, and
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md`'s create-vs-attach section for the live cross-process
+/// proof this was verified with.
+impl litebox::platform::SharedKernelStateProvider for WindowsUserland {
+    type Handle<T: Send + Sync + 'static> = SharedArc<T>;
+
+    fn is_shared_kernel_state_attach_child(
+        &self,
+        _slot: litebox::platform::SharedKernelStateSlot,
+    ) -> bool {
+        // `SHARED_KERNEL_HEAP_INHERITED_CHILD` is only ever SET from inside
+        // `init_shared_kernel_heap`'s inherited-section branch -- and nothing implicitly calls
+        // that function anymore for an ordinary process (ordinary `GlobalAlloc` traffic no longer
+        // touches it at all post-revert, see `SLAB_ALLOC`'s doc comment), so without this explicit
+        // call here, THIS check would always observe the untouched, default `false` on a fresh
+        // cross-process-fork child that has made no other shared-arena call yet -- silently
+        // forcing every process onto the "construct fresh" branch regardless of whether it could
+        // actually have attached. Idempotent and safe to call from ordinary, non-reentrant code
+        // (this is a `LiteBox::new`/`LinuxShimBuilder::build`-time call, not one reachable from
+        // `WindowsUserland::alloc` itself), exactly like `shared_arc_probe_child_attach`'s own
+        // identical call.
+        if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+            init_shared_kernel_heap();
+        }
+        // Same boolean for every slot: a process either genuinely reached the inherited-section
+        // success path (and can therefore attach to ANY slot its ancestor created) or it did not
+        // (the process that creates the section in the first place, or one that fell back to a
+        // private, non-content-shared section) -- see `SHARED_KERNEL_HEAP_INHERITED_CHILD`'s own
+        // doc comment.
+        SHARED_KERNEL_HEAP_INHERITED_CHILD.load(Ordering::Acquire)
+    }
+
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: litebox::platform::SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T> {
+        let (arc, offset) =
+            SharedArc::new(value).expect("shared_kernel_state: arena_alloc failed (arena exhausted)");
+        let offset_cell = match slot {
+            litebox::platform::SharedKernelStateSlot::LiteBoxX => &SHARED_LITEBOXX_OFFSET,
+            litebox::platform::SharedKernelStateSlot::ShimGlobalState => &SHARED_GLOBALSTATE_OFFSET,
+        };
+        offset_cell.store(offset, Ordering::Release);
+        arc
+    }
+
+    fn attach_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: litebox::platform::SharedKernelStateSlot,
+    ) -> Option<Self::Handle<T>> {
+        if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
+            init_shared_kernel_heap();
+        }
+        if !SHARED_KERNEL_HEAP_INHERITED_CHILD.load(Ordering::Acquire) {
+            return None;
+        }
+        // Allocation-free reads (see `raw_env_read_usize`'s own doc comment for why: this can run
+        // before the process's own heap is otherwise usable) -- byte-string literals rather than
+        // `shared_kernel_state_slot_env_var`'s `&str` (used only by the export/write side in
+        // `process_fork.rs`, which already has an allocator available) to avoid building a
+        // NUL-terminated buffer at runtime here.
+        let offset = match slot {
+            litebox::platform::SharedKernelStateSlot::LiteBoxX => {
+                raw_env_read_usize(b"LITEBOX_INTERNAL_FORK_CHILD_LITEBOXX_OFFSET\0")
+            }
+            litebox::platform::SharedKernelStateSlot::ShimGlobalState => {
+                raw_env_read_usize(b"LITEBOX_INTERNAL_FORK_CHILD_GLOBALSTATE_OFFSET\0")
+            }
+        }?;
+        // Recorded (not just used locally) so THIS process can re-export the SAME offset to its
+        // OWN fork children later, exactly like `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s own
+        // "content-sharing composes transitively across nested forks" property -- without this,
+        // an attach-only process (never a creator) would have nothing for
+        // `shared_kernel_state_offset` to return, breaking propagation past one fork generation.
+        let offset_cell = match slot {
+            litebox::platform::SharedKernelStateSlot::LiteBoxX => &SHARED_LITEBOXX_OFFSET,
+            litebox::platform::SharedKernelStateSlot::ShimGlobalState => &SHARED_GLOBALSTATE_OFFSET,
+        };
+        offset_cell.store(offset, Ordering::Release);
+        // SAFETY: `is_shared_kernel_state_attach_child` (checked via
+        // `SHARED_KERNEL_HEAP_INHERITED_CHILD` above) confirmed this process mapped the SAME
+        // shared-kernel-heap section at the SAME address as its ancestor, and `offset` was read
+        // from the env var the ancestor's own `create_shared_kernel_state` populated for this
+        // EXACT slot right before spawning this process (see
+        // `process_fork::spawn_process_fork_child`) -- the caller's own generic `T` is the same
+        // monomorphization in both processes since a cross-process-fork child re-execs the
+        // identical binary.
+        Some(unsafe { SharedArc::<T>::attach(offset) })
     }
 }
 

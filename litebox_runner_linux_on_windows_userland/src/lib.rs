@@ -1356,6 +1356,19 @@ pub fn diag_process_fork_globalstate_probe() {
     eprintln!(
         "[process_fork_diag] globalstate-probe (child): GlobalState constructed successfully, no crash/hang/error"
     );
+    // Diagnostic-only (`LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE=1`), the child-side half of the
+    // decisive live cross-process `GlobalState` create-vs-attach proof -- see
+    // `litebox_shim_linux::syscalls::process::Task::try_cross_process_fork`'s matching parent-side
+    // sentinel bump for the full mechanism. A genuinely ATTACHED `GlobalState` observes the
+    // parent's post-bump value here; an independently-constructed one shows the pristine
+    // `next_thread_id: 2.into()` a fresh `GlobalState` always starts from -- the two are never
+    // confusable (the bump delta is 100,000).
+    if std::env::var_os("LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE").is_some() {
+        eprintln!(
+            "[globalstate_share_probe] child observed next_thread_id={}",
+            shim.diag_next_thread_id()
+        );
+    }
     diag_elapsed!("GlobalState built, handing off to vmem-adopt-probe");
 
     diag_process_fork_vmem_adopt_probe(platform, &shim, fs, t0);

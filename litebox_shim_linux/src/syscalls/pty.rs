@@ -47,7 +47,7 @@ use litebox::{
 use litebox_common_linux::{Termios, Winsize, errno::Errno};
 
 use crate::{
-    GlobalState, ShimPlatform, Task,
+    GlobalStateHandle, ShimPlatform, Task,
     channel::{Channel, ReadEnd, WriteEnd},
 };
 
@@ -596,7 +596,7 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> Task<Platform, FS> {
     /// Returns the new pty's id (`TIOCGPTN`'s value) on success.
     pub(crate) fn attach_pty_stdio(
         &self,
-        global: &Arc<GlobalState<Platform, FS>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<u32, Errno> {
         let id = global.next_pty_id.fetch_add(1, Ordering::Relaxed);
         let (master, slave) = new_pty_pair(&global.litebox, id);

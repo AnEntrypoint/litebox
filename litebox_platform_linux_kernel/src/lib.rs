@@ -137,6 +137,23 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
 }
 
+/// This platform's `fork()`-equivalent gives every guest process an automatic, correct, isolated
+/// COPY of the parent's whole address space (see
+/// [`litebox::platform::SharedKernelStateProvider`]'s own doc comment) -- so this is the
+/// trivial, always-correct "construct fresh" default: an ordinary `Arc::new`, identical to what
+/// every call site did before this trait existed.
+impl<Host: HostInterface> litebox::platform::SharedKernelStateProvider for LinuxKernel<Host> {
+    type Handle<T: Send + Sync + 'static> = alloc::sync::Arc<T>;
+
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        _slot: litebox::platform::SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T> {
+        alloc::sync::Arc::new(value)
+    }
+}
+
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,

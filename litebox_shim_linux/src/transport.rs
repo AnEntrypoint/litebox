@@ -12,7 +12,7 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -24,7 +24,7 @@ trait DropGuard: Send + Sync {
 
 /// Concrete, generic implementation of [`DropGuard`].
 struct SocketDropGuard<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
+    global: GlobalStateHandle<Platform, FS>,
     sockfd: SocketFd<Platform>,
 }
 
@@ -63,7 +63,7 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
-        global: Arc<GlobalState<Platform, FS>>,
+        global: GlobalStateHandle<Platform, FS>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
