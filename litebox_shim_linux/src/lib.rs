@@ -477,10 +477,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// `is_shared_kernel_state_attach_child`) constructs a fresh `GlobalState` exactly as this
     /// always did before this trait existed. A cross-process-fork child that this platform has
     /// confirmed can reach its ancestor's existing allocation instead ATTACHES to that SAME live
-    /// instance -- so every field below (`futex_manager`, `pipes`, `net`, the pid/tid allocator,
-    /// every registry) becomes genuinely, live, shared across the whole fork family, not merely
-    /// placed at a consistent address. See `Self::proc_self_info`'s own doc comment for the one
-    /// known exception.
+    /// instance -- so every field below (`pipes`, `net`, the pid/tid allocator, every registry)
+    /// becomes genuinely, live, shared across the whole fork family, not merely placed at a
+    /// consistent address. See `Self::proc_self_info`'s own doc comment for the other known
+    /// exceptions, and `GlobalStateHandle`'s own doc comment's "Sixth instance" section for
+    /// `futex_manager`, which is deliberately NOT part of `GlobalState` at all.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
         let platform = self.platform;
         let slot = litebox::platform::SharedKernelStateSlot::ShimGlobalState;
@@ -510,6 +511,18 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let my_segment_scan_cache = Arc::new(litebox::sync::Mutex::new(
             alloc::collections::BTreeMap::new(),
         ));
+        // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
+        // comment's "Sixth instance of the SAME defect" section. Unlike `Network`/`Pipes` (which
+        // are genuinely, correctly meant to be one shared instance for the whole fork family and
+        // so are REBOUND in place, not shadowed), `FutexManager`'s own doc comment already scopes
+        // it to "private" (single-process) futexes only -- so a fresh per-process instance is not
+        // a workaround, it IS the intended semantics (`FUTEX_PRIVATE_FLAG`-equivalent), and it
+        // sidesteps the deeper structural problem entirely: `LoanList`'s entries are pinned on the
+        // WAITING THREAD'S OWN STACK by design (its own doc comment), so they can never be safely
+        // relocated into cross-process-shared memory or referenced from a different process at all
+        // -- unlike a `BTreeMap`, there is no "move the collection into the shared arena" fix
+        // available here even in principle.
+        let my_futex_manager = Arc::new(FutexManager::new());
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -522,7 +535,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                     GlobalState {
                         platform: self.platform,
                         bootstrap_process: once_cell::race::OnceBox::new(),
-                        futex_manager: FutexManager::new(),
                         pipes: Pipes::new(&self.litebox),
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
@@ -560,6 +572,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             elf_patch_cache: my_elf_patch_cache,
             exec_ranges_cache: my_exec_ranges_cache,
             segment_scan_cache: my_segment_scan_cache,
+            futex_manager: my_futex_manager,
         })
     }
 }
@@ -2777,6 +2790,29 @@ struct FifoPipe<Platform: ShimPlatform> {
 /// mkdir repro stopped panicking but started HANGING instead (host CPU climbing, zero new log
 /// output) -- see `GlobalState`'s own removed-field note for `segment_scan_cache` for why a
 /// corrupted `BTreeMap` can hang instead of panicking. Fixed the identical way.
+///
+/// # Sixth instance of the SAME defect, different underlying shape: `futex_manager`
+///
+/// Live-diagnosed 2026-09-17 via two `cdb -p` snapshots 20s apart with identical stacks (confirmed
+/// genuine hang, not slow progress): with the fifth instance above and the separate `RawMutex`/
+/// `Pipes` fixes all landed, the same repro hung one step later inside `FutexManager::wake` ->
+/// `LoanList::extract_if` -> `RawMutex::block`. `FutexManager.table: Box<[LoanList<...>; 256]>` is
+/// process-private-heap exactly like `elf_patch_cache` et al. above, but `LoanList` itself is
+/// structurally deeper, not just "a `BTreeMap` whose nodes happen to be on the wrong heap": its own
+/// doc comment says entries are "allocated once by the caller, potentially on the stack", and
+/// `FutexManager::wait` does exactly that (`pin!(LoanListEntry::new(...))` on the waiting guest
+/// thread's own stack). A stack address is fork-family-address-identical only for the ONE thread
+/// that actually called `fork()`; any OTHER thread's stack-resident entry, or lock state a
+/// non-forking thread held at fork time, becomes permanently unrecoverable garbage to every other
+/// process in the family -- classic post-fork "the lock's owner doesn't exist here" deadlock, not a
+/// relocatable-pointer bug. There is no "move it into the shared arena" fix available even in
+/// principle. Resolved the same way as `elf_patch_cache`: `FutexManager`'s own pre-existing doc
+/// comment already scopes it to "private" (single-process) futexes only ("this only supports
+/// 'private' futexes, since it assumes only a single process"), so giving each process in the fork
+/// family its own fresh `FutexManager` is not a workaround, it is the already-documented intended
+/// semantics -- `GlobalStateHandle` carries its own, always-freshly-constructed `futex_manager`
+/// field, shadowing `GlobalState`'s (now removed) field for every existing
+/// `self.global.futex_manager` call site with no further change.
 pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     inner: Platform::Handle<GlobalState<Platform, FS>>,
     litebox: litebox::LiteBox<Platform>,
@@ -2785,6 +2821,7 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     elf_patch_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>>,
     exec_ranges_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>>,
     segment_scan_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>>,
+    futex_manager: Arc<FutexManager<Platform>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -2797,6 +2834,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             elf_patch_cache: self.elf_patch_cache.clone(),
             exec_ranges_cache: self.exec_ranges_cache.clone(),
             segment_scan_cache: self.segment_scan_cache.clone(),
+            futex_manager: self.futex_manager.clone(),
         }
     }
 }
@@ -2858,8 +2896,17 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     // `STATUS_STACK_OVERFLOW`. Every reader of "the shim-wide `LiteBox`" instead goes through
     // `GlobalStateHandle`'s own separate, always-locally-valid `litebox` field (see its doc
     // comment) -- do not re-add a field with this name here.
-    /// The futex manager for handling futex operations.
-    futex_manager: FutexManager<Platform>,
+    // NOTE: this struct deliberately has NO `futex_manager` field -- SIXTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment (`litebox`/`proc_self_info`/`pts_registry`/`elf_patch_cache`/etc), live-diagnosed
+    // 2026-09-17 via `cdb -p`: a hang inside `FutexManager::wake` -> `LoanList::extract_if` ->
+    // `RawMutex::block`. `FutexManager` itself already only supports `FUTEX_PRIVATE_FLAG`-style
+    // per-process futexes (see its own doc comment), and `LoanList` entries are pinned on the
+    // WAITING THREAD'S OWN STACK by design, so there is no way to relocate them into shared memory
+    // even in principle -- unlike `Network`/`Pipes`, this one genuinely cannot be rebound, only
+    // kept per-process. `GlobalStateHandle` carries its own, always-freshly-constructed
+    // `futex_manager` field instead (populated once per process in `LinuxShimBuilder::build`,
+    // attach or create alike) -- do not re-add a field with this name here.
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
     /// The network subsystem.
