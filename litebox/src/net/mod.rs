@@ -440,8 +440,39 @@ where
     /// construction time to the CALLING process's own, always-correct equivalent.
     ///
     /// `Network`'s smoltcp `socket_set`/`interface`/`closing_in_background`/`queued_for_closure`
-    /// are genuinely, correctly shared across an entire cross-process-fork family -- one virtual
-    /// NIC for the whole guest, same as `futex_manager`/`pipes`/every registry in `GlobalState`.
+    /// need to be genuinely shared across the whole cross-process-fork family for real guest
+    /// behavior (nginx's own reverse proxy to selkies over `127.0.0.1:8081` -- see
+    /// `docs/AGENTS_ARCHIVE_2026-09-17.md`'s working-browser-config section -- runs nginx and
+    /// selkies as TWO SEPARATE cross-process-fork children; that loopback `connect()` can only
+    /// resolve inside smoltcp's own virtual routing if both processes' smoltcp code walks the SAME
+    /// socket set, so per-process-shadowing `Network`, unlike `futex_manager`, would silently
+    /// break that specific already-working path rather than merely losing an optimization).
+    ///
+    /// **This claim was aspirational, not yet true of the implementation as of this note
+    /// (2026-09-17, later same day as the `litebox`/`device` fixes below): `socket_set` is
+    /// `smoltcp::iface::SocketSet::new(vec![])` -- an ordinary, growable, PRIVATE-per-process-heap
+    /// `Vec` -- and `interface`/`queued_for_closure: Vec<SocketFd<_>>`/`closing_in_background:
+    /// Vec<SocketHandle>` are the same shape. This is the SAME "GlobalState registry whose nodes
+    /// live on the ordinary private heap" defect class as `pty_registry`/`flock_registry`/etc
+    /// (this file's own "`SharedArc<T>`" section), just one level deeper (inside `Network`, which
+    /// is itself correctly arena-placed) and not yet fixed for these four fields -- ONLY `litebox`/
+    /// `device` below were. Live-caught 2026-09-17 (RUST_BACKTRACE=1, fourth pass after the
+    /// pipe-handle-leak fix): a cross-process-fork child's smoltcp `tcp::Socket::dispatch` ->
+    /// `seq_to_transmit` panicked `called Option::unwrap() on a None value` at
+    /// `smoltcp-0.12.0/src/socket/tcp.rs:2126:46` (`self.tuple.unwrap()`) -- a `Socket`'s own
+    /// `tuple` field reading back as `None` when a live connection's real state (in whichever
+    /// process actually created it) has it `Some`, exactly the stale-shared-pointer symptom this
+    /// whole doc comment otherwise describes. Recurred twice in one boot (non-fatal both times --
+    /// the crashing fork child dies, the s6-style supervisor respawns, and the boot reached a new
+    /// best point, `DE_LAUNCHED`, anyway) rather than being a hard blocker, which is why this is
+    /// recorded here rather than rushed into an unverified fix: correctly making `socket_set`'s
+    /// per-slot smoltcp `Socket`s (each with their own rx/tx ring buffers) shared-arena-native is a
+    /// genuinely large, separate redesign (fixed socket-count cap, fixed-size arena-backed buffers
+    /// per slot via smoltcp's own `Managed<'a, [u8]>` buffer constructors, same for `interface`'s
+    /// routes/neighbor-cache storage), not a two-field rebind like `litebox`/`device` below -- see
+    /// `docs/AGENTS_ARCHIVE_2026-09-17.md` for the live evidence and why a per-process-shadow
+    /// (this struct's OTHER established fix pattern) is the WRONG pattern here specifically.
+    ///
     /// Two of its OTHER fields are different in kind -- each is a raw pointer captured once by
     /// whichever process happened to construct `GlobalState`/`Network` first, then placed inline
     /// in the cross-process-shared arena; every OTHER process in the fork family, including every

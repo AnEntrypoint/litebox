@@ -1961,3 +1961,178 @@ the recovery path exactly twice.
 Previously-recorded allocator livelock (`SafeZoneAllocator::alloc`, `SpinMutex<ZoneAllocator>`,
 CLIMBING CPU) not re-investigated this pass -- still open. Distinct from D above (D's snapshots
 show flat CPU, no thread spinning -- a lock left locked forever, not a livelock).
+
+## Nginx-self-test pipe-EOF wedge -- full fix detail (fourth pass, attribution: lanmower)
+
+Full evidence trail for AGENTS.md's condensed "nginx-self-test pipe-EOF wedge" entry. Root
+cause: spawn_process_fork_child's CreateProcessW calls (process_fork.rs) used plain
+bInheritHandles=TRUE, which inherits EVERY currently-inheritable handle open anywhere in the
+spawning process into the new child -- not just the ones that call intended. A sibling
+cross-process-fork child's own bridge-pipe child end (marked inheritable in
+create_inheritable_child_pipe, only closed after ITS OWN spawn's CreateProcessW returns) is
+open and inheritable during that whole window, so any OTHER CreateProcessW(bInheritHandles=
+TRUE) call from the same process racing inside that window silently duplicates it too -- keeping
+the pipe's underlying kernel object alive after its real writer exits, so the reader never sees
+EOF. Fix (process_fork.rs, spawn_suspended_impl): switched from broad bInheritHandles=TRUE
+to PROC_THREAD_ATTRIBUTE_HANDLE_LIST (STARTUPINFOEXW + Initialize/UpdateProcThreadAttribute
+List), an explicit per-call handle allow-list (each child's own bridge-pipe ends + the
+shared-heap section handle + its own wired stdio handles) -- matches real fork()+exec()
+semantics (child gets exactly the fds it should) and is immune to whatever else is concurrently
+marked inheritable elsewhere in the process. spawn_suspended/spawn_suspended_forcing_handle_
+inheritance both thread extra_inheritable_handles through; spawn_process_fork_child builds
+the list from child_pipe_handles + the shared-heap handle. Live-verified: a real
+.wfgy/webtop_stack.sh boot under LITEBOX_PROCESS_FORK=1 no longer hangs at the self-test --
+NGINX_SELFTEST_FAILED (a real, non-hanging result) now prints after the bounded 20s retry
+window, and the boot continues (SELKIES_LAUNCHED_LAST, SELKIES_BIND_WATCHDOG_STARTED, dozens
+more task-resume-probe/pipe-pump cycles completing cleanly) -- previously this wedged forever,
+confirmed stuck 65s+ with zero log growth in the prior (third) pass. XVFB_FAILED/DBUS_FAILED
+this same (third) run were tentatively attributed to low host memory (~2.75GB free) -- refuted by
+the fifth pass, see AGENTS.md's current entry and the fifth-pass section below.
+
+## Fifth pass (2026-09-17, RUST_BACKTRACE=1 boot) -- full evidence, attribution: lanmower
+
+Invocation: host env LITEBOX_PROCESS_FORK=1, LITEBOX_LOG=warn,litebox_platform_windows_
+userland::fork_verify=error, RUST_BACKTRACE=1; target/release/litebox_runner_linux_on_
+windows_userland.exe --gui=hidden -p 8081:8081 --env GLIBC_TUNABLES=glibc.malloc.tcache_count=
+0:glibc.malloc.mxfast=0 --oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from
+.wfgy/webtop_seed.tar -- /bin/bash /webtop_stack.sh. Host RAM: ~3.6GB free at start (healthier
+than the ~2.75GB third pass), degrading to ~1.9GB by the time the run was stopped (26 accumulated
+orphaned fork-child processes the crashed/still-running top-level left behind -- same
+non-teardown behavior noted in earlier passes, still not investigated further).
+
+Symbolizing the previously-recorded rip=0x7ff630c77dd0/module_base=0x7ff630a90000/
+rva=0x1e7dd0 against target/release/litebox_runner_linux_on_windows_userland.exe (llvm-
+symbolizer 22.1.8 from scoop install llvm, at C:\Users\user\scoop\apps\llvm\22.1.8\bin\
+llvm-symbolizer.exe, --obj=<exe> --relative-address --demangle --inlines 0x1e7dd0) resolved to
+the exact monomorphized shape of syscalls::mm::ExecRangesCache (mm.rs:378) --
+BTreeMap<(u64,u64), Arc<Vec<Range<u64>>>>::insert_recursing. But git log -p -S
+"exec_ranges_cache" shows commit 34129ed ("Fix cross-process-fork corrupted-BTreeMap crashes
+in elf_patch_cache, exec_ranges_cache, segment_scan_cache", 13:35:51) already shadowed this field
+per-process on GlobalStateHandle -- HOURS before a270ccc (17:40:51), the commit this same
+day's fourth pass built against. git status confirmed lib.rs carries no uncommitted changes,
+so the running binary already had this fix. Checked all six remaining registries' types for a
+byte-identical monomorphization (Rust/LLVM can fold/misattribute identical-layout generic
+instantiations): pty_registry (BTreeMap<u32, PtyFd<_>>, 4-byte key -- no match),
+daemon_pty_masters (same, no match), fifo_registry (BTreeMap<(usize,usize), FifoPipe<_>>,
+value is two PipeFds not one pointer -- no match), sysv_shm (BTreeMap<i32,SysvShmSegment>
+plus BTreeMap<i32,i32>, neither matches), shared_files/memfds
+(BTreeMap<(usize,usize),MemfdEntry<_>>, value is handle+size+bool, not one pointer -- no
+match), flock_registry (BTreeMap<(usize,usize), Arc<FlockFile<_>>>, file.rs:299) --
+16-byte key + single 8-byte Arc pointer value, IDENTICAL layout to ExecRangesCache's
+(u64,u64)+Arc<Vec<Range<u64>>>. Strong ICF/COMDAT-folding candidate, but not proceeded with
+once live re-testing showed a different, real, reproducing panic instead (below) -- flock_
+registry's own cross-process correctness (it IS supposed to be genuinely shared, real Linux
+flock() contends across the whole process tree) remains open, unconfirmed by a live repro this
+pass, and NOT fixed.
+
+Re-ran with RUST_BACKTRACE=1 (set as a host env var before the top-level runner process starts
+-- spawn_process_fork_child's child_env construction, process_fork.rs:1585-1605, already
+copies the parent's OWN environment for anything not explicitly listed there, per its own comment
+at child_env's declaration, so RUST_BACKTRACE needed no code change to propagate into every
+fork child). Log: .wfgy/boot_backtrace_run1.log (CRLF, UTF-8 BOM; grep -a needed, plain
+grep/grep -c silently returned 0 matches on lines that visibly matched in tail output --
+worth remembering for the next session).
+
+Milestones reached, in order: NGINX_CONFIGURED -> NGINX_STARTED -> (native-thread stack
+overflow, thread '<unknown>' (4984) has overflowed its stack, non-fatal, boot continued) ->
+NGINX_SELFTEST_FAILED -> XVFB_FAILED -> (second stack overflow, tid 904) -> DBUS_FAILED ->
+PATCH_OUTPUT_BEGIN/SELKIES_BACKPRESSURE_PATCH_STAGE_DONE/PATCH_MARKER_CHECK ->
+SELKIES_LAUNCHED_LAST -> SELKIES_SUPERVISOR: attempt=1 exited rc=2 -- respawning -> (smoltcp
+panic #1, tid 2184) -> SELKIES_BIND_WATCHDOG_STARTED -> (guest fatal signal: Signal(11),
+comm= a 16-byte-padded name resolving to "ldconfig", the SAME pre-existing/already-tracked
+guest crash noted in earlier passes) -> SELKIES_PORT_UP curl_exit=137 -> SK_TAIL_BEGIN ->
+DE_LAUNCHED (image startwm.sh) -- new best milestone, past every previous pass's stopping
+point -> SELKIES_SUPERVISOR: attempt=2 exited rc=137 -- respawning -> (smoltcp panic #2, tid
+15772, byte-identical location/message to panic #1) -> run stopped here (host RAM had fallen to
+~1.9GB with 26 accumulated processes; stopped deliberately to avoid a resource-pressure-confounded
+read rather than let it run further degraded).
+
+Both smoltcp panics, byte-identical location and message:
+smoltcp-0.12.0/src/socket/tcp.rs:2126:46, called Option::unwrap() on a None value, inside
+<smoltcp::socket::tcp::Socket>::seq_to_transmit, reached via Socket::dispatch ->
+Interface::socket_egress::<litebox::net::phy::Device<WindowsUserland>> ->
+<Interface>::poll::<Device<WindowsUserland>> -> <Network<WindowsUserland>>::
+internal_perform_platform_interaction -> ...ThreadProvider::with_fork_duplicate_claim_owner.
+
+tcp.rs:2126 is self.tuple.unwrap().local.addr inside seq_to_transmit, called only from
+dispatch(), which smoltcp's own state machine normally only reaches once a socket's tuple is
+set (i.e. past Closed/before full teardown) -- a None here means the Socket's real,
+live-in-some-process state is being read back as zeroed/garbage in a DIFFERENT (attaching)
+process. litebox::net::Network<Platform> (litebox/src/net/mod.rs:60-82) has NINE fields;
+GlobalStateHandle::net_lock() (litebox_shim_linux/src/lib.rs:2865-2871) only rebinds TWO
+(litebox, device) per-process before handing out the lock guard, per Network::
+rebind_per_process_fields's own (now-corrected) doc comment. The other seven: socket_set
+(smoltcp::iface::SocketSet<'static>, constructed SocketSet::new(vec![]), mod.rs:134 --
+ordinary heap Vec), interface (smoltcp::iface::Interface, owns its own routes/neighbor-cache
+storage, also heap-backed), queued_for_closure (Vec<SocketFd<Platform>>), closing_in_
+background (Vec<SocketHandle>) (all Vec-backed), plus zero_time/local_port_allocator/
+platform_interaction (not checked closely this pass, no evidence implicating them). All four
+Vec-backed fields are the SAME "GlobalState registry whose nodes live on the ordinary private
+heap" defect class as every other fix today, just one level deeper (inside Network, which is
+itself correctly arena-placed via SharedArc) and never yet addressed.
+
+Why per-process-shadowing (futex_manager's pattern) is the WRONG fix here, unlike the six
+registries: AGENTS.md's "A real desktop renders in a browser" section documents the actual
+working browser config as nginx reverse-proxying to selkies over 127.0.0.1:8081, with --publish
+tunnelling /websockets. Under LITEBOX_PROCESS_FORK=1, nginx and selkies are separate guest
+processes -- separate cross-process-fork children, separate Windows processes. nginx's own
+connect() to 127.0.0.1:8081 can only resolve to selkies' listening socket if BOTH processes'
+smoltcp code walks the SAME socket_set (smoltcp's virtual loopback routing has no other
+mechanism to find a peer's listening socket). A fresh, empty, per-process Network/socket_set
+would make that connect() fail outright (ECONNREFUSED, nothing listening in this process's own
+view) -- a functional regression on the one thing that's currently the whole session's own stated
+end goal, not merely a lost optimization (contrast futex_manager, whose OWN doc comment already
+scopes it to FUTEX_PRIVATE_FLAG-only semantics, so per-process was always correct there).
+
+The correct fix, not attempted this pass (real, separate, follow-on engineering, not a quick
+rebind): make socket_set's backing storage genuinely shared-arena-native. smoltcp's
+SocketSet::new() accepts anything Into<Managed<'a, [SocketStorage<'a>]>>, including a
+&'static mut [SocketStorage<'static>] slice -- if that slice is carved out of the SAME
+fixed-base shared_kernel_arena_alloc region SharedArc<T> already uses (same virtual address
+in every attaching process, no translation needed), the SocketSet's own top-level storage
+becomes safe. But each individual smoltcp::socket::tcp::Socket/udp::Socket placed in a slot
+ALSO owns its own rx/tx ring buffers, which smoltcp constructs via SocketBuffer::new() --
+currently presumably heap Vec<u8>-backed too (not checked this pass) but ALSO expressible via
+the same Managed<'a,[u8]> constructor with a &'static mut [u8] slice. A real fix needs: a
+fixed socket-count cap (smoltcp's SocketSet currently grows unbounded via Vec, no cap today),
+fixed-size arena-backed rx/tx buffers per slot (sized for the cap x per-socket buffer size, a
+one-time bounded arena reservation), and the same treatment for interface's own routes/
+neighbor-cache storage and for queued_for_closure/closing_in_background. Given the panics
+observed were NON-FATAL (crashing fork child dies, s6 supervisor respawns, boot reached a new
+best point DE_LAUNCHED regardless) this was judged real-but-not-blocking, and a rushed,
+unverified redesign of the actual working network path was judged higher-risk than leaving it
+correctly characterized for a dedicated follow-on pass.
+
+XVFB_FAILED evidence, verbatim from the log: /webtop_stack.sh: line 280:   147 Killed
+xset q > /dev/null 2>&1 immediately preceding [s] XVFB_FAILED. webtop_stack.sh's own wait
+loop (lines 274-280) polls for /tmp/.X11-unix/X${DISPLAY#:} via [ -S ... ] (a shell builtin,
+forks nothing) for up to 60s, THEN runs xset q exactly once -- that single xset invocation is
+what got killed (a fatal signal, not a clean nonzero exit), not a timeout in the wait loop itself.
+Xvfb/dbus-daemon (and anything they spawn, like xset) are refused cross-process-fork
+eligibility (own comm name -- see "Eligibility" in AGENTS.md), so they run the THREAD-based
+(relocating) fork path -- the ALREADY-DOCUMENTED, still-open ADVISORY-001 section 3N tcache/heap-
+corruption class (GLIBC_TUNABLES only partially mitigates it; docs/AGENTS_ARCHIVE_2026-09-16.md
+calls this "Track B territory, not a tunable-coverage gap"). This run's own webtop_stack.sh
+comments (lines 259-273) independently describe the SAME class hitting xset specifically in
+earlier sessions. Given the boot went on to reach SELKIES_PORT_UP/DE_LAUNCHED (which needs a
+genuinely working X display for selkies to capture from), XVFB_FAILED most likely means "the
+xset liveness probe itself crashed", not "Xvfb never came up" -- a false negative on the actual
+check, not evidence Xvfb is broken. Not re-investigated further this pass; real fix is the same
+Track B fixed-base-shared-heap work that would make Xvfb/dbus-daemon cross-process-fork-
+eligible in the first place, eliminating the thread-based path (and its corruption class) for
+them entirely.
+
+DBUS_FAILED was observed but not separately root-caused this pass (same thread-based-fork
+window, plausibly the same corruption class per dbus-launch's own documented SIGSEGV history in
+webtop_stack.sh's own comments at lines ~290-292) -- no direct "Killed"-style evidence line was
+captured for it this run; worth a dedicated look before assuming it's identical to XVFB_FAILED.
+
+Pickup for a future pass: (1) implement the socket_set/interface shared-arena-native redesign
+above, verify live by hammering a real cross-process nginx<->selkies loopback connection across
+several boots; (2) resolve flock_registry's own still-unconfirmed cross-process-BTreeMap
+correctness question (either a live repro that actually exercises flock() across a real fork,
+or a static-only fix under the same shared-arena-native pattern -- do not per-process-shadow it,
+real flock() must contend across the whole process tree); (3) push past DE_LAUNCHED toward a
+real browser/terminal/apps witness now that RAM is healthy again and both known crash classes are
+characterized -- host RAM recovers cleanly to ~4.7GB+ free after killing all litebox_runner/
+orphaned fork-child processes, confirmed this pass.

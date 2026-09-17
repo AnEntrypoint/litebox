@@ -107,48 +107,47 @@ symptom this investigation began from, genuinely not root-caused (`docs/track-b-
 `cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
 
 **The nginx-self-test pipe-EOF wedge (fourth pass, 2026-09-17) — CONFIRMED and FIXED.** Root
-cause: `spawn_process_fork_child`'s `CreateProcessW` calls (`process_fork.rs`) used plain
-`bInheritHandles=TRUE`, which inherits EVERY currently-inheritable handle open anywhere in the
-spawning process into the new child — not just the ones that call intended. A sibling
-cross-process-fork child's own bridge-pipe `child` end (marked inheritable in
-`create_inheritable_child_pipe`, only closed after ITS OWN spawn's `CreateProcessW` returns) is
-open and inheritable during that whole window, so any OTHER `CreateProcessW(bInheritHandles=
-TRUE)` call from the same process racing inside that window silently duplicates it too — keeping
-the pipe's underlying kernel object alive after its real writer exits, so the reader never sees
-EOF. Fix (`process_fork.rs`, `spawn_suspended_impl`): switched from broad `bInheritHandles=TRUE`
-to `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`STARTUPINFOEXW` + `Initialize/UpdateProcThreadAttribute
-List`), an explicit per-call handle allow-list (each child's own bridge-pipe ends + the
-shared-heap section handle + its own wired stdio handles) — matches real `fork()`+`exec()`
-semantics (child gets exactly the fds it should) and is immune to whatever else is concurrently
-marked inheritable elsewhere in the process. `spawn_suspended`/`spawn_suspended_forcing_handle_
-inheritance` both thread `extra_inheritable_handles` through; `spawn_process_fork_child` builds
-the list from `child_pipe_handles` + the shared-heap handle. **Live-verified**: a real
-`.wfgy/webtop_stack.sh` boot under `LITEBOX_PROCESS_FORK=1` no longer hangs at the self-test —
-`NGINX_SELFTEST_FAILED` (a real, non-hanging result) now prints after the bounded 20s retry
-window, and the boot continues (`SELKIES_LAUNCHED_LAST`, `SELKIES_BIND_WATCHDOG_STARTED`, dozens
-more `task-resume-probe`/pipe-pump cycles completing cleanly) — previously this wedged forever,
-confirmed stuck 65s+ with zero log growth in the prior (third) pass. `XVFB_FAILED`/`DBUS_FAILED`
-this same run are plausible low-host-memory fallout (run started at only ~2.75GB free, common
-in this session) rather than a new litebox defect — not re-investigated this pass.
+cause: broad `bInheritHandles=TRUE` on `spawn_process_fork_child`'s `CreateProcessW` calls leaked
+a sibling fork child's own inheritable bridge-pipe handle into unrelated children racing the same
+window, keeping the pipe's kernel object alive past its real writer's exit so the reader never
+saw EOF. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit per-call handle allow-list
+(`process_fork.rs`, `spawn_suspended_impl`). Live-verified fixed. Full mechanism: archive.
 
-**New blocker found immediately after (fourth pass, NOT fixed)**: a real Rust panic,
-`alloc::collections::btree::node.rs:1232: range end index 833 out of range for slice of length
-11`, in a forked child's `BTreeMap` (`is_in_guest=false` — host-side Rust code, not
-guest-emulated), crashes that thread/process and appears to be what stopped the top-level
-script's own forward progress this run (no further `[s]` milestones after
-`SELKIES_BIND_WATCHDOG_STARTED`). No backtrace was captured (`RUST_BACKTRACE=1` was not set).
-Consistent with — but not yet proven to be — the already-documented "GlobalState nested
-collections not actually shared" gap (`pty_registry`/`flock_registry`/`fifo_registry`/
-`sysv_shm`/`memfds`/`shared_files` still real, per-process-heap `BTreeMap`s under cross-process
-fork; see "`SharedArc<T>`" section below). Pickup: re-run with `RUST_BACKTRACE=1` exported into
-`child_env` (`spawn_process_fork_child`), or symbolize `rip=0x7ff630c77dd0`/`module_base=
-0x7ff630a90000`/`rva=0x1e7dd0` from this run's own log against this exact build's `.pdb`
-(`advisor/probes/symbolize_litebox_crash.py`) to identify which registry's `BTreeMap` this is
-before attempting a fix — do not guess which one. `XVFB_UP`/`DBUS_UP`/`DE_UP`/browser/terminal/
-apps NOT reached this pass. Host memory recovered cleanly (~6GB free after killing 23 orphaned
-fork-child processes the crashed top-level left behind — the top-level's own death does not tear
-down its cross-process-fork children, a separate observation, not investigated further this
-pass).
+**That BTreeMap panic — IDENTIFIED, NOT one of the six registries (fifth pass, 2026-09-17).**
+Symbolizing `rip=0x7ff630c77dd0`/`rva=0x1e7dd0` resolved to `ExecRangesCache`'s
+`insert_recursing` — already fixed hours earlier (`34129ed`, before `a270ccc`); almost certainly
+an ICF/COMDAT symbol collision with `flock_registry`'s byte-identical-layout type. Re-ran with
+`RUST_BACKTRACE=1` (host env var; `child_env` already inherits the parent's environment, no code
+change needed) instead of guessing further: the CURRENT live panic is neither hypothesis, nor any
+of the six registries — it's `litebox::net::Network`'s `socket_set`/`interface`/
+`queued_for_closure`/`closing_in_background` (`litebox/src/net/mod.rs`), still `Vec`-backed and
+NOT cross-process-safe despite `rebind_per_process_fields`'s prior doc comment claiming otherwise
+(corrected this pass) — only `litebox`/`device`, TWO of Network's nine fields, were ever actually
+rebound. Real panic, reproduced twice identically: `smoltcp-0.12.0/src/socket/tcp.rs:2126:46`,
+`Socket::seq_to_transmit`, `self.tuple.unwrap()` on a `None` — a live connection's real state
+reading back as garbage in an attaching process, same stale-cross-process-pointer symptom as
+every other fix today, one level deeper. **NOT a hard blocker**: the crashing fork child died,
+the s6 supervisor respawned it, and the boot reached `DE_LAUNCHED (image startwm.sh)` anyway — a
+new best point. **Deliberately NOT fixed this pass**: unlike the six registries, `Network` can't
+be safely per-process-shadowed — nginx and selkies are separate fork children that must see the
+SAME `socket_set` for smoltcp's virtual loopback `127.0.0.1:8081` routing to resolve (see "A real
+desktop renders in a browser" below); the correct fix is a shared-arena-native redesign (fixed
+socket-count cap, arena-backed rx/tx buffers), real separate follow-on work. Full evidence
+including the six-registry elimination and ICF reasoning: archive.
+
+**`XVFB_FAILED`/`DBUS_FAILED` — characterized, NOT primarily RAM pressure (fifth pass, healthy
+~3.6GB-free start).** Direct log evidence: `webtop_stack.sh: line 280: 147 Killed xset q >
+/dev/null 2>&1` immediately before `[s] XVFB_FAILED` — the liveness-check `xset` itself got
+killed (signal), not Xvfb failing to start. `Xvfb`/`dbus-daemon` (and anything they spawn) are
+refused cross-process-fork eligibility, so they run the THREAD-based path — the ALREADY-
+DOCUMENTED, still-open ADVISORY-001 §3N tcache/heap-corruption class that `GLIBC_TUNABLES` only partially
+mitigates ("Track B territory, not a tunable-coverage gap", `docs/AGENTS_ARCHIVE_2026-09-16.md`) —
+consistent with, not a new defect. Likely a FALSE NEGATIVE on Xvfb's actual health: the boot
+reached `SELKIES_PORT_UP`/`DE_LAUNCHED` afterward, which needs a real working X display for selkies
+to capture from, so `XVFB_FAILED` most likely means "the `xset` liveness probe crashed", not
+"Xvfb itself never started". Real fix is the same Track B step-3 fixed-base-shared-heap work that
+would let `Xvfb`/`dbus-daemon` themselves become cross-process-fork-eligible, eliminating the
+thread-based path (and its tcache corruption class) for them entirely — not attempted this pass.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
