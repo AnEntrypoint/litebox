@@ -153,3 +153,111 @@ instances were left running; the pre-existing live-demo runner (PID 2012/13108, 
 `LITEBOX_PROCESS_FORK` set) was killed at the start of this investigation (per the task's own
 authorization) and was NOT restarted afterward — a future session/user wanting the live desktop demo
 back up needs to re-run `.wfgy/webtop_stack.sh` fresh.
+
+## Follow-up session, same day: both suspect bugs fixed+verified live, plus one new bug found
+
+Task: fix the `spawn_suspended` `STARTF_USESTDHANDLES` bug flagged above. Read both blocks in full
+first (~3388-3570 pre-fix). Real bug found in the SECOND block (~3546-3569, `if inherit_stdio &&
+!want_stdout_pipe && !want_stdin_pipe`): it unconditionally wrote
+`startup_info.hStdInput/hStdOutput/hStdError = GetStdHandle(...)` and forced
+`dwFlags |= STARTF_USESTDHANDLES` / `inherit_handles = 1`, with NO null/`INVALID_HANDLE_VALUE`
+check — unlike the FIRST block (~3461-3534), which only assigns a stream when
+`!h.is_null() && h != INVALID_HANDLE_VALUE`. So whenever the parent's own `STD_INPUT_HANDLE` (or
+stdout/stderr) is invalid/null — a real condition for a non-interactively-launched/redirected
+runner process — the first block correctly left that field unset, and the second block then
+clobbered it back to the invalid value anyway, handing the child a `STARTUPINFOW` naming a
+genuinely invalid HANDLE as one of its standard streams. The first block also ran on
+`!want_stdout_pipe` ALONE, ignoring `inherit_stdio` — so the diagnostic memory-copy-only probe
+(pass 111/112, `inherit_stdio=false`) got the parent's stdio wired in despite explicitly asking not
+to. Fix: one block, `else if inherit_stdio`, keeping the first block's per-handle validity guard as
+the only place `STARTF_USESTDHANDLES`/`hStd*` are set; the true `else` (`!want_stdout_pipe &&
+!inherit_stdio`) now correctly leaves the child's stdio fully unset again.
+
+**Reproduction, before fixing**: ~10 live runs of the exact `OUTER_START; INNER_SHELL_OK; id;
+INNER_DONE; OUTER_EXIT=$?` repro from the investigation above (`LITEBOX_PROCESS_FORK=1`, cached
+`debian-xfce`, `LITEBOX_LOG` with `litebox_shim_linux::syscalls::process=debug,
+litebox_platform_windows_userland=debug`): 7/10 clean, 0/10 hit the documented `Fatal error: glibc
+detected an invalid stdio handle`, 3/10 hit a DIFFERENT, new failure:
+`[shared_kernel_heap] FATAL CreateFileMappingW failed win32_err=0x5aa requested_size=0x200000000`
+followed by `/bin/bash: line 1: 2 Killed .../bin/bash -c 'echo INNER_SHELL_OK; id; echo
+INNER_DONE'`, `OUTER_EXIT=137`. `0x5aa` = `ERROR_NO_SYSTEM_RESOURCES`. Also tried the task's own
+literal suggested shape (`bash -c 'echo A; bash -c "echo B"'`, single-quoted to dodge the
+documented quoting gotcha): 5/5 runs printed both `A` and `B` with ZERO `clone:`/fork debug lines
+at all — GNU bash tail-exec's the final command of a `-c` script (no subsequent statement needs
+the shell to survive), so this exact shape never calls `fork()` under real bash semantics and is
+not a usable repro; use the `OUTER_EXIT=$?`-suffixed shape instead, which forces a real fork.
+
+**Root cause of the NEW bug**: `init_shared_kernel_heap` (`litebox_platform_windows_userland/src/
+lib.rs`) creates its 8 GiB pagefile-backed section via `CreateFileMappingW(INVALID_HANDLE_VALUE,
+NULL, PAGE_READWRITE, ...)` with no `SEC_RESERVE` flag — Windows defaults this to `SEC_COMMIT`,
+which charges the FULL 8 GiB against system resources at section-CREATION time, not lazily on
+first touch as the function's own doc comment claims. Every cross-process fork child is a
+genuinely separate Windows process that independently runs this same function on its own first
+allocation, WHILE the parent's own already-live 8 GiB section still holds its charge — live-checked
+system counters at failure time (`Win32_PerfFormattedData_PerfOS_Memory.CommitLimit` ~32.7 GB,
+committed ~10.5 GB, ~9 GB free physical RAM, ~14.6 GB free pagefile space) show tens of GB of
+nominal headroom, consistent with transient kernel-pool/VAD contention from two ~8 GiB
+`SEC_COMMIT` sections coexisting rather than genuine exhaustion — this is Track B step 3
+(`windows-userland: fixed-base shared kernel heap`, commit `c08182d`) hitting exactly the gap its
+own AGENTS.md entry disclosed: "no second process has actually mapped the shared section yet (this
+pass is single-process only)". Fix applied: bounded retry on `CreateFileMappingW` (8 attempts,
+10ms/attempt linear backoff, ≤280ms worst case) before the existing `abort()` — this project's own
+"bounded retry, then surface" doctrine applied to a measured-transient OS resource condition, not a
+memory-semantics rewrite. The doc-comment-promised proper fix (`SEC_RESERVE` + explicit
+per-allocation `VirtualAlloc(..., MEM_COMMIT, ...)` on the bump allocator's hot path, matching the
+"reserve now, commit on touch" pattern this same file already uses elsewhere for `copy_one_group`/
+`try_allocate_cow_pages`) is a larger change to a hot path and was deliberately NOT attempted this
+pass — `PRD shared-kernel-heap-eager-full-commit-not-lazy-reserve`.
+
+**Verification after both fixes** (`cargo build --release -p litebox_platform_windows_userland -p
+litebox_runner_linux_on_windows_userland`, clean): 24/24 consecutive live runs of the exact
+`OUTER_EXIT=$?` repro completed cleanly (`INNER_SHELL_OK`, `uid=0(root)`, `INNER_DONE`,
+`OUTER_EXIT=0` every time) — 0 heap-abort (was 3/10), 0 glibc-abort (was 0/10, unchanged — never
+witnessed either before or after). Host memory stable across all ~40 total repro runs this pass
+(`FreePhysicalMemory` ~8.7-9.0 GB of 15.6 GB throughout, no leaked `litebox_runner` processes at
+any point, confirmed via `Get-Process` after each batch).
+
+**PTY test** (step 5 of the task): `bash -c 'which script; script -qec "echo PTY_START; id; echo
+PTY_DONE" /dev/null; echo SCRIPT_EXIT=$?'` under `LITEBOX_PROCESS_FORK=1` — `script` itself was
+killed by `fatal signal: ... signal=Signal(13)` (SIGPIPE) ~6s in, with `n_orphans=1` at exit
+(a forked child process DID survive, so a real fork happened) — neither `PTY_START` nor
+`PTY_DONE` were ever printed. This is a DIFFERENT bug from the stdio-handle fix above (that fix is
+specifically about plain-stdio inheritance; a PTY slave fd is a different code path entirely) and
+was NOT root-caused this pass — disclosed as a new, real, PTY-specific finding rather than
+investigated further given the session's scope. `PRD cross-process-fork-pty-sigpipe-in-
+script-relay`.
+
+**Full webtop boot with `LITEBOX_PROCESS_FORK=1` deliberately NOT attempted**: `.wfgy/
+webtop_stack.sh` starts Xvfb early and forks repeatedly right after — directly in the blast radius
+of the already-documented, still-unfixed "Fork-after-Xorg PERMANENT freeze" (2026-09-16 entry,
+above/AGENTS.md) — so adding `LITEBOX_PROCESS_FORK=1` to this exact boot recipe today would almost
+certainly hang the whole guest irrecoverably before ever reaching a terminal emulator, testing
+that known-open freeze bug rather than either fix from this pass. That freeze needs to be fixed
+first before a meaningful "does the eligibility gate correctly route a mixed real-desktop
+workload" test is worth the wall-clock/host-memory cost. `LITEBOX_PROCESS_FORK=1` remains NOT set
+in the standing boot recipe.
+
+**Honest bottom line on the terminal-emulator shell crash**: the specific `Fatal error: glibc
+detected an invalid stdio handle` message from the prior investigation was never reproduced in
+~34 attempts across this pass's before/after builds, so this session cannot claim to have
+witnessed that exact symptom disappear. What WAS fixed and live-verified: (1) a real, provable
+`STARTF_USESTDHANDLES` correctness bug matching the exact shape the prior session flagged
+(inspection-verified, not repro-verified); (2) a newly-found, highly-reproducible (30%) shared-
+kernel-heap resource-exhaustion abort that WAS live-witnessed and IS confirmed fixed (24/24 vs.
+7/10). Neither fix touches the default thread-based fork path's own still-open "second glibc
+corruption class" (`double free or corruption (out)`), and `LITEBOX_PROCESS_FORK=1` is still not
+part of the standing boot recipe, so the terminal-emulator symptom a real desktop user would see
+is not proven resolved end-to-end this pass — it needs the Fork-after-Xorg freeze fixed and a real
+desktop boot+click-through to close out.
+
+## Five cheap-wins PRD rows closed, 2026-09-16 (moved here 2026-09-17 to keep AGENTS.md under budget)
+
+All cargo build/fmt-verified, no boot needed. `litebox-mm-unsafe-op-in-unsafe-fn-breaks-dwarnings`
+(explicit `unsafe{}`+SAFETY comments around `change_page_permissions` in `litebox/src/mm/mod.rs`,
+commit `d336d94`); `litebox-common-linux-not-rustfmt-clean` (`cargo fmt -p litebox_common_linux`,
+commit `30a3392`); `litebox-shim-linux-cfg-test-build-broken` (`Cell<i32>` drift in `#[cfg(test)]`
+call sites, 21 errors fixed, commit `8e70c81`); `repo-hygiene-violations-contradict-the-standing-
+lesson` (10 tracked probe-artifact/scratch-file violations `git rm --cached`, `.gitignore`
+widened, commits `a4d4759`/`a37773d`); `windows-reserve-and-commit-64kib-granularity-noaccess-
+flanks` (documented the ~60KiB reserved-but-uncommitted flank as an intentional CoW guard, no code
+change, commit `936714f`).

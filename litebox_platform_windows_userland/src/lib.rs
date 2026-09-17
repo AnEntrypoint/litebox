@@ -9713,16 +9713,52 @@ fn init_shared_kernel_heap() {
     // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into high/low
     // 32-bit halves, not a single 64-bit parameter (same pattern as `create_shared_memory`).
     #[expect(clippy::cast_possible_truncation)]
-    let section = unsafe {
-        CreateFileMappingW(
-            Win32_Foundation::INVALID_HANDLE_VALUE,
-            core::ptr::null(),
-            Win32_Memory::PAGE_READWRITE,
-            (size_u64 >> 32) as u32,
-            size_u64 as u32,
-            core::ptr::null(),
-        )
-    };
+    let size_high = (size_u64 >> 32) as u32;
+    #[expect(clippy::cast_possible_truncation)]
+    let size_low = size_u64 as u32;
+    // BOUNDED RETRY (found+fixed this session): a real cross-process-fork child is a genuinely
+    // separate Windows process that ALSO calls this same function on its own first allocation,
+    // while the PARENT's own 8 GiB section from its own call is still live -- live-reproduced
+    // this exact call failing with `win32_err=0x5aa` (`ERROR_NO_SYSTEM_RESOURCES`) in ~30% of
+    // fork-child spawns (3/10 in a row), byte-identical `requested_size`, with tens of GiB of
+    // headroom on every other system-memory counter checked at the same moment (commit limit,
+    // free physical memory, free pagefile space) -- consistent with transient kernel-pool/VAD
+    // contention from creating a multi-GiB `SEC_COMMIT` section while a sibling process holds an
+    // identical one, not real exhaustion. A single failure here previously `abort()`ed the whole
+    // fork child outright (guest-visible as an unexplained `Killed`), so retry a bounded number of
+    // times with a short backoff before giving up -- this project's own "bounded retry, then
+    // surface" standard, applied to a genuinely transient OS resource condition rather than a
+    // deterministic bug.
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut section = core::ptr::null_mut();
+    let mut last_err: u32 = 0;
+    for attempt in 0..MAX_ATTEMPTS {
+        section = unsafe {
+            CreateFileMappingW(
+                Win32_Foundation::INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                Win32_Memory::PAGE_READWRITE,
+                size_high,
+                size_low,
+                core::ptr::null(),
+            )
+        };
+        if !section.is_null() {
+            break;
+        }
+        last_err = unsafe { GetLastError() };
+        if attempt + 1 < MAX_ATTEMPTS {
+            // Allocation-free sleep (a raw syscall wrapper, not a libstd `Duration`-formatting
+            // path) -- safe under the same reentrancy constraint as `diag_raw_print`/
+            // `std::process::abort()` below. Linear backoff, 10ms/attempt (10ms..=70ms): this is
+            // the process's own startup path, so it trades a bounded, sub-second worst-case delay
+            // (<=280ms total) for surviving a transient condition that resolved itself in every
+            // live repro within a handful of milliseconds.
+            unsafe {
+                windows_sys::Win32::System::Threading::Sleep(10 * (attempt + 1));
+            }
+        }
+    }
     if section.is_null() {
         // Allocation-free failure reporting, deliberately NOT `assert!`/`panic!` with formatted
         // arguments: this can run on the process's FIRST EVER host allocation, from inside
@@ -9734,8 +9770,8 @@ fn init_shared_kernel_heap() {
         // ever reporting the real error. `diag_raw_print` + `std::process::abort()` are both
         // allocation-free and non-unwinding, so neither can recurse here.
         diag_raw_print(
-            b"[shared_kernel_heap] FATAL CreateFileMappingW failed win32_err=0x",
-            unsafe { GetLastError() } as usize,
+            b"[shared_kernel_heap] FATAL CreateFileMappingW failed after retries win32_err=0x",
+            last_err as usize,
             b" requested_size=0x",
             SHARED_KERNEL_HEAP_SIZE,
         );

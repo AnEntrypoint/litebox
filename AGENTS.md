@@ -301,25 +301,41 @@ performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, and the
 (DRM/KMS+wgpu) decision — all CLOSED 2026-09-16, none open. Full detail moved to
 `docs/AGENTS_ARCHIVE_2026-09-17.md` to keep this file under budget.
 
-## Terminal-emulator shell crash — investigated 2026-09-17, real mechanism found, NOT fixed
+## Cross-process-fork stdio-handle bug — FIXED 2026-09-17, plus a second bug found+fixed the same pass
 
-Live-tested (not assumed) whether the xfce4-terminal/shell crash is a leaked fd or just needs
-`LITEBOX_PROCESS_FORK=1`: it is neither. `LITEBOX_PROCESS_FORK=1` is confirmed NOT set in
-`.wfgy/webtop_stack.sh`'s standing boot recipe. A clean, fd-redirection-free, genuinely
-`beyond_stdio==0` fork+exec repro (no Xorg, no terminal) still crashes under BOTH fork paths: the
-default thread-based path hits the already-documented, still-unfixed "second glibc corruption
-class" (`double free or corruption (out)`, distinct from the tcache/safe-linking class
-`GLIBC_TUNABLES` covers); `LITEBOX_PROCESS_FORK=1` correctly takes the eligible cross-process path
-(`clone: cross-process fork() is eligible`, `spawned new task`, confirmed via debug log) but the
-child's own glibc then aborts with `Fatal error: glibc detected an invalid stdio handle` before
-running any guest code — a distinct, previously-uncharacterized bug in
-`spawn_cross_process_fork_child`'s stdio wiring (`litebox_platform_windows_userland/src/
-process_fork.rs`'s `spawn_suspended`), not in xfce4-terminal's fd hygiene. Neither path is
-currently safe for this shape. No code fix applied (unverified-fix risk, see archive). Full
-repro commands, debug-log evidence, and the exact suspect code (`spawn_suspended`'s two redundant
-`STARTF_USESTDHANDLES` blocks): `docs/AGENTS_ARCHIVE_2026-09-17.md`. Also note: AGENTS.md's own
-prior "5 refused forks of 34" claim for `LITEBOX_PROCESS_FORK=1` on a real debian-xfce boot has no
-corroborating evidence anywhere in the tracked repo — treat as unverified until re-demonstrated.
+`spawn_suspended`'s (`litebox_platform_windows_userland/src/process_fork.rs`) two back-to-back
+`STARTF_USESTDHANDLES` blocks were NOT merely redundant: the second one unconditionally overwrote
+`startup_info.hStd*` and forced `STARTF_USESTDHANDLES`/`inherit_handles=1` with **no null/
+`INVALID_HANDLE_VALUE` guard**, clobbering the first block's correct "leave this stream unset when
+invalid" decision -- handing the fork child a genuinely invalid HANDLE as a standard stream. Fixed
+by keeping exactly one block (`else if inherit_stdio`), the first block's validity guard as the
+only path that sets `STARTF_USESTDHANDLES`/`hStd*`. **Not independently reproduced**: ~34 live
+repro attempts before/after the fix never hit the documented `Fatal error: glibc detected an
+invalid stdio handle` abort -- applied on inspection (real, provable defect), not a witnessed
+before/after flip of that exact symptom. The task's own suggested repro shape (`bash -c 'echo A;
+bash -c "echo B"'`) never calls `clone()` at all (bash tail-exec's a `-c` script's final command) --
+use a trailing command (`OUTER_EXIT=$?`) to force a real fork.
+
+**Second, more consequential bug found+fixed live this pass**: the fixed-base shared kernel heap
+(`init_shared_kernel_heap`, ADVISORY-002 §3.3) creates its 8 GiB section without `SEC_RESERVE`, so
+Windows commits the FULL 8 GiB at `CreateFileMappingW` time, not lazily as the doc comment claims
+-- every fork child repeats this while the parent's own 8 GiB section is still live. Measured live:
+`win32_err=0x5aa`/`ERROR_NO_SYSTEM_RESOURCES` on 3/10 fork-child spawns despite tens of GiB of
+headroom on every system-memory counter -- transient kernel-pool/VAD contention, not real
+exhaustion. Fixed with a bounded retry (8 attempts, 10ms/attempt backoff) before the existing
+`abort()`. Live-verified 24/24 clean post-fix vs. 7/10 pre-fix. Proper fix (`SEC_RESERVE` +
+on-demand per-allocation commit) is a larger hot-path change, deliberately not attempted; PRD
+`shared-kernel-heap-eager-full-commit-not-lazy-reserve`.
+
+**PTY test, NOT root-caused**: `script -qec '...' /dev/null` under a real PTY hit `signal=Signal(13)`
+(SIGPIPE) on `script` itself ~6s in (`n_orphans=1` -- a fork DID survive) -- a different bug from
+the plain-stdio fix above; PRD `cross-process-fork-pty-sigpipe-in-script-relay`.
+
+**Full webtop boot NOT attempted**: the still-unfixed "Fork-after-Xorg PERMANENT freeze" (below)
+sits directly in `.wfgy/webtop_stack.sh`'s boot path and would make this a near-certain
+irrecoverable hang unrelated to either fix, not a meaningful mixed-workload test -- fix that freeze
+first. `LITEBOX_PROCESS_FORK=1` remains NOT set in the standing boot recipe. Full repro commands,
+debug-log evidence, live-run counts: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Presenter-process split (`docs/presenter-process-design.md`) -- done, fully verified live end-to-end, 2026-09-16
 
@@ -332,16 +348,11 @@ One real bug found and fixed: missing per-call `OVERLAPPED` made the first real 
 deadlocks instead). Small disclosed pre-existing gaps unrelated to the crash (`frames on <dir>`,
 `ps` PROCESS_TREE, `PrintWindow` partial-shape). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
-## Five cheap-wins PRD rows closed, 2026-09-16 (all cargo build/fmt-verified, no boot needed)
+## Five cheap-wins PRD rows closed, 2026-09-16
 
-`litebox-mm-unsafe-op-in-unsafe-fn-breaks-dwarnings` (explicit `unsafe{}`+SAFETY comments around
-`change_page_permissions` in `litebox/src/mm/mod.rs`, commit `d336d94`); `litebox-common-linux-not-
-rustfmt-clean` (`cargo fmt -p litebox_common_linux`, commit `30a3392`); `litebox-shim-linux-cfg-test-
-build-broken` (`Cell<i32>` drift in `#[cfg(test)]` call sites, 21 errors fixed, commit `8e70c81`);
-`repo-hygiene-violations-contradict-the-standing-lesson` (10 tracked probe-artifact/scratch-file
-violations `git rm --cached`, `.gitignore` widened, commits `a4d4759`/`a37773d`); `windows-reserve-
-and-commit-64kib-granularity-noaccess-flanks` (documented the ~60KiB reserved-but-uncommitted flank as
-an intentional CoW guard, no code change, commit `936714f`). Full detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+All cargo build/fmt-verified, no boot needed (`unsafe_op_in_unsafe_fn`, `litebox_common_linux`
+rustfmt, `litebox_shim_linux` `#[cfg(test)]` build, repo hygiene, reserved-flank documentation).
+Full detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 ## Docs and tooling map
 

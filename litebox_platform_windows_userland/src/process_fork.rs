@@ -3458,9 +3458,9 @@ fn spawn_suspended(
             }
             startup_info.hStdInput = stdin_read;
         }
-    } else {
-        // FIX (track-b investigation, confirmed live): this function's own doc comment claims
-        // "the child inherits the parent's real console session's stdio the ordinary way a
+    } else if inherit_stdio {
+        // FIX (track-b investigation, confirmed live): this function's own doc comment used to
+        // claim "the child inherits the parent's real console session's stdio the ordinary way a
         // genuine `fork()` child would" via `bInheritHandles=0` and no `STARTF_USESTDHANDLES` --
         // but that reasoning is backwards. `bInheritHandles=0` means NONE of the parent's open
         // handles (including its stdio) are inherited; omitting `STARTF_USESTDHANDLES` then just
@@ -3477,6 +3477,25 @@ fn spawn_suspended(
         // semantics, so the child's own stdout writes (and any guest `write(1, ..)`/`write(2, ..)`
         // this platform routes through the real Windows stdio handles) become visible the same way
         // a normal, non-fork guest program's output already is.
+        //
+        // BUG FIXED HERE (found this session): this branch used to run unconditionally whenever
+        // `!want_stdout_pipe`, ignoring `inherit_stdio` entirely -- so even the memory-copy-only
+        // diagnostic probe (`inherit_stdio=false`, pass 111/112) got the parent's stdio wired in
+        // against its own explicit request. Worse, a SECOND, later block in this function
+        // (removed here) re-ran the identical `GetStdHandle` lookups and then unconditionally
+        // wrote `startup_info.hStdInput/hStdOutput/hStdError = h` and forced
+        // `dwFlags |= STARTF_USESTDHANDLES` / `inherit_handles = 1` with NO null/
+        // `INVALID_HANDLE_VALUE` guard at all -- unlike this block, which only assigns a stream
+        // when the handle is actually valid. Whenever the parent's own `STD_INPUT_HANDLE` (or
+        // stdout/stderr) was null or `INVALID_HANDLE_VALUE` -- a real condition for a
+        // non-interactively-launched/redirected runner process, live-confirmed via `GetStdHandle`
+        // in this exact spawn path -- that second block clobbered this block's correct "leave it
+        // unset" decision and hand the child a `STARTUPINFOW` naming a genuinely invalid HANDLE as
+        // one of its standard streams, which is then what the child's own fd 0/1/2 plumbing (and
+        // in turn the guest's dynamically-linked glibc probing those fds at startup) inherits.
+        // Fixed by keeping exactly one such block, gated on `inherit_stdio` (so the diagnostic
+        // probe's explicit `inherit_stdio=false` is respected again), and preserving this block's
+        // per-handle validity guard as the only place `STARTF_USESTDHANDLES`/`hStd*` get set.
         unsafe {
             let stdout_h = windows_sys::Win32::System::Console::GetStdHandle(
                 windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
@@ -3493,7 +3512,10 @@ fn spawn_suspended(
             // below only propagates handles that are ALREADY marked inheritable, silently skipping
             // any that are not, so mark each one explicitly (`HANDLE_FLAG_INHERIT = 1`) before
             // relying on it; a failed `SetHandleInformation` just leaves that handle exactly as
-            // inheritable as it already was, no worse than the pre-fix behavior.
+            // inheritable as it already was, no worse than the pre-fix behavior. Each stream is
+            // ONLY wired into `startup_info` -- and only then counts toward `STARTF_USESTDHANDLES`
+            // -- when it is neither null nor `INVALID_HANDLE_VALUE`; an invalid stream is left at
+            // its zeroed default rather than ever being copied into the child's `STARTUPINFOW`.
             const HANDLE_FLAG_INHERIT: u32 = 1;
             if !stdout_h.is_null()
                 && stdout_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
@@ -3532,42 +3554,9 @@ fn spawn_suspended(
             inherit_handles = 1;
         }
     }
-
-    // A real cross-process `fork()` child must write to the SAME stdout/stderr as its parent -- it
-    // is running the guest's own forked code, and that code's output is the whole point. With
-    // `bInheritHandles = FALSE` and no `STARTF_USESTDHANDLES`, `CreateProcessW` gives the child
-    // neither, so everything it prints (the guest's own writes AND the child-side
-    // `[process_fork_diag]` lines) is discarded. That is why a forked `(echo B)` under
-    // `LITEBOX_PROCESS_FORK=1` produced no `B`, and why the child looked like it had never started
-    // when in fact nothing it said could reach us.
-    //
-    // Only for the non-pipe case: the diagnostic callers deliberately hand the child pipe ends
-    // instead and must keep doing so.
-    if inherit_stdio && !want_stdout_pipe && !want_stdin_pipe {
-        use windows_sys::Win32::Foundation::SetHandleInformation;
-        use windows_sys::Win32::System::Console::{
-            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        };
-        const HANDLE_FLAG_INHERIT: u32 = 1;
-        let stdin_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let stderr_h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
-        // These are the parent's own long-lived std handles; marking them inheritable changes a
-        // property of the handle rather than creating a duplicate, so nothing here needs closing
-        // afterwards -- and the post-spawn cleanup below only ever closes pipe ends it created.
-        for h in [stdin_h, stdout_h, stderr_h] {
-            if !h.is_null() && h as isize != -1 {
-                unsafe {
-                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-                }
-            }
-        }
-        startup_info.dwFlags |= STARTF_USESTDHANDLES;
-        startup_info.hStdInput = stdin_h;
-        startup_info.hStdOutput = stdout_h;
-        startup_info.hStdError = stderr_h;
-        inherit_handles = 1;
-    }
+    // else (`!want_stdout_pipe && !inherit_stdio`): the diagnostic memory-copy-only probe's own
+    // explicit request -- leave the child's stdio completely unset (fresh console/NUL default),
+    // matching its documented intent instead of silently overriding it.
 
     // `CREATE_NO_WINDOW`: every caller of this function redirects the child's stdio itself
     // (`want_stdout_pipe`/`want_stdin_pipe`'s pipes, or `inherit_stdio`'s inherited handles) --
