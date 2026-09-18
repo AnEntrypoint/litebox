@@ -385,3 +385,35 @@ build/launch, stale processes killed with `Stop-Process -Force` when the build's
 proved one was still running); host free RAM fluctuated 0.9-5.6 GB across the session, recovering
 promptly after each kill -- consistent with prior sessions' established "unrelated to litebox"
 baseline, never trending down across cleanups.
+
+**Third run this pass, with `litebox_shim_linux::syscalls::process=debug` -- the second stall did
+NOT reproduce; confirms the fifteenth-pass fix, and separately reconfirms the pre-existing,
+already-tracked AF_UNIX connection-DATA gap is what still blocks the browser milestone, not a new
+regression.** Fresh binary (both fix commits included), same repro. This run's own early section hit
+a SIMILAR-looking ~120s pause right after `NGINX_STARTED` (matching the second stall's location) but
+self-resolved on its own without intervention -- consistent with this whole area being genuinely
+probabilistic, as repeatedly established all session, rather than the second stall being deterministic.
+Progressed FAR further than any other run this pass: `NGINX_STARTED` -> `XVFB_FAILED` ->
+`DBUS_FAILED` -> selkies launched and retried 30x -> `DE_LAUNCHED (image startwm.sh)` ->
+`DE_FALLBACK_LAUNCHED` -> settled into the script's own steady-state `[s] HOLD t=<n>s` loop (reached
+`t=480s` before this pass ended it), 559 total cross-process forks, 30+ MB of debug log, zero
+uncaught panics, zero permanent stall. **`XVFB_FAILED`/`DBUS_FAILED` root cause, directly confirmed
+in context**: the exact `[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT
+guest pid` WARN fired for `xset`'s own connect to Xvfb's X11 socket (`self_pid=12892
+owner_pid=2380`), then `webtop_stack.sh`'s own 60s `XSOCK` poll loop gave up and killed both `Xvfb`
+and the pending `xset q` -- i.e. the thirteenth-pass `SharedUnixConnTable`/`SharedUnixConnectQueue`
+mechanism (proven sound in the fourteenth pass's minimal isolated repro) is NOT actually resolving
+this connect for Xvfb's real socket in the full boot, for a reason the isolated repro's success does
+not explain -- matching this file's own thirteenth-pass entry ("did NOT reach the browser/
+terminal/apps milestone... `XVFB_FAILED`/`DBUS_FAILED` NOT yet closed") and AGENTS.md's own current
+"Open here" section precisely. This is NOT a new regression from this pass's fix and NOT the second
+stall from earlier in this same pass -- a separate, pre-existing, already-tracked gap. Tried
+`Invoke-WebRequest http://127.0.0.1:8080/` against the published nginx port while the run sat in its
+`HOLD` state: timed out (nothing real being served, consistent with a genuinely non-functional
+X/selkies backend) -- did not attempt a browser/CDP connection given this direct evidence the
+backend has nothing to show. **Concrete next step for the browser milestone**: instrument
+`connect_cross_process`/`SharedUnixConnectQueue::post`/`try_claim` (`litebox_shim_linux/src/
+syscalls/unix.rs`) with the same kind of direct pid/path logging used for the fourteenth-pass probe,
+run this EXACT full-boot repro (not another isolated probe -- the isolated repro already passed and
+does not reproduce this), and find where Xvfb's specific listener socket path diverges from the
+probe's own connect/accept sequence.

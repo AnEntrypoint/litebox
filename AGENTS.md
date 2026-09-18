@@ -112,11 +112,9 @@ cause: broad `bInheritHandles=TRUE` leaked a sibling fork child's inheritable br
 into unrelated children racing the same window. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit
 per-call handle allow-list (`process_fork.rs`, `spawn_suspended_impl`). Live-verified. Archive.
 
-**`Network::socket_set` made shared-arena-native (eighth pass)**: fixed a `tuple.unwrap()` panic by
-giving `socket_set` a 256-slot (`MAX_SOCKETS`) fixed array in the shared kernel arena instead of a
-private-heap `Vec`. A/B-confirmed (ninth pass) this genuinely fixed that panic (old binary
-crash-loops 8x on it, new binary zero) and, in doing so, newly exposed a downstream stall the old
-binary could never reach (it crashed first). Full narrative: archive.
+**`Network::socket_set` made shared-arena-native (eighth pass)**: fixed a `tuple.unwrap()` panic via
+a 256-slot (`MAX_SOCKETS`) fixed array in the shared kernel arena instead of a private-heap `Vec`.
+A/B-confirmed (ninth pass): old binary crash-loops 8x on it, new binary zero. Archive.
 
 **Post-`NGINX_STARTED` CPU livelock — ROOT-CAUSED and FIXED (tenth pass, 2026-09-17).** A thread
 burning 100% of a core forever inside `LocalPortAllocator::ephemeral_port`/`deallocate`
@@ -128,7 +126,7 @@ Verified clean build + 25 net unit tests + two live re-runs, livelock confirmed 
 AGENTS_ARCHIVE_2026-09-17.md`.
 
 **Poison-on-dead-holder scheme for `Network` — DESIGNED, IMPLEMENTED, LIVE-VERIFIED (eleventh
-pass, 2026-09-17).** `RawMutex` gained a `poisoned: AtomicBool`; `GlobalStateHandle::net_lock`
+pass).** `RawMutex` gained a `poisoned: AtomicBool`; `GlobalStateHandle::net_lock`
 opts in via `lock_recovering_poison()`, and on poison `Network::reset_after_poisoning`
 wholesale-resets `socket_set`/`closing_in_background`/`queued_for_closure`/`local_port_allocator`
 (`SocketHandle` has no generation counter, so wiping every field is the only way to tell stale
@@ -140,13 +138,13 @@ reached `SELKIES_PORT_UP`+`DE_LAUNCHED` with one disclosed non-fatal residual pa
 the browser/terminal/apps milestone — attributed then to the Xvfb/dbus by-name exclusion, now
 superseded by the twelfth-pass entry below. Detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-**Twelfth pass (2026-09-17/18)**: by-name `Xvfb`/`dbus-daemon` cross-process-fork exclusion relaxed
-— both now cross-process-fork for real (log-proven). `XVFB_FAILED`/`DBUS_FAILED` still fire, root
-cause precisely named: `unix_addr_table`'s `Backlog`/`Channel` connection DATA is still
-per-process-heap (presence side-index already shared) — closed by the thirteenth pass below. Same
-pass, separately: `SafeZoneAllocator::dealloc`'s `spin::mutex::SpinMutex` (`litebox/src/mm/
-allocator.rs`) live-caught spinning forever (no dead-holder recovery, unlike `RawMutex`) — **still
-open**, own dedicated pass needed. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**Twelfth pass**: by-name `Xvfb`/`dbus-daemon` cross-process-fork exclusion relaxed — both now
+cross-process-fork for real (log-proven). `XVFB_FAILED`/`DBUS_FAILED` still fire, root cause
+precisely named: `unix_addr_table`'s `Backlog`/`Channel` connection DATA is still per-process-heap
+(presence side-index already shared) — attempted by the thirteenth pass below, still not fully
+closed (fifteenth pass). Same pass, separately: `SafeZoneAllocator::dealloc`'s
+`spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) live-caught spinning forever (no
+dead-holder recovery, unlike `RawMutex`) — **still open**. Full narrative: archive.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
@@ -158,11 +156,11 @@ the full design), three real bugs found+fixed along the way (stack overflow on a
 array, an ambiguous-`None`-timeout infinite-poll bug, a missing shared-queue check in event-driven
 `accept()` paths). Full narrative: archive.
 
-**Fourteenth pass, 2026-09-18 — isolated AF_UNIX repro PASSED clean; full-boot stall theory since
-REFUTED (see fifteenth pass below).** `SharedUnixConnTable`/`SharedUnixConnectQueue` genuinely work
-for the minimal cross-process case (byte-exact bidirectional round trip, fork-before-listen probe).
-The fourteenth pass's own read of the subsequent full-boot stall (`net::wait_on_tun`/
-`with_fork_duplicate_claim_owner` as a two-holder deadlock) was WRONG — see below.
+**Fourteenth pass — isolated AF_UNIX repro PASSED clean; full-boot stall theory since REFUTED
+(fifteenth pass below).** `SharedUnixConnTable`/`SharedUnixConnectQueue` genuinely work for the
+minimal cross-process case (byte-exact round trip, fork-before-listen probe). This pass's own read
+of the subsequent full-boot stall (`wait_on_tun`/`with_fork_duplicate_claim_owner` two-holder
+deadlock) was WRONG.
 
 **Fifteenth pass, 2026-09-18 — real root cause found and FIXED, live-verified: a smoltcp
 stale-`SocketHandle` panic killed `net_worker` threads platform-wide.** `wait_on_tun` is
@@ -198,15 +196,18 @@ insufficient-first-fix detail, and concrete next steps: `docs/AGENTS_ARCHIVE_202
 (-2) ~~root-cause `net::wait_on_tun`/`with_fork_duplicate_claim_owner`~~ — REFUTED, fifteenth
 pass: structurally can't deadlock (single lock, every caller caps its timeout to 1ms); the real
 mechanism was a smoltcp stale-`SocketHandle` panic killing `net_worker` platform-wide, now FIXED
-(above). **NEW TOP PRIORITY, fifteenth pass**: root-cause the SECOND stall found past that fix — a
-process genuinely blocked in what looks like `sys_wait4` (via its `wait_until` closure shape), but
-cdb's enclosing frame names for this release/ICF binary are unreliable (huge, implausible offsets).
-Add a direct `eprintln!`/log line at the top of `Task::sys_wait4` printing `pid`/`self.pid.get()`
-instead of trusting symbol resolution; then check whether the awaited child already exited at the
-OS level without being reaped. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass.
+(above) and a third confirmation run reached a stable `HOLD` steady state (559 forks, zero panics,
+zero permanent stall) with no intervention needed — a SECOND stall this pass's own second run hit at
+a similar point did NOT reproduce a third time, consistent with this whole area being genuinely
+probabilistic rather than a deterministic bug; not re-prioritized unless it recurs. **The browser
+milestone is still blocked by the ALREADY-TRACKED, pre-existing gap named in "Open here" below**
+(`unix_addr_table`'s connection-DATA sharing for Xvfb's own X11 socket specifically — confirmed live,
+third run: `xset`'s connect got the exact `ECONNREFUSED ... DIFFERENT guest pid` WARN, then the
+script's own 60s timeout killed both `Xvfb` and `xset` before the shared-queue mechanism resolved
+it, despite that same mechanism passing the fourteenth pass's minimal isolated repro) — NOT a new
+regression from this pass. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass.
 
-(-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass, passed
-clean (above). (0)
+(-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
 (0) **~~TOP PRIORITY, twelfth pass~~ — superseded by thirteenth-pass entry above.** (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`)
 needs the same dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever
