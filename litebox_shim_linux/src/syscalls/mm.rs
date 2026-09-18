@@ -77,6 +77,7 @@ fn cow_mmap_enabled() -> bool {
 /// can hand back the same pointer to all of them instead of establishing a second mapping. That
 /// is genuine sharing, not an approximation -- writes through one attachment are immediately
 /// visible to the others, which is exactly what callers rely on.
+#[derive(Clone, Copy)]
 pub(crate) struct SysvShmSegment {
     /// Base address of the backing anonymous mapping.
     addr: usize,
@@ -91,18 +92,92 @@ pub(crate) struct SysvShmSegment {
     removed: bool,
 }
 
+/// Realistic upper bound on simultaneously live SysV shm segments in one guest session (X11's
+/// MIT-SHM extension allocates one per client-side pixmap/framebuffer pool, plus Xvfb's own
+/// `-shmem` framebuffer) -- sized generously, never grown, same discipline as
+/// `syscalls::unix::UNIX_ADDR_PRESENCE_CAPACITY`.
+pub(crate) const MAX_SYSV_SHM_SEGMENTS: usize = 128;
+
+#[derive(Clone, Copy)]
+struct ShmSlot {
+    shmid: i32,
+    segment: SysvShmSegment,
+}
+
 /// All System V shared-memory segments, plus the key -> id index `shmget` needs.
+///
+/// A fixed-size, pointer-free slot array -- deliberately NOT a `BTreeMap` (the type this field
+/// used before the 2026-09-18 systematic `GlobalState`-field audit). `GlobalState::sysv_shm` is
+/// genuinely, correctly meant to be shared across the whole cross-process-fork family (see its
+/// own doc comment: "any process that knows the key or id can attach", exactly what X11's
+/// MIT-SHM extension and Xvfb's own `-shmem` framebuffer rely on for real cross-process content
+/// sharing), so unlike `unix_addr_table`/`fifo_registry` (fixed the same 2026-09-18 audit pass by
+/// shadowing them as per-process-private on `GlobalStateHandle` instead) this table cannot simply
+/// be made per-process -- two DIFFERENT guest processes' `shmget(same key)` genuinely must
+/// resolve to the same segment. A `BTreeMap`'s heap-allocated nodes are the SAME defect class
+/// already fixed a dozen times over elsewhere in this crate (see `GlobalStateHandle`'s own doc
+/// comment): an attaching cross-process-fork child's copy of the root pointer is the first
+/// creator's, meaningless in its own address space. `SysvShmSegment` itself is already fully
+/// `Copy`/pointer-free (a handful of `usize`/`i32`/`bool` fields, no `Vec`/`Box`/`Arc`), so a
+/// flat array of `Option<ShmSlot>` needs no `unsafe` and no second `SharedKernelStateProvider`
+/// slot -- it inherits whatever cross-process sharing `GlobalState` itself already gets for free,
+/// the same reasoning `syscalls::unix::SharedUnixAddrPresenceTable`'s own doc comment gives.
+/// `shmid` values are NOT slot indices (real Linux `shmid`s are opaque, monotonically-issued via
+/// `GlobalState::next_shmid`, and this table must tolerate holes as segments are removed), so
+/// every lookup is a linear scan over [`MAX_SYSV_SHM_SEGMENTS`] slots -- cheap, since these
+/// syscalls (`shmget`/`shmat`/`shmdt`/`shmctl`) are rare compared to the data-plane operations
+/// that actually move pixels.
 pub(crate) struct SysvShmTable {
-    segments: BTreeMap<i32, SysvShmSegment>,
-    by_key: BTreeMap<i32, i32>,
+    slots: [Option<ShmSlot>; MAX_SYSV_SHM_SEGMENTS],
 }
 
 impl SysvShmTable {
     pub(crate) fn new() -> Self {
         Self {
-            segments: BTreeMap::new(),
-            by_key: BTreeMap::new(),
+            slots: [None; MAX_SYSV_SHM_SEGMENTS],
         }
+    }
+
+    fn index_of_id(&self, shmid: i32) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, Some(s) if s.shmid == shmid))
+    }
+
+    fn index_of_key(&self, key: i32) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, Some(s) if s.segment.key == key))
+    }
+
+    fn get_mut(&mut self, shmid: i32) -> Option<&mut SysvShmSegment> {
+        let i = self.index_of_id(shmid)?;
+        Some(&mut self.slots[i].as_mut().unwrap().segment)
+    }
+
+    fn get_by_addr_mut(&mut self, addr: usize) -> Option<(i32, &mut SysvShmSegment)> {
+        let i = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, Some(s) if s.segment.addr == addr))?;
+        let slot = self.slots[i].as_mut().unwrap();
+        Some((slot.shmid, &mut slot.segment))
+    }
+
+    fn remove(&mut self, shmid: i32) {
+        if let Some(i) = self.index_of_id(shmid) {
+            self.slots[i] = None;
+        }
+    }
+
+    fn insert(&mut self, shmid: i32, segment: SysvShmSegment) -> Result<(), Errno> {
+        let free = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_none())
+            .ok_or(Errno::ENOSPC)?;
+        self.slots[free] = Some(ShmSlot { shmid, segment });
+        Ok(())
     }
 }
 
@@ -121,7 +196,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut table = self.global.sysv_shm.lock();
 
         if key != IPC_PRIVATE
-            && let Some(&existing) = table.by_key.get(&key)
+            && let Some(existing_idx) = table.index_of_key(key)
         {
             if shmflg & (IPC_CREAT | IPC_EXCL) == (IPC_CREAT | IPC_EXCL) {
                 return Err(Errno::EEXIST);
@@ -129,14 +204,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // A caller asking for MORE than the existing segment holds cannot be satisfied by
             // handing it back, and silently returning a too-small segment would corrupt whatever
             // wrote past the end.
-            let seg = table
-                .segments
-                .get(&existing)
-                .expect("by_key only ever indexes live segments");
-            if size > seg.size {
+            let existing_slot = table.slots[existing_idx]
+                .as_ref()
+                .expect("index_of_key only ever returns an occupied slot");
+            if size > existing_slot.segment.size {
                 return Err(Errno::EINVAL);
             }
-            return Ok(usize::try_from(existing).unwrap());
+            return Ok(usize::try_from(existing_slot.shmid).unwrap());
         }
 
         if key != IPC_PRIVATE && shmflg & IPC_CREAT == 0 {
@@ -164,19 +238,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .global
             .next_shmid
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        table.segments.insert(
-            shmid,
-            SysvShmSegment {
-                addr: ptr.as_usize(),
-                size: rounded,
-                key,
-                attaches: 0,
-                removed: false,
-            },
-        );
-        if key != IPC_PRIVATE {
-            table.by_key.insert(key, shmid);
-        }
+        table
+            .insert(
+                shmid,
+                SysvShmSegment {
+                    addr: ptr.as_usize(),
+                    size: rounded,
+                    key,
+                    attaches: 0,
+                    removed: false,
+                },
+            )
+            .map_err(|_| Errno::ENOMEM)?;
         litebox_util_log::debug!(
             key:% = key, shmid:% = shmid, size:% = rounded, addr:% = ptr.as_usize();
             "sysv shm: created segment"
@@ -198,7 +271,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         _shmflg: i32,
     ) -> Result<usize, Errno> {
         let mut table = self.global.sysv_shm.lock();
-        let Some(seg) = table.segments.get_mut(&shmid) else {
+        let Some(seg) = table.get_mut(shmid) else {
             return Err(Errno::EINVAL);
         };
         if shmaddr != 0 && shmaddr != seg.addr {
@@ -212,19 +285,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `shmdt(shmaddr)`.
     pub(crate) fn sys_shmdt(&self, shmaddr: usize) -> Result<usize, Errno> {
         let mut table = self.global.sysv_shm.lock();
-        let Some((&shmid, _)) = table.segments.iter().find(|(_, s)| s.addr == shmaddr) else {
+        let Some((shmid, seg)) = table.get_by_addr_mut(shmaddr) else {
             return Err(Errno::EINVAL);
         };
-        let seg = table
-            .segments
-            .get_mut(&shmid)
-            .expect("id just located in this same table");
         seg.attaches = seg.attaches.saturating_sub(1);
         let drop_now = seg.removed && seg.attaches == 0;
         if drop_now {
-            let key = seg.key;
-            table.segments.remove(&shmid);
-            table.by_key.remove(&key);
+            table.remove(shmid);
         }
         Ok(0)
     }
@@ -243,7 +310,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         const IPC_STAT: i32 = 2;
 
         let mut table = self.global.sysv_shm.lock();
-        let Some(seg) = table.segments.get_mut(&shmid) else {
+        let Some(seg) = table.get_mut(shmid) else {
             return Err(Errno::EINVAL);
         };
 
@@ -252,9 +319,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 seg.removed = true;
                 let drop_now = seg.attaches == 0;
                 if drop_now {
-                    let key = seg.key;
-                    table.segments.remove(&shmid);
-                    table.by_key.remove(&key);
+                    table.remove(shmid);
                 }
                 Ok(0)
             }

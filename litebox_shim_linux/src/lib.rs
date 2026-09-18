@@ -528,6 +528,15 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let my_memfds = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
         let my_shared_files =
             Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        // Ninth instance of the SAME defect -- see `GlobalStateHandle::unix_addr_table`'s doc
+        // comment (2026-09-18 systematic audit).
+        let my_unix_addr_table = Arc::new(litebox::sync::RwLock::new(
+            syscalls::unix::UnixAddrTable::new(),
+        ));
+        // Tenth instance of the SAME defect -- see `GlobalStateHandle::fifo_registry`'s doc
+        // comment (2026-09-18 systematic audit).
+        let my_fifo_registry =
+            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -539,14 +548,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                     slot,
                     GlobalState {
                         platform: self.platform,
+                        _fs: core::marker::PhantomData,
                         bootstrap_process: once_cell::race::OnceBox::new(),
                         pipes: Pipes::new(&self.litebox),
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-                        unix_addr_table: litebox::sync::RwLock::new(
-                            syscalls::unix::UnixAddrTable::new(),
-                        ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
@@ -561,7 +568,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
-                        fifo_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
                         drm: syscalls::drm::DrmSubsystem::new(),
@@ -580,6 +586,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             futex_manager: my_futex_manager,
             memfds: my_memfds,
             shared_files: my_shared_files,
+            unix_addr_table: my_unix_addr_table,
+            fifo_registry: my_fifo_registry,
         })
     }
 }
@@ -2868,6 +2876,30 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// `BTreeMap`-node panic in `syscalls::mm::MemfdRegistry`, fixed the identical way).
     memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
     shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    /// Ninth instance of the SAME defect class this struct's own doc comment documents eight
+    /// times over, found during the 2026-09-18 systematic `GlobalState`-field audit: this table's
+    /// own doc comment (`syscalls::unix::SharedUnixAddrPresenceTable`'s, on the removed
+    /// `GlobalState` field below) already says the real per-address bind/listen entries are kept
+    /// "alongside (never instead of) each process's OWN real `UnixAddrTable`" -- i.e. this was
+    /// always intended to be per-process private state, with `unix_addr_presence`/
+    /// `unix_shared_conn_table` below (both flat, pointer-free, and correctly left as plain
+    /// `GlobalState` fields) doing all of the genuine cross-process work. Leaving the real
+    /// `BTreeMap` itself as a byte-shared `GlobalState` field was still the same live hazard as
+    /// `elf_patch_cache` et al.: an attaching cross-process-fork child's copy of its root pointer
+    /// is the first creator's, meaningless in its own address space, on the very first `bind()`/
+    /// `connect()`/`listen()` that child performs. Fixed the identical way: `GlobalStateHandle`
+    /// carries its own, always-freshly-constructed-per-process `unix_addr_table`, shadowing
+    /// `GlobalState`'s (now removed) field for every existing `self.global.unix_addr_table` call
+    /// site with no further change.
+    unix_addr_table: Arc<litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>>,
+    /// Tenth instance of the SAME defect class, found in the same audit: `GlobalState::
+    /// fifo_registry`'s own doc comment already says outright "shared by every thread of this
+    /// process -- but NOT across processes" -- i.e. this too was always meant to be per-process
+    /// private state, mistakenly placed as a byte-shared `GlobalState` field. Fixed the identical
+    /// way, shadowing `GlobalState`'s (now removed) field.
+    fifo_registry: Arc<
+        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>>,
+    >,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -2883,6 +2915,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             futex_manager: self.futex_manager.clone(),
             memfds: self.memfds.clone(),
             shared_files: self.shared_files.clone(),
+            unix_addr_table: self.unix_addr_table.clone(),
+            fifo_registry: self.fifo_registry.clone(),
         }
     }
 }
@@ -2952,6 +2986,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
+    // `FS` is no longer used by any field of this struct as of the 2026-09-18 systematic audit:
+    // its last use (`unix_addr_table: RwLock<Platform, UnixAddrTable<Platform, FS>>`) moved to
+    // `GlobalStateHandle` (see that struct's `unix_addr_table` field doc comment) since it was
+    // always meant to be per-process-private state, not a genuinely shared `GlobalState` field.
+    // Kept as a zero-sized marker rather than dropped from this struct's generics entirely,
+    // since every caller already threads `FS` through `GlobalState<Platform, FS>` and removing
+    // the parameter would be a wider, purely-cosmetic churn for no behavior change.
+    _fs: core::marker::PhantomData<FS>,
     // NOTE: this struct deliberately has NO `litebox` field. `LiteBox<Platform>` is
     // `Platform::Handle<LiteBoxX<Platform>>` (effectively an `Arc` pointer); a value placed here
     // would be copied byte-for-byte into the cross-process shared kernel arena on the CREATE
@@ -2982,9 +3024,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
-    /// UNIX domain socket address table
-    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
-    /// Cross-process-visible companion to `unix_addr_table` above (see
+    // NOTE: this struct deliberately has NO `unix_addr_table` field -- NINTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, found in the 2026-09-18 systematic audit. See `GlobalStateHandle::unix_addr_table`'s
+    // own doc comment for the full reasoning (this was always meant to be per-process private
+    // state, per `SharedUnixAddrPresenceTable`'s own doc comment) -- do not re-add a field with
+    // this name here.
+    /// Cross-process-visible companion to the real per-process `unix_addr_table` (see
     /// `syscalls::unix::SharedUnixAddrPresenceTable`'s own doc comment for exactly what it does
     /// and does not close): a plain, no-pointer-indirection fixed-size field of this SAME struct,
     /// so it inherits whatever cross-process sharing `GlobalState` itself already gets (real on
@@ -3117,10 +3163,14 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// cross-process `fork()` child recognises the FIFO (its type travels with the writable layer)
     /// and gets a pipe of its own, so data written by one process does not reach a reader in
     /// another. See `Task::open_fifo`.
-    fifo_registry: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
-    >,
+    // NOTE: this struct deliberately has NO `fifo_registry` field -- TENTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, found in the 2026-09-18 systematic audit: this field's own doc comment (above)
+    // already says outright it is shared "by every thread of this process -- but NOT across
+    // processes", i.e. it was always meant to be per-process private state, mistakenly placed as
+    // a byte-shared `GlobalState` field. `GlobalStateHandle` carries its own, always-freshly-
+    // constructed-per-process `fifo_registry` field instead -- do not re-add a field with this
+    // name here.
     /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
     /// formatted the same way real Linux formats its autobind abstract-namespace names: a
     /// leading NUL byte followed by 5 lowercase hex digits (see `unix(7)`). Real Linux starts
