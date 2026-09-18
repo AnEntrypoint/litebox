@@ -112,6 +112,14 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         }
     }
 
+    /// Returns the platform this instance was created with -- e.g. so a caller holding only a
+    /// [`LiteBox`] (not a `Platform` reference directly, as `litebox_shim_linux::GlobalStateHandle`
+    /// callers into `syscalls::unix`'s `SharedUnixConnTable` are) can still reach
+    /// platform-specific instance methods such as `SystemInfoProvider::is_process_alive`.
+    pub fn platform(&self) -> &'static Platform {
+        self.x.platform
+    }
+
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent

@@ -12709,6 +12709,34 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         usize::try_from(count).unwrap_or(1).max(1)
     }
 
+    /// Same `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` liveness
+    /// check `RawMutex::try_recover_from_dead_holder_unregistered` already uses for its own
+    /// dead-holder recovery (see that function's doc comment) -- not factored into a shared helper
+    /// this pass (that `RawMutex` method is a private inherent method on a different type in this
+    /// same file, and unifying them is a pure refactor out of scope for the live bug this exists
+    /// to fix), but deliberately the identical two Win32 calls and the identical dead/alive
+    /// verdict rule, so a future unification is a mechanical dedup rather than a behavior change.
+    fn is_process_alive(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: liveness probe only, minimum access requested.
+        let handle = unsafe {
+            Win32_Threading::OpenProcess(Win32_Threading::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        // SAFETY: `handle` was just successfully opened above.
+        let ok = unsafe { Win32_Threading::GetExitCodeProcess(handle, &raw mut exit_code) };
+        // SAFETY: `handle` is a valid, owned handle not used again after this point.
+        unsafe {
+            Win32_Foundation::CloseHandle(handle);
+        }
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+
     /// Real host memory via `GlobalMemoryStatusEx`, with the AVAILABLE figure deliberately
     /// discounted before it is reported to the guest.
     ///

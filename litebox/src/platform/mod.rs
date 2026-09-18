@@ -1618,6 +1618,29 @@ pub trait SystemInfoProvider {
         1
     }
 
+    /// Returns whether the OS process identified by `pid` (a real, host-level process id -- e.g.
+    /// the value already used as `owner_pid`/`self_pid` in `litebox_shim_linux::syscalls::unix`'s
+    /// `unix_addr_presence`/`SharedUnixConnectQueue` diagnostics) is still alive.
+    ///
+    /// Used to reclaim fixed-capacity shared-arena state (e.g.
+    /// `syscalls::unix::SharedUnixConnTable`'s connection slots) whose only release path is a
+    /// cooperative `Drop` that never runs when the owning process is torn down externally
+    /// (`TerminateProcess`/a supervisory timeout-kill) instead of exiting normally -- confirmed
+    /// live 2026-09-18 (Track B, twentieth pass): every `LITEBOX_PROCESS_FORK=1` child caught
+    /// stuck in `sys_ppoll` on a cross-process AF_UNIX connection and then killed by the boot
+    /// script's own timeout leaked its `SharedUnixConnTable` slot forever, permanently exhausting
+    /// the (deliberately small, `SHARED_UNIX_CONN_CAPACITY`-bounded) pool after only a handful of
+    /// such kills and silently ECONNREFUSED-ing every X11/D-Bus client that tried to connect
+    /// afterward -- the actual mechanism behind a desktop that (intermittently, depending on how
+    /// many prior connects had already been killed) never finished booting.
+    ///
+    /// Default `true` (assume alive) so a platform that cannot cheaply answer this just never
+    /// reclaims -- matching every existing platform's prior behavior exactly rather than risking a
+    /// false "dead" verdict that steals a genuinely live process's state.
+    fn is_process_alive(&self, _pid: u32) -> bool {
+        true
+    }
+
     /// Real host memory, as `(total_kb, available_kb)`, for `/proc/meminfo`.
     ///
     /// # Why this must be real, not a fixed value

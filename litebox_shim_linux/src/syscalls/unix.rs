@@ -417,7 +417,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
         let key = self.addr.to_key();
         let (kind, key_bytes) = presence_kind_and_bytes(&key);
         let (request_idx, client_cred) = global.unix_shared_connect_queue.try_claim(kind, key_bytes)?;
-        let Some(slot) = global.unix_shared_conn_table.alloc(&client_cred, &self.listener_cred) else {
+        let Some(slot) = global
+            .unix_shared_conn_table
+            .alloc(global.litebox.platform(), &client_cred, &self.listener_cred)
+        else {
             // Pool exhausted -- leave this request CLAIMED-but-never-completed; the client's own
             // bounded poll loop eventually times out and retries with a fresh `post()`. Bounded,
             // self-healing, never a panic.
@@ -2751,7 +2754,7 @@ where
 /// bus each accept a modest number) -- same sizing philosophy as [`UNIX_ADDR_PRESENCE_CAPACITY`]/
 /// `MAX_SOCKETS`.
 ///
-/// Sized SMALL on purpose, together with [`SHARED_UNIX_CONN_BUF`] below -- learned live,
+/// Sized small on purpose, together with [`SHARED_UNIX_CONN_BUF`] below -- learned live,
 /// 2026-09-18: `GlobalState` (which embeds this table) is constructed as an ordinary Rust value
 /// and passed BY VALUE through `create_shared_kernel_state`/`SharedArc::new` before being placed
 /// in the shared arena, so an oversized field here blows the constructing thread's stack before
@@ -2759,7 +2762,16 @@ where
 /// this table at 8 MiB total). [`UnixAddrPresenceSlot`]'s own proven-safe table is ~31 KiB total
 /// (256 slots x ~124 bytes) -- this table's total footprint is kept in that same order of
 /// magnitude rather than sized generously the way a heap-backed collection could be.
-pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 8;
+///
+/// Raised from 8 to 64 (matching [`SHARED_UNIX_CONNECT_QUEUE_CAPACITY`]'s own scale; still well
+/// under an order of magnitude below the 8 MiB stack-overflow threshold above at ~256 KiB total)
+/// as a mitigation for a real, live-caught leak this same pass also adds proper (bounded)
+/// reclaim for -- see [`SharedUnixConnTable::alloc`]'s doc comment: a slot's only release path is
+/// a cooperative `Drop` that never runs when its owning process is killed externally rather than
+/// exiting normally, which every `sys_ppoll`-stuck client caught and killed during this
+/// investigation did. A bigger pool buys more time before that leak (now partially, safely
+/// recovered by `alloc`'s own dead-holder reclaim) can exhaust it entirely.
+pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 64;
 
 /// Per-direction shared ring buffer capacity. Bounded like a real kernel AF_UNIX socket's own
 /// finite send/receive buffer: this is control-plane protocol traffic (X11/D-Bus requests and
@@ -2946,8 +2958,50 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
     }
 
     /// Claims a free slot and fills it in; returns its index, or `None` if every slot is in use
-    /// (degrades to `ECONNREFUSED`/`EAGAIN` at the call site, never panics).
-    fn alloc(&self, client_cred: &Ucred, server_cred: &Ucred) -> Option<u32> {
+    /// and none can be reclaimed (degrades to `ECONNREFUSED`/`EAGAIN` at the call site, never
+    /// panics).
+    ///
+    /// `platform` is used only for the dead-holder reclaim pass below (see [`Self::
+    /// reclaim_dead_slot`]) -- never for the ordinary fast path, which stays exactly as cheap as
+    /// before.
+    fn alloc(&self, platform: &Platform, client_cred: &Ucred, server_cred: &Ucred) -> Option<u32> {
+        if let Some(idx) = self.try_claim_empty(client_cred, server_cred) {
+            return Some(idx);
+        }
+        // No EMPTY slot on the fast path -- before degrading the caller to `ECONNREFUSED`/
+        // `EAGAIN`, check whether any OCCUPIED slot is actually orphaned: live-caught 2026-09-18
+        // (Track B, twentieth pass), every `LITEBOX_PROCESS_FORK=1` client caught stuck in
+        // `sys_ppoll` on a cross-process AF_UNIX connection (via `cdb -pv`, confirming the AF_UNIX
+        // bounded-15ms repoll this codebase already added to `PollSet::wait` IS engaged --
+        // `has_unwakeable_fd=true`/`register=false` live in the debugger -- so the repoll itself
+        // is not the defect) was eventually killed by the boot script's own timeout rather than
+        // exiting normally. A killed process never runs `Drop`, so its
+        // `ConnTransport::Shared`/`UnixConnectedStream`'s `free()` call never happens either --
+        // this table's fixed pool silently, permanently loses one slot per such kill, with no
+        // prior recovery path at all. Reclaim requires BOTH the client's and the server's owning
+        // process to be confirmed dead ([`litebox::platform::SystemInfoProvider::
+        // is_process_alive`]) -- deliberately conservative: reclaiming a slot a still-live process
+        // (e.g. a long-lived listener like Xvfb, which normally outlives any one client) still
+        // holds a reference to would hand a live user's connection state out from under it, a
+        // strictly worse bug than the leak this fixes. This therefore does not recover every leak
+        // (a slot whose long-lived server side never dies is never reclaimed this way -- see
+        // [`SHARED_UNIX_CONN_CAPACITY`]'s own doc comment for why the capacity was also raised, as
+        // the complementary mitigation for exactly that remaining case), but is unconditionally
+        // safe: it never disrupts a slot either endpoint might still be using.
+        for slot in &self.slots {
+            if self.reclaim_dead_slot(slot, platform)
+                && let Some(idx) = self.try_claim_empty(client_cred, server_cred)
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Fast-path claim: atomically takes the first `EMPTY` slot found and fills it in for a new
+    /// connection. Split out of [`Self::alloc`] so its dead-holder reclaim pass can retry this
+    /// exact logic after freeing an orphaned slot, without duplicating the fill-in fields.
+    fn try_claim_empty(&self, client_cred: &Ucred, server_cred: &Ucred) -> Option<u32> {
         for (i, slot) in self.slots.iter().enumerate() {
             if slot
                 .state
@@ -2971,6 +3025,35 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             }
         }
         None
+    }
+
+    /// If `slot` is `OCCUPIED` but both its client and server owning processes are confirmed
+    /// dead, frees it back to `EMPTY` and returns `true`. A CAS guards the actual free so two
+    /// racing callers that both observe the same orphaned slot never double-free it -- the loser
+    /// simply returns `false` and moves on (to the next slot, or a later call).
+    fn reclaim_dead_slot(&self, slot: &SharedConnSlot<Platform>, platform: &Platform) -> bool {
+        if slot.state.load(Ordering::Acquire) != CONN_SLOT_OCCUPIED {
+            return false;
+        }
+        let client_pid = slot.client_pid.load(Ordering::Relaxed);
+        let server_pid = slot.server_pid.load(Ordering::Relaxed);
+        if platform.is_process_alive(client_pid) || platform.is_process_alive(server_pid) {
+            return false;
+        }
+        let reclaimed = slot
+            .state
+            .compare_exchange(
+                CONN_SLOT_OCCUPIED,
+                CONN_SLOT_EMPTY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if reclaimed {
+            slot.client_to_server.reset();
+            slot.server_to_client.reset();
+        }
+        reclaimed
     }
 
     fn get(&self, idx: u32) -> &SharedConnSlot<Platform> {
