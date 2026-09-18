@@ -738,3 +738,89 @@ the exact function without cross-referencing source the way this addendum just d
 temporary `eprintln!` directly at the real `wait_on_tun`/`NatGateway::new` call sites to prove
 which (if either) genuinely fires here, before spending further time reading the release binary's
 own disassembly.
+
+## Eighteenth pass, 2026-09-18 -- systematic GlobalState field audit, debug binary, unambiguous stall read
+
+**Eighteenth pass, 2026-09-18 -- systematic `GlobalState` field audit (3 more defects fixed), a
+debug build for reliable `cdb` symbols, and an unambiguous read on the post-xset stall.**
+
+*Audit.* Every field of `GlobalState` (`litebox_shim_linux/src/lib.rs`) was classified by hand:
+POD/pointer-free (safe as-is) vs heap-indirection (BTreeMap/Vec/Arc, needing per-process shadowing
+or a real shared-arena-native redesign, per which semantics it actually needs). Three more
+defects found, not yet fixed by any prior pass, all fixed and verified this pass (66 `litebox`
+unit tests pass, cargo check clean, cheap repro passes):
+- `unix_addr_table` (BTreeMap) -- its own companion table's doc comment already said entries are
+  kept "alongside (never instead of) each process's own real `UnixAddrTable`", i.e. always meant
+  to be per-process-private. Shadowed onto `GlobalStateHandle`, same treatment as
+  `elf_patch_cache`.
+- `fifo_registry` (BTreeMap) -- its own doc comment already said "shared by every thread of this
+  process -- but NOT across processes". Same shadow fix.
+- `sysv_shm` (two BTreeMaps) -- genuinely DOES need real cross-process visibility (X11 MIT-SHM /
+  Xvfb's `-shmem` framebuffer / selkies pixelflux all depend on two different guest processes'
+  `shmget(same key)` resolving to the same segment), so shadowing would break real semantics.
+  Redesigned as a fixed 128-slot pointer-free array (`SysvShmSegment` is already fully
+  `Copy`/POD) -- inherits `GlobalState`'s own cross-process sharing for free, same pattern
+  `SharedUnixAddrPresenceTable` established.
+
+Remaining fields the same audit found still defective, NOT yet fixed (deeper redesign than a flat
+Copy-slot array, since their payload types own real heap state -- `Arc<FlockFile>`/`PtyFd`
+ring-buffers, `Pollee` observer lists): `pty_registry`, `daemon_pty_masters`, `flock_registry`,
+`drm` (`DrmSubsystem`), `evdev` (`EvdevSubsystem`) -- all genuinely need cross-process visibility
+per their own doc comments (a real global `/dev/pts`/flock/DRM/evdev namespace), none touched by
+the Xvfb/selkies boot path this investigation targets, so left as follow-on work (pickup list
+below). `bootstrap_process` (`OnceBox<Arc<Process>>`) was also audited and is DIFFERENT in kind
+from the rest: it is set exactly ONCE, before any fork ever occurs, so on this codebase's real-
+address-space-duplicating fork model every later descendant should have a valid mapping at that
+address by construction (unlike a `BTreeMap` mutated post-fork by many different processes) --
+plausibly already safe; left as-is pending live confirmation rather than patched speculatively.
+
+*Debug binary.* `cargo build -p litebox_runner_linux_on_windows_userland` (no `--release`) --
+the workspace has no `[profile.release]` override anywhere, so "release" is plain
+`opt-level=3`+default codegen-units, and the ambiguous/merged symbols both this pass and the
+seventeenth pass hit are MSVC linker-level ICF (identical-code-folding, `/OPT:ICF`, applied by
+default once optimization is on) folding distinct functions into one symbol, not LTO (already
+off). The plain `cargo build` dev profile disables optimization entirely (codegen-units=256,
+opt-level=0), which keeps ICF from ever triggering. Produces
+`target/debug/litebox_runner_linux_on_windows_userland.exe` + matching `.pdb` (~25MB exe, ~240MB
+pdb.) Confirmed live: boots the real cheap repro correctly; booted the real
+`.wfgy/webtop_stack.sh` workload (much slower -- fine, diagnostic only) and reproduced the same
+stall as the release binary at the same script offset. **Use this binary, not the release one,
+any time a `cdb` read needs to be trusted** -- symbol path `target/debug` (matching `.pdb` sits
+next to the exe already, no separate copy step needed the way the release-binary symbolizer
+script requires).
+
+*The post-xset stall -- unambiguous read obtained, BOTH prior candidate theories REFUTED, real
+blocking site pinned down.* A non-invasive `cdb -pv` snapshot of the RELEASE binary stuck at the
+same point reproduced the exact ambiguity the seventeenth pass flagged: one thread's stack read
+as `syscalls::process::Task::sys_execve::copy_vector+0xd78` calling directly into `net::
+wait_on_tun` (impossible per source, confirmed again), a different thread simultaneously showed a
+`NatGateway::new` call folded into an unrelated `shared_arc_probe_parent_prepare` diagnostic
+closure's name -- both textbook ICF garbling, not real call graphs. Re-ran the IDENTICAL repro
+(`LITEBOX_PROCESS_FORK=1` + `.wfgy/webtop_stack.sh`, `--resume-from .wfgy/webtop_seed.tar`)
+against the new DEBUG binary; it stalled at the same script offset (19289, `xrdb`'s own line,
+winpid distinct each run) and a `cdb -pv -y target\debug` snapshot this time gave 7 clean,
+internally-consistent, non-folded stacks (`.wfgy/cdb_debugbuild_snapshot.log`):
+- Both release-build candidates are explained as false leads from otherwise-legitimate BACKGROUND
+  threads, not the blocking site: one thread genuinely is inside `net::wait_on_tun` -- but it is
+  the per-fork-child `net_worker` thread's OWN normal <=1ms-bounded poll loop
+  (`litebox_runner_linux_on_windows_userland/src/lib.rs:1935-1966`), doing exactly what it always
+  does; another genuinely is inside `NatGateway::new`'s own background retry closure, also
+  ordinary standing infrastructure. Neither blocks guest forward progress.
+- The REAL blocked thread (unambiguous, clean symbols, zero inlining/folding): a guest `ppoll()`
+  syscall -- `litebox_shim_linux::syscalls::file::sys_ppoll` -> `epoll::PollSet::wait` ->
+  `litebox::event::wait::WaitContext::commit_wait` -> `RawMutex::block_or_maybe_timeout` --
+  genuinely parked on a `Condvar`. `PollSet::wait` (`syscalls/epoll.rs:929`) already contains the
+  seventeenth-pass AF_UNIX bounded-15ms-repoll fix (`has_unwakeable_fd` matches
+  `EpollDescriptor::Unix`), so this is NOT the "no wake at all" gap that fix closed -- the log's
+  own evidence (`self_pid=13684 owner_pid=13008`, a `[unix_addr_presence] ECONNREFUSED... bound by
+  a DIFFERENT guest pid` WARN printed 3.4s into this run, before the stall) shows this same guest
+  process already took the `connect_cross_process` cross-process path once. The bounded repoll IS
+  running (small-but-nonzero CPU matches a low-duty-cycle 15ms loop, not a true freeze) but
+  whatever readiness condition it is polling for (`Backlog::check_io_events`'s
+  `unix_shared_connect_queue.has_pending(...)` check, `syscalls/unix.rs:449-467`, looked correct
+  on inspection) never flips true. **Not yet fully root-caused**: did not get far enough this pass
+  to pin down, with live variable inspection (`cdb`'s `dv`/`dt` against this exact stuck thread),
+  which specific fd/direction is polling (listener-side `Backlog::check_io_events` vs. an
+  already-`connect()`ed client waiting on a reply that its peer never sends) -- next session:
+  reproduce again, and BEFORE anything else `dt`/`dv` thread 1's `PollSet` locals (entries/fds) at
+  the exact stuck point to identify the fd, then trace which side of the rendezvous never posts.
