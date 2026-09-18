@@ -197,13 +197,18 @@ nothing; the parent's `wait4()` emulation then reports that exit code to the gue
 `Killed`. **Fix**: `GlobalStateHandle` carries its own fresh-per-process `memfds`/`shared_files`
 (same shape as `elf_patch_cache` et al.), shadowing the removed `GlobalState` fields with no call-
 site changes. Build clean. **Live-verified twice**: `xset` now completes cleanly, 2/2, zero panics.
-**A different, deeper, NOT-YET-ROOT-CAUSED stall sits immediately past this fix, deterministic
-2/2**: the very next fork child (`xrdb`, script offset ~19289) enters `connect_cross_process`
-against an abstract-namespace address, logs the already-known cross-process-presence WARN, then
-makes no further progress at all (near-zero CPU) for 100s+ -- past `SHARED_UNIX_CROSS_CONNECT_
-TIMEOUT`'s documented 3s bound, which reads correct on inspection but evidently isn't reached.
-Concrete next step: `cdb -pv` attach to the stuck winpid, `~*k` to see the real blocked primitive.
-Full evidence and the exact code read: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**A different, deeper, NOT-YET-ROOT-CAUSED stall sits immediately past this fix, recurring across
+several boots** (sometimes resolves into the SAME `xset q ... Killed` -> `XVFB_FAILED` symptom
+this whole investigation started from, after a long delay; sometimes stalls again immediately
+after that on the next fork). Non-invasive `cdb -pv` snapshots (symbol-resolved, `.pdb` present)
+of two different stuck occurrences show real, live `Condvar`-based waits, but do NOT agree on
+which function -- one read as `connect_cross_process`'s abstract-socket rendezvous, another as
+`net::wait_on_tun`/`NatGateway::new`'s `OnceLock` init, and the second one's own caller offset
+(`copy_vector+0xd78`) is too large to trust against this build's own "symbol-resolution noise"
+lesson (checked directly against source: `copy_vector` has no networking call at all). Concrete
+next step: do not trust either symbol without cross-referencing source; add a targeted `eprintln!`
+at the real candidate call sites, or use a non-LTO debug build, before reading more disassembly.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 

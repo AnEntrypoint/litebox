@@ -699,3 +699,42 @@ finding -- proceeded per standing instruction rather than treating it as a block
 files added, per standing rule. `.wfgy/cdb_catch_xset.txt` (the cdb command script) and this pass's
 `.wfgy/cdb_boot_catch*.log`/`boot_memfds_fix*.log`/`boot_debug_unix.log` repro logs are gitignored
 scratch artifacts, not committed.
+
+**Addendum, same pass: a non-invasive `cdb -pv` symbol-resolved snapshot of a THIRD live
+occurrence of this stall, and why it does NOT settle the question.** With `-y <target/release>`
+(this build's own `.pdb` is present) and `.reload /f`, `~*k` on the stuck winpid resolved real
+function names instead of raw offsets, cross-process-safely (`-pv`, confirmed `Detached` cleanly,
+target still alive afterward). Five threads total: (0) `main` blocked in `Thread::join` on the
+guest-execution thread (expected); (1) a guest-level pty/epoll wait inside
+`diag_process_fork_globalstate_probe_inner` (a second, DIFFERENT guest thread, unrelated); (2) the
+already-known `fault_terminate_watchdog_thread_body` sleep loop (expected, benign); (3) the REAL
+guest-execution thread (matches this pass's own `task-resume-probe` log line, confirmed via
+`diag_process_fork_task_resume_probe` in its own stack), blocked in `Condvar::wait_timeout` ->
+`futex_wait` -> `WaitOnAddress`, symbol-resolved as `litebox_platform_windows_userland::net::
+wait_on_tun+0xf8` called from `syscalls::process::sys_execve::copy_vector+0xd78`; (4) a separate
+thread blocked in a literal `thread::sleep` inside `OnceLock::call_once_force` ->
+`SharedArc::...::shared_arc_probe_parent_prepare` -> `net::NatGateway::new`, i.e. a real,
+plausible retry-backoff loop lazily constructing the NAT gateway singleton. **This does NOT
+confirm the fifteenth pass's `wait_on_tun`-REFUTED finding was wrong**: frame 3's own caller
+offset (`copy_vector+0xd78`, +3192 bytes) is far too large to trust for a ~40-line function that
+does nothing but walk pointers and build `CString`s -- checked directly against
+`litebox_shim_linux/src/syscalls/process.rs:5985-6022`'s actual source, which contains no
+networking call of any kind. This is exactly the symbol-resolution-noise failure mode this
+project's own standing lesson already names ("trust only small offsets," `docs/
+AGENTS_ARCHIVE_2026-09-17.md:1852`) -- `wait_on_tun`'s own thin wrapper around the generic
+`Condvar::wait_timeout` is a strong ICF (identical-code-folding) merge candidate with some other,
+differently-purposed thin wait wrapper, and the debugger has no way to disambiguate which one a
+merged symbol's name actually refers to at this call site. **What IS reliable**: this process is
+genuinely blocked (not spinning) inside SOME capped-or-uncapped `Condvar`-based wait reached from
+somewhere inside real guest-execve-adjacent code, concurrently with a second thread genuinely
+sleep-retrying `NatGateway::new`'s lazy `OnceLock` initialization -- a real, live, two-thread
+wait/init relationship worth a dedicated future pass, but NOT provably the AF_UNIX
+`connect_cross_process` path this pass's earlier, non-symbolized `Abstract([47, 116, 109, 112,
+...])`-address evidence pointed at (a DIFFERENT stuck winpid, different occurrence -- the two may
+be entirely different mechanisms that both happen to stall around the same point in the boot
+script, not one mechanism). **Concrete next step, refined**: do not trust either symbol name for
+the exact function without cross-referencing source the way this addendum just did for
+`copy_vector`; either build a debug (non-LTO/non-ICF) binary for one targeted repro, or add a
+temporary `eprintln!` directly at the real `wait_on_tun`/`NatGateway::new` call sites to prove
+which (if either) genuinely fires here, before spending further time reading the release binary's
+own disassembly.
