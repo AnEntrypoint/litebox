@@ -124,44 +124,38 @@ PASSED; real full-boot-stall root cause was a smoltcp stale-`SocketHandle` panic
 offsets). (16) `webtop_stack.sh`'s `[ -S "$XSOCK" ]` never true on this shim, fixed: `-S` → `-e`.
 (17) `xset q`'s silent kill CAUGHT LIVE + FIXED (`memfds`/`shared_files` per-process-shadowed).
 
-**Eighteenth pass, 2026-09-18 -- systematic `GlobalState` field audit (3 more defects fixed), a
-debug build for reliable `cdb` symbols, an unambiguous read on the post-xset stall (detail:
-archive).** Fixed `unix_addr_table`/`fifo_registry` (per-process-private, shadowed) and `sysv_shm`
-(fixed 128-slot array). Still open, deeper redesign needed: `pty_registry`/`daemon_pty_masters`/
+**Eighteenth pass** — systematic `GlobalState` field audit (3 more defects fixed: `unix_addr_
+table`/`fifo_registry` per-process-shadowed, `sysv_shm` fixed 128-slot array), a debug build for
+reliable `cdb` symbols. Still open, deeper redesign needed: `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (pickup list). Found the real blocked thread: guest `ppoll()`
-(`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`), parked on a
-Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` never flips true.
+parked on a Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` never
+flips true. Full detail: archive.
 
-**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall (twice), `has_pending`/queue logic
-REFUTED as the bug; found a real-but-unconfirmed `Init`-state gap in `UnixInitStream::
-check_io_events`. Full detail: archive.
+**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall, `has_pending`/queue logic REFUTED
+as the bug; found a real-but-unconfirmed `Init`-state gap in `UnixInitStream::check_io_events`.
+Full detail: archive.
 
-**Twentieth pass** — root-caused and FIXED the `SharedUnixConnTable` slot leak on
-externally-killed clients (commit `05d279d`; `SystemInfoProvider::is_process_alive` dead-holder
-check + both-endpoints-confirmed-dead reclaim in `SharedUnixConnTable::alloc` +
-`SHARED_UNIX_CONN_CAPACITY` 8->64). Live-confirmed the AF_UNIX bounded-15ms-repoll in
-`PollSet::wait` (13th pass) IS engaged and correctly re-scanning -- not the bug. Found (not yet
-fixed at the time) a second, separate `wait4(-1)` stall with no bounded-repoll fallback. Full
-transcripts, cdb technique notes: archive.
+**Twentieth pass** — FIXED the `SharedUnixConnTable` slot leak on externally killed clients
+(commit `05d279d`; dead-holder check + reclaim, `SHARED_UNIX_CONN_CAPACITY` 8->64). Confirmed the
+AF_UNIX bounded-15ms-repoll IS engaged and re-scanning -- not the bug. Found (not yet fixed) a
+second `wait4(-1)` stall with no bounded-repoll fallback. Full detail: archive.
 
-**Twenty-first pass** — root-caused and FIXED the `wait4(-1)` stall (commit `a771692`): no
-bounded-repoll fallback on `pid == -1`. Browser milestone not reached. Full detail: archive.
+**Twenty-first pass** — FIXED the `wait4(-1)` stall (commit `a771692`): no bounded-repoll
+fallback on `pid == -1`. Browser milestone not reached.
 
 **Twenty-second/twenty-third passes** — `_nofork_tick()` removed a `sleep`-forks-every-iteration
-cost from the Xvfb/dbus wait loops (script-only), then a real regression in that same fix (dash's
-`$SECONDS` unset, collapsing the busy-wait to a no-op) was found and fixed. Chased an AF_UNIX
-rendezvous "livelock" (timing race vs. address mismatch candidates) that the twenty-fourth pass
-below REFUTED entirely. Browser milestone not reached either pass. Full detail: archive.
+cost from the Xvfb/dbus wait loops (script-only), then a real regression in that fix (dash's
+`$SECONDS` unset, collapsing the busy-wait to a no-op) was found+fixed. Chased an AF_UNIX
+rendezvous "livelock" REFUTED entirely by the twenty-fourth pass below. Browser milestone not
+reached. Full detail: archive.
 
 **Twenty-fourth pass** — live per-request `debug!()` instrumentation (`unix.rs`, kept) proved
 **the AF_UNIX rendezvous mechanism itself sound**: the one real cross-process connect per boot
-(Xvfb's X11 socket) succeeded in ~23ms both times, no timing race, no address/key mismatch (the
-`kind=1`/`kind=0` dual registration is correct real-Linux X11 behavior). **Real blocker found
-upstream of AF_UNIX entirely**: `webtop_stack.sh`'s own `$XSOCK` wait loop (lines 319-322) never
-completed even once — `xset q`/`/usr/bin/sleep` appeared ZERO times in 5-17-minute traces. Also
-FIXED along the way: `sys_wait4`'s `pid > 0` branch had no bounded-repoll fallback (mirrors the
-already-fixed `pid == -1` case). Leading hypothesis for next pass: writable-layer
-cross-child-visibility (pickup item 3) — not yet directly confirmed. Full detail: archive.
+succeeded in ~23ms both times, no timing race, no address/key mismatch (`kind=1`/`kind=0` dual
+registration is correct real X11 behavior). **Real blocker found upstream of AF_UNIX entirely**:
+`$XSOCK` wait loop (lines 319-322) never completed even once. Also FIXED: `sys_wait4`'s `pid > 0`
+branch had no bounded-repoll fallback. Leading hypothesis for next pass: writable-layer
+cross-child-visibility (pickup item 3). Full detail: archive.
 
 Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
 kill. **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass** — refuted a
@@ -182,10 +176,11 @@ Live evidence: the shell's own `[ -e "$XSOCK" ]` broke out for the first time in
 cross-process-forked Windows processes, RAM as low as ~300-450MB) made the listener's own 15ms
 re-poll thread starve for scheduling — widened to 15s; live `unix=debug` trace then showed a
 genuine end-to-end cross-process AF_UNIX connect for Xvfb's real X11 socket complete
-(`request completed ... slot=0`), the first ever directly witnessed on this path. `[s] XVFB_UP`
-itself not yet directly witnessed printing (pickup list below has the precise next step). Did NOT
-reach the XFCE-desktop/browser/terminal/apps milestone this pass. Full evidence, all seven boot
-attempts: `docs/AGENTS_ARCHIVE_2026-09-18.md`, twenty-fifth pass.
+(`request completed ... slot=0`), the first ever directly witnessed on this path. **Third finding,
+one layer deeper**: the established connection's data doesn't flow — pickup list below has the
+precise cdb-confirmed evidence and next step. Did NOT reach the XFCE-desktop/browser/terminal/apps
+milestone this pass (ten boot attempts total). Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`,
+twenty-fifth pass.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -204,18 +199,25 @@ branch had no repoll fallback~~ (commit pending, twenty-fourth pass, mirrors the
 path~~ (twenty-fifth pass: `cross_process_bound_unix_socket_status` + presence-table fallback in
 `do_stat`/`do_access`, `litebox_shim_linux/src/syscalls/file.rs`)/~~`SHARED_UNIX_CROSS_CONNECT_
 TIMEOUT` (3s) too tight under real multi-process contention~~ (twenty-fifth pass: widened to 15s)
-— all REFUTED or FIXED, passes 15-25 (archive). **Current top blocker (twenty-fifth pass)**: none
-confirmed yet — `[s] XVFB_UP` has not been directly witnessed printing (every run that reached a
-successful `connect_cross_process` completion was still healthy/running when this session's own
-time/RAM budget ended it). **Next step**: one more
-patient, well-resourced boot watched long enough past the connect-succeeds point to see `[s]
-XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED`/`SELKIES_PORT_UP` actually print, then push forward. Secondary,
-not yet chased: the `kind=1` (abstract) AF_UNIX connect variant still timed out at 15s in the one
-run exercising both, while `kind=0` (path) succeeded — only worth chasing if a future pass sees
-BOTH fail (real X11 libraries retry across variants). The general writable-layer-visibility gap
-(item 3 below) remains open for anything that ISN'T a bound AF_UNIX path (e.g. `webtop_stack.sh`'s
-own `/tmp/empty: No such file or directory`, still observed, unfixed by the narrow AF_UNIX-only
-fallback). cdb technique notes (still current): set
+— all REFUTED or FIXED, passes 15-25 (archive). **Current top blocker (twenty-fifth pass,
+continued)**: connection establishment works end-to-end now (live-confirmed), but the established
+connection's DATA doesn't flow — `xset q` writes its 12-byte X11 `xConnClientPrefix` into the
+shared ring (`try_sendto_shared: wrote`, new permanent debug site), but Xvfb's own read of it
+(`try_recvfrom_shared: read`) was never observed across three full boots (8-20+ min each). Two
+live cdb snapshots of Xvfb's guest thread, seconds apart, show DIFFERENT stack addresses on the
+same `commit_wait` frame — proves it's a correctly-cycling bounded-repoll (`sys_epoll_pwait ->
+EpollFile::wait`), not frozen, so the repoll runs but never sees the connected client fd as ready.
+**Next step**: a THROTTLED `syscalls::epoll=debug` (mirror `has_pending`'s 1-in-400 gate — an
+unthrottled one hit 78MB in under 8 minutes, unusable) to check whether Xvfb's own
+`epoll_ctl(ADD, new_client_fd)` ever runs after `accept()` (leading hypothesis: it doesn't), or
+`entry.poll(global)`'s readiness bookkeeping has a gap specific to a freshly-`Shared`-transport
+`Connected` socket vs. the well-tested `Local` case. Full detail: archive. Once closed, confirm
+`[s] XVFB_UP` prints, then push to `DBUS_UP`/`DE_LAUNCHED`/`SELKIES_PORT_UP`. Secondary, not yet
+chased: the `kind=1` (abstract) connect variant still timed out at 15s in the one run exercising
+both, `kind=0` (path) succeeded — only worth chasing if a future pass sees BOTH fail. The general
+writable-layer-visibility gap (item 3 below) remains open for anything that ISN'T a bound AF_UNIX
+path (`webtop_stack.sh`'s own `/tmp/empty`, still observed). cdb notes (still current, PLUS: two
+snapshots seconds apart distinguish cycling from frozen — one snapshot alone is NOT proof): set
 `_NT_SYMBOL_PATH` env var (not `-y`); only the LAST `-c` flag is honored, chain one `;`-joined
 string (e.g. `~*kb;qd`, never a bare `q`); dump `~*kb` first (thread index isn't stable across
 binaries), then `.frame N; dv /t /v` on the specific frame of interest. Separately, still open:

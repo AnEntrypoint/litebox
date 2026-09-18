@@ -926,6 +926,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
         if msg.data.len() > SHARED_UNIX_CONN_BUF {
             let n = write_ring.try_write(&msg.data[..SHARED_UNIX_CONN_BUF]);
+            litebox_util_log::debug!(
+                slot:% = *slot, is_client:% = *is_client, len:% = n;
+                "DIAG try_sendto_shared: partial write (oversized message)"
+            );
             return if n == 0 {
                 Err((msg, Errno::EAGAIN))
             } else {
@@ -935,6 +939,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         if !write_ring.try_write_all(&msg.data) {
             return Err((msg, Errno::EAGAIN));
         }
+        litebox_util_log::debug!(
+            slot:% = *slot, is_client:% = *is_client, len:% = msg.data.len();
+            "DIAG try_sendto_shared: wrote"
+        );
         Ok(msg.data.len())
     }
 
@@ -1035,6 +1043,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let (read_ring, _) = Self::shared_rings(global, *slot, *is_client);
         let n = read_ring.try_read(buf);
         if n > 0 {
+            litebox_util_log::debug!(
+                slot:% = *slot, is_client:% = *is_client, len:% = n;
+                "DIAG try_recvfrom_shared: read"
+            );
             self.pollee.notify_observers(Events::OUT);
             return Ok((n, Vec::new()));
         }

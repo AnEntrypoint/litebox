@@ -1544,3 +1544,77 @@ status`), `litebox_shim_linux/src/syscalls/file.rs` (`do_stat`/`do_access` fallb
 `cross_process_bound_unix_socket_stat` helper), `litebox_shim_linux/src/syscalls/unix.rs`
 (`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` 3s -> 15s). `.wfgy/repro_xsock_fallback_v1.ps1` (new,
 gitignored launch script, `unix=debug` logging).
+
+### Twenty-fifth pass, continued -- the NEXT blocker found and precisely characterized:
+### `xset q` writes its X11 setup request into the shared ring, but Xvfb's own read of it was
+### never observed across three more full boot attempts; live cdb evidence rules out the
+### obvious "connect timeout" and "genuinely frozen thread" explanations
+
+**Method.** Added two new, permanent, low-volume `debug!()` sites (kept, cheap -- fire once per
+real transfer, not per poll iteration, same discipline as the AF_UNIX rendezvous instrumentation
+already in this file): `try_sendto_shared`/`try_recvfrom_shared`
+(`litebox_shim_linux/src/syscalls/unix.rs`), logging `slot`/`is_client`/`len` on every real
+byte-level write/read over a `Shared`-transport AF_UNIX connection -- the ONE thing the existing
+`unix=debug` instrumentation never covered (it stopped at connection establishment). Rebooted with
+`unix=debug` (not `epoll=debug` -- confirmed live this pass that `epoll=debug` is catastrophically
+hot, 78MB of log in under 8 minutes on this exact repro, an order of magnitude worse even than the
+already-documented `file=debug` cost; unconditional per-iteration `EpollFile::wait` logging is not
+usable for a real boot and needs the SAME kind of throttle `has_pending`'s own 1-in-400 gate
+already applies before any future pass re-enables it).
+
+**Finding.** Across three of the run's boot attempts, `xset q`'s own initial X11
+`xConnClientPrefix` write (exactly 12 bytes -- the real wire size of that struct) landed cleanly:
+`DIAG try_sendto_shared: wrote slot=0 is_client=true len=12`. In every one of those three runs,
+**zero corresponding `try_recvfrom_shared: read` ever appeared on Xvfb's (`is_client=false`) side**
+across 8-20+ minutes of continued observation, while Xvfb's OWN listening-socket idle-accept loop
+(`SharedUnixConnectQueue::has_pending`, a DIFFERENT code path) kept ticking normally on its
+~3.2s cadence the entire time -- Xvfb is provably alive, scheduled, and executing, just never
+observed reading the 12 bytes sitting in the ring.
+
+**Live cdb evidence, directly ruling out two competing explanations.** Attached `cdb -pv` to
+Xvfb's own Windows process (identified via matching `owner_pid`/winpid -- confirmed live this
+pass that `LITEBOX_PROCESS_FORK=1` uses the real Windows PID as the guest PID directly, so the
+two numberings coincide) and took two stack snapshots of its single guest-execution thread
+several seconds apart. Both times the thread was inside `sys_epoll_pwait -> EpollFile::wait ->
+Pollee::wait -> WaitContext::wait_on_events -> wait_until -> commit_wait ->
+RawMutex::block_or_maybe_timeout` -- BUT the two snapshots' frame arguments differed (different
+stack addresses on the `commit_wait` frame), proving this is a live, CYCLING bounded-repoll loop,
+not a single permanently-parked wait -- ruling out "genuinely frozen thread" as the explanation
+(the mistake the pass's own first read of a single cdb snapshot nearly made; two snapshots,
+`docs/AGENTS_ARCHIVE_2026-09-18.md`'s own established technique from the 24th pass, is what
+caught it). Source read of `litebox_shim_linux/src/syscalls/epoll.rs`'s
+`has_unready_stdin_or_armed_timerfd_interest`/`repoll_stdin_and_timerfd_interests` (added
+2026-09-18, BEFORE this session, per its own doc comment -- "AF_UNIX joins them as of
+2026-09-18") shows the bounded-repoll-with-Unix-socket-awareness mechanism this exact scenario
+needs ALREADY EXISTS and is architecturally sound on paper: any unready `EpollDescriptor::Unix`
+interest unconditionally forces a bounded (`STDIN_REPOLL_INTERVAL`) re-poll instead of an
+indefinite block, and the repoll calls `entry.poll(global)` on every registered stdin/timerfd/Unix
+interest, pushing it into the ready set the moment `check_io_events_shared` (which reads the REAL
+ring-buffer fill state fresh every call, confirmed correct by code inspection) reports it ready.
+
+**Leading, NOT YET distinguished hypotheses for the next pass** (needs a THROTTLED
+`syscalls::epoll=debug` -- e.g. mirroring `has_pending`'s 1-in-400 gate -- to get a usable trace of
+what's actually in Xvfb's interest set without a repeat of the 78MB blowup): (a) Xvfb's own guest
+code may never call `epoll_ctl(EPOLL_CTL_ADD, new_client_fd, ...)` on the just-`accept()`ed
+connection at all -- if the connected socket is never added to the interest set,
+`repoll_stdin_and_timerfd_interests` has nothing to check for it, matching the symptom exactly;
+(b) a bug in `entry.poll(global)`'s own readiness bookkeeping for a freshly-`Shared`-transport
+`Connected` `UnixSocket` specifically (as opposed to a `Local`-transport one, which is the
+well-tested, pre-existing case) -- e.g. `is_ready` getting set/stuck incorrectly, or the entry's
+`desc.upgrade()` failing for this specific descriptor shape; (c) something upstream of epoll
+entirely -- worth confirming with a debugger breakpoint on `accept()`'s own return, in Xvfb's
+guest code, that a real `epoll_ctl(ADD)` syscall follows it, before trusting (a)/(b) as the
+narrower explanation. This is a DIFFERENT, deeper layer than anything the twelfth-through-
+twenty-fifth-pass AF_UNIX rendezvous work (connection establishment, now confirmed genuinely
+working end-to-end) ever reached -- the rendezvous protocol succeeds; the established
+connection's actual byte-level conversation is what's silent.
+
+**Host state.** Three more boot attempts this continuation (ten total across the whole
+twenty-fifth pass), RAM held healthy throughout (2.6-5.8GB free, no proactive kill needed this
+half), all process trees fully cleaned via WMI `Terminate` before each next launch and at session
+end. Did NOT reach `[s] XVFB_UP`, `DBUS_UP`, `DE_LAUNCHED`, `SELKIES_PORT_UP`, or the browser/
+terminal/apps milestone this pass. `.wfgy/xvfb_cdb_dump.txt`/`xvfb_cdb_snap2.txt` (transient,
+gitignored, deleted after use) held the two raw cdb snapshots referenced above.
+
+**Files touched this continuation**: `litebox_shim_linux/src/syscalls/unix.rs` (two new permanent
+`debug!()` sites in `try_sendto_shared`/`try_recvfrom_shared`, kept).
