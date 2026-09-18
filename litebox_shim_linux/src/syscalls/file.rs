@@ -2783,7 +2783,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
-        let status = self.files.borrow().fs.file_status(pathname)?;
+        let status = match self.files.borrow().fs.file_status(&pathname) {
+            Ok(status) => status,
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => {
+                let path_str = pathname.as_rust_str()?;
+                self.cross_process_bound_unix_socket_stat(path_str)
+                    .ok_or(Errno::ENOENT)?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
@@ -3089,6 +3099,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .then(|| litebox::fs::devices::devpts_slave_status(id))
     }
 
+    /// Cross-process fallback for a `stat`/`access` miss on `path`: if this process's own
+    /// `SharedUnixAddrPresenceTable` (genuinely cross-process-visible, unlike the writable-layer
+    /// content itself) shows a listening AF_UNIX socket bound at `path` ANYWHERE in the fork
+    /// family, synthesize the same minimal status the OWNING process's own filesystem view
+    /// already gives it, instead of a real (but structurally-blind) `ENOENT`. See
+    /// `litebox::fs::devices::cross_process_bound_unix_socket_status`'s doc comment for the full
+    /// reasoning and the pass that root-caused this.
+    fn cross_process_bound_unix_socket_stat(&self, path: &str) -> Option<litebox::fs::FileStatus> {
+        let owner_pid = self
+            .global
+            .unix_addr_presence
+            .lookup(crate::syscalls::unix::UNIX_ADDR_KIND_PATH, path.as_bytes())?;
+        // `warn!`, not `debug!`: this fires at most a handful of times per real boot (once per
+        // distinct bound-but-locally-invisible path a caller actually stats/accesses), so its
+        // cost is negligible -- and firing at `warn` makes it visible in the project's own
+        // default `LITEBOX_LOG` filter (AGENTS.md: `warn,...fork_verify=error`) without needing
+        // the extremely hot, boot-slowing `syscalls::file=debug` target (every `sys_read` etc.
+        // logs at `debug` too -- confirmed live, twenty-fifth pass, 300+MB/14s of log at that
+        // level on this exact repro).
+        litebox_util_log::warn!(
+            path:% = path, owner_pid:% = owner_pid, self_pid:% = self.pid.get();
+            "DIAG cross_process_bound_unix_socket_stat: synthesizing stat for a sibling-bound AF_UNIX path"
+        );
+        Some(litebox::fs::devices::cross_process_bound_unix_socket_status(path))
+    }
+
     fn do_stat<T: From<litebox::fs::FileStatus>>(
         &self,
         pathname: impl path::Arg,
@@ -3098,13 +3134,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
             return Ok(T::from(status));
         }
-        let status = if follow_symlink {
-            let path = self.resolve_final_symlinks(normalized_path)?;
-            self.files.borrow().fs.file_status(path)?
+        let lookup_path = if follow_symlink {
+            self.resolve_final_symlinks(normalized_path)?
         } else {
-            self.files.borrow().fs.symlink_metadata(normalized_path)?
+            normalized_path
         };
-        Ok(T::from(status))
+        let status = if follow_symlink {
+            self.files.borrow().fs.file_status(lookup_path.clone())
+        } else {
+            self.files.borrow().fs.symlink_metadata(lookup_path.clone())
+        };
+        match status {
+            Ok(status) => Ok(T::from(status)),
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => self
+                .cross_process_bound_unix_socket_stat(&lookup_path)
+                .map(T::from)
+                .ok_or(Errno::ENOENT),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Given an already-normalized absolute path, transparently follow the *final* path

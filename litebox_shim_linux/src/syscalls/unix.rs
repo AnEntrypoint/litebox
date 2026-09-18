@@ -2723,7 +2723,21 @@ pub(crate) const SHARED_UNIX_POLL_INTERVAL: Duration = Duration::from_millis(15)
 /// DIFFERENT process to reach its own `accept()` call, even for an ordinary blocking `connect()`
 /// with no caller-supplied deadline -- see that function's own doc comment for the live-caught
 /// indefinite-hang this bounds.
-pub(crate) const SHARED_UNIX_CROSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// Widened from the original `3s` (twenty-fifth pass): live-caught, twice in a row, a listener
+/// that WAS genuinely bound+listening (`unix_addr_presence` confirmed it) and had already served
+/// a request successfully moments earlier in a calm run (twenty-fourth pass, ~23ms) still let a
+/// real request sit unclaimed for the full old 3s bound and time out, once the `$XSOCK`
+/// writable-layer-visibility fix (same pass) let the boot legitimately reach this code path for
+/// the first time and put 8 real concurrent cross-process-forked Windows processes in flight at
+/// once. `SHARED_UNIX_POLL_INTERVAL`'s 15ms re-poll cadence only fires while the listener's OWN
+/// thread is actually scheduled -- under that much concurrent contention (host free RAM measured
+/// as low as ~300-450MB mid-boot this pass) a thread can legitimately sit unscheduled for several
+/// real seconds at a time, which is a host-scheduling latency problem, not a defect in the
+/// rendezvous protocol itself (confirmed sound, twenty-fourth pass). `15s` keeps this bounded
+/// (never the literal-forever hang the original comment guards against) while giving a genuinely
+/// slow-but-alive listener real room to get scheduled.
+pub(crate) const SHARED_UNIX_CROSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Drop-in replacement for [`WaitContext::wait_on_events`] that additionally re-polls on a short
 /// bounded timeout instead of relying purely on a real wake -- see this module's own "Shared

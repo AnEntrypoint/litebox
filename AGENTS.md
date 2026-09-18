@@ -147,46 +147,45 @@ transcripts, cdb technique notes: archive.
 **Twenty-first pass** — root-caused and FIXED the `wait4(-1)` stall (commit `a771692`): no
 bounded-repoll fallback on `pid == -1`. Browser milestone not reached. Full detail: archive.
 
-**Twenty-second pass** — added `_nofork_tick()` to remove a `sleep`-forks-every-iteration cost
-from the Xvfb/dbus wait loops (script-only, `.wfgy/webtop_stack.sh`); live-verified in a minimal
-container. Full boot then progressed to script byte-offset 20498 (further than ever before) and
-hung; debug-symbol `cdb` REFUTED a `NatGateway::new` retry-sleep theory and found the real
-blocked thread: the fork child's guest-execution thread inside a genuine `ppoll()`
-(`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`) right after an
-`ECONNREFUSED ... owner_pid=<other child>` WARN. Browser milestone not reached. Full detail
-(exact commands, RAM trace, cdb logs): archive.
+**Twenty-second/twenty-third passes** — `_nofork_tick()` removed a `sleep`-forks-every-iteration
+cost from the Xvfb/dbus wait loops (script-only), then a real regression in that same fix (dash's
+`$SECONDS` unset, collapsing the busy-wait to a no-op) was found and fixed. Chased an AF_UNIX
+rendezvous "livelock" (timing race vs. address mismatch candidates) that the twenty-fourth pass
+below REFUTED entirely. Browser milestone not reached either pass. Full detail: archive.
 
-**Twenty-third pass** — root-caused and FIXED a real regression in the twenty-second pass's own
-`_nofork_tick` fix (this image's real `/bin/sh` is `/bin/dash`, where `$SECONDS` is unset,
-collapsing the busy-wait to a silent no-op) — full detail: archive. With that fixed, the boot
-advanced into the already-tracked AF_UNIX rendezvous gap as a genuine multi-minute CPU-active
-livelock, confirmed via live `cdb -pv` on two threads at once (`sys_epoll_pwait`/`sys_ppoll`,
-both provably engaged in their bounded ~15ms repoll, `diag_iteration` in the tens of thousands).
-Two candidates were proposed (timing race vs. address mismatch) but not yet distinguished.
-**Both REFUTED by the twenty-fourth pass, below.**
-
-**Twenty-fourth pass** — added live per-request `debug!()` instrumentation to
-`unix.rs`'s `Backlog::listen`/`connect_cross_process`/`SharedUnixConnectQueue::{try_claim,
-has_pending}` (kept) and re-booted twice with `LITEBOX_LOG` raised for `unix`/`epoll`. **The
-AF_UNIX rendezvous mechanism itself is confirmed sound**: exactly ONE real cross-process connect
-occurred per boot (Xvfb's own X11 socket), and it succeeded in ~23ms both times — no timing race,
-no address/key mismatch (the apparent `kind=1`/`kind=0` dual registration for the same path is
-correct, standard real-Linux X11 dual-socket behavior, not a bug). **The real blocker is upstream
-of AF_UNIX entirely**: `webtop_stack.sh`'s own `$XSOCK` wait loop (lines 319-322) never completes
-— `xset q` (line 323, the next X11 client) and even `/usr/bin/sleep` (the loop's own dash-fallback
-fork) appear ZERO times in either ~10-20MB trace despite 5-17 minutes of runtime. Along the way,
-live-caught (cdb, byte-identical frame twice 20s apart) and FIXED a genuine bug: `sys_wait4`'s
-targeted `pid > 0` branch (`process.rs`) called `wait_for_cross_process_exit` with NO
-bounded-repoll fallback, unlike its already-fixed `pid == -1` sibling (21st pass) — same lost-wake
-hazard, now closed. This fix alone did not unblock the `$XSOCK` stall. Leading hypothesis for next
-pass: the already-tracked writable-layer cross-child-visibility gap (pickup item 3) — Xvfb is a
-long-running cross-process-forked daemon that never exits, and writable-layer state appears to
-sync back to siblings only at child EXIT, so the shell's `[ -e "$XSOCK" ]` may structurally never
-see a file Xvfb created. Not yet directly confirmed. Full detail: archive.
+**Twenty-fourth pass** — live per-request `debug!()` instrumentation (`unix.rs`, kept) proved
+**the AF_UNIX rendezvous mechanism itself sound**: the one real cross-process connect per boot
+(Xvfb's X11 socket) succeeded in ~23ms both times, no timing race, no address/key mismatch (the
+`kind=1`/`kind=0` dual registration is correct real-Linux X11 behavior). **Real blocker found
+upstream of AF_UNIX entirely**: `webtop_stack.sh`'s own `$XSOCK` wait loop (lines 319-322) never
+completed even once — `xset q`/`/usr/bin/sleep` appeared ZERO times in 5-17-minute traces. Also
+FIXED along the way: `sys_wait4`'s `pid > 0` branch had no bounded-repoll fallback (mirrors the
+already-fixed `pid == -1` case). Leading hypothesis for next pass: writable-layer
+cross-child-visibility (pickup item 3) — not yet directly confirmed. Full detail: archive.
 
 Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
 kill. **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass** — refuted a
 dead end, redirected toward the real upstream blocker, fixed one real independent bug.
+
+**Twenty-fifth pass** — writable-layer-visibility hypothesis CONFIRMED by direct source read
+(`CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment states it outright: "nothing propagates to an
+already-running long-lived process between ITS OWN spawns" — Xvfb neither exits nor spawns, so
+its `$XSOCK` write can never publish). **Fixed, live-verified, `$XSOCK` stall CLOSED**: a bound
+AF_UNIX path is a NAME marker, not content, so it doesn't need the general writable-layer sync —
+`litebox::fs::devices::cross_process_bound_unix_socket_status` + a `do_stat`/`do_access` fallback
+in `litebox_shim_linux/src/syscalls/file.rs` now consult the already-shared
+`SharedUnixAddrPresenceTable` on a real `ENOENT` instead of the private per-process filesystem.
+Live evidence: the shell's own `[ -e "$XSOCK" ]` broke out for the first time in this whole
+25-pass investigation, and the boot advanced to script offset 23017 — past `xset q`, into
+`dbus-launch` setup, further than any prior pass. **Second bug found one step downstream, fixed**:
+`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (3s) was too tight once real contention (8 concurrent
+cross-process-forked Windows processes, RAM as low as ~300-450MB) made the listener's own 15ms
+re-poll thread starve for scheduling — widened to 15s; live `unix=debug` trace then showed a
+genuine end-to-end cross-process AF_UNIX connect for Xvfb's real X11 socket complete
+(`request completed ... slot=0`), the first ever directly witnessed on this path. `[s] XVFB_UP`
+itself not yet directly witnessed printing (pickup list below has the precise next step). Did NOT
+reach the XFCE-desktop/browser/terminal/apps milestone this pass. Full evidence, all seven boot
+attempts: `docs/AGENTS_ARCHIVE_2026-09-18.md`, twenty-fifth pass.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -201,18 +200,22 @@ rendezvous timing race~~/~~AF_UNIX rendezvous address/key mismatch~~ (both REFUT
 per-request instrumentation, twenty-fourth pass: the mechanism is sound, only ONE real
 cross-process connect ever occurs and it succeeds in ~23ms)/~~`sys_wait4`'s `pid > 0` targeted
 branch had no repoll fallback~~ (commit pending, twenty-fourth pass, mirrors the already-fixed
-`pid == -1` case) — all REFUTED or FIXED, passes 15-24 (archive). **Current top blocker
-(twenty-fourth pass)**: NOT the AF_UNIX/epoll code — `webtop_stack.sh`'s own `$XSOCK` wait loop
-(lines 319-322) never completes even one iteration of its own dash-fallback forking `sleep`;
-`xset q` (the next required X11 client, line 323) and `/usr/bin/sleep` both appear ZERO times in
-full-debug-level traces spanning 5-17 real minutes. **Next step**: confirm or refute the
-writable-layer cross-child-visibility hypothesis directly — add a live probe (or extend the
-existing diagnostic logging) that reads `/tmp/.X11-unix/` from BOTH the shell's own process and
-Xvfb's around the `$XSOCK` loop, or trace `import_cross_process_writable_layer`/the writable-layer
-merge path directly, to settle whether a long-running (never-exiting) cross-process-forked
-child's writable-layer changes are genuinely invisible to siblings until it exits. If confirmed,
-the fix is architectural (periodic/continuous writable-layer visibility, not exit-only) and
-likely large — worth its own dedicated pass. cdb technique notes (still current): set
+`pid == -1` case)/~~`webtop_stack.sh`'s `$XSOCK` wait loop never sees a sibling-bound AF_UNIX
+path~~ (twenty-fifth pass: `cross_process_bound_unix_socket_status` + presence-table fallback in
+`do_stat`/`do_access`, `litebox_shim_linux/src/syscalls/file.rs`)/~~`SHARED_UNIX_CROSS_CONNECT_
+TIMEOUT` (3s) too tight under real multi-process contention~~ (twenty-fifth pass: widened to 15s)
+— all REFUTED or FIXED, passes 15-25 (archive). **Current top blocker (twenty-fifth pass)**: none
+confirmed yet — `[s] XVFB_UP` has not been directly witnessed printing (every run that reached a
+successful `connect_cross_process` completion was still healthy/running when this session's own
+time/RAM budget ended it). **Next step**: one more
+patient, well-resourced boot watched long enough past the connect-succeeds point to see `[s]
+XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED`/`SELKIES_PORT_UP` actually print, then push forward. Secondary,
+not yet chased: the `kind=1` (abstract) AF_UNIX connect variant still timed out at 15s in the one
+run exercising both, while `kind=0` (path) succeeded — only worth chasing if a future pass sees
+BOTH fail (real X11 libraries retry across variants). The general writable-layer-visibility gap
+(item 3 below) remains open for anything that ISN'T a bound AF_UNIX path (e.g. `webtop_stack.sh`'s
+own `/tmp/empty: No such file or directory`, still observed, unfixed by the narrow AF_UNIX-only
+fallback). cdb technique notes (still current): set
 `_NT_SYMBOL_PATH` env var (not `-y`); only the LAST `-c` flag is honored, chain one `;`-joined
 string (e.g. `~*kb;qd`, never a bare `q`); dump `~*kb` first (thread index isn't stable across
 binaries), then `.frame N; dv /t /v` on the specific frame of interest. Separately, still open:

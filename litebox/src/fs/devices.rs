@@ -186,6 +186,59 @@ pub fn devpts_slave_status(id: u32) -> FileStatus {
     }
 }
 
+/// What `stat`/`access` report for a real AF_UNIX `bind()` path that some sibling process in this
+/// fork family has registered (`litebox_shim_linux::syscalls::unix::SharedUnixAddrPresenceTable`,
+/// a genuinely shared, cross-process-visible side table) but that does not exist in THIS
+/// process's own private, per-process writable filesystem layer.
+///
+/// **Why this exists.** Litebox's writable-layer content only crosses process boundaries at a
+/// cross-process `fork()`'s spawn/exit instants (see `docs/track-b-fork-fix-progress.md` and
+/// `litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc
+/// comment for the honest limit: "nothing propagates to an already-running long-lived process
+/// between ITS OWN spawns"). A long-running, never-exiting cross-process-forked daemon (Xvfb,
+/// dbus-daemon) that `bind()`s a listening AF_UNIX socket therefore never republishes that
+/// filesystem write to any sibling for as long as it keeps running -- confirmed live as the exact
+/// cause of `webtop_stack.sh`'s `$XSOCK` wait loop never observing Xvfb's own socket path
+/// (twenty-fourth/twenty-fifth pass).
+///
+/// **Why this is the right fix, not the general writable-layer sync.** A bound AF_UNIX path is
+/// purely a NAME/existence marker -- litebox has no `FileType::Socket` variant at all, so
+/// `UnixSocketAddr::bind`'s own server-side path creation already represents it as an ordinary
+/// `RegularFile` in the OWNING process's filesystem view (`litebox_shim_linux/src/syscalls/
+/// unix.rs`). This function returns that SAME representation for a sibling's `stat`/`access`,
+/// rather than widening the general writable-layer sync to a periodic/continuous mechanism (a
+/// much larger, racier undertaking for content this table doesn't even carry).
+#[must_use]
+pub fn cross_process_bound_unix_socket_status(path: &str) -> FileStatus {
+    // FNV-1a over the path, so two different bound paths never collide on `(dev, ino)` -- no
+    // hashing crate needed for this `no_std` module.
+    let mut ino: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        ino ^= u64::from(*b);
+        ino = ino.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    FileStatus {
+        file_type: FileType::RegularFile,
+        // Matches `UnixSocketAddr::bind`'s own server-side creation mode exactly
+        // (`Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH`).
+        mode: Mode::RWXU
+            .union(Mode::RGRP)
+            .union(Mode::XGRP)
+            .union(Mode::ROTH)
+            .union(Mode::XOTH),
+        size: 0,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 0,
+            ino: ino as usize,
+            rdev: None,
+        },
+        blksize: 4096,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
 /// `/dev/ptmx`, the pty multiplexer. Real Linux character device 5:2.
 const PTMX_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,

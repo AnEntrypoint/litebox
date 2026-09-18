@@ -1433,3 +1433,114 @@ terminal/apps milestone this pass -- redirected the investigation away from a de
 AF_UNIX rendezvous mechanism, now confirmed sound) toward the real upstream blocker (the
 `$XSOCK` wait loop / writable-layer-visibility gap), fixed one real independent bug along the
 way, left a precise, evidence-backed next step.
+
+## Twenty-fifth pass -- writable-layer-visibility hypothesis CONFIRMED via source read, real
+## narrow fix landed + live-verified (the `$XSOCK` stall itself is CLOSED), a second real bug
+## found one step downstream and fixed, browser/terminal/apps milestone still not reached
+
+**Method.** Read the real code, not just the prior pass's hypothesis, at every hop: `litebox_shim_
+linux/src/syscalls/process.rs`'s `import_cross_process_writable_layer` (called ONLY from `sys_
+wait4`'s two branches, after a child is OBSERVED TO HAVE EXITED); `litebox_runner_linux_on_
+windows_userland/src/lib.rs`'s task-resume-probe tail (the child's OWN writable-layer export
+happens in the last ~15 lines before `std::process::exit`, unconditionally, nowhere earlier);
+`litebox_platform_windows_userland/src/process_fork.rs`'s `CONTAINER_FS_SNAPSHOT_ENV_VAR` doc
+comment, which states the honest limit in so many words: "nothing propagates to an already-
+running long-lived process between ITS OWN spawns." Xvfb neither exits nor spawns children on
+this path, so both triggers that could ever publish its `$XSOCK` write are permanently absent for
+as long as it runs -- **hypothesis CONFIRMED by direct source reading, no live dual-process probe
+needed**; the design doc comment already states the exact mechanism as a known, disclosed
+limitation, not a bug to be found by more instrumentation.
+
+**Fix 1 (the real one) -- route a bound AF_UNIX path's existence through the ALREADY-shared
+`SharedUnixAddrPresenceTable` instead of the general writable-layer/tar-export mechanism.** A
+bound socket path is a NAME/existence marker, not real file content (litebox has no
+`FileType::Socket` variant at all -- `UnixSocketAddr::bind`'s own server-side creation already
+represents it as an ordinary `RegularFile`, confirmed at `litebox_shim_linux/src/syscalls/
+unix.rs`), so it doesn't need the general mechanism's content-sync semantics, only a cross-
+process-visible "does X exist" answer -- which `SharedUnixAddrPresenceTable` (a genuinely shared,
+lock-free, fixed-slot table living in the shared kernel arena, established thirteenth pass)
+already provides for exactly this purpose. Added `litebox::fs::devices::
+cross_process_bound_unix_socket_status(path)` (new, `litebox/src/fs/devices.rs`, right after the
+existing `devpts_*` synthetic-stat constructors it mirrors -- `FileStatus` is `#[non_exhaustive]`
+so only this crate can build one) and wired it into `litebox_shim_linux/src/syscalls/file.rs`'s
+`do_stat`/`do_access` as a fallback consulted ONLY on a real `ENOENT`
+(`FileStatusError::PathError(PathError::NoSuchFileOrDirectory)`): if `self.global.unix_addr_
+presence.lookup(UNIX_ADDR_KIND_PATH, path.as_bytes())` hits (any owner pid, including a foreign
+one), synthesize the RegularFile status instead of propagating ENOENT. Logs at `warn!` (not
+`debug!` -- confirmed live that `syscalls::file=debug` is FAR too hot, ~300MB/14s of pure
+`sys_read` spam on this exact repro, close to making a boot untestable) exactly once per real
+fallback hit, naming `path`/`owner_pid`/`self_pid`.
+
+**Live-verified, directly, multiple independent boots (debug binary, `LITEBOX_PROCESS_FORK=1` +
+`.wfgy/webtop_stack.sh`, `--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from
+.wfgy/webtop_seed.tar`).** The exact log line fired as designed: `DIAG cross_process_bound_unix_
+socket_stat: synthesizing stat for a sibling-bound AF_UNIX path path=/tmp/.X11-unix/X1
+owner_pid=<Xvfb's guest pid> self_pid=1` -- the shell's OWN `[ -e "$XSOCK" ]` check, guest pid 1,
+resolving via the presence table rather than its own private (writable-layer-blind) filesystem
+view. This is the FIRST time in this entire multi-day, 25-pass investigation the `$XSOCK` wait
+loop has ever broken out before its 60-iteration bound. Two independent runs (of seven total this
+pass) advanced the script to offset 23017 -- PAST `xset q` (offset ~21749-21928) and into the
+`dbus-launch` shim setup (webtop_stack.sh line ~343 territory) -- the furthest point any pass has
+ever reached, and a strictly different, LATER blocker than anything the twelfth-through-
+twenty-fourth-pass AF_UNIX/epoll investigation chain was ever chasing. **The `$XSOCK` stall itself
+is CLOSED.**
+
+**Fix 2 -- `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` widened `3s` -> `15s` (`litebox_shim_linux/src/
+syscalls/unix.rs`).** Once the `$XSOCK` fix let the boot reach `xset q`'s own `connect()` for the
+first time ever, a SECOND, previously-unreachable bug surfaced: live `unix=debug` tracing caught
+`connect_cross_process: posted request` -> `connect_cross_process: request TIMED OUT, cancelling`
+for BOTH the abstract (`kind=1`) and path (`kind=0`) dual registrations, each timing out at
+exactly the old `3.00s`/`3.01s` bound, even though `unix_addr_presence` confirmed the listener
+(Xvfb) WAS genuinely bound the whole time. Root cause: `SHARED_UNIX_POLL_INTERVAL`'s 15ms re-poll
+only fires while the LISTENER's own thread is actually scheduled, and unblocking `$XSOCK` put 8
+real concurrent cross-process-forked Windows processes in flight at once (each independently
+re-serving ~1GB+ of cached OCI layers on its own fork) -- host free RAM measured as low as
+~300-450MB mid-boot more than once this pass, a genuine host-scheduling-latency regime the old 3s
+bound was never validated against (twenty-fourth pass's own clean single-connect measurement was
+~23ms, in a calm environment). Not a rendezvous-protocol defect (still confirmed sound). Widened
+to `15s` -- still bounded (never the literal-forever hang the original 3s comment itself guards
+against), but enough real wall-clock room for a genuinely-alive-but-starved listener to get
+scheduled. **Live-verified working**: with the widened bound, a full `unix=debug` trace of a
+LATER run showed the `kind=0` (path) request `posted` then, ~7s later, Xvfb's own `unix_accept`
+entry, `SharedUnixConnectQueue::try_claim: claimed request ... client_pid=<xset's guest pid>`,
+`unix_accept: result ok=true`, and finally `connect_cross_process: request completed ...
+slot=0` on the client side -- a genuine, complete, successful cross-process AF_UNIX connection
+for Xvfb's real X11 socket, the first ever directly witnessed end-to-end on this exact code path.
+
+**Not yet closed.** (a) `[s] XVFB_UP` itself was never directly observed printing in any of the
+seven boot attempts this pass -- every run that reached the connect-succeeded point was still
+running (RAM healthy, Xvfb idling normally via `has_pending` polls) when this session's own
+wall-clock/RAM guard killed it; the successful `request completed` trace strongly implies `xset
+q` itself would go on to exit 0 and print `XVFB_UP`, but this is inference from the connect
+succeeding, not a directly witnessed marker -- **top priority for the next pass: one more patient
+run, watched long enough (the connect alone took ~7-19s of in-guest time this pass; budget
+accordingly) to see the actual `[s] XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED` markers print.** (b) The
+`kind=1` (abstract-namespace) connect variant timed out even at the new 15s bound in the one run
+that reached both attempts, while the `kind=0` (path) variant succeeded -- not investigated
+further this pass (real X11 clients fall back path-first or abstract-first depending on library
+version, so a working path-based connect is likely sufficient), but worth a dedicated look if a
+future pass sees BOTH variants fail. (c) The narrow AF_UNIX-bind-path fallback does NOT fix the
+general writable-layer-visibility gap for a plain file/directory a long-running sibling creates
+(e.g. `webtop_stack.sh:343`'s `/tmp/empty: No such file or directory`, still observed, same
+already-documented non-fatal class as before) -- deliberately out of scope (see Fix 1's own
+reasoning for why the AF_UNIX case specifically doesn't need the general mechanism); the general
+gap (AGENTS.md pickup item 3) remains open for anything that isn't a bound socket path.
+
+**Host state.** Seven boot attempts total this pass, RAM fluctuated 300MB-6.9GB (host baseline
+itself drifted from ~4.5GB free at session start down to ~1.6-2.9GB idle-with-zero-litebox-
+processes by mid-session -- confirmed via `Get-Process | Sort WS` that this is OTHER host
+software, `Resolve`/Chrome/Discord, growing over the session, not a litebox leak); every run's
+process tree fully cleaned via WMI `Terminate` before the next launch, confirmed zero stray
+`litebox_runner` processes after each kill. Two runs hit genuinely critical RAM (~300-450MB free,
+8 concurrent processes) and were killed proactively rather than left to risk a host-wide
+freeze -- both recovered fully within seconds. Did NOT reach the XFCE-desktop/browser/terminal/
+apps milestone this pass, but closed the `$XSOCK` stall that has blocked every single prior pass
+back to the twenty-second, found and fixed a second real bug one step downstream, and left the
+boot provably closer than it has ever been (a real successful cross-process X11 socket connection,
+directly witnessed).
+
+**Files touched this pass**: `litebox/src/fs/devices.rs` (new `cross_process_bound_unix_socket_
+status`), `litebox_shim_linux/src/syscalls/file.rs` (`do_stat`/`do_access` fallback wiring, new
+`cross_process_bound_unix_socket_stat` helper), `litebox_shim_linux/src/syscalls/unix.rs`
+(`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` 3s -> 15s). `.wfgy/repro_xsock_fallback_v1.ps1` (new,
+gitignored launch script, `unix=debug` logging).
