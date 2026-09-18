@@ -153,53 +153,60 @@ Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` 
 REFUTED as the bug; found a real-but-unconfirmed `Init`-state gap in `UnixInitStream::
 check_io_events`. Full detail: archive.
 
-**Twentieth pass, 2026-09-18 -- root-caused and FIXED the `SharedUnixConnTable` slot leak (commit
-`05d279d`); found (not yet fixed) a second, separate `wait4(-1)` stall.** Live `cdb -pv` (pid
-17296, thread 1 frame 6 = `PollSet::wait`) got the locals the nineteenth pass couldn't (`_NT_
-SYMBOL_PATH` env var instead of a `-y` argument works around Git Bash mangling backslashes):
-`has_unwakeable_fd = true`, `register = false` -- **live-confirmed the AF_UNIX bounded-15ms-repoll
-in `PollSet::wait` (13th pass, `b86f1f1`) IS engaged and correctly re-scanning; the repoll design
-itself is not the bug.** Code review of the write path confirms why a stuck poll can still persist
-for minutes anyway: `try_sendto_shared`/`SharedByteRing` never call `notify_observers` (by design,
-no cross-process push wake exists) -- correct once the peer writes, but nothing forces the peer TO
-write. **Root cause instead found on the resource-lifecycle side**: `SharedConnSlot::free()` only
-runs via `Drop`, which never fires when a stuck client (xrdb/selkies, all caught live in this exact
-stall) is killed externally rather than exiting -- confirmed live across 4+ independent leaked
-slots this pass, directly correlated with a `SELKIES_PORT_UP` curl-readiness loop spawning 40+
-rapid-fire retries instead of the handful expected. **Fixed**: `SystemInfoProvider::
-is_process_alive` (new, default `true`; Windows impl reuses `RawMutex`'s own dead-holder
-OpenProcess/GetExitCodeProcess check) + `LiteBox::platform()` accessor + a conservative
-both-endpoints-confirmed-dead reclaim pass in `SharedUnixConnTable::alloc`, plus
-`SHARED_UNIX_CONN_CAPACITY` 8->64 as a cheap complementary mitigation (a long-lived server like
-Xvfb never notices its peer died, so the safe both-dead reclaim condition alone doesn't cover that
-half). Compiles clean; **NOT yet re-verified end-to-end past Xvfb** -- the post-fix verification
-boot hit a SEPARATE stall first (below) before reaching that section again. **New, not yet fixed**:
-the root script interpreter's own `wait4(-1)` (`syscalls/process.rs` ~2313-2380) blocks via a PLAIN
-`wait_until` with NO bounded-repoll fallback (unlike every AF_UNIX call site) -- live-caught stuck
-even after its cross-process child had ALREADY exited cleanly (`0xc0de0000`, not killed). Not
-confirmed deterministic. Full transcripts, cdb technique notes, and the precise next-step: archive.
+**Twentieth pass** — root-caused and FIXED the `SharedUnixConnTable` slot leak on
+externally-killed clients (commit `05d279d`; `SystemInfoProvider::is_process_alive` dead-holder
+check + both-endpoints-confirmed-dead reclaim in `SharedUnixConnTable::alloc` +
+`SHARED_UNIX_CONN_CAPACITY` 8->64). Live-confirmed the AF_UNIX bounded-15ms-repoll in
+`PollSet::wait` (13th pass) IS engaged and correctly re-scanning -- not the bug. Found (not yet
+fixed at the time) a second, separate `wait4(-1)` stall with no bounded-repoll fallback. Full
+transcripts, cdb technique notes: archive.
+
+**Twenty-first pass** — root-caused and FIXED that `wait4(-1)` stall (commit `a771692`):
+`sys_wait4`'s `pid == -1` blocking branch had no bounded-repoll fallback (unlike every AF_UNIX/
+stdin/evdev call site), relying solely on a cross-process notify that can be lost. Fixed by
+matching `PollSet::wait`'s proven 15ms bounded-repoll pattern. Live-verified: debug binary
+sustained 50+ and release binary 45+ consecutive cross-process fork/reap cycles through the exact
+path that previously hung permanently after the first one, both reaching well past `NGINX_STARTED`
+into the Xvfb-launch section. **Did NOT reach the XFCE-desktop/browser milestone** -- release boot
+was stopped mid-Xvfb-section on a genuine host-memory falling-trend (not a litebox hang; memory
+recovered immediately on kill). New smaller leads for next pass: the `[ -e "$XSOCK" ]` wait loop's
+`sleep 1` (`webtop_stack.sh:288`) appears to fork every iteration despite the script's own
+builtin-sleep comment (confirmed via repeated identical script-offset forks); and a
+`mkdir -p .../web` immediately followed by a `printf > .../50x.html` hit "No such file or
+directory" (`webtop_stack.sh:107-110`), same class as the tracked `/tmp/empty` gap, non-fatal.
+Full evidence, exact repro commands, precise next step: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 (-2) ~~root-cause `net::wait_on_tun`~~/~~`unix_addr_table` sharing~~/~~fatal `xset` kill~~/~~stall
 in `connect_cross_process`/`net::wait_on_tun`~~/~~`has_pending`/`SharedUnixConnectQueue` matching
 logic~~ — all REFUTED or FIXED, passes 15-19 (archive). ~~`SharedUnixConnTable` slot leak on
-externally-killed clients~~ — ROOT-CAUSED and FIXED, twentieth pass (commit `05d279d`); NOT yet
-re-verified end-to-end (a separate stall, below, blocked the verification boot first). **Current
-best lead, NOT yet fixed**: `sys_wait4`'s `pid == -1` branch has no bounded-repoll fallback and can
-hang forever even after the awaited child already exited cleanly, if its exit-notifier interrupt is
-ever lost. **Precise next step**: reproduce (`.wfgy/repro_debug_ppoll_stall.ps1`), and when the
-root process (not a forked child) is caught in `Task::sys_wait4 -> wait_until -> commit_wait` with
-a child already logged as exited, `dv`/`dx` the `arm_cross_process_exit_notifier`/
-`spawn_cross_process_exit_notifier` state to see whether the notifier ran at all. cdb technique:
-set `_NT_SYMBOL_PATH` env var (not `-y`) for reliable symbol loading under Git Bash; only the LAST
-`-c` flag is honored, chain one `;`-joined string; `~*e` broadcast silently produced no output in
-this session's trials -- use explicit `~Ns;.frame 6;dv /t /v` per thread instead, and dump `~*kb`
-first since thread index is NOT stable across different guest binaries (Xlib clients vs
-Python/selkies have different thread layouts). Separately, once `SharedUnixConnTable`'s fix is
-verified live: `UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth
-pass, still real, still unconfirmed as anyone's actual mechanism) remains open. Full evidence:
-`docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twentieth passes.
+externally-killed clients~~ — ROOT-CAUSED and FIXED, twentieth pass (commit `05d279d`). ~~`sys_wait4`'s
+`pid == -1` branch has no bounded-repoll fallback~~ — ROOT-CAUSED and FIXED, twenty-first pass
+(commit `a771692`), live-verified 50+ and 45+ consecutive cross-process fork/reap cycles in two
+independent boots (debug then release) through the exact code path that previously hung
+permanently after the first one. **Neither fix has yet been re-verified all the way to the
+XFCE-desktop/browser milestone** — the twenty-first-pass release boot progressed past both prior
+stall points into the Xvfb-launch section before being stopped on a host-memory falling-trend, not
+a litebox hang (detail above). **Current best lead for next pass**: re-run the full boot with more
+host RAM headroom (close other apps) and confirm whether it reaches `XVFB_UP`/`DBUS_UP`/
+`SELKIES_PORT_UP`/`DE_LAUNCHED` cleanly now that both known blocking-wait gaps are fixed; if a new
+stall appears, use the corrected single-attach `cdb -pv` technique (below) to diagnose it live
+rather than guessing. Also worth a cheap look: the `[ -e "$XSOCK" ]` wait loop's `sleep 1`
+(`webtop_stack.sh:286-289`) appears to fork a fresh cross-process child every iteration (confirmed
+live via repeated identical `guest fd 255 reopened ... at offset 19217`), contradicting the
+script's own comment that `sleep` is a builtin here — if real, that's up to 60 avoidable forks
+just waiting for Xvfb. cdb technique: set `_NT_SYMBOL_PATH` env var (not `-y`) for reliable symbol
+loading under Git Bash; only the LAST `-c` flag is honored, chain one `;`-joined string; `~*e`
+broadcast silently produced no output in this session's trials -- use explicit `~Ns;.frame 6;dv /t
+/v` per thread instead, and dump `~*kb` first since thread index is NOT stable across different
+guest binaries (Xlib clients vs Python/selkies have different thread layouts). Separately:
+`UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth pass, still
+real, still unconfirmed as anyone's actual mechanism) remains open, and a `mkdir -p
+/usr/share/selkies/web` immediately followed by a `printf ... > .../50x.html` redirect
+(`webtop_stack.sh:107-110`) hit `No such file or directory` live this pass — same class as the
+already-tracked `/tmp/empty` writable-layer cross-child-visibility gap (item 3 below), non-fatal.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-first passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
@@ -341,12 +348,13 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-20th passes: Xvfb/dbus relaxed; shared
+- **Archives** (newest first) — `_2026-09-18.md` (12th-21st passes: Xvfb/dbus relaxed; shared
   AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
   `-S`/`-e` script bug FIXED; `xset` silent kill CAUGHT LIVE + FIXED; GlobalState field audit +
   debug binary + unambiguous stall read; live cdb repro of the ppoll stall twice, has_pending
-  REFUTED; `SharedUnixConnTable` slot leak ROOT-CAUSED + FIXED, `has_unwakeable_fd` live-confirmed
-  engaged, `wait4(-1)` no-repoll-fallback stall found not yet fixed), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  REFUTED; `SharedUnixConnTable` slot leak ROOT-CAUSED + FIXED; `wait4(-1)` no-repoll-fallback
+  stall ROOT-CAUSED + FIXED, live-verified 50+/45+ sustained fork/reap cycles, boot reached
+  Xvfb-launch section, browser milestone still not reached), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:

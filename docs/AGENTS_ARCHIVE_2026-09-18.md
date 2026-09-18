@@ -1114,3 +1114,116 @@ forever.
 processes started this pass were killed; host free memory ~4.2 GB of ~15.2 GB total at end of pass
 (down from ~6.2 GB at pass start -- consistent with ordinary host churn, not confirmed as a
 litebox-caused leak since all litebox processes were confirmed killed before this measurement).
+
+## Twenty-first pass, 2026-09-18 -- root-caused and FIXED the wait4(-1) no-repoll-fallback stall (commit a771692)
+
+Took the twentieth pass's own precise pickup-list lead at face value and confirmed it structurally
+before touching code: read `sys_wait4`'s `pid == -1` blocking branch
+(`litebox_shim_linux/src/syscalls/process.rs`, then ~2348-2380) side by side with `PollSet::wait`
+(`litebox_shim_linux/src/syscalls/epoll.rs:929-1013`), the AF_UNIX/stdin/evdev bounded-repoll
+pattern already proven live (13th pass, `b86f1f1`; 18th pass, `has_unwakeable_fd` confirmation).
+`PollSet::wait` detects up front whether any entry is an "unwakeable" fd kind and, if so, wraps
+`wait_until` in a loop using `cx.with_timeout(STDIN_REPOLL_INTERVAL)` (15ms), re-scanning
+`scan_once` on every wake -- real or timed-out -- so a lost/never-fired wake self-heals within one
+short interval instead of hanging. `sys_wait4`'s `pid == -1` branch had no equivalent: plain
+`self.wait_cx().wait_until(&mut poll_once)`, no deadline at all, relying entirely on
+`Task::prepare_for_exit`'s `parent.interrupt_all_threads()` to wake the thread. For a
+cross-process-forked child, that wake has to cross a real Windows process boundary via
+`spawn_cross_process_exit_notifier`'s background waiter thread -- structurally the same class of
+gap already fixed for AF_UNIX/stdin/evdev, just never given the same treatment on this call site.
+
+**Fix** (`litebox_shim_linux/src/syscalls/process.rs`, the `else` branch inside the `pid == -1`
+arm of `sys_wait4`): wrapped the blocking wait in a `loop`, calling
+`self.wait_cx().with_timeout(WAIT4_REPOLL_INTERVAL).wait_until(&mut poll_once)` each iteration
+(`WAIT4_REPOLL_INTERVAL` = 15ms, matching `STDIN_REPOLL_INTERVAL`). On `Ok(())`, break (a child was
+found). On `Err(WaitError::TimedOut)`, `continue` -- this is always our own repoll bound, never a
+genuine caller timeout, because `wait4` itself takes no timeout argument so `wait_cx()` (built via
+`WaitContext::new`, no deadline) never carries a real deadline here. On `Err(WaitError::Interrupted)`,
+kept the existing pre-fix logic byte-for-byte (re-poll once synchronously before surfacing `EINTR`,
+per the `sleep 3 & wait` race already documented there) and `break` on success instead of falling
+through the old bare `match`. No other call site or behavior changed; `no_hang`/`pid > 0` paths
+untouched.
+
+**Live verification, debug binary** (`cargo build -p litebox_runner_linux_on_windows_userland`,
+`.wfgy/repro_debug_ppoll_stall.ps1`, `LITEBOX_PROCESS_FORK=1`, real `docker.io/linuxserver/
+webtop:debian-xfce`): booted clean, all 17 layers cache-HIT. The exact previously-fatal sequence
+(`task-resume-probe (child): exiting with encoded status 0xc0de0000` for a cross-process child)
+was immediately followed by the PARENT spawning its NEXT cross-process child rather than hanging --
+confirmed repeatedly, dozens of times in a row, across the whole `webtop_stack.sh` nginx-config
+setup block (`mkdir`/`sed`/`cp`/`ln` etc, each its own cross-process fork under
+`LITEBOX_PROCESS_FORK=1`). Counted 50+ consecutive `exiting with encoded status` lines after
+`[s] NGINX_STARTED supervisor_pid=20` alone (the `NGINX_SELFTEST` retry loop,
+`webtop_stack.sh:205-217`, `curl -m 3`/`sleep 1` each forking), all reaped promptly, zero stalls,
+confirmed via both direct log tailing (`iconv -f UTF-16LE -t UTF-8`, the boot log's actual encoding
+under PowerShell's `*>` redirection) and `Get-Process litebox_runner_linux_on_windows_userland`
+process-list/CPU-time growth between checks. Stopped the debug boot manually (WMI `Terminate`, per
+the spinning-allocator-safe kill method) once this was conclusively demonstrated, rather than
+waiting out the debug binary's much slower per-fork OCI-rootfs-rematerialization cost (every single
+forked command re-walks all 17 cached layers before executing, regardless of build profile) all the
+way to a full desktop.
+
+**Live verification, release binary**: `cargo build -p litebox_runner_linux_on_windows_userland
+--release` (53.74s clean, one pre-existing unrelated `dead_code` warning on `live_pty_ids`). Fresh
+boot (`.wfgy/release_boot_repro.ps1`, same image/flags) independently sustained 45+ consecutive
+fork/reap cycles past `NGINX_STARTED`, correctly reached the loop's own bounded, non-fatal
+`[s] NGINX_SELFTEST_FAILED last_code= after 20s -- supervisor still retrying in background`
+(`webtop_stack.sh:216`, this is BY DESIGN not an error -- the nginx supervisor keeps retrying in the
+background and the script continues), then progressed into the Xvfb-launch section past the
+self-test loop (`guest fd 255 reopened ... at offset 19217`, a script byte-offset never reached in
+either boot before this pass's fix landed).
+
+**New, smaller finding, not yet fixed**: the `[ -e "$XSOCK" ]` Xvfb-ready wait loop
+(`webtop_stack.sh:274-289`) forked a fresh cross-process child at the SAME script offset (19217)
+many times in a row -- consistent with its own `sleep 1` (line 288) forking every iteration, which
+directly contradicts that loop's own comment (`webtop_stack.sh:268-270`) claiming `sleep`/`[` are
+bash builtins on this guest ("`type sleep` on this image's bash reports 'sleep is a shell
+builtin'"). Not root-caused this pass (could be a different guest shell selecting this script,
+`sh` vs `bash`, or the claim could be stale/wrong) -- if confirmed, this is up to 60 avoidable
+cross-process forks (the loop's own iteration cap) just waiting for Xvfb, worth a cheap dedicated
+fix next pass (e.g. skip the outer loop's sleep-forking entirely by using a real builtin busy-wait
+construct, or confirm+update the stale comment if `sleep` truly isn't builtin here).
+
+**Also newly observed, non-fatal, not yet root-caused**: `webtop_stack.sh:107-110`'s
+`mkdir -p /usr/share/selkies/web` immediately followed by `[ -f .../50x.html ] || printf ... >
+.../50x.html` hit `/webtop_stack.sh: line 108: /usr/share/selkies/web/50x.html: No such file or
+directory` on the redirect -- i.e. the directory `mkdir -p` just created one line earlier was not
+visible to the very next shell operation. Same class as the already-tracked `/tmp/empty`
+writable-layer cross-child-visibility gap (Track B pickup list item 3), just a different path;
+purely cosmetic (the comment right above it in the script already explains this file's own
+narrow purpose -- making nginx's own 502 error page not itself 404 -- so its absence changes
+nothing else). Script continues past it unconditionally either way.
+
+**Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass.** The release boot was
+stopped mid-Xvfb-launch-section, not because of any litebox stall, but on host memory: free
+physical memory was observed on a genuine FALLING TREND (1.85 GB -> 1.66 GB free, of 15.6 GB total)
+while the current in-flight fork's CPU time had nearly flatlined between two checks roughly a
+minute apart -- exactly the documented "watch `FreePhysicalMemory`, kill on a falling trend not a
+fixed RSS number" signal from this file's own standing lessons. This host had several other large
+processes resident at the time (two `claude` processes, `firefox`, two `chrome` instances,
+`Discord`, `MsMpEng`) totaling well over half of RAM before litebox's own ~2.5 GB across three
+processes -- consistent with ordinary host churn rather than a litebox-specific leak, but the
+falling trend combined with stalled fork progress was reason enough to stop rather than push
+further and risk host instability. Killed all `litebox_runner_linux_on_windows_userland.exe`
+processes via WMI `Terminate` (spinning-allocator-safe method); free memory recovered to ~3.6-3.7 GB
+within about a second of the kill completing, confirming the drop tracked the boot's own resident
+set/cache pressure rather than a runaway host-wide leak.
+
+**Precise next step**: re-run the full release boot (`.wfgy/release_boot_repro.ps1`) with more host
+RAM headroom free (close unrelated apps first, or wait for a quieter host moment), and this time let
+it run all the way through `XVFB_UP`/`DBUS_UP`/`SELKIES_PORT_UP`/`DE_LAUNCHED` uninterrupted now
+that both the `SharedUnixConnTable` slot leak (20th pass) and the `wait4(-1)` no-repoll-fallback
+stall (this pass) are fixed. If a genuinely new stall appears, use the corrected single-attach
+`cdb -pv` technique (set `_NT_SYMBOL_PATH` env var, not `-y`; chain one `;`-joined `-c` string;
+dump `~*kb` before `.frame`/`dv` since thread index is not stable across guest binaries) to
+diagnose it live rather than re-guessing from log inspection alone. Once a boot reaches `DE_LAUNCHED`/
+`DE_UP`, connect a real browser (`chrome-devtools`/`claude-in-chrome` MCP tooling) to the selkies
+port, take real screenshots, open the Applications menu, launch Terminal Emulator and confirm a
+real shell prompt, and try at least one other app (Thunar/file manager) -- the standing "all apps
+must work" bar this whole investigation has been aimed at.
+
+**Host state at end of pass**: all `litebox_runner_linux_on_windows_userland.exe` processes started
+this pass (both debug and release boots) were killed via WMI `Terminate` before this pass ended; no
+`litebox_runner` process remained. Free physical memory recovered to ~3.6 GB of ~15.6 GB total
+after the final kill (was as low as ~1.66 GB mid-boot, on the falling trend that triggered the
+stop) -- consistent with the drop having tracked this pass's own boot activity, not a persistent
+host-wide leak outliving the killed processes.
