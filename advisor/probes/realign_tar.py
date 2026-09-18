@@ -27,7 +27,15 @@ def main(src, dst):
     order = []
     with tarfile.open(src) as t:
         for m in t:
-            if m.isfile():
+            # A zero-length file is "content-identical" to every other zero-length
+            # file only vacuously -- symlinking them together collapses unrelated
+            # files (e.g. an empty __init__.py and an empty lock file) into one
+            # inode. That silently turned `import urllib.parse` into opening
+            # /lib/apk/db/lock with PermissionError, killing selkies before it
+            # started (docs/webtop-alpine-mate-2026-09-07.md, "A second packaging
+            # bug found on the way"). Excluding size==0 from dedup is the fix --
+            # there is nothing to dedup in zero bytes.
+            if m.isfile() and m.size > 0:
                 h = hashlib.sha256(t.extractfile(m).read()).hexdigest()
                 digests.setdefault(h, []).append(m.name)
             order.append((m.name, m.type))

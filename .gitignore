@@ -130,7 +130,6 @@ tags
 [._]*.un~
 
 ### VisualStudioCode ###
-.vscode/*
 
 # Local History for Visual Studio Code
 .history/
@@ -183,7 +182,6 @@ build/
 .eggs/
 .venv/
 venv/
-.env
 *.pyo
 .mypy_cache/
 .ruff_cache/
@@ -244,3 +242,5 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 ### lesson (AGENTS.md), regardless of which subdirectory a probe happens to write them into
 advisor/probes/**/*.bmp
 advisor/probes/**/*.log
+config.bat
+node_modules

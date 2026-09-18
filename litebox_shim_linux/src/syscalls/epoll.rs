@@ -339,7 +339,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
             let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
-            litebox_util_log::debug!(
+            // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
+            // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
+            // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
+            // pass), unusable for a real boot. The per-Unix-entry `debug!` sites in
+            // `repoll_stdin_and_timerfd_interests` below are the throttled replacement: bounded by
+            // the (small) number of live Unix-socket epoll interests, not by iteration count.
+            litebox_util_log::trace!(
                 tid:% = diag_tid,
                 epfd:% = diag_epfd,
                 iteration:% = diag_iteration,
@@ -429,30 +435,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         diag_tid: i32,
         diag_epfd: u32,
     ) {
+        // Keep the fd alongside each entry (lost by a plain `.values()` iteration) so the
+        // targeted per-Unix-entry trace below can name which fd it's reporting on -- see that
+        // trace's own comment for why this is the throttled replacement for the old unthrottled
+        // per-iteration `debug!` (now `trace!` above).
+        // Entries already sitting in the ready queue (`entry.is_ready`, maintained by
+        // `ReadySet::push`/`pop_multiple`) don't need re-polling here -- skipping them keeps this
+        // throttled to genuinely-still-pending interests, mirroring `has_unready_stdin_or_armed_
+        // timerfd_interest`'s own "already ready" exclusion just above.
         let entries: alloc::vec::Vec<_> = self
             .interests
             .lock()
-            .values()
-            .filter(|entry| {
-                matches!(
-                    entry.desc.upgrade(),
-                    Some(EpollDescriptor::File(_))
-                        | Some(EpollDescriptor::Timerfd(_))
-                        | Some(EpollDescriptor::Unix(_))
-                )
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
+                    && matches!(
+                        entry.desc.upgrade(),
+                        Some(EpollDescriptor::File(_))
+                            | Some(EpollDescriptor::Timerfd(_))
+                            | Some(EpollDescriptor::Unix(_))
+                    )
             })
-            .cloned()
+            .map(|(key, entry)| (key.0, entry.clone()))
             .collect();
-        litebox_util_log::debug!(
+        litebox_util_log::trace!(
             tid:% = diag_tid,
             epfd:% = diag_epfd,
             n_entries:% = entries.len();
             "DIAG repoll_stdin_and_timerfd_interests: entries to check"
         );
-        for entry in entries {
-            if let Some((_, is_ready)) = entry.poll(global)
-                && is_ready
-            {
+        // 1-in-400 gate on the routine "still not ready" case (mirrors `SharedUnixConnectQueue::
+        // has_pending`'s own throttle, ~6s of wall time at the 15ms repoll cadence) -- an
+        // unthrottled per-entry-per-cycle `debug!` here hit unusable log volume across a full
+        // boot's many concurrently-idle Unix epoll interests (dbus-daemon, Xvfb, ...). The moment
+        // an entry actually becomes ready is logged unconditionally: that transition is the exact,
+        // rare, high-value evidence AGENTS.md's twenty-fifth-pass pickup list asked for next --
+        // whether Xvfb's real accepted-client fd is ever seen ready by this repoll at all, and with
+        // what mask.
+        static REPOLL_UNIX_DIAG_COUNTER: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let call_idx = REPOLL_UNIX_DIAG_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        for (fd, entry) in entries {
+            let is_unix = matches!(entry.desc.upgrade(), Some(EpollDescriptor::Unix(_)));
+            let result = entry.poll(global);
+            let is_ready = result.as_ref().is_some_and(|(_, ready)| *ready);
+            if is_unix && (is_ready || call_idx % 400 == 0) {
+                litebox_util_log::debug!(
+                    tid:% = diag_tid,
+                    epfd:% = diag_epfd,
+                    fd:% = fd,
+                    is_ready:% = is_ready,
+                    event_mask:? = result.as_ref().and_then(|(ev, _)| ev.as_ref()).map(|ev| ev.events);
+                    "DIAG repoll: Unix epoll interest checked"
+                );
+            }
+            if is_ready {
                 self.ready.push(&entry);
             }
         }
@@ -499,11 +536,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         let mask = Events::from_bits_truncate(event.events);
         let flags = EpollFlags::from_bits_truncate(event.events);
         let event_data = event.data;
+        let is_unix = matches!(file, EpollDescriptor::Unix(_));
         litebox_util_log::debug!(
             fd:% = fd,
             mask:? = mask,
             flags:? = flags,
-            data:% = event_data;
+            data:% = event_data,
+            is_unix:% = is_unix;
             "EpollFile::add_interest"
         );
         let entry = EpollEntry::new(
