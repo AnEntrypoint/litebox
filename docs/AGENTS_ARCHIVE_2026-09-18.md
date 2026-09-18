@@ -1227,3 +1227,57 @@ this pass (both debug and release boots) were killed via WMI `Terminate` before 
 after the final kill (was as low as ~1.66 GB mid-boot, on the falling trend that triggered the
 stop) -- consistent with the drop having tracked this pass's own boot activity, not a persistent
 host-wide leak outliving the killed processes.
+
+## Twenty-first pass (full detail, moved from AGENTS.md when it crossed 30KB)
+
+Root-caused and FIXED the `wait4(-1)` stall (commit `a771692`): `sys_wait4`'s `pid == -1`
+blocking branch had no bounded-repoll fallback (unlike every AF_UNIX/stdin/evdev call site),
+relying solely on a cross-process notify that can be lost. Fixed by matching `PollSet::wait`'s
+15ms bounded-repoll pattern. Debug binary sustained 50+, release 45+ consecutive fork/reap
+cycles through the previously-permanent-hang path, into the Xvfb-launch section, then stopped
+mid-section on a host-memory falling-trend (not a litebox hang; recovered immediately on kill)
+-- browser milestone not reached.
+
+## Twenty-second pass (full detail, moved from AGENTS.md when it crossed 30KB)
+
+The `sleep 1`-forks-every-iteration lead CONFIRMED and FIXED (script-only, `.wfgy/
+webtop_stack.sh`, gitignored, not git-tracked): live-tested in a minimal `debian:stable-slim`
+container under `LITEBOX_PROCESS_FORK=1`, `type sleep` reports `sleep is /usr/bin/sleep` (NOT a
+builtin -- `test`/`[`/`kill` really are, contradicting the script's own stale comment), and 3
+loop iterations of `sleep 1` produced exactly 3 `[process_fork_diag] globalstate-probe (child)`
+forks. Added `_nofork_tick()` (pure `SECONDS`/`[`/`:` busy-wait, zero forks, same 1-tick
+granularity) and applied it to the two PURE poll loops where sleep was the only forking cost
+(Xvfb `$XSOCK` wait, dbus `/tmp/addr` wait) -- left the nginx-selftest/`SELKIES_PORT_UP` loops
+alone since `curl` forks there regardless, so sleep wasn't the marginal cost. Verified live:
+identical 3x1s timing, zero fork children. `.wfgy/webtop_seed.tar` regenerated from the fixed
+script. (Twenty-third pass found this fix itself only worked under bash, not this image's real
+`/bin/dash` -- see AGENTS.md.)
+
+Re-ran the full release-binary boot with the fix (`LITEBOX_PROCESS_FORK=1`, `docker.io/
+linuxserver/webtop:debian-xfce`, port 8090:3000). Host RAM started tight (~3.5GB free of 15.6GB
+total, other host apps -- not this pass's problem) and fell to as low as 0.57GB free mid-run
+before recovering on its own to 2.5GB+ (no litebox action taken at that exact moment) -- noted
+honestly per standing practice, this crossed into genuinely critical territory for ~15-30s,
+closer to the edge than any prior pass's recorded dip. Script reached `NGINX_STARTED`/
+`NGINX_SELFTEST_FAILED` (expected, by-design) and progressed to script byte-offset 20498 --
+further than the twenty-first pass's best (19217), inside/just past the now-fixed `$XSOCK`/dbus
+wait loops, with NO repeated-identical-offset fork storm this time (the sleep-fork fix's
+intended effect, confirmed). Then genuinely HUNG: zero log growth and near-zero CPU growth on
+the leaf fork child (winpid 19600) for 4+ minutes straight, no new fork children spawned.
+
+Live `cdb -pv` on the hung leaf (release binary, `.wfgy/cdb_stall_19600.log`) found the same
+5-thread shape the 18th pass flagged ICF-suspect, including a `thread::sleep` frame named
+`net::NatGateway::new`. Checked that name against its actual source instead of trusting it
+(`net.rs:888-926`, `lib.rs:11338-11362`): neither `NatGateway::new` nor the nearby `shared_arc_
+probe` `OnceLock` init contains any retry/backoff sleep at all -- REFUTED, ICF noise, same
+failure mode the 18th-pass addendum already warned about for a different frame. Rebuilt the
+debug (non-LTO/non-ICF) binary and reproduced the identical stall at the identical offset
+(20498); `cdb -pv` against its matching `.pdb` (`.wfgy/cdb_debug_stall_17860.log`) resolved
+every frame for real this time: `wait_on_tun` and the NAT-gateway's own 5ms idle sleep are both
+genuine, benign, NOT the blocker. The actual blocked thread is the fork child's real
+guest-execution thread, inside a genuine guest `ppoll()` (`sys_ppoll -> PollSet::wait ->
+commit_wait -> RawMutex::block_or_maybe_timeout`) right after the `ECONNREFUSED ... owner_pid=
+<other child>` WARN. Killed both boots cleanly (WMI `Terminate`, RAM recovered to 4.6-4.7GB each
+time). Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass -- blocked by
+this AF_UNIX/dbus `ppoll` gap, not by RAM, not by the sleep-fork issue (fixed and confirmed
+working this same pass).

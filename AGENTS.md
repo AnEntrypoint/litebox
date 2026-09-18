@@ -144,53 +144,68 @@ check + both-endpoints-confirmed-dead reclaim in `SharedUnixConnTable::alloc` +
 fixed at the time) a second, separate `wait4(-1)` stall with no bounded-repoll fallback. Full
 transcripts, cdb technique notes: archive.
 
-**Twenty-first pass** — root-caused and FIXED that `wait4(-1)` stall (commit `a771692`):
-`sys_wait4`'s `pid == -1` blocking branch had no bounded-repoll fallback (unlike every AF_UNIX/
-stdin/evdev call site), relying solely on a cross-process notify that can be lost. Fixed by
-matching `PollSet::wait`'s 15ms bounded-repoll pattern. Debug binary sustained 50+, release 45+
-consecutive fork/reap cycles through the previously-permanent-hang path, into the Xvfb-launch
-section, then stopped mid-section on a host-memory falling-trend (not a litebox hang; recovered
-immediately on kill) -- **browser milestone not reached**. Archive has full repro commands.
+**Twenty-first pass** — root-caused and FIXED the `wait4(-1)` stall (commit `a771692`): no
+bounded-repoll fallback on `pid == -1`. Browser milestone not reached. Full detail: archive.
 
-**Twenty-second pass** -- the `sleep 1`-forks-every-iteration lead CONFIRMED and FIXED (script-only,
-`.wfgy/webtop_stack.sh`, gitignored, not git-tracked): live-tested in a minimal `debian:stable-slim`
-container under `LITEBOX_PROCESS_FORK=1`, `type sleep` reports `sleep is /usr/bin/sleep` (NOT a
-builtin -- `test`/`[`/`kill` really are, contradicting the script's own stale comment), and 3 loop
-iterations of `sleep 1` produced exactly 3 `[process_fork_diag] globalstate-probe (child)` forks.
-Added `_nofork_tick()` (pure `SECONDS`/`[`/`:` busy-wait, zero forks, same 1-tick granularity) and
-applied it to the two PURE poll loops where sleep was the only forking cost (Xvfb `$XSOCK` wait,
-dbus `/tmp/addr` wait) -- left the nginx-selftest/`SELKIES_PORT_UP` loops alone since `curl` forks
-there regardless, so sleep wasn't the marginal cost. Verified live: identical 3x1s timing,
-**zero** fork children. `.wfgy/webtop_seed.tar` regenerated from the fixed script.
+**Twenty-second pass** — added `_nofork_tick()` to remove a `sleep`-forks-every-iteration cost
+from the Xvfb/dbus wait loops (script-only, `.wfgy/webtop_stack.sh`); live-verified in a minimal
+container. Full boot then progressed to script byte-offset 20498 (further than ever before) and
+hung; debug-symbol `cdb` REFUTED a `NatGateway::new` retry-sleep theory and found the real
+blocked thread: the fork child's guest-execution thread inside a genuine `ppoll()`
+(`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`) right after an
+`ECONNREFUSED ... owner_pid=<other child>` WARN. Browser milestone not reached. Full detail
+(exact commands, RAM trace, cdb logs): archive.
 
-Re-ran the full release-binary boot with the fix (`LITEBOX_PROCESS_FORK=1`,
-`docker.io/linuxserver/webtop:debian-xfce`, port 8090:3000). Host RAM started tight (~3.5GB free of
-15.6GB total, other host apps -- not this pass's problem) and fell to as low as **0.57GB free**
-mid-run before recovering on its own to 2.5GB+ (no litebox action taken at that exact moment) --
-noted honestly per standing practice, this crossed into genuinely critical territory for ~15-30s,
-closer to the edge than any prior pass's recorded dip. Script reached `NGINX_STARTED`/
-`NGINX_SELFTEST_FAILED` (expected, by-design) and progressed to **script byte-offset 20498** --
-further than the twenty-first pass's best (19217), inside/just past the now-fixed `$XSOCK`/dbus
-wait loops, with NO repeated-identical-offset fork storm this time (the sleep-fork fix's intended
-effect, confirmed). Then genuinely HUNG: zero log growth and near-zero CPU growth on the leaf
-fork child (winpid 19600) for 4+ minutes straight, no new fork children spawned.
+**Twenty-third pass** — root-caused and FIXED a real regression in the twenty-second pass's own
+`_nofork_tick` fix: this image's real `/bin/sh` is `/bin/dash` (confirmed live:
+`readlink -f /bin/sh` -> `/bin/dash`), where `$SECONDS` (bash/ksh-only) is simply unset --
+directly probed live: `SECONDS_IS:[]`, and `SECONDS_AFTER:[0]` even after a real `sleep 1`
+(dash never auto-increments it). Before this fix, `_nofork_tick`'s `while [ "$SECONDS" -lt
+"$until" ]; do :; done` ran as `[ "" -lt "$until" ]` under dash, erroring ("Illegal number",
+live-caught in `.wfgy/webtop_stack.sh:82`) and exiting non-zero, collapsing the `while` to a
+silent, instant no-op on its first pass -- not slow, gone: every retry loop using it (Xvfb's
+`$XSOCK` wait, dbus's `/tmp/addr` wait) burned all 15 retries in milliseconds and declared
+XVFB_FAILED/DBUS_FAILED before Xvfb/dbus-daemon had any real time to start. Fixed:
+`_nofork_tick` now branches on `[ -n "$BASH_VERSION" ]` (unset in dash, set in bash) -- the real
+busy-wait only under a shell that actually has `$SECONDS`, an ordinary forking `sleep`
+otherwise (correctness over the fork-avoidance optimization). Script-only,
+`.wfgy/webtop_stack.sh` (gitignored, not git-tracked), `.wfgy/webtop_seed.tar` regenerated.
+Live-verified in isolation (`_nofork_tick 2` under the real `/bin/dash` now correctly takes
+`ELAPSED:2` real seconds, forking `sleep` as expected) and via a full real-image boot: no more
+premature XVFB_FAILED/DBUS_FAILED, confirmed by their total ABSENCE from the log this pass
+(previously the very first thing printed after Xvfb starts).
 
-Live `cdb -pv` on the hung leaf (release binary, `.wfgy/cdb_stall_19600.log`) found the same
-5-thread shape the 18th pass flagged ICF-suspect, including a `thread::sleep` frame named
-`net::NatGateway::new`. Checked that name against its actual source instead of trusting it
-(`net.rs:888-926`, `lib.rs:11338-11362`): **neither `NatGateway::new` nor the nearby `shared_arc_
-probe` `OnceLock` init contains any retry/backoff sleep at all** -- REFUTED, ICF noise, same failure
-mode the 18th-pass addendum already warned about for a different frame. Rebuilt the **debug**
-(non-LTO/non-ICF) binary and reproduced the identical stall at the identical offset (20498);
-`cdb -pv` against its matching `.pdb` (`.wfgy/cdb_debug_stall_17860.log`) resolved every frame for
-real this time: `wait_on_tun` and the NAT-gateway's own 5ms idle sleep are both genuine, benign,
-NOT the blocker. **The actual blocked thread is the fork child's real guest-execution thread**,
-inside a genuine guest `ppoll()` (`sys_ppoll -> PollSet::wait -> commit_wait ->
-RawMutex::block_or_maybe_timeout`) right after the `ECONNREFUSED ... owner_pid=<other child>` WARN
--- detail and next step in the pickup list below. Killed both boots cleanly (WMI `Terminate`, RAM
-recovered to 4.6-4.7GB each time). **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone
-this pass** -- blocked by this AF_UNIX/dbus `ppoll` gap, not by RAM, not by the sleep-fork issue
-(fixed and confirmed working this same pass).
+With that fixed, the full boot (debug binary, `LITEBOX_PROCESS_FORK=1`) advances into the SAME
+already-tracked AF_UNIX rendezvous gap, now a genuine multi-minute CPU-active livelock (not a
+silent deadlock) -- confirmed via live `cdb -pv` debug-symbol frame walks on TWO independent
+guest threads in TWO different host processes at once: one blocked in `sys_epoll_pwait ->
+EpollFile::wait -> ... -> RawMutex::block_or_maybe_timeout` (`epoll.rs:306-378`; locals:
+`has_bounded_repoll_interest=true`, `diag_iteration=0x5799`=22425), the other in `sys_ppoll ->
+PollSet::wait -> ... -> RawMutex::block_or_maybe_timeout` (`epoll.rs:929-1012`; locals:
+`has_unwakeable_fd=true`, `register=false`). Both AF_UNIX-aware bounded ~15ms repoll paths
+(`epoll.rs:381-420`) are provably engaged and actively re-checking for 5+ real minutes straight,
+never once observing readiness. Source-cross-checked both dead ends this pointed at, same
+discipline as the twenty-second pass's `NatGateway::new` refutation -- neither holds up:
+`EpollDescriptor::poll`'s `Unix` arm (`epoll.rs:264-267`) DOES reach the shared-queue-aware
+`Backlog::check_io_events(&self, global)` (`unix.rs:452-470`) via `UnixStream::check_io_events`'s
+`Listen` arm (`unix.rs:1606`, `listen.global`) -- "epoll never got the wiring" REFUTED; and
+`SharedUnixConnectQueue::{post,has_pending,try_claim,complete,poll_result,cancel}`
+(`unix.rs:3132-3243`) read internally consistent by inspection (matching `(kind,key)` compares,
+correct `compare_exchange`-guarded state transitions) -- no obvious logic bug there either.
+
+Genuinely NOT yet root-caused past this point: with both wait-side mechanisms provably engaged
+and correctly wired to the shared-queue check, and the queue's own state machine reading sound
+in isolation, the remaining gap is either (a) the connecting client's own request being
+cancelled by its 3s `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (`unix.rs:2692`) before the listener's
+periodic repoll ever coincides with a still-PENDING window, or (b) a still-unidentified
+mismatch between the specific `Backlog` instance a listener thread is actually polling and the
+specific address a client names (neither thread's own polled fd/address was directly inspected
+this pass). Next step: pickup list item (-2) below.
+
+Both boots killed cleanly (WMI `Terminate`), RAM recovered 5-9GB free each time (host RAM was
+never the constraint this pass). **Did NOT reach the XFCE-desktop/browser/terminal/apps
+milestone this pass** -- advanced past the sleep-fork regression this pass introduced, into the
+same not-yet-fully-root-caused AF_UNIX rendezvous gap the twenty-second pass already named.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -198,30 +213,28 @@ this pass** -- blocked by this AF_UNIX/dbus `ppoll` gap, not by RAM, not by the 
 in `connect_cross_process`/`net::wait_on_tun`~~/~~`has_pending`/`SharedUnixConnectQueue` matching
 logic~~/~~`SharedUnixConnTable` slot leak~~ (commit `05d279d`)/~~`sys_wait4`'s `pid == -1` no-repoll
 gap~~ (commit `a771692`)/~~`sleep 1`-forks-every-iteration in the `$XSOCK`/dbus wait loops~~
-(script-only, twenty-second pass)/~~`net::NatGateway::new`/`net::wait_on_tun` retry-hang theory~~
-(REFUTED with debug-build symbols + direct source read, twenty-second pass -- neither function
-contains any retry sleep) — all REFUTED or FIXED, passes 15-22 (archive). **Current top blocker,
-debug-symbol-CONFIRMED (twenty-second pass)**: the real guest-execution thread stuck in a genuine
-guest `ppoll()` (`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`)
-right after an `[unix_addr_presence] ECONNREFUSED ... owner_pid=<other fork child>` WARN at the
-script's dbus section (byte-offset 20498) -- the already-tracked "guest processes share no AF_UNIX
-namespace" gap (item 4/4b below), now concretely on dbus: the awaited fd's readiness cannot flip
-cross-process with today's design, so this isn't a livelock in the repoll mechanism (that already
-works, passes 19-20) but a wait for an event that structurally can't happen yet. **Next step**: pin
-down which exact guest binary/call site issues this specific `ppoll()` (dbus-launch shim vs
-dbus-daemon itself) with a live debug-build `cdb` frame walk on thread 1's args, then decide whether
-it needs the SharedUnixConnTable-style connection-data fix already used elsewhere or a dbus-specific
-workaround. cdb technique: set
-`_NT_SYMBOL_PATH` env var (not `-y`) for reliable symbol loading under Git Bash; only the LAST `-c`
-flag is honored, chain one `;`-joined string (e.g. `~*kb;qd`, never a bare `q`); `~*e` broadcast
-silently produced no output in this project's trials — use explicit `~Ns;.frame 6;dv /t /v` per
-thread instead, and dump `~*kb` first since thread index is NOT stable across different guest
-binaries. Separately, still open: `UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state
-report (nineteenth pass, unconfirmed as anyone's actual mechanism), and a `mkdir -p
-/usr/share/selkies/web` immediately followed by `printf ... > .../50x.html` hitting `No such file
-or directory` (`webtop_stack.sh:107-110`, live again in the twenty-second pass) — same class as the
-already-tracked `/tmp/empty` writable-layer cross-child-visibility gap (item 3 below), non-fatal.
-Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-second passes.
+(script-only, twenty-second pass)/~~`net::NatGateway::new`/`net::wait_on_tun` retry-hang theory~~/
+~~`_nofork_tick` no-ops under dash, collapsing the retry window to zero~~ (script-only,
+twenty-third pass)/~~"epoll never got the bounded-repoll/shared-queue wiring"~~ (REFUTED by
+source read + locals dump, twenty-third pass: it does) — all REFUTED or FIXED, passes 15-23
+(archive). **Current top blocker, debug-symbol-CONFIRMED on two processes at once
+(twenty-third pass)**: a real, CPU-active livelock -- both `sys_ppoll -> PollSet::wait` and
+`sys_epoll_pwait -> EpollFile::wait` are provably engaged in their bounded ~15ms AF_UNIX repoll
+(`has_unwakeable_fd`/`has_bounded_repoll_interest` both `true`, thousands of iterations logged),
+and `Backlog::check_io_events`/`SharedUnixConnectQueue` are correctly wired and internally
+consistent by inspection -- yet the rendezvous still never completes within 5+ real minutes.
+**Next step**: re-run the fourteenth pass's own minimal isolated AF_UNIX repro (not the full
+boot) with `LITEBOX_LOG` raised for `unix`/`epoll` (existing `debug!` sites already trace
+`has_pending` -- no new instrumentation needed) to watch one request's exact state transitions
+across its 3s `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` window and settle (a) cancel-before-repoll-
+coincides vs (b) a listener/address mismatch. cdb technique notes (still current): set
+`_NT_SYMBOL_PATH` env var (not `-y`); only the LAST `-c` flag is honored, chain one `;`-joined
+string (e.g. `~*kb;qd`, never a bare `q`); dump `~*kb` first (thread index isn't stable across
+binaries), then `.frame N; dv /t /v` on the specific frame of interest. Separately, still open:
+`UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth pass), and a
+`mkdir -p /usr/share/selkies/web` + `printf ... > .../50x.html` `No such file or directory`
+(`webtop_stack.sh:107-110`) — same class as the `/tmp/empty` gap (item 3 below), non-fatal.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-third passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
@@ -269,17 +282,15 @@ indistinguishable from "never drew"). For browser/selkies, `Xvfb` IS correct and
 
 ## A real desktop renders in a browser
 
-**XFCE renders in a real host browser, and MATE too** — full pipeline (Xvfb, selkies/pixelflux x264,
-MIT-SHM) inside litebox, only the reverse proxy host-side. Working config: selkies `--addr=0.0.0.0`
-port **8081**, dashboard over `--publish`, `/websockets` tunnelled to 8081. Fourteen litebox defects
-got here, all landed (archive).
+**XFCE renders in a real host browser, and MATE too** — full pipeline (Xvfb, selkies/pixelflux
+x264, MIT-SHM) inside litebox, reverse proxy host-side only. Working config: selkies
+`--addr=0.0.0.0` port **8081**, dashboard over `--publish`, `/websockets` tunnelled to 8081.
+Fourteen litebox defects got here, all landed (archive).
 
-**A stock s6-overlay image boots with no flags/stubs**: `/init` runs 16 cross-process children with
-zero uncarriable fds into supervision — retires three "fundamental blocker" claims older notes
-carried. **The black XFCE desktop was deterministic, now fixed**: the runtime rewriter corrupted
-`libLLVM.so.19.1`'s `.dynsym`, so mesa `dlopen` failed forever — not a race. Settled in the archive:
-PI futexes work; labwc's SIGABRT is upstream wlroots; every pre-`694bb93` gdk-pixbuf finding is stale;
-two network fixes this path needed.
+**A stock s6-overlay image boots with no flags/stubs**: `/init` runs 16 cross-process children
+with zero uncarriable fds. **The black XFCE desktop was deterministic, now fixed**: the runtime
+rewriter corrupted `libLLVM.so.19.1`'s `.dynsym`, so mesa `dlopen` failed forever. Rest settled
+in the archive (PI futexes, labwc SIGABRT, gdk-pixbuf, network fixes).
 
 **XFCE also renders on the THREAD-based fork path, gated by one flag** (`docker.io/linuxserver/
 webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in — ADVISORY-001 §3N's
@@ -291,7 +302,7 @@ Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fo
 below closes. Selkies also needs `--clipboard-enabled=false` (its clipboard monitor re-triggers the
 same corruption every tick).
 
-**Sixth/seventh pass (closed)** — a writable-layer-adoption race fixed via the existing
+**Sixth/seventh pass (closed)** — writable-layer-adoption race fixed via the existing
 atomic-rename primitive; live-verified 5/5 boots, zero recurrence. Detail: archive.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. Architectural gap:
@@ -302,10 +313,9 @@ proven sound in isolation by the fourteenth-pass repro) was meant to put the des
 crash-free path — the fourteenth-pass full-boot stall is the thing standing between here and there.
 
 **The glibc/tcache crash class still sporadically hits selkies** on the THREAD-based fork path, a
-SECOND corruption signature under heavy fork load (`double free or corruption (out)` SIGABRT),
-separate from the ACK-stall-kill below. Track B territory, not a tunable-coverage gap — do not
-re-attempt a `GLIBC_TUNABLES`/env fix without evidence of a THIRD mechanism. Detail: `docs/
-AGENTS_ARCHIVE_2026-09-16.md`.
+SECOND corruption signature under heavy fork load (`double free or corruption (out)` SIGABRT).
+Track B territory, not a tunable-coverage gap — do not re-attempt a `GLIBC_TUNABLES` fix without
+evidence of a THIRD mechanism. Detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
 
@@ -354,29 +364,26 @@ livelock (distinct mechanism, no dead-holder recovery unlike `RawMutex`) is stil
 
 ## Closed — do not re-attempt without a genuinely new approach
 
-VEH_FRAME_STRIDE canary guard, `dev_bench`/`litebox_runner_snp` Windows build failures, CoW-mmap
+VEH_FRAME_STRIDE canary guard, `dev_bench`/`litebox_runner_snp` build failures, CoW-mmap
 performance, input-latency bugs, presenter-split duplicate-`SYN_REPORT`, the GUI-protocol
-(DRM/KMS+wgpu) decision, five cheap-wins PRD rows, cross-process-fork stdio-handle bug
-(`spawn_suspended`'s clobbered `STARTF_USESTDHANDLES` blocks), presenter-process split
-(`litebox_presenter_protocol` + `ControlServer` zero-copy scanout, `docs/presenter-process-
-design.md`) — all CLOSED, none open. Full detail: archive.
+decision, five cheap-wins PRD rows, cross-process-fork stdio-handle bug (`spawn_suspended`'s
+clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-process-design.md`)
+— all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-21st passes: Xvfb/dbus relaxed; shared
+- **Archives** (newest first) — `_2026-09-18.md` (12th-22nd passes: Xvfb/dbus relaxed; shared
   AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
-  `-S`/`-e` script bug FIXED; `xset` silent kill CAUGHT LIVE + FIXED; GlobalState field audit +
-  debug binary + unambiguous stall read; live cdb repro of the ppoll stall twice, has_pending
-  REFUTED; `SharedUnixConnTable` slot leak ROOT-CAUSED + FIXED; `wait4(-1)` no-repoll-fallback
-  stall ROOT-CAUSED + FIXED, live-verified 50+/45+ sustained fork/reap cycles, boot reached
-  Xvfb-launch section, browser milestone still not reached), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  `xset` silent kill FIXED; GlobalState field audit + debug binary; `SharedUnixConnTable` leak +
+  `wait4(-1)` no-repoll stall both ROOT-CAUSED + FIXED; sleep-fork-per-iteration FIXED, real
+  `ppoll` blocker found; browser milestone still not reached), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:
   `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache). `docs/veh-exception-handler-design.md` —
-  read before touching the VEH handler.
+  read before touching VEH.
 - Desktop logs: `docs/webtop-debian-selkies-2026-09-06.md`, `webtop-alpine-mate-2026-09-07.md`,
   `webtop-debian-xfce-2026-09-08.md`, `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`.
 - Consult before deriving: `docs/premade-library-research.md`, `docs/drm-dumb-buffer-ioctl-reference.md`,
@@ -386,4 +393,4 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
   `drm_flip_probe.c`, `clone_probe.c`, `socketpair_fork_probe.c`) plus `MEASUREMENT-PITFALLS.md`,
   `DISK-HYGIENE.md`.
-- `.gm/memories/` — older per-topic notes, superseded by this file/archives wherever they overlap.
+- `.gm/memories/` — older per-topic notes, superseded by this file/archives.
