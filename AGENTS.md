@@ -154,24 +154,14 @@ the full design), three real bugs found+fixed along the way (stack overflow on a
 array, an ambiguous-`None`-timeout infinite-poll bug, a missing shared-queue check in event-driven
 `accept()` paths). Full narrative: archive.
 
-**Fourteenth pass — isolated AF_UNIX repro PASSED clean; full-boot stall theory since REFUTED
-(fifteenth pass below).** `SharedUnixConnTable`/`SharedUnixConnectQueue` genuinely work for the
-minimal cross-process case (byte-exact round trip, fork-before-listen probe). This pass's own read
-of the subsequent full-boot stall (`wait_on_tun`/`with_fork_duplicate_claim_owner` two-holder
-deadlock) was WRONG.
-
-**Fifteenth pass, 2026-09-18 — real root cause found and FIXED, live-verified: a smoltcp
-stale-`SocketHandle` panic killed `net_worker` threads platform-wide.** `wait_on_tun`'s apparent
-"deadlock" was symbol-resolution noise (trust only small offsets, `docs/
-AGENTS_ARCHIVE_2026-09-17.md:1852`); the real mechanism was `Network::reset_after_poisoning`
-wiping `socket_set` while a still-alive process's own fd kept naming a now-dead `SocketHandle`,
-and smoltcp 0.12's `get`/`get_mut` panics outright on that — uncaught inside `net_worker`, killing
-that process's networking permanently, cascading platform-wide since `Network` is shared. Fixed,
-two parts, both required: `catch_unwind` + `force_reset_network_after_panic()` around
-`net_worker` (`litebox_runner_linux_on_windows_userland/src/lib.rs`), plus
-`Network::socket_set_contains` (`litebox/src/net/mod.rs`) guarding every call site that would
-otherwise re-touch a handle a reset already removed. Live-verified, panic signature gone. Full
-evidence and exact log lines: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**Fourteenth/fifteenth passes, 2026-09-18 (detail: archive).** Isolated AF_UNIX repro PASSED
+clean; the full-boot stall's first theory (`wait_on_tun` two-holder deadlock) was WRONG (symbol-
+resolution noise, trust only small offsets). Real root cause: a smoltcp stale-`SocketHandle`
+panic killed `net_worker` threads platform-wide (`Network::reset_after_poisoning` wiping
+`socket_set` while a live fd still named a dead handle). FIXED: `catch_unwind` +
+`force_reset_network_after_panic()` around `net_worker`
+(`litebox_runner_linux_on_windows_userland/src/lib.rs`) plus `Network::socket_set_contains`
+(`litebox/src/net/mod.rs`) guarding every re-touch site. Live-verified, panic signature gone.
 
 **Sixteenth pass, 2026-09-18 — the "60s XSOCK timeout killed the shared-queue mechanism" theory
 REFUTED; real bug was the script's OWN new readiness check; FIXED and live-verified; a SECOND,
@@ -193,38 +183,57 @@ fatal kill right after the fork resume, with none of the exit diagnostics every 
 shows and nothing in litebox's own ungated fault machinery — ruling out the known VEH-caught fault
 class, at least. Concrete next step and full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
+**Seventeenth pass, 2026-09-18 — `xset q`'s silent kill: CAUGHT LIVE (via `cdb -o -g -G` child-
+process debugging), root-caused, and FIXED; a different, deeper stall found immediately past it.**
+Real mechanism: `try_memfd_mmap`/`try_shared_file_mmap` (hit by any file-backed `mmap()`, i.e. any
+exec'd binary's own dynamic linker -- confirmed on `sed -i` as readily as `xset`) read/inserted
+into `GlobalState::memfds`/`shared_files`, two `BTreeMap`s still raw in the cross-process shared
+arena -- the SEVENTH/EIGHTH instance of the SAME "attaching process reads a private-heap `BTreeMap`
+root pointer" defect already fixed six times over (`GlobalStateHandle`'s own doc comment). The
+corrupted-node panic unwinds to `diag_process_fork_globalstate_probe`'s `.join().expect(...)`
+(`lib.rs:1258`), re-panics UNCAUGHT on `main`, and Rust cleanly `process::exit(101)`s -- a real,
+controlled exit, NOT a hardware fault, which is exactly why the VEH-based crash machinery showed
+nothing; the parent's `wait4()` emulation then reports that exit code to the guest as a bare
+`Killed`. **Fix**: `GlobalStateHandle` carries its own fresh-per-process `memfds`/`shared_files`
+(same shape as `elf_patch_cache` et al.), shadowing the removed `GlobalState` fields with no call-
+site changes. Build clean. **Live-verified twice**: `xset` now completes cleanly, 2/2, zero panics.
+**A different, deeper, NOT-YET-ROOT-CAUSED stall sits immediately past this fix, deterministic
+2/2**: the very next fork child (`xrdb`, script offset ~19289) enters `connect_cross_process`
+against an abstract-namespace address, logs the already-known cross-process-presence WARN, then
+makes no further progress at all (near-zero CPU) for 100s+ -- past `SHARED_UNIX_CROSS_CONNECT_
+TIMEOUT`'s documented 3s bound, which reads correct on inspection but evidently isn't reached.
+Concrete next step: `cdb -pv` attach to the stuck winpid, `~*k` to see the real blocked primitive.
+Full evidence and the exact code read: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 (-2) ~~root-cause `net::wait_on_tun`/`with_fork_duplicate_claim_owner`~~ — REFUTED, fifteenth
-pass: structurally can't deadlock (single lock, every caller caps its timeout to 1ms); the real
-mechanism was a smoltcp stale-`SocketHandle` panic killing `net_worker` platform-wide, now FIXED
-(above) and a third confirmation run reached a stable `HOLD` steady state (559 forks, zero panics,
-zero permanent stall) with no intervention needed — a SECOND stall this pass's own second run hit at
-a similar point did NOT reproduce a third time, consistent with this whole area being genuinely
-probabilistic rather than a deterministic bug; not re-prioritized unless it recurs. ~~The browser
+pass: structurally can't deadlock; real mechanism was the smoltcp stale-`SocketHandle` panic, now
+FIXED (above) -- a confirmation run reached stable `HOLD` (559 forks, zero panics); a second stall
+elsewhere did not reproduce a third time, consistent with that area being genuinely probabilistic;
+not re-prioritized unless it recurs. ~~The browser
 milestone is blocked by `unix_addr_table`'s connection-DATA sharing for Xvfb's socket~~ — REFUTED,
 sixteenth pass: the "60s timeout killed both `Xvfb` and `xset`" symptom was `webtop_stack.sh`'s own
 `-S`-on-an-unsupported-file-type bug (now FIXED, above), not the shared-queue mechanism, which never
-even got a fair chance to run before this fix. **The browser milestone is now blocked by a
-DIFFERENT, NOT-YET-ROOT-CAUSED fatal kill of `xset` itself immediately after a genuine cross-process
-fork** — see the sixteenth-pass entry above for the precise, evidenced gap and concrete next step.
-Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth and sixteenth passes.
+even got a fair chance to run before this fix. ~~The browser milestone is blocked by a fatal kill
+of `xset`~~ — ROOT-CAUSED and FIXED, seventeenth pass (`memfds`/`shared_files`, see above); 2/2
+live-verified clean. **The browser milestone is now blocked by a DIFFERENT, deeper stall in
+`connect_cross_process`'s abstract-socket rendezvous, immediately past where `xset` used to die**
+— see the seventeenth-pass entry above; next step `cdb -pv` on the stuck winpid. Full evidence:
+`docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through seventeenth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
-(0) **~~TOP PRIORITY, twelfth pass~~ — superseded by thirteenth-pass entry above.** (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`)
-needs the same dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever
-in `dealloc` this pass, high blast radius, own dedicated pass. (1) ~~Debugger-root-cause the
-dead-holder-recovery data-inconsistency panic~~ — DONE, eleventh pass. (1b) `queued_for_closure`'s
-own still-open cross-process-Vec hazard (nothing yet converts its STORAGE to a fixed pointer-free
-array the way `closing_in_background`/`socket_set` already were) remains a live risk: any process
-reading/pushing it while attached rather than constructing could still hit the stale-pointer class
-on the Vec header itself; (2) debugger-root-cause `litebox/src/event/wait.rs:224`'s
-`unreachable!()` on garbage thread state (dozens per boot, most frequent panic historically, NOT
-yet debugger-confirmed — do not patch blind); (3) root-cause the `/tmp/empty` writable-layer
-cross-child-visibility gap; (4) finish the `Network` shared-arena redesign (`interface`,
-`queued_for_closure` remain); (5) after (0)-(4), `timerfd`/`signalfd` are the next-cheapest
-carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
+(0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
+dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in `dealloc`,
+high blast radius, own dedicated pass. (1b) `queued_for_closure`'s own still-open cross-process-Vec
+hazard (STORAGE not yet converted to a fixed pointer-free array the way `closing_in_background`/
+`socket_set` already were) remains a live risk. (2) debugger-root-cause `litebox/src/
+event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most frequent
+panic historically, NOT yet debugger-confirmed — do not patch blind); (3) root-cause the
+`/tmp/empty` writable-layer cross-child-visibility gap; (4) finish the `Network` shared-arena
+redesign (`interface`, `queued_for_closure` remain); (5) after (0)-(4), `timerfd`/`signalfd` are
+the next-cheapest carriable fd kinds before attempting `socket`/`unix-socket`/`pty`/`epoll`.
 
 ## Container images and OCI loading
 
@@ -276,9 +285,8 @@ Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fo
 below closes. Selkies also needs `--clipboard-enabled=false` (its clipboard monitor re-triggers the
 same corruption every tick).
 
-**Sixth/seventh pass (closed)** — a writable-layer-adoption race (shared snapshot-path deleted by
-the first of several importers, non-atomic export let a concurrent importer read a torn tar) fixed
-via the existing atomic-rename primitive; live-verified 5/5 boots, zero recurrence. Detail: archive.
+**Sixth/seventh pass (closed)** — a writable-layer-adoption race fixed via the existing
+atomic-rename primitive; live-verified 5/5 boots, zero recurrence. Detail: archive.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. Architectural gap:
 **guest processes share no AF_UNIX/loopback/FIFO namespace** — precisely confirmed and named
@@ -371,10 +379,11 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th pass: Xvfb/dbus relaxed, SafeZoneAllocator
-  livelock; 13th pass: shared AF_UNIX connection data plane; 14th pass: isolated repro PASSED; 15th
-  pass: `wait_on_tun` stall theory REFUTED, real smoltcp-panic root cause FIXED, second stall found),
-  `_2026-09-17.md`
+- **Archives** (newest first) — `_2026-09-18.md` (12th: Xvfb/dbus relaxed, SafeZoneAllocator
+  livelock; 13th: shared AF_UNIX connection data plane; 14th: isolated repro PASSED; 15th:
+  `wait_on_tun` REFUTED, smoltcp-panic FIXED; 16th: `-S`/`-e` script bug FIXED; 17th: `xset`'s
+  silent kill CAUGHT LIVE + FIXED (`memfds`/`shared_files`), new `connect_cross_process` stall
+  found), `_2026-09-17.md`
   (shell-crash investigation, stdio-handle bug, 12 registry/pointer/lock fixes, writable-layer-race
   fix), `_2026-09-16.md` (popup-menu re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md`
   (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, browser config,

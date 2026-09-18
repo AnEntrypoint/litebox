@@ -517,3 +517,185 @@ every launch); killed cleanly via `Stop-Process -Force`, verified zero `litebox_
 `litebox-presenter` processes remained; host free RAM 5.09GB before the run, 2.86GB immediately
 after a forced kill of an 8-process fork family, recovering to 5.19GB within 5 seconds -- consistent
 with every prior session's own "RAM pressure is transient and unrelated to litebox" baseline.
+
+## Seventeenth pass, 2026-09-18 -- `xset q`'s silent kill CAUGHT LIVE, root-caused, FIXED; a new, deeper stall found immediately past it
+
+**Method**: launched the runner with `cdb -o -g -G -cf <script>` (Debugging Tools for Windows,
+`x64\cdb.exe`) so the whole cross-process-fork child tree is auto-attached from process start
+(`-o` = debug child processes too; `-g -G` = skip the initial/final breakpoints). The script
+silences routine noise so only genuine faults break in: `sxn sse` (litebox's own `fork_verify`
+single-step healing traps constantly and is expected), `sxn ld`/`sxn ud` (module load spam),
+`sxn ct`/`sxn et` (thread create/exit spam), `sxn eh` (Rust's own MSVC-target unwind machinery
+raises a first-chance `e06d7363` C++ EH exception on every panic-unwind -- expected, not a crash),
+`sxn c0000008` (STATUS_INVALID_HANDLE -- Windows raises this as a first-chance exception on
+`CloseHandle` of an already-closed handle ONLY when a debugger is attached; harmless double-close
+noise the codebase doesn't see without `cdb` attached at all -- note the cdb mnemonic for this is
+NOT `ii`, use the raw hex code). `av`/`gp`/`asrt`/`bpe` are left as `sxe` with a short auto-
+continuing diagnostic (`.exr -1; r; g` -- `.ecxr`+`kv`+disassembly were tried first and dropped:
+`.ecxr` reliably failed with "Unable to get exception context, HRESULT 0x8000FFFF" on these
+single-step-adjacent traps, and the extra output roughly quadrupled log volume for no additional
+signal). `RUST_BACKTRACE=1` was set on the runner's own environment (not just `--env` into the
+guest) specifically so a HOST-side Rust panic prints its full stack trace into the same combined
+log cdb writes to.
+
+**First finding (initially mis-read as `xset`-specific, then generalized): a benign, already-
+working AV-based healing loop.** The first AV caught this way was NOT a crash: a cross-process-
+fork child hit a `fs:[0x28]`-relative (stack-canary-check-shaped) access violation repeatedly
+(12-14 times, same thread, same RIP, single-step then AV each time) on an ordinary fork child
+(script byte offset 4879, nowhere near `xset`), then resolved cleanly -- `run_thread returned
+(guest thread terminated)` -> `exported writable layer` -> `exiting with encoded status
+0xc0de0000`, the same clean-exit pattern every successful fork child shows. This is
+`vectored_exception_handler`'s own documented AV-path stale-pointer healing
+(`litebox_platform_windows_userland/src/fork_verify.rs`) working as designed, caught live for the
+first time simply because nothing had instrumented a child this deeply before. A separate, also-
+benign AV recurred ~14 times across the whole boot in the TOP-LEVEL PARENT at one fixed address,
+once per completed fork child -- also never fatal. Neither is the mechanism this pass hunted;
+noted so a future pass doesn't re-investigate them as new leads.
+
+**Second finding, the real one: `sed -i` (script lines 90-94, `webtop_stack.sh`'s own nginx-config
+`sed` calls, much earlier than `xset`) dies with the exact same `bash: ... Killed` signature the
+whole investigation had been chasing for `xset` specifically.** Caught the moment it happened:
+immediately preceding the `Killed` line, cdb's own `RUST_BACKTRACE=1`-driven panic print showed
+
+```
+thread '<unnamed>' (21496) panicked at
+/rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\alloc\src\collections\btree\node.rs:1232:35:
+range end index 25710 out of range for slice of length 11
+```
+
+with a full backtrace through `alloc::collections::btree::map::BTreeMap<..., MemfdEntry, ...>::
+insert`, `litebox_shim_linux::syscalls::mm`, `litebox_shim_linux::syscalls::file`,
+`LinuxShimEntrypoints`, `litebox_platform_windows_userland::diag_mm_enabled`, `syscall_callback`,
+`run_thread_inner`, `run_thread_with_fork_verification`,
+`litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe_inner`. The exact
+same panic message, byte-identical ("25710... length 11" every time, never a different number --
+a frozen stale value being read back, not random heap garbage), recurred on three more independent
+forked children across two separate `cdb`-instrumented boots, always inside
+`syscalls::mm::try_memfd_mmap`/`try_shared_file_mmap` (confirmed by reading those two functions:
+both do `self.global.memfds.lock().get_mut(&key)` / `self.global.shared_files.lock()...
+insert(...)`, on literally EVERY `mmap()` of any file-backed fd -- i.e. every exec'd guest binary's
+own dynamic linker mapping its shared libraries at startup hits one of these two call sites,
+unconditionally, regardless of whether the fd is actually a memfd). This unwinds (via Rust's
+MSVC-target SEH-based panic-unwind, the `e06d7363` C++ EH exception silenced above) to
+`diag_process_fork_globalstate_probe`'s `.spawn(diag_process_fork_globalstate_probe_inner)
+.expect(...).join().expect(...)` (`litebox_runner_linux_on_windows_userland/src/lib.rs:1253-1258`)
+-- the `.join()` returns `Err`, and `.expect("cross-process fork child's guest-execution thread
+panicked")` panics a SECOND time, this time on that process's own `main` thread, with nothing
+further up the call stack to catch it (confirmed: the second panic's own backtrace shows
+`std::rt::lang_start_internal`'s `catch_unwind` -- Rust's own runtime entrypoint wrapper around
+`main`, not an application-level catch -- immediately below `main`). Rust's default behavior when
+`main` itself panics uncaught is to print the message (already captured above) and call
+`std::process::exit(101)`: a clean, fully controlled process exit, NOT a hardware fault of any
+kind. This is the concrete, live-confirmed answer to why litebox's own VEH-based
+`RECENT_FAULTS`/`RECOVERY_LOG` crash machinery (`litebox_platform_windows_userland`, "Host-side
+crash machinery" section) showed nothing for this class of death every previous pass: there is no
+exception for it to intercept. The visible-to-the-guest symptom (`bash: ... NN Killed ...`, zero
+further diagnostic) comes from a separate, still-open gap one layer further out: the PARENT's
+`wait4()`-emulation path apparently maps any unrecognized host child exit code (101 here, vs. the
+`0xc0deNNNN` sentinel family a clean guest-thread exit uses) to a synthetic "killed by signal"
+status for the guest rather than surfacing the real exit code -- worth a dedicated future pass in
+its own right, independent of the panic itself being fixed (below), since ANY future uncaught
+host-side panic in ANY guest-reachable path will still show up this same opaque way.
+
+**Root cause, precisely**: `GlobalState::memfds`/`GlobalState::shared_files` (both
+`litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>`, i.e. plain
+`BTreeMap<(usize, usize), MemfdEntry<Platform>>` under a lock) were still raw fields of the shared
+`GlobalState` struct placed byte-for-byte in the cross-process shared kernel arena. This is the
+identical defect class `GlobalStateHandle`'s own doc comment already documents six separate times
+(`litebox`, `proc_self_info`/`pts_registry`, `elf_patch_cache`, `exec_ranges_cache`,
+`segment_scan_cache`, `futex_manager`): `SharedArc::new`/`create_shared_kernel_state` shares only a
+value's literal inline bytes, and a `BTreeMap`'s inline bytes are just a root pointer + length --
+meaningless (in `elf_patch_cache`'s case, this exact `btree::node.rs:1232` panic, previously
+diagnosed 2026-09-17) in an ATTACHING cross-process-fork child's own address space, which never had
+those specific heap pages mapped at all. `memfds`/`shared_files` simply hadn't been hit by this
+yet, because nothing before this pass had a cross-process-fork child perform a file-backed `mmap()`
+early enough in its life to reach `try_memfd_mmap`/`try_shared_file_mmap` while instrumented
+closely enough to notice -- `elf_patch_cache` et al. are touched by `execve` itself (universal,
+found immediately, 2026-09-17), while these two are touched only by `mmap()` (only found now,
+because `sed`'s own dynamic linker's library-mapping `mmap()` calls happened to be the first
+sufficiently-early, sufficiently-common trigger this investigation's tooling caught in the act).
+
+**Fix, identical shape to the six prior instances**: removed `memfds`/`shared_files` from
+`GlobalState` (replaced with a `NOTE` comment matching the `litebox`/`futex_manager` ones, pointing
+at this section). Added `memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry
+<Platform>>>` and `shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry
+<Platform>>>` to `GlobalStateHandle` itself, constructed fresh (`my_memfds`/`my_shared_files`,
+empty `BTreeMap::new()` wrapped in a fresh `Mutex` wrapped in a fresh `Arc`) in
+`LinuxShimBuilder::build()` before the create-vs-attach branch, alongside `my_elf_patch_cache` et
+al. -- so every process, create or attach alike, gets its own private, always-valid, always-
+correctly-constructed instance. Every existing `self.global.memfds`/`self.global.shared_files` call
+site (`litebox_shim_linux/src/syscalls/mm.rs:839,1031`, `syscalls/file.rs:1053,1118`) needed no
+changes at all: Rust's field-resolution rules try the receiver's own concrete type
+(`GlobalStateHandle`) before auto-`Deref`ing to `GlobalState`, so the new field transparently
+shadows the removed one, exactly as documented for all six prior instances. `Clone` for
+`GlobalStateHandle` updated to clone the two new `Arc`s. Build: `cargo build --release -p
+litebox_runner_linux_on_windows_userland`, clean, zero errors, one pre-existing unrelated warning
+(`live_pty_ids` dead-code, not touched by this change), 42.63s.
+
+**Accepted, explicit tradeoff** (identical in kind to `futex_manager`'s own documented one): a
+memfd created by one process in a cross-process-fork family, or a `MAP_SHARED` mapping of an
+ordinary file, is no longer visible to another member of that same family via this specific
+mechanism. This was never actually working before this fix (it panicked the reader instead of
+sharing anything), so this is a strict improvement, not a regression -- the WITHIN-one-process
+`dup()`/thread-fork sharing rationale `memfds`'s own doc comment describes is completely unaffected
+(it never crossed a `GlobalStateHandle` instance to begin with).
+
+**Live-verified, twice, clean (no `cdb`, no debug overhead)**: fresh binary,
+`LITEBOX_PROCESS_FORK=1` + `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error`
++ `RUST_BACKTRACE=1`, `.wfgy/webtop_stack.sh` (`-e`-fixed, sixteenth pass) unchanged,
+`--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/webtop_seed.tar`. Both
+runs: the fork resuming at script byte offset 19217 (`xset`'s own line) shows the same clean
+`task-resume-probe (child): run_thread returned (guest thread terminated)` -> `exported writable
+layer` -> `exiting with encoded status 0xc0de0000` sequence every other successful fork child in
+the log shows -- no panic, no `Killed`, no exception of any kind at that point in either run. Zero
+`sed`/`xset`-class panics anywhere in either full boot log up to the point each run reached (see
+below). This closes the entire investigation this multi-day session's "xset q silent kill" question
+was about: real mechanism identified with direct live evidence (a genuine Rust panic->clean-exit,
+not a hardware fault, not a gap in the VEH machinery itself), fixed at its actual root cause (not
+worked around), and the fix live-verified to actually stop it from recurring.
+
+**A different, deeper, NOT-YET-ROOT-CAUSED stall found immediately past this fix, deterministic
+2/2.** Both live-verification boots above progress cleanly past `xset` (offset 19217) into the very
+next fork child (offset ~19289 -- `xrdb "$HOME/.Xresources"` per the script's own next line, though
+not yet confirmed by direct comm-name evidence) and then stop making any further forward progress
+at all: no more log lines of any kind, and the specific winpid's own CPU time barely moves across a
+5-second `Get-Process` sample (9.703125s -> 9.765625s -- ~1.25% of one core, i.e. blocked, not
+spinning). A third run, this time with `LITEBOX_LOG=...,litebox_shim_linux::syscalls::unix=debug`
+added specifically to get this module's `TRACE unix_connect: entry`/`: result` lines, reproduced
+the identical stall at the identical point and revealed the connect target is an ABSTRACT-namespace
+address (`Abstract([47, 116, 109, 112, ...])`, i.e. bytes starting `/tmp` -- not the X11 socket,
+which is path-based, not abstract; likely a D-Bus-family or compositor IPC socket), and that
+`connect()`'s cross-process branch (`connect_cross_process`, `litebox_shim_linux/src/
+syscalls/unix.rs:1354`) is reached, immediately logs the already-known `log_cross_process_
+presence_miss` WARN (`[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest
+pid`), and then nothing else is ever logged for that process again. Two candidate mechanisms were
+read (both look correct on inspection, neither confirmed live yet): (a) if the `unix_addr_presence`
+re-check inside `log_cross_process_presence_miss` finds a different result than
+`connect_cross_process`'s own immediately-preceding check (a TOCTOU race between the two separate
+atomic lookups), the control flow this pass read statically may not match what actually executes;
+(b) `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (3 seconds, `unix.rs:2689`) and `wait_on_events_polling`'s
+own already-once-fixed deadline-ambiguity guard (`has_real_deadline`/`remaining_timeout()`,
+`unix.rs:2705-2746`, itself the product of a live fix earlier this same day for an unbounded-poll-
+loop bug in this exact function) both read as correct in isolation, yet the observed stall vastly
+exceeds 3 seconds (100s+ real wall-clock, both runs) -- either this specific call path never
+actually reaches that bounded wait (most likely, given (a) above), or there is a third, not-yet-
+found bug in the same neighborhood. **Concrete next step**: `cdb -pv` (non-invasive) attach to the
+specific stuck winpid the moment the stall is confirmed (identify it via the same `task-resume-
+probe (child, winpid=NNNNN)` log line this pass used) and run `~*k` -- near-zero CPU across a
+multi-second sample already rules out a spin loop, so the resulting stack should show exactly which
+wait primitive (a `RawMutex`, an OS-level `WaitOnAddress`/event, or something else) the thread is
+genuinely blocked in, rather than further static reading of code that looks correct on paper. This
+is likely the same general "cross-process AF_UNIX connection data plane" area Track B pickup (-2)
+already flags as "genuinely probabilistic" for a different symptom (`net::wait_on_tun`) -- worth
+checking whether this is that same probabilistic class recurring deterministically for a different
+reason, or a genuinely separate, third mechanism in the same neighborhood.
+
+**Host state**: single runner instance at a time throughout (confirmed via `Get-Process` before
+every launch, and a forced `Stop-Process` between each); host free RAM fluctuated between ~1.7GB
+and ~4.3GB across this pass's several launches with no litebox process running at the low points
+either, consistent with every prior session's "RAM pressure is host-wide and unrelated to litebox"
+finding -- proceeded per standing instruction rather than treating it as a blocker. Files touched:
+`litebox_shim_linux/src/lib.rs` only (the `GlobalState`/`GlobalStateHandle` fix above); no test
+files added, per standing rule. `.wfgy/cdb_catch_xset.txt` (the cdb command script) and this pass's
+`.wfgy/cdb_boot_catch*.log`/`boot_memfds_fix*.log`/`boot_debug_unix.log` repro logs are gitignored
+scratch artifacts, not committed.

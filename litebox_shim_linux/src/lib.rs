@@ -523,6 +523,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // -- unlike a `BTreeMap`, there is no "move the collection into the shared arena" fix
         // available here even in principle.
         let my_futex_manager = Arc::new(FutexManager::new());
+        // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
+        // comment's "Seventh and eighth instances of the SAME defect" section.
+        let my_memfds = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        let my_shared_files =
+            Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -561,8 +566,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
                         drm: syscalls::drm::DrmSubsystem::new(),
                         evdev: syscalls::evdev::EvdevSubsystem::new(),
-                        memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                        shared_files: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                     },
                 )
             });
@@ -575,6 +578,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             exec_ranges_cache: my_exec_ranges_cache,
             segment_scan_cache: my_segment_scan_cache,
             futex_manager: my_futex_manager,
+            memfds: my_memfds,
+            shared_files: my_shared_files,
         })
     }
 }
@@ -2857,6 +2862,12 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     exec_ranges_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>>,
     segment_scan_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>>,
     futex_manager: Arc<FutexManager<Platform>>,
+    /// Seventh/eighth instances of the SAME defect this struct's own doc comment already
+    /// documents six times over: see `LinuxShimBuilder::build`'s `my_memfds`/`my_shared_files`
+    /// for the live-caught 2026-09-18 evidence (`sed`/`xset` both died on this, a corrupted-
+    /// `BTreeMap`-node panic in `syscalls::mm::MemfdRegistry`, fixed the identical way).
+    memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -2870,6 +2881,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             exec_ranges_cache: self.exec_ranges_cache.clone(),
             segment_scan_cache: self.segment_scan_cache.clone(),
             futex_manager: self.futex_manager.clone(),
+            memfds: self.memfds.clone(),
+            shared_files: self.shared_files.clone(),
         }
     }
 }
@@ -3141,19 +3154,33 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// matching how a real kernel input device is one object regardless of how many processes
     /// have it open.
     evdev: syscalls::evdev::EvdevSubsystem<Platform>,
-    /// Real shared-memory state for every live `memfd_create` fd, keyed by the backing in-mem
-    /// file's own `(dev, ino)` -- shim-wide for the same `(dev, ino)`-keying rationale as
-    /// `flock_registry` (any fd sharing the same underlying open file description, e.g. via
-    /// `dup()`/`fork()`, must resolve to the SAME real shared-memory handle, not a fresh one per
-    /// fd number). See `syscalls::mm::MemfdRegistry`'s own doc comment for the full shape.
-    memfds: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
-
-    /// Real shared-memory backing for writable `MAP_SHARED` mappings of ORDINARY files, keyed by
-    /// the file's `(dev, ino)` exactly as [`syscalls::mm::MemfdRegistry`] is -- so that every
-    /// process mapping the same file binds to the same object and sees the others' writes. See
-    /// `syscalls::mm::try_shared_file_mmap` for why this exists and what it deliberately does not
-    /// do. Same entry shape as a memfd's, hence the shared type.
-    shared_files: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
+    // NOTE: this struct deliberately has NO `memfds`/`shared_files` fields -- SEVENTH and EIGHTH
+    // instances of the SAME cross-process-garbage-pointer defect class documented on
+    // `GlobalStateHandle`'s own doc comment (`litebox`/`proc_self_info`/`pts_registry`/
+    // `elf_patch_cache`/etc), live-caught 2026-09-18 under `cdb -o` child-process debugging: a
+    // real `alloc::collections::btree::node.rs:1232` "range end index 25710 out of range for
+    // slice of length 11" panic inside `MemfdRegistry`'s `BTreeMap::insert`/`get_mut`, hit by a
+    // cross-process-fork child's `try_memfd_mmap`/`try_shared_file_mmap` (`syscalls::mm`) on the
+    // very first file-backed `mmap()` it performed post-fork (i.e. essentially every exec'd guest
+    // binary's own dynamic linker mapping its shared libraries -- confirmed live on both `sed`
+    // and, matching the same-day investigation this closes, `xset`). The panic unwound to the
+    // guest-execution thread's `.join().expect(...)` in
+    // `litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe`, which
+    // re-panicked on the process's own `main` thread uncaught -- a clean Rust
+    // `std::process::exit(101)` after printing the panic (see that panic message's own stack
+    // trace for confirmation), NOT a hardware fault, which is exactly why this crash never showed
+    // up in litebox's VEH-based `RECENT_FAULTS`/`RECOVERY_LOG` machinery (nothing there to catch:
+    // there was no CPU exception, just a controlled panicking exit) -- the parent's `wait4()`
+    // emulation then reports that unrecognized host exit code to the guest shell as a bare
+    // `Killed`, with zero further diagnostic. `GlobalStateHandle` carries its own, always-
+    // freshly-constructed-per-process `memfds`/`shared_files` fields instead (below), shadowing
+    // these (now removed) fields for every existing `self.global.memfds`/`self.global.
+    // shared_files` call site with no further change -- same fix shape as `elf_patch_cache`
+    // above, and the same accepted tradeoff: a memfd/shared-file mapping created by one process
+    // in a cross-process-fork family is no longer visible to another member of that family (it
+    // never safely was -- it panicked instead), rather than losing the WITHIN-one-process
+    // dup()/thread-fork sharing `memfds`'s own doc comment used to describe, which is unaffected
+    // since it never crossed a `GlobalStateHandle` instance to begin with.
     // NOTE: this struct deliberately has NO `proc_self_info`/`pts_registry` fields either, for
     // the SAME reason it has no `litebox` field above -- see `GlobalStateHandle`'s doc comment's
     // "Second instance of the SAME defect" section. `GlobalStateHandle` carries its OWN, always
