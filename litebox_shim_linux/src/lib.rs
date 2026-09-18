@@ -543,6 +543,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             syscalls::unix::UnixAddrTable::new(),
                         ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
+                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
+                        unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
                         flock_registry: litebox::sync::Mutex::new(
@@ -2944,6 +2946,15 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// for free -- no second `SharedKernelStateProvider` slot needed, unlike `unix_addr_table`
     /// itself, whose `BTreeMap` nodes remain private-heap-allocated regardless.
     unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable,
+    /// Shared-arena-native pool of cross-process AF_UNIX connection byte-transport slots -- see
+    /// `syscalls::unix::SharedUnixConnTable`'s own doc comment (the "Shared cross-process AF_UNIX
+    /// connection data plane" section of `syscalls/unix.rs`) for the full rendezvous design this
+    /// and `unix_shared_connect_queue` below implement together. A plain field of this same
+    /// struct, same free-riding-on-`GlobalState`'s-own-sharing rationale as `unix_addr_presence`.
+    unix_shared_conn_table: syscalls::unix::SharedUnixConnTable<Platform>,
+    /// Cross-process `connect()`/`accept()` rendezvous queue -- see `unix_shared_conn_table`'s doc
+    /// comment above.
+    unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue,
     // NOTE: this struct deliberately has NO `elf_patch_cache` field -- THIRD instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment (`litebox`/`proc_self_info`/`pts_registry`), live-diagnosed 2026-09-17: an attaching

@@ -378,26 +378,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
         Ok(client)
     }
 
-    /// Attempts to accept a pending connection without blocking.
-    fn try_accept(&self) -> Result<UnixConnectedStream<Platform, FS>, TryOpError<Errno>> {
-        let mut state = self.state.lock();
-        match state.sockets.pop_front() {
-            Some(stream) => {
-                if !state.is_shutdown {
-                    self.pollee.notify_observers(Events::OUT);
+    /// Attempts to accept a pending connection without blocking. Checks the private,
+    /// same-process backlog first (unchanged fast path); if that's empty and not shut down, also
+    /// checks `global.unix_shared_connect_queue` for a genuinely cross-process client's pending
+    /// request naming this address -- see the "Shared cross-process AF_UNIX connection data
+    /// plane" module doc comment (near [`SharedUnixConnectQueue`]) for the full rendezvous
+    /// design this closes.
+    fn try_accept(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> Result<UnixConnectedStream<Platform, FS>, TryOpError<Errno>> {
+        {
+            let mut state = self.state.lock();
+            match state.sockets.pop_front() {
+                Some(stream) => {
+                    if !state.is_shutdown {
+                        self.pollee.notify_observers(Events::OUT);
+                    }
+                    return Ok(stream);
                 }
-                Ok(stream)
+                None if state.is_shutdown => return Err(TryOpError::Other(Errno::ESHUTDOWN)),
+                None => {}
             }
-            None if state.is_shutdown => Err(TryOpError::Other(Errno::ESHUTDOWN)),
+        }
+        match self.try_accept_shared(global) {
+            Some(stream) => Ok(stream),
             None => Err(TryOpError::TryAgain),
         }
     }
 
-    fn check_io_events(&self) -> Events {
+    /// The shared-queue half of [`Self::try_accept`] -- claims one pending cross-process connect
+    /// request naming this listener's own address, if any, and completes it with a fresh
+    /// [`SharedUnixConnTable`] slot.
+    fn try_accept_shared(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> Option<UnixConnectedStream<Platform, FS>> {
+        let key = self.addr.to_key();
+        let (kind, key_bytes) = presence_kind_and_bytes(&key);
+        let (request_idx, client_cred) = global.unix_shared_connect_queue.try_claim(kind, key_bytes)?;
+        let Some(slot) = global.unix_shared_conn_table.alloc(&client_cred, &self.listener_cred) else {
+            // Pool exhausted -- leave this request CLAIMED-but-never-completed; the client's own
+            // bounded poll loop eventually times out and retries with a fresh `post()`. Bounded,
+            // self-healing, never a panic.
+            return None;
+        };
+        global.unix_shared_connect_queue.complete(request_idx, slot);
+        let local_addr = UnixSocketAddr::from(self.addr.as_ref());
+        let stream = UnixConnectedStream::new_shared(
+            global.clone(),
+            slot,
+            false, // this is the accepting ("server") side of the slot
+            local_addr,
+            // The client's own bound address, if any, isn't carried through the shared queue in
+            // this first cut (most AF_UNIX clients connect unbound) -- `getpeername()` on the
+            // accepted side reports Unnamed rather than a real path/abstract address in that
+            // case, a disclosed, non-panicking simplification.
+            UnixSocketAddr::Unnamed,
+            client_cred,
+        );
+        self.pollee.notify_observers(Events::IN);
+        Some(stream)
+    }
+
+    /// `global` is used to also check `unix_shared_connect_queue` for a genuinely cross-process
+    /// pending request naming this listener's own address -- see [`SharedUnixConnectQueue::
+    /// has_pending`]'s doc comment for why this half is required at all (not just [`Self::
+    /// try_accept`]'s own shared-queue check): a real event-driven listener (Xvfb, dbus-daemon)
+    /// calls `poll`/`epoll_wait` to learn a connection is waiting BEFORE ever calling `accept()`.
+    fn check_io_events(&self, global: &GlobalStateHandle<Platform, FS>) -> Events {
         let state = self.state.lock();
         let mut events = Events::empty();
         if !state.sockets.is_empty() {
             events |= Events::IN;
+        } else if !state.is_shutdown {
+            let key = self.addr.to_key();
+            let (kind, key_bytes) = presence_kind_and_bytes(&key);
+            if global.unix_shared_connect_queue.has_pending(kind, key_bytes) {
+                events |= Events::IN;
+            }
         }
         if state.is_shutdown {
             events |= Events::IN | Events::HUP;
@@ -582,17 +641,75 @@ struct Message<Platform: ShimPlatform, FS: ShimFS> {
     fds: Vec<AnyDupFd<Platform, FS>>,
 }
 
+/// The two ways a [`UnixConnectedStream`] moves bytes to/from its peer. `Local` is the original,
+/// unchanged same-process path (an `Arc`-boxed `crate::channel::Channel`, unusable across a real
+/// process boundary). `Shared` is the new cross-process-fork path: a slot in
+/// [`SharedUnixConnTable`], living in the shared kernel arena, with no `Arc`/`Box`/pointer
+/// crossing between the two processes anywhere -- see that type's own module doc comment for the
+/// full rendezvous design and its explicit scope limits (byte-stream only, no genuine cross-
+/// process wakeup).
+enum ConnTransport<Platform: ShimPlatform, FS: ShimFS> {
+    Local {
+        addr: AddrView<FS>,
+        /// The read end of the local socket's channel for receiving messages.
+        recv_channel: crate::channel::ReadEnd<Platform, Message<Platform, FS>>,
+        /// The write end of the connected peer socket for sending messages.
+        connected_send_channel: crate::channel::WriteEnd<Platform, Message<Platform, FS>>,
+    },
+    Shared {
+        global: GlobalStateHandle<Platform, FS>,
+        slot: u32,
+        /// `true` if this endpoint is the connect()-ing side (reads `server_to_client`, writes
+        /// `client_to_server`); `false` for the accept()-ing side (the reverse).
+        is_client: bool,
+        local_addr: UnixSocketAddr,
+        peer_addr: UnixSocketAddr,
+        /// Set true by this endpoint's own `Drop`/`shutdown(SHUT_RD)` -- distinct from the ring's
+        /// own `write_shutdown` (which tracks the PEER's write direction), needed because a
+        /// `Shared` connection has no `channel::EndPointer`-style `Arc` this side can inspect to
+        /// ask "did I already shut myself down".
+        self_read_shutdown: AtomicBool,
+    },
+}
+
 /// Represents a connected Unix stream socket.
 struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
-    addr: AddrView<FS>,
-    /// The read end of the local socket's channel for receiving messages.
-    recv_channel: crate::channel::ReadEnd<Platform, Message<Platform, FS>>,
-    /// The write end of the connected peer socket for sending messages.
-    connected_send_channel: crate::channel::WriteEnd<Platform, Message<Platform, FS>>,
+    transport: ConnTransport<Platform, FS>,
     pollee: Arc<Pollee<Platform>>,
     /// Real credentials (pid/uid/gid) of the *peer* task, as of connection
     /// establishment -- what `getsockopt(SO_PEERCRED)` reports to this side.
     peer_cred: Ucred,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for ConnTransport<Platform, FS> {
+    fn drop(&mut self) {
+        // `Local`'s two channel ends already shut themselves down via their own `Drop` impls
+        // (`channel.rs`) -- nothing extra needed here. `Shared` has no such per-field `Drop`
+        // (its fields are a plain index/bools, not `Arc`-boxed endpoints), so this is the only
+        // place that can mark this endpoint's own direction shut down and, once BOTH sides are
+        // gone, release the slot back to the shared pool.
+        if let ConnTransport::Shared {
+            global, slot, is_client, ..
+        } = self
+        {
+            let table = &global.unix_shared_conn_table;
+            let slot_ref = table.get(*slot);
+            if *is_client {
+                slot_ref.client_to_server.shutdown();
+            } else {
+                slot_ref.server_to_client.shutdown();
+            }
+            // Both directions shut down (i.e. both endpoints have dropped, or one dropped after
+            // already shutting down its write side and the other direction was already shut by
+            // the peer's own earlier drop) -- safe to reclaim the slot. This is a conservative,
+            // best-effort check: worst case a slot is freed slightly late (bounded by
+            // SHARED_UNIX_CONN_CAPACITY, self-healing on the next connection churn), never
+            // double-freed (each endpoint's `Drop` runs at most once).
+            if slot_ref.client_to_server.is_shutdown() && slot_ref.server_to_client.is_shutdown() {
+                table.free(*slot);
+            }
+        }
+    }
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -622,46 +739,115 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
         let first = UnixConnectedStream {
-            addr: addr1,
-            recv_channel,
-            connected_send_channel: send_channel_peer,
+            transport: ConnTransport::Local {
+                addr: addr1,
+                recv_channel,
+                connected_send_channel: send_channel_peer,
+            },
             pollee: pollee1,
             peer_cred: second_cred,
         };
         let second = UnixConnectedStream {
-            addr: addr2,
-            recv_channel: recv_channel_peer,
-            connected_send_channel: send_channel,
+            transport: ConnTransport::Local {
+                addr: addr2,
+                recv_channel: recv_channel_peer,
+                connected_send_channel: send_channel,
+            },
             pollee: pollee2,
             peer_cred: first_cred,
         };
+        let ConnTransport::Local {
+            recv_channel,
+            connected_send_channel,
+            ..
+        } = &first.transport
+        else {
+            unreachable!("first's transport was just constructed as ConnTransport::Local above");
+        };
         if read_shutdown {
-            first.recv_channel.shutdown();
+            recv_channel.shutdown();
         }
         if write_shutdown {
-            first.connected_send_channel.shutdown();
+            connected_send_channel.shutdown();
         }
         (first, second)
     }
 
+    /// Constructs the `Shared`-transport half of a genuinely cross-process connection --
+    /// see [`ConnTransport::Shared`]'s doc comment. `is_client` selects which of the slot's two
+    /// [`SharedByteRing`]s this side reads/writes.
+    fn new_shared(
+        global: GlobalStateHandle<Platform, FS>,
+        slot: u32,
+        is_client: bool,
+        local_addr: UnixSocketAddr,
+        peer_addr: UnixSocketAddr,
+        peer_cred: Ucred,
+    ) -> Self {
+        Self {
+            transport: ConnTransport::Shared {
+                global,
+                slot,
+                is_client,
+                local_addr,
+                peer_addr,
+                self_read_shutdown: AtomicBool::new(false),
+            },
+            pollee: Arc::new(Pollee::new()),
+            peer_cred,
+        }
+    }
+
+    /// For `Shared` transport, returns `(ring this side reads from, ring this side writes to)`.
+    fn shared_rings(
+        global: &GlobalStateHandle<Platform, FS>,
+        slot: u32,
+        is_client: bool,
+    ) -> (&SharedByteRing<Platform>, &SharedByteRing<Platform>) {
+        let slot_ref = global.unix_shared_conn_table.get(slot);
+        if is_client {
+            (&slot_ref.server_to_client, &slot_ref.client_to_server)
+        } else {
+            (&slot_ref.client_to_server, &slot_ref.server_to_client)
+        }
+    }
+
     fn get_local_addr(&self) -> UnixSocketAddr {
-        match self.addr.get_local_addr() {
-            Some(addr) => UnixSocketAddr::from(addr),
-            None => UnixSocketAddr::Unnamed,
+        match &self.transport {
+            ConnTransport::Local { addr, .. } => match addr.get_local_addr() {
+                Some(addr) => UnixSocketAddr::from(addr),
+                None => UnixSocketAddr::Unnamed,
+            },
+            ConnTransport::Shared { local_addr, .. } => local_addr.clone(),
         }
     }
 
     fn get_peer_addr(&self) -> UnixSocketAddr {
-        match self.addr.get_peer_addr() {
-            Some(addr) => UnixSocketAddr::from(addr),
-            None => UnixSocketAddr::Unnamed,
+        match &self.transport {
+            ConnTransport::Local { addr, .. } => match addr.get_peer_addr() {
+                Some(addr) => UnixSocketAddr::from(addr),
+                None => UnixSocketAddr::Unnamed,
+            },
+            ConnTransport::Shared { peer_addr, .. } => peer_addr.clone(),
         }
     }
 
+    /// Returns the number of bytes actually accepted on success -- always `msg.data.len()` for
+    /// `Local` transport (its underlying `Channel` pushes one whole `Message` atomically, no
+    /// partial concept), but possibly LESS than `msg.data.len()` for `Shared` transport on an
+    /// over-sized single write (see [`Self::try_sendto_shared`]/[`SHARED_UNIX_CONN_BUF`]'s doc
+    /// comments).
     fn try_sendto(
         &self,
         msg: Message<Platform, FS>,
-    ) -> Result<(), (Message<Platform, FS>, Errno)> {
+    ) -> Result<usize, (Message<Platform, FS>, Errno)> {
+        let ConnTransport::Local {
+            connected_send_channel,
+            ..
+        } = &self.transport
+        else {
+            return self.try_sendto_shared(msg);
+        };
         // TODO: write partial data?
         let len = msg.data.len();
         let sock_id = self as *const _ as usize;
@@ -690,7 +876,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 "diag-unix-stream-write-bytes"
             );
         }
-        let result = self.connected_send_channel.try_write_one(msg);
+        let result = connected_send_channel.try_write_one(msg).map(|()| len);
         litebox_util_log::debug!(
             sock_id:% = sock_id,
             len:% = len,
@@ -698,6 +884,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             "diag-unix-stream-write: try_sendto pushed into connected_send_channel"
         );
         result
+    }
+
+    /// `Shared`-transport half of [`Self::try_sendto`] -- see [`ConnTransport::Shared`]'s doc
+    /// comment for the byte-stream-only, no-`SCM_RIGHTS` scope limit this enforces. Prefers an
+    /// atomic all-or-nothing write (temporary backpressure resolves via the normal `EAGAIN`-then-
+    /// retry path); only degrades to a genuine short write for the one case that could never
+    /// resolve any other way -- a single message bigger than the whole ring.
+    fn try_sendto_shared(
+        &self,
+        msg: Message<Platform, FS>,
+    ) -> Result<usize, (Message<Platform, FS>, Errno)> {
+        let ConnTransport::Shared {
+            global,
+            slot,
+            is_client,
+            ..
+        } = &self.transport
+        else {
+            unreachable!("try_sendto_shared only called for ConnTransport::Shared");
+        };
+        if !msg.fds.is_empty() {
+            return Err((msg, Errno::EOPNOTSUPP));
+        }
+        let (_, write_ring) = Self::shared_rings(global, *slot, *is_client);
+        if write_ring.is_shutdown() {
+            return Err((msg, Errno::EPIPE));
+        }
+        if msg.data.is_empty() {
+            return Ok(0);
+        }
+        if msg.data.len() > SHARED_UNIX_CONN_BUF {
+            let n = write_ring.try_write(&msg.data[..SHARED_UNIX_CONN_BUF]);
+            return if n == 0 {
+                Err((msg, Errno::EAGAIN))
+            } else {
+                Ok(n)
+            };
+        }
+        if !write_ring.try_write_all(&msg.data) {
+            return Err((msg, Errno::EAGAIN));
+        }
+        Ok(msg.data.len())
     }
 
     /// Reads up to `buf.len()` bytes, same message-boundary-spanning behavior as before, plus any
@@ -710,6 +938,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
+        let ConnTransport::Local { recv_channel, .. } = &self.transport else {
+            return self.try_recvfrom_shared(buf);
+        };
         let mut total_read = 0;
         let mut fds = Vec::new();
         // `buf` itself is reassigned (advanced) below as bytes are consumed; keep a raw pointer
@@ -719,7 +950,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let buf_start: *const u8 = buf.as_ptr();
         let mut buf: &mut [u8] = buf;
         while !buf.is_empty() {
-            let n = match self.recv_channel.peek_and_consume_one(|msg| {
+            let n = match recv_channel.peek_and_consume_one(|msg| {
                 // `Vec::append` empties `msg.fds`, so a later partial read of this same
                 // (already-drained-of-fds) message correctly appends nothing further.
                 fds.append(&mut msg.fds);
@@ -770,17 +1001,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         Ok((total_read, fds))
     }
 
+    /// `Shared`-transport half of [`Self::try_recvfrom`]. Pure byte-stream (no message
+    /// boundaries to preserve -- [`SharedByteRing`] never had any), and always reports an empty
+    /// `fds` list (see [`ConnTransport::Shared`]'s scope-limit doc comment: `SCM_RIGHTS` is
+    /// rejected up front on the sending side, so there is never anything to deliver here).
+    fn try_recvfrom_shared(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
+        let ConnTransport::Shared {
+            global,
+            slot,
+            is_client,
+            self_read_shutdown,
+            ..
+        } = &self.transport
+        else {
+            unreachable!("try_recvfrom_shared only called for ConnTransport::Shared");
+        };
+        if self_read_shutdown.load(Ordering::Acquire) {
+            return Err(TryOpError::Other(Errno::ESHUTDOWN));
+        }
+        let (read_ring, _) = Self::shared_rings(global, *slot, *is_client);
+        let n = read_ring.try_read(buf);
+        if n > 0 {
+            self.pollee.notify_observers(Events::OUT);
+            return Ok((n, Vec::new()));
+        }
+        if read_ring.is_shutdown() {
+            return Err(TryOpError::Other(Errno::ESHUTDOWN));
+        }
+        Err(TryOpError::TryAgain)
+    }
+
     /// `SOCK_SEQPACKET`'s own boundary-preserving read: unlike [`Self::try_recvfrom`], never
     /// spans more than the ONE message at the front of `recv_channel`. A message larger than
     /// `buf` is truncated (matching real Linux `recv(2)`'s "excess bytes in a datagram are
     /// discarded" behavior for message-boundary-preserving socket types) rather than left
     /// partially in the queue for a follow-up read to continue.
+    ///
+    /// `Shared` transport has no message-boundary concept at all (see [`ConnTransport::Shared`]'s
+    /// doc comment: byte-stream only) -- `SOCK_SEQPACKET` over a genuinely cross-process
+    /// connection degrades to the same behavior as [`Self::try_recvfrom_shared`], which is a
+    /// disclosed, guest-observable difference from real boundary-preserving `SEQPACKET` semantics
+    /// rather than a panic; no real boot-critical guest (X11, D-Bus) uses `SOCK_SEQPACKET`.
     fn try_recvfrom_one_message(
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
+        let ConnTransport::Local { recv_channel, .. } = &self.transport else {
+            return self.try_recvfrom_shared(buf);
+        };
         let mut fds = Vec::new();
-        let n = self.recv_channel.peek_and_consume_one(|msg| {
+        let n = recv_channel.peek_and_consume_one(|msg| {
             fds.append(&mut msg.fds);
             let n = core::cmp::min(buf.len(), msg.data.len());
             buf[..n].copy_from_slice(&msg.data[..n]);
@@ -797,34 +1070,100 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     }
 
     fn check_io_events(&self) -> Events {
+        let ConnTransport::Local {
+            recv_channel,
+            connected_send_channel,
+            ..
+        } = &self.transport
+        else {
+            return self.check_io_events_shared();
+        };
         let mut events = Events::empty();
-        let is_read_shutdown = self.recv_channel.is_shutdown();
-        let is_peer_write_shutdown = self.recv_channel.is_peer_shutdown();
-        let is_write_shutdown = self.connected_send_channel.is_shutdown();
+        let is_read_shutdown = recv_channel.is_shutdown();
+        let is_peer_write_shutdown = recv_channel.is_peer_shutdown();
+        let is_write_shutdown = connected_send_channel.is_shutdown();
         if is_read_shutdown || is_peer_write_shutdown {
             events |= Events::RDHUP | Events::IN;
             if is_write_shutdown {
                 events |= Events::HUP;
             }
         }
-        if !self.recv_channel.is_empty() {
+        if !recv_channel.is_empty() {
             events |= Events::IN;
         }
-        if !self.connected_send_channel.is_full() {
+        if !connected_send_channel.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
+
+    fn check_io_events_shared(&self) -> Events {
+        let ConnTransport::Shared {
+            global,
+            slot,
+            is_client,
+            self_read_shutdown,
+            ..
+        } = &self.transport
+        else {
+            unreachable!("check_io_events_shared only called for ConnTransport::Shared");
+        };
+        let (read_ring, write_ring) = Self::shared_rings(global, *slot, *is_client);
+        let mut events = Events::empty();
+        let is_read_shutdown = self_read_shutdown.load(Ordering::Acquire);
+        let is_peer_write_shutdown = read_ring.is_shutdown();
+        if is_read_shutdown || is_peer_write_shutdown {
+            events |= Events::RDHUP | Events::IN;
+            if write_ring.is_shutdown() {
+                events |= Events::HUP;
+            }
+        }
+        if !read_ring.is_empty() {
+            events |= Events::IN;
+        }
+        if !write_ring.is_full() {
             events |= Events::OUT;
         }
         events
     }
 
     fn shutdown(&self, how: ShutdownHow) {
-        let mut events = Events::empty();
-        if how.is_shutdown_read() && self.recv_channel.shutdown() {
-            events |= Events::IN | Events::RDHUP;
+        match &self.transport {
+            ConnTransport::Local {
+                recv_channel,
+                connected_send_channel,
+                ..
+            } => {
+                let mut events = Events::empty();
+                if how.is_shutdown_read() && recv_channel.shutdown() {
+                    events |= Events::IN | Events::RDHUP;
+                }
+                if how.is_shutdown_write() && connected_send_channel.shutdown() {
+                    events |= Events::OUT | Events::HUP;
+                }
+                self.pollee.notify_observers(events);
+            }
+            ConnTransport::Shared {
+                global,
+                slot,
+                is_client,
+                self_read_shutdown,
+                ..
+            } => {
+                let mut events = Events::empty();
+                if how.is_shutdown_read() && !self_read_shutdown.swap(true, Ordering::AcqRel) {
+                    events |= Events::IN | Events::RDHUP;
+                }
+                if how.is_shutdown_write() {
+                    let (_, write_ring) = Self::shared_rings(global, *slot, *is_client);
+                    if !write_ring.is_shutdown() {
+                        write_ring.shutdown();
+                        events |= Events::OUT | Events::HUP;
+                    }
+                }
+                self.pollee.notify_observers(events);
+            }
         }
-        if how.is_shutdown_write() && self.connected_send_channel.shutdown() {
-            events |= Events::OUT | Events::HUP;
-        }
-        self.pollee.notify_observers(events);
     }
 }
 
@@ -977,6 +1316,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         litebox_util_log::debug!(addr:? = addr; "TRACE unix_connect: entry");
         let backlog = match self.lookup(task, &addr) {
             Ok(b) => b,
+            Err(Errno::ECONNREFUSED) => {
+                return self.connect_cross_process(task, &addr, is_nonblocking);
+            }
             Err(e) => {
                 litebox_util_log::debug!(addr:? = addr, err:? = e; "TRACE unix_connect: lookup failed");
                 return Err(e);
@@ -985,24 +1327,106 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         // check if we can bind to the address
         let _ = addr.clone().bind(task, false)?;
         let client_cred = task.peer_cred();
-        let result = task.wait_cx()
-            .wait_on_events(
-                is_nonblocking,
-                Events::OUT,
-                |observer, mask| {
-                    backlog.pollee.register_observer(observer, mask);
-                    Ok(())
-                },
-                || self.try_connect(&backlog, client_cred),
-            )
-            .map_err(Errno::from);
+        let result = wait_on_events_polling(
+            &task.wait_cx(),
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                backlog.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || self.try_connect(&backlog, client_cred),
+        )
+        .map_err(Errno::from);
         litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result");
         result
+    }
+
+    /// The genuinely-cross-process half of [`Self::connect`]: reached only once the ordinary
+    /// same-process `lookup()` against the real `unix_addr_table` has already missed. Posts a
+    /// request into `global.unix_shared_connect_queue` and polls for the listener's own
+    /// `accept()` (running the shared-queue half of [`Backlog::try_accept`]) to complete it --
+    /// see the "Shared cross-process AF_UNIX connection data plane" module doc comment for the
+    /// full rendezvous design. Falls straight through to the existing, unchanged
+    /// `log_cross_process_presence_miss`-then-`ECONNREFUSED` behavior when `unix_addr_presence`
+    /// doesn't show a listener anywhere either (a genuinely absent address, not a cross-process
+    /// gap).
+    fn connect_cross_process(
+        &self,
+        task: &Task<Platform, FS>,
+        addr: &UnixSocketAddr,
+        is_nonblocking: bool,
+    ) -> Result<(), Errno> {
+        let Some(key) = addr.to_key() else {
+            return Err(Errno::ECONNREFUSED);
+        };
+        let (kind, key_bytes) = presence_kind_and_bytes(&key);
+        let self_pid = task.pid.get() as u32;
+        match task.global.unix_addr_presence.lookup(kind, key_bytes) {
+            Some(owner_pid) if owner_pid != self_pid => {}
+            _ => {
+                log_cross_process_presence_miss(task, &key);
+                return Err(Errno::ECONNREFUSED);
+            }
+        }
+        let client_cred = task.peer_cred();
+        let Some(request_idx) = task
+            .global
+            .unix_shared_connect_queue
+            .post(kind, key_bytes, &client_cred)
+        else {
+            // Queue full -- ordinary, guest-triggerable degrade, not a bug.
+            return Err(Errno::EAGAIN);
+        };
+        // Bounded even for an ordinary blocking `connect()` with no caller-supplied deadline --
+        // live-caught 2026-09-18: an unbounded wait here, for a listener that has bound/listened
+        // (so `unix_addr_presence` genuinely shows it) but whose OWN `accept()` loop hasn't run
+        // yet (still earlier in its own startup), froze the connecting guest's entire script
+        // indefinitely -- strictly worse than this path's OLD behavior (an immediate
+        // `ECONNREFUSED` a calling script could itself retry/tolerate). Real POSIX blocking
+        // `connect()` CAN legitimately wait a while for a slow-to-accept listener, but never
+        // forever without any caller-requested timeout being involved -- bounding it here trades
+        // strict fidelity for never being the thing that hangs a boot.
+        let cx = task.wait_cx().with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT);
+        let result = wait_on_events_polling(
+            &cx,
+            is_nonblocking,
+            Events::empty(),
+            |_observer, _mask| Ok::<(), Errno>(()), // no real wake source exists yet -- see doc
+            || match task.global.unix_shared_connect_queue.poll_result(request_idx) {
+                Some(slot) => Ok(slot),
+                None => Err(TryOpError::TryAgain),
+            },
+        );
+        let slot = match result {
+            Ok(slot) => slot,
+            Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut)) => {
+                task.global.unix_shared_connect_queue.cancel(request_idx);
+                return Err(Errno::ECONNREFUSED);
+            }
+            Err(e) => {
+                task.global.unix_shared_connect_queue.cancel(request_idx);
+                return Err(Errno::from(e));
+            }
+        };
+        let stream = UnixConnectedStream::new_shared(
+            task.global.clone(),
+            slot,
+            true, // this is the connecting ("client") side of the slot
+            UnixSocketAddr::Unnamed,
+            addr.clone(),
+            task.global.unix_shared_conn_table.get(slot).server_cred(),
+        );
+        self.with_state(|state| match state {
+            UnixStreamState::Init(_) => (UnixStreamState::Connected(stream), Ok(())),
+            other => (other, Err(Errno::EISCONN)),
+        })
     }
 
     fn accept(
         &self,
         cx: &WaitContext<'_, Platform>,
+        global: &GlobalStateHandle<Platform, FS>,
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner<Platform, FS>, Errno> {
@@ -1012,26 +1436,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 Ok(listen.backlog.clone())
             })?;
         litebox_util_log::debug!(nonblocking:% = is_nonblocking; "TRACE unix_accept: entry");
-        let res = cx
-            .wait_on_events(
-                is_nonblocking,
-                Events::IN,
-                |observer, mask| {
-                    backlog.pollee.register_observer(observer, mask);
-                    Ok(())
-                },
-                || {
-                    let accepted = backlog.try_accept()?;
-                    if let Some(peer) = peer.as_deref_mut() {
-                        *peer = accepted.get_peer_addr();
-                    }
-                    Ok(UnixSocketInner::Stream(UnixStream::new(
-                        UnixStreamState::Connected(accepted),
-                        self.preserve_boundaries,
-                    )))
-                },
-            )
-            .map_err(Errno::from);
+        let res = wait_on_events_polling(
+            cx,
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                backlog.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let accepted = backlog.try_accept(global)?;
+                if let Some(peer) = peer.as_deref_mut() {
+                    *peer = accepted.get_peer_addr();
+                }
+                Ok(UnixSocketInner::Stream(UnixStream::new(
+                    UnixStreamState::Connected(accepted),
+                    self.preserve_boundaries,
+                )))
+            },
+        )
+        .map_err(Errno::from);
         litebox_util_log::debug!(ok:% = res.is_ok(); "TRACE unix_accept: result");
         // accept on a shut-down listen: Linux returns EAGAIN for non-blocking, EINVAL
         // for blocking. try_accept signals shutdown via ESHUTDOWN; translate here.
@@ -1055,37 +1479,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             data: buf.to_vec(),
             fds,
         });
-        cx.with_timeout(timeout)
-            .wait_on_events(
-                is_nonblocking,
-                Events::OUT,
-                |observer, mask| {
-                    self.with_state_ref(|state| {
-                        let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
-                        Ok(())
-                    })
-                },
-                || {
-                    self.with_state_ref(|state| {
-                        let conn = state
-                            .connected()
-                            .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        if addr.is_some() {
-                            return Err(TryOpError::Other(Errno::EISCONN));
+        wait_on_events_polling(
+            &cx.with_timeout(timeout),
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    if addr.is_some() {
+                        return Err(TryOpError::Other(Errno::EISCONN));
+                    }
+                    match conn.try_sendto(msg.take().unwrap()) {
+                        Ok(n) => Ok(n),
+                        Err((m, Errno::EAGAIN)) => {
+                            let _ = msg.replace(m);
+                            Err(TryOpError::TryAgain)
                         }
-                        match conn.try_sendto(msg.take().unwrap()) {
-                            Ok(()) => Ok(buf.len()),
-                            Err((m, Errno::EAGAIN)) => {
-                                let _ = msg.replace(m);
-                                Err(TryOpError::TryAgain)
-                            }
-                            Err((_, err)) => Err(TryOpError::Other(err)),
-                        }
-                    })
-                },
-            )
-            .map_err(Errno::from)
+                        Err((_, err)) => Err(TryOpError::Other(err)),
+                    }
+                })
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn recvfrom(
@@ -1096,37 +1520,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
-        let res = cx
-            .with_timeout(timeout)
-            .wait_on_events(
-                is_nonblocking,
-                Events::IN,
-                |observer, mask| {
-                    self.with_state_ref(|state| {
-                        let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
-                        Ok(())
-                    })
-                },
-                || {
-                    self.with_state_ref(|state| {
-                        let conn = state
-                            .connected()
-                            .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = if self.preserve_boundaries {
-                            conn.try_recvfrom_one_message(buf)?
-                        } else {
-                            conn.try_recvfrom(buf)?
-                        };
-                        // For connected stream sockets, no need to return the source address
-                        if let Some(source_addr) = source_addr.as_deref_mut() {
-                            *source_addr = None;
-                        }
-                        Ok(n)
-                    })
-                },
-            )
-            .map_err(Errno::from);
+        let res = wait_on_events_polling(
+            &cx.with_timeout(timeout),
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    let n = if self.preserve_boundaries {
+                        conn.try_recvfrom_one_message(buf)?
+                    } else {
+                        conn.try_recvfrom(buf)?
+                    };
+                    // For connected stream sockets, no need to return the source address
+                    if let Some(source_addr) = source_addr.as_deref_mut() {
+                        *source_addr = None;
+                    }
+                    Ok(n)
+                })
+            },
+        )
+        .map_err(Errno::from);
         match res {
             // Linux SO_RCVTIMEO expiry surfaces as `EAGAIN`, not `ETIMEDOUT`
             Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
@@ -1177,7 +1600,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 }
                 events
             }
-            UnixStreamState::Listen(listen) => listen.backlog.check_io_events(),
+            UnixStreamState::Listen(listen) => listen.backlog.check_io_events(&listen.global),
             UnixStreamState::Connected(conn) => conn.check_io_events(),
         })
     }
@@ -1664,6 +2087,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     pub(super) fn accept(
         &self,
         cx: &WaitContext<'_, Platform>,
+        global: &GlobalStateHandle<Platform, FS>,
         flags: SockFlags,
         peer: Option<&mut UnixSocketAddr>,
     ) -> Result<UnixSocket<Platform, FS>, Errno> {
@@ -1671,6 +2095,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             UnixSocketInner::Stream(stream) => {
                 let accepted = stream.accept(
                     cx,
+                    global,
                     peer,
                     self.get_status().contains(OFlags::NONBLOCK)
                         | flags.contains(SockFlags::NONBLOCK),
@@ -2213,5 +2638,523 @@ fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
             );
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared cross-process AF_UNIX connection data plane.
+//
+// `unix_addr_presence` (above) only proves a listener EXISTS somewhere in the fork family; it
+// deliberately can't hand back a usable connection because `Backlog`/`UnixConnectedStream`'s
+// `crate::channel::Channel` byte-transport buffers are `Arc`-boxed on the ordinary per-process
+// heap -- the same stale-cross-process-pointer class fixed a dozen times today for
+// `Network::socket_set` et al., just one layer deeper. Extending that same fixed-slot,
+// pointer-free pattern to the CONNECTION itself needs more than a storage swap, though: today's
+// `connect()`/`accept()` are direct same-process method calls on `Arc<Backlog>`/
+// `Arc<Pollee>` -- objects a genuinely different process can never dereference at all, no matter
+// what backs them. The types below are therefore a real rendezvous PROTOCOL, not just a shared
+// buffer: a client that cannot resolve `unix_addr_table` locally but sees a foreign owner in
+// `unix_addr_presence` posts a request into `SharedUnixConnectQueue`; the listener's own
+// `accept()` loop, which already polls its private backlog, also polls this queue for requests
+// naming its own address and completes them by handing out a slot from `SharedUnixConnTable` --
+// a fixed pool of fixed-capacity byte ring buffers, each guarded by the same cross-process
+// `RawMutex`-backed `litebox::sync::Mutex` every other shared registry in this codebase already
+// uses (`Network::net_lock` et al.), so both processes can safely read/write from their own
+// address space with no raw pointer crossing the process boundary anywhere.
+//
+// # Explicit scope limits (guest-reachable, never a panic on the excluded paths)
+//
+// - **Byte-stream only.** `Message::fds` (`SCM_RIGHTS`) has no representation here -- a
+//   `TypedFd`/`AnyDupFd` is fundamentally a handle into ONE process's own descriptor table, not
+//   plain bytes, and cannot be made shared-memory-native by this pattern at all. `try_sendto`
+//   refuses a non-empty `fds` list on a `Shared`-transport connection with `EOPNOTSUPP` (never
+//   silently drops them -- a caller that actually depended on a donated fd must see a clean
+//   error, not a mysteriously missing descriptor on the other end).
+// - **No genuine cross-process wakeup.** Nothing in this codebase can deliver a Windows-level
+//   wake from one process's write into a blocked wait in a different process's `Pollee` (that
+//   would need `litebox_platform_windows_userland/src/xproc_sync.rs`'s named-event primitive,
+//   `docs/AGENTS_ARCHIVE_2026-09-17.md` calls it "still unwired") -- so every blocking operation
+//   on a `Shared`-transport connection (`accept`/`connect`/`sendto`/`recvfrom` all reaching
+//   `EAGAIN`) is driven by the call sites below re-polling on a short bounded timeout
+//   ([`SHARED_UNIX_POLL_INTERVAL`]) instead of a real wait, matching this codebase's own already-
+//   established fallback philosophy for exactly this situation (`RawMutex::
+//   poll_until_value_changes`'s doc comment: "Correct by construction ... at the cost of
+//   latency/CPU while polling, never loses a wakeup").
+pub(crate) const SHARED_UNIX_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
+/// Upper bound on how long [`UnixStream::connect_cross_process`] waits for a listener in a
+/// DIFFERENT process to reach its own `accept()` call, even for an ordinary blocking `connect()`
+/// with no caller-supplied deadline -- see that function's own doc comment for the live-caught
+/// indefinite-hang this bounds.
+pub(crate) const SHARED_UNIX_CROSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Drop-in replacement for [`WaitContext::wait_on_events`] that additionally re-polls on a short
+/// bounded timeout instead of relying purely on a real wake -- see this module's own "Shared
+/// cross-process AF_UNIX connection data plane" doc comment above for why: nothing in this
+/// codebase can deliver a wake from one process's write into a different process's blocked wait.
+///
+/// Safe to use unconditionally, including for ordinary same-process connections: a real wake
+/// still unblocks a waiter immediately (this only ever ADDS an upper bound on how long a call can
+/// be stuck with no real wake pending, it never removes or delays the real wake path), and a
+/// non-blocking call is unaffected (`wait_on_events` itself returns before ever reaching this
+/// function's loop in that case). A genuine caller-supplied deadline (`cx`'s own, e.g. from
+/// `SO_RCVTIMEO`) is always honored exactly: this function's own polling interval never widens
+/// `cx`'s deadline (`WaitContext::with_timeout` only ever narrows it), and the final iteration
+/// before a real deadline uses the real remaining duration verbatim, so that iteration's own
+/// `TimedOut` is genuine rather than one of this function's own synthetic sub-waits.
+fn wait_on_events_polling<Platform, R, E>(
+    cx: &WaitContext<'_, Platform>,
+    nonblock: bool,
+    events: Events,
+    mut register_observer: impl FnMut(Weak<dyn litebox::event::observer::Observer<Events>>, Events) -> Result<(), E>,
+    mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+) -> Result<R, TryOpError<E>>
+where
+    Platform: ShimPlatform,
+{
+    // Captured ONCE, outside the loop: `WaitContext::remaining_timeout` returns `None` in TWO
+    // different situations -- "no deadline was ever set" AND "the deadline has already passed" --
+    // so re-deriving "did a real deadline just expire" from a bare `None` inside the loop is
+    // ambiguous and was live-caught 2026-09-18 turning a supposedly-3-second-bounded cross-process
+    // `connect()` into an unbounded poll loop (once the real deadline passed, `remaining_timeout()`
+    // started returning `None` on every subsequent iteration, which this function's own earlier
+    // version misread as "no real deadline exists" and kept polling forever). Recording whether a
+    // real deadline exists up front, before it can have expired, resolves the ambiguity: `None`
+    // afterward can only mean "expired", never "never had one".
+    let has_real_deadline = cx.deadline().is_some();
+    loop {
+        let remaining = cx.remaining_timeout();
+        if has_real_deadline && remaining.is_none() {
+            return Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut));
+        }
+        let this_iter_timeout = match remaining {
+            None => SHARED_UNIX_POLL_INTERVAL,
+            Some(d) => d.min(SHARED_UNIX_POLL_INTERVAL),
+        };
+        let bounded = cx.with_timeout(this_iter_timeout);
+        match bounded.wait_on_events(nonblock, events, &mut register_observer, &mut try_op) {
+            Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut))
+                if !has_real_deadline || remaining.is_some_and(|d| d > this_iter_timeout) =>
+            {
+                // This was one of our own synthetic sub-wait ticks, not a real caller deadline
+                // (either there IS no real deadline, or it's still further away than this tick) --
+                // loop around and re-check for a cross-process change.
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Realistic upper bound on simultaneously OPEN cross-process AF_UNIX stream connections in one
+/// guest session (X11 rarely has more than a handful of concurrent clients; D-Bus system+session
+/// bus each accept a modest number) -- same sizing philosophy as [`UNIX_ADDR_PRESENCE_CAPACITY`]/
+/// `MAX_SOCKETS`.
+///
+/// Sized SMALL on purpose, together with [`SHARED_UNIX_CONN_BUF`] below -- learned live,
+/// 2026-09-18: `GlobalState` (which embeds this table) is constructed as an ordinary Rust value
+/// and passed BY VALUE through `create_shared_kernel_state`/`SharedArc::new` before being placed
+/// in the shared arena, so an oversized field here blows the constructing thread's stack before
+/// ever reaching the arena at all (`thread 'main' has overflowed its stack`, live-reproduced with
+/// this table at 8 MiB total). [`UnixAddrPresenceSlot`]'s own proven-safe table is ~31 KiB total
+/// (256 slots x ~124 bytes) -- this table's total footprint is kept in that same order of
+/// magnitude rather than sized generously the way a heap-backed collection could be.
+pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 8;
+
+/// Per-direction shared ring buffer capacity. Bounded like a real kernel AF_UNIX socket's own
+/// finite send/receive buffer: this is control-plane protocol traffic (X11/D-Bus requests and
+/// replies), not bulk pixel data (MIT-SHM already carries that over System V shared memory, never
+/// through this socket). Total shared-arena footprint:
+/// `SHARED_UNIX_CONN_CAPACITY * 2 * SHARED_UNIX_CONN_BUF` = 32 KiB -- see
+/// [`SHARED_UNIX_CONN_CAPACITY`]'s doc comment for why this is deliberately small, not generous.
+/// A single write larger than this never hangs regardless (see [`SharedByteRing::try_write`] and
+/// its call site in `UnixConnectedStream::try_sendto_shared`): it degrades to a real short write
+/// of the first `SHARED_UNIX_CONN_BUF` bytes, matching a real kernel socket's own short-write
+/// behavior on an over-sized single `write(2)`, rather than looping on `EAGAIN` forever.
+const SHARED_UNIX_CONN_BUF: usize = 2048;
+
+const CONN_SLOT_EMPTY: u32 = 0;
+const CONN_SLOT_OCCUPIED: u32 = 1;
+
+/// One direction's worth of shared byte transport: a fixed ring buffer plus its read/write
+/// cursors, all guarded by one cross-process `RawMutex`-backed lock (same primitive
+/// `GlobalStateHandle::net_lock` already uses for `Network`) so concurrent same-direction access
+/// from either side's process is always serialized through real, dereferenceable local memory --
+/// no raw pointer is ever handed from one process to another; each side only ever touches its OWN
+/// copy of the `Arc`-free, inline-in-the-shared-arena bytes.
+struct SharedByteRing<Platform: ShimPlatform> {
+    cursor: Mutex<Platform, RingCursor>,
+    buf: [AtomicU8; SHARED_UNIX_CONN_BUF],
+}
+
+#[derive(Clone, Copy, Default)]
+struct RingCursor {
+    write_pos: usize,
+    read_pos: usize,
+    /// Set once the writing side calls `shutdown`/is dropped. Mirrors `channel::EndPointer`'s own
+    /// `is_shutdown` -- queued bytes remain readable after this is set; a reader only observes
+    /// EOF once `write_pos == read_pos` as well.
+    write_shutdown: bool,
+}
+
+impl<Platform: ShimPlatform> SharedByteRing<Platform> {
+    fn new_empty() -> Self {
+        Self {
+            cursor: Mutex::new(RingCursor::default()),
+            buf: core::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+
+    fn reset(&self) {
+        *self.cursor.lock() = RingCursor::default();
+    }
+
+    /// All-or-nothing write, mirroring `channel::WriteEnd::try_write_one`'s own contract (that
+    /// pushes one whole `Message` or fails with the ring untouched) so callers don't need to
+    /// track a partial-write remainder across calls: either every byte of `data` fits right now
+    /// and is written, or NONE of it is and the buffer is left exactly as it was. Never blocks,
+    /// never panics.
+    fn try_write_all(&self, data: &[u8]) -> bool {
+        let mut cursor = self.cursor.lock();
+        if cursor.write_shutdown {
+            return false;
+        }
+        let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let free = SHARED_UNIX_CONN_BUF - used;
+        if data.len() > free {
+            return false;
+        }
+        for (i, b) in data.iter().enumerate() {
+            self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+                .store(*b, Ordering::Relaxed);
+        }
+        cursor.write_pos = cursor.write_pos.wrapping_add(data.len());
+        true
+    }
+
+    /// Partial write: writes as many LEADING bytes of `data` as currently fit, returning the
+    /// count (which may be `0` if the ring is full or shut down -- never blocks, never panics).
+    /// Only used for the one case [`Self::try_write_all`] can never resolve no matter how empty
+    /// the ring is -- a single message bigger than the whole ring -- see
+    /// [`SHARED_UNIX_CONN_BUF`]'s doc comment.
+    fn try_write(&self, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let mut cursor = self.cursor.lock();
+        if cursor.write_shutdown {
+            return 0;
+        }
+        let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let free = SHARED_UNIX_CONN_BUF - used;
+        let n = data.len().min(free);
+        for (i, b) in data.iter().take(n).enumerate() {
+            self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+                .store(*b, Ordering::Relaxed);
+        }
+        cursor.write_pos = cursor.write_pos.wrapping_add(n);
+        n
+    }
+
+    /// Reads up to `out.len()` bytes; returns the count read. `0` is ambiguous between "empty and
+    /// still open" and "empty and shut down" by design -- callers distinguish via
+    /// [`Self::is_shutdown`]/[`Self::is_empty`], mirroring `channel::ReadEnd::peek_and_consume_one`'s
+    /// own EAGAIN-vs-ESHUTDOWN split.
+    fn try_read(&self, out: &mut [u8]) -> usize {
+        let mut cursor = self.cursor.lock();
+        let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let n = out.len().min(avail);
+        for (i, slot) in out.iter_mut().take(n).enumerate() {
+            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+                .load(Ordering::Relaxed);
+        }
+        cursor.read_pos = cursor.read_pos.wrapping_add(n);
+        n
+    }
+
+    fn is_empty(&self) -> bool {
+        let cursor = self.cursor.lock();
+        cursor.write_pos == cursor.read_pos
+    }
+
+    fn is_full(&self) -> bool {
+        let cursor = self.cursor.lock();
+        cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
+    }
+
+    fn shutdown(&self) {
+        self.cursor.lock().write_shutdown = true;
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.cursor.lock().write_shutdown
+    }
+}
+
+/// One allocated cross-process connection: two independent [`SharedByteRing`]s (client-to-server,
+/// server-to-client) plus enough bookkeeping for `SO_PEERCRED` on both sides. Sized/guarded
+/// exactly like [`UnixAddrPresenceSlot`] -- deliberately no `Vec`/`Box`/pointer field anywhere,
+/// so the whole slot's live state is its own inline bytes.
+struct SharedConnSlot<Platform: ShimPlatform> {
+    state: AtomicU32,
+    client_to_server: SharedByteRing<Platform>,
+    server_to_client: SharedByteRing<Platform>,
+    client_pid: AtomicU32,
+    client_uid: AtomicU32,
+    client_gid: AtomicU32,
+    server_pid: AtomicU32,
+    server_uid: AtomicU32,
+    server_gid: AtomicU32,
+}
+
+impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
+    fn new_empty() -> Self {
+        Self {
+            state: AtomicU32::new(CONN_SLOT_EMPTY),
+            client_to_server: SharedByteRing::new_empty(),
+            server_to_client: SharedByteRing::new_empty(),
+            client_pid: AtomicU32::new(0),
+            client_uid: AtomicU32::new(0),
+            client_gid: AtomicU32::new(0),
+            server_pid: AtomicU32::new(0),
+            server_uid: AtomicU32::new(0),
+            server_gid: AtomicU32::new(0),
+        }
+    }
+
+    fn server_cred(&self) -> Ucred {
+        Ucred {
+            pid: self.server_pid.load(Ordering::Relaxed) as u32,
+            uid: self.server_uid.load(Ordering::Relaxed),
+            gid: self.server_gid.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Fixed pool of [`SharedConnSlot`]s -- the shared-arena-native backing for every currently-open
+/// cross-process AF_UNIX stream connection, allocated by a listener's `accept()` and released
+/// when the last side referencing it drops.
+pub(crate) struct SharedUnixConnTable<Platform: ShimPlatform> {
+    slots: [SharedConnSlot<Platform>; SHARED_UNIX_CONN_CAPACITY],
+}
+
+impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| SharedConnSlot::new_empty()),
+        }
+    }
+
+    /// Claims a free slot and fills it in; returns its index, or `None` if every slot is in use
+    /// (degrades to `ECONNREFUSED`/`EAGAIN` at the call site, never panics).
+    fn alloc(&self, client_cred: &Ucred, server_cred: &Ucred) -> Option<u32> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot
+                .state
+                .compare_exchange(
+                    CONN_SLOT_EMPTY,
+                    CONN_SLOT_OCCUPIED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                slot.client_to_server.reset();
+                slot.server_to_client.reset();
+                slot.client_pid.store(client_cred.pid as u32, Ordering::Relaxed);
+                slot.client_uid.store(client_cred.uid, Ordering::Relaxed);
+                slot.client_gid.store(client_cred.gid, Ordering::Relaxed);
+                slot.server_pid.store(server_cred.pid as u32, Ordering::Relaxed);
+                slot.server_uid.store(server_cred.uid, Ordering::Relaxed);
+                slot.server_gid.store(server_cred.gid, Ordering::Relaxed);
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    fn get(&self, idx: u32) -> &SharedConnSlot<Platform> {
+        &self.slots[idx as usize]
+    }
+
+    /// Releases a slot back to the pool. Best-effort, idempotent: only the LAST of the two
+    /// endpoints to drop actually frees it (guarded by each `ConnTransport::Shared` handle's own
+    /// `Drop`, which only calls this after marking itself gone -- see that `Drop` impl).
+    fn free(&self, idx: u32) {
+        let slot = &self.slots[idx as usize];
+        slot.client_to_server.reset();
+        slot.server_to_client.reset();
+        slot.state.store(CONN_SLOT_EMPTY, Ordering::Release);
+    }
+}
+
+const REQ_EMPTY: u32 = 0;
+const REQ_WRITING: u32 = 1;
+const REQ_PENDING: u32 = 2;
+const REQ_CLAIMED: u32 = 3;
+const REQ_ACCEPTED: u32 = 4;
+
+/// Realistic upper bound on simultaneously in-flight cross-process `connect()` attempts (bounded
+/// like every other fixed-capacity table in this file; a full queue degrades a connect attempt to
+/// a retry, never a panic).
+pub(crate) const SHARED_UNIX_CONNECT_QUEUE_CAPACITY: usize = 64;
+
+struct PendingConnectRequest {
+    state: AtomicU32,
+    kind: AtomicU32,
+    len: AtomicU32,
+    bytes: [AtomicU8; UNIX_ADDR_KEY_MAX],
+    client_pid: AtomicU32,
+    client_uid: AtomicU32,
+    client_gid: AtomicU32,
+    /// Valid once `state == REQ_ACCEPTED`; `u32::MAX` means "not yet set".
+    conn_slot: AtomicU32,
+}
+
+impl PendingConnectRequest {
+    fn new_empty() -> Self {
+        Self {
+            state: AtomicU32::new(REQ_EMPTY),
+            kind: AtomicU32::new(0),
+            len: AtomicU32::new(0),
+            bytes: core::array::from_fn(|_| AtomicU8::new(0)),
+            client_pid: AtomicU32::new(0),
+            client_uid: AtomicU32::new(0),
+            client_gid: AtomicU32::new(0),
+            conn_slot: AtomicU32::new(u32::MAX),
+        }
+    }
+
+    fn matches(&self, kind: u32, key: &[u8]) -> bool {
+        self.kind.load(Ordering::Relaxed) == kind
+            && self.len.load(Ordering::Relaxed) as usize == key.len()
+            && key
+                .iter()
+                .enumerate()
+                .all(|(i, b)| self.bytes[i].load(Ordering::Relaxed) == *b)
+    }
+}
+
+/// Cross-process AF_UNIX connect/accept rendezvous: the piece [`SharedUnixAddrPresenceTable`]'s
+/// own doc comment explicitly named as out of scope ("cannot safely hand back a dereferenceable
+/// `Arc<Backlog>` to a DIFFERENT process's `connect()` call"). A client posts a request naming the
+/// address it wants; the listener's own `accept()` loop -- already running in the ONE process that
+/// legitimately owns the real `Arc<Backlog>` -- claims matching requests and completes them with a
+/// [`SharedUnixConnTable`] slot index, entirely without either side ever dereferencing a pointer
+/// that came from the other process.
+pub(crate) struct SharedUnixConnectQueue {
+    requests: [PendingConnectRequest; SHARED_UNIX_CONNECT_QUEUE_CAPACITY],
+}
+
+impl SharedUnixConnectQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            requests: core::array::from_fn(|_| PendingConnectRequest::new_empty()),
+        }
+    }
+
+    /// Client side: posts a connect request for `(kind, key)`. Returns the request index to poll,
+    /// or `None` if `key` is oversized or every slot is busy (caller returns `EAGAIN`/retries,
+    /// same degrade-gracefully contract as [`SharedUnixAddrPresenceTable::insert`]).
+    fn post(&self, kind: u32, key: &[u8], client_cred: &Ucred) -> Option<usize> {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return None;
+        }
+        for (i, req) in self.requests.iter().enumerate() {
+            if req
+                .state
+                .compare_exchange(REQ_EMPTY, REQ_WRITING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                for (j, b) in key.iter().enumerate() {
+                    req.bytes[j].store(*b, Ordering::Relaxed);
+                }
+                req.len.store(key.len() as u32, Ordering::Relaxed);
+                req.kind.store(kind, Ordering::Relaxed);
+                req.client_pid.store(client_cred.pid as u32, Ordering::Relaxed);
+                req.client_uid.store(client_cred.uid, Ordering::Relaxed);
+                req.client_gid.store(client_cred.gid, Ordering::Relaxed);
+                req.conn_slot.store(u32::MAX, Ordering::Relaxed);
+                req.state.store(REQ_PENDING, Ordering::Release);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Listener side, read-only: does a request naming `(kind, key)` currently sit `PENDING`?
+    /// Unlike [`Self::try_claim`], never mutates state -- this is `Backlog::check_io_events`'s
+    /// own half of the rendezvous, called from `poll`/`select`/`epoll_wait` to decide whether the
+    /// listening fd is readable, which must happen BEFORE a real event-driven server (Xvfb,
+    /// dbus-daemon: both wait on readiness before ever calling `accept()`) will call `accept()`
+    /// at all. Missing this half was a real, live-caught bug (2026-09-18): `try_accept`'s shared-
+    /// queue check was correct but functionally dead code, because nothing ever told the
+    /// listener's `poll()` loop a cross-process connection was waiting, so it never got called.
+    fn has_pending(&self, kind: u32, key: &[u8]) -> bool {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return false;
+        }
+        self.requests
+            .iter()
+            .any(|req| req.state.load(Ordering::Acquire) == REQ_PENDING && req.matches(kind, key))
+    }
+
+    /// Listener side: finds and claims (so a racing second `accept()` on the same address can't
+    /// double-claim it) one pending request naming `(kind, key)`. Returns the claimed request's
+    /// index and the client's real credentials.
+    fn try_claim(&self, kind: u32, key: &[u8]) -> Option<(usize, Ucred)> {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return None;
+        }
+        for (i, req) in self.requests.iter().enumerate() {
+            if req.state.load(Ordering::Acquire) == REQ_PENDING
+                && req.matches(kind, key)
+                && req
+                    .state
+                    .compare_exchange(REQ_PENDING, REQ_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let cred = Ucred {
+                    pid: req.client_pid.load(Ordering::Relaxed) as u32,
+                    uid: req.client_uid.load(Ordering::Relaxed),
+                    gid: req.client_gid.load(Ordering::Relaxed),
+                };
+                return Some((i, cred));
+            }
+        }
+        None
+    }
+
+    /// Listener side: finishes a claimed request with the slot it allocated for the connection.
+    fn complete(&self, idx: usize, conn_slot: u32) {
+        let req = &self.requests[idx];
+        req.conn_slot.store(conn_slot, Ordering::Relaxed);
+        req.state.store(REQ_ACCEPTED, Ordering::Release);
+    }
+
+    /// Client side: non-blocking poll for the outcome of `post`'s returned index. Consumes the
+    /// request (resets it to `REQ_EMPTY`) exactly once, the same call that first observes
+    /// `REQ_ACCEPTED` -- safe because only the one client that posted this index ever polls it.
+    fn poll_result(&self, idx: usize) -> Option<u32> {
+        let req = &self.requests[idx];
+        if req.state.load(Ordering::Acquire) == REQ_ACCEPTED {
+            let slot = req.conn_slot.load(Ordering::Relaxed);
+            req.state.store(REQ_EMPTY, Ordering::Release);
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// Client side: best-effort withdrawal of a still-unclaimed request (e.g. the connect
+    /// attempt's own deadline expired). If a listener concurrently claimed it in the meantime,
+    /// this is a no-op -- the listener's `complete()` still runs and the resulting slot is simply
+    /// never attached to by anyone, a bounded leak matching this table's existing degrade-rather-
+    /// than-panic philosophy (reclaimed when the whole fork family exits).
+    fn cancel(&self, idx: usize) {
+        let req = &self.requests[idx];
+        let _ = req
+            .state
+            .compare_exchange(REQ_PENDING, REQ_EMPTY, Ordering::AcqRel, Ordering::Acquire);
     }
 }

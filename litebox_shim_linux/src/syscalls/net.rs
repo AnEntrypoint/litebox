@@ -1561,7 +1561,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             |file| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
-                let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
+                let accepted_file =
+                    file.accept(&self.wait_cx(), &self.global, flags, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Unix);
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(

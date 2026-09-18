@@ -227,13 +227,42 @@ dedicated, carefully-scoped pass, not a rushed change here.
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
 Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: archive.
 
+**Thirteenth pass, 2026-09-18 — shared cross-process AF_UNIX connection data plane DESIGNED and
+IMPLEMENTED (`SharedUnixConnTable`/`SharedUnixConnectQueue`, `syscalls/unix.rs`'s own module doc
+comment has the full design), `XVFB_FAILED`/`DBUS_FAILED` NOT yet closed.** Three real bugs found
+live and fixed along the way (each independently significant, not just this feature's own
+teething problems): (1) a `GlobalState`-embedded fixed array passed BY VALUE through
+`create_shared_kernel_state`/`SharedArc::new` overflowed the constructing thread's stack at 8 MiB
+— shrunk to ~32 KiB, same order of magnitude as `SharedUnixAddrPresenceTable`'s already-proven-safe
+size; (2) `WaitContext::remaining_timeout()`'s `None` is ambiguous between "no deadline" and
+"deadline expired", which silently turned a 3-second bounded cross-process `connect()` timeout
+into an infinite poll loop once live-tested — fixed by capturing `cx.deadline().is_some()` once
+before the retry loop, matching `epoll.rs`'s own already-correct pattern; (3) `Backlog::
+check_io_events` never checked the new shared connect queue, so a real event-driven listener
+(Xvfb, dbus-daemon) blocked in `poll`/`epoll_wait` never even got to `accept()` for a cross-process
+client — fixed, then further extended the pre-existing "bounded 15ms repoll for an unwakeable fd
+kind" mechanism (built for stdin/evdev/timerfd) to cover AF_UNIX sockets too, since no genuine
+cross-process wake exists anywhere in this codebase. **Did NOT reach the browser/terminal/apps
+milestone**: `XVFB_FAILED`/`DBUS_FAILED` persisted in every one of seven live boots that reached a
+decision; the last run (epoll fix included) hadn't reached a decision at all after 8 real minutes
+(vs ~1.5-3 min every earlier run) when killed for time — not root-caused, possibly the broadened
+repoll scope's own added latency, needs a timed A/B. No isolated minimal repro was built this pass
+(a real process deviation, owed as the next pass's first step). Full narrative, exact log
+evidence, and files touched: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(0) **TOP PRIORITY, twelfth pass**: extend `unix_addr_table`'s presence-sharing PATTERN (flat,
-fixed-slot, lock-free) from presence-only to the real `Backlog`/`Channel` connection data — this is
-now the ONE thing standing between the boot and the browser/terminal/apps milestone (Xvfb/dbus
-themselves cross-process-fork fine as of this pass; clients just can't complete a connection to
-them yet). (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`)
+(-1) **NEW TOP PRIORITY, thirteenth pass**: build the minimal isolated cross-process AF_UNIX repro
+(one parent listens, one genuinely-cross-process-forked child connects, both directions exchange
+real bytes) that should have come BEFORE the full-boot attempts above — this pass skipped it under
+time pressure and paid for it (three iterations of boot-then-diagnose instead of a fast, cheap,
+isolated loop). Once that passes, re-run `webtop_stack.sh` under run 7's binary (epoll/`PollSet`
+fix included) for a clean, uncontaminated read on whether `XVFB_FAILED`/`DBUS_FAILED` finally
+close. If run 7's timed A/B (above) shows the broadened bounded-repoll scope is the slowdown
+culprit, narrow it (e.g. only a Unix socket in `Listen` state, or only a `Shared`-transport
+connected socket, not every same-process Unix socket fd) before re-testing. (0)
+
+(0) **~~TOP PRIORITY, twelfth pass~~ — superseded by thirteenth-pass entry above.** (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`)
 needs the same dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever
 in `dealloc` this pass, high blast radius, own dedicated pass. (1) ~~Debugger-root-cause the
 dead-holder-recovery data-inconsistency panic~~ — DONE, eleventh pass. (1b) `queued_for_closure`'s
@@ -445,12 +474,13 @@ test hit a separate, NOT-root-caused `signal=Signal(13)`) and **presenter-proces
 
 ## Docs and tooling map
 
-- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-17.md` (shell-crash investigation, stdio-handle bug,
-  twelve registry/pointer/lock fixes, writable-layer-race fix + 5-boot verification, newest at
-  bottom), `_2026-09-16.md` (popup-menu re-test, `spawn_exec_collision_child` fix, Track A audit,
-  RawMutex/presenter detail), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md` (fork fd
-  eligibility, cost history, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW, practices).
-  Older: `_2026-09-03.md`, `_2026-09-05.md`.
+- **Archives** — `docs/AGENTS_ARCHIVE_2026-09-18.md` (thirteenth pass: shared cross-process AF_UNIX
+  connection data plane, three real bugs found+fixed, seven-boot verification, newest),
+  `_2026-09-17.md` (shell-crash investigation, stdio-handle bug, twelve registry/pointer/lock
+  fixes, writable-layer-race fix + 5-boot verification), `_2026-09-16.md` (popup-menu re-test,
+  `spawn_exec_collision_child` fix, Track A audit, RawMutex/presenter detail), `_2026-09-15.md`
+  (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, cost history, OCI cache, s6-boot,
+  browser config, crash-dump/VEH, CoW, practices). Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache, Appendix D presenter). `docs/veh-exception-
   handler-design.md` — canonical VEH narrative, read before touching the handler.

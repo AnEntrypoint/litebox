@@ -378,10 +378,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
     }
 
-    /// Returns `true` if any current interest is either a stdin fd or an armed timerfd, not
-    /// currently ready -- see [`Self::wait`]'s doc comment for why both fd kinds need bounded
-    /// periodic re-polling instead of relying solely on the observer-notification wakeup every
-    /// other fd kind gets.
+    /// Returns `true` if any current interest is a stdin fd, an armed timerfd, or an AF_UNIX
+    /// socket fd, not currently ready -- see [`Self::wait`]'s doc comment for why the first two
+    /// kinds need bounded periodic re-polling instead of relying solely on the observer-
+    /// notification wakeup every other fd kind gets. AF_UNIX joins them as of 2026-09-18, for the
+    /// same fundamental reason, live-caught on the cross-process AF_UNIX rendezvous
+    /// (`syscalls::unix`'s "Shared cross-process AF_UNIX connection data plane"): a listening
+    /// socket's `Backlog::check_io_events` can now correctly SEE a cross-process client's pending
+    /// `SharedUnixConnectQueue` request (and a `Shared`-transport connected socket can correctly
+    /// see new bytes in its peer-written ring), but nothing calls `notify_observers` on this
+    /// process's OWN `Pollee` when that happens in a DIFFERENT process -- there is no real
+    /// cross-process wake in this codebase at all (`litebox_platform_windows_userland::
+    /// xproc_sync`'s named-event primitive exists but is still unwired). Without this, a real
+    /// event-driven listener (Xvfb, dbus-daemon: both call `epoll_wait` before ever calling
+    /// `accept()`) blocks forever even once a cross-process client is genuinely waiting --
+    /// live-confirmed: owner processes sat blocked past two separate clients' full connect
+    /// attempts with zero `accept()` ever observed. Scoped to EVERY Unix socket interest, not just
+    /// listening ones (mirrors "any armed timerfd" above, not narrowed to "a timerfd that's about
+    /// to fire") -- a `Shared`-transport connected socket has exactly the same missing-wake gap on
+    /// its read side, and the cost of an unnecessary 15ms-interval re-check for an ordinary
+    /// same-process Unix socket (which still gets its real wake immediately; this only adds an
+    /// upper bound) is the same accepted tradeoff already established for timerfd/stdin.
     fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalStateHandle<Platform, FS>) -> bool {
         self.interests.lock().values().any(|entry| {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
@@ -396,13 +413,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                     Ok(litebox::platform::StdioStream::Stdin)
                 ),
                 Some(EpollDescriptor::Timerfd(_)) => true,
+                Some(EpollDescriptor::Unix(_)) => true,
                 _ => false,
             }
         })
     }
 
-    /// Re-polls every stdin and timerfd interest and pushes it into the ready set if it has
-    /// become readable. Called after each bounded repoll interval elapses in [`Self::wait`].
+    /// Re-polls every stdin, timerfd and Unix-socket interest and pushes it into the ready set if
+    /// it has become readable. Called after each bounded repoll interval elapses in [`Self::wait`]
+    /// -- see [`Self::has_unready_stdin_or_armed_timerfd_interest`]'s doc comment for why Unix
+    /// sockets joined this list.
     fn repoll_stdin_and_timerfd_interests(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
@@ -416,7 +436,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             .filter(|entry| {
                 matches!(
                     entry.desc.upgrade(),
-                    Some(EpollDescriptor::File(_)) | Some(EpollDescriptor::Timerfd(_))
+                    Some(EpollDescriptor::File(_))
+                        | Some(EpollDescriptor::Timerfd(_))
+                        | Some(EpollDescriptor::Unix(_))
                 )
             })
             .cloned()
@@ -930,11 +952,16 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         // evdev can never signal, and misses every event pushed during that sleep, confirmed live:
         // real `CursorMoved`-driven `push_input_rel` calls landing mid-wait with a guest `select()`
         // loop that never woke for them despite retrying every 0.5s.
+        // AF_UNIX joins stdin/evdev here too, same reasoning and same 2026-09-18 fix as
+        // `EpollFile::has_unready_stdin_or_armed_timerfd_interest`'s doc comment covers in full --
+        // a `select`/`poll`-based listener (not just an `epoll_wait`-based one) has exactly the
+        // same missing-cross-process-wake gap.
         let has_unwakeable_fd = self.entries.iter().any(|entry| {
             entry.fd >= 0
                 && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
                     .is_ok_and(|desc| {
-                        matches!(&desc, EpollDescriptor::File(file)
+                        matches!(&desc, EpollDescriptor::Unix(_))
+                            || matches!(&desc, EpollDescriptor::File(file)
                         if global.litebox.descriptor_table().with_metadata(
                             file,
                             |_: &crate::syscalls::file::EvdevFd| (),
