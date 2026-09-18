@@ -183,6 +183,20 @@ struct MmappedFile {
     abs_path: PathBuf,
 }
 
+/// Best-effort extraction of a human-readable message from a caught panic payload (a bare
+/// `Box<dyn Any + Send>` as handed back by `std::panic::catch_unwind`), for logging -- used by
+/// the `net_worker` loops' own panic recovery (see their doc comments for why a panic there must
+/// be caught rather than allowed to kill the thread).
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Memory-maps `path` read-only instead of copying its bytes into a private heap
 /// buffer, so the OS page cache transparently shares the physical pages across
 /// every concurrent runner process reading the same rootfs archive -- mirrors
@@ -864,10 +878,37 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
         while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
             let timeout = loop {
-                match net_shim.perform_network_interaction() {
-                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                // `perform_network_interaction` can panic deep inside smoltcp (confirmed live,
+                // 2026-09-18: `"handle does not refer to a valid socket"`, `socket_set.rs:116`,
+                // reached via a stale `SocketHandle` a dead-holder `reset_after_poisoning()` call
+                // elsewhere didn't know this process was still holding). Left uncaught, that panic
+                // unwinds this whole thread and kills it permanently -- this process's networking
+                // never runs again, and since `Network` is shared across the whole fork family,
+                // every OTHER process's own `net_worker` panics on the same stale handle in turn
+                // the next time it ticks, until every worker has died and networking silently
+                // stops platform-wide (live-confirmed: this exact panic was the LAST log line
+                // before a genuine, permanent full-boot stall). Catch it, force the same recovery
+                // `net_lock`'s own dead-holder path already performs (see
+                // `LinuxShim::force_reset_network_after_panic`'s doc comment), and keep the loop
+                // (and this process's networking) alive instead.
+                let advice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    net_shim.perform_network_interaction()
+                }));
+                match advice {
+                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately) => {}
+                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout }) => {
                         break timeout;
+                    }
+                    Err(payload) => {
+                        let panic_msg = panic_payload_message(&payload);
+                        litebox_util_log::error!(
+                            panic_msg:% = panic_msg;
+                            "net_worker: caught a panic inside perform_network_interaction -- \
+                             forcing Network::reset_after_poisoning() recovery instead of letting \
+                             it kill this thread's networking permanently"
+                        );
+                        net_shim.force_reset_network_after_panic();
+                        break None;
                     }
                 }
             };
@@ -1896,10 +1937,28 @@ fn diag_process_fork_task_resume_probe(
         const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
         loop {
             let timeout = loop {
-                match net_shim.perform_network_interaction() {
-                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                // Same panic-recovery discipline as `run()`'s own `net_worker` -- see its doc
+                // comment. A cross-process-fork child is exactly where this was first
+                // live-confirmed to matter (2026-09-18: this worker's own panic was the LAST
+                // thing ever logged before a genuine, permanent full-boot stall).
+                let advice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    net_shim.perform_network_interaction()
+                }));
+                match advice {
+                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately) => {}
+                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout }) => {
                         break timeout;
+                    }
+                    Err(payload) => {
+                        let panic_msg = panic_payload_message(&payload);
+                        litebox_util_log::error!(
+                            panic_msg:% = panic_msg;
+                            "net_worker (fork child): caught a panic inside perform_network_interaction -- \
+                             forcing Network::reset_after_poisoning() recovery instead of letting \
+                             it kill this thread's networking permanently"
+                        );
+                        net_shim.force_reset_network_after_panic();
+                        break None;
                     }
                 }
             };

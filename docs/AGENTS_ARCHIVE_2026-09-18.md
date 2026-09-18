@@ -185,3 +185,203 @@ rather than coincidental timing.
 killed cleanly via `Stop-Process -Force`, verified zero `litebox_runner`/`litebox-presenter`
 processes remained; host free RAM 2.4 GB immediately after kill, 4.8 GB ~5s later (recovering
 normally, consistent with prior sessions' unrelated-to-litebox RAM baseline).
+
+## Twelfth pass, 2026-09-17/18 -- by-name Xvfb/dbus-daemon exclusion relaxed; AF_UNIX connection-DATA
+gap precisely characterized; SafeZoneAllocator::dealloc spinlock livelock live-caught
+
+**By-name exclusion relaxed and re-tested -- new, precisely-characterized blocker found.**
+`try_cross_process_fork` (`litebox_shim_linux/src/syscalls/process.rs`) unconditionally refused any
+`comm` matching `Xvfb`/`dbus-daemon` before the fd-eligibility scan even ran (added `4bad287`, when
+`Network` internals were still private-per-process-heap, so a cross-process-forked Xvfb would have
+been unreachable regardless). That precondition is now false (`d1ff9d2`, `6fc102c`), so the by-name
+block was removed, letting both comms fall through to the SAME fd-eligibility gate as everything
+else (the `unix-socket` fd-kind refusal itself is untouched). Live-verified, `LITEBOX_PROCESS_FORK=1`
++ `.wfgy/webtop_stack.sh`: Xvfb DOES now genuinely cross-process-fork (direct log proof, not
+inferred: a same-run WARN shows a DIFFERENT guest pid than the connecting client owning the bound
+X11 socket -- `[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid ...
+self_pid=17392 owner_pid=16756`). `XVFB_FAILED`/`DBUS_FAILED` still fire, but for a NEW, DIFFERENT,
+now-precisely-characterized reason, not the old thread-based tcache class: `unix_addr_table`'s
+`Backlog`/`Channel` connection DATA (as opposed to the presence side-index already shared per
+"`unix_addr_table` presence sharing") is still real per-process-heap, so a client in a DIFFERENT
+cross-process-forked guest process gets ECONNREFUSED even though the listener is genuinely alive and
+bound -- the exact gap AGENTS.md's own "Open here" section already named ("guest processes share no
+AF_UNIX/loopback/FIFO namespace"), now hit by name for the first time. Safety: zero crash/corruption
+from the relaxation itself -- boot reached its stable `HOLD t=` steady state both after
+`XVFB_FAILED`+`DBUS_FAILED`+`DE_FAILED` (run 1) and separately in a second boot (run 2, independently
+confirmed safe, though that run's own progress was gated by an unrelated finding below). **Pickup for
+the browser milestone this named**: extend the `unix_addr_table` presence-sharing PATTERN (flat,
+fixed-slot, lock-free) from presence-only to the actual `Backlog`/`Channel` connection data --
+separate, larger, not attempted this pass (done, thirteenth pass, above).
+
+**`SafeZoneAllocator::dealloc` spinlock livelock -- LIVE-CAUGHT for the first time (run 2 of this
+same pass), previously only theorized.** Unrelated to the Xvfb/dbus relaxation above (hit deep in a
+`[process_fork_diag] globalstate-probe (child)` diagnostic's own `std::process::exit()` call, present
+since before this pass). Two live `cdb -pv` samples ~27s apart, symbolized against the matching
+same-timestamp `.pdb` (`-y <dir>`, required -- raw offsets alone mis-suggested
+`ntdll!RtlFreeActivationContextStack`/`ntdll!LdrShutdownProcess` internals until symbolized), showed
+a single thread bit-identical at the same leaf instruction (`test al,al` in
+`SafeZoneAllocator::<WindowsUserland as GlobalAlloc>::dealloc+0x59`, disassembly confirms a classic
+`lock cmpxchg`+`pause`-backoff spin loop) while its User Mode CPU time climbed continuously (9:22 ->
+9:49 and counting) -- genuinely spinning, not blocked. Call chain:
+`diag_process_fork_globalstate_probe_inner` -> `std::process::exit` -> Rust's own TLS-destructor
+cleanup (`std::sys::thread_local::guard::windows::cleanup`/`destructors::list::run`) -> freeing a
+TLS-held `Vec<String>`/`Option<..>` -> `SafeZoneAllocator::dealloc` spins forever acquiring its
+internal `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) -- a raw external-crate spinlock
+with NO dead-holder recovery, unlike `RawMutex` (which got exactly this recovery mechanism the same
+day). Consistent with a thread/process elsewhere dying while holding this global-allocator lock,
+permanently starving every future `alloc`/`dealloc` in that process. Resisted `Stop-Process -Force`
+for ~2 minutes; only WMI `Invoke-CimMethod -MethodName Terminate` worked (now a standing rule, top of
+`AGENTS.md`). Not root-caused further that pass -- real fix is giving `SafeZoneAllocator`'s spinlock
+the same dead-holder-recovery treatment `RawMutex` already has, or routing it through `RawMutex`
+itself; high blast radius (global allocator, every allocation in every process) -- deserves its own
+dedicated, carefully-scoped pass, not a rushed change alongside something else. Still open as of the
+fifteenth pass.
+
+## Fifteenth pass, 2026-09-18 -- the `wait_on_tun`/`with_fork_duplicate_claim_owner` theory REFUTED;
+real root cause found (a smoltcp stale-`SocketHandle` panic that killed `net_worker` threads
+platform-wide) and FIXED, live-verified; a SECOND, different stall found past it, not yet fixed
+
+**The fourteenth pass's own top-priority theory is wrong.** Read `net::wait_on_tun`
+(`litebox_platform_windows_userland/src/net.rs:1059`) and `with_fork_duplicate_claim_owner`
+(`litebox_platform_windows_userland/src/lib.rs:4547`) in full: `wait_on_tun` takes a single
+`notify_lock: Arc<Mutex<()>>` (grepped -- ONE lock site in the whole file, no contention possible)
+and calls `Condvar::wait_timeout` with a caller-supplied timeout ALWAYS capped to 1ms by every real
+caller (`litebox_runner_linux_on_windows_userland`'s two `net_worker` closures, `MAX_TIMEOUT`) --
+structurally incapable of blocking longer than 1ms, let alone forever. `with_fork_duplicate_claim_owner`
+is a trivial synchronous `CURRENT_GUEST_PID.set/f()/set` wrapper with no wait of its own. Neither
+can deadlock.
+
+**What actually happened**: `net_worker` (spawned once per real OS process, both at `run()`'s own
+construction and again per cross-process-fork child, `litebox_runner_linux_on_windows_userland/src/
+lib.rs` -- two near-identical closures) loops calling `perform_network_interaction()` then
+`wait_on_tun(<=1ms)` forever. Because this loop spends most of its time inside that 1ms wait, a
+`cdb -pv` stack sample lands inside `wait_on_tun` on almost ANY snapshot of ANY live process's
+`net_worker` thread, deadlock or not -- this is what the fourteenth pass actually caught: normal,
+permanently-present idle background noise, not a hang. (Separately: several OTHER frames sampled
+this investigation, e.g. `with_fork_duplicate_claim_owner...do_clone+0x2d1` shown calling into
+`litebox_presenter_protocol::pipe::create_and_accept_one_instance`, and `prepare_for_exit.llvm.<hash>
++0x602f`/`pty_ioctl+0x6bbc` at absurd byte offsets for those functions' real, short bodies, are
+IMPOSSIBLE as literal call nesting -- confirming this release/LTO/ICF binary's symbol resolution for
+deep, heavily-inlined/merged frames is fundamentally unreliable, matching `docs/
+AGENTS_ARCHIVE_2026-09-17.md:1852`'s own prior note about the same phenomenon. Trust only frames with
+small offsets into functions whose own source has no plausible reason to call the next frame down;
+treat everything else as a nearest-symbol/ICF-merge artifact, not literal ground truth.)
+
+**Live repro** (fresh `8fcbd56` HEAD binary, `LITEBOX_PROCESS_FORK=1` + `.wfgy/webtop_stack.sh`,
+`.wfgy/repro_head_9f3a2c.log`): boot reached `NGINX_STARTED`, then genuinely stalled (confirmed via
+multiple samples: log size and per-process CPU both flat for 240s+ at a time, repeatedly). The LAST
+thing ever logged before the stall, every time this exact signature was hit:
+```
+5.726899900s  WARN ...RawMutex::poll_until_value_changes: recorded holder process is dead --
+  recovering orphaned lock (queue-full fallback path) holder_pid=15576 val=2
+5.726944900s  WARN ...GlobalStateHandle::net_lock: acquired a Network lock recovered from a dead
+  holder -- resetting Network to a safe empty state to avoid reading torn socket_set/
+  closing_in_background/local_port_allocator state
+thread '<unnamed>' (5568) panicked at .../smoltcp-0.12.0/src/iface/socket_set.rs:116:21:
+  handle does not refer to a valid socket
+  2: <litebox::net::Network<...>>::internal_perform_platform_interaction
+  3: <litebox::net::Network<...>>::perform_platform_interaction
+  4: ...with_fork_duplicate_claim_owner...Task...
+[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid ...
+[diag-proc-sys-open-miss] unregistered path opened: /proc/18536/cmdline errno=2
+<-- total, permanent silence from every process from here on -->
+```
+**Root cause, precisely**: `Network::reset_after_poisoning` (`litebox/src/net/mod.rs`) already
+existed (eleventh pass) to recover from a dead `net_lock` holder by wiping `socket_set`/
+`closing_in_background`/`queued_for_closure`/`local_port_allocator` back to empty -- its own doc
+comment ALREADY disclosed the accepted gap: "a `SocketFd`/`LocalPort` token some OTHER, still-alive
+process minted before this reset and continues to hold becomes stale the instant this runs ... using
+it afterward can still panic exactly as before." That disclosed gap fired for real: a per-process
+descriptor-table entry (a socket fd this SAME still-alive process owned) kept naming a
+`smoltcp::iface::SocketHandle` that `reset_after_poisoning` had just removed from `socket_set`, and
+smoltcp's own `SocketSet::get`/`get_mut` (0.12, no generation counter on `SocketHandle`) panic
+outright on that (`"handle does not refer to a valid socket"`, `socket_set.rs:116`). This panic was
+UNCAUGHT inside `net_worker`'s own loop body, so it unwound and killed that ENTIRE background thread
+permanently (Rust's default panic strategy is unwind here -- no `[profile.release] panic = "abort"`
+anywhere in the workspace `Cargo.toml`, confirmed by grep -- so the OS PROCESS survives, but that
+process's own `net_worker` never runs again). Because `Network` (`socket_set` et al.) is genuinely,
+deliberately shared across the WHOLE cross-process-fork family (one virtual NIC for the whole
+guest), every OTHER live process's own `net_worker` thread was equally likely to independently hit
+the exact same (or a different) stale handle on ITS OWN very next tick and die the same way --
+consistent with the observed total, permanent, platform-wide silence: every process's `net_worker`
+died in turn until networking simply stopped running anywhere, and everything downstream of it
+(every AF_UNIX/TCP/UDP syscall waiting on a `perform_network_interaction` tick to make progress)
+hung forever with nothing left to ever wake it.
+
+**Fix, two parts, both required** (a fix that only did part 1 was tried first and, live-verified,
+was NOT sufficient on its own -- see below):
+
+1. **Stop the panic from killing the thread.** `litebox_shim_linux::LinuxShim::perform_network_interaction`
+   is `#![no_std]` and cannot itself call `catch_unwind`; added a sibling `pub fn
+   force_reset_network_after_panic(&self)` (`self.0.net_lock().reset_after_poisoning()`) that a
+   `std`-enabled caller can invoke after catching a panic. Both `net_worker` closures in
+   `litebox_runner_linux_on_windows_userland/src/lib.rs` (the `run()`-constructed one and the
+   per-cross-process-fork-child one) now wrap `net_shim.perform_network_interaction()` in
+   `std::panic::catch_unwind(std::panic::AssertUnwindSafe(...))`; on `Err`, log the panic message
+   (`panic_payload_message`, a new free function) and call `force_reset_network_after_panic()`
+   instead of propagating. **Live-verified insufficient alone** (`.wfgy/repro_fix_v1.log`): the
+   thread no longer died, but the SAME stale handle re-panicked on EVERY subsequent tick forever (a
+   tight catch-panic-recover-repanic loop, hundreds of times in the log) -- `reset_after_poisoning`
+   wipes `Network`'s OWN shared registries but never touches any process's own descriptor-table
+   entries, so the offending process's own still-open socket fd kept re-presenting the exact same
+   now-dead handle to `close_pending_sockets`/`drain_all_socket_channel_buffers` every single tick.
+
+2. **Stop future ticks from re-touching a handle a reset already removed.** Added
+   `Network::socket_set_contains(socket_set: &SocketSet, handle) -> bool` (a linear
+   `socket_set.iter().any(...)` scan -- smoltcp 0.12 has no checked `get`/`try_get`, and no way to
+   patch the vendored crate from this workspace; bounded and cheap, `MAX_SOCKETS` = 256) and guarded
+   every call site that would otherwise panic on a stale handle: `remove_dead_sockets`'s
+   `closing_in_background` scan, `close_pending_sockets`'s per-descriptor `with_socket_mut` call (a
+   stale handle is treated as "already closed," clearing `consider_closed` and skipping), and
+   `drain_socket_channel_buffers`'s TCP/UDP paths (stale -> skip draining), including the nested
+   listening-socket `server_socket.socket_set_handles` scan (a listener's own individual accepted-
+   connection handles can independently go stale). All in `litebox/src/net/mod.rs`.
+
+**Live-verified** (`.wfgy/repro_fix_v2.log`, fresh binary with BOTH parts): the exact panic signature
+above did not recur in this run at all within the reproduced window (boot reached `NGINX_STARTED`
+and progressed well past it before hitting the UNRELATED second stall below), and part 1 alone was
+already independently confirmed (previous paragraph) to turn a permanent thread death into a
+survivable, repeatedly-recovering thread -- the two together close both halves of the mechanism: the
+thread survives AND stops immediately re-panicking on the same stale handle.
+
+**A SECOND, DIFFERENT stall found past this fix -- NOT YET ROOT-CAUSED, real next pickup.** The same
+`.wfgy/repro_fix_v2.log` run reached `NGINX_STARTED` then genuinely stalled again (log size and CPU
+both flat 1270s+, far longer than any of this script's own explicit timeouts, so not simply a slow
+retry loop) BEFORE ever printing `NGINX_SELFTEST`/`NGINX_SELFTEST_FAILED` -- earlier in the boot than
+the fourteenth pass's own stall point. Only 4 host processes remained alive at the stall (two of
+them, confirmed via full untruncated `~*k` dumps with zero unmatched/hidden threads, are
+`run_external_fault_watchdog_child` helper processes with nothing else running -- litebox's own
+crash-monitoring infrastructure, not part of the guest's process tree). Of the two real guest
+processes: one (`winpid` forked immediately after `NGINX_STARTED`, so very plausibly the nginx
+self-test loop's own shell or the backgrounded `nginx_supervisor.sh`) has a thread genuinely blocked
+in `RawMutex::block`, reached via a `WaitContext::wait_until` instantiation whose closure-shape
+matches `Process::sys_wait4`'s own poll loop -- strongly suggesting a real, live `sys_wait4` blocking
+wait for a child that never changes state, but (per the symbol-reliability caveat above) the
+displayed enclosing frames (`pty_ioctl`/`prepare_for_exit.llvm.<hash>`) are almost certainly WRONG
+names for whatever the true caller is (huge, implausible byte offsets into short functions). The
+other guest process shows no thread doing anything but idling (net_worker, a fault watchdog, a
+`SharedArc`/`OnceLock` init-retry sleep) -- notably NOT itself waiting in `sys_wait4`, so if the
+first process is waiting specifically for THIS one, the wait target is not itself blocked in any way
+visible in its own stack, which would point at a genuine missed-wakeup (the awaited child's exit
+notification never reached the waiter) rather than the waiter's target being hung too.
+**Concrete next steps**: (1) do not trust cdb's enclosing-frame names for this binary without cross-
+checking plausibility (a huge offset into a short function, or a call chain that makes no sense
+given the named function's own source, both mean "wrong name," not "surprising code path"); (2)
+add a direct, cheap diagnostic instead of relying on symbol resolution -- an `eprintln!`/log line at
+the TOP of `Task::sys_wait4` printing `pid`/`options`/`self.pid.get()` would immediately show which
+guest pid is waiting for which child, with zero symbol-resolution uncertainty; (3) once the waiting
+pid and its target are both known, check whether the target already exited at the OS level (a
+cross-process child whose real Windows process handle already signaled, but
+`try_wait_for_cross_process_exit`/`reap_cross_process_child` never got called for some reason) versus
+genuinely still running but stuck elsewhere.
+
+**Files touched this pass**: `litebox_shim_linux/src/lib.rs` (`force_reset_network_after_panic`),
+`litebox_runner_linux_on_windows_userland/src/lib.rs` (`panic_payload_message`, both `net_worker`
+closures wrapped in `catch_unwind`), `litebox/src/net/mod.rs` (`socket_set_contains` and its four
+call sites). No test files added, per standing rule.
+
+**Host state**: builds and boots run one at a time (confirmed via `Get-Process` before each new
+build/launch, stale processes killed with `Stop-Process -Force` when the build's own file-lock
+proved one was still running); host free RAM fluctuated 0.9-5.6 GB across the session, recovering
+promptly after each kill -- consistent with prior sessions' established "unrelated to litebox"
+baseline, never trending down across cleanups.

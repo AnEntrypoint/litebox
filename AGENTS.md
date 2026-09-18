@@ -140,53 +140,13 @@ reached `SELKIES_PORT_UP`+`DE_LAUNCHED` with one disclosed non-fatal residual pa
 the browser/terminal/apps milestone — attributed then to the Xvfb/dbus by-name exclusion, now
 superseded by the twelfth-pass entry below. Detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
-**By-name exclusion relaxed and re-tested (twelfth pass, 2026-09-17/18) — new, precisely-characterized blocker found.** `try_cross_process_fork`
-(`litebox_shim_linux/src/syscalls/process.rs`) unconditionally refused any `comm` matching
-`Xvfb`/`dbus-daemon` before the fd-eligibility scan even ran (added `4bad287`, when `Network`
-internals were still private-per-process-heap, so a cross-process-forked Xvfb would have been
-unreachable regardless). That precondition is now false (`d1ff9d2`, `6fc102c`), so the by-name
-block was removed, letting both comms fall through to the SAME fd-eligibility gate as everything
-else (the `unix-socket` fd-kind refusal itself is untouched). Live-verified, `LITEBOX_PROCESS_FORK=1`
-+ `.wfgy/webtop_stack.sh`: Xvfb DOES now genuinely cross-process-fork (direct log proof, not
-inferred: a same-run WARN shows a DIFFERENT guest pid than the connecting client owning the bound
-X11 socket — `[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid ...
-self_pid=17392 owner_pid=16756`). `XVFB_FAILED`/`DBUS_FAILED` still fire, but for a NEW, DIFFERENT,
-now-precisely-characterized reason, not the old thread-based tcache class: `unix_addr_table`'s
-`Backlog`/`Channel` connection DATA (as opposed to the presence side-index already shared per
-"`unix_addr_table` presence sharing" above) is still real per-process-heap, so a client in a
-DIFFERENT cross-process-forked guest process gets ECONNREFUSED even though the listener is
-genuinely alive and bound — the exact gap this file's "Open here" section already named
-("guest processes share no AF_UNIX/loopback/FIFO namespace"), now hit by name for the first time.
-Safety: zero crash/corruption from the relaxation itself — boot reached its stable `HOLD t=`
-steady state both after `XVFB_FAILED`+`DBUS_FAILED`+`DE_FAILED` (run 1) and separately in a second
-boot (run 2, independently confirmed safe, though that run's own progress was gated by an unrelated
-finding below). **Next real pickup for the browser milestone**: extend the `unix_addr_table`
-presence-sharing PATTERN (flat, fixed-slot, lock-free) from presence-only to the actual
-`Backlog`/`Channel` connection data — separate, larger, not attempted this pass.
-
-**`SafeZoneAllocator::dealloc` spinlock livelock — LIVE-CAUGHT for the first time (twelfth pass,
-run 2), previously only theorized ("Previously-recorded allocator livelock (`SafeZoneAllocator::
-alloc`) not re-investigated this pass -- still open" — RawMutex section above).** Unrelated to the
-Xvfb/dbus relaxation above (hit deep in a `[process_fork_diag] globalstate-probe (child)`
-diagnostic's own `std::process::exit()` call, present since before this pass). Two live `cdb -pv`
-samples ~27s apart, symbolized against the matching same-timestamp `.pdb` (`-y <dir>`, required —
-raw offsets alone mis-suggested `ntdll!RtlFreeActivationContextStack`/`ntdll!LdrShutdownProcess`
-internals until symbolized), showed a single thread bit-identical at the same leaf instruction
-(`test al,al` in `SafeZoneAllocator::<WindowsUserland as GlobalAlloc>::dealloc+0x59`, disassembly
-confirms a classic `lock cmpxchg`+`pause`-backoff spin loop) while its User Mode CPU time climbed
-continuously (9:22 → 9:49 and counting) — genuinely spinning, not blocked. Call chain:
-`diag_process_fork_globalstate_probe_inner` → `std::process::exit` → Rust's own TLS-destructor
-cleanup (`std::sys::thread_local::guard::windows::cleanup`/`destructors::list::run`) → freeing a
-TLS-held `Vec<String>`/`Option<..>` → `SafeZoneAllocator::dealloc` spins forever acquiring its
-internal `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) — a raw external-crate spinlock
-with NO dead-holder recovery, unlike `RawMutex` (which got exactly this recovery mechanism earlier
-today). Consistent with a thread/process elsewhere dying while holding this global-allocator lock,
-permanently starving every future `alloc`/`dealloc` in that process. Resisted `Stop-Process -Force`
-for ~2 minutes; only WMI `Invoke-CimMethod -MethodName Terminate` worked (now a standing rule,
-top of file). Not root-caused further this pass — real fix is giving `SafeZoneAllocator`'s spinlock the
-same dead-holder-recovery treatment `RawMutex` already has, or routing it through `RawMutex`
-itself; high blast radius (global allocator, every allocation in every process) — deserves its own
-dedicated, carefully-scoped pass, not a rushed change here.
+**Twelfth pass (2026-09-17/18)**: by-name `Xvfb`/`dbus-daemon` cross-process-fork exclusion relaxed
+— both now cross-process-fork for real (log-proven). `XVFB_FAILED`/`DBUS_FAILED` still fire, root
+cause precisely named: `unix_addr_table`'s `Backlog`/`Channel` connection DATA is still
+per-process-heap (presence side-index already shared) — closed by the thirteenth pass below. Same
+pass, separately: `SafeZoneAllocator::dealloc`'s `spin::mutex::SpinMutex` (`litebox/src/mm/
+allocator.rs`) live-caught spinning forever (no dead-holder recovery, unlike `RawMutex`) — **still
+open**, own dedicated pass needed. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
 **Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
 `LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
@@ -198,30 +158,52 @@ the full design), three real bugs found+fixed along the way (stack overflow on a
 array, an ambiguous-`None`-timeout infinite-poll bug, a missing shared-queue check in event-driven
 `accept()` paths). Full narrative: archive.
 
-**Fourteenth pass, 2026-09-18 — isolated repro built and PASSED clean** (owed since the thirteenth
-pass skipped it): a freestanding two-process AF_UNIX connect/accept probe, fork-before-listen so
-the fork is eligibility-clean, live-fired the exact `ECONNREFUSED ... DIFFERENT guest pid` WARN and
-then self-healed to a byte-exact bidirectional round trip. **`SharedUnixConnTable`/
-`SharedUnixConnectQueue` genuinely works for the minimal case.** A clean full-boot re-run (fresh
-`b86f1f1` binary) reached `NGINX_STARTED`/`NGINX_SELFTEST_FAILED` (expected) then hit a NEW,
-DIFFERENT, not-yet-root-caused stall: near-zero CPU, zero log growth for 4+ minutes (genuine block,
-not the old CPU-livelock class) — `cdb -pv` found two separate OS processes simultaneously blocked
-inside the SAME cross-process-fork internal step, `net::wait_on_tun`'s `Condvar::wait_timeout`
-(via `do_clone`'s `with_fork_duplicate_claim_owner`), plus one process stuck in `sys_wait4`'s
-`prepare_for_exit` never reaping a child. Did NOT reach `XVFB_UP`/`DBUS_UP`/browser/terminal/apps.
-Full evidence, exact log lines, host-RAM confirmation: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**Fourteenth pass, 2026-09-18 — isolated AF_UNIX repro PASSED clean; full-boot stall theory since
+REFUTED (see fifteenth pass below).** `SharedUnixConnTable`/`SharedUnixConnectQueue` genuinely work
+for the minimal cross-process case (byte-exact bidirectional round trip, fork-before-listen probe).
+The fourteenth pass's own read of the subsequent full-boot stall (`net::wait_on_tun`/
+`with_fork_duplicate_claim_owner` as a two-holder deadlock) was WRONG — see below.
+
+**Fifteenth pass, 2026-09-18 — real root cause found and FIXED, live-verified: a smoltcp
+stale-`SocketHandle` panic killed `net_worker` threads platform-wide.** `wait_on_tun` is
+structurally incapable of blocking (single lock site, every caller caps its timeout to 1ms) —
+the fourteenth pass's "two-holder deadlock" read was a cdb sample catching this thread's own
+permanently-present idle noise, not a hang; several other frames sampled this investigation
+(`prepare_for_exit+0x602f`, `pty_ioctl+0x6bbc`, huge offsets into short functions calling things
+their own source can't reach) are release/LTO/ICF symbol-resolution artifacts, not literal call
+stacks (matches `docs/AGENTS_ARCHIVE_2026-09-17.md:1852`'s prior note on the same phenomenon — trust
+only small, plausible offsets). **Real mechanism**: `Network::reset_after_poisoning`'s own doc
+comment already disclosed the gap — a still-alive process's OWN descriptor-table entry can keep
+naming a `SocketHandle` the reset just wiped, and smoltcp's `SocketSet::get`/`get_mut` (0.12, no
+generation counter) panics outright (`"handle does not refer to a valid socket"`). That panic was
+UNCAUGHT inside `net_worker`'s loop, permanently killing that process's networking; since `Network`
+is shared across the whole fork family, every OTHER process's `net_worker` died the same way in
+turn until networking silently stopped everywhere — matching the observed total, permanent,
+platform-wide log silence exactly. **Fix, two parts, both required** (part 1 alone, live-tested,
+only turned it into an infinite catch-repanic loop): (1) `net_worker`'s two closures
+(`litebox_runner_linux_on_windows_userland/src/lib.rs`) now `catch_unwind` around
+`perform_network_interaction()` and call a new `LinuxShim::force_reset_network_after_panic()`
+instead of propagating; (2) `litebox/src/net/mod.rs` gained `Network::socket_set_contains` (a
+bounded linear scan — smoltcp has no checked `get`) guarding `remove_dead_sockets`,
+`close_pending_sockets`, and `drain_socket_channel_buffers`'s TCP/UDP/listener-handle paths against
+ever touching an already-removed handle again. Live-verified: the panic signature did not recur in
+a full run with both parts. **A SECOND, different, not-yet-root-caused stall found past this fix**
+(one process genuinely blocked in what looks like `sys_wait4`, per the closure-shape of its
+`wait_until` instantiation, but with unreliable enclosing frame names) — did not reach
+`XVFB_UP`/`DBUS_UP`/browser/terminal/apps this pass either. Full evidence, exact log lines, the
+insufficient-first-fix detail, and concrete next steps: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(-2) **NEW TOP PRIORITY, fourteenth pass**: root-cause `net::wait_on_tun`/`with_fork_duplicate_
-claim_owner` (`litebox_platform_windows_userland/src/net.rs`) — does its `Condvar::wait_timeout`
-have a real bound, and can two concurrently-forking guest processes each end up waiting on a
-condition only the OTHER would signal (a two-holder deadlock distinct from the AF_UNIX
-connect/accept path, which the fourteenth-pass isolated repro already proved sound)? Get a second
-`cdb` sample ~30s apart on the SAME stalled pids to confirm it's a genuine unchanging wait (the
-tenth/twelfth-pass livelock-diagnosis method), and sample the other two live processes not yet
-sampled. Do not re-attempt the AF_UNIX broadened-repoll-scope A/B until this new stall is
-understood — the stall long-predates reaching the epoll/AF_UNIX-heavy part of the boot.
+(-2) ~~root-cause `net::wait_on_tun`/`with_fork_duplicate_claim_owner`~~ — REFUTED, fifteenth
+pass: structurally can't deadlock (single lock, every caller caps its timeout to 1ms); the real
+mechanism was a smoltcp stale-`SocketHandle` panic killing `net_worker` platform-wide, now FIXED
+(above). **NEW TOP PRIORITY, fifteenth pass**: root-cause the SECOND stall found past that fix — a
+process genuinely blocked in what looks like `sys_wait4` (via its `wait_until` closure shape), but
+cdb's enclosing frame names for this release/ICF binary are unreliable (huge, implausible offsets).
+Add a direct `eprintln!`/log line at the top of `Task::sys_wait4` printing `pid`/`self.pid.get()`
+instead of trusting symbol resolution; then check whether the awaited child already exited at the
+OS level without being reaped. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass, passed
 clean (above). (0)
@@ -385,8 +367,10 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (13th pass: shared AF_UNIX connection data plane;
-  14th pass: isolated repro PASSED, new full-boot `wait_on_tun` stall), `_2026-09-17.md`
+- **Archives** (newest first) — `_2026-09-18.md` (12th pass: Xvfb/dbus relaxed, SafeZoneAllocator
+  livelock; 13th pass: shared AF_UNIX connection data plane; 14th pass: isolated repro PASSED; 15th
+  pass: `wait_on_tun` stall theory REFUTED, real smoltcp-panic root cause FIXED, second stall found),
+  `_2026-09-17.md`
   (shell-crash investigation, stdio-handle bug, 12 registry/pointer/lock fixes, writable-layer-race
   fix), `_2026-09-16.md` (popup-menu re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md`
   (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, browser config,

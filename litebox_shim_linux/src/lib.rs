@@ -1012,6 +1012,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         self.0.net_lock().perform_platform_interaction()
     }
 
+    /// Force the exact same recovery [`GlobalStateHandle::net_lock`]'s own dead-holder path
+    /// already performs (see `litebox::net::Network::reset_after_poisoning`'s doc comment) --
+    /// for a caller that caught a panic escaping [`Self::perform_network_interaction`] (e.g.
+    /// smoltcp's own `"handle does not refer to a valid socket"`, `socket_set.rs:116`, seen live
+    /// 2026-09-18 during a `LITEBOX_PROCESS_FORK=1` full webtop boot).
+    ///
+    /// # Why this is needed
+    ///
+    /// A panic that unwinds through `perform_network_interaction`'s `MutexGuard` releases the
+    /// lock normally (the holding thread is still alive, just unwinding) -- `RawMutex`'s own
+    /// dead-holder poisoning is an OS-level "the recorded holder PROCESS died" signal and is
+    /// never set by an ordinary same-process panic, so the very next `net_lock()` call would NOT
+    /// see `recovered_from_dead_holder` and would NOT reset anything, leaving whatever stale
+    /// `SocketHandle` caused the panic still in place. Every future tick (this process's own next
+    /// `wait_on_tun` cycle, and every OTHER process's, since `Network` is shared across the whole
+    /// fork family) would panic on the exact same handle again. Left unaddressed, each process's
+    /// own `net_worker` thread panics and dies in turn the first time it touches the same stale
+    /// handle, until every process's worker has died and networking is silently gone
+    /// platform-wide with no further log output at all -- live-confirmed as the mechanism behind
+    /// a genuine full-boot stall: this exact panic was the LAST thing ever logged before total,
+    /// permanent log silence (`docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass).
+    ///
+    /// Calling this after catching such a panic is the same trade-off `reset_after_poisoning`
+    /// itself already discloses (a real loss of in-flight connections, in exchange for
+    /// self-consistent state for every future caller) -- just triggered by a live in-process
+    /// panic instead of an OS-level dead-holder signal. The caller (necessarily `std`-enabled,
+    /// since this `no_std` crate cannot itself call `catch_unwind`) is expected to wrap its own
+    /// call to [`Self::perform_network_interaction`] in `std::panic::catch_unwind` and call this
+    /// method from the `Err` arm before resuming its polling loop.
+    pub fn force_reset_network_after_panic(&self) {
+        self.0.net_lock().reset_after_poisoning();
+    }
+
     /// Establish a TCP connection to the given address.
     ///
     /// Returns a [`transport::ShimTransport`] that can be used as a

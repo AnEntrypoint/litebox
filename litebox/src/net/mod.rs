@@ -800,9 +800,32 @@ where
     /// own address space, and running its `Vec` destructor through THIS process's global allocator
     /// hangs indefinitely inside `dealloc` -- live `cdb`-confirmed, a thread frozen inside exactly
     /// that call, reached from here, before this fix.
+    /// Whether `handle` still names a live socket in `self.socket_set` -- see
+    /// [`Self::reset_after_poisoning`]'s own doc comment for why a per-process descriptor's
+    /// `SocketHandle` can survive a dead-holder-triggered reset stale: that reset only wipes
+    /// `Network`'s own shared registries, never any process's own descriptor table, and
+    /// smoltcp's `SocketHandle` (0.12) carries no generation counter to tell a stale one apart
+    /// from a live one short of a linear scan. Bounded by `MAX_SOCKETS` (256), so this scan is
+    /// cheap; guards every call site that would otherwise panic (`"handle does not refer to a
+    /// valid socket"`, `smoltcp::iface::socket_set::SocketSet::get`/`get_mut`) on a handle
+    /// something else already removed. Live-confirmed load-bearing 2026-09-18: without this,
+    /// the exact same stale handle re-panicked every single tick even after the caller caught
+    /// and recovered from the first panic (`reset_after_poisoning` alone does not stop a
+    /// process's own still-open socket fd from repeatedly re-touching its own now-dead handle).
+    fn socket_set_contains(
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        handle: smoltcp::iface::SocketHandle,
+    ) -> bool {
+        socket_set.iter().any(|(h, _)| h == handle)
+    }
+
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
             let Some(handle) = *slot else { continue };
+            if !Self::socket_set_contains(&self.socket_set, handle) {
+                *slot = None;
+                continue;
+            }
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
@@ -818,6 +841,13 @@ where
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
+                // See `socket_set_contains`'s doc comment: a stale handle (this descriptor's own
+                // socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
+                // elsewhere) has nothing left to close.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    socket_handle.consider_closed = false;
+                    continue;
+                }
                 // check if there is pending data to be sent
                 if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
@@ -873,6 +903,12 @@ where
             Some(proxy) => proxy.as_ref(),
             None => return,
         };
+        // See `Network::socket_set_contains`'s doc comment: a stale handle (this descriptor's
+        // own socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
+        // elsewhere) has nothing left to drain -- `socket_set.get_mut` would otherwise panic.
+        if !socket_set.iter().any(|(h, _)| h == socket_handle.handle) {
+            return;
+        }
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
@@ -934,8 +970,12 @@ where
                         .socket_set_handles
                         .iter()
                         .any(|&h| {
-                            let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
+                            // Same stale-handle guard as above: one of a listening socket's own
+                            // accepted-connection handles can independently go stale.
+                            socket_set.iter().any(|(live, _)| live == h) && {
+                                let socket: &tcp::Socket = socket_set.get(h);
+                                socket.state() == tcp::State::Established
+                            }
                         })
                         .then(|| {
                             proxy.set_readable(true);
