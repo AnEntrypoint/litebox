@@ -824,3 +824,171 @@ internally-consistent, non-folded stacks (`.wfgy/cdb_debugbuild_snapshot.log`):
   already-`connect()`ed client waiting on a reply that its peer never sends) -- next session:
   reproduce again, and BEFORE anything else `dt`/`dv` thread 1's `PollSet` locals (entries/fds) at
   the exact stuck point to identify the fd, then trace which side of the rendezvous never posts.
+
+## Nineteenth pass, 2026-09-18 -- live cdb repro of the post-xset ppoll stall (twice), has_pending REFUTED as the bug, real client-side gap found, next-step evidence still missing
+
+**Setup.** `LITEBOX_PROCESS_FORK=1` + debug binary (`target/debug/litebox_runner_linux_on_windows_userland.exe`,
+built earlier today, matching `.pdb` present) + `.wfgy/webtop_stack.sh` via
+`--resume-from .wfgy/webtop_seed.tar` (regenerated same day, newer than the script, confirmed
+current). Launch script: `.wfgy/repro_debug_ppoll_stall.ps1` (same shape as `.wfgy/ab_repro_new.ps1`,
+pointed at the debug binary and port 8090). `cdb.exe` at
+`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`; every attach used `-pv` (non-invasive)
+with `-y target\debug` for symbols, never a bare `q` to detach.
+
+**First repro.** Boot reached `NGINX_STARTED`/`NGINX_SELFTEST_FAILED` (expected, open/tracked
+separately), then went fully silent (no log growth) for 60+ seconds -- past the script's own bounded
+60s `[ -e "$XSOCK" ]` wait loop, so this was a genuine stall, not that loop's own silence. A full
+`cdb -pv -p <pid> -y target\debug -c "~*kb;qd"` sweep of every live `litebox_runner_linux_on_windows_userland.exe`
+process found exactly one (winpid 17248) with a `sys_ppoll -> PollSet::wait -> commit_wait ->
+RawMutex::block_or_maybe_timeout` frame -- an exact match for the eighteenth pass's own read.
+Decoded boot log correlation (`iconv -f UTF-16LE -t UTF-8`, PowerShell `*>` redirection is UTF-16):
+`task-resume-probe (child): guest fd 255 reopened on /webtop_stack.sh at offset 19289` then
+`task-resume-probe (child, winpid=17248): built Task, ... entering real guest execution` then a
+`3.412319000s WARN litebox_shim_linux::syscalls::unix: [unix_addr_presence] ECONNREFUSED but
+address IS bound, by a DIFFERENT guest pid ... listener self_pid=17248 owner_pid=9964` then
+`/webtop_stack.sh: line 290: 149 Killed xset q > /dev/null 2>&1` then `[s] XVFB_FAILED`.
+
+Script offset 19289 is `xset q`'s own line (confirmed by direct `sed -n` on `.wfgy/webtop_stack.sh`),
+not `xrdb`'s (the eighteenth pass misread this by one command -- `xrdb` is the very next line,
+offset ~19468, and DOES run, harmlessly failing with `.Xresources: No such file`).
+
+**Identity of `self_pid`/`owner_pid`: confirmed to be the real Windows PID, not a small guest-internal
+counter.** `task.pid.get()` literally equals the host `winpid` for a `LITEBOX_PROCESS_FORK=1` child --
+proven by grepping the decoded log for `winpid=9964` and finding its own `task-resume-probe` resume
+at script offset 16877, which is `/usr/bin/Xvfb "$DISPLAY" ... &`'s own line. So `owner_pid=9964`
+in the WARN directly names Xvfb's real host process, and `self_pid=17248`/`self_pid=4700` (see
+below) directly name xset's.
+
+**Chasing "Killed" as a literal SIGKILL was a dead end.** Windows PID 17248 was found ALIVE (via a
+second, later `cdb -pv` attach) still blocked in the exact same `ppoll` stack MINUTES after its own
+"Killed" log line -- initially read as "the guest was told this process died but the real OS process
+never actually terminated" (a scary, novel bug class). This is very likely WRONG: `Get-Process -Id
+17248`'s own `StartTime` (10:30:58) postdated the boot log's own "Killed" event by roughly ten
+minutes of wall clock, and dozens of short-lived children (nginx-supervisor retries) cycled through
+PIDs in between -- ordinary Windows PID reuse is the far more likely explanation than a zombie
+surviving its own reported death. Do not re-chase this specific "SIGKILL but still alive" angle
+without first correlating `Get-Process`'s own `StartTime` against the exact boot-log timestamp for
+the SAME winpid, in the SAME run, to rule out reuse definitively either way.
+
+**`decode_cross_process_wait_status`/`CROSS_PROCESS_EXIT_MARKER` (`syscalls/process.rs:334-403`)
+investigated as a candidate universal bug, then ruled out as the live cause here.** The function's
+own doc comment says the encode-side call site "does not exist yet" and it carries
+`#[allow(dead_code)]` -- true of the "production" `do_clone`-driven path. But the ACTUAL mechanism
+driving every `LITEBOX_PROCESS_FORK=1` child in this whole day's testing is a diagnostic/resume
+harness in the runner crate (`diag_process_fork_task_resume_probe` et al., visible on every stuck
+thread's own call stack, well below `run_thread_with_fork_verification`) which DOES correctly print
+`exiting with encoded status 0xc0de0000` (marker + exit code 0) for every child that reaches its own
+normal exit -- confirmed by grepping dozens of such lines in the decoded log, all for children other
+than xset. xset's own resume block has NO such line before "Killed", meaning it never reached its
+own exit path at all -- consistent with "genuinely still executing (blocked) when something else
+killed it", not "a normal exit misreported as a kill". This whole angle is a real, confirmed,
+still-relevant piece of dead code (worth fixing eventually so a FUTURE externally-killed child's real
+Linux exit code isn't lost), but not the live blocker here.
+
+**Second, independent repro (retry of the same script line, later child).** After `XVFB_FAILED`, the
+script proceeds (xrdb fails harmlessly, the runner's own logic then triggers `[process_fork_diag]
+globalstate-probe (child): rebuilding rootfs from OCI image ...` -- a full, all-cache-hit re-pull,
+real wall-clock cost even cached) and resumes at offset 19468 as winpid 4700, which hits the
+IDENTICAL WARN (`self_pid=4700 owner_pid=9964`) and then goes silent forever -- no `[s]` marker, no
+further `task-resume-probe` line, ever, for the rest of the observation window (20+ minutes). A fresh
+full `cdb -pv` sweep caught winpid 4700 in the EXACT SAME `sys_ppoll -> PollSet::wait -> commit_wait`
+stack as 17248 before it. This is strong evidence the stall is deterministic and tied to this exact
+script step (xset's cross-process connect to Xvfb), not a one-off.
+
+**Frame numbering, confirmed stable across both captures (for the next session's `dv`)**: `k` on the
+stuck thread consistently shows: 00 `ntdll!NtWaitForSingleObject`, 01 `KERNELBASE!WaitForSingleObjectEx`,
+02 `RawMutex::block_or_maybe_timeout`, 03 `impl$27::block_or_timeout`, 04 `commit_wait`, 05
+`wait_until`, 06 `PollSet::wait`, 07 `sys_ppoll::closure$1`, 08 `Task::sys_ppoll`. `.frame 06; dv /t
+/v` is where `self` (the `&mut PollSet`, whose `entries: Vec<PollEntry>` names every polled fd + its
+requested mask) should be readable.
+
+**Why the locals were still NOT captured this pass, despite two tries each on 17248 and on 4700.**
+Every follow-up `cdb -pv` attach (issued as a SEPARATE PowerShell/cdb invocation, seconds to ~1 minute
+after the sweep that found the thread) hit `Unable to examine process id <pid>, HRESULT 0x80004002`
+-- the process had already exited by the time the second command ran. Both 17248 and 4700 independently
+show the SAME pattern: alive and genuinely blocked in `ppoll` when swept, gone (not replaced by a
+further script step) within roughly 1-3 minutes of being caught. This means the stuck process is not
+eternally frozen -- something eventually reaps it -- but whatever SHOULD happen next in the script
+never does (no further `[s]` marker, no further `task-resume-probe`, ever, for the remainder of every
+observation window run this pass). **Concrete fix for next time**: combine discovery and locals
+inspection into ONE `cdb` invocation/command string (e.g. run `k;.frame 6;dv /t /v` against every
+thread of every candidate pid in the SAME dispatch as the sweep) rather than two separate `Invoke`s,
+to close this race entirely.
+
+**Static code review of the AF_UNIX rendezvous itself (`syscalls/unix.rs`): no bug found.**
+`SharedUnixConnectQueue::{post, has_pending, try_claim, complete, poll_result, cancel}`
+(lines ~3045-3160) read as a correct, simple atomic state machine (`REQ_EMPTY -> REQ_WRITING ->
+REQ_PENDING -> REQ_CLAIMED -> REQ_ACCEPTED -> REQ_EMPTY`), matched by `(kind, key)` via
+`PendingConnectRequest::matches`. `presence_kind_and_bytes`/`UnixSocketAddr::to_key`/
+`UnixBoundSocketAddr::to_key` are the SAME functions used on both the `listen()`-side insert
+(`unix.rs:263-270`) and the `connect_cross_process`-side lookup/post (`unix.rs:1360-1376`), so a
+key-encoding mismatch between listener and client is structurally ruled out, not just unobserved.
+`Backlog::check_io_events` (`unix.rs:449-467`) correctly falls through to `has_pending` only when the
+private same-process backlog is empty and not shut down, and `UnixStream::check_io_events`
+(`unix.rs:1590-1606`) correctly routes `Listen` state to it with a captured `GlobalStateHandle`
+(`listen.global`, set at `listen()` time) -- no missing-`global`-parameter gap either.
+`PollSet::wait`'s `has_unwakeable_fd` check (`epoll.rs:959-977`) correctly matches
+`EpollDescriptor::Unix(_)` unconditionally (any unix-socket fd, not just listeners), so the
+bounded-15ms-repoll path is taken and IS running for this fd, exactly as the eighteenth pass found.
+
+**Real gap found instead, NOT the confirmed live cause but a genuine bug on its own merits, NOT
+fixed this pass.** `wait_on_events_polling` (`unix.rs:2705-2746`, used by `connect_cross_process`'s
+own bounded wait) delegates to `litebox::event::polling::WaitContext::wait_on_events`
+(`litebox/src/event/polling.rs:49-84`), whose very first lines are `match try_op() { Err(TryOpError::
+TryAgain) if !nonblock => {} ret => return ret }`. For a NON-BLOCKING `connect()` (`nonblock ==
+true`), this returns immediately -- a single non-waiting check, no observer registration, no loop --
+the moment the connection hasn't ALREADY completed synchronously. `connect_cross_process`
+(`unix.rs:1354-1424`) posts into `unix_shared_connect_queue` unconditionally before this check, so
+the request DOES sit in the queue and the listener's `accept()` loop WILL eventually claim+complete
+it -- but the client's OWN `request_idx` is a plain local variable, stored nowhere on
+`self`/`UnixInitStream`, and is simply dropped once `connect_cross_process` returns
+`EINPROGRESS`-equivalent to the guest. `UnixInitStream::check_io_events`, reached via
+`UnixStream::check_io_events`'s `Init` arm (`unix.rs:1590-1602`), is a STATIC report (`OUT|HUP`,
+plus `IN` only if `read_shutdown`) that never touches `unix_shared_connect_queue` at all. So a
+subsequent `poll()`/`select()`/`ppoll()` on that same fd -- the normal POSIX pattern for a
+non-blocking connect (`connect()` once, then `poll()` for `POLLOUT`) -- can NEVER observe the
+connection actually completing; the socket is stuck reporting `Init`'s state forever, even once the
+real cross-process connection is sitting fully established in `unix_shared_conn_table`, unclaimed by
+anyone. **This is real and confirmed by code reading alone**, but NOT yet confirmed as xset's own
+specific mechanism: xset is old, simple Xlib-based `x11-utils` code, and Xlib's own connect path is
+BLOCKING by default, so this exact gap more plausibly explains a LATER, more modern, async-socket-
+based client (dbus client libraries, GTK/XFCE session components using non-blocking connects) than
+`xset` itself. Deliberately NOT fixed this pass -- the task's own stated methodology ("`dt`/`dv` the
+stuck thread's `PollSet` locals FIRST to identify the exact fd/direction before touching any code")
+was followed in spirit: the locals were sought repeatedly and genuinely, but the race described
+above prevented capturing them, and patching this specific gap without knowing whether it's even the
+right fd would be exactly the "patch blind" this project's own standing rules warn against elsewhere
+(`litebox/src/event/wait.rs:224`'s `unreachable!()`, same principle).
+
+**Ruled out, not a bug**: process `13448` (persistent since early boot, `StartTime` unchanged across
+many samples) is the `nginx_supervisor.sh` loop, legitimately blocked in `sys_wait4`'s "any child"
+path waiting on its own currently-alive supervised nginx child -- confirmed via its OWN full `cdb
+-pv -c "~*kb;qd"` thread dump (5 threads: main joining the guest thread, the `sys_wait4` blocker, a
+`net::wait_on_tun` background poll thread matching AGENTS.md's own established "innocent background
+infrastructure" finding, and two more sleep-loop watchdog threads). Processes `3220`/`15140` are
+`run_external_fault_watchdog_child` -- single-thread host-side crash watchdogs, not guest execution
+at all, not relevant to this investigation.
+
+**Open question flagged for next session, not chased further this pass due to time**: once a `ppoll`-
+stuck child IS eventually reaped (confirmed it does happen, just later than expected), NOTHING
+continues the boot script afterward in any run observed this pass -- log stays frozen indefinitely
+past that point, no new `task-resume-probe`/`[s]` line ever appears again. This could be (a) a
+genuinely separate bug in the resume/continuation chain that drops the next script step specifically
+when a child is externally-timed-out rather than exiting via its own normal path, or (b) simply that
+NOTHING in this specific script continues past a failed `xset q` besides `xrdb`+`dbus-launch`, and
+one of THOSE is itself independently stuck on the exact same non-blocking-connect gap described
+above (dbus client libraries are prime non-blocking-connect suspects) -- these two explanations are
+not mutually exclusive and either would look identical from the outside (silence forever). Next
+session's very first move should be exactly what this pass's own methodology called for and could
+not quite land: catch a fresh stuck thread and read `PollSet::wait`'s `entries` in the SAME cdb
+dispatch that found it, before it can self-terminate out from under a second attach.
+
+**Live evidence artifacts this pass** (gitignored, `.wfgy/`, not committed): `.wfgy/
+repro_debug_ppoll_stall.ps1` (ready-to-rerun launch script), `.wfgy/debug_ppoll_stall_boot.log`
+(UTF-16, decode with `iconv -f UTF-16LE -t UTF-8`), `.wfgy/cdb_17248.log`/`cdb_4700.log` (initial
+sweeps showing the stuck stack), `.wfgy/cdb4_13448.log` (nginx-supervisor full dump ruling it out).
+
+**Host state at end of pass**: all `litebox_runner_linux_on_windows_userland.exe` processes started
+this pass were killed (`Stop-Process -Force`); host free memory ~6.35 GB of ~15.2 GB total,
+consistent with the ~6.5 GB free measured at the start of this pass (no leak from this session's own
+activity).

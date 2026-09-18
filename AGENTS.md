@@ -101,124 +101,121 @@ unsanitizable `fs_base`/context. The old unconditional-by-`comm`-name refusal fo
 everything else. On a real `debian-xfce` boot the only remaining blocking kind is `unix-socket` — 5
 refused forks of 34, down from 34/34 (pre-twelfth-pass baseline). Per-kind deviations: archive.
 
-**Per-fork cost** was ~3.5-5s, now ~1.2s; a full `webtop_stack.sh` boot reaches `NGINX_STARTED` in
-under a minute versus never in 15+. Older cost explanations were measured wrong. Use
-`LITEBOX_DIAG_FORK_TIMING=1` for the next cost question. Three correctness bugs fixed; detail: archive.
+**Per-fork cost** was ~3.5-5s, now ~1.2s; `NGINX_STARTED` in under a minute versus never in 15+.
+Use `LITEBOX_DIAG_FORK_TIMING=1` for the next cost question.
 
-**Still open**: nginx's own SSL-cert generation fails on its first real startup attempt — the original
-symptom this investigation began from, genuinely not root-caused (`docs/track-b-fork-fix-progress.md:
-146-152`). The TOP-LEVEL parent's curl-self-test stall (`sys_wait4(pid=-1)` not checking
-`cross_process_children`) is fixed (`6e86a40`) — do not cite that one as open.
+**Still open**: nginx's own SSL-cert generation fails on its first real startup attempt — the
+original symptom this investigation began from, genuinely not root-caused
+(`docs/track-b-fork-fix-progress.md:146-152`).
 
-**The nginx-self-test pipe-EOF wedge (fourth pass, 2026-09-17) — CONFIRMED and FIXED.** Root
-cause: broad `bInheritHandles=TRUE` leaked a sibling fork child's inheritable bridge-pipe handle
-into unrelated children racing the same window. Fix: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit
-per-call handle allow-list (`process_fork.rs`, `spawn_suspended_impl`). Live-verified. Archive.
-
-**`Network::socket_set` made shared-arena-native (eighth pass)**: fixed a `tuple.unwrap()` panic via
-a 256-slot (`MAX_SOCKETS`) fixed array in the shared kernel arena instead of a private-heap `Vec`.
-A/B-confirmed (ninth pass): old binary crash-loops 8x on it, new binary zero. Archive.
-
-**Post-`NGINX_STARTED` CPU livelock — ROOT-CAUSED and FIXED (tenth pass, 2026-09-17).** A thread
-burning 100% of a core forever inside `LocalPortAllocator::ephemeral_port`/`deallocate`
-(`hashbrown` SIMD probe on a `HashMap` whose backing table is private-per-process-heap, meaningless
-to an attaching fork child). Fixed: converted to a fixed pointer-free `[u16; 65535]` array
-(`litebox/src/net/local_ports.rs`); a second instance (`closing_in_background`, same mechanism)
-converted the same way (`litebox/src/net/mod.rs`). `interface`/`queued_for_closure` remain open.
-Verified clean build + 25 net unit tests + two live re-runs, livelock confirmed gone. Detail: `docs/
-AGENTS_ARCHIVE_2026-09-17.md`.
-
-**Poison-on-dead-holder scheme for `Network` — DESIGNED, IMPLEMENTED, LIVE-VERIFIED (eleventh
-pass).** `RawMutex` gained a `poisoned: AtomicBool`; `GlobalStateHandle::net_lock`
-opts in via `lock_recovering_poison()`, and on poison `Network::reset_after_poisoning`
-wholesale-resets `socket_set`/`closing_in_background`/`queued_for_closure`/`local_port_allocator`
-(`SocketHandle` has no generation counter, so wiping every field is the only way to tell stale
-from live). Also fixed the same pass: a removed `Socket`'s normal `Drop` freed its RX/TX ring
-`Vec`s through the CURRENT process's allocator on a pointer naming a dead process's private heap —
-fixed via `core::mem::forget` (that memory was never this process's to free). Five live
-`LITEBOX_PROCESS_FORK=1` boots: real dead-holder-recovery fired live, zero panic-cascade; furthest
-reached `SELKIES_PORT_UP`+`DE_LAUNCHED` with one disclosed non-fatal residual panic. Did NOT reach
-the browser/terminal/apps milestone — attributed then to the Xvfb/dbus by-name exclusion, now
-superseded by the twelfth-pass entry below. Detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+**Passes 4-11 (2026-09-17), all FIXED and live-verified, full narrative in the 09-17 archive**:
+(4) nginx-self-test pipe-EOF wedge — broad `bInheritHandles=TRUE` leaked a sibling fork child's
+bridge-pipe handle; fixed via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit handle allow-list. (8)
+`Network::socket_set` made shared-arena-native (256-slot fixed array, was a `tuple.unwrap()` panic
+via a private-heap `Vec`). (10) post-`NGINX_STARTED` CPU livelock — `LocalPortAllocator`
+hashbrown-SIMD-on-dead-heap; converted to a fixed `[u16; 65535]` array (`local_ports.rs`);
+`closing_in_background` converted the same way. `interface`/`queued_for_closure` remain open. (11)
+poison-on-dead-holder scheme for `Network` — `RawMutex` gained `poisoned: AtomicBool`,
+`Network::reset_after_poisoning` wholesale-resets on poison; a removed `Socket`'s `Drop` freeing
+another process's heap via its RX/TX ring `Vec`s fixed via `core::mem::forget`.
 
 **Twelfth pass**: by-name `Xvfb`/`dbus-daemon` cross-process-fork exclusion relaxed — both now
-cross-process-fork for real. `XVFB_FAILED`/`DBUS_FAILED` root cause named: `unix_addr_table`'s
-`Backlog`/`Channel` connection DATA still per-process-heap — closed thirteenth/sixteenth pass (see
-below; the actual remaining blocker turned out to be script-level, not this). Separately:
-`SafeZoneAllocator::dealloc`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) live-caught
-spinning forever, no dead-holder recovery unlike `RawMutex` — **still open**. Detail: archive.
+cross-process-fork for real. `SafeZoneAllocator::dealloc`'s `spin::mutex::SpinMutex`
+(`litebox/src/mm/allocator.rs`), live-caught spinning forever with no dead-holder recovery unlike
+`RawMutex` — **still open**.
 
-**Fork-after-Xorg PERMANENT freeze** — did NOT reproduce 2026-09-17 under `LITEBOX_PROCESS_FORK=1`
-(thread-based-fork-only issue), clean 2/2. Evidence, plus a disclosed ENOMEM finding: archive.
+**Thirteenth pass, 2026-09-18** — shared cross-process AF_UNIX connection data plane DESIGNED and
+IMPLEMENTED (`SharedUnixConnTable`/`SharedUnixConnectQueue`, `syscalls/unix.rs`'s module doc has
+the full design); three real bugs found+fixed along the way.
 
-**Thirteenth pass, 2026-09-18 — shared cross-process AF_UNIX connection data plane DESIGNED and
-IMPLEMENTED** (`SharedUnixConnTable`/`SharedUnixConnectQueue`, `syscalls/unix.rs`'s module doc has
-the full design); three real bugs found+fixed along the way. Full narrative: archive.
+**Fourteenth/fifteenth passes, 2026-09-18.** Isolated AF_UNIX repro PASSED clean; the full-boot
+stall's first theory (`wait_on_tun` two-holder deadlock) was WRONG (symbol-resolution noise, trust
+only small offsets). Real root cause: a smoltcp stale-`SocketHandle` panic killed `net_worker`
+threads platform-wide. FIXED via `catch_unwind` + `force_reset_network_after_panic()`.
 
-**Fourteenth/fifteenth passes, 2026-09-18 (detail: archive).** Isolated AF_UNIX repro PASSED
-clean; the full-boot stall's first theory (`wait_on_tun` two-holder deadlock) was WRONG (symbol-
-resolution noise, trust only small offsets — a lesson re-confirmed the eighteenth pass, above).
-Real root cause: a smoltcp stale-`SocketHandle` panic killed `net_worker` threads platform-wide.
-FIXED: `catch_unwind` + `force_reset_network_after_panic()` around `net_worker` plus
-`Network::socket_set_contains` guarding every re-touch site. Live-verified, panic signature gone.
+**Sixteenth pass** — `.wfgy/webtop_stack.sh`'s `[ -S "$XSOCK" ]` readiness check can never be true
+on this shim (no `Socket` `FileType` variant), burning its full 60s every boot. Fixed: `-S` → `-e`.
 
-**Sixteenth pass, 2026-09-18 — the "60s XSOCK timeout killed the shared-queue mechanism" theory
-REFUTED; real bug was the script's OWN new readiness check; FIXED and live-verified.**
-`.wfgy/webtop_stack.sh`'s `[ -S "$XSOCK" ]` readiness check can **never** be true here (no
-`Socket` `FileType` variant on this shim), so it burned its full 60s every boot regardless of
-Xvfb's real state. **Fix**: `-S` → `-e`. **Live-verified**: `xset` now connects within the first
-real second, boot reaches stable `HOLD`, zero panics/stalls. A second, then-unroot-caused `xset`
-kill sat immediately past this fix — see seventeenth pass. Full evidence: archive.
-
-**Seventeenth pass, 2026-09-18 — `xset q`'s silent kill: CAUGHT LIVE, root-caused, and FIXED**
-(`memfds`/`shared_files`, SEVENTH/EIGHTH instance of the BTreeMap-in-shared-arena defect;
-`GlobalStateHandle` carries fresh-per-process copies). Live-verified twice, zero panics. A
-different, deeper stall immediately past it was left unresolved with two disagreeing, unreliable
-`cdb` symbol reads on the release binary -- see eighteenth pass below, which builds the tool this
-pass was missing and resolves it. Full seventeenth-pass narrative: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**Seventeenth pass** — `xset q`'s silent kill CAUGHT LIVE and FIXED (`memfds`/`shared_files`,
+seventh/eighth instance of the BTreeMap-in-shared-arena defect; `GlobalStateHandle` now carries
+fresh-per-process copies). Live-verified twice, zero panics. Full pass 4-17 narratives: `docs/
+AGENTS_ARCHIVE_2026-09-17.md` and `_2026-09-18.md`.
 
 **Eighteenth pass, 2026-09-18 -- systematic `GlobalState` field audit (3 more defects fixed), a
-debug build for reliable `cdb` symbols (see standing lessons above), and an unambiguous read on
-the post-xset stall (detail: archive).** Audit fixed `unix_addr_table`/`fifo_registry` (both per
-their own doc comments always meant to be per-process-private, shadowed onto `GlobalStateHandle`
-like `elf_patch_cache`) and `sysv_shm` (genuinely cross-process for X11 MIT-SHM, redesigned as a
-fixed 128-slot pointer-free array, `SysvShmSegment` already fully `Copy`). Still open, same
-defect, deeper redesign needed (non-POD payload): `pty_registry`/`daemon_pty_masters`/
-`flock_registry`/`drm`/`evdev` (pickup list). `bootstrap_process` audited and is plausibly already
-safe (set once, pre-fork) -- left as-is. **The post-xset stall**: a clean debug-binary `cdb -pv`
-snapshot (7 threads, zero inlining/folding) REFUTES both prior candidate theories -- `net::
-wait_on_tun` and `NatGateway::new` are both innocent, ordinary background threads (the
-per-fork-child `net_worker` poll loop and the gateway's own retry closure), not the blocking site.
-**The real blocked thread**: a guest `ppoll()` (`sys_ppoll` -> `PollSet::wait` ->
-`WaitContext::commit_wait` -> `RawMutex::block_or_maybe_timeout`), genuinely parked on a
-`Condvar`. `PollSet::wait` already has the seventeenth-pass AF_UNIX bounded-15ms-repoll fix and IS
-running (small-but-nonzero CPU, not a true freeze) -- but the readiness condition it polls for
-(`Backlog::check_io_events`'s `unix_shared_connect_queue.has_pending(...)`, looked correct on
-inspection) never flips true. Not yet fully root-caused: next session, reproduce again and
-`dt`/`dv` the stuck thread's `PollSet`
-locals FIRST to identify the exact fd/direction before touching any code. Full narrative + cdb
-transcript: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+debug build for reliable `cdb` symbols, an unambiguous read on the post-xset stall (detail:
+archive).** Fixed `unix_addr_table`/`fifo_registry` (per-process-private, shadowed) and `sysv_shm`
+(fixed 128-slot array). Still open, deeper redesign needed: `pty_registry`/`daemon_pty_masters`/
+`flock_registry`/`drm`/`evdev` (pickup list). Found the real blocked thread: guest `ppoll()`
+(`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`), parked on a
+Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` never flips true.
+
+**Nineteenth pass, 2026-09-18 -- live repro of the ppoll stall (twice, debug binary, direct `cdb
+-pv` thread-stack evidence), `has_pending`/queue logic REFUTED as the bug, one real structural gap
+found and NOT yet fixed (detail: archive).** Booted `.wfgy/webtop_stack.sh` under
+`LITEBOX_PROCESS_FORK=1` + debug binary twice; both times independently reproduced the identical
+`sys_ppoll -> PollSet::wait -> commit_wait` stack via non-invasive `cdb -pv` on the live guest
+process (winpid 17248, then its retry winpid 4700), confirming the eighteenth-pass read is real
+and repeatable, not a one-off. **Identity established**: `task.pid.get()` (used as `self_pid`/
+`owner_pid` in the `unix_addr_presence`/`[unix_addr_presence]` WARN) IS the real Windows PID for a
+`LITEBOX_PROCESS_FORK=1` child -- `owner_pid=9964` in the log directly correlates to Xvfb's own
+host process (confirmed via its `task-resume-probe` resume offset, 16877, matching the script's
+own `Xvfb ... &` launch line). The connecting client both times was `xset q` (script offset
+19289/19468). **`SharedUnixConnectQueue`/`has_pending`/`try_claim`/`complete` code-reviewed
+line-by-line: structurally sound** -- no bug found in the matching/claiming logic itself, and
+`presence_kind_and_bytes`/`to_key()` produce identical keys on both the `listen()`-side insert and
+the `connect_cross_process`-side lookup, so a key-encoding mismatch is also ruled out.
+**Real gap found (confirmed via `wait_on_events_polling`/`polling.rs:60-63`'s own nonblock
+short-circuit): a NON-BLOCKING cross-process `connect()` that doesn't complete synchronously posts
+into `unix_shared_connect_queue` and returns `EINPROGRESS`-equivalent immediately, but the
+`request_idx` is never stored anywhere on the socket, and `UnixInitStream::check_io_events` (the
+`Init`-state arm, `syscalls/unix.rs` around line 1590-1602) is a static `OUT|HUP` report that never
+re-checks `unix_shared_connect_queue.poll_result()` -- so a later `poll()`/`select()`/`ppoll()` on
+that same fd can NEVER observe the connection actually completing.** This is real and confirmed by
+code reading, but NOT yet confirmed as THE mechanism behind xset's own stall specifically (xset's
+Xlib connect is very likely blocking, not non-blocking, so this gap more plausibly explains a
+LATER dbus/xfce4-session-class client than xset itself) -- **not fixed this pass, deliberately**:
+repeated attempts to catch the exact stuck thread's `PollSet` `entries` (fd/mask) via a second,
+immediate follow-up `cdb -pv` call raced the process's own teardown every time (it reliably
+self-terminates within 1-3 minutes of being caught, before a second attach could complete) so the
+"which fd/direction" question named by the eighteenth pass is STILL not conclusively answered --
+see the pickup list below for the precise next step. Separately ruled out: `13448` (nginx
+supervisor, blocked in a legitimate wait4 on its live-nginx child -- not a bug) and the
+`decode_cross_process_wait_status`/`CROSS_PROCESS_EXIT_MARKER` dead-code path (real dead code, but
+NOT the live cause here -- the diagnostic `task-resume-probe` harness already encodes
+`0xc0de0000` correctly on every NORMAL child exit; xset's "Killed" report is consistent with it
+never reaching its own exit path at all, i.e. genuinely still running when killed, not a
+misreported normal exit). Full cdb transcripts + timeline: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(-2) ~~root-cause `net::wait_on_tun`/`with_fork_duplicate_claim_owner`~~ — REFUTED, fifteenth
-pass: structurally can't deadlock; real mechanism was the smoltcp stale-`SocketHandle` panic, now
-FIXED (above) -- a confirmation run reached stable `HOLD` (559 forks, zero panics); a second stall
-elsewhere did not reproduce a third time, consistent with that area being genuinely probabilistic;
-not re-prioritized unless it recurs. ~~The browser
-milestone is blocked by `unix_addr_table`'s connection-DATA sharing for Xvfb's socket~~ — REFUTED,
-sixteenth pass: the "60s timeout killed both `Xvfb` and `xset`" symptom was `webtop_stack.sh`'s own
-`-S`-on-an-unsupported-file-type bug (now FIXED, above), not the shared-queue mechanism, which never
-even got a fair chance to run before this fix. ~~The browser milestone is blocked by a fatal kill
-of `xset`~~ — ROOT-CAUSED and FIXED, seventeenth pass (`memfds`/`shared_files`, see above); 2/2
-live-verified clean. ~~The stall past `xset` is in `connect_cross_process`'s rendezvous or
-`net::wait_on_tun`/`NatGateway::new`~~ — REFUTED, eighteenth pass: a clean debug-binary `cdb` read
-showed both are innocent background threads; **the browser milestone is now blocked by a guest
-`ppoll()` (`sys_ppoll` -> `PollSet::wait` -> `RawMutex::block_or_maybe_timeout`) whose AF_UNIX
-bounded-15ms-repoll runs but never observes the awaited readiness flip true** — see the
-eighteenth-pass entry above for the exact next step (`dt`/`dv` the stuck thread's `PollSet`
-locals to identify the fd before touching any code). Full evidence: `docs/
-AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through eighteenth passes.
+(-2) ~~root-cause `net::wait_on_tun`~~ — REFUTED, fifteenth pass (smoltcp panic, FIXED). ~~blocked
+by `unix_addr_table`'s connection-DATA sharing~~ — REFUTED, sixteenth pass (`-S`/`-e` script bug,
+FIXED). ~~blocked by a fatal kill of `xset`~~ — ROOT-CAUSED and FIXED, seventeenth pass
+(`memfds`/`shared_files`). ~~stall past `xset` is in `connect_cross_process`'s rendezvous or
+`net::wait_on_tun`/`NatGateway::new`~~ — REFUTED, eighteenth pass (both innocent background
+threads). ~~the `has_pending`/`SharedUnixConnectQueue` matching logic itself is buggy~~ — REFUTED,
+nineteenth pass (line-by-line review found it structurally sound; live-reproduced the identical
+stall twice with fresh, independent `cdb` evidence). **Current best lead, NOT yet fixed**: a
+non-blocking cross-process `connect()` that returns `EINPROGRESS` never stores its
+`unix_shared_connect_queue` `request_idx` anywhere, and `UnixInitStream::check_io_events`
+(`syscalls/unix.rs` ~1590) is a static `OUT|HUP` report that never re-polls the queue for
+completion -- confirmed by code reading (`wait_on_events_polling`'s nonblock short-circuit,
+`polling.rs:60-63`), NOT yet confirmed live as xset's own specific mechanism (xset's own connect is
+likely blocking) nor fixed. **Precise next step**: reproduce once more (`.wfgy/
+repro_debug_ppoll_stall.ps1` is the ready-to-run launch script, debug binary + `LITEBOX_
+PROCESS_FORK=1` + `.wfgy/webtop_stack.sh` via `--resume-from .wfgy/webtop_seed.tar`), and as SOON
+as a process shows the `sys_ppoll -> PollSet::wait -> commit_wait` stack via a `cdb -pv -p <pid> -y
+target\debug -c "~*kb;qd"` sweep, IMMEDIATELY (same breath, no gap -- the process reliably
+self-terminates within 1-3 minutes of being caught) re-attach and dump `.frame 6;dv /t /v` (frame
+index confirmed stable across two independent captures: 00 ntdll, 01 KERNELBASE, 02
+`RawMutex::block_or_maybe_timeout`, 03 `block_or_timeout`, 04 `commit_wait`, 05 `wait_until`, 06
+`PollSet::wait`, 07 `sys_ppoll::closure$1`, 08 `Task::sys_ppoll`) to read `self.entries` (fd list +
+requested mask) -- this is the one piece of evidence still missing. Separately: once a process gets
+reaped after being caught stuck, NOTHING continues the boot script afterward (observed: log frozen
+indefinitely, no new `task-resume-probe` lines, no `[s]` markers) -- worth checking next session
+whether the resume/continuation chain itself drops the next script step when a child is
+externally-timed-out rather than exiting normally. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`,
+fifteenth through nineteenth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
@@ -323,57 +320,31 @@ address/TID-based wait is process-local (`WaitOnAddress`, keyed events, `NtAlert
 ACCESS_DENIED); only a shared kernel object crosses processes — `RawMutex` (below) is the one that
 matters; `xproc_sync.rs`'s named-event primitive is live-verified but still unwired.
 
-## Cross-process-capable `RawMutex` -- done, live-verified (detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`)
+## Shared-memory foundations -- all DONE, live-verified 2026-09-16/17 (detail: those two archives)
 
-`RawMutex` no longer calls `WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) -- manual
+`RawMutex`: no longer calls `WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) -- manual
 wait queue + one auto-reset kernel `Event` per OS thread, cross-process half real
-(`DuplicateHandle`-based). Live-verified under real multithreaded contention, no hang/deadlock.
-
-## Shared kernel heap -- selective-routing correction landed (detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`)
-
-`SLAB_ALLOC` stayed on the private per-process `VirtualAlloc2` path (routing everything through one
-shared bump allocator exhausted an 8 GiB pool in 45-90 execs); the fixed-base/handle-inherit
-machinery instead backs a small **64 MiB, standalone, bounded** `shared_kernel_arena_alloc`
-(`lib.rs`), NOT wired to `GlobalAlloc`, reserved for `LiteBoxX`/`GlobalState` placement only.
-
-### `SharedArc<T>` and real `GlobalState` create-vs-attach -- DONE 2026-09-17; does NOT close XVFB_FAILED/DBUS_FAILED (detail: archive)
-
-Hand-rolled `SharedArc<T>` places `value`+`strong: AtomicUsize` in the 64 MiB arena;
-`SharedKernelStateProvider` gives `LinuxShimBuilder::build` a real attach-or-create branch.
-**Root cause precisely characterized**: `SharedArc::new` shares only `T`'s literal inline bytes --
-every `GlobalState` REGISTRY was a `BTreeMap`/similar whose NODES live on the private per-process
-heap, meaningless to an attaching process. PRD: `globalstate-nested-collections-not-actually-
-shared`. Of the original list (`unix_addr_table`, `pty_registry`, `daemon_pty_masters`,
-`flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`, `shared_files`): `unix_addr_table`/
-`fifo_registry`/`memfds`/`shared_files` are now per-process-shadowed on `GlobalStateHandle`,
-`sysv_shm` is now a real shared-arena-native fixed array -- see the eighteenth-pass entry above
-and the seventeenth-pass one. `pty_registry`/`daemon_pty_masters`/`flock_registry` remain open
-(pickup list).
-
-## `unix_addr_table` presence sharing -- landed 2026-09-17 (real blocker was elsewhere; detail: archive)
-
-`SharedUnixAddrPresenceTable` (`syscalls/unix.rs`): fixed-256-slot, pure-atomic, lock-free
-`(kind, key bytes<=108, owner pid)` side-index mirrored alongside each process's real
-`unix_addr_table` `BTreeMap`. **The reusable flat-table PATTERN** the connection-DATA layer
-(below) and `sysv_shm` (eighteenth pass) reused next.
-
-## Cross-process fork: twelve registry/pointer/lock fixes, landed 2026-09-17 (detail: archive)
-
-Root pattern (11 of 12): a raw `Arc`/`Box` pointer frozen into cross-process-shared bytes by
-whichever process constructs `GlobalState` first, dangling in every attaching process -- fixed by
-per-process-copy shadowing, a locking accessor (`net_lock`, `pipes()`), or a fixed-slot
-pointer-free array. Instance 12 (`net_lock` left locked by an exiting fork-child) was a
-lock-liveness gap, fixed via `RawMutex` owner-death recovery (below).
-
-## RawMutex lost-wakeup, Pipes stale-pointer, FutexManager sharing gap, lock-orphaning -- ALL FOUR FIXED 2026-09-17 (detail: archive)
-
-(A) `RawMutex::resolve_waiter_event`'s cross-process branch panicked on a stale pid -- `waiters` is
-now a fixed-32-slot pointer-free `WaiterQueue`. (B) `Pipes.litebox`'s stale pointer crashed a
-killed fork child's stdio teardown -- rebound via `GlobalStateHandle::pipes()`. (C) `FutexManager`
-cross-process sharing hung on stack-allocated `LoanList` entries -- each process gets its own fresh
-`FutexManager`. (D) A cross-process-fork child's un-shutdown `net_worker` could be killed
-mid-hold of `net_lock` -- fixed with `RawMutex` owner-death recovery. `SafeZoneAllocator::alloc`'s
-spinlock livelock (distinct from D, still open) was live-caught in the twelfth pass, above.
+(`DuplicateHandle`-based); gained `poisoned: AtomicBool` + owner-death recovery (eleventh pass,
+above); `resolve_waiter_event`'s stale-pid panic fixed via a fixed-32-slot pointer-free
+`WaiterQueue`. Shared kernel heap: a small **64 MiB, standalone, bounded**
+`shared_kernel_arena_alloc` (`lib.rs`, NOT wired to `GlobalAlloc`) backs `SharedArc<T>`
+(`value`+`strong: AtomicUsize`) for `LiteBoxX`/`GlobalState` placement; `SLAB_ALLOC` stays on the
+private per-process path (a shared bump allocator exhausted an 8 GiB pool in 45-90 execs).
+**Root cause of the whole `GlobalState`-sharing class, precisely characterized**: `SharedArc::new`
+shares only `T`'s literal inline bytes -- any REGISTRY that was a `BTreeMap`/similar has its NODES
+on the private per-process heap, meaningless to an attaching process (PRD:
+`globalstate-nested-collections-not-actually-shared`). Of the original list (`unix_addr_table`,
+`pty_registry`, `daemon_pty_masters`, `flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`,
+`shared_files`): `unix_addr_table`/`fifo_registry`/`memfds`/`shared_files` are now
+per-process-shadowed on `GlobalStateHandle`, `sysv_shm` is a real shared-arena-native fixed array.
+`pty_registry`/`daemon_pty_masters`/`flock_registry` remain open (pickup list).
+`SharedUnixAddrPresenceTable` (`syscalls/unix.rs`) established the reusable flat-table PATTERN
+(`sysv_shm` and the AF_UNIX connection-DATA layer both reused it next): fixed-256-slot,
+pure-atomic, lock-free `(kind, key bytes<=108, owner pid)` side-index. `Pipes.litebox`'s stale
+pointer (fixed via `GlobalStateHandle::pipes()`) and `FutexManager`'s stack-allocated `LoanList`
+sharing hang (fixed: each process gets its own fresh `FutexManager`) were two more instances of
+the same raw-pointer-frozen-into-shared-bytes root pattern. `SafeZoneAllocator::alloc`'s spinlock
+livelock (distinct mechanism, no dead-holder recovery unlike `RawMutex`) is still open.
 
 ## Closed — do not re-attempt without a genuinely new approach
 
@@ -386,10 +357,11 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-18th passes: Xvfb/dbus relaxed; shared
+- **Archives** (newest first) — `_2026-09-18.md` (12th-19th passes: Xvfb/dbus relaxed; shared
   AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
   `-S`/`-e` script bug FIXED; `xset` silent kill CAUGHT LIVE + FIXED; GlobalState field audit +
-  debug binary + unambiguous stall read), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  debug binary + unambiguous stall read; live cdb repro of the ppoll stall twice, has_pending
+  REFUTED, non-blocking-connect `Init`-state gap found), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:
