@@ -417,3 +417,103 @@ syscalls/unix.rs`) with the same kind of direct pid/path logging used for the fo
 run this EXACT full-boot repro (not another isolated probe -- the isolated repro already passed and
 does not reproduce this), and find where Xvfb's specific listener socket path diverges from the
 probe's own connect/accept sequence.
+
+## Sixteenth pass, 2026-09-18 -- the "60s XSOCK timeout killed the shared-queue mechanism" theory
+REFUTED; real bug was the boot script's own new readiness check; FIXED and live-verified; a SECOND,
+different, not-yet-root-caused `xset` kill found immediately past it
+
+**Followed the fifteenth pass's own concrete next step, and found something upstream of it
+instead.** Before instrumenting `connect_cross_process` itself, re-read `.wfgy/webtop_stack.sh`'s
+own wait loop (lines 274-280 as of the fifteenth pass) that gates the `xset q` liveness probe:
+
+```
+XSOCK="/tmp/.X11-unix/X${DISPLAY#:}"
+i=0
+while [ $i -lt 60 ]; do
+  [ -S "$XSOCK" ] && break
+  i=$((i+1)); sleep 1
+done
+xset q > /dev/null 2>&1 && echo "[s] XVFB_UP" || echo "[s] XVFB_FAILED"
+```
+
+`[ -S ... ]` is a POSIX socket-file-TYPE test. Checked the filesystem layer with no hypothesis
+involved: `litebox::fs::FileType` (`litebox/src/fs/mod.rs:271-278`) enumerates exactly
+`RegularFile`/`Directory`/`CharacterDevice`/`Symlink`/`Fifo` -- there is no `Socket` variant at
+all. `UnixSocketAddr::bind`'s server-side path-creation branch (`litebox_shim_linux/src/
+syscalls/unix.rs:107-140`) calls `fs.open(path, OFlags::CREAT|EXCL|RDWR, mode)` -- an ORDINARY
+regular-file create, with its own `// TODO: extend fs to support creating sock file (i.e., with
+type InodeType::Socket)` comment sitting right there disclosing the gap. `sys_mknodat`
+(`litebox_shim_linux/src/syscalls/file.rs:1181-1185`) confirms independently: `InodeType::Socket
+| InodeType::BlockDevice | InodeType::CharDevice | InodeType::Dir => return Err(Errno::EPERM)`,
+with its own `// TODO: socket, block and char files are not supported` comment. So `lstat()` on
+ANY litebox-bound AF_UNIX path reports `S_IFREG`, never `S_IFSOCK` -- structurally, unconditionally,
+regardless of whether Xvfb is genuinely listening. `-S "$XSOCK"` can never be true.
+
+**This readiness check is brand new, added THIS SAME DAY** (its own comment block, lines 257-273,
+says so explicitly): it replaced a `while ...; do xset q ...; done` retry loop specifically to stop
+re-exec'ing `xset` up to 60 times per boot (a thread-based-fork tcache-corruption concern from
+before Xvfb/dbus-daemon's by-name cross-process-fork exclusion was relaxed, twelfth pass). So the
+fourteenth/fifteenth passes' own "60s XSOCK poll loop gave up and killed both Xvfb and the pending
+`xset q`" read was real (that IS what the log showed) but mis-attributed the STALL to the shared-
+queue rendezvous mechanism (`SharedUnixConnTable`/`SharedUnixConnectQueue`) never resolving in time
+-- the mechanism never even got a fair chance to run before this fix, because the loop unconditionally
+burned its whole 60s on every single boot first, every time, regardless of Xvfb's real state.
+
+**Fix**: changed `[ -S "$XSOCK" ]` to `[ -e "$XSOCK" ]` in `.wfgy/webtop_stack.sh` -- mere path
+existence is the one thing `bind()`'s `CREAT|EXCL` actually guarantees once Xvfb has bound the
+address, and `-e` is still a bash builtin (zero forks while waiting, preserving the exact property
+the `-S` optimization was going for). Safe to drop the exec-avoidance concern that motivated `-S`
+in the first place: this session already runs under `LITEBOX_PROCESS_FORK=1` (real cross-process
+fork, not the thread-based/relocating path the corruption class needs) with the global
+`GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0` export already covering every
+future exec'd process regardless.
+
+**Live-verified**, fresh HEAD binary (`30e0022`) + `LITEBOX_PROCESS_FORK=1` +
+`.wfgy/webtop_stack.sh` with the fix, `--oci-image docker.io/linuxserver/webtop:debian-xfce
+--resume-from .wfgy/webtop_seed.tar` (seed tar regenerated from the fixed script; the old one is
+kept as `.wfgy/webtop_seed_stale.tar`): the Xvfb stage's `xset` connect attempt happened well inside
+the first real second (`0.666113000s WARN ... self_pid=19484 owner_pid=8040` -- a genuinely
+DIFFERENT pid, confirming real cross-process fork, not the old thread-based path), never burning
+the dead 60s wait at all. The boot then progressed through the SAME known-good trajectory as the
+fifteenth pass's best run: `SELKIES_SUPERVISOR` respawned and gave up after 30 attempts (root cause
+directly visible in-line: `/tmp/selkies_supervisor.sh: 19: cannot open /tmp/empty: No such file` --
+the ALREADY-TRACKED `/tmp/empty` writable-layer cross-child-visibility gap, Track B pickup (3), not
+a new regression) -> `SELKIES_PORT_SELFTEST_FAILED after 170s` -> `DE_LAUNCHED (image startwm.sh)`
+-> `DE_VIA_STARTWM=no` -> `DE_FALLBACK_LAUNCHED` -> `DE_FAILED` -> stable `[s] HOLD t=20s`+ with zero
+panics and zero permanent stall. `Invoke-WebRequest http://127.0.0.1:8080/` still timed out (nginx
+has nothing real to proxy while selkies never successfully starts) -- browser milestone NOT reached
+this pass.
+
+**A SECOND, different, NOT-YET-ROOT-CAUSED blocker sits immediately past this fix.** The exact same
+`/webtop_stack.sh: line 290:   149 Killed                  xset q > /dev/null 2>&1` signature the
+fourteenth/fifteenth passes already saw (and `docs/AGENTS_ARCHIVE_2026-09-17.md:2229` saw even
+earlier, when Xvfb/dbus/xset were still thread-based-fork-only) still fires -- but now, immediately
+after a WARN that proves `xset` genuinely cross-process-forked into a different OS process
+(`self_pid=19484`), not the thread-based path the 09-17 archive blamed. Unlike every OTHER forked
+child visible in the same log (which each show `run_thread returned (guest thread terminated)` ->
+`exported writable layer to ...` -> `exiting with encoded status 0xc0deNNNN`), pid 19484's own
+sequence stops dead right after the WARN and the `[diag-proc-sys-open-miss]` line -- no exit
+diagnostic at all. litebox's own ungated fault machinery (`RECENT_FAULTS`/`RECOVERY_LOG`/minidump,
+ordinarily unconditional per this file's "Host-side crash machinery" section) logged NOTHING for
+this event either, which argues against (but does not fully rule out) a host `0xC0000005`-class VEH
+-caught fault of the kind that machinery already catches. Grepped the full log for `panic`/
+`0xC0000005`/`WER`/`abort` around this exact point: nothing. **Not root-caused this pass** -- a
+one-shot, ~1-second-lived forked child is hard to catch with a debugger after the fact; the
+concrete next step is either (a) a deliberate short `sleep` shim placed in front of the real `xset`
+binary (e.g. a wrapper script substituted via `PATH`, mirroring the existing `dbus-launch` shim
+technique already used elsewhere in this same script) so `cdb -pv` can attach BEFORE the kill, or
+(b) direct temporary logging inside `connect_cross_process`/`wait_on_events_polling`
+(`litebox_shim_linux/src/syscalls/unix.rs`) bracketing every real syscall it performs, since the
+WARN's own `self_pid` matches the killed pid exactly, meaning the fatal event happens somewhere
+inside or immediately after that exact function on this exact process.
+
+**Files touched this pass**: `.wfgy/webtop_stack.sh` only (`-S` -> `-e`; gitignored, not committed
+to git as tracked source -- consistent with every other repro artifact in this directory). No Rust
+source changed. `.wfgy/webtop_seed.tar` regenerated from the fixed script (old copy preserved as
+`.wfgy/webtop_seed_stale.tar`). No test files added, per standing rule.
+
+**Host state**: one runner instance at a time throughout (confirmed via `Get-Process` before/after
+every launch); killed cleanly via `Stop-Process -Force`, verified zero `litebox_runner`/
+`litebox-presenter` processes remained; host free RAM 5.09GB before the run, 2.86GB immediately
+after a forced kill of an 8-process fork family, recovering to 5.19GB within 5 seconds -- consistent
+with every prior session's own "RAM pressure is transient and unrelated to litebox" baseline.

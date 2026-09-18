@@ -139,16 +139,14 @@ the browser/terminal/apps milestone — attributed then to the Xvfb/dbus by-name
 superseded by the twelfth-pass entry below. Detail: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
 
 **Twelfth pass**: by-name `Xvfb`/`dbus-daemon` cross-process-fork exclusion relaxed — both now
-cross-process-fork for real (log-proven). `XVFB_FAILED`/`DBUS_FAILED` still fire, root cause
-precisely named: `unix_addr_table`'s `Backlog`/`Channel` connection DATA is still per-process-heap
-(presence side-index already shared) — attempted by the thirteenth pass below, still not fully
-closed (fifteenth pass). Same pass, separately: `SafeZoneAllocator::dealloc`'s
-`spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) live-caught spinning forever (no
-dead-holder recovery, unlike `RawMutex`) — **still open**. Full narrative: archive.
+cross-process-fork for real. `XVFB_FAILED`/`DBUS_FAILED` root cause named: `unix_addr_table`'s
+`Backlog`/`Channel` connection DATA still per-process-heap — closed thirteenth/sixteenth pass (see
+below; the actual remaining blocker turned out to be script-level, not this). Separately:
+`SafeZoneAllocator::dealloc`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) live-caught
+spinning forever, no dead-holder recovery unlike `RawMutex` — **still open**. Detail: archive.
 
-**Fork-after-Xorg PERMANENT freeze — did NOT reproduce 2026-09-17; thread-based-fork-only.** Under
-`LITEBOX_PROCESS_FORK=1` the identical script completed cleanly 2/2 — zero freeze, zero double-free.
-Full evidence, a disclosed ENOMEM finding under concurrent cross-process forks: archive.
+**Fork-after-Xorg PERMANENT freeze** — did NOT reproduce 2026-09-17 under `LITEBOX_PROCESS_FORK=1`
+(thread-based-fork-only issue), clean 2/2. Evidence, plus a disclosed ENOMEM finding: archive.
 
 **Thirteenth pass, 2026-09-18 — shared cross-process AF_UNIX connection data plane DESIGNED and
 IMPLEMENTED** (`SharedUnixConnTable`/`SharedUnixConnectQueue`, `syscalls/unix.rs`'s module doc has
@@ -163,33 +161,37 @@ of the subsequent full-boot stall (`wait_on_tun`/`with_fork_duplicate_claim_owne
 deadlock) was WRONG.
 
 **Fifteenth pass, 2026-09-18 — real root cause found and FIXED, live-verified: a smoltcp
-stale-`SocketHandle` panic killed `net_worker` threads platform-wide.** `wait_on_tun` is
-structurally incapable of blocking (single lock site, every caller caps its timeout to 1ms) —
-the fourteenth pass's "two-holder deadlock" read was a cdb sample catching this thread's own
-permanently-present idle noise, not a hang; several other frames sampled this investigation
-(`prepare_for_exit+0x602f`, `pty_ioctl+0x6bbc`, huge offsets into short functions calling things
-their own source can't reach) are release/LTO/ICF symbol-resolution artifacts, not literal call
-stacks (matches `docs/AGENTS_ARCHIVE_2026-09-17.md:1852`'s prior note on the same phenomenon — trust
-only small, plausible offsets). **Real mechanism**: `Network::reset_after_poisoning`'s own doc
-comment already disclosed the gap — a still-alive process's OWN descriptor-table entry can keep
-naming a `SocketHandle` the reset just wiped, and smoltcp's `SocketSet::get`/`get_mut` (0.12, no
-generation counter) panics outright (`"handle does not refer to a valid socket"`). That panic was
-UNCAUGHT inside `net_worker`'s loop, permanently killing that process's networking; since `Network`
-is shared across the whole fork family, every OTHER process's `net_worker` died the same way in
-turn until networking silently stopped everywhere — matching the observed total, permanent,
-platform-wide log silence exactly. **Fix, two parts, both required** (part 1 alone, live-tested,
-only turned it into an infinite catch-repanic loop): (1) `net_worker`'s two closures
-(`litebox_runner_linux_on_windows_userland/src/lib.rs`) now `catch_unwind` around
-`perform_network_interaction()` and call a new `LinuxShim::force_reset_network_after_panic()`
-instead of propagating; (2) `litebox/src/net/mod.rs` gained `Network::socket_set_contains` (a
-bounded linear scan — smoltcp has no checked `get`) guarding `remove_dead_sockets`,
-`close_pending_sockets`, and `drain_socket_channel_buffers`'s TCP/UDP/listener-handle paths against
-ever touching an already-removed handle again. Live-verified: the panic signature did not recur in
-a full run with both parts. **A SECOND, different, not-yet-root-caused stall found past this fix**
-(one process genuinely blocked in what looks like `sys_wait4`, per the closure-shape of its
-`wait_until` instantiation, but with unreliable enclosing frame names) — did not reach
-`XVFB_UP`/`DBUS_UP`/browser/terminal/apps this pass either. Full evidence, exact log lines, the
-insufficient-first-fix detail, and concrete next steps: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+stale-`SocketHandle` panic killed `net_worker` threads platform-wide.** `wait_on_tun`'s apparent
+"deadlock" was symbol-resolution noise (trust only small offsets, `docs/
+AGENTS_ARCHIVE_2026-09-17.md:1852`); the real mechanism was `Network::reset_after_poisoning`
+wiping `socket_set` while a still-alive process's own fd kept naming a now-dead `SocketHandle`,
+and smoltcp 0.12's `get`/`get_mut` panics outright on that — uncaught inside `net_worker`, killing
+that process's networking permanently, cascading platform-wide since `Network` is shared. Fixed,
+two parts, both required: `catch_unwind` + `force_reset_network_after_panic()` around
+`net_worker` (`litebox_runner_linux_on_windows_userland/src/lib.rs`), plus
+`Network::socket_set_contains` (`litebox/src/net/mod.rs`) guarding every call site that would
+otherwise re-touch a handle a reset already removed. Live-verified, panic signature gone. Full
+evidence and exact log lines: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+
+**Sixteenth pass, 2026-09-18 — the "60s XSOCK timeout killed the shared-queue mechanism" theory
+REFUTED; real bug was the script's OWN new readiness check; FIXED and live-verified; a SECOND,
+different, not-yet-root-caused `xset` kill found immediately past it.** `.wfgy/webtop_stack.sh`'s
+`[ -S "$XSOCK" ]` readiness check (added THIS SAME DAY to stop re-exec'ing `xset` up to 60x) can
+**never** be true: `litebox::fs::FileType` has no `Socket` variant, path-based `bind()`
+(`litebox_shim_linux/src/syscalls/unix.rs`) just does a plain `fs.open(CREAT|EXCL|RDWR)`, and
+`sys_mknodat` explicitly `EPERM`s `InodeType::Socket` — all three already disclosed by their own
+`// TODO` comments. So the loop burned its full 60s on every boot regardless of Xvfb's real state,
+independent of `SharedUnixConnTable`/`SharedUnixConnectQueue`. **Fix**: `-S` → `-e` (existence,
+still zero forks) — safe now that `LITEBOX_PROCESS_FORK=1` + the global `GLIBC_TUNABLES` export
+remove the thread-based-fork corruption class `-S` was dodging. **Live-verified**: `xset`'s connect
+now happens inside the first real second (WARN `self_pid=19484 owner_pid=8040`, genuine
+cross-process fork), never burning the 60s — boot then reaches the same known-stable trajectory
+(`SELKIES_SUPERVISOR` gives up after 30, the ALREADY-TRACKED `/tmp/empty` gap, pickup (3) below) →
+`DE_LAUNCHED` → `DE_FALLBACK_LAUNCHED` → `DE_FAILED` → stable `HOLD`, zero panics/stalls. **A
+SECOND, NOT-YET-ROOT-CAUSED blocker sits immediately past this fix**: `xset q` still gets a real
+fatal kill right after the fork resume, with none of the exit diagnostics every other forked child
+shows and nothing in litebox's own ungated fault machinery — ruling out the known VEH-caught fault
+class, at least. Concrete next step and full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -199,13 +201,14 @@ mechanism was a smoltcp stale-`SocketHandle` panic killing `net_worker` platform
 (above) and a third confirmation run reached a stable `HOLD` steady state (559 forks, zero panics,
 zero permanent stall) with no intervention needed — a SECOND stall this pass's own second run hit at
 a similar point did NOT reproduce a third time, consistent with this whole area being genuinely
-probabilistic rather than a deterministic bug; not re-prioritized unless it recurs. **The browser
-milestone is still blocked by the ALREADY-TRACKED, pre-existing gap named in "Open here" below**
-(`unix_addr_table`'s connection-DATA sharing for Xvfb's own X11 socket specifically — confirmed live,
-third run: `xset`'s connect got the exact `ECONNREFUSED ... DIFFERENT guest pid` WARN, then the
-script's own 60s timeout killed both `Xvfb` and `xset` before the shared-queue mechanism resolved
-it, despite that same mechanism passing the fourteenth pass's minimal isolated repro) — NOT a new
-regression from this pass. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass.
+probabilistic rather than a deterministic bug; not re-prioritized unless it recurs. ~~The browser
+milestone is blocked by `unix_addr_table`'s connection-DATA sharing for Xvfb's socket~~ — REFUTED,
+sixteenth pass: the "60s timeout killed both `Xvfb` and `xset`" symptom was `webtop_stack.sh`'s own
+`-S`-on-an-unsupported-file-type bug (now FIXED, above), not the shared-queue mechanism, which never
+even got a fair chance to run before this fix. **The browser milestone is now blocked by a
+DIFFERENT, NOT-YET-ROOT-CAUSED fatal kill of `xset` itself immediately after a genuine cross-process
+fork** — see the sixteenth-pass entry above for the precise, evidenced gap and concrete next step.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth and sixteenth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
