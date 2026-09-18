@@ -149,73 +149,57 @@ archive).** Fixed `unix_addr_table`/`fifo_registry` (per-process-private, shadow
 (`sys_ppoll -> PollSet::wait -> commit_wait -> RawMutex::block_or_maybe_timeout`), parked on a
 Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` never flips true.
 
-**Nineteenth pass, 2026-09-18 -- live repro of the ppoll stall (twice, debug binary, direct `cdb
--pv` thread-stack evidence), `has_pending`/queue logic REFUTED as the bug, one real structural gap
-found and NOT yet fixed (detail: archive).** Booted `.wfgy/webtop_stack.sh` under
-`LITEBOX_PROCESS_FORK=1` + debug binary twice; both times independently reproduced the identical
-`sys_ppoll -> PollSet::wait -> commit_wait` stack via non-invasive `cdb -pv` on the live guest
-process (winpid 17248, then its retry winpid 4700), confirming the eighteenth-pass read is real
-and repeatable, not a one-off. **Identity established**: `task.pid.get()` (used as `self_pid`/
-`owner_pid` in the `unix_addr_presence`/`[unix_addr_presence]` WARN) IS the real Windows PID for a
-`LITEBOX_PROCESS_FORK=1` child -- `owner_pid=9964` in the log directly correlates to Xvfb's own
-host process (confirmed via its `task-resume-probe` resume offset, 16877, matching the script's
-own `Xvfb ... &` launch line). The connecting client both times was `xset q` (script offset
-19289/19468). **`SharedUnixConnectQueue`/`has_pending`/`try_claim`/`complete` code-reviewed
-line-by-line: structurally sound** -- no bug found in the matching/claiming logic itself, and
-`presence_kind_and_bytes`/`to_key()` produce identical keys on both the `listen()`-side insert and
-the `connect_cross_process`-side lookup, so a key-encoding mismatch is also ruled out.
-**Real gap found (confirmed via `wait_on_events_polling`/`polling.rs:60-63`'s own nonblock
-short-circuit): a NON-BLOCKING cross-process `connect()` that doesn't complete synchronously posts
-into `unix_shared_connect_queue` and returns `EINPROGRESS`-equivalent immediately, but the
-`request_idx` is never stored anywhere on the socket, and `UnixInitStream::check_io_events` (the
-`Init`-state arm, `syscalls/unix.rs` around line 1590-1602) is a static `OUT|HUP` report that never
-re-checks `unix_shared_connect_queue.poll_result()` -- so a later `poll()`/`select()`/`ppoll()` on
-that same fd can NEVER observe the connection actually completing.** This is real and confirmed by
-code reading, but NOT yet confirmed as THE mechanism behind xset's own stall specifically (xset's
-Xlib connect is very likely blocking, not non-blocking, so this gap more plausibly explains a
-LATER dbus/xfce4-session-class client than xset itself) -- **not fixed this pass, deliberately**:
-repeated attempts to catch the exact stuck thread's `PollSet` `entries` (fd/mask) via a second,
-immediate follow-up `cdb -pv` call raced the process's own teardown every time (it reliably
-self-terminates within 1-3 minutes of being caught, before a second attach could complete) so the
-"which fd/direction" question named by the eighteenth pass is STILL not conclusively answered --
-see the pickup list below for the precise next step. Separately ruled out: `13448` (nginx
-supervisor, blocked in a legitimate wait4 on its live-nginx child -- not a bug) and the
-`decode_cross_process_wait_status`/`CROSS_PROCESS_EXIT_MARKER` dead-code path (real dead code, but
-NOT the live cause here -- the diagnostic `task-resume-probe` harness already encodes
-`0xc0de0000` correctly on every NORMAL child exit; xset's "Killed" report is consistent with it
-never reaching its own exit path at all, i.e. genuinely still running when killed, not a
-misreported normal exit). Full cdb transcripts + timeline: `docs/AGENTS_ARCHIVE_2026-09-18.md`.
+**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall (twice), `has_pending`/queue logic
+REFUTED as the bug; found a real-but-unconfirmed `Init`-state gap in `UnixInitStream::
+check_io_events`. Full detail: archive.
+
+**Twentieth pass, 2026-09-18 -- root-caused and FIXED the `SharedUnixConnTable` slot leak (commit
+`05d279d`); found (not yet fixed) a second, separate `wait4(-1)` stall.** Live `cdb -pv` (pid
+17296, thread 1 frame 6 = `PollSet::wait`) got the locals the nineteenth pass couldn't (`_NT_
+SYMBOL_PATH` env var instead of a `-y` argument works around Git Bash mangling backslashes):
+`has_unwakeable_fd = true`, `register = false` -- **live-confirmed the AF_UNIX bounded-15ms-repoll
+in `PollSet::wait` (13th pass, `b86f1f1`) IS engaged and correctly re-scanning; the repoll design
+itself is not the bug.** Code review of the write path confirms why a stuck poll can still persist
+for minutes anyway: `try_sendto_shared`/`SharedByteRing` never call `notify_observers` (by design,
+no cross-process push wake exists) -- correct once the peer writes, but nothing forces the peer TO
+write. **Root cause instead found on the resource-lifecycle side**: `SharedConnSlot::free()` only
+runs via `Drop`, which never fires when a stuck client (xrdb/selkies, all caught live in this exact
+stall) is killed externally rather than exiting -- confirmed live across 4+ independent leaked
+slots this pass, directly correlated with a `SELKIES_PORT_UP` curl-readiness loop spawning 40+
+rapid-fire retries instead of the handful expected. **Fixed**: `SystemInfoProvider::
+is_process_alive` (new, default `true`; Windows impl reuses `RawMutex`'s own dead-holder
+OpenProcess/GetExitCodeProcess check) + `LiteBox::platform()` accessor + a conservative
+both-endpoints-confirmed-dead reclaim pass in `SharedUnixConnTable::alloc`, plus
+`SHARED_UNIX_CONN_CAPACITY` 8->64 as a cheap complementary mitigation (a long-lived server like
+Xvfb never notices its peer died, so the safe both-dead reclaim condition alone doesn't cover that
+half). Compiles clean; **NOT yet re-verified end-to-end past Xvfb** -- the post-fix verification
+boot hit a SEPARATE stall first (below) before reaching that section again. **New, not yet fixed**:
+the root script interpreter's own `wait4(-1)` (`syscalls/process.rs` ~2313-2380) blocks via a PLAIN
+`wait_until` with NO bounded-repoll fallback (unlike every AF_UNIX call site) -- live-caught stuck
+even after its cross-process child had ALREADY exited cleanly (`0xc0de0000`, not killed). Not
+confirmed deterministic. Full transcripts, cdb technique notes, and the precise next-step: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(-2) ~~root-cause `net::wait_on_tun`~~ — REFUTED, fifteenth pass (smoltcp panic, FIXED). ~~blocked
-by `unix_addr_table`'s connection-DATA sharing~~ — REFUTED, sixteenth pass (`-S`/`-e` script bug,
-FIXED). ~~blocked by a fatal kill of `xset`~~ — ROOT-CAUSED and FIXED, seventeenth pass
-(`memfds`/`shared_files`). ~~stall past `xset` is in `connect_cross_process`'s rendezvous or
-`net::wait_on_tun`/`NatGateway::new`~~ — REFUTED, eighteenth pass (both innocent background
-threads). ~~the `has_pending`/`SharedUnixConnectQueue` matching logic itself is buggy~~ — REFUTED,
-nineteenth pass (line-by-line review found it structurally sound; live-reproduced the identical
-stall twice with fresh, independent `cdb` evidence). **Current best lead, NOT yet fixed**: a
-non-blocking cross-process `connect()` that returns `EINPROGRESS` never stores its
-`unix_shared_connect_queue` `request_idx` anywhere, and `UnixInitStream::check_io_events`
-(`syscalls/unix.rs` ~1590) is a static `OUT|HUP` report that never re-polls the queue for
-completion -- confirmed by code reading (`wait_on_events_polling`'s nonblock short-circuit,
-`polling.rs:60-63`), NOT yet confirmed live as xset's own specific mechanism (xset's own connect is
-likely blocking) nor fixed. **Precise next step**: reproduce once more (`.wfgy/
-repro_debug_ppoll_stall.ps1` is the ready-to-run launch script, debug binary + `LITEBOX_
-PROCESS_FORK=1` + `.wfgy/webtop_stack.sh` via `--resume-from .wfgy/webtop_seed.tar`), and as SOON
-as a process shows the `sys_ppoll -> PollSet::wait -> commit_wait` stack via a `cdb -pv -p <pid> -y
-target\debug -c "~*kb;qd"` sweep, IMMEDIATELY (same breath, no gap -- the process reliably
-self-terminates within 1-3 minutes of being caught) re-attach and dump `.frame 6;dv /t /v` (frame
-index confirmed stable across two independent captures: 00 ntdll, 01 KERNELBASE, 02
-`RawMutex::block_or_maybe_timeout`, 03 `block_or_timeout`, 04 `commit_wait`, 05 `wait_until`, 06
-`PollSet::wait`, 07 `sys_ppoll::closure$1`, 08 `Task::sys_ppoll`) to read `self.entries` (fd list +
-requested mask) -- this is the one piece of evidence still missing. Separately: once a process gets
-reaped after being caught stuck, NOTHING continues the boot script afterward (observed: log frozen
-indefinitely, no new `task-resume-probe` lines, no `[s]` markers) -- worth checking next session
-whether the resume/continuation chain itself drops the next script step when a child is
-externally-timed-out rather than exiting normally. Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`,
-fifteenth through nineteenth passes.
+(-2) ~~root-cause `net::wait_on_tun`~~/~~`unix_addr_table` sharing~~/~~fatal `xset` kill~~/~~stall
+in `connect_cross_process`/`net::wait_on_tun`~~/~~`has_pending`/`SharedUnixConnectQueue` matching
+logic~~ — all REFUTED or FIXED, passes 15-19 (archive). ~~`SharedUnixConnTable` slot leak on
+externally-killed clients~~ — ROOT-CAUSED and FIXED, twentieth pass (commit `05d279d`); NOT yet
+re-verified end-to-end (a separate stall, below, blocked the verification boot first). **Current
+best lead, NOT yet fixed**: `sys_wait4`'s `pid == -1` branch has no bounded-repoll fallback and can
+hang forever even after the awaited child already exited cleanly, if its exit-notifier interrupt is
+ever lost. **Precise next step**: reproduce (`.wfgy/repro_debug_ppoll_stall.ps1`), and when the
+root process (not a forked child) is caught in `Task::sys_wait4 -> wait_until -> commit_wait` with
+a child already logged as exited, `dv`/`dx` the `arm_cross_process_exit_notifier`/
+`spawn_cross_process_exit_notifier` state to see whether the notifier ran at all. cdb technique:
+set `_NT_SYMBOL_PATH` env var (not `-y`) for reliable symbol loading under Git Bash; only the LAST
+`-c` flag is honored, chain one `;`-joined string; `~*e` broadcast silently produced no output in
+this session's trials -- use explicit `~Ns;.frame 6;dv /t /v` per thread instead, and dump `~*kb`
+first since thread index is NOT stable across different guest binaries (Xlib clients vs
+Python/selkies have different thread layouts). Separately, once `SharedUnixConnTable`'s fix is
+verified live: `UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth
+pass, still real, still unconfirmed as anyone's actual mechanism) remains open. Full evidence:
+`docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twentieth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
@@ -357,11 +341,12 @@ design.md`) — all CLOSED, none open. Full detail: archive.
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-19th passes: Xvfb/dbus relaxed; shared
+- **Archives** (newest first) — `_2026-09-18.md` (12th-20th passes: Xvfb/dbus relaxed; shared
   AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
   `-S`/`-e` script bug FIXED; `xset` silent kill CAUGHT LIVE + FIXED; GlobalState field audit +
   debug binary + unambiguous stall read; live cdb repro of the ppoll stall twice, has_pending
-  REFUTED, non-blocking-connect `Init`-state gap found), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  REFUTED; `SharedUnixConnTable` slot leak ROOT-CAUSED + FIXED, `has_unwakeable_fd` live-confirmed
+  engaged, `wait4(-1)` no-repoll-fallback stall found not yet fixed), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:

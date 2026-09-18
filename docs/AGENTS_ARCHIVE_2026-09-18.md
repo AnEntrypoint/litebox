@@ -992,3 +992,125 @@ sweeps showing the stuck stack), `.wfgy/cdb4_13448.log` (nginx-supervisor full d
 this pass were killed (`Stop-Process -Force`); host free memory ~6.35 GB of ~15.2 GB total,
 consistent with the ~6.5 GB free measured at the start of this pass (no leak from this session's own
 activity).
+
+## Twentieth pass, 2026-09-18 -- root-caused and FIXED the SharedUnixConnTable slot leak; found (not yet fixed) a second, separate wait4(-1) stall
+
+Booted `.wfgy/webtop_stack.sh` under the debug binary + `LITEBOX_PROCESS_FORK=1` per
+`.wfgy/repro_debug_ppoll_stall.ps1`. Fixed the cdb symbol-loading problem that blocked the
+nineteenth pass's `dv`/`dx` locals dump: `-y target\debug` gets mangled by Git Bash's automatic
+path conversion (backslashes silently dropped, `target\debug` becomes `targetdebug`, "system cannot
+find the file specified"). Fix: set `_NT_SYMBOL_PATH` as an environment variable
+(`export _NT_SYMBOL_PATH='C:\dev\litebox-main\target\debug'` -- backslashes survive fine as a plain
+env-var value, unlike a `-y` command-line argument) instead of passing `-y`/`.sympath` on the
+command line; also `export MSYS_NO_PATHCONV=1`. Also confirmed cdb (this build, 10.0.18362.1) only
+honors the LAST `-c` flag if given multiple -- chain everything into one `-c "cmd1;cmd2;..."`
+string instead. `~*e "cmd"` (broadcast a command to every thread) silently produced zero output in
+every trial here (cause not fully isolated); the reliable alternative that DID work: explicit
+per-thread `~Ns;.echo THREADN;.frame 6;dv /t /v` chains, N = 0..7 (a thread index past the
+process's actual thread count just errors "Illegal thread error" harmlessly and the chain
+continues).
+
+**Live decisive evidence obtained** (single `cdb -pv` attach, pid 17296, a selkies-related
+cross-process-forked child caught stuck in the exact `sys_ppoll -> PollSet::wait -> commit_wait ->
+RawMutex::block_or_maybe_timeout` stack, thread 1, frame 6):
+```
+self = 0x...273f3cb0  (PollSet<WindowsUserland>*)
+has_unwakeable_fd = true
+register = false
+```
+**This refutes, with direct live evidence, any hypothesis that PollSet::wait's AF_UNIX
+bounded-15ms-repoll path (`epoll.rs`, `has_unwakeable_fd`/`STDIN_REPOLL_INTERVAL`, landed 13th
+pass, commit `b86f1f1`) is inactive or broken for a Shared-transport AF_UNIX fd.** It is correctly
+engaged (`has_unwakeable_fd=true`) and has already cycled through at least one bounded
+wait-then-rescan iteration (`register=false`, which the code only sets on a repoll-loop iteration
+AFTER the first). A thread caught in this exact stack is NOT permanently blocked on an
+un-signalable condvar -- it is actively, correctly re-scanning `check_io_events`/
+`check_io_events_shared()` every ~15ms. The only way this can still appear stuck for minutes is if
+`check_io_events_shared()` genuinely, persistently never observes readiness -- i.e. the PEER
+(usually Xvfb) never actually writes the expected reply into the shared ring at all.
+
+**Code review of the write/notify path (`syscalls/unix.rs`) confirms this is architecturally
+expected, not a bug in itself**: `try_sendto_shared`/`SharedByteRing::try_write{_all}` write real
+bytes into real shared-arena memory (visible cross-process, correctly paired via `shared_rings`'s
+`is_client` swap -- no read/write-ring mixup found), but call `self.pollee.notify_observers(...)`
+NEVER on the write path (only `try_recvfrom_shared` does, to unblock a local blocked WRITER, which
+is same-process-only anyway) -- there genuinely is no push-based cross-process wake for this
+transport, which is why the bounded-repoll design exists at all (module doc comment: "No genuine
+cross-process wakeup... driven by call sites... re-polling on a short bounded timeout"). Confirmed
+this is BY DESIGN and already correctly engaged. The open question is therefore squarely on the
+SERVER (accept/reply) side, not the client's poll -- not fully resolved this pass (a second catch,
+pid 9192, missed: thread numbering is NOT stable across different guest binaries -- `xset`/`xrdb`
+had the ppoll thread at index 1 twice; a Python/selkies-class process's thread layout differs and
+the same `~1s` guess landed on a thread-pool worker instead, "Cannot find frame 0x6" -- future
+attempts must dump `~*kb` first and search its OWN output for the matching stack shape per-process,
+never assume a fixed thread index across different guest binaries).
+
+**Root-caused and FIXED, this pass: SharedUnixConnTable's fixed 8-slot pool permanently leaks one
+slot per stuck client killed externally.** `SharedConnSlot::free()` (`unix.rs` ~2983) is only ever
+called from `ConnTransport::Shared`'s `Drop` impl (~line 685/709) -- and `Drop` NEVER runs when a
+process is torn down by `TerminateProcess`/WMI `Terminate` (the very kill mechanism this whole
+investigation's own timeout-based catch-and-kill relies on). Traced this live across the session:
+at least four independent cross-process children (xrdb-class retries at winpid 13888/16592,
+selkies-class retries at winpid 17296/9192) were each caught stuck in exactly this `sys_ppoll` stack
+and subsequently disappeared without ever completing their X11 round trip -- each one leaked its
+`unix_shared_conn_table` slot. Direct log evidence of the compounding effect: a `curl`-based
+`SELKIES_PORT_UP` readiness-poll loop (`webtop_stack.sh` offset ~45304) that should complete in a
+handful of one-second iterations instead spawned 40+ distinct forked `curl` child winpids in rapid
+succession -- consistent with every fresh selkies (re)connect attempt racing an
+already-shrunk-or-exhausted slot pool and failing fast (`ECONNREFUSED` via the 3-second
+`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` bound) rather than the boot ever reaching `SELKIES_PORT_UP`.
+
+**Fix landed** (commit `05d279d`): `litebox::platform::SystemInfoProvider` gained
+`is_process_alive(pid) -> bool` (default `true`, i.e. "assume alive, never reclaim" for any
+platform that doesn't override it). `WindowsUserland`'s override reuses the exact
+`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` pattern
+`RawMutex::try_recover_from_dead_holder_unregistered` already established for the identical
+dead-holder-recovery problem on a different shared primitive (not factored into a shared helper
+this pass). `litebox::LiteBox<Platform>` gained a `pub fn platform(&self) -> &'static Platform`
+accessor so `litebox_shim_linux`'s `SharedUnixConnTable` can reach it via
+`global.litebox.platform()`. `SharedUnixConnTable::alloc` now falls back to a reclaim pass when no
+`EMPTY` slot is found: for each `OCCUPIED` slot, if BOTH the recorded `client_pid` AND `server_pid`
+are confirmed dead, CAS-reclaim it and retry the claim. Deliberately conservative -- requiring BOTH
+endpoints dead means a slot whose long-lived server (e.g. Xvfb, which stays alive for the whole boot
+and has no signal that its peer died) never actually gets reclaimed this way;
+`SHARED_UNIX_CONN_CAPACITY` was therefore also raised 8 -> 64 (still tiny, ~256 KiB total) purely to
+buy more headroom against the still-not-fully-reclaimed Xvfb-survives case, pending a real fix for
+that remaining half (a genuine candidate: have the SERVER side notice a peer whose owning process is
+confirmed dead and self-shutdown its own slot half -- not attempted this pass).
+
+Rebuilt cleanly (`cargo build -p litebox_runner_linux_on_windows_userland`, no errors, one
+pre-existing unrelated `dead_code` warning). Re-booted to verify: this run did NOT reach the
+AF_UNIX/Xvfb section again before running into a SEPARATE, not-previously-investigated stall (see
+next section) -- so the `SharedUnixConnTable` fix's live end-to-end effect on reaching a working
+desktop is UNVERIFIED this pass (verified by code review + compilation only).
+
+**New finding, NOT yet fixed: the root script interpreter's own `wait4(-1)` can hang forever, with
+NO bounded-repoll fallback, even after the cross-process child it's waiting for already exited
+CLEANLY (not killed).** Live `cdb -pv` on the persistent root process during the post-fix
+verification boot showed thread 1 parked in `litebox_shim_linux::Task::sys_wait4 -> ... ->
+WaitContext::wait_until<...,syscalls::process::impl$10::sys_wait4::closure_env$0<...>> ->
+commit_wait -> RawMutex::block_or_maybe_timeout`, while the log showed its most recent forked child
+(winpid 7960) had ALREADY logged `task-resume-probe (child): exiting with encoded status
+0xc0de0000` -- a completely normal, cooperative exit, not an external kill. `sys_wait4`'s
+`pid == -1` branch (`syscalls/process.rs` ~2313-2380) blocks via a PLAIN
+`self.wait_cx().wait_until(&mut poll_once)` -- unlike every AF_UNIX call site, this has NO
+bounded periodic re-poll fallback at all; it relies entirely on
+`arm_cross_process_exit_notifier`/`spawn_cross_process_exit_notifier` (`process.rs` ~3243-3260)
+correctly firing an interrupt. Both notifier paths look structurally correct on inspection, and this
+general area already has extensive prior-pass doc-comment coverage of a related race (the
+`EINTR`-vs-"child already exited" re-check a few lines above) -- but this specific manifestation (a
+cross-process child that had ALREADY fully exited before the wait even started blocking) was not
+chased further this pass. Not confirmed deterministic -- the FIRST boot this session (before the
+`SharedUnixConnTable` fix) got much further without visibly hitting this stall, so it may be
+racy/intermittent like the AF_UNIX issue. **Precise next step**: reproduce again, and as soon as the
+root process's `wait4` thread is caught in this stack with a child already known-exited in the log,
+get `dv`/`dx` on the notifier thread/closure state to see whether it ever ran, or ran but its
+`interrupt_all_threads()` call didn't reach this specific waiting thread. A real fix by analogy with
+the AF_UNIX case: wrap `sys_wait4`'s `pid == -1` blocking branch in a bounded-repoll loop too, so a
+missed/lost interrupt self-heals within one short timeout instead of hanging the whole script
+forever.
+
+**Host state at end of pass**: all `litebox_runner_linux_on_windows_userland.exe`/`cdb.exe`
+processes started this pass were killed; host free memory ~4.2 GB of ~15.2 GB total at end of pass
+(down from ~6.2 GB at pass start -- consistent with ordinary host churn, not confirmed as a
+litebox-caused leak since all litebox processes were confirmed killed before this measurement).
