@@ -2215,6 +2215,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
         litebox_util_log::debug!(tid:% = self.tid.get(), pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
+        // Shared by both the `pid == -1` ("any child") bounded-repoll fallback (below) and the
+        // targeted `pid > 0` cross-process branch (twenty-fourth pass: that branch previously
+        // called `wait_for_cross_process_exit` directly, an unbounded blocking wait with NO
+        // repoll fallback at all -- the exact same lost-cross-process-wake hazard already
+        // documented and fixed for `pid == -1` in the twenty-first pass, just never ported to
+        // this sibling branch. Live-caught via two `cdb -pv` snapshots 20s apart, byte-identical
+        // `sys_wait4 -> RawMutex::block_or_maybe_timeout` frame: a shell's `wait` for one specific
+        // cross-process-forked child (e.g. `_nofork_tick`'s own forking `sleep` fallback under
+        // dash) parks forever if that child's exit notify is ever lost, exactly like the already-
+        // fixed `pid == -1` case, blocking the whole boot script indefinitely at a step the AF_UNIX
+        // rendezvous mechanism has nothing to do with.
+        const WAIT4_REPOLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(15);
         const WNOHANG: i32 = 0x1;
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
@@ -2259,7 +2271,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 raw_exit
             } else {
-                self.global.platform.wait_for_cross_process_exit(handle)
+                // Bounded-repoll fallback, same mechanism and same reason as the `pid == -1`
+                // branch below (see its own doc comment) -- a raw, unbounded
+                // `wait_for_cross_process_exit` here relies entirely on the cross-process exit
+                // notifier's wake arriving, which is the exact wake class already known to be
+                // lossy. Re-poll `try_wait_for_cross_process_exit` directly on our own bound
+                // instead of trusting the notify alone.
+                let mut raw_exit = None;
+                loop {
+                    match self
+                        .wait_cx()
+                        .with_timeout(WAIT4_REPOLL_INTERVAL)
+                        .wait_until(|| {
+                            raw_exit = self.global.platform.try_wait_for_cross_process_exit(handle);
+                            raw_exit.is_some()
+                        }) {
+                        Ok(()) => break,
+                        Err(litebox::event::wait::WaitError::TimedOut) => continue,
+                        Err(litebox::event::wait::WaitError::Interrupted) => {
+                            // Same race as the `pid == -1` branch's own `Interrupted` handling:
+                            // the child's own exit-notify SIGCHLD can itself be observed as "an
+                            // interrupt is pending" and short-circuit `wait_until` before
+                            // `poll_once` ever runs again. Re-check synchronously before
+                            // surfacing a spurious `EINTR`.
+                            raw_exit = self.global.platform.try_wait_for_cross_process_exit(handle);
+                            if raw_exit.is_none() {
+                                return Err(Errno::EINTR);
+                            }
+                            break;
+                        }
+                    }
+                }
+                raw_exit.expect("loop only exits Ok/break-with-Interrupted once raw_exit is set")
             };
             self.import_cross_process_writable_layer(handle);
             process.reap_cross_process_child(pid);
@@ -2364,8 +2407,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // takes no timeout argument, so `wait_cx()` never carries a real caller deadline
                 // here and every `TimedOut` below is this fallback's own bound, never a genuine
                 // timeout to surface to the caller.
-                const WAIT4_REPOLL_INTERVAL: core::time::Duration =
-                    core::time::Duration::from_millis(15);
                 loop {
                     match self
                         .wait_cx()

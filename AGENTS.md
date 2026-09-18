@@ -157,55 +157,36 @@ blocked thread: the fork child's guest-execution thread inside a genuine `ppoll(
 (exact commands, RAM trace, cdb logs): archive.
 
 **Twenty-third pass** — root-caused and FIXED a real regression in the twenty-second pass's own
-`_nofork_tick` fix: this image's real `/bin/sh` is `/bin/dash` (confirmed live:
-`readlink -f /bin/sh` -> `/bin/dash`), where `$SECONDS` (bash/ksh-only) is simply unset --
-directly probed live: `SECONDS_IS:[]`, and `SECONDS_AFTER:[0]` even after a real `sleep 1`
-(dash never auto-increments it). Before this fix, `_nofork_tick`'s `while [ "$SECONDS" -lt
-"$until" ]; do :; done` ran as `[ "" -lt "$until" ]` under dash, erroring ("Illegal number",
-live-caught in `.wfgy/webtop_stack.sh:82`) and exiting non-zero, collapsing the `while` to a
-silent, instant no-op on its first pass -- not slow, gone: every retry loop using it (Xvfb's
-`$XSOCK` wait, dbus's `/tmp/addr` wait) burned all 15 retries in milliseconds and declared
-XVFB_FAILED/DBUS_FAILED before Xvfb/dbus-daemon had any real time to start. Fixed:
-`_nofork_tick` now branches on `[ -n "$BASH_VERSION" ]` (unset in dash, set in bash) -- the real
-busy-wait only under a shell that actually has `$SECONDS`, an ordinary forking `sleep`
-otherwise (correctness over the fork-avoidance optimization). Script-only,
-`.wfgy/webtop_stack.sh` (gitignored, not git-tracked), `.wfgy/webtop_seed.tar` regenerated.
-Live-verified in isolation (`_nofork_tick 2` under the real `/bin/dash` now correctly takes
-`ELAPSED:2` real seconds, forking `sleep` as expected) and via a full real-image boot: no more
-premature XVFB_FAILED/DBUS_FAILED, confirmed by their total ABSENCE from the log this pass
-(previously the very first thing printed after Xvfb starts).
+`_nofork_tick` fix (this image's real `/bin/sh` is `/bin/dash`, where `$SECONDS` is unset,
+collapsing the busy-wait to a silent no-op) — full detail: archive. With that fixed, the boot
+advanced into the already-tracked AF_UNIX rendezvous gap as a genuine multi-minute CPU-active
+livelock, confirmed via live `cdb -pv` on two threads at once (`sys_epoll_pwait`/`sys_ppoll`,
+both provably engaged in their bounded ~15ms repoll, `diag_iteration` in the tens of thousands).
+Two candidates were proposed (timing race vs. address mismatch) but not yet distinguished.
+**Both REFUTED by the twenty-fourth pass, below.**
 
-With that fixed, the full boot (debug binary, `LITEBOX_PROCESS_FORK=1`) advances into the SAME
-already-tracked AF_UNIX rendezvous gap, now a genuine multi-minute CPU-active livelock (not a
-silent deadlock) -- confirmed via live `cdb -pv` debug-symbol frame walks on TWO independent
-guest threads in TWO different host processes at once: one blocked in `sys_epoll_pwait ->
-EpollFile::wait -> ... -> RawMutex::block_or_maybe_timeout` (`epoll.rs:306-378`; locals:
-`has_bounded_repoll_interest=true`, `diag_iteration=0x5799`=22425), the other in `sys_ppoll ->
-PollSet::wait -> ... -> RawMutex::block_or_maybe_timeout` (`epoll.rs:929-1012`; locals:
-`has_unwakeable_fd=true`, `register=false`). Both AF_UNIX-aware bounded ~15ms repoll paths
-(`epoll.rs:381-420`) are provably engaged and actively re-checking for 5+ real minutes straight,
-never once observing readiness. Source-cross-checked both dead ends this pointed at, same
-discipline as the twenty-second pass's `NatGateway::new` refutation -- neither holds up:
-`EpollDescriptor::poll`'s `Unix` arm (`epoll.rs:264-267`) DOES reach the shared-queue-aware
-`Backlog::check_io_events(&self, global)` (`unix.rs:452-470`) via `UnixStream::check_io_events`'s
-`Listen` arm (`unix.rs:1606`, `listen.global`) -- "epoll never got the wiring" REFUTED; and
-`SharedUnixConnectQueue::{post,has_pending,try_claim,complete,poll_result,cancel}`
-(`unix.rs:3132-3243`) read internally consistent by inspection (matching `(kind,key)` compares,
-correct `compare_exchange`-guarded state transitions) -- no obvious logic bug there either.
+**Twenty-fourth pass** — added live per-request `debug!()` instrumentation to
+`unix.rs`'s `Backlog::listen`/`connect_cross_process`/`SharedUnixConnectQueue::{try_claim,
+has_pending}` (kept) and re-booted twice with `LITEBOX_LOG` raised for `unix`/`epoll`. **The
+AF_UNIX rendezvous mechanism itself is confirmed sound**: exactly ONE real cross-process connect
+occurred per boot (Xvfb's own X11 socket), and it succeeded in ~23ms both times — no timing race,
+no address/key mismatch (the apparent `kind=1`/`kind=0` dual registration for the same path is
+correct, standard real-Linux X11 dual-socket behavior, not a bug). **The real blocker is upstream
+of AF_UNIX entirely**: `webtop_stack.sh`'s own `$XSOCK` wait loop (lines 319-322) never completes
+— `xset q` (line 323, the next X11 client) and even `/usr/bin/sleep` (the loop's own dash-fallback
+fork) appear ZERO times in either ~10-20MB trace despite 5-17 minutes of runtime. Along the way,
+live-caught (cdb, byte-identical frame twice 20s apart) and FIXED a genuine bug: `sys_wait4`'s
+targeted `pid > 0` branch (`process.rs`) called `wait_for_cross_process_exit` with NO
+bounded-repoll fallback, unlike its already-fixed `pid == -1` sibling (21st pass) — same lost-wake
+hazard, now closed. This fix alone did not unblock the `$XSOCK` stall. Leading hypothesis for next
+pass: the already-tracked writable-layer cross-child-visibility gap (pickup item 3) — Xvfb is a
+long-running cross-process-forked daemon that never exits, and writable-layer state appears to
+sync back to siblings only at child EXIT, so the shell's `[ -e "$XSOCK" ]` may structurally never
+see a file Xvfb created. Not yet directly confirmed. Full detail: archive.
 
-Genuinely NOT yet root-caused past this point: with both wait-side mechanisms provably engaged
-and correctly wired to the shared-queue check, and the queue's own state machine reading sound
-in isolation, the remaining gap is either (a) the connecting client's own request being
-cancelled by its 3s `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (`unix.rs:2692`) before the listener's
-periodic repoll ever coincides with a still-PENDING window, or (b) a still-unidentified
-mismatch between the specific `Backlog` instance a listener thread is actually polling and the
-specific address a client names (neither thread's own polled fd/address was directly inspected
-this pass). Next step: pickup list item (-2) below.
-
-Both boots killed cleanly (WMI `Terminate`), RAM recovered 5-9GB free each time (host RAM was
-never the constraint this pass). **Did NOT reach the XFCE-desktop/browser/terminal/apps
-milestone this pass** -- advanced past the sleep-fork regression this pass introduced, into the
-same not-yet-fully-root-caused AF_UNIX rendezvous gap the twenty-second pass already named.
+Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
+kill. **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass** — refuted a
+dead end, redirected toward the real upstream blocker, fixed one real independent bug.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -215,26 +196,30 @@ logic~~/~~`SharedUnixConnTable` slot leak~~ (commit `05d279d`)/~~`sys_wait4`'s `
 gap~~ (commit `a771692`)/~~`sleep 1`-forks-every-iteration in the `$XSOCK`/dbus wait loops~~
 (script-only, twenty-second pass)/~~`net::NatGateway::new`/`net::wait_on_tun` retry-hang theory~~/
 ~~`_nofork_tick` no-ops under dash, collapsing the retry window to zero~~ (script-only,
-twenty-third pass)/~~"epoll never got the bounded-repoll/shared-queue wiring"~~ (REFUTED by
-source read + locals dump, twenty-third pass: it does) — all REFUTED or FIXED, passes 15-23
-(archive). **Current top blocker, debug-symbol-CONFIRMED on two processes at once
-(twenty-third pass)**: a real, CPU-active livelock -- both `sys_ppoll -> PollSet::wait` and
-`sys_epoll_pwait -> EpollFile::wait` are provably engaged in their bounded ~15ms AF_UNIX repoll
-(`has_unwakeable_fd`/`has_bounded_repoll_interest` both `true`, thousands of iterations logged),
-and `Backlog::check_io_events`/`SharedUnixConnectQueue` are correctly wired and internally
-consistent by inspection -- yet the rendezvous still never completes within 5+ real minutes.
-**Next step**: re-run the fourteenth pass's own minimal isolated AF_UNIX repro (not the full
-boot) with `LITEBOX_LOG` raised for `unix`/`epoll` (existing `debug!` sites already trace
-`has_pending` -- no new instrumentation needed) to watch one request's exact state transitions
-across its 3s `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` window and settle (a) cancel-before-repoll-
-coincides vs (b) a listener/address mismatch. cdb technique notes (still current): set
+twenty-third pass)/~~"epoll never got the bounded-repoll/shared-queue wiring"~~/~~AF_UNIX
+rendezvous timing race~~/~~AF_UNIX rendezvous address/key mismatch~~ (both REFUTED with live
+per-request instrumentation, twenty-fourth pass: the mechanism is sound, only ONE real
+cross-process connect ever occurs and it succeeds in ~23ms)/~~`sys_wait4`'s `pid > 0` targeted
+branch had no repoll fallback~~ (commit pending, twenty-fourth pass, mirrors the already-fixed
+`pid == -1` case) — all REFUTED or FIXED, passes 15-24 (archive). **Current top blocker
+(twenty-fourth pass)**: NOT the AF_UNIX/epoll code — `webtop_stack.sh`'s own `$XSOCK` wait loop
+(lines 319-322) never completes even one iteration of its own dash-fallback forking `sleep`;
+`xset q` (the next required X11 client, line 323) and `/usr/bin/sleep` both appear ZERO times in
+full-debug-level traces spanning 5-17 real minutes. **Next step**: confirm or refute the
+writable-layer cross-child-visibility hypothesis directly — add a live probe (or extend the
+existing diagnostic logging) that reads `/tmp/.X11-unix/` from BOTH the shell's own process and
+Xvfb's around the `$XSOCK` loop, or trace `import_cross_process_writable_layer`/the writable-layer
+merge path directly, to settle whether a long-running (never-exiting) cross-process-forked
+child's writable-layer changes are genuinely invisible to siblings until it exits. If confirmed,
+the fix is architectural (periodic/continuous writable-layer visibility, not exit-only) and
+likely large — worth its own dedicated pass. cdb technique notes (still current): set
 `_NT_SYMBOL_PATH` env var (not `-y`); only the LAST `-c` flag is honored, chain one `;`-joined
 string (e.g. `~*kb;qd`, never a bare `q`); dump `~*kb` first (thread index isn't stable across
 binaries), then `.frame N; dv /t /v` on the specific frame of interest. Separately, still open:
 `UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth pass), and a
 `mkdir -p /usr/share/selkies/web` + `printf ... > .../50x.html` `No such file or directory`
 (`webtop_stack.sh:107-110`) — same class as the `/tmp/empty` gap (item 3 below), non-fatal.
-Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-third passes.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-fourth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 

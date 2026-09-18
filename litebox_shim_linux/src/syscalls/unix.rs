@@ -265,6 +265,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, cred));
         let owner_pid = task.pid.get() as u32;
         let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+        litebox_util_log::debug!(
+            owner_pid:% = owner_pid,
+            kind:% = presence_kind,
+            key_len:% = presence_bytes.len(),
+            key_bytes:? = presence_bytes;
+            "DIAG Backlog::listen: registering presence"
+        );
         global
             .unix_addr_presence
             .insert(presence_kind, presence_bytes, owner_pid);
@@ -1381,6 +1388,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             // Queue full -- ordinary, guest-triggerable degrade, not a bug.
             return Err(Errno::EAGAIN);
         };
+        litebox_util_log::debug!(
+            self_pid:% = self_pid,
+            kind:% = kind,
+            key_len:% = key_bytes.len(),
+            key_bytes:? = key_bytes,
+            request_idx:% = request_idx;
+            "DIAG connect_cross_process: posted request"
+        );
         // Bounded even for an ordinary blocking `connect()` with no caller-supplied deadline --
         // live-caught 2026-09-18: an unbounded wait here, for a listener that has bound/listened
         // (so `unix_addr_presence` genuinely shows it) but whose OWN `accept()` loop hasn't run
@@ -1402,12 +1417,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             },
         );
         let slot = match result {
-            Ok(slot) => slot,
+            Ok(slot) => {
+                litebox_util_log::debug!(
+                    self_pid:% = self_pid,
+                    request_idx:% = request_idx,
+                    slot:% = slot;
+                    "DIAG connect_cross_process: request completed"
+                );
+                slot
+            }
             Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut)) => {
+                litebox_util_log::debug!(
+                    self_pid:% = self_pid,
+                    request_idx:% = request_idx;
+                    "DIAG connect_cross_process: request TIMED OUT, cancelling"
+                );
                 task.global.unix_shared_connect_queue.cancel(request_idx);
                 return Err(Errno::ECONNREFUSED);
             }
             Err(e) => {
+                litebox_util_log::debug!(
+                    self_pid:% = self_pid,
+                    request_idx:% = request_idx,
+                    err:? = e;
+                    "DIAG connect_cross_process: request failed with other error, cancelling"
+                );
                 task.global.unix_shared_connect_queue.cancel(request_idx);
                 return Err(Errno::from(e));
             }
@@ -3177,6 +3211,35 @@ impl SharedUnixConnectQueue {
         if key.len() > UNIX_ADDR_KEY_MAX {
             return false;
         }
+        // DIAGNOSTIC (2026-09-18, twenty-fourth pass): throttled dump of the whole queue's real
+        // state every ~6s (400 calls * the ~15ms bounded-repoll interval this is exclusively
+        // called from) alongside the specific (kind, key) THIS check is looking for -- settles
+        // live whether the livelock is "queue genuinely empty, nobody is posting" vs "queue HAS
+        // pending entries but none match this listener's own key" (timing vs address-mismatch).
+        static DIAG_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        if DIAG_COUNTER.fetch_add(1, Ordering::Relaxed) % 400 == 0 {
+            let snapshot: alloc::vec::Vec<_> = self
+                .requests
+                .iter()
+                .enumerate()
+                .filter(|(_, req)| req.state.load(Ordering::Acquire) == REQ_PENDING)
+                .map(|(i, req)| {
+                    let len = req.len.load(Ordering::Relaxed) as usize;
+                    let len = len.min(UNIX_ADDR_KEY_MAX);
+                    let bytes: alloc::vec::Vec<u8> =
+                        (0..len).map(|j| req.bytes[j].load(Ordering::Relaxed)).collect();
+                    (i, req.kind.load(Ordering::Relaxed), bytes)
+                })
+                .collect();
+            litebox_util_log::debug!(
+                checking_kind:% = kind,
+                checking_key_len:% = key.len(),
+                checking_key_bytes:? = key,
+                pending_count:% = snapshot.len(),
+                pending_snapshot:? = snapshot;
+                "DIAG SharedUnixConnectQueue::has_pending: queue snapshot"
+            );
+        }
         self.requests
             .iter()
             .any(|req| req.state.load(Ordering::Acquire) == REQ_PENDING && req.matches(kind, key))
@@ -3202,6 +3265,14 @@ impl SharedUnixConnectQueue {
                     uid: req.client_uid.load(Ordering::Relaxed),
                     gid: req.client_gid.load(Ordering::Relaxed),
                 };
+                litebox_util_log::debug!(
+                    idx:% = i,
+                    kind:% = kind,
+                    key_len:% = key.len(),
+                    key_bytes:? = key,
+                    client_pid:% = cred.pid;
+                    "DIAG SharedUnixConnectQueue::try_claim: claimed request"
+                );
                 return Some((i, cred));
             }
         }
