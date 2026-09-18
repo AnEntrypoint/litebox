@@ -109,3 +109,79 @@ the FIRST step of the next pass, before touching anything else).
   net.rs` (threaded `global` through `UnixSocket::accept`'s call site), `litebox_shim_linux/src/
   syscalls/epoll.rs` (`EpollDescriptor::Unix` joined the bounded-repoll set in both `EpollFile::
   wait`/`has_unready_stdin_or_armed_timerfd_interest` and `PollSet::wait`/`has_unwakeable_fd`).
+
+## Fourteenth pass, 2026-09-18 — isolated AF_UNIX repro PASSED; full-boot stall is a NEW, DIFFERENT hang (not the connect/accept path, not the old CPU livelock)
+
+**Isolated repro (this pass's owed first step, thirteenth pass skipped it) — BUILT and RUN, PASSED
+clean.** `af_unix_crossproc_probe.c` (freestanding, no-libc, raw syscalls, built on the host with
+`clang --target=x86_64-unknown-linux-gnu -nostdlib -nostdinc -ffreestanding -fno-stack-protector
+-static -O1`, same convention as `advisor/probes/socketpair_fork_probe.c`): parent calls `fork()`
+FIRST, before any unix-socket fd exists in either process's fd table (so the fork itself is
+cross-process-fork ELIGIBLE regardless of the still-in-place "unix-socket fd kind" refusal, which
+only blocks a process that already HOLDS a unix-socket fd at ITS OWN fork time) -- the PARENT then
+creates the AF_UNIX listener (`bind`+`listen`) AFTER the fork, and the CHILD -- confirmed via log
+as a genuinely separate cross-process-forked OS process (`task-resume-probe (child, winpid=...)`,
+`shared_kernel_heap] INHERITED section`, `vmem-adopt-probe`) -- connects and exchanges real bytes
+both directions. Run under the fresh `b86f1f1` binary + `LITEBOX_PROCESS_FORK=1`, `--initial-files`
+tar with just `/probe/probe`. Real log evidence, one run, exit 0:
+```
+PRE-FORK: no socket fd open yet
+PARENT bind() rc=0
+PARENT listen() rc=0
+[process_fork_diag] ...task-resume-probe (child, winpid=18804)... entering real guest execution
+   0.509331500s  WARN ...[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT
+   guest pid ... self_pid=17308 owner_pid=1
+PARENT accept() rc=4
+CHILD connect() rc=0
+CHILD write rc=16
+PARENT read rc=16 data="PING-FROM-CHILD "
+PARENT write rc=17
+CHILD read rc=17 data="PONG-FROM-PARENT "
+CHILD: ROUND TRIP OK
+PARENT: child exit status=0
+DONE
+```
+The exact "ECONNREFUSED but address IS bound, by a DIFFERENT guest pid" WARN fired live (proving
+the repro genuinely hits the code path the thirteenth pass built), and the connect self-healed via
+the new shared-connect-queue retry to a real, byte-exact, bidirectional round trip. **Conclusion:
+`SharedUnixConnTable`/`SharedUnixConnectQueue` genuinely works for the minimal two-process case.**
+The full-boot stall below is therefore NOT this mechanism being broken.
+
+**Clean full-boot re-run, fresh `b86f1f1` binary, `LITEBOX_PROCESS_FORK=1` + `.wfgy/webtop_stack.sh`
+via the exact `--oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from
+.wfgy/webtop_seed.tar` recipe (`.wfgy/ab_repro_new.ps1`'s invocation, cache-hit, no image re-pull) —
+reached `NGINX_STARTED` then `NGINX_SELFTEST_FAILED` (both expected/pre-existing/documented, nginx's
+own SSL self-test gap, non-fatal), then produced ZERO further log growth and near-zero CPU growth
+across all 4 live guest-side processes for 4+ real minutes (confirmed twice, 100s apart, byte-identical
+log size both checks) — a GENUINE blocking stall, not the CPU-burning livelock class fixed in the
+tenth/twelfth passes.** `cdb -pv -y <pdb dir>` sampled two of the four live processes (`~*k`, all
+threads, non-invasive `-pv`/`qd`):
+- Both processes have a thread idling normally in `sys_epoll_pwait`/`is_input_device` (expected: a
+  guest waiting on real input/event fds).
+- **Both processes ALSO have a thread simultaneously blocked inside the SAME cross-process-fork
+  internal step**: `do_clone`'s `with_fork_duplicate_claim_owner` -> `net::wait_on_tun` ->
+  `Condvar::wait_timeout` (`litebox_platform_windows_userland/src/net.rs`, reached via
+  `diag_process_fork_task_resume_probe`). Two DIFFERENT OS processes stuck in this exact step at
+  the exact same time is a new, not-yet-documented observation.
+- One process has a thread inside `Process::sys_wait4`'s `prepare_for_exit` path (a process trying
+  to exit, waiting to reap a child) that never returns — consistent with, but not proof of, the
+  same `wait_on_tun`/duplicate-claim-owner mechanism never releasing whatever the exiting process's
+  wait4 is blocked on.
+**Not root-caused this pass** (out of time budget for this session) — leads for next pickup:
+(1) `net::wait_on_tun`'s `Condvar::wait_timeout` — does it have a bounded timeout at all, and if
+two processes both call `with_fork_duplicate_claim_owner` around the same real time, can each end
+up waiting on a condition only the OTHER would signal (a genuine two-holder deadlock over the
+network-duplicate-claim-owner protocol, not the AF_UNIX connect path)? (2) Does NOT look like the
+"broadened bounded-repoll scope" concern flagged at the end of the thirteenth pass — CPU stayed flat
+near-zero across the whole stall window, and a repoll-cost problem would show measurable, climbing
+CPU instead. That A/B (broadened vs narrowed epoll repoll scope) was NOT run this pass since the
+observed stall long-predates reaching the epoll/AF_UNIX-heavy part of the boot (still stuck around
+the nginx-selftest-adjacent stage, before any `[s] XVFB_UP`/`XVFB_FAILED` marker printed at all).
+(3) Symbolize/sample the OTHER two live processes (only 2 of 4 sampled this pass) and, if the stall
+reproduces again, get a THIRD independent sample of the same `wait_on_tun` frame ~30s apart to
+confirm it's a genuine unchanging wait (matching the tenth/twelfth-pass livelock-diagnosis method)
+rather than coincidental timing.
+**Host state**: only one runner instance ran at a time (confirmed via `Get-Process` before/after);
+killed cleanly via `Stop-Process -Force`, verified zero `litebox_runner`/`litebox-presenter`
+processes remained; host free RAM 2.4 GB immediately after kill, 4.8 GB ~5s later (recovering
+normally, consistent with prior sessions' unrelated-to-litebox RAM baseline).
