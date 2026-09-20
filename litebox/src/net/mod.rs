@@ -122,8 +122,23 @@ where
     local_port_allocator: LocalPortAllocator,
     /// Whether outside interaction is automatic or manual
     platform_interaction: PlatformInteraction,
-    /// FDs that are queued for eventual closure
-    queued_for_closure: Vec<SocketFd<Platform>>,
+    /// FDs that are queued for eventual closure. A fixed, pointer-free, `MAX_SOCKETS`-capacity
+    /// array of slots (`None` == empty), NOT a `Vec` (as this used to be) -- same fix, same
+    /// reason, as `closing_in_background` just below: `Network`, including this field inline
+    /// within it, lives in the cross-process shared kernel arena, and a `Vec`'s backing buffer is
+    /// a SEPARATE allocation on the constructing process's private heap, reachable only through a
+    /// raw pointer stored inline in the `Vec` -- a cross-process-forked child that ATTACHES to
+    /// (rather than constructs) the shared `GlobalState` reads that same pointer VALUE,
+    /// meaningless in its own address space. This field was originally left as the one exception
+    /// to the `closing_in_background` fix (2026-09-17) because it additionally touched
+    /// `DescriptorTable::drain_entries_full_covered_by`'s `&mut Vec<TypedFd<_>>` signature --
+    /// live-caught exactly as predicted (twenty-eighth pass): `TypedFd::as_usize().unwrap()`
+    /// panicked on `None`, reading a foreign process's dangling `Vec` pointer as if it were this
+    /// process's own storage, repeatedly, on a real webtop boot. Fixed by widening
+    /// `drain_entries_full_covered_by` to take `&mut [Option<TypedFd<_>>]` instead (a fixed array
+    /// coerces to that slice type for free), closing the gap this field's own prior doc comment
+    /// had already named and deferred.
+    queued_for_closure: [Option<SocketFd<Platform>>; MAX_SOCKETS],
     /// Sockets that are closing in the background. A fixed, pointer-free, `MAX_SOCKETS`-capacity
     /// array of slots (`None` == empty), NOT a `Vec` (as this used to be) -- `Network`, including
     /// this field inline within it, lives in the cross-process shared kernel arena
@@ -137,9 +152,7 @@ where
     /// `index out of bounds: the len is 256 but the index is 3414407380873671541` in
     /// `smoltcp::iface::socket_set::SocketSet::retain` (`litebox/src/net/local_ports.rs`'s
     /// `LocalPortAllocator::refcount` doc comment covers the identical bug class, found and fixed
-    /// the same pass; `queued_for_closure` above is the same still-open shape but additionally
-    /// touches the shared `DescriptorTable::drain_entries_full_covered_by` API, so it is left for
-    /// a dedicated follow-on rather than folded into this fix).
+    /// the same pass; `queued_for_closure` above got the same fix, twenty-eighth pass).
     closing_in_background: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
 }
 
@@ -200,7 +213,7 @@ where
             zero_time: litebox.x.platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
-            queued_for_closure: vec![],
+            queued_for_closure: core::array::from_fn(|_| None),
             closing_in_background: [None; MAX_SOCKETS],
         }
     }
@@ -558,11 +571,12 @@ where
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
     ///
-    /// **UPDATE (2026-09-17, later same day still): `socket_set`'s slot array and
-    /// `closing_in_background` are now both fixed, pointer-free, shared-arena-native storage --
-    /// see `Network::socket_set`'s `alloc_shared_socket_storage` and the `closing_in_background`
-    /// field's own doc comment for each fix and its live-caught evidence. `interface` (routes/
-    /// neighbor-cache) and `queued_for_closure` remain the still-open instances of this doc
+    /// **UPDATE (2026-09-17, later same day still; `queued_for_closure` added 2026-09-2x,
+    /// twenty-eighth pass): `socket_set`'s slot array, `closing_in_background`, and
+    /// `queued_for_closure` are now all fixed, pointer-free, shared-arena-native storage -- see
+    /// `Network::socket_set`'s `alloc_shared_socket_storage` and the `closing_in_background`/
+    /// `queued_for_closure` fields' own doc comments for each fix and its live-caught evidence.
+    /// `interface` (routes/neighbor-cache) remains the sole still-open instance of this doc
     /// comment's defect class.**
     ///
     /// `Network`'s smoltcp `socket_set`/`interface`/`closing_in_background`/`queued_for_closure`
@@ -699,7 +713,13 @@ where
             core::mem::forget(self.socket_set.remove(handle));
         }
         self.closing_in_background = [None; MAX_SOCKETS];
-        self.queued_for_closure.clear();
+        // Plain reassignment (not `mem::forget`-guarded like `socket_set` above) is safe here:
+        // `TypedFd`'s `OwnedFd` holds no heap allocation at all (a bare `u32` + `AtomicBool`), so
+        // dropping a queued-but-not-yet-closed one costs nothing and frees nothing in any
+        // process's address space -- its `Drop` impl only ever panics when the
+        // `panic_on_unclosed_fd_drop` Cargo feature is compiled in, which no runner in this
+        // workspace currently enables.
+        self.queued_for_closure = core::array::from_fn(|_| None);
         self.local_port_allocator.reset_after_poisoning();
     }
 
@@ -1247,7 +1267,15 @@ where
                 // It seems like there might be other duplicates around (e.g., due to `dup`), so we
                 // can't immediately close it out.
                 // We attempt to queue it for future closure and then just return.
-                self.queued_for_closure.push(dup_fd);
+                if let Some(slot) = self.queued_for_closure.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(dup_fd);
+                }
+                // Else: `MAX_SOCKETS` slots (matching every other live-socket-capacity bound in
+                // this struct) are already all occupied by other pending-closure duplicates --
+                // dropping `dup_fd` here on a guest-reachable path is a disclosed, deliberate
+                // trade-off (this specific duplicate's underlying entry stays open a little
+                // longer than ideal) rather than adding a NEW `.expect()`/panic to a class this
+                // whole struct already went to real effort to remove (twenty-eighth pass).
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
@@ -1275,7 +1303,7 @@ where
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
     /// were closed.
     fn attempt_to_close_queued(&mut self) -> bool {
-        if self.queued_for_closure.is_empty() {
+        if self.queued_for_closure.iter().all(Option::is_none) {
             // fast path
             return false;
         }

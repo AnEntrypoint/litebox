@@ -182,16 +182,23 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have at least one other duplicate floating around and still accessing an entry somewhere
     /// outside of `fds`; if an entry is returned, then all possible FDs to it have been removed
     /// removed from `fds` (and no other operation was concurrently accessing an entry).
+    /// Takes `fds` as a slice of `Option` slots, rather than a `Vec`, specifically so a caller
+    /// whose OWN backing storage for `fds` is a fixed-size, pointer-free array placed in a
+    /// cross-process-shared struct (e.g. `litebox::net::Network::queued_for_closure`) never needs
+    /// a private-heap `Vec` of its own just to call this function -- see that field's own doc
+    /// comment for the cross-process-dangling-pointer defect class this signature exists to let
+    /// callers avoid entirely, live-caught as a real `TypedFd::as_usize().unwrap()` panic on a
+    /// `None` read through exactly such a foreign `Vec` pointer.
     pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        fds: &mut Vec<TypedFd<Subsystem>>,
+        fds: &mut [Option<TypedFd<Subsystem>>],
     ) -> Vec<Subsystem::Entry> {
         // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
         // we have the same number of FDs as matching to the strong-count of a descriptor entry,
         // then it must be the case that we have everything needed to close the entries out.
         let removable_entries: Vec<*const RwLock<_, _>> = {
             let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
-            for fd in fds.iter() {
+            for fd in fds.iter().flatten() {
                 let entry = &self.entries[fd.x.as_usize().unwrap()];
                 // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
                 // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
@@ -211,12 +218,13 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Now we can actually go and remove every single such FD.
         let entries: Vec<Subsystem::Entry> = {
             let mut entries = vec![];
-            fds.retain(|fd: &TypedFd<Subsystem>| {
+            for slot in fds.iter_mut() {
+                let Some(fd) = slot else { continue };
                 let entry = &self.entries[fd.x.as_usize().unwrap()];
                 let entry = entry.as_ref().unwrap();
                 let entry_ptr = Arc::as_ptr(&entry.x);
                 if !removable_entries.contains(&entry_ptr) {
-                    return true;
+                    continue;
                 }
                 // This FD is removable
                 let entry = self.remove(fd);
@@ -224,8 +232,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     // This is the last of the individual entries that were holding a ref to this.
                     entries.push(entry);
                 }
-                false
-            });
+                *slot = None;
+            }
             entries
         };
         debug_assert_eq!(entries.len(), removable_entries.len());
