@@ -478,18 +478,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         for (fd, entry) in entries {
             let is_unix = matches!(entry.desc.upgrade(), Some(EpollDescriptor::Unix(_)));
             let result = entry.poll(global);
-            let is_ready = result.as_ref().is_some_and(|(_, ready)| *ready);
-            if is_unix && (is_ready || call_idx % 400 == 0) {
+            // ROOT CAUSE (2026-09-20, live-confirmed via cursor/mask tracing): `EpollEntry::poll`
+            // returns `(event: Option<EpollEvent>, is_still_ready: bool)`. `is_still_ready` means
+            // "keep auto-requeuing this entry for CONTINUOUS reporting" and is unconditionally
+            // `false` whenever the entry's own registration is `EDGE_TRIGGER`/`ONE_SHOT` -- BY
+            // DESIGN, matching real epoll: an edge-triggered fd is reported once per edge, not
+            // continuously. `event.is_some()` is the actual "is there a real event to report right
+            // now" signal, true regardless of edge/level. This function was pushing to the ready
+            // set on `is_still_ready` instead of `event.is_some()` -- harmless for the level-
+            // triggered stdin/timerfd cases this repoll originally covered (the two fields
+            // coincide there), but for any `EPOLLET`-registered Unix socket (exactly how Xvfb
+            // registers its accepted X11 client fd) this meant the bounded repoll could NEVER
+            // push it ready, even with real unread data sitting in its `SharedByteRing`: live
+            // trace showed `event_mask=Some(1)` (real `EPOLLIN`) paired with the old `is_ready`
+            // (i.e. `is_still_ready`) reading `false` on every single cycle. This is the actual
+            // mechanism behind the "Xvfb never reads `xset q`'s bytes" gap this whole investigation
+            // has been chasing since the twenty-fifth pass.
+            let has_event = result.as_ref().is_some_and(|(ev, _)| ev.is_some());
+            if is_unix && (has_event || call_idx % 400 == 0) {
                 litebox_util_log::debug!(
                     tid:% = diag_tid,
                     epfd:% = diag_epfd,
                     fd:% = fd,
-                    is_ready:% = is_ready,
+                    has_event:% = has_event,
                     event_mask:? = result.as_ref().and_then(|(ev, _)| ev.as_ref()).map(|ev| ev.events);
                     "DIAG repoll: Unix epoll interest checked"
                 );
             }
-            if is_ready {
+            if has_event {
                 self.ready.push(&entry);
             }
         }
@@ -555,6 +571,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         let events = file
             .poll(global, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
+        if is_unix {
+            // Definitive live answer to "does the very first poll at ADD time already see the
+            // ring's real data" -- every earlier check (mod_interest's own immediate re-poll,
+            // the bounded repoll) has read as structurally correct by source inspection alone;
+            // this is the one remaining unverified link (2026-09-20).
+            litebox_util_log::debug!(
+                fd:% = fd, raw_events:? = events;
+                "DIAG add_interest: initial poll result (Unix)"
+            );
+        }
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
             self.ready.push(&entry);
@@ -593,18 +619,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
 
         let mask = Events::from_bits_truncate(event.events);
+        let event_data = event.data; // copy out of the packed struct -- see `add_interest`'s
+        // identical local-variable copy just above; a direct `event.data` reference in the
+        // debug! macro below is an unaligned-field-of-packed-struct compile error.
+        // Mirrors `add_interest`'s own log -- some event loops (live-observed on this exact
+        // Xvfb/dbus boot path, 2026-09-20: `add_interest` registers with an EMPTY mask,
+        // `Events(0x0)`/only `EDGE_TRIGGER`, no real `IN` bit) register the fd once with a
+        // placeholder empty mask, then immediately `EPOLL_CTL_MOD` the real interest in --
+        // `add_interest`'s own log alone can never see that second call, so it looked
+        // indistinguishable from "the real interest is never registered at all" until this site
+        // existed too. Logged BEFORE `flags`/`mask` are moved into `inner` below (`EpollFlags`
+        // isn't `Clone`).
+        litebox_util_log::debug!(
+            fd:% = fd,
+            mask:? = mask,
+            flags:? = flags,
+            data:% = event_data,
+            is_unix:% = matches!(file, EpollDescriptor::Unix(_));
+            "EpollFile::mod_interest"
+        );
         inner.mask = mask;
         inner.flags = flags;
-        inner.data = event.data;
+        inner.data = event_data;
+        drop(inner);
 
         entry
             .is_enabled
             .store(true, core::sync::atomic::Ordering::Relaxed);
         let observer = entry.weak_self.clone();
-        drop(inner);
 
         // re-register the observer with the new mask
         if let Some(events) = file.poll(global, mask, Some(observer as _)) {
+            if matches!(file, EpollDescriptor::Unix(_)) {
+                litebox_util_log::debug!(
+                    fd:% = fd, raw_events:? = events;
+                    "DIAG mod_interest: initial poll result (Unix)"
+                );
+            }
             if !events.is_empty() {
                 // Add the updated entry to the ready list if the file is ready
                 self.ready.push(entry);

@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-18)
+# litebox — current state (2026-09-20)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -141,21 +141,13 @@ AF_UNIX bounded-15ms-repoll IS engaged and re-scanning -- not the bug. Found (no
 second `wait4(-1)` stall with no bounded-repoll fallback. Full detail: archive.
 
 **Twenty-first pass** — FIXED the `wait4(-1)` stall (commit `a771692`): no bounded-repoll
-fallback on `pid == -1`. Browser milestone not reached.
-
-**Twenty-second/twenty-third passes** — `_nofork_tick()` removed a `sleep`-forks-every-iteration
-cost from the Xvfb/dbus wait loops (script-only), then a real regression in that fix (dash's
-`$SECONDS` unset, collapsing the busy-wait to a no-op) was found+fixed. Chased an AF_UNIX
-rendezvous "livelock" REFUTED entirely by the twenty-fourth pass below. Browser milestone not
-reached. Full detail: archive.
-
-**Twenty-fourth pass** — live per-request `debug!()` instrumentation (`unix.rs`, kept) proved
-**the AF_UNIX rendezvous mechanism itself sound**: the one real cross-process connect per boot
-succeeded in ~23ms both times, no timing race, no address/key mismatch (`kind=1`/`kind=0` dual
-registration is correct real X11 behavior). **Real blocker found upstream of AF_UNIX entirely**:
-`$XSOCK` wait loop (lines 319-322) never completed even once. Also FIXED: `sys_wait4`'s `pid > 0`
-branch had no bounded-repoll fallback. Leading hypothesis for next pass: writable-layer
-cross-child-visibility (pickup item 3). Full detail: archive.
+fallback on `pid == -1`. **Twenty-second/twenty-third passes** — `_nofork_tick()` sleep-forks-
+every-iteration fix (script-only) + its own dash-`$SECONDS` regression fix; AF_UNIX rendezvous
+"livelock" theory raised then REFUTED by the twenty-fourth pass. **Twenty-fourth pass** — live
+per-request instrumentation proved the AF_UNIX rendezvous mechanism itself sound (one real connect
+per boot, ~23ms, no timing/address-mismatch); real blocker found upstream (`$XSOCK` wait loop never
+completing); also fixed `sys_wait4`'s `pid > 0` no-repoll gap. Browser milestone not reached by any
+of these three passes. Full detail (all three): archive.
 
 Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
 kill. **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass** — refuted a
@@ -182,49 +174,44 @@ precise cdb-confirmed evidence and next step. Did NOT reach the XFCE-desktop/bro
 milestone this pass (ten boot attempts total). Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`,
 twenty-fifth pass.
 
+**Twenty-sixth pass (2026-09-20) — ROOT-CAUSED AND FIXED the "Xvfb never reads `xset q`'s bytes"
+gap; `XVFB_UP` printed for the first time ever.** Root cause + fix: pickup list item (-2) below.
+Two hypotheses REFUTED en route with live evidence, both worth keeping: `epoll_ctl(ADD)` DOES fire
+for Xvfb's accepted client fd, just with an initially-EMPTY mask immediately followed by a real
+`EPOLL_CTL_MOD` (a legitimate os/epoll pattern the old add-only logging couldn't see); and the
+`SharedByteRing` cursor DOES become visible cross-process within ~15-30ms (refuting a shared-
+memory-visibility bug). Live-verified on the DEBUG binary: `try_recvfrom_shared: read slot=0` fired
+repeatedly (first time ever), `[s] XVFB_UP` printed, boot reached `[s] DE_LAUNCHED (image
+startwm.sh)` and attempted `[s] SELKIES_PORT_UP` (curl_exit=137 — safety-killed at host RAM
+~320-480MB / 19 concurrent forked processes, not a further litebox bug). Release-binary/real-
+browser milestone: not yet attempted this pass. Full raw-log evidence: `docs/
+AGENTS_ARCHIVE_2026-09-18.md`, twenty-sixth pass.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
-(-2) ~~root-cause `net::wait_on_tun`~~/~~`unix_addr_table` sharing~~/~~fatal `xset` kill~~/~~stall
-in `connect_cross_process`/`net::wait_on_tun`~~/~~`has_pending`/`SharedUnixConnectQueue` matching
-logic~~/~~`SharedUnixConnTable` slot leak~~ (commit `05d279d`)/~~`sys_wait4`'s `pid == -1` no-repoll
-gap~~ (commit `a771692`)/~~`sleep 1`-forks-every-iteration in the `$XSOCK`/dbus wait loops~~
-(script-only, twenty-second pass)/~~`net::NatGateway::new`/`net::wait_on_tun` retry-hang theory~~/
-~~`_nofork_tick` no-ops under dash, collapsing the retry window to zero~~ (script-only,
-twenty-third pass)/~~"epoll never got the bounded-repoll/shared-queue wiring"~~/~~AF_UNIX
-rendezvous timing race~~/~~AF_UNIX rendezvous address/key mismatch~~ (both REFUTED with live
-per-request instrumentation, twenty-fourth pass: the mechanism is sound, only ONE real
-cross-process connect ever occurs and it succeeds in ~23ms)/~~`sys_wait4`'s `pid > 0` targeted
-branch had no repoll fallback~~ (commit pending, twenty-fourth pass, mirrors the already-fixed
-`pid == -1` case)/~~`webtop_stack.sh`'s `$XSOCK` wait loop never sees a sibling-bound AF_UNIX
-path~~ (twenty-fifth pass: `cross_process_bound_unix_socket_status` + presence-table fallback in
-`do_stat`/`do_access`, `litebox_shim_linux/src/syscalls/file.rs`)/~~`SHARED_UNIX_CROSS_CONNECT_
-TIMEOUT` (3s) too tight under real multi-process contention~~ (twenty-fifth pass: widened to 15s)
-— all REFUTED or FIXED, passes 15-25 (archive). **Current top blocker (twenty-fifth pass,
-continued)**: connection establishment works end-to-end now (live-confirmed), but the established
-connection's DATA doesn't flow — `xset q` writes its 12-byte X11 `xConnClientPrefix` into the
-shared ring (`try_sendto_shared: wrote`, new permanent debug site), but Xvfb's own read of it
-(`try_recvfrom_shared: read`) was never observed across three full boots (8-20+ min each). Two
-live cdb snapshots of Xvfb's guest thread, seconds apart, show DIFFERENT stack addresses on the
-same `commit_wait` frame — proves it's a correctly-cycling bounded-repoll (`sys_epoll_pwait ->
-EpollFile::wait`), not frozen, so the repoll runs but never sees the connected client fd as ready.
-**Next step**: a THROTTLED `syscalls::epoll=debug` (mirror `has_pending`'s 1-in-400 gate — an
-unthrottled one hit 78MB in under 8 minutes, unusable) to check whether Xvfb's own
-`epoll_ctl(ADD, new_client_fd)` ever runs after `accept()` (leading hypothesis: it doesn't), or
-`entry.poll(global)`'s readiness bookkeeping has a gap specific to a freshly-`Shared`-transport
-`Connected` socket vs. the well-tested `Local` case. Full detail: archive. Once closed, confirm
-`[s] XVFB_UP` prints, then push to `DBUS_UP`/`DE_LAUNCHED`/`SELKIES_PORT_UP`. Secondary, not yet
-chased: the `kind=1` (abstract) connect variant still timed out at 15s in the one run exercising
-both, `kind=0` (path) succeeded — only worth chasing if a future pass sees BOTH fail. The general
-writable-layer-visibility gap (item 3 below) remains open for anything that ISN'T a bound AF_UNIX
-path (`webtop_stack.sh`'s own `/tmp/empty`, still observed). cdb notes (still current, PLUS: two
-snapshots seconds apart distinguish cycling from frozen — one snapshot alone is NOT proof): set
-`_NT_SYMBOL_PATH` env var (not `-y`); only the LAST `-c` flag is honored, chain one `;`-joined
-string (e.g. `~*kb;qd`, never a bare `q`); dump `~*kb` first (thread index isn't stable across
-binaries), then `.frame N; dv /t /v` on the specific frame of interest. Separately, still open:
+(-2) Fourteen AF_UNIX/epoll/wait4/network hypotheses raised across passes 15-26 were each
+REFUTED or FIXED (root-cause + commit sha, where one exists, listed pass-by-pass in the archive) —
+nothing from that list is open. The LAST of them, and the deepest: Xvfb's accepted client fd's data
+never got read because `EpollFile::repoll_stdin_and_timerfd_interests` decided ready-set membership
+from `EpollEntry::poll`'s `is_still_ready` field instead of its `event.is_some()` field —
+`is_still_ready` is unconditionally `false` for any `EPOLLET`-registered fd (by design), and Xvfb
+registers its accepted X11 client fd exactly that way, so the bounded repoll could never mark it
+ready no matter how much unread data sat in its ring. FIXED twenty-sixth pass
+(`litebox_shim_linux/src/syscalls/epoll.rs`); live-verified: `[s] XVFB_UP` printed for the first
+time ever. **Current top blocker**: release-binary + real-browser/terminal/apps
+milestone not yet attempted; on the DEBUG binary, host RAM fell to ~320-480MB once dbus/XFCE/
+selkies forked 19 concurrent Windows processes, forcing a safety kill before `SELKIES_PORT_UP`
+could be confirmed (`curl_exit=137`, not a known litebox bug). Next step: retry on the RELEASE
+binary (should cost less RAM per forked process than the DEBUG build) with the real `.wfgy/
+webtop_stack.sh`, watching `FreePhysicalMemory` closely. Secondary, not yet chased: the `kind=1`
+(abstract) connect variant still timed out at 15s in the one run exercising both, `kind=0` (path)
+succeeded — only worth chasing if a future pass sees BOTH fail. The general writable-layer-
+visibility gap (item 3 below) remains open for anything that ISN'T a bound AF_UNIX path
+(`webtop_stack.sh`'s own `/tmp/empty`, still observed). Separately, still open:
 `UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth pass), and a
 `mkdir -p /usr/share/selkies/web` + `printf ... > .../50x.html` `No such file or directory`
 (`webtop_stack.sh:107-110`) — same class as the `/tmp/empty` gap (item 3 below), non-fatal.
-Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-fourth passes.
+Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-sixth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 

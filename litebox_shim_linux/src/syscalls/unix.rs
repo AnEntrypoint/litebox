@@ -939,8 +939,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         if !write_ring.try_write_all(&msg.data) {
             return Err((msg, Errno::EAGAIN));
         }
+        // `diag_cursor()` read AFTER the write (2026-09-20) -- pairs with the same call in
+        // `check_io_events_shared` to prove/disprove cross-process visibility of this exact
+        // cursor update from the writer's OWN process's point of view.
+        let (wp, rp) = write_ring.diag_cursor();
         litebox_util_log::debug!(
-            slot:% = *slot, is_client:% = *is_client, len:% = msg.data.len();
+            slot:% = *slot, is_client:% = *is_client, len:% = msg.data.len(),
+            write_pos_after:% = wp, read_pos_after:% = rp;
             "DIAG try_sendto_shared: wrote"
         );
         Ok(msg.data.len())
@@ -1145,6 +1150,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
         if !write_ring.is_full() {
             events |= Events::OUT;
+        }
+        // 1-in-100 throttled + always-log-on-nonzero-cursor (2026-09-20): definitive answer to
+        // whether THIS process's view of the peer-written ring's cursor ever advances off
+        // (0, 0) at all -- if `write_pos` is stuck at 0 here while the writer's own process
+        // logged a successful `try_write_all`/`try_sendto_shared: wrote` for this exact slot,
+        // that's live proof of a cross-process shared-memory visibility gap (same root-cause
+        // shape as the earlier writable-layer-visibility bug), not a logic bug in this
+        // readiness check itself.
+        static DIAG_CIOE_COUNTER: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let (wp, rp) = read_ring.diag_cursor();
+        let call_idx = DIAG_CIOE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if wp != 0 || call_idx % 100 == 0 {
+            litebox_util_log::debug!(
+                slot:% = *slot,
+                is_client:% = *is_client,
+                read_write_pos:% = wp,
+                read_read_pos:% = rp,
+                computed_events:? = events;
+                "DIAG check_io_events_shared: read_ring cursor snapshot"
+            );
         }
         events
     }
@@ -2960,6 +2986,16 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 
     fn is_shutdown(&self) -> bool {
         self.cursor.lock().write_shutdown
+    }
+
+    /// Diagnostic-only (2026-09-20): exposes the raw cursor for the targeted, throttled
+    /// `check_io_events_shared` trace below -- answers definitively whether a reader in a
+    /// DIFFERENT process ever observes the writer's cursor update at all (root-causing the
+    /// AF_UNIX Xvfb-never-reads-`xset q` gap), as opposed to inferring it indirectly from
+    /// `is_empty()` alone.
+    fn diag_cursor(&self) -> (usize, usize) {
+        let cursor = self.cursor.lock();
+        (cursor.write_pos, cursor.read_pos)
     }
 }
 

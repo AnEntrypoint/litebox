@@ -1618,3 +1618,101 @@ gitignored, deleted after use) held the two raw cdb snapshots referenced above.
 
 **Files touched this continuation**: `litebox_shim_linux/src/syscalls/unix.rs` (two new permanent
 `debug!()` sites in `try_sendto_shared`/`try_recvfrom_shared`, kept).
+
+## Twenty-sixth pass, 2026-09-20 — ROOT-CAUSED AND FIXED: Xvfb never reading `xset q`'s bytes; `[s] XVFB_UP` printed for the first time ever
+
+Picked up exactly where the twenty-fifth pass's own pickup list left off: hypothesis (a) (does
+`epoll_ctl(ADD, new_client_fd)` fire at all) and (b) (a readiness-bookkeeping gap specific to
+`Shared`-transport `Connected` sockets) from that section above, tested with a real throttled
+trace instead of further static reading.
+
+**Instrumentation added** (`litebox_shim_linux/src/syscalls/epoll.rs`, `unix.rs`):
+- `EpollFile::wait`'s old unthrottled per-~15ms-iteration `debug!()` ("DIAG EpollFile::wait: loop
+  iteration") demoted to `trace!()` -- this alone was almost the entire 78MB/8min blowup the
+  twenty-fifth pass flagged as unusable.
+- `repoll_stdin_and_timerfd_interests`'s own per-cycle `debug!()` demoted to `trace!()` too; a new
+  per-Unix-entry `debug!()` added in its place, 1-in-400-throttled on the routine "still not ready"
+  case but UNCONDITIONAL the moment an entry is seen ready (or, post-fix, has a real event) --
+  this is what actually caught the bug, see below.
+- `add_interest`/`mod_interest` both gained an `is_unix` field on their existing per-call `debug!()`
+  (both already low-volume -- 33 total `add_interest` calls across a whole boot -- so no new
+  throttling needed), plus a NEW `debug!()` logging the raw `Events` returned by their own initial
+  `file.poll(...)` call for any Unix descriptor.
+- `SharedByteRing` gained `diag_cursor()` (returns `(write_pos, read_pos)`), logged from both
+  `try_sendto_shared` (after the write) and a new throttled site in `check_io_events_shared`
+  (1-in-100 + unconditional whenever `write_pos != 0`) -- built specifically to settle whether the
+  peer's ring-cursor update is visible cross-process at all, independent of the higher-level
+  `is_empty()` boolean.
+
+**Live findings, in the order they closed off hypotheses**:
+
+1. `epoll_ctl(ADD)` DOES fire for Xvfb's accepted client fd (confirmed fd=8 in one traced run,
+   correlated via its `data=` pointer to the SAME fd across `add_interest`/`mod_interest`/repoll
+   log lines). Hypothesis (a) REFUTED. But its own initial registration mask was EMPTY
+   (`Events(0x0)`, or just the `EDGE_TRIGGER` bit alone) -- Xvfb's os/epoll layer reserves the slot
+   first with no real interest, then immediately follows with a real `EPOLL_CTL_MOD` setting
+   `EPOLLIN|EPOLLET`, ~70 microseconds later. This ADD-then-MOD pattern is a real, legitimate
+   event-loop technique -- the investigation's OWN `add_interest`-only logging from the prior pass
+   could never have seen the real mask this way, which is why it looked indistinguishable from
+   "the real interest never gets registered."
+2. The `SharedByteRing` cursor genuinely propagates cross-process: `try_sendto_shared`'s own
+   `write_pos_after=12` (client side, `is_client=true`) is followed, within ~15-30ms (one to two
+   bounded-repoll cycles), by `check_io_events_shared` on Xvfb's side (`is_client=false`) correctly
+   reading `read_write_pos=12` and computing `Events(IN | OUT)`. The FIRST one or two checks
+   immediately after `add_interest`/`mod_interest` (run synchronously, before that propagation
+   window elapsed) legitimately still saw `write_pos=0` -- a real, small, and ultimately harmless
+   race, NOT a shared-memory-visibility bug (that hypothesis, raised mid-pass, is REFUTED).
+3. **The real bug, found by comparing the new per-Unix-entry repoll log against `mod_interest`'s
+   own initial-poll log**: `mod_interest`'s own synchronous re-poll ran too early (still inside the
+   ~15-30ms propagation window above) and saw `Events(0x0)` -- expected, not the bug. But the
+   BOUNDED REPOLL, which runs every ~15ms specifically to catch exactly this kind of case, kept
+   showing `event_mask=Some(1)` (a real, correctly-computed `EPOLLIN`) on EVERY cycle, for 60+
+   consecutive cycles across multiple full boots, while its OWN `is_ready` field read `false` on
+   every one of those same cycles. That is a direct contradiction inside `EpollFile::
+   repoll_stdin_and_timerfd_interests`'s own logic, not a data-visibility question at all.
+   `EpollEntry::poll` returns `(event: Option<EpollEvent>, is_still_ready: bool)`; the repoll
+   function was branching on `is_still_ready` (the SECOND field) to decide ready-set membership.
+   `is_still_ready` is DELIBERATELY forced `false` whenever the entry's own registration carries
+   `EPOLLET`/`EPOLLONESHOT` (real edge-triggered semantics: "don't keep auto-reporting this
+   forever", not "there's nothing to report") -- see `EpollEntry::poll`'s own body. Xvfb registers
+   its accepted X11 client fd `EPOLLET` (confirmed above), so `is_still_ready` was unconditionally
+   `false` for it regardless of real readiness, and the repoll's `if is_ready { self.ready.push(...)
+   }` (using that field under the misleading local name `is_ready`) could NEVER push it, no matter
+   how much unread data sat in the ring. `ReadySet::pop_multiple` -- the OTHER consumer of the same
+   `(event, is_still_ready)` tuple -- already used the two fields correctly (`event` to decide
+   whether to deliver, `is_still_ready` separately to decide whether to auto-requeue), which is why
+   this exact bug shape never surfaced anywhere else: every other fd kind that reaches the bounded
+   repoll (stdin, timerfd) is realistically always registered level-triggered, where the two fields
+   happen to coincide, masking the distinction.
+
+**The fix** (`repoll_stdin_and_timerfd_interests`): push to the ready set on `event.is_some()`
+instead of `is_still_ready`, renaming the local binding to `has_event` for clarity. No other call
+site needed a matching fix -- `pop_multiple` was already correct, and the initial `add_interest`/
+`mod_interest` polls already used `!events.is_empty()` on the raw `Events`, an equivalent-safe
+check that was never the bug (see finding 2's timing note for why those still sometimes read empty
+regardless).
+
+**Live verification, DEBUG binary, same `.wfgy/webtop_stack.sh` full boot**: after the fix,
+`try_recvfrom_shared: read slot=0` fired repeatedly (the FIRST time this exact log line had ever
+been observed in this entire multi-day investigation), followed by `[s] XVFB_UP` (never printed
+before this pass, across dozens of boot attempts over 26 passes). The boot then reached `[s]
+DE_LAUNCHED (image startwm.sh)` and attempted `[s] SELKIES_PORT_UP` before returning
+`curl_exit=137` -- at that exact point host free RAM had fallen to ~320-480KB... (KB, not a typo:
+roughly 320,000-480,000 KB free, i.e. ~0.3-0.5GB) with 19 concurrent cross-process-forked Windows
+processes alive, and the run was deliberately WMI-`Terminate`d for host safety before determining
+whether `SELKIES_PORT_UP`'s own failure is a real litebox bug or simply memory starvation at that
+process count. Not yet re-attempted with more host headroom or on the RELEASE binary (which should
+cost meaningfully less RSS per forked process than the DEBUG build, per the project's own standing
+build-config notes).
+
+**Not yet done this pass**: the release-binary + real-browser/terminal/apps milestone. Given how
+far this pass got on the DEBUG binary (further than any of the prior 25 passes), this is the most
+promising point this whole investigation has ever been at going into that attempt.
+
+**Files touched**: `litebox_shim_linux/src/syscalls/epoll.rs` (the real fix, plus the trace/log
+throttling and new diagnostic sites), `litebox_shim_linux/src/syscalls/unix.rs` (`SharedByteRing::
+diag_cursor` + its two call sites). All diagnostic `debug!()` sites kept as permanent, low-volume
+additions (matching this project's own established practice for high-value single-shot evidence
+sites), consistent with everything already living in `try_sendto_shared`/`try_recvfrom_shared`
+from the prior pass.
+
