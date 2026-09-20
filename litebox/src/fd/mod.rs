@@ -189,6 +189,23 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// comment for the cross-process-dangling-pointer defect class this signature exists to let
     /// callers avoid entirely, live-caught as a real `TypedFd::as_usize().unwrap()` panic on a
     /// `None` read through exactly such a foreign `Vec` pointer.
+    ///
+    /// **A further, DIFFERENT cross-process gap, also live-caught (twenty-eighth pass), once the
+    /// above was fixed**: `self` (`Descriptors`) is deliberately PER-PROCESS-PRIVATE (see
+    /// `GlobalStateHandle::litebox`'s own doc comment), but `fds` -- when it is
+    /// `Network::queued_for_closure` -- is genuinely CROSS-PROCESS-SHARED, and every process runs
+    /// its own periodic tick that calls this function against that SAME shared queue. A `TypedFd`
+    /// one process pushed encodes an index into THAT process's own private `entries`, meaningless
+    /// (out of bounds, or resolving to an unrelated live entry) in a DIFFERENT process's table --
+    /// confirmed live: `index out of bounds: the len is 16 but the index is 31`. Every lookup
+    /// below is therefore a best-effort, `None`-tolerant lookup: an index this process's own
+    /// table cannot resolve is left untouched in `fds` (never cleared, never force-removed) so
+    /// whichever process's OWN tick the index actually belongs to can still resolve and close it
+    /// correctly later -- the accepted, disclosed cost is that an entry belonging to a process
+    /// that exits before its own next tick can leak (stay queued forever, never closed), the same
+    /// class of bounded trade-off already accepted elsewhere in this codebase (e.g.
+    /// `Network::reset_after_poisoning`'s own doc comment) rather than a crash on a guest-
+    /// reachable path.
     pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fds: &mut [Option<TypedFd<Subsystem>>],
@@ -199,11 +216,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let removable_entries: Vec<*const RwLock<_, _>> = {
             let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
             for fd in fds.iter().flatten() {
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
-                // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
-                // need to expand it out, we'd simply have a `continue` here.
-                let entry = entry.as_ref().unwrap();
+                // `None` here means either a real closed-fd (the ordinary, previously-anticipated
+                // case -- see the historical comment this replaced) or a foreign-process index
+                // this table cannot resolve (see this function's own doc comment) -- both skip
+                // identically; there is no way, or need, to tell them apart from here.
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else { continue };
                 strong_count_and_count
                     .entry(Arc::as_ptr(&entry.x))
                     .or_insert((Arc::strong_count(&entry.x), 0))
@@ -220,8 +238,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             let mut entries = vec![];
             for slot in fds.iter_mut() {
                 let Some(fd) = slot else { continue };
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                let entry = entry.as_ref().unwrap();
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
                 let entry_ptr = Arc::as_ptr(&entry.x);
                 if !removable_entries.contains(&entry_ptr) {
                     continue;
