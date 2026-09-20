@@ -31,7 +31,7 @@ use crate::{
     GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
     syscalls::signal,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -47,6 +47,191 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
         }
     }
 }
+
+/// Longest path key [`SharedFilePublishTable`] indexes by. Matches
+/// `syscalls::unix::UNIX_ADDR_KEY_MAX` for consistency -- there's no principled reason for either
+/// bound to differ, and both simply cap a fixed-size atomic byte array.
+const FILE_PUBLISH_PATH_MAX: usize = 108;
+
+/// Longest content [`SharedFilePublishTable`] stores per entry. A D-Bus session address string
+/// (`unix:path=/tmp/dbus-XXXXXXXXXX,guid=<32 hex chars>\n`) is well under 128 bytes in practice;
+/// sized with headroom while staying tiny and fixed -- this table is not, and must never become,
+/// a general byte-content sharing mechanism (see the table's own doc comment).
+const FILE_PUBLISH_CONTENT_MAX: usize = 256;
+
+/// A small, fixed number of slots: this table exists for a FEW well-known daemon-published files
+/// per boot (today: exactly one, D-Bus's `/tmp/addr`), never a general "every small file" cache.
+const FILE_PUBLISH_CAPACITY: usize = 8;
+
+const FILE_PUBLISH_EMPTY: u32 = 0;
+const FILE_PUBLISH_WRITING: u32 = 1;
+const FILE_PUBLISH_OCCUPIED: u32 = 2;
+
+/// One slot of [`SharedFilePublishTable`]. Same shape, and same reasoning, as
+/// `syscalls::unix::UnixAddrPresenceSlot`: no `Vec`/`Box`/pointer anywhere, so the whole slot's
+/// live state is its own inline bytes and needs no second `SharedKernelStateProvider` slot to be
+/// genuinely cross-process-visible as an ordinary `GlobalState` field.
+struct FilePublishSlot {
+    state: AtomicU32,
+    path_len: AtomicU32,
+    content_len: AtomicU32,
+    owner_pid: AtomicU32,
+    path: [AtomicU8; FILE_PUBLISH_PATH_MAX],
+    content: [AtomicU8; FILE_PUBLISH_CONTENT_MAX],
+}
+
+impl FilePublishSlot {
+    fn new_empty() -> Self {
+        Self {
+            state: AtomicU32::new(FILE_PUBLISH_EMPTY),
+            path_len: AtomicU32::new(0),
+            content_len: AtomicU32::new(0),
+            owner_pid: AtomicU32::new(0),
+            path: core::array::from_fn(|_| AtomicU8::new(0)),
+            content: core::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+
+    fn matches_path(&self, path: &[u8]) -> bool {
+        self.path_len.load(Ordering::Relaxed) as usize == path.len()
+            && path
+                .iter()
+                .enumerate()
+                .all(|(i, b)| self.path[i].load(Ordering::Relaxed) == *b)
+    }
+}
+
+/// Cross-process-visible side channel for a SMALL, NAMED byte-string a long-lived, never-exiting
+/// daemon publishes (and may occasionally republish) that a short-lived sibling process needs to
+/// read -- the gap `syscalls::unix::SharedUnixAddrPresenceTable` deliberately left open (that
+/// table proves only that a path exists, never its content -- see its own doc comment).
+///
+/// **Why this exists.** Litebox's ordinary writable-layer content only crosses process
+/// boundaries at a cross-process `fork()`'s own spawn/exit instants
+/// (`litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s doc
+/// comment). `dbus-daemon --nofork --print-address > /tmp/addr` never forks or exits again once
+/// it starts, so its write to `/tmp/addr` never reaches that sync point -- and the parent shell's
+/// own poll loop (`webtop_stack.sh`, deliberately fork-free via `_nofork_tick`, to avoid the fork
+/// corruption class a naive `bash -c` retry loop otherwise hits) never gets one either. Confirmed
+/// live as the twenty-seventh pass's `DBUS_FAILED` root cause (`AGENTS.md` pickup item 3).
+///
+/// # Scope -- deliberately narrow
+///
+/// This is NOT a general writable-layer content-sync mechanism. That approach was tried, as a
+/// periodic per-process full-tree export/merge thread, and PROVEN to cause a worse,
+/// 100%-reproducible regression (a stale snapshot permanently clobbering a fresher one via
+/// `publish_as_container_fs_snapshot`'s size-based tie-breaker -- see the twenty-seventh pass's
+/// writeup in `docs/AGENTS_ARCHIVE_2026-09-18.md`). This table holds only a HANDFUL of entries
+/// ([`FILE_PUBLISH_CAPACITY`]), each capped at [`FILE_PUBLISH_CONTENT_MAX`] bytes, for paths this
+/// crate explicitly opts in via [`SHARED_PUBLISH_PATHS`] -- widening it to "every small file"
+/// would BE the general mechanism already ruled out.
+///
+/// # How it's used
+///
+/// `do_write` publishes into this table (never instead of the real per-process write -- the
+/// owning process's own filesystem view stays the actual source of truth) whenever a write to an
+/// opted-in path succeeds, at the real byte offset being written (so a caller that emits its
+/// publication across more than one `write()` call still ends up with the whole thing published,
+/// not just its last call -- see `Task::maybe_publish_shared_file`). `do_stat`/`do_access`/
+/// `do_open_resolved` consult it, on a real local `ENOENT`, to MATERIALIZE a genuine local copy
+/// (`Task::materialize_shared_publish`) rather than only synthesizing a stat result the way
+/// `cross_process_bound_unix_socket_status` does for an AF_UNIX bind path -- a bind path has no
+/// content to copy (litebox has no `FileType::Socket` at all), but a short byte string can be
+/// copied bit for bit, so the materialized file behaves completely normally for every subsequent
+/// `stat`/`open`/`read` in this process, with no further special-casing needed anywhere else.
+pub(crate) struct SharedFilePublishTable {
+    slots: [FilePublishSlot; FILE_PUBLISH_CAPACITY],
+}
+
+impl SharedFilePublishTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| FilePublishSlot::new_empty()),
+        }
+    }
+
+    /// Publishes `bytes` at `offset` within `path`'s published content (creating the entry on its
+    /// first call for a given path). An `offset` of `0` RESETS the published length to exactly
+    /// this write's own extent -- matching real Linux `O_TRUNC` + sequential-write-from-start
+    /// semantics, so a daemon that restarts and rewrites its address file from scratch doesn't
+    /// leak stale trailing bytes from a previous incarnation. Any other `offset` extends the
+    /// published length if this write reaches further than what's already recorded (a plain
+    /// append), without disturbing bytes outside `[offset, offset + bytes.len())`. Returns
+    /// `false` -- never panics, this is a guest-reachable path -- if `path` exceeds this table's
+    /// fixed bounds or every slot is occupied by a DIFFERENT path; either only degrades this side
+    /// channel, never the real per-process write a caller already performed first.
+    pub(crate) fn publish_at(&self, path: &[u8], offset: usize, bytes: &[u8], owner_pid: u32) -> bool {
+        if path.len() > FILE_PUBLISH_PATH_MAX || offset > FILE_PUBLISH_CONTENT_MAX {
+            return false;
+        }
+        let end = offset.saturating_add(bytes.len()).min(FILE_PUBLISH_CONTENT_MAX);
+        let bytes = &bytes[..end.saturating_sub(offset)];
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED && slot.matches_path(path) {
+                slot.state.store(FILE_PUBLISH_WRITING, Ordering::Release);
+                for (i, b) in bytes.iter().enumerate() {
+                    slot.content[offset + i].store(*b, Ordering::Relaxed);
+                }
+                let existing_len = slot.content_len.load(Ordering::Relaxed) as usize;
+                let new_len = if offset == 0 { end } else { existing_len.max(end) };
+                slot.content_len.store(new_len as u32, Ordering::Relaxed);
+                slot.owner_pid.store(owner_pid, Ordering::Relaxed);
+                slot.state.store(FILE_PUBLISH_OCCUPIED, Ordering::Release);
+                return true;
+            }
+        }
+        for slot in &self.slots {
+            if slot
+                .state
+                .compare_exchange(
+                    FILE_PUBLISH_EMPTY,
+                    FILE_PUBLISH_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                for (i, b) in path.iter().enumerate() {
+                    slot.path[i].store(*b, Ordering::Relaxed);
+                }
+                slot.path_len.store(path.len() as u32, Ordering::Relaxed);
+                for (i, b) in bytes.iter().enumerate() {
+                    slot.content[offset + i].store(*b, Ordering::Relaxed);
+                }
+                slot.content_len.store(end as u32, Ordering::Relaxed);
+                slot.owner_pid.store(owner_pid, Ordering::Relaxed);
+                slot.state.store(FILE_PUBLISH_OCCUPIED, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Looks up `path`; returns its published content (owned, copied out of the shared slot) if
+    /// ANY process in the fork family has published it.
+    pub(crate) fn lookup(&self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+        if path.len() > FILE_PUBLISH_PATH_MAX {
+            return None;
+        }
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED && slot.matches_path(path) {
+                let len = (slot.content_len.load(Ordering::Relaxed) as usize).min(FILE_PUBLISH_CONTENT_MAX);
+                let mut out = alloc::vec::Vec::with_capacity(len);
+                for slot_byte in &slot.content[..len] {
+                    out.push(slot_byte.load(Ordering::Relaxed));
+                }
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
+/// Paths a long-lived, non-forking daemon publishes that a short-lived sibling process needs to
+/// read -- see [`SharedFilePublishTable`]'s own doc comment for why this is a fixed, explicit
+/// list rather than a general "every small write" mechanism. Extend this list, not the mechanism,
+/// for the next daemon-published-file gap this shape fits.
+const SHARED_PUBLISH_PATHS: &[&str] = &["/tmp/addr"];
 
 /// LOUD, allocation-free diagnostic for an `open`/`openat` on a `/proc/` or `/sys/` path that
 /// falls through to a generic error (almost always `ENOENT`) instead of being served by one of
@@ -790,6 +975,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let file = match self.do_open(path.clone(), flags, mode) {
             Ok(file) => file,
+            // A real local `ENOENT` on a path a sibling has published content for (see
+            // `SharedFilePublishTable`'s own doc comment): materialize a genuine local copy, then
+            // retry the SAME open once against that now-real file -- e.g. `read -r A < /tmp/addr`
+            // in `webtop_stack.sh` reaching here after `[ -s /tmp/addr ]` already saw the
+            // materialized stat from `do_stat`'s matching fallback.
+            Err(Errno::ENOENT) if self.materialize_shared_publish(path_str) => {
+                match self.do_open(path.clone(), flags, mode) {
+                    Ok(file) => file,
+                    Err(errno) => {
+                        diag_raw_print_proc_sys_open_miss(self.global.platform, path_str, errno);
+                        return Err(errno);
+                    }
+                }
+            }
             Err(errno) => {
                 diag_raw_print_proc_sys_open_miss(self.global.platform, path_str, errno);
                 return Err(errno);
@@ -1645,6 +1844,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        // `SharedFilePublishTable`'s write-side hook (see its own doc comment): resolve the real
+        // byte offset THIS write will land at, before performing it, only for a path this crate
+        // has explicitly opted in via `SHARED_PUBLISH_PATHS` -- `sys_lseek(fd, 0, CUR)` reports
+        // the current position without requiring read access on `fd` (unlike a real read-back
+        // would, and `dbus-daemon --print-address > /tmp/addr`'s fd is write-only), and without
+        // moving it either (`offset=0` on `SEEK_CUR` is a pure query on real Linux, mirrored by
+        // `sys_lseek`'s own implementation here).
+        let publish_target = {
+            let files = self.files.borrow();
+            files.lookup_fd_path(raw_fd).and_then(|p| {
+                let path = p.to_str().ok()?;
+                SHARED_PUBLISH_PATHS.contains(&path).then(|| path.to_string())
+            })
+        };
+        let publish_offset = match (&publish_target, offset) {
+            (None, _) => None,
+            (Some(_), Some(explicit)) => Some(explicit),
+            (Some(_), None) => self
+                .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                .ok(),
+        };
         let files = self.files.borrow();
         let res = files
             .run_on_raw_fd(
@@ -1711,6 +1931,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL))
             .flatten();
+        drop(files);
+        if let Ok(n) = res
+            && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
+        {
+            let published = self.global.shared_file_publish.publish_at(
+                path.as_bytes(),
+                pos,
+                &buf[..n],
+                self.pid.get() as u32,
+            );
+            if published {
+                litebox_util_log::warn!(
+                    path:% = path, offset:% = pos, len:% = n, self_pid:% = self.pid.get();
+                    "DIAG shared_file_publish: republished a sibling-visible file after a local write"
+                );
+            }
+        }
         if let Err(Errno::EPIPE) = res {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -2789,8 +3026,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 litebox::fs::errors::PathError::NoSuchFileOrDirectory,
             )) => {
                 let path_str = pathname.as_rust_str()?;
-                self.cross_process_bound_unix_socket_stat(path_str)
-                    .ok_or(Errno::ENOENT)?
+                if self.materialize_shared_publish(path_str)
+                    && let Ok(status) = self.files.borrow().fs.file_status(&pathname)
+                {
+                    status
+                } else {
+                    self.cross_process_bound_unix_socket_stat(path_str)
+                        .ok_or(Errno::ENOENT)?
+                }
             }
             Err(e) => return Err(e.into()),
         };
@@ -3125,6 +3368,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(litebox::fs::devices::cross_process_bound_unix_socket_status(path))
     }
 
+    /// Cross-process fallback for a real local `ENOENT` on `path`: if `SharedFilePublishTable`
+    /// holds a sibling's published content for it, copy that content, byte for byte, into a REAL
+    /// file at `path` in THIS process's own private filesystem view before returning. See
+    /// `syscalls::file::SharedFilePublishTable`'s own doc comment for why this is safe to do
+    /// (unlike `cross_process_bound_unix_socket_stat` above, which can only ever synthesize a
+    /// stat -- a bind path has no bytes to copy, but a short published byte string does). Once
+    /// materialized, every subsequent `stat`/`access`/`open`/`read` in this process sees an
+    /// entirely ordinary local file, with no further special-casing needed anywhere else. Returns
+    /// whether anything was actually materialized (so a caller can retry its real lookup only
+    /// when there is a genuine reason to).
+    fn materialize_shared_publish(&self, path: &str) -> bool {
+        let Some(content) = self.global.shared_file_publish.lookup(path.as_bytes()) else {
+            return false;
+        };
+        let Ok(fd) = self.sys_open(
+            path,
+            OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
+            Mode::RUSR.union(Mode::WUSR).union(Mode::RGRP).union(Mode::ROTH),
+        ) else {
+            return false;
+        };
+        let Ok(fd) = i32::try_from(fd) else {
+            return false;
+        };
+        let _ = self.sys_write(fd, &content, None);
+        let _ = self.sys_close(fd);
+        litebox_util_log::warn!(
+            path:% = path, len:% = content.len(), self_pid:% = self.pid.get();
+            "DIAG materialize_shared_publish: copied a sibling's published file content into this \
+             process's own filesystem view"
+        );
+        true
+    }
+
     fn do_stat<T: From<litebox::fs::FileStatus>>(
         &self,
         pathname: impl path::Arg,
@@ -3148,10 +3425,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(status) => Ok(T::from(status)),
             Err(litebox::fs::errors::FileStatusError::PathError(
                 litebox::fs::errors::PathError::NoSuchFileOrDirectory,
-            )) => self
-                .cross_process_bound_unix_socket_stat(&lookup_path)
-                .map(T::from)
-                .ok_or(Errno::ENOENT),
+            )) => {
+                if self.materialize_shared_publish(&lookup_path) {
+                    let retried = if follow_symlink {
+                        self.files.borrow().fs.file_status(lookup_path.clone())
+                    } else {
+                        self.files.borrow().fs.symlink_metadata(lookup_path.clone())
+                    };
+                    if let Ok(status) = retried {
+                        return Ok(T::from(status));
+                    }
+                }
+                self.cross_process_bound_unix_socket_stat(&lookup_path)
+                    .map(T::from)
+                    .ok_or(Errno::ENOENT)
+            }
             Err(e) => Err(e.into()),
         }
     }

@@ -557,6 +557,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
+                        shared_file_publish: syscalls::file::SharedFilePublishTable::new(),
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
                         flock_registry: litebox::sync::Mutex::new(
@@ -3047,6 +3048,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Cross-process `connect()`/`accept()` rendezvous queue -- see `unix_shared_conn_table`'s doc
     /// comment above.
     unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue,
+    /// Cross-process-visible side channel for the small handful of named byte-string files a
+    /// long-lived, never-exiting daemon publishes that a short-lived sibling needs to read (e.g.
+    /// D-Bus's `/tmp/addr`) -- see `syscalls::file::SharedFilePublishTable`'s own doc comment for
+    /// the full mechanism and scope boundary. Same free-riding-on-`GlobalState`'s-own-sharing
+    /// rationale as `unix_addr_presence` above: a plain, pointer-free field of this same struct.
+    shared_file_publish: syscalls::file::SharedFilePublishTable,
     // NOTE: this struct deliberately has NO `elf_patch_cache` field -- THIRD instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment (`litebox`/`proc_self_info`/`pts_registry`), live-diagnosed 2026-09-17: an attaching
