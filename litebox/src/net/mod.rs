@@ -1433,6 +1433,13 @@ where
                     }
                 };
 
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment): a dead-holder
+                // `reset_after_poisoning()` elsewhere may have wiped this handle out of
+                // `socket_set` already -- report it the same way a genuinely closed/reset socket
+                // would read, instead of panicking deep in smoltcp's own `get_mut`.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(ConnectError::InvalidState);
+                }
                 let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if check_progress {
                     check_state(socket.state())
@@ -1463,6 +1470,10 @@ where
             Protocol::Udp => {
                 if addr.port() == 0 {
                     return Err(ConnectError::Unaddressable);
+                }
+                // Stale-handle guard -- see the identical TCP-branch guard above.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(ConnectError::InvalidState);
                 }
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if !socket.is_open() {
@@ -1518,6 +1529,14 @@ where
             .ok_or(LocalAddrError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
+        // Stale-handle guard (see `socket_set_contains`'s own doc comment): a dead-holder
+        // `reset_after_poisoning()` elsewhere may have wiped this handle out of `socket_set`
+        // already. Reported the same way an unbound socket already is below (`Ipv4Addr::
+        // UNSPECIFIED`, port 0) rather than panicking deep in smoltcp's own `get` -- a stale
+        // handle genuinely has no address to report, same as a never-bound one.
+        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+            return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
@@ -1563,6 +1582,12 @@ where
         &self,
         socket_handle: &SocketHandle<Platform>,
     ) -> Result<SocketAddr, RemoteAddrError> {
+        // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported the same
+        // way a real "never connected" TCP socket already is, rather than panicking deep in
+        // smoltcp's own `get`.
+        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+            return Err(RemoteAddrError::NotConnected);
+        }
         let endpoint = match socket_handle.protocol() {
             Protocol::Tcp => self
                 .socket_set
@@ -1655,6 +1680,13 @@ where
                     addr: bind_addr,
                     port: lp.port(),
                 };
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- treated the
+                // same as an invalid fd (the handle no longer names anything real to bind)
+                // instead of panicking deep in smoltcp's own `get_mut`.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    self.local_port_allocator.deallocate(lp);
+                    return Err(BindError::InvalidFd);
+                }
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if let Err(e) = socket.bind(local_endpoint) {
                     self.local_port_allocator.deallocate(lp);
@@ -1709,11 +1741,17 @@ where
         }
         match &socket_handle.specific {
             ProtocolSpecific::Tcp(_) => {
-                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the socket
-                // stays in the set and the read half keeps delivering until the peer closes too.
-                // Releasing the fd remains `close_handle`'s job, unchanged.
-                tcp_socket.close();
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment): nothing left
+                // to send a FIN on, so this is a harmless no-op instead of panicking deep in
+                // smoltcp's own `get_mut`.
+                if Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    let tcp_socket: &mut tcp::Socket =
+                        self.socket_set.get_mut(socket_handle.handle);
+                    // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the
+                    // socket stays in the set and the read half keeps delivering until the peer
+                    // closes too. Releasing the fd remains `close_handle`'s job, unchanged.
+                    tcp_socket.close();
+                }
                 Ok(())
             }
             // UDP/ICMP/raw are connectionless: real Linux reports `ENOTCONN` for `shutdown` on a
@@ -1799,7 +1837,12 @@ where
                     if server_socket.socket_set_handles.len() > new_backlog_usize {
                         for handle in server_socket.socket_set_handles.split_off(new_backlog_usize)
                         {
-                            let _ = self.socket_set.remove(handle);
+                            // Stale-handle guard (see `socket_set_contains`'s own doc comment) --
+                            // a handle already wiped by a dead-holder `reset_after_poisoning()`
+                            // elsewhere has nothing left to remove.
+                            if Self::socket_set_contains(&self.socket_set, handle) {
+                                let _ = self.socket_set.remove(handle);
+                            }
                         }
                     }
                     server_socket.backlog = Some(backlog);
@@ -1851,16 +1894,26 @@ where
                     return Err(AcceptError::NotListening);
                 }
                 // (Purely an optimization) remove all handles that are closed, by only keeping ones
-                // that are not closed
+                // that are not closed. A stale handle (see `socket_set_contains`'s own doc
+                // comment: a dead-holder `reset_after_poisoning()` elsewhere may have wiped it out
+                // of `socket_set` already) is treated the same as a closed one -- both get
+                // dropped here -- instead of panicking deep in smoltcp's own `get`, live-caught
+                // (twenty-eighth pass) as a real `"handle does not refer to a valid socket"` panic
+                // that killed a whole cross-process-fork child's guest-execution thread outright
+                // (this was selkies' own `accept()` call).
                 server_socket.socket_set_handles.retain(|&h| {
-                    let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.is_open()
+                    Self::socket_set_contains(&self.socket_set, h) && {
+                        let socket: &tcp::Socket = self.socket_set.get(h);
+                        socket.is_open()
+                    }
                 });
                 // Find a socket that has progressed further in its TCP state machine, by finding a
                 // socket in an established state
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
-                    let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
+                    Self::socket_set_contains(&self.socket_set, h) && {
+                        let socket: &tcp::Socket = self.socket_set.get(h);
+                        socket.state() == tcp::State::Established
+                    }
                 }) else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared
@@ -1936,6 +1989,12 @@ where
                     // TCP is connection-oriented, so no destination address should be provided
                     return Err(SendError::UnnecessaryDestinationAddress);
                 }
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
+                // the same way smoltcp's own `tcp::SendError::InvalidState` already is just
+                // below, rather than panicking deep in its `get_mut`.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(SendError::SocketInInvalidState);
+                }
                 self.socket_set
                     .get_mut::<tcp::Socket>(socket_handle.handle)
                     .send_slice(buf)
@@ -1951,6 +2010,9 @@ where
                 let Some(remote_endpoint) = destination else {
                     return Err(SendError::DestinationAddressRequired);
                 };
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(SendError::SocketInInvalidState);
+                }
                 let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if !udp_socket.is_open() {
                     let local_port = self
@@ -2019,6 +2081,12 @@ where
                     // TCP is connection-oriented, so no need to provide a source address
                     *source_addr = None;
                 }
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
+                // the same way smoltcp's own `tcp::RecvError::InvalidState` already is just
+                // below, rather than panicking deep in its `get_mut`.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(ReceiveError::SocketInInvalidState);
+                }
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
                 if flags.contains(ReceiveFlags::TRUNC) {
                     unimplemented!("TRUNC flag for tcp");
@@ -2043,6 +2111,10 @@ where
                 })
             }
             Protocol::Udp => {
+                // Stale-handle guard -- see the identical TCP-branch guard above.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(ReceiveError::SocketInInvalidState);
+                }
                 let udp_socket = self.socket_set.get_mut::<udp::Socket>(socket_handle.handle);
                 match udp_socket.recv() {
                     Ok((data, meta)) => {
@@ -2097,6 +2169,12 @@ where
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
+                // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported as
+                // an invalid fd (the handle no longer names anything real) instead of panicking
+                // deep in smoltcp's own `get_mut`.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(errors::SetTcpOptionError::InvalidFd);
+                }
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
                 match data {
                     TcpOptionData::NODELAY(nodelay) => {
@@ -2132,6 +2210,10 @@ where
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
+                // Stale-handle guard -- see the identical guard in `set_tcp_option` above.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return Err(errors::GetTcpOptionError::InvalidFd);
+                }
                 let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
                 match name {
                     TcpOptionName::NODELAY => {
