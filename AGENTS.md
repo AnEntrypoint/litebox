@@ -150,73 +150,63 @@ completing); also fixed `sys_wait4`'s `pid > 0` no-repoll gap. Browser milestone
 of these three passes. Full detail (all three): archive.
 
 Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
-kill. **Did NOT reach the XFCE-desktop/browser/terminal/apps milestone this pass** — refuted a
-dead end, redirected toward the real upstream blocker, fixed one real independent bug.
+kill.
 
-**Twenty-fifth pass** — writable-layer-visibility hypothesis CONFIRMED by direct source read
-(`CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment states it outright: "nothing propagates to an
-already-running long-lived process between ITS OWN spawns" — Xvfb neither exits nor spawns, so
-its `$XSOCK` write can never publish). **Fixed, live-verified, `$XSOCK` stall CLOSED**: a bound
-AF_UNIX path is a NAME marker, not content, so it doesn't need the general writable-layer sync —
-`litebox::fs::devices::cross_process_bound_unix_socket_status` + a `do_stat`/`do_access` fallback
-in `litebox_shim_linux/src/syscalls/file.rs` now consult the already-shared
-`SharedUnixAddrPresenceTable` on a real `ENOENT` instead of the private per-process filesystem.
-Live evidence: the shell's own `[ -e "$XSOCK" ]` broke out for the first time in this whole
-25-pass investigation, and the boot advanced to script offset 23017 — past `xset q`, into
-`dbus-launch` setup, further than any prior pass. **Second bug found one step downstream, fixed**:
-`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (3s) was too tight once real contention (8 concurrent
-cross-process-forked Windows processes, RAM as low as ~300-450MB) made the listener's own 15ms
-re-poll thread starve for scheduling — widened to 15s; live `unix=debug` trace then showed a
-genuine end-to-end cross-process AF_UNIX connect for Xvfb's real X11 socket complete
-(`request completed ... slot=0`), the first ever directly witnessed on this path. **Third finding,
-one layer deeper**: the established connection's data doesn't flow — pickup list below has the
-precise cdb-confirmed evidence and next step. Did NOT reach the XFCE-desktop/browser/terminal/apps
-milestone this pass (ten boot attempts total). Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`,
-twenty-fifth pass.
+**Twenty-fifth pass** — CONFIRMED (direct source read of `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc
+comment) that a bound AF_UNIX path needs only presence, not content, sync: FIXED via the already-
+shared `SharedUnixAddrPresenceTable` consulted on `ENOENT` (`litebox::fs::devices::
+cross_process_bound_unix_socket_status`, `do_stat`/`do_access` in `litebox_shim_linux/src/
+syscalls/file.rs`) — closed the `$XSOCK` stall for good. Also widened
+`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` 3s->15s (real contention starved the listener's 15ms re-poll).
+Superseded by the twenty-sixth pass's deeper fix below (the "established connection's data
+doesn't flow" finding this pass ended on). Full evidence: archive.
 
 **Twenty-sixth pass (2026-09-20) — ROOT-CAUSED AND FIXED the "Xvfb never reads `xset q`'s bytes"
-gap; `XVFB_UP` printed for the first time ever.** Root cause + fix: pickup list item (-2) below.
-Two hypotheses REFUTED en route with live evidence, both worth keeping: `epoll_ctl(ADD)` DOES fire
-for Xvfb's accepted client fd, just with an initially-EMPTY mask immediately followed by a real
-`EPOLL_CTL_MOD` (a legitimate os/epoll pattern the old add-only logging couldn't see); and the
-`SharedByteRing` cursor DOES become visible cross-process within ~15-30ms (refuting a shared-
-memory-visibility bug). Live-verified on the DEBUG binary: `try_recvfrom_shared: read slot=0` fired
-repeatedly (first time ever), `[s] XVFB_UP` printed, boot reached `[s] DE_LAUNCHED (image
-startwm.sh)` and attempted `[s] SELKIES_PORT_UP` (curl_exit=137 — safety-killed at host RAM
-~320-480MB / 19 concurrent forked processes, not a further litebox bug). Release-binary/real-
-browser milestone: not yet attempted this pass. Full raw-log evidence: `docs/
-AGENTS_ARCHIVE_2026-09-18.md`, twenty-sixth pass.
+gap; `XVFB_UP` printed for the first time ever.** Root cause: `EpollFile::
+repoll_stdin_and_timerfd_interests` decided ready-set membership from `EpollEntry::poll`'s
+`is_still_ready` field instead of its `event.is_some()` field — `is_still_ready` is
+unconditionally `false` for any `EPOLLET`-registered fd, and Xvfb registers its accepted X11
+client fd exactly that way. Fixed (`litebox_shim_linux/src/syscalls/epoll.rs`), live-verified on
+both debug and release binaries. Boot reached `[s] DE_LAUNCHED` and attempted `SELKIES_PORT_UP`
+(curl_exit=137 — safety-killed at host RAM ~320-480MB, debug-binary-only, not a further litebox
+bug). Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, twenty-sixth pass.
+
+**Twenty-seventh pass (2026-09-20) — surgical pre-create LANDED (safe); general periodic-sync
+mechanism attempted, PROVEN to cause a worse regression than it fixed, cleanly reverted.**
+(1) **Surgical fix, kept**: `/tmp/empty`, `config/` and `config/.Xresources` (deterministic,
+never-guarded-by-a-`[ -d ]`-check content) now ship baked into `.wfgy/webtop_seed.tar` itself
+(imported via `--resume-from` before any fork happens), so every process in the boot tree has them
+from time zero — no visibility race to lose. `usr/share/selkies/web/50x.html` was deliberately
+**not** pre-seeded: `webtop_stack.sh:127` guards a REAL one-time dashboard-directory copy behind
+`[ ! -d /usr/share/selkies/web ]`, and pre-creating that directory would silently skip the real
+copy for every process, replacing the dashboard with just the error page. Live-verified: no
+regression, byte-identical boot progress to before this change.
+(2) **General fix, tried and reverted**: a background thread per real OS process (`run()` and the
+real cross-process fork-child bootstrap `diag_process_fork_task_resume_probe` — confirmed real via
+`[process_fork_diag] task-resume-probe` lines despite the `diag_` naming) periodically exported+
+published this process's writable layer to the canonical snapshot and additively merged missing
+entries back (AF_UNIX-bounded-repoll-shaped). It DID fix the target problem (`dbus-daemon`'s
+`/tmp/addr` write became visible to the parent shell's poll) but caused a WORSE, 100%-reproducible
+regression: `webtop_stack.sh`'s `cp /defaults/default.conf` + four sequential `sed -i` calls (each
+its own real fork+`wait4`) raced the periodic export, capturing a self-consistent but TEMPORALLY
+STALE snapshot (post-`cp`, pre-`sed`); `publish_as_container_fs_snapshot`'s existing size-based
+"bigger wins" tie-breaker (never a timestamp) then let that stale snapshot PERMANENTLY clobber the
+shell's fresher, correct one. Result: `NGINX_SUPERVISOR: giving up after 30 attempts` every time,
+literal unsubstituted `invalid port in upstream "127.0.0.1:CWS"` — in all 3 tested variants (500ms;
+3000ms; 3000ms + "skip if canonical modified <750ms ago"), 100% reproduction, NOT reduced by
+widening the interval — the tell that this is not a rare coincidence: N full-tree-walk threads'
+aggregate CPU/I/O cost slows the exact fork+wait4+import sequences the fix depends on completing
+fast, so widening the interval only grows the contention that recreates the same collision at the
+new timescale. CONFIRMED via isolation (`LITEBOX_NO_WRITABLE_LAYER_SYNC=1`, surgical fix kept): 0
+CWS occurrences, clean `NGINX_STARTED`, boot proceeds to `XVFB_UP`/`DBUS_FAILED` exactly as before.
+Mechanism (`spawn_writable_layer_sync_thread`/`merge_missing_writable_layer_entries`,
+`litebox_runner_linux_on_windows_userland/src/lib.rs`) fully REMOVED, not disabled — do not re-add
+a per-process timer-driven full-tree export/publish without first fixing one of pickup item 3's
+two structural prerequisites, verified against this same nginx repro. Did not reach the browser/
+terminal/apps milestone this pass. RAM 1.8-6.5GB free throughout; every process cleanly WMI-
+`Terminate`d before this pass ended.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
-
-(-2) Fourteen AF_UNIX/epoll/wait4/network hypotheses raised across passes 15-26 were each
-REFUTED or FIXED (root-cause + commit sha, where one exists, listed pass-by-pass in the archive) —
-nothing from that list is open. The LAST of them, and the deepest: Xvfb's accepted client fd's data
-never got read because `EpollFile::repoll_stdin_and_timerfd_interests` decided ready-set membership
-from `EpollEntry::poll`'s `is_still_ready` field instead of its `event.is_some()` field —
-`is_still_ready` is unconditionally `false` for any `EPOLLET`-registered fd (by design), and Xvfb
-registers its accepted X11 client fd exactly that way, so the bounded repoll could never mark it
-ready no matter how much unread data sat in its ring. FIXED twenty-sixth pass
-(`litebox_shim_linux/src/syscalls/epoll.rs`); live-verified on BOTH debug and release binaries:
-`[s] XVFB_UP` printed for the first time ever. **Current top blocker, re-characterized**: the
-general writable-layer cross-child-visibility gap (item 3 below) is far more PERVASIVE on a real
-full boot than previously documented — not just `$XSOCK`/`/tmp/empty`, but hit live at `/config/
-.Xresources`, `/config` itself (`cd` target), and `/usr/share/selkies/web/50x.html`, each a
-DIFFERENT cross-process-forked child missing a file/dir an earlier sibling created. Four defensive same-process re-create patches added to the (gitignored, local-only) `.wfgy/
-webtop_stack.sh`/`webtop_seed.tar` (`: > /tmp/empty` before each of its 3 uses, `mkdir -p "$HOME"`
-before `cd "$HOME"`) did NOT fully resolve it — the fork boundary and the writable-layer-snapshot
-boundary aren't the same point, so a same-process textual reordering can't reliably win this race;
-see item 3 below for the real fix needed. Host RAM held safely (2.3-3.7GB free) throughout this
-pass's release-binary attempts; the one low-RAM event (~320-480MB) was DEBUG-binary-only, not
-reproduced on release. Secondary, not yet chased: the `kind=1`
-(abstract) connect variant still timed out at 15s in the one run exercising both, `kind=0` (path)
-succeeded — only worth chasing if a future pass sees BOTH fail. The general writable-layer-
-visibility gap (item 3 below) remains open for anything that ISN'T a bound AF_UNIX path
-(`webtop_stack.sh`'s own `/tmp/empty`, still observed). Separately, still open:
-`UnixInitStream::check_io_events`'s static `OUT|HUP` Init-state report (nineteenth pass), and a
-`mkdir -p /usr/share/selkies/web` + `printf ... > .../50x.html` `No such file or directory`
-(`webtop_stack.sh:107-110`) — same class as the `/tmp/empty` gap (item 3 below), non-fatal.
-Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth through twenty-sixth passes.
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
 
@@ -226,12 +216,23 @@ high blast radius, own dedicated pass. (1b) `queued_for_closure`'s own still-ope
 hazard (STORAGE not yet converted to a fixed pointer-free array the way `closing_in_background`/
 `socket_set` already were) remains a live risk. (2) debugger-root-cause `litebox/src/
 event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most frequent
-panic historically, NOT yet debugger-confirmed — do not patch blind); (3) **now the sole confirmed
-blocker to the browser/terminal/apps milestone (twenty-sixth pass)**: root-cause the general
-writable-layer cross-child-visibility gap (`/tmp/empty`, `/config`, `/usr/share/selkies/web/
-50x.html` all hit live on one real boot) — same-process defensive re-creates don't reliably win
-because the fork boundary and the writable-layer-snapshot boundary aren't the same point; needs
-the sync mechanism itself widened, not more script patches; (4) finish the `Network` shared-arena
+panic historically, NOT yet debugger-confirmed — do not patch blind); (3) **still the sole
+confirmed blocker to the browser/terminal/apps milestone**: `DBUS_FAILED` — `dbus-daemon --nofork`
+writes `/tmp/addr` but never forks/exits again, so the parent shell's `_nofork_tick`-based poll
+(a pure busy-wait, zero forks, confirmed by direct read of `webtop_stack.sh`'s own `_nofork_tick`)
+never gets a synchronization point to see it. A periodic full-tree timer-based sync is DISPROVEN
+(twenty-seventh pass, above) as a viable general fix — it is fundamentally incompatible with
+`publish_as_container_fs_snapshot`'s existing size-based tie-breaker once a high-frequency extra
+writer is added. The real fix needs ONE of: (a) replace that tie-breaker with a real
+timestamp/generation counter so a stale publish can never beat a fresher one regardless of size or
+publish frequency; (b) a lock that any multi-entry import (`import_all`/
+`import_cross_process_writable_layer`) holds as writer and any export/walk holds as reader, so an
+export can never observe a filesystem mid multi-file-import; (c) extend the
+`SharedUnixAddrPresenceTable` POD/lock-free flat-table pattern (already proven for AF_UNIX
+presence, `sysv_shm`) to small file CONTENT specifically for long-lived, non-forking daemons'
+LATE writes — narrower in scope than a general sync, but sidesteps both (a) and (b) entirely.
+Whichever is chosen, verify with the SAME nginx `cp`+multi-`sed` sequence as a regression probe
+before declaring victory. (4) finish the `Network` shared-arena
 redesign (`interface`, `queued_for_closure` remain); (4b) `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) genuinely need
 cross-process visibility per their own doc comments but hold non-POD payload (Arc-based state,
