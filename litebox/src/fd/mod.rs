@@ -206,6 +206,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// class of bounded trade-off already accepted elsewhere in this codebase (e.g.
     /// `Network::reset_after_poisoning`'s own doc comment) rather than a crash on a guest-
     /// reachable path.
+    ///
+    /// **A THIRD variant of the same gap, also live-caught immediately after the above two**: an
+    /// in-bounds index can resolve to a REAL, live entry that belongs to a completely different
+    /// `FdEnabledSubsystem` (a pipe, a pty, a plain file -- `Descriptors::entries` numbers every
+    /// fd kind in one shared index space per process). `DescriptorEntry::into_subsystem_entry`'s
+    /// own `downcast().unwrap()` then panics with `called Result::unwrap() on an Err value`
+    /// instead of the type mismatch it should just refuse. Guarded the same way: check
+    /// `matches_subsystem::<Subsystem>()` before trusting the index at all.
     pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fds: &mut [Option<TypedFd<Subsystem>>],
@@ -222,6 +230,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 // identically; there is no way, or need, to tell them apart from here.
                 let Some(idx) = fd.x.as_usize() else { continue };
                 let Some(Some(entry)) = self.entries.get(idx) else { continue };
+                if !entry.read().matches_subsystem::<Subsystem>() {
+                    continue;
+                }
                 strong_count_and_count
                     .entry(Arc::as_ptr(&entry.x))
                     .or_insert((Arc::strong_count(&entry.x), 0))
@@ -242,6 +253,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 let Some(Some(entry)) = self.entries.get(idx) else {
                     continue;
                 };
+                if !entry.read().matches_subsystem::<Subsystem>() {
+                    continue;
+                }
                 let entry_ptr = Arc::as_ptr(&entry.x);
                 if !removable_entries.contains(&entry_ptr) {
                     continue;
