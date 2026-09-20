@@ -1216,6 +1216,20 @@ where
                 {
                     return false;
                 }
+                // Same stale-handle guard as `remove_dead_sockets`/`close_pending_sockets`
+                // (`socket_set_contains`'s own doc comment): a dead-holder
+                // `reset_after_poisoning()` elsewhere may have already wiped this FD's socket
+                // out of `socket_set` before this guest `close()` call ever reached it -- this
+                // was the one remaining guest-reachable call site still going straight to
+                // `with_socket`'s unguarded `SocketSet::get`, live-caught as a real
+                // `"handle does not refer to a valid socket"` smoltcp panic that killed a whole
+                // cross-process-fork child's guest-execution thread outright (AGENTS.md,
+                // twenty-eighth pass). Nothing is left to flush for a socket that's already
+                // gone, so this closes immediately, matching a real Linux double-close's
+                // benign-no-op spirit, instead of panicking on a guest-reachable path.
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    return true;
+                }
                 !socket_handle.with_socket(
                     &self.socket_set,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
@@ -1285,47 +1299,68 @@ where
             mut specific,
             proxy,
         } = socket_handle;
+        // Stale-handle guard at each `socket_set` touch point below (see `socket_set_contains`'s
+        // own doc comment): a dead-holder `reset_after_poisoning()` elsewhere may already have
+        // wiped `handle` (and/or a TCP listening socket's own backlog handles) out of
+        // `socket_set` before this call ever reached it -- `SocketSet::remove`/`get_mut` both
+        // panic on a handle they no longer have (live-caught: this exact call chain killed a
+        // whole cross-process-fork child's guest-execution thread outright, AGENTS.md
+        // twenty-eighth pass -- the `close()` call site that reaches here was fixed first, but
+        // this function has its own, deeper, independent set of the same unguarded accesses).
+        // The rest of this function's bookkeeping (port deallocation, `closing_in_background`,
+        // proxy state) is independent of `socket_set` and still runs exactly as before either
+        // way -- only the smoltcp-side close/abort is skipped when there is nothing left to
+        // close or abort.
+        let handle_is_live = Self::socket_set_contains(&self.socket_set, handle);
         match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
-                let _ = self.socket_set.remove(handle);
+                if handle_is_live {
+                    let _ = self.socket_set.remove(handle);
+                }
             }
             Protocol::Udp => {
-                let smoltcp::socket::Socket::Udp(mut socket) = self.socket_set.remove(handle)
-                else {
-                    unreachable!()
-                };
-                self.local_port_allocator
-                    .deallocate_port(socket.endpoint().port);
-                socket.close();
+                if handle_is_live {
+                    let smoltcp::socket::Socket::Udp(mut socket) = self.socket_set.remove(handle)
+                    else {
+                        unreachable!()
+                    };
+                    self.local_port_allocator
+                        .deallocate_port(socket.endpoint().port);
+                    socket.close();
+                }
             }
             Protocol::Tcp => {
                 let tcp_specific = specific.tcp_mut();
                 if let Some(server_socket) = tcp_specific.server_socket.take() {
                     // remove all listening sockets in the backlog
                     for handle in server_socket.socket_set_handles {
-                        let _ = self.socket_set.remove(handle);
+                        if Self::socket_set_contains(&self.socket_set, handle) {
+                            let _ = self.socket_set.remove(handle);
+                        }
                     }
                 }
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
-                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
-                if tcp_specific.immediate_close.load(Ordering::Relaxed) {
-                    tcp_socket.abort();
-                } else {
-                    tcp_socket.close();
+                if handle_is_live {
+                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
+                    if tcp_specific.immediate_close.load(Ordering::Relaxed) {
+                        tcp_socket.abort();
+                    } else {
+                        tcp_socket.close();
+                    }
+                    let slot = self
+                        .closing_in_background
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect(
+                            "closing_in_background has MAX_SOCKETS slots, one per possible live \
+                             socket_set entry -- a socket being closed here always currently \
+                             occupies one, so a free slot always exists",
+                        );
+                    *slot = Some(handle);
                 }
-                let slot = self
-                    .closing_in_background
-                    .iter_mut()
-                    .find(|slot| slot.is_none())
-                    .expect(
-                        "closing_in_background has MAX_SOCKETS slots, one per possible live \
-                         socket_set entry -- a socket being closed here always currently \
-                         occupies one, so a free slot always exists",
-                    );
-                *slot = Some(handle);
             }
         }
         if let Some(proxy) = proxy {
