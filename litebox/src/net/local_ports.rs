@@ -104,14 +104,15 @@ impl LocalPortAllocator {
     #[must_use]
     pub(crate) fn allocate_same_local_port(&mut self, port: &LocalPort) -> LocalPort {
         let slot = &mut self.refcount[Self::index(port.port)];
-        if *slot == 0 {
-            // Because we have a `LocalPort`, it is (as an invariant) impossible to have the value
-            // be missing from the refcount.
-            unreachable!()
-        }
-        // We just bump the refcount, making sure there is no overflow, and then produce the new
-        // `LocalPort` token.
-        *slot = slot.checked_add(1).unwrap();
+        // Ordinarily, having a live `LocalPort` token makes a `0` refcount here impossible -- but
+        // see `deallocate`'s own doc comment: a dead-holder `reset_after_poisoning()` elsewhere
+        // can zero this whole table out from under a token minted before it. Rebuild as if this
+        // call were the first holder of the port instead of panicking on a guest-reachable path.
+        *slot = if *slot == 0 {
+            1
+        } else {
+            slot.checked_add(1).unwrap()
+        };
         LocalPort { port: port.port }
     }
 
@@ -119,7 +120,17 @@ impl LocalPortAllocator {
     pub(crate) fn deallocate(&mut self, port: LocalPort) {
         let slot = &mut self.refcount[Self::index(port.port)];
         match *slot {
-            0 => unreachable!(),
+            // Live-caught (twenty-eighth pass), exactly as this struct's own
+            // `reset_after_poisoning` doc comment already predicted: a `LocalPort` token minted
+            // BEFORE a dead-holder `reset_after_poisoning()` elsewhere zeroed this whole table can
+            // still be deallocated afterward by whichever (possibly different) process still
+            // holds it -- its slot's refcount no longer matches reality by construction, not a
+            // genuine double-free. Since the table has already been reset to "every port free",
+            // there is nothing left here to double-decrement; a no-op is the correct, safe
+            // response, matching this codebase's own established trade-off for this whole
+            // poisoning-recovery class (`Network::close`/`close_handle`, `queued_for_closure`)
+            // rather than a panic on a guest-reachable path.
+            0 => {}
             1 => *slot = 0,
             n => *slot = n - 1,
         }
@@ -137,11 +148,14 @@ impl LocalPortAllocator {
     /// [`crate::net::Network::reset_after_poisoning`] -- see that method's own doc comment for why
     /// this exists: a dead lock holder can die mid-`allocate`/`deallocate`, leaving some slot's
     /// refcount not matching the real number of live [`LocalPort`] tokens still referencing it, in
-    /// either direction. This does not by itself fix a *pre-existing* [`LocalPort`] token minted
-    /// before the crash later hitting this module's own `unreachable!()`s on a refcount that no
-    /// longer matches (that token's issuing `Network` state is itself being wholesale reset by the
-    /// same caller) -- it only guarantees every NEW allocation after this point starts from a
-    /// clean, self-consistent table.
+    /// either direction. A *pre-existing* [`LocalPort`] token minted before the crash later
+    /// hitting a refcount that no longer matches (that token's issuing `Network` state is itself
+    /// being wholesale reset by the same caller) was live-caught exactly as this comment once
+    /// predicted (twenty-eighth pass) -- `deallocate`/`allocate_same_local_port` no longer panic
+    /// on it (see their own doc comments: a no-op, or rebuilding as the first holder,
+    /// respectively), so this reset only needs to guarantee every NEW allocation after this point
+    /// starts from a clean, self-consistent table, not that every pre-existing token's later use
+    /// stays fully correct.
     pub(crate) fn reset_after_poisoning(&mut self) {
         self.refcount = [0; Self::PORT_COUNT];
     }
