@@ -197,13 +197,18 @@ from `EpollEntry::poll`'s `is_still_ready` field instead of its `event.is_some()
 `is_still_ready` is unconditionally `false` for any `EPOLLET`-registered fd (by design), and Xvfb
 registers its accepted X11 client fd exactly that way, so the bounded repoll could never mark it
 ready no matter how much unread data sat in its ring. FIXED twenty-sixth pass
-(`litebox_shim_linux/src/syscalls/epoll.rs`); live-verified: `[s] XVFB_UP` printed for the first
-time ever. **Current top blocker**: release-binary + real-browser/terminal/apps
-milestone not yet attempted; on the DEBUG binary, host RAM fell to ~320-480MB once dbus/XFCE/
-selkies forked 19 concurrent Windows processes, forcing a safety kill before `SELKIES_PORT_UP`
-could be confirmed (`curl_exit=137`, not a known litebox bug). Next step: retry on the RELEASE
-binary (should cost less RAM per forked process than the DEBUG build) with the real `.wfgy/
-webtop_stack.sh`, watching `FreePhysicalMemory` closely. Secondary, not yet chased: the `kind=1`
+(`litebox_shim_linux/src/syscalls/epoll.rs`); live-verified on BOTH debug and release binaries:
+`[s] XVFB_UP` printed for the first time ever. **Current top blocker, re-characterized**: the
+general writable-layer cross-child-visibility gap (item 3 below) is far more PERVASIVE on a real
+full boot than previously documented — not just `$XSOCK`/`/tmp/empty`, but hit live at `/config/
+.Xresources`, `/config` itself (`cd` target), and `/usr/share/selkies/web/50x.html`, each a
+DIFFERENT cross-process-forked child missing a file/dir an earlier sibling created. Four defensive same-process re-create patches added to the (gitignored, local-only) `.wfgy/
+webtop_stack.sh`/`webtop_seed.tar` (`: > /tmp/empty` before each of its 3 uses, `mkdir -p "$HOME"`
+before `cd "$HOME"`) did NOT fully resolve it — the fork boundary and the writable-layer-snapshot
+boundary aren't the same point, so a same-process textual reordering can't reliably win this race;
+see item 3 below for the real fix needed. Host RAM held safely (2.3-3.7GB free) throughout this
+pass's release-binary attempts; the one low-RAM event (~320-480MB) was DEBUG-binary-only, not
+reproduced on release. Secondary, not yet chased: the `kind=1`
 (abstract) connect variant still timed out at 15s in the one run exercising both, `kind=0` (path)
 succeeded — only worth chasing if a future pass sees BOTH fail. The general writable-layer-
 visibility gap (item 3 below) remains open for anything that ISN'T a bound AF_UNIX path
@@ -221,8 +226,12 @@ high blast radius, own dedicated pass. (1b) `queued_for_closure`'s own still-ope
 hazard (STORAGE not yet converted to a fixed pointer-free array the way `closing_in_background`/
 `socket_set` already were) remains a live risk. (2) debugger-root-cause `litebox/src/
 event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most frequent
-panic historically, NOT yet debugger-confirmed — do not patch blind); (3) root-cause the
-`/tmp/empty` writable-layer cross-child-visibility gap; (4) finish the `Network` shared-arena
+panic historically, NOT yet debugger-confirmed — do not patch blind); (3) **now the sole confirmed
+blocker to the browser/terminal/apps milestone (twenty-sixth pass)**: root-cause the general
+writable-layer cross-child-visibility gap (`/tmp/empty`, `/config`, `/usr/share/selkies/web/
+50x.html` all hit live on one real boot) — same-process defensive re-creates don't reliably win
+because the fork boundary and the writable-layer-snapshot boundary aren't the same point; needs
+the sync mechanism itself widened, not more script patches; (4) finish the `Network` shared-arena
 redesign (`interface`, `queued_for_closure` remain); (4b) `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) genuinely need
 cross-process visibility per their own doc comments but hold non-POD payload (Arc-based state,

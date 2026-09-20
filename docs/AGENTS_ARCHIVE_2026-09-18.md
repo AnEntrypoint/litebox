@@ -1716,3 +1716,77 @@ additions (matching this project's own established practice for high-value singl
 sites), consistent with everything already living in `try_sendto_shared`/`try_recvfrom_shared`
 from the prior pass.
 
+### Twenty-sixth pass, continued — release binary, real `webtop_stack.sh`, the writable-layer gap turns out to be pervasive
+
+With the epoll fix verified on the debug binary, rebuilt `cargo build --release -p
+litebox_runner_linux_on_windows_userland` and ran the REAL `.wfgy/release_boot_repro.ps1`
+(`--gui=hidden -p 8090:3000`, the actual `webtop_stack.sh`, not a probe). Two of the first three
+launch attempts stalled at "Fetching manifest..." for ~20-45s before the process silently exited
+with no further output (no crash dump, no stderr) -- a transient OCI-registry-manifest-fetch
+hiccup, unrelated to litebox; the third attempt's manifest fetch simply took longer and then
+proceeded normally (`Pulled manifest (17 layer(s))`, cache hits for all 17 layers). Not yet
+root-caused as its own issue, but low-cost to work around (retry once with a longer initial wait
+before concluding a real failure).
+
+**`XVFB_UP` confirmed on the RELEASE binary too** (`[s] XVFB_UP`), matching the debug-binary
+result -- the fix is real, not a debug-build artifact. Boot continued further than any prior pass
+on either binary: `NGINX_CONFIGURED`/`NGINX_STARTED`, `XVFB_UP`, then `[s] DBUS_FAILED`, then a
+SEPARATE cross-process-forked child hit `SELKIES_SUPERVISOR` respawning 30 times (`rc=2` every
+attempt) before giving up (`SELKIES_PORT_SELFTEST_FAILED after 170s`), then `[s] DE_LAUNCHED
+(image startwm.sh)`. A live `chrome-devtools` browser check against `http://localhost:8090/`
+(the real host-side port mapped to the guest's nginx) returned `net::ERR_EMPTY_RESPONSE` --
+consistent with nginx/selkies never reaching a state that serves real content.
+
+**Root cause of `DBUS_FAILED`**: `/webtop_stack.sh: line 343: /tmp/empty: No such file or
+directory` in a cross-process-forked child resumed at script byte offset 23017 -- the SAME general
+writable-layer cross-child-visibility gap already tracked as pickup item 3 (previously
+characterized narrowly, around `$XSOCK`/`/tmp/empty`), but this pass found it hits MANY more sites
+on a real full boot than previously documented: `/config/.Xresources` (line 326, another child),
+`/config` itself as a `cd` target (line ~783's `cd "$HOME"`, `$HOME=/config`, exported line 49 --
+a THIRD child), and `/usr/share/selkies/web/50x.html` (line 138, a FOURTH). Each is a plain file or
+directory an EARLIER process/script-region created (`: > /tmp/empty` at line 278; `mkdir -p
+"$HOME/.config/openbox"` at line 105 implicitly creates `/config`; some `mkdir -p .../50x.html`
+site the archive already flagged as non-fatal) that a LATER cross-process-forked sibling's own
+writable-layer snapshot simply doesn't include.
+
+**Attempted fix, INSUFFICIENT**: added four defensive same-process re-creates directly in
+`.wfgy/webtop_stack.sh` (gitignored, local-only -- not a tracked file, so this doesn't reach `git
+status`): `: > /tmp/empty` immediately before each of its three consumers (dbus-daemon line ~343,
+selkies line ~633, the direct-xfce4-session fallback line ~805), and `mkdir -p "$HOME"`
+immediately before `cd "$HOME"` (line ~783). Repacked into `.wfgy/webtop_seed.tar` (plain `tar -cf
+webtop_seed.tar webtop_stack.sh` from the `.wfgy` directory; verified with `tar -tvf`/`tar -xOf`
+that the new content actually landed before reusing it) and reran. Live evidence the fix did NOT
+work: this run's `DBUS_FAILED` moved to `line 347` -- i.e. the DBUS-DAEMON LINE ITSELF, three lines
+further down than before purely because the four new comment/code lines shifted it -- meaning the
+defensive `: > /tmp/empty` written immediately above it STILL didn't make the file visible to
+whichever process actually executes the dbus-daemon invocation.
+
+**Working theory for why the same-process fix failed**: the cross-process fork this codebase uses
+for a bash `&`-backgrounded job resumes a CHILD from a snapshot of the PARENT bash interpreter's
+own state, including its script-file (`fd 255`) READ POSITION -- and bash reads scripts in
+buffered chunks, not strictly one line at a time, so by the time bash's OWN in-process view
+reaches "now execute the dbus-daemon line," its fd's file position (and, more importantly, the
+writable-layer snapshot litebox captures AT THE FORK POINT) may not correspond to "state
+immediately after the previous synchronous statement completed" the way a naive reading of the
+script's line order would suggest. The fork boundary and the intended "run this defensive line,
+then immediately fork for the very next line" boundary are not guaranteed to coincide. This makes
+a purely script-side, statement-reordering fix unreliable for this class of gap -- the real fix
+belongs in litebox's own writable-layer sync mechanism (widen WHEN a sync happens, not just move
+lines around in the consuming script).
+
+**Not a memory story this time**: host RAM stayed healthy through all of this pass's
+release-binary attempts (2.3-3.7GB free throughout, watched continuously); the single ~320-480MB
+low-RAM event that forced an earlier safety kill was specific to the DEBUG binary's own heavier
+per-process footprint under the same 19-process fork count, and did not reproduce on release.
+
+**Still not reached**: the browser/terminal/apps milestone. The epoll fix (this pass's main
+result) is confirmed real and holds on both binaries; the remaining, now sole, blocker is the
+general writable-layer cross-child-visibility gap, confirmed pervasive rather than narrow. Next
+pass's real next step: design and implement a genuine fix for that gap (e.g. widen
+`CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own sync trigger to also fire on ordinary `write`/`mkdir`/
+`rename` syscalls that create a path another sibling later `stat`s/`open`s, not only at a child's
+own spawn/exit boundary, mirroring the AF_UNIX-bind-path-specific fix's shape but generalized) --
+this is real, substantial new design work, not a quick patch, and deserves its own dedicated pass
+with the same "isolated repro first" discipline this investigation's own prior passes have
+sometimes skipped under time pressure (see the fourteenth pass's self-critique above).
+
