@@ -1052,6 +1052,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 slot:% = *slot, is_client:% = *is_client, len:% = n;
                 "DIAG try_recvfrom_shared: read"
             );
+            // Same hex-prefix trace `try_recvfrom` (the `Local`-transport sibling) already has for
+            // its own `LITEBOX_DRM_TRACE`-gated variant, extended to the `Shared`-transport path --
+            // Xvfb's own X11 socket runs over `Shared`, and this path never had this diagnostic, so
+            // the 30th-pass investigation into Xvfb's deterministic mid-boot SIGSEGV could see WHICH
+            // bytes it read but not their actual content, only length. Gated on this module's own
+            // `LITEBOX_LOG` debug level (same as the plain length-only event two lines up) rather
+            // than `drm_trace_enabled()`'s `AtomicBool`: that flag is set exactly once, by the
+            // top-level runner's own startup routine (`litebox_runner_linux_on_windows_userland::
+            // run`), which a `LITEBOX_PROCESS_FORK=1` cross-process fork CHILD's own resume path
+            // never re-invokes (confirmed live, 2026-09-21 -- zero `diag-unix-shared-read-bytes`
+            // lines from a boot where `LITEBOX_DRM_TRACE=1` was exported to the whole process tree
+            // and `litebox_shim_linux::syscalls::unix=debug`'s own sibling lines fired thousands of
+            // times in the SAME child processes), so it silently stays `false` in every fork child,
+            // Xvfb included -- the one process this trace exists to observe. `LITEBOX_LOG`'s
+            // `EnvFilter`, by contrast, is already proven live to re-initialize correctly per fork
+            // child (every other diagnostic in this investigation relied on exactly that). Bounded
+            // to the same 4096-byte cap as the `Local`-path sibling.
+            let preview_len = n.min(4096);
+            litebox_util_log::debug!(
+                slot:% = *slot, is_client:% = *is_client, total_read:% = n,
+                prefix_hex:? = &buf[..preview_len];
+                "diag-unix-shared-read-bytes"
+            );
             self.pollee.notify_observers(Events::OUT);
             return Ok((n, Vec::new()));
         }

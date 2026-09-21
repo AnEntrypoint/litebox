@@ -1838,6 +1838,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             result:? = result.as_ref().map(|n| *n);
             "sys_write"
         );
+        // Dedicated, separately-targeted event for stderr traffic only -- the `sys_write` event
+        // above shares a target (module path) with `sys_read`/every other `file.rs` syscall, so
+        // enabling it via `LITEBOX_LOG` to catch a guest's own crash-time stderr text (glibc
+        // `abort()`/`assert()`/Xorg `ErrorF` messages, all unbuffered writes to fd 2) also floods
+        // the log with every `sys_read` from every process in the boot -- a single `LITEBOX_LOG`
+        // grant that pulled in unrelated `sys_read` spam produced 400MB+ of log in under 9 real
+        // seconds on a real boot (2026-09-21, thirty-first pass). A distinct target lets a caller
+        // enable ONLY this signal (`litebox_diag::stderr_capture=debug`) at the volume stderr
+        // actually has (diagnostic by definition, never a hot loop).
+        if fd == 2 {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::stderr_capture",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                pid = self.pid.get(),
+                tid = self.tid.get(),
+                comm = core::str::from_utf8(&self.comm.get())
+                    .unwrap_or("<non-utf8>")
+                    .trim_end_matches('\0'),
+                text = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
+                "stderr_write"
+            );
+        }
         result
     }
     fn do_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
