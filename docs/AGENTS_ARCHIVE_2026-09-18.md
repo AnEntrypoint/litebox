@@ -1790,3 +1790,150 @@ this is real, substantial new design work, not a quick patch, and deserves its o
 with the same "isolated repro first" discipline this investigation's own prior passes have
 sometimes skipped under time pressure (see the fourteenth pass's self-critique above).
 
+## Twenty-eighth pass, 2026-09-21 -- DBUS_FAILED CLOSED for good; five further real crash-class bugs found+fixed; new blocker found: cross-process-fork DISPLAY loss
+
+Implemented pickup item 3's own recommended option (c): extended the `SharedUnixAddrPresenceTable`
+flat-table pattern one more time, to small file CONTENT rather than just existence.
+`SharedFilePublishTable` (`litebox_shim_linux/src/syscalls/file.rs`) is an 8-slot, 256-byte-content,
+POD, lock-free table living on `GlobalState` (`shared_file_publish` field, `litebox_shim_linux/src/
+lib.rs`). `do_write` publishes the real byte offset/content of any write to an opted-in path
+(`SHARED_PUBLISH_PATHS`, today just `/tmp/addr`) alongside the real per-process write --
+`sys_lseek(fd, 0, SEEK_CUR)` gets the pre-write offset without needing read access on a write-only fd.
+`do_stat`/`do_access`/`do_open_resolved` consult it on a real local `ENOENT` and MATERIALIZE a genuine
+local copy (`Task::materialize_shared_publish`, via ordinary `sys_open`/`sys_write`/`sys_close`) rather
+than only synthesizing a stat result -- a short byte string, unlike an AF_UNIX bind path, can safely be
+copied bit for bit, so every subsequent `stat`/`open`/`read` in that process then works completely
+unmodified with no further special-casing.
+
+**Live-verified, repeatedly, on the debug AND release binaries**: `[s] DBUS_UP` prints for the first
+time in this entire 28-pass investigation. Commit: the dbus fix itself (`SharedFilePublishTable` +
+its three call sites).
+
+**Immediately hit a NEW blocker getting further, live-caught on the release binary, real
+`webtop_stack.sh`**: a real `"handle does not refer to a valid socket"` smoltcp panic inside
+`Network::close`, unguarded, killed a whole cross-process-fork child's guest-execution thread outright
+(the process's own `main` thread `.join().expect()`s the guest thread's `JoinHandle`, so a panic there
+re-panics `main` and kills that ONE OS process -- `litebox_runner_linux_on_windows_userland/src/
+lib.rs:1258`). Root cause: `Network`'s own dead-holder-recovery mechanism (`reset_after_poisoning`,
+documented since the eleventh/`RawMutex` work) wipes `socket_set` clean whenever ANY process's `net`
+lock is force-recovered from a dead holder -- and while THREE sibling functions
+(`remove_dead_sockets`/`close_pending_sockets`/`drain_socket_channel_buffers`) already guarded every
+`socket_set` touch with `socket_set_contains()`, `close()`'s own `with_socket()` call and
+`close_handle()`'s own `remove()`/`get_mut()` calls were the two remaining unguarded sites in the close
+path. Fixed both with the same guard, same disclosed trade-off (skip the smoltcp-side close/abort when
+there's nothing left to close; port deallocation/`closing_in_background`/proxy-state bookkeeping is
+unaffected either way). Commit: `Network::close`/`close_handle` guard.
+
+**Rebuilt, retested -- hit a THIRD, DIFFERENT crash from the SAME general area**: `TypedFd::
+as_usize().unwrap()` panicked on `None` inside `DescriptorTable::drain_entries_full_covered_by`,
+repeatedly (each individually caught by the existing `net_worker` `catch_unwind` +
+`reset_after_poisoning()` recovery, so not immediately fatal, but firing on essentially every tick once
+triggered -- a real, disclosed cost, and each firing wipes `socket_set` clean again, compounding the
+risk of hitting one of the OTHER, still-unguarded call sites). Root cause: `Network::queued_for_closure`
+was still a plain `Vec<SocketFd<Platform>>` -- the ONE field its own doc comment already flagged as
+deliberately left unconverted when `closing_in_background` got the shared-fixed-array fix on
+2026-09-17, because doing so also required widening `DescriptorTable::drain_entries_full_covered_by`'s
+`&mut Vec<TypedFd<_>>` parameter. `Network` lives in the shared kernel arena; a `Vec`'s backing buffer
+is private-heap, meaningless to a cross-process-fork child that only ATTACHES. Fixed: `queued_for_
+closure` converted to a fixed `[Option<SocketFd<_>>; MAX_SOCKETS]` array (mirroring
+`closing_in_background` exactly); `drain_entries_full_covered_by`'s signature widened to `&mut
+[Option<TypedFd<_>>]` (its one call site) so the fixed array passes directly, no `Vec` involved at all.
+`TypedFd`'s `OwnedFd` holds no heap allocation (bare `u32` + `AtomicBool`), so no `mem::forget` guard is
+needed resetting/dropping queued entries (unlike `socket_set`'s real `Socket` RX/TX buffers). Commit:
+`queued_for_closure` fixed-array conversion.
+
+**Rebuilt, retested -- the SAME function immediately surfaced a SECOND, DIFFERENT bug once the first
+was fixed**: `"index out of bounds: the len is 16 but the index is 31"` in the very same function.
+Honest finding, matching the task's own explicit instruction to say so if a fix turns out wrong under
+live testing rather than force it: making the CONTAINER genuinely shared did NOT make the CONTENT
+cross-process-safe. `Descriptors` (`self.entries` inside `drain_entries_full_covered_by`) is
+deliberately PER-PROCESS-PRIVATE (see `GlobalStateHandle::litebox`'s own doc comment) -- unlike
+`closing_in_background`'s plain `smoltcp::iface::SocketHandle`s (genuinely valid regardless of which
+process resolves them, since `socket_set` itself is genuinely shared), a `TypedFd` one process pushes
+into the now-shared `queued_for_closure` encodes an index into THAT process's own private `entries`
+table, meaningless (out of bounds, or resolving to an unrelated live entry) to whichever OTHER
+process's own periodic tick happens to drain the shared queue next -- and EVERY process runs its own
+tick against the SAME shared `Network`. Fixed: every `self.entries` lookup in this function is now
+`None`-tolerant instead of `.unwrap()`-panicking; an index this process's own table cannot resolve is
+left untouched in the queue (never force-cleared) so whichever process it actually belongs to can
+still resolve and close it correctly on ITS OWN next tick. Disclosed cost: an entry belonging to a
+process that exits before its own next tick can leak (stay queued forever, never closed) -- accepted,
+matching this codebase's own established trade-off shape for this whole class (`reset_after_
+poisoning`'s own doc comment). Commit: `drain_entries_full_covered_by` None-tolerant lookups.
+
+**Rebuilt, retested -- a FOURTH bug, same boot, different module**: `"internal error: entered
+unreachable code"` at `local_ports.rs:122`, repeatedly, each individually caught the same way as the
+third bug. `LocalPortAllocator::reset_after_poisoning`'s OWN doc comment already predicted this exact
+failure mode word for word: a `LocalPort` token minted before a dead-holder reset zeroes the whole
+refcount table can later be deallocated (or reallocated via `allocate_same_local_port`) against a slot
+that no longer matches reality. Fixed: `deallocate`'s `refcount==0` case is now a no-op (nothing left
+to double-decrement) instead of `unreachable!()`; `allocate_same_local_port`'s `refcount==0` case now
+rebuilds the slot as the first holder instead of panicking. Commit: `LocalPortAllocator` fix.
+
+**Given three independent crash sites from the SAME `reset_after_poisoning` class surfaced in
+sequence, did a proactive sweep of every REMAINING unguarded `socket_set.get`/`get_mut`/`remove` call
+site in `litebox/src/net/mod.rs`** (not just reactive one-at-a-time patching) -- justified by live
+evidence, not speculation: `accept()`'s own `socket_set_handles` retain/position closures were the
+NEXT one hit live (killed selkies' own cross-process-fork child outright, forced a `SELKIES_SUPERVISOR`
+respawn, `rc=137`). Guarded, with the same pattern, every one of: `accept` (backlog retain/position),
+`connect` (TCP+UDP), `get_local_addr`, `get_remote_addr_for_handle`, `bind` (UDP), `shutdown` (TCP),
+`send` (TCP+UDP), `receive` (TCP+UDP), `set_tcp_option`, `get_tcp_option`, `listen`'s backlog-shrink
+removal -- each degrading to that function's own most fitting existing error variant (or an
+already-established "nothing bound"/no-op shape) instead of panicking, zero behavior change on the
+live-handle path. Commit: comprehensive `net/mod.rs` guard sweep.
+
+**Rebuilt, retested -- a FIFTH bug, one layer beyond the fourth**: `"called Result::unwrap() on an Err
+value"` at `fd/mod.rs`'s `into_subsystem_entry`, killing the cross-process-fork child running the XFCE
+session's own `startwm.sh` outright (directly causing that attempt's `DE_FAILED`). A THIRD variant of
+the queued-for-closure cross-process-index gap: an in-bounds index into `Descriptors::entries` can
+resolve to a REAL, live entry -- just one belonging to a completely different `FdEnabledSubsystem` (a
+pipe, pty, or plain file; `entries` numbers every fd kind in one shared per-process index space, and a
+`Network::queued_for_closure` index is only ever meaningful to whichever process originally pushed it).
+`DescriptorEntry` already has a `matches_subsystem` check used by this exact class of guard elsewhere
+in the same file (`iter`/`iter_mut`) -- applied it here too, alongside the existing
+`as_usize()`/`entries.get()` guards. Commit: `matches_subsystem` guard.
+
+**Result after all five: two consecutive full release-binary boots ran completely panic-free,
+end-to-end, for the first time in this entire investigation** -- `DBUS_UP`, `SELKIES_LAUNCHED_LAST`,
+`SELKIES_PORT_UP`, `DE_LAUNCHED` all reached with zero crashes logged. Reproduced twice.
+
+**New, sole blocker found, precisely evidenced, NOT a crash**: `DE_FAILED` still fires (both the
+`startwm.sh` path and the direct `xfce4-session` fallback), but now because `xfce4-session: Cannot
+open display: .` -- `$DISPLAY` reads as EMPTY inside the forked child that execs `xfce4-session`,
+even though `export DISPLAY=:1` runs at the very top of `webtop_stack.sh` (line 51) and is correctly
+visible to every earlier fork (Xvfb's own invocation, `xset q`'s successful connect that produces
+`XVFB_UP`). Decisive live test (a one-line diagnostic added to the LOCAL, gitignored
+`.wfgy/webtop_stack.sh` test copy, `echo "[s] DIAG_DISPLAY=...` straight to stdout -- not through any
+guest file, to rule out the writable-layer-visibility class entirely): the PARENT shell's OWN live
+environment, read IMMEDIATELY before forking the `xfce4-session` child, correctly shows
+`DISPLAY=[:1]` (and a correctly-formed `DBUS_SESSION_BUS_ADDRESS`, confirming the dbus fix's
+materialized content is exactly right). The bug is therefore neither a script issue nor (this time)
+the writable-layer-file class -- it is specifically that the FORKED CHILD does not receive an
+accurate copy of the parent's CURRENT process memory (wherever dash keeps its exported-variable
+table) at the fork instant, even though the parent's own live state is correct moments before and
+after. `sys_execve` itself (`litebox_shim_linux/src/syscalls/process.rs`) is not implicated -- it
+reads `envp` straight from the CALLING (already-forked) process's own current memory via `UserPtr`,
+no cross-process step involved at that point. The bug is upstream, in however the cross-process-fork
+child's initial memory ("vmem-adopt-probe... adopting N pre-populated region(s)") gets constructed --
+the SAME general shape of issue pass 26's own "bash reads scripts in buffered chunks... the fork
+boundary and the intended 'run this defensive line, then immediately fork for the very next line'
+boundary are not guaranteed to coincide" theory named for the writable-layer case, but here affecting
+actual GUEST PROCESS MEMORY content (a shell's own heap-resident variable table) rather than a
+filesystem snapshot. Not yet root-caused with a debugger this pass -- needs its own dedicated
+`cdb`/debug-binary session comparing the parent's actual live memory at the fork syscall instant
+against what the child's adopted region shows, mirroring the eighteenth-pass `GlobalState` field audit's
+own method. Two boots reproduced this identically. Did not reach the browser/terminal/apps milestone
+this pass -- closer than ever (crash-free all the way to `DE_LAUNCHED`), but this new, precisely
+evidenced blocker is what stands between here and there now.
+
+**Host state**: RAM ranged 0.75-7.3GB free across roughly a dozen boot attempts this pass (both debug
+and release binaries), never critically low enough to force an unplanned kill; every process tree
+cleanly WMI-`Terminate`d between attempts and at session end.
+
+**Files touched**: `litebox_shim_linux/src/lib.rs` (`shared_file_publish` field),
+`litebox_shim_linux/src/syscalls/file.rs` (`SharedFilePublishTable` + `do_write`/`do_stat`/
+`do_access`/`do_open_resolved` wiring), `litebox/src/net/mod.rs` (all five net-module fixes above),
+`litebox/src/fd/mod.rs` (`drain_entries_full_covered_by`'s three fixes). `.wfgy/webtop_stack.sh`'s own
+`DIAG_DISPLAY` diagnostic line is LOCAL-ONLY (gitignored `.wfgy/`), not part of any commit -- remove
+or keep at a future session's discretion; it costs nothing to leave in.
+

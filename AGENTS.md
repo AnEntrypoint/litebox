@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-20)
+# litebox — current state (2026-09-21)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -72,8 +72,8 @@ warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error` by ref
   top-level program, never via a runtime-built `/bin/sh -c` wrapper.
 - **Never trust a container tag name for its WM/session contents** — verify by registry manifest + blob
   tar-listing, or a live in-guest `/usr/bin` listing.
-- **Never record a test count you did not just watch run to completion**, and never leave a suite red
-  for an environmental reason. No counts are recorded here on purpose.
+- **Never record a test count not just watched run to completion**; never leave a suite red for an
+  environmental reason. No counts are recorded here on purpose.
 - **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`,
   gitignored); untrack anything `git add -A` sweeps in.
 - Procedural know-how is in the archive's "Working practices": freestanding guest binaries built on the
@@ -113,27 +113,26 @@ AGENTS_ARCHIVE_2026-09-17.md`/`_2026-09-18.md`.** (4) nginx-self-test pipe-EOF w
 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit handle allow-list. (8) `Network::socket_set` made
 shared-arena-native (256-slot fixed array). (10) post-`NGINX_STARTED` CPU livelock —
 `LocalPortAllocator`/`closing_in_background` converted to fixed `[u16; 65535]` arrays
-(`interface`/`queued_for_closure` remain open). (11) `RawMutex` poison-on-dead-holder scheme;
+(`interface` remains open; `queued_for_closure` fixed twenty-eighth pass). (11) `RawMutex` poison-on-dead-holder scheme;
 `Socket::Drop` cross-process-heap-free fixed via `core::mem::forget`. (12) by-name `Xvfb`/
 `dbus-daemon` cross-process-fork exclusion relaxed (`SafeZoneAllocator::dealloc`'s spinlock
 livelock found, **still open**). (13) shared cross-process AF_UNIX connection data plane DESIGNED
 + IMPLEMENTED (`SharedUnixConnTable`/`SharedUnixConnectQueue`). (14/15) isolated AF_UNIX repro
 PASSED; real full-boot-stall root cause was a smoltcp stale-`SocketHandle` panic killing
 `net_worker` threads platform-wide, FIXED via `catch_unwind` + `force_reset_network_after_panic()`
-(the `wait_on_tun` two-holder-deadlock theory was WRONG — symbol-resolution noise, trust only small
-offsets). (16) `webtop_stack.sh`'s `[ -S "$XSOCK" ]` never true on this shim, fixed: `-S` → `-e`.
+(the `wait_on_tun` two-holder-deadlock theory was WRONG). (16) `webtop_stack.sh`'s `[ -S "$XSOCK" ]`
+never true on this shim, fixed: `-S` → `-e`.
 (17) `xset q`'s silent kill CAUGHT LIVE + FIXED (`memfds`/`shared_files` per-process-shadowed).
 
 **Eighteenth pass** — systematic `GlobalState` field audit (3 more defects fixed: `unix_addr_
 table`/`fifo_registry` per-process-shadowed, `sysv_shm` fixed 128-slot array), a debug build for
 reliable `cdb` symbols. Still open, deeper redesign needed: `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (pickup list). Found the real blocked thread: guest `ppoll()`
-parked on a Condvar, AF_UNIX bounded-15ms-repoll running but the awaited `has_pending(...)` never
-flips true. Full detail: archive.
+parked on a Condvar, AF_UNIX bounded-15ms-repoll running but `has_pending(...)` never flips true.
+Archive.
 
-**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall, `has_pending`/queue logic REFUTED
-as the bug; found a real-but-unconfirmed `Init`-state gap in `UnixInitStream::check_io_events`.
-Full detail: archive.
+**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall, `has_pending`/queue logic REFUTED as
+the bug; found an unconfirmed `Init`-state gap in `UnixInitStream::check_io_events`. Archive.
 
 **Twentieth pass** — FIXED the `SharedUnixConnTable` slot leak on externally killed clients
 (commit `05d279d`; dead-holder check + reclaim, `SHARED_UNIX_CONN_CAPACITY` 8->64). Confirmed the
@@ -147,64 +146,63 @@ every-iteration fix (script-only) + its own dash-`$SECONDS` regression fix; AF_U
 per-request instrumentation proved the AF_UNIX rendezvous mechanism itself sound (one real connect
 per boot, ~23ms, no timing/address-mismatch); real blocker found upstream (`$XSOCK` wait loop never
 completing); also fixed `sys_wait4`'s `pid > 0` no-repoll gap. Browser milestone not reached by any
-of these three passes. Full detail (all three): archive.
+of these three passes. Full detail (all three): archive. RAM ranged 1.4-4.8GB free throughout,
+recovered fully after each kill.
 
-Both boots killed cleanly (WMI `Terminate`), RAM ranged 1.4-4.8GB free, recovered fully after each
-kill.
-
-**Twenty-fifth pass** — CONFIRMED (direct source read of `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc
-comment) that a bound AF_UNIX path needs only presence, not content, sync: FIXED via the already-
-shared `SharedUnixAddrPresenceTable` consulted on `ENOENT` (`litebox::fs::devices::
+**Twenty-fifth pass** — CONFIRMED a bound AF_UNIX path needs only presence, not content, sync:
+FIXED via `SharedUnixAddrPresenceTable` consulted on `ENOENT` (`litebox::fs::devices::
 cross_process_bound_unix_socket_status`, `do_stat`/`do_access` in `litebox_shim_linux/src/
 syscalls/file.rs`) — closed the `$XSOCK` stall for good. Also widened
 `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` 3s->15s (real contention starved the listener's 15ms re-poll).
-Superseded by the twenty-sixth pass's deeper fix below (the "established connection's data
-doesn't flow" finding this pass ended on). Full evidence: archive.
+Superseded by the twenty-sixth pass's deeper fix below. Archive.
 
 **Twenty-sixth pass (2026-09-20) — ROOT-CAUSED AND FIXED the "Xvfb never reads `xset q`'s bytes"
 gap; `XVFB_UP` printed for the first time ever.** Root cause: `EpollFile::
 repoll_stdin_and_timerfd_interests` decided ready-set membership from `EpollEntry::poll`'s
 `is_still_ready` field instead of its `event.is_some()` field — `is_still_ready` is
 unconditionally `false` for any `EPOLLET`-registered fd, and Xvfb registers its accepted X11
-client fd exactly that way. Fixed (`litebox_shim_linux/src/syscalls/epoll.rs`), live-verified on
-both debug and release binaries. Boot reached `[s] DE_LAUNCHED` and attempted `SELKIES_PORT_UP`
-(curl_exit=137 — safety-killed at host RAM ~320-480MB, debug-binary-only, not a further litebox
-bug). Full evidence: `docs/AGENTS_ARCHIVE_2026-09-18.md`, twenty-sixth pass.
+client fd exactly that way. Fixed (`litebox_shim_linux/src/syscalls/epoll.rs`), verified on both
+debug and release binaries. Boot reached `[s] DE_LAUNCHED` and attempted `SELKIES_PORT_UP`
+(curl_exit=137 — safety-killed at low RAM, debug-binary-only). Archive.
 
-**Twenty-seventh pass (2026-09-20) — surgical pre-create LANDED (safe); general periodic-sync
-mechanism attempted, PROVEN to cause a worse regression than it fixed, cleanly reverted.**
-(1) **Surgical fix, kept**: `/tmp/empty`, `config/` and `config/.Xresources` (deterministic,
-never-guarded-by-a-`[ -d ]`-check content) now ship baked into `.wfgy/webtop_seed.tar` itself
-(imported via `--resume-from` before any fork happens), so every process in the boot tree has them
-from time zero — no visibility race to lose. `usr/share/selkies/web/50x.html` was deliberately
-**not** pre-seeded: `webtop_stack.sh:127` guards a REAL one-time dashboard-directory copy behind
-`[ ! -d /usr/share/selkies/web ]`, and pre-creating that directory would silently skip the real
-copy for every process, replacing the dashboard with just the error page. Live-verified: no
-regression, byte-identical boot progress to before this change.
-(2) **General fix, tried and reverted**: a background thread per real OS process (`run()` and the
-real cross-process fork-child bootstrap `diag_process_fork_task_resume_probe` — confirmed real via
-`[process_fork_diag] task-resume-probe` lines despite the `diag_` naming) periodically exported+
-published this process's writable layer to the canonical snapshot and additively merged missing
-entries back (AF_UNIX-bounded-repoll-shaped). It DID fix the target problem (`dbus-daemon`'s
-`/tmp/addr` write became visible to the parent shell's poll) but caused a WORSE, 100%-reproducible
-regression: `webtop_stack.sh`'s `cp /defaults/default.conf` + four sequential `sed -i` calls (each
-its own real fork+`wait4`) raced the periodic export, capturing a self-consistent but TEMPORALLY
-STALE snapshot (post-`cp`, pre-`sed`); `publish_as_container_fs_snapshot`'s existing size-based
-"bigger wins" tie-breaker (never a timestamp) then let that stale snapshot PERMANENTLY clobber the
-shell's fresher, correct one. Result: `NGINX_SUPERVISOR: giving up after 30 attempts` every time,
-literal unsubstituted `invalid port in upstream "127.0.0.1:CWS"` — in all 3 tested variants (500ms;
-3000ms; 3000ms + "skip if canonical modified <750ms ago"), 100% reproduction, NOT reduced by
-widening the interval — the tell that this is not a rare coincidence: N full-tree-walk threads'
-aggregate CPU/I/O cost slows the exact fork+wait4+import sequences the fix depends on completing
-fast, so widening the interval only grows the contention that recreates the same collision at the
-new timescale. CONFIRMED via isolation (`LITEBOX_NO_WRITABLE_LAYER_SYNC=1`, surgical fix kept): 0
-CWS occurrences, clean `NGINX_STARTED`, boot proceeds to `XVFB_UP`/`DBUS_FAILED` exactly as before.
-Mechanism (`spawn_writable_layer_sync_thread`/`merge_missing_writable_layer_entries`,
-`litebox_runner_linux_on_windows_userland/src/lib.rs`) fully REMOVED, not disabled — do not re-add
-a per-process timer-driven full-tree export/publish without first fixing one of pickup item 3's
-two structural prerequisites, verified against this same nginx repro. Did not reach the browser/
-terminal/apps milestone this pass. RAM 1.8-6.5GB free throughout; every process cleanly WMI-
-`Terminate`d before this pass ended.
+**Twenty-seventh pass (2026-09-20)** — surgical pre-create of `/tmp/empty`/`config/`/
+`config/.Xresources` into `webtop_seed.tar` LANDED (safe, live-verified, no regression). A general
+periodic-writable-layer-sync-thread alternative was tried and PROVEN to cause a worse regression
+(100%-reproducible `NGINX_SUPERVISOR` failure via a stale-snapshot/size-tie-breaker collision with
+`cp`+`sed` config generation) — fully REMOVED, not disabled; do not re-add without first fixing the
+tie-breaker or adding an import-lock (see pickup list). Full evidence: archive.
+
+**Twenty-eighth pass (2026-09-21) — `DBUS_FAILED` CLOSED for good (pickup item 3's own option (c),
+`SharedFilePublishTable`); FIVE further real crash-class bugs found+fixed the same pass; two
+consecutive full release-binary boots ran completely panic-free end-to-end for the first time
+ever, all the way to `DE_LAUNCHED`; new, precisely-evidenced, non-crash blocker found.**
+`SharedFilePublishTable` (`litebox_shim_linux/src/syscalls/file.rs`, `GlobalState.shared_file_
+publish`): an 8-slot/256-byte-content POD table extending `SharedUnixAddrPresenceTable`'s pattern
+to small file CONTENT, not just existence. `do_write` publishes an opted-in path's real
+offset+bytes (`SHARED_PUBLISH_PATHS = ["/tmp/addr"]`) alongside the real write;
+`do_stat`/`do_access`/`do_open_resolved` MATERIALIZE a genuine local copy on a real `ENOENT` (safe
+here, unlike the AF_UNIX presence table, because a short byte string can be copied bit for bit).
+`[s] DBUS_UP` now prints every time — never once before this pass, across 27 prior passes.
+Immediately surfaced (live, real boot) FIVE further, real, independent crash bugs in the SAME
+already-known `Network::reset_after_poisoning` stale-handle/stale-index class, found and fixed one
+at a time as each blocked further progress: (1) `Network::close`/`close_handle`'s own two
+remaining unguarded `socket_set` touches (three sibling functions already had the guard). (2)
+`Network::queued_for_closure` was the one field explicitly left as a plain `Vec` when
+`closing_in_background` got the shared-fixed-array fix on 2026-09-17 — converted to a fixed
+`[Option<SocketFd<_>>; MAX_SOCKETS]` array, `DescriptorTable::drain_entries_full_covered_by`
+widened from `&mut Vec<TypedFd<_>>` to `&mut [Option<TypedFd<_>>]`. (3) **Honest finding**: making
+that container shared did NOT make its CONTENT cross-process-safe — a `TypedFd` encodes a
+per-process-private `Descriptors::entries` index, meaningless to whichever OTHER process's own
+tick drains the now-shared queue next (`"index out of bounds: the len is 16 but the index is
+31"`); fixed via `None`-tolerant lookups (leave a foreign index untouched rather than force-clear
+it) instead of forcing the original shared-array idea to be "enough" on its own. (4)
+`LocalPortAllocator::deallocate`/`allocate_same_local_port`'s own `unreachable!()`s, exactly as
+their own doc comment already predicted. (5) A proactive sweep of every remaining unguarded
+`net/mod.rs` `socket_set` call site (justified by live evidence of three independent hits, not
+speculation) — `accept`, `connect`, `get_local_addr`, `get_remote_addr_for_handle`, `bind`,
+`shutdown`, `send`, `receive`, `set_tcp_option`, `get_tcp_option`, `listen` — then a further
+`DescriptorEntry` cross-subsystem-downcast panic in `drain_entries_full_covered_by`
+(`matches_subsystem` guard, mirroring `iter`/`iter_mut`). Full evidence: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -212,34 +210,39 @@ terminal/apps milestone this pass. RAM 1.8-6.5GB free throughout; every process 
 
 (0b) `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
 dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in `dealloc`,
-high blast radius, own dedicated pass. (1b) `queued_for_closure`'s own still-open cross-process-Vec
-hazard (STORAGE not yet converted to a fixed pointer-free array the way `closing_in_background`/
-`socket_set` already were) remains a live risk. (2) debugger-root-cause `litebox/src/
+high blast radius, own dedicated pass. ~~(1b) `queued_for_closure`'s own cross-process-Vec
+hazard~~ — FIXED, twenty-eighth pass (fixed array + `matches_subsystem`/`None`-tolerant guards,
+`litebox/src/net/mod.rs` + `litebox/src/fd/mod.rs`). (2) debugger-root-cause `litebox/src/
 event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, most frequent
-panic historically, NOT yet debugger-confirmed — do not patch blind); (3) **still the sole
-confirmed blocker to the browser/terminal/apps milestone**: `DBUS_FAILED` — `dbus-daemon --nofork`
-writes `/tmp/addr` but never forks/exits again, so the parent shell's `_nofork_tick`-based poll
-(a pure busy-wait, zero forks, confirmed by direct read of `webtop_stack.sh`'s own `_nofork_tick`)
-never gets a synchronization point to see it. A periodic full-tree timer-based sync is DISPROVEN
-(twenty-seventh pass, above) as a viable general fix — it is fundamentally incompatible with
-`publish_as_container_fs_snapshot`'s existing size-based tie-breaker once a high-frequency extra
-writer is added. The real fix needs ONE of: (a) replace that tie-breaker with a real
-timestamp/generation counter so a stale publish can never beat a fresher one regardless of size or
-publish frequency; (b) a lock that any multi-entry import (`import_all`/
-`import_cross_process_writable_layer`) holds as writer and any export/walk holds as reader, so an
-export can never observe a filesystem mid multi-file-import; (c) extend the
-`SharedUnixAddrPresenceTable` POD/lock-free flat-table pattern (already proven for AF_UNIX
-presence, `sysv_shm`) to small file CONTENT specifically for long-lived, non-forking daemons'
-LATE writes — narrower in scope than a general sync, but sidesteps both (a) and (b) entirely.
-Whichever is chosen, verify with the SAME nginx `cp`+multi-`sed` sequence as a regression probe
-before declaring victory. (4) finish the `Network` shared-arena
-redesign (`interface`, `queued_for_closure` remain); (4b) `pty_registry`/`daemon_pty_masters`/
+panic historically, NOT yet debugger-confirmed — do not patch blind). ~~(3) `DBUS_FAILED`~~ —
+CLOSED, twenty-eighth pass (`SharedFilePublishTable`, `litebox_shim_linux/src/syscalls/file.rs` —
+extends `SharedUnixAddrPresenceTable`'s pattern to small file CONTENT); `[s] DBUS_UP` now prints
+every boot. **Current sole blocker to the browser/terminal/apps milestone, precisely evidenced,
+twenty-eighth pass**: `DE_FAILED` — both `startwm.sh` and the direct `xfce4-session` fallback fail
+with `xfce4-session: Cannot open display: .` (`$DISPLAY` empty) inside the forked child that execs
+it, even though `export DISPLAY=:1` (line 51) is correctly visible to every EARLIER fork (Xvfb
+itself, `xset q`'s successful connect). A direct stdout-only diagnostic (bypassing the
+writable-layer-file class entirely) confirmed the PARENT shell's own live environment is CORRECT
+(`DISPLAY=[:1]`) immediately before the fork that loses it — neither a script bug nor the
+writable-layer-visibility class; the cross-process-fork CHILD is not receiving an accurate copy of
+the parent's current process memory (wherever dash's exported-variable table lives) at the fork
+instant. `sys_execve` (`litebox_shim_linux/src/syscalls/process.rs`) reads `envp` from the
+ALREADY-FORKED child's own current memory, no cross-process step there — the bug is upstream, in
+the memory-adoption step (`vmem-adopt-probe`). NOT yet root-caused with a debugger — needs its own
+`cdb`/debug-binary session (mirror the eighteenth-pass `GlobalState` field-audit method: compare
+the parent's real live memory at the fork instant against the child's adopted region) before
+attempting a fix. Two boots reproduced this identically. Full evidence: archive. (4) finish the
+`Network` shared-arena redesign (`interface` remains
+— `queued_for_closure` is now fixed, see (1b)); (4b) `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) genuinely need
 cross-process visibility per their own doc comments but hold non-POD payload (Arc-based state,
 `Pollee` observer lists), so need a deeper redesign than `sysv_shm`'s flat-Copy-slot-array fix —
 not yet touched by any pass, not on the Xvfb/selkies boot path so lower urgency than (0)-(4); (5)
 after (0)-(4), `timerfd`/`signalfd` are the next-cheapest carriable fd kinds before attempting
-`socket`/`unix-socket`/`pty`/`epoll`.
+`socket`/`unix-socket`/`pty`/`epoll`. (6) The general writable-layer-visibility gap for LARGE/
+unbounded content (`/tmp/de.log`/`/tmp/de2.log`, `/tmp/wm1`/`/tmp/wm2` — reconfirmed real,
+twenty-eighth pass) is SEPARATE, lower-priority than the DISPLAY-loss blocker above —
+`SharedFilePublishTable`'s 256-byte cap must NOT be widened to try to cover it.
 
 ## Container images and OCI loading
 
@@ -292,12 +295,10 @@ same corruption every tick).
 **Sixth/seventh pass (closed)** — writable-layer-adoption race fixed via the existing
 atomic-rename primitive; live-verified 5/5 boots, zero recurrence. Detail: archive.
 
-**Open here.** One client per selkies instance, no slot reclaim on reload. Architectural gap:
-**guest processes share no AF_UNIX/loopback/FIFO namespace** — precisely confirmed and named
-(`unix_addr_table`'s `Backlog`/`Channel` connection data) in the twelfth-pass entry above; extending
-that table's presence-sharing pattern to real connection data (now DONE, thirteenth pass, and
-proven sound in isolation by the fourteenth-pass repro) was meant to put the desktop on the
-crash-free path — the fourteenth-pass full-boot stall is the thing standing between here and there.
+**Open here.** One client per selkies instance, no slot reclaim on reload. The AF_UNIX
+connection-data-plane gap this paragraph used to describe is now DONE (thirteenth pass) and
+crash-free through `DE_LAUNCHED` (twenty-eighth pass) — see the Cross-process fork section above
+for the current sole blocker (`DISPLAY` loss across fork).
 
 **The glibc/tcache crash class still sporadically hits selkies** on the THREAD-based fork path, a
 SECOND corruption signature under heavy fork load (`double free or corruption (out)` SIGABRT).
@@ -359,11 +360,14 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-22nd passes: Xvfb/dbus relaxed; shared
+- **Archives** (newest first) — `_2026-09-18.md` (12th-28th passes: Xvfb/dbus relaxed; shared
   AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
   `xset` silent kill FIXED; GlobalState field audit + debug binary; `SharedUnixConnTable` leak +
-  `wait4(-1)` no-repoll stall both ROOT-CAUSED + FIXED; sleep-fork-per-iteration FIXED, real
-  `ppoll` blocker found; browser milestone still not reached), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  `wait4(-1)` no-repoll stall both FIXED; sleep-fork-per-iteration FIXED; epoll EPOLLET ready-set
+  bug FIXED (`XVFB_UP` first-ever); writable-layer surgical pre-create landed; `DBUS_FAILED`
+  CLOSED (`SharedFilePublishTable`); five further `reset_after_poisoning` crash bugs fixed; two
+  panic-free full boots to `DE_LAUNCHED`; new DISPLAY-loss blocker found, not yet root-caused),
+  `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:
