@@ -2535,3 +2535,192 @@ detection fires too late, essentially AT the crash itself, since Xvfb appears to
 stderr during normal operation and only ever writes anything as part of its own crash handler --
 reusable code, wrong trigger, kept for the next pass to fix), .wfgy/xvfb_live_cdb2_*.log (the
 live cdb capture).
+
+## Thirty-second pass, 2026-09-21 -- cdb attach REFUTED as viable (it perturbs the very race it
+needs to observe); a low-overhead in-process diagnostic (LITEBOX_DIAG_FATALDUMP=1) caught the
+REAL deterministic SIGSEGV clean, twice, with bit-identical rip AND fault address; exact
+mechanism now known with hardware ground truth; precise Xvfb call site still open.
+
+### Method 1 (refuted): cdb auto-continue filter
+
+Reused the 31st pass's proven two-stage PID-identification pipeline (`.wfgy/
+xvfb_live_cdb_orchestrator3.ps1`/`xvfb_live_cdb_boot_wrapper3.ps1`, same offset=18647-then-
+0xc0de0000-sentinel-then-winpid sequence) and finished its own pickup item: a `cdb -p <pid> -c
+"sxe -c \"r;k;.exr -1;!analyze -v;gn\" av;g"` session that dumps full register/stack/analysis
+state on EVERY first-chance access violation and unconditionally resumes via `gn` ("go, not
+handled by the debugger" -- verified this is the correct verb: it defers to the process's own
+normal SEH/VEH dispatch exactly as if no debugger were attached, `gh` would skip VEH's own
+FS_BASE repair entirely and was never used). This DID catch two real, distinct AVs live: one the
+literal `sub rax, fs:[28h]` stack-canary-check shape already known from the 31st pass, and a
+SECOND, previously-unseen shape of the SAME FS_BASE-reset class -- `mov rdx, qword ptr fs:[r12]`
+(register-indirect TLS access, `r12=0xfffffffffffffc60`) -- proving the 31st pass's own
+"filter on fault address == 0x28" heuristic was too narrow: the correct discriminator is
+whether the faulting instruction carries the `0x64` FS-segment-override prefix byte, not the
+literal displacement value (litebox's own `faulting_instruction_has_fs_override` already uses
+the right predicate; the pickup note that suggested filtering by address magnitude did not).
+
+**Honest, load-bearing negative result**: after cdb attached, the SAME boot that reaches
+`XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED` cleanly with no debugger instead hit `XVFB_FAILED` within
+seconds of attach and never recovered (`DE_FAILED`, then an inert 28+-minute `[s] HOLD` loop,
+Xvfb process alive but never crashing again). Root cause: Windows freezes the WHOLE debugged
+process while cdb's first-chance-exception script runs (`r;k;.exr -1;!analyze -v`, several
+hundred ms each, confirmed by `!analyze -v`'s own `ANALYSIS_SESSION_ELAPSED_TIME` field), and
+the FS_BASE-reset class fires often enough that this repeatedly stalled Xvfb's own thread long
+enough to lose the `xset q` liveness race (already known to be narrow, `docs/
+AGENTS_ARCHIVE_2026-09-18.md`'s 26th-pass entry) -- which then starves the boot of the
+xfce4-session/panel/window-manager X11 traffic volume the deterministic crash itself needs
+(byte-volume-correlated per the 31st pass's own Method 2). **cdb is therefore structurally
+unable to observe this specific bug**: attaching it changes the very timing the bug depends on.
+Do not re-attempt a cdb-based capture of this crash without first solving the freeze-on-every-
+FS_BASE-reset problem (e.g., a `.dvalloc`/breakpoint-only approach that never actually invokes
+`!analyze`, or filtering at the OS level before the debugger ever sees the routine class) --
+this pass's own two consecutive `XVFB_FAILED` results after attach, vs. zero in N prior
+undebugged boots, is strong enough evidence to treat this as settled rather than bad luck.
+
+### Method 2 (worked): broadened `LITEBOX_DIAG_FATALDUMP=1`, no debugger
+
+Read `litebox_platform_windows_userland/src/lib.rs`'s existing (pre-this-pass) `diag_fataldump_
+enabled()` gate closely: it already does everything cdb's script does -- full register dump,
+code bytes at rip, a raw stack dump, `describe_addr_for_diagnostics` on the fault address -- as
+a plain synchronous `eprintln!` inside the VEH handler itself, no cross-process debug-event
+round trip, so it does not carry cdb's freeze cost. It was gated to fire only for a small
+class of ALREADY-known crash shapes from an unrelated (apk/jq) investigation (`ExceptionInformation[1]
+< 0x1_0000 || == usize::MAX`), which never matched this crash's own large fault address
+(`0x7feffecdd400`). The overhead concern that motivated keeping the gate narrow was ALREADY
+solved by a completely separate, magnitude-independent exclusion (`faulting_instruction_has_fs_
+override`), so removing the magnitude restriction (commit `26fe95c`) was a pure win: any AV that
+survives the FS_BASE exclusion is rare by construction, regardless of address size.
+
+Booted with `LITEBOX_DIAG_FATALDUMP=1` alongside the existing `litebox_diag::stderr_capture=debug`,
+no `LITEBOX_PROCESS_FORK`/cdb changes, otherwise identical to every prior pass's repro. Two
+independent full boots (of six total attempts -- see "Flakiness" below) reached the real crash
+cleanly, with `XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED` all firing normally beforehand, at ~207s into
+Xvfb's own life (boot A) and an equivalent position (boot B), matching the 190-220s window
+exactly. Both captures:
+
+```
+[veh-regs] ENTRY rip=0x7fefede9dabd rdi=<heap ptr, ~0x4411_5777xx, varies> rsi=0x7feffecdd400 rdx=0x40
+[veh] rip bytes (16): [c5, fe, 6f, 06, 48, 83, fa, 40, 0f, 87, 42, 01, 00, 00, c5, fe]
+[veh] fault addr=0x7feffecdd400 type=0x0 protect=0x1 alloc_base=0x0 watched=false
+```
+
+`rip` is bit-identical across both independent process launches; so is the fault address
+(`rsi`) and the remaining-length register (`rdx=0x40`). Only the destination pointer (`rdi`,
+a heap address) varies slightly between runs, as expected. `type=0x0 alloc_base=0x0` at the
+fault address means Windows has NO allocation of any kind there -- not a demand-paging-
+repairable legitimate guest page, a genuinely wild pointer.
+
+### Decoding the mechanism precisely
+
+`c5 fe 6f 06` disassembles as `vmovdqu (%rsi),%ymm0` -- an AVX2 256-bit (32-byte) unaligned
+vector load, immediately followed by `48 83 fa 40` (`cmp $0x40,%rdx`) and `0f 87 42 01 00 00`
+(`ja +0x142`), the classic bounds-check tail of glibc's `memcpy`/`memmove`/`mempcpy` AVX2
+multiarch implementation handling a 33-64 byte remainder. Byte-for-byte matched (via `objdump
+-d` on the same-BuildID runtime `libc.so.6` extracted straight from `.litebox-cache`,
+`c495b62edadd6c356265942ec1282d98058a7b41`) to file offset `0x162abd`, giving a precise host
+load bias of `0x7fefedd3b000` -- independently cross-checked against `[codewatch] crash page ...
+alloc_base=0x7fefedd30000` (same 64KB-granular region, off by exactly the ELF segment's own
+sub-page alignment). **This is glibc's own optimized bulk-copy routine, called BY Xvfb (not a
+litebox-shim bug in the copy itself), reading 64+ bytes from a source pointer Xvfb computed and
+that is completely unmapped.** `0x7feffecdd400` is `TASK_ADDR_MAX (0x7FEFFFFF0000) -
+0x1312C00`, i.e. exactly ~19.2MB below the top of the guest address space, matching the 31st
+pass's own approximate figure precisely now that the arithmetic is exact.
+
+**Xorg's own self-printed backtrace is NOT trustworthy past frame 0 here** -- live-verified:
+frames 1-9 of its 13-frame dump printed as bare `"N: "` with no module/address at all (`dladdr()`
+failed to resolve ANY of them), and frame 0's own printed address (`Xvfb+0x1b20ed`, matching the
+31st pass's independently-found offset exactly, confirming it is a real, reproducible artifact,
+not a fluke of that one investigation) decodes to a file offset inside `.eh_frame_hdr`, not
+`.text` (`.text` only spans `0x33900`-`0x19a345` in this exact Xvfb build, `BuildID
+sha1=6440f00c805782c9a39a5acd92855079e9fffc92`, confirmed via `readelf -S` on the real runtime
+binary pulled from `.litebox-cache`) -- i.e. Xorg's crash-handler `backtrace()` call itself
+appears to misresolve on this optimized, frame-pointer-omitted code shape, an independent minor
+finding worth remembering (do not trust `(EE) Backtrace:` frame addresses at face value again
+without cross-checking against a real section table first). A naive raw-stack-word scan (dumping
+32 qwords from `rsp` and checking which fall in Xvfb's `.text` range) surfaced several
+PLAUSIBLE-LOOKING but almost certainly STALE candidates (`ProcSELinuxGetClientContext`,
+`ConstructClientResourceBytes`, `SELinuxReceive`, `ProcXkbGetKbdByName` -- four unrelated
+extension handlers, unlikely to be simultaneously live on one call stack) -- a follow-up attempt
+to classify each stack qword via `describe_addr_for_diagnostics` (committed, then reverted same
+pass, see "Flakiness" below) was built to disambiguate real return addresses from stack noise by
+page-protection shape but was not validated before this pass ran out of time.
+
+### Flakiness (recorded so it is not re-investigated as if it were new)
+
+Six `LITEBOX_DIAG_FATALDUMP=1` boots this pass: 1 clean crash capture, 1 clean crash capture (after
+reverting the stack-classify addition), 3x `XVFB_FAILED`/`DE_FAILED` (Xvfb up but the liveness
+probe/desktop launch still lost its own pre-existing race, unrelated to this pass's diagnostic --
+this exact race's history, `docs/AGENTS_ARCHIVE_2026-09-18.md`'s 26th-pass entry, already
+describes it as narrowed but not eliminated), 1 genuine multi-minute stall with zero new forks and
+a static log size (killed via WMI Terminate per the standing playbook, RAM recovered cleanly, no
+lasting host impact). The extra per-qword `describe_addr_for_diagnostics` stack-classification
+loop was added, then REVERTED (not committed) after three consecutive `XVFB_FAILED` results
+immediately followed adding it, on the working theory it added just enough per-fatal-dump-event
+latency to tip the already-narrow `XVFB_UP` race -- NOT proven (only 3 data points, and a plain,
+unmodified rebuild ALSO hung once), but cheap to avoid: the reverted code is preserved in this
+entry's own diff description above, re-add and rebuild if a future pass wants to retry proper
+return-address classification with a longer boot budget to average out the flakiness.
+
+### Root cause: still open, precisely scoped
+
+Confirmed NOT the FS_BASE-reset class (no `0x64` prefix on the faulting `vmovdqu`). Confirmed NOT
+a litebox transport/ring-buffer bug (the 31st pass's own audit of `SharedByteRing` already reads
+as sound, and this pass's fault is deep inside glibc's OWN copy routine, not litebox shim code).
+Two live, evidenced hypotheses, neither confirmed: (1) Xvfb's own client-input-buffer growth logic
+(`os/io.c`, real Xorg source, not present in this checkout) computes a read boundary that
+overruns its actual allocation under the exact pipelined-large-batch shape the 31st pass's Method
+2 already decoded (a `_NET_WM_ICON` `ChangeProperty` immediately followed by a second
+`ChangeProperty`) -- a genuine, if narrow, Xvfb-own bug that real Linux would presumably also hit
+under the identical byte sequence (would need a bit-identical repro against upstream Xvfb on real
+Linux to confirm, not attempted this pass). (2) litebox's own top-down mmap/brk allocator
+advances its "next address" watermark for a region Xvfb legitimately expects to be backed (e.g.
+during buffer growth via `realloc`, which itself may `mmap` a fresh large-enough block) without
+actually committing real memory there, OR returns a stale/miscomputed hint address once under a
+specific allocation-history sequence -- consistent with the address being ~19.2MB below
+`TASK_ADDR_MAX` (the exact region litebox's own top-down allocator would be bumping through) and
+with its PERFECT bit-for-bit reproducibility across independent process launches (real garbage/
+uninitialized-memory reuse would not normally reproduce this precisely; a deterministic allocator
+watermark would). `sys_shmat`/`sys_shmget` (`litebox_shim_linux/src/syscalls/mm.rs`) were
+inspected and read as sound (delegate to the ordinary anonymous-mmap path, no address-arithmetic
+of their own) -- ruled out as the direct site, though the 64-byte copy length (nowhere near
+framebuffer-sized) already made SHM an unlikely culprit before that read. **Pickup, precisely
+scoped**: (a) get a real stack unwind -- either finish and re-validate the reverted `describe_
+addr_for_diagnostics`-per-stack-qword classifier (this pass's own near-complete attempt, budget
+for the boot-flakiness this pass hit) or build a minimal CFI-aware unwinder using `.eh_frame`
+data already present in the extracted Xvfb ELF/debug info (`.wfgy/xvfb.debug`, `.wfgy/
+xvfb_runtime.bin`, both kept, matching `BuildID sha1=6440f00c805782c9a39a5acd92855079e9fffc92`);
+(b) once the real Xvfb call site is known, cross-reference against upstream Xvfb/glibc source
+(network access confirmed available this pass -- `debuginfod.debian.net` answered the Xvfb
+BuildID with real DWARF in one request, `curl -o xvfb.debug .../buildid/<id>/debuginfo`; the
+matching `libc6` BuildID `c495b62edadd6c356265942ec1282d98058a7b41` was NOT found on either
+Debian's or Ubuntu's debuginfod, source-level libc symbol names for the exact memmove variant
+remain unresolved, low priority since the bug is almost certainly on the CALLER side, not inside
+glibc's own well-tested memcpy) to determine whether this is fixable in Xvfb-facing shim code
+(a litebox bug) or is a genuine upstream Xvfb defect real Linux would also hit under the same
+byte sequence.
+
+### Host state, files touched
+
+RAM ranged 3.0-7.7GB free across this pass's ~9 boot attempts (2 cdb, 6 fataldump-plain,
+1 stack-classify variant); one boot needed a WMI-Terminate-based recovery after a multi-minute
+stall (log size static, zero new forks, not a low-RAM condition); one `cargo build` needed a
+`--target-dir target/debug_rebuild` workaround after `target/debug/litebox_runner_linux_on_
+windows_userland.exe` stayed locked by a completely-exited process for several minutes (same
+class of issue the 14th-pass entry already describes, `docs/AGENTS_ARCHIVE_2026-09-17.md`) --
+resolved on its own eventually, no manual handle-killer intervention needed this time. All
+`litebox_runner`/`cdb` processes cleanly WMI-Terminate'd between every attempt; RAM fully
+recovered (6.9-7.7GB free) before this entry was written.
+
+**Committed** (`26fe95c`): `litebox_platform_windows_userland/src/lib.rs`'s `diag_fataldump_
+enabled()` AV-magnitude-restriction removal (Method 2 above).
+
+**LOCAL-ONLY, not committed** (gitignored `.wfgy/`): `.wfgy/xvfb_live_cdb_orchestrator3.ps1`/
+`xvfb_live_cdb_boot_wrapper3.ps1` (the auto-continuing cdb filter, Method 1, refuted as a viable
+approach for THIS crash but the `gn`-auto-continue technique itself is sound and reusable for a
+different, less timing-sensitive investigation), `.wfgy/xvfb_fataldump_boot{1,3,4,5,6}.ps1`/
+`.log` (boot1 and boot6 are the two clean crash captures; `.wfgy/xvfb_fataldump_boot2.log` was
+overwritten by boot1's own script reuse, boot1's real log is preserved), `.wfgy/xvfb.debug`
+(fetched Xvfb DWARF debug info, `BuildID sha1=6440f00c805782c9a39a5acd92855079e9fffc92`),
+`.wfgy/xvfb_runtime.bin` (real runtime Xvfb ELF extracted from `.litebox-cache`, same BuildID),
+`.wfgy/libc_probe/*.so` (five candidate runtime `libc.so.6` extractions, `BuildID
+c495b62edadd6c356265942ec1282d98058a7b41` is the one actually loaded by the `debian-xfce` image).

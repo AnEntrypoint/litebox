@@ -194,27 +194,45 @@ fix (2) is unresolved and a wholly separate, likely more fundamental issue was f
 hits a real SIGABRT at ≈190-197s into every full boot — see the thirty-first pass immediately below
 for its REAL abort text (caught live for the first time) and root mechanism.
 
-**Thirty-first pass (2026-09-21) — Xvfb's real abort text caught live for the first time; root
-mechanism is a genuine SIGSEGV, not a resource limit; a live `cdb` capture found a SEPARATE,
-pre-existing, mostly-already-handled "FS_BASE-reset" fault class; the DETERMINISTIC crash's exact
-trigger is still open.** Two new permanent diagnostics (`litebox_diag::stderr_capture` in
-`file.rs`'s `sys_write`, mirrors fd==2 writes into the host log, bypassing the writable-layer gap;
-a `LITEBOX_LOG`-gated hex-prefix trace on `try_recvfrom_shared` in `unix.rs`) showed the SIGABRT
-chased since the thirtieth pass is NOT the real event — it is the tail of Xorg's own crash handler
-after catching a real SIGSEGV(11) (`"Caught signal 11 ... Server aborting"`), at guest address
-`0x7feffecdd400`, bit-identical across three boots. The X11 bytes read right before crashing
-decode as a well-formed `ChangeProperty`/`_NET_WM_ICON` write (16x16, nothing malformed). A live
-`cdb` attach (new PID-identification pipeline via `[process_fork_diag]`'s script-offset +
-exec-sentinel-exit + next-winpid sequence) caught a real access violation (`sub rax, fs:[0x28]`,
-reading literal address `0x28`) — but this is `litebox_platform_windows_userland`'s own
-already-documented "FS_BASE-reset" class (Windows clears FS_BASE on its own initiative; normally
-silently repaired by the existing VEH handler), firing 22s into Xvfb's life — a DIFFERENT,
-apparently-harmless phenomenon from the ~190-220s deterministic crash (whose own fault addresses
-are nowhere near `0x28` and shift across runs). Every method, every ruled-out hypothesis
-(trampoline-stub collision, tcache corruption, `SharedByteRing` race — refuted by direct code
-reading or live evidence), and the precise pickup (finish the live-`cdb` conditional-continue
-script to skip FS_BASE-resets and stop only on the real fault; or fetch matching Debian debug
-symbols for the cached `Xvfb`/`libc6` build): archive.
+**Thirty-first pass (2026-09-21)** — Xvfb's real abort text caught live for the first time
+(`litebox_diag::stderr_capture` in `file.rs`'s `sys_write`): the SIGABRT chased since the
+thirtieth pass is the TAIL of Xorg's own crash handler after a real SIGSEGV(11), guest address
+`0x7feffecdd400`, bit-identical across boots. A live `cdb` attach caught an access violation
+(`sub rax, fs:[0x28]`) but it was a SEPARATE, already-handled "FS_BASE-reset" class (Windows
+clears FS_BASE on its own initiative, silently repaired by the existing VEH), firing 22s into
+Xvfb's life, not the real crash.
+
+**Thirty-second pass (2026-09-21) — cdb REFUTED as viable for this crash (attaching it starves
+the boot of the very X11 traffic the crash needs); a low-overhead in-process diagnostic caught
+the REAL fault clean, twice, with hardware ground truth; exact Xvfb call site still open.**
+Finishing the 31st pass's own cdb pickup (auto-continue via `gn` on every first-chance AV,
+`.wfgy/xvfb_live_cdb_orchestrator3.ps1`) worked exactly as scripted, but attaching cdb to Xvfb's
+own pid measurably perturbs it: two consecutive boots hit `XVFB_FAILED`/`DE_FAILED` immediately
+after attach (vs. clean boots with no debugger) — Windows freezes the whole debugged process
+during each first-chance-exception script (confirmed via `!analyze -v`'s own elapsed-time field),
+and the FS_BASE-reset class fires often enough that this loses the already-narrow `xset q`
+liveness race, which then starves `DE_LAUNCHED`'s own X11 traffic the crash is byte-volume-
+correlated with. **cdb is structurally unable to observe this bug.** Instead, broadened
+`litebox_platform_windows_userland/src/lib.rs`'s existing `diag_fataldump_enabled()` gate
+(`26fe95c`): it already did a full register/stack/code-bytes dump as a synchronous `eprintln!`
+inside the VEH handler (no debugger, no freeze), just gated to a small address-magnitude range
+from an unrelated older investigation — dropping that restriction (the real overhead guard,
+`faulting_instruction_has_fs_override`, is independent of address magnitude) let it also catch
+this crash. `LITEBOX_DIAG_FATALDUMP=1`, no debugger: two independent boots reached the real
+fault with `XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED` all firing normally first, at ~207s into Xvfb's own
+life, bit-identical `rip=0x7fefede9dabd` and fault address `0x7feffecdd400` both times.
+Byte-matched (`objdump -d` against the same-BuildID runtime `libc.so.6`) to glibc's own AVX2
+memcpy/memmove multiarch routine (`vmovdqu (%rsi),%ymm0`, file offset `0x162abd`) reading 64+
+bytes from a source pointer that is COMPLETELY UNMAPPED on the host (`type=0x0 alloc_base=0x0`)
+— not FS_BASE-related (no `0x64` prefix), not a litebox transport bug (`SharedByteRing` re-read
+as sound), a genuine wild pointer Xvfb itself computed. `0x7feffecdd400` = `TASK_ADDR_MAX -
+0x1312C00`, exactly ~19.2MB below the top of the guest address space. Xorg's own self-printed
+backtrace was found NOT trustworthy past frame 0 (frames 1-9 of 13 fail `dladdr()` entirely; live
+evidence, don't re-trust `(EE) Backtrace:` addresses without cross-checking a real section
+table). Root cause of WHICH Xvfb call site feeds the bad pointer remains open — needs real
+CFI-based unwinding (no tool for this readily available this pass) or upstream Xvfb source
+cross-reference; full evidence, every ruled-out hypothesis, exact repro, and the flakiness
+profile (2 clean captures / 6 attempts, unrelated to the fix): archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -224,12 +242,17 @@ symbols for the cached `Xvfb`/`libc6` build): archive.
 dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in `dealloc`,
 high blast radius, own dedicated pass. (2) debugger-root-cause `litebox/src/event/wait.rs:224`'s
 `unreachable!()` on garbage thread state (dozens per boot, most frequent panic historically, NOT
-yet debugger-confirmed — do not patch blind). **Current top blocker, thirty-first pass — mechanism
-narrowed to a real SIGSEGV (not SIGABRT, which is downstream — see that pass's own entry above),
-exact trigger still open**: pickup is that pass's own two-item list (finish the live-`cdb`
-conditional-continue script that skips already-understood FS_BASE-reset AVs and stops only on the
-real fault; the PID-identification half is proven and reusable — or fetch matching Debian debug
-symbols for the cached `Xvfb` build, `BuildID` `sha1=6440f00c805782c9a39a5acd92855079e9fffc92`).
+yet debugger-confirmed — do not patch blind). **Current top blocker, thirty-second pass — hardware
+ground truth in hand (bit-identical `rip`/fault-address across two independent boots, glibc AVX2
+memcpy/memmove reading 64+ bytes from a fully-unmapped `0x7feffecdd400`), exact Xvfb call site
+still open**: pickup is real CFI-based stack unwinding (no tool for this was readily available
+this pass — `.wfgy/xvfb.debug`'s DWARF `.eh_frame`/`.debug_line` data is already fetched and
+matches the exact running `BuildID sha1=6440f00c805782c9a39a5acd92855079e9fffc92`, a naive
+raw-stack-word scan surfaced 4 plausible-but-probably-stale candidates) or upstream Xvfb source
+cross-reference (network access confirmed working — `debuginfod.debian.net` answered in one
+request) to determine whether this is a litebox-shim bug or a genuine upstream Xvfb defect. Use
+`LITEBOX_DIAG_FATALDUMP=1` (no debugger — attaching one was proven this pass to starve the boot
+of the traffic the crash needs), NOT cdb, for the next capture.
 ~~DISPLAY/getenv() as the DE_FAILED cause~~ — REFUTED FOR GOOD, thirtieth pass (see
 that pass's own entry above for the LD_PRELOAD-interposer evidence). ~~AF_UNIX connect()
 EAGAIN-vs-EINPROGRESS~~ — FIXED, thirtieth pass; that same code path's
@@ -365,12 +388,11 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-31st passes: shared AF_UNIX connection
-  plane; `xset`/epoll/DBUS_FAILED all CLOSED; panic-free boots to `DE_LAUNCHED`; DISPLAY/getenv()
-  REFUTED (30th); AF_UNIX connect() errno bug fixed (30th); Xvfb's real SIGSEGV caught live, two
-  new permanent diagnostics, FS_BASE-reset red herring separated out, exact trigger still open
-  (31st) — see AGENTS.md's own 31st-pass entry above for the summary, this file for full
-  trace/repro detail), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+- **Archives** (newest first) — `_2026-09-18.md` (12th-32nd passes, full trace/repro detail for
+  everything AGENTS.md's own pass entries above summarize — shared AF_UNIX connection plane;
+  DBUS_FAILED/DISPLAY-getenv()/AF_UNIX-errno all CLOSED; Xvfb's real SIGSEGV root-caused to a
+  glibc memcpy reading an unmapped pointer, cdb refuted as a viable capture method, exact Xvfb
+  call site still open (32nd)), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:
