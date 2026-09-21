@@ -2084,3 +2084,207 @@ found to trigger bug 3, then REMOVED again once bug 3 was fixed and a cleaner no
 existed) is LOCAL-ONLY (gitignored `.wfgy/`), not part of any commit; `.wfgy/webtop_seed.tar` was
 regenerated from the clean (post-revert) script.
 
+
+## Thirtieth pass, 2026-09-21 -- DISPLAY/getenv() hypothesis refuted with direct live evidence; one AF_UNIX connect() errno bug found+fixed; Xvfb's own deterministic SIGABRT found
+
+Picked up the 29th pass's precisely-narrowed blocker: `xfce4-session` alone reports `Cannot open
+display: .` despite a proven-correct `envp` at the loader boundary and proven-correct `getenv()` in
+`printenv`/`xset` in the identical invocation shape. The 29th pass's own leading hypothesis was that
+something in `xfce4-session`'s much larger GTK/glib/pango/cairo/dbus-glib shared-library dependency
+graph does its own early environment sanitization, or that litebox's dynamic-linker emulation
+behaves differently for a binary with many `DT_NEEDED` entries.
+
+### Method: an LD_PRELOAD getenv() interposer, not a single cdb breakpoint
+
+Rather than attach `cdb` to one live `xfce4-session` process at one instant (the originally-planned
+approach), built `getenv_probe.c`: a tiny freestanding shared object that (1) in its constructor,
+dumps the whole `environ` array the instant it loads, and (2) DEFINES `char *getenv(const char
+*name)` itself -- because LD_PRELOAD symbol precedence means this definition wins for every caller
+in the whole process, including glibc's own internal callers and every shared library's calls, not
+just the main executable's -- logging every single `(name, result)` pair to `/tmp/getenv_trace.log`
+via raw `syscall()` (declared `extern`, resolved dynamically against the already-loaded libc at
+runtime, exactly like `extern char **environ` already is) before returning the real answer read
+straight from `environ`. This gives a complete trace of every `getenv()` call across the entire
+boot, not one point-in-time snapshot -- strictly more evidence than an interactive breakpoint could
+give for the same investigation, and faster to obtain (no interactive `cdb` session, no guessing
+which of dozens of shared libraries' symbol tables to search for `getenv`'s address).
+
+Built with (no glibc sysroot needed on this Windows host, matching the existing `forklock_probe.c`/
+`tramp_fork_probe.c` precedent for host-cross-compiled freestanding guest code):
+
+```
+clang --target=x86_64-unknown-linux-gnu -shared -fPIC -nostdlib \
+  -Wl,--unresolved-symbols=ignore-all -O1 -o getenv_probe.so getenv_probe.c
+```
+
+Injected via `LD_PRELOAD=/tmp/getenv_probe.so`, exported right after `export DISPLAY=:1` near the
+top of the LOCAL `.wfgy/webtop_stack.sh` test copy, so every process forked after that point loads
+it (Xvfb, dbus-daemon, xset, xfce4-session, its whole child tree). The probe's own `.so` was baked
+into a new local `webtop_seed_probe.tar` (a `webtop_seed.tar` copy with `tmp/getenv_probe.so`
+appended via Python's `tarfile` module) and the script also appends
+`sed 's/^/[getenvtrace] /' /tmp/getenv_trace.log` right after the existing `DE_FAILED`/`sed
+.../de2.log` diagnostic, so the trace ends up directly in the runner's own captured combined log
+(the top-level script's own inherited stdout) instead of needing a separate `--export-writable-layer`
+step.
+
+### Result 1: DISPLAY is proven correct at every single call site, including deep inside GDK
+
+A full debug-binary boot (`LITEBOX_PROCESS_FORK=1`, `--resume-from .wfgy/webtop_seed_probe.tar`)
+produced a `/tmp/getenv_trace.log` with 90 separate `CONSTRUCTOR pid=...` markers (90 distinct guest
+processes loaded the probe) and 1356 total `GETENV query` lines. Of those, **19 separate `GETENV
+query name=DISPLAY` calls, ALL returning `result=[:1]`** -- zero exceptions, zero NULLs, zero empty
+strings, across the WHOLE boot. Critically, several of these are not bare Xlib calls: the trace
+shows two complete, textbook GDK backend-selection sequences --
+
+```
+GETENV query name=GDK_BACKEND result=NULL(not found)
+GETENV query name=WAYLAND_DISPLAY result=NULL(not found)
+GETENV query name=DISPLAY result=[:1]
+```
+
+-- appearing exactly twice in the whole trace, which lines up precisely with `webtop_stack.sh`
+launching `xfce4-session` exactly twice (once via `/defaults/startwm.sh`'s `dbus-launch
+--exit-with-session /usr/bin/xfce4-session`, once via the direct fallback). This is real GDK/GTK
+backend-probing code (try Wayland via `WAYLAND_DISPLAY`, fall back to X11 via `DISPLAY`), not a
+synthetic test -- and it resolves `DISPLAY` correctly both times. Also present: many GTK/Mesa/GDK
+env var names (`GDK_GL`, `GALLIUM_DRIVER`, `MESA_GLSL_VERSION_OVERRIDE`, `FONTCONFIG_PATH`, etc.),
+confirming a real GTK/Mesa dependency chain was exercised under the interposer, not just simple
+coreutils calls.
+
+**Conclusion: `getenv("DISPLAY")` is proven correct at every call site this boot ever reaches,
+including inside real GDK backend-selection logic run by (almost certainly) `xfce4-session` itself.
+The DISPLAY/`getenv()`/`environ` line of investigation, the 29th pass's own leading hypothesis and
+this whole multi-pass sub-investigation's original framing, is REFUTED FOR GOOD.** Do not re-open it
+without genuinely new information.
+
+### Result 2: the real mechanism is a cross-process AF_UNIX connect() bug -- one fixed, one found-but-scoped-out
+
+With `getenv()` ruled out, re-ran the SAME boot shape with `litebox_shim_linux::syscalls::unix=debug`
+enabled (the plain, unmodified `.wfgy/webtop_seed.tar`, no probe -- isolating one variable at a
+time). The log showed, repeatedly, during the `xfce4-session` launch window:
+
+```
+[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid -- cross-process
+AF_UNIX data-plane sharing gap (unix_addr_table's Backlog/Channel values are not yet
+shared-memory-native), not a genuinely absent listener
+```
+
+Tracing `UnixStream::connect`/`connect_cross_process` end to end (`litebox_shim_linux/src/syscalls/
+unix.rs`) showed this diagnostic log fires from the SAME-PROCESS-ONLY `lookup()` BEFORE the real
+cross-process fallback (`connect_cross_process`) even runs -- so by itself it does not mean the
+connect failed, only that the fast local path missed. Following an actual connect through the whole
+rendezvous protocol for pid 18640 (the exact PID that owns the correct `DISPLAY=:1`/GTK-backend
+traffic pattern from Result 1's trace, strongly suggesting this pid IS `xfce4-session`/its
+immediate `dbus-launch` wrapper) showed:
+
+- Two X11 (`/tmp/.X11-unix/X1`) connects, BOTH completing successfully via `connect_cross_process`
+  (`request completed ... slot=3`, `slot=4`), with real bidirectional X11 protocol traffic flowing
+  afterward (`try_sendto_shared`/`try_recvfrom_shared`: a 12-byte client prefix write, an 8+2040+548
+  byte X server Setup reply read back -- matches a real X `Setup` response size -- then ordinary
+  request/reply traffic continuing for tens of exchanges). **The X11 transport itself works,
+  end-to-end, for this exact process.**
+- One dbus (`/tmp/dbus-<token>`) connect completing successfully (`slot=5`).
+- A SECOND dbus connect attempt from the SAME pid returning `TryOpError::TryAgain` -> mapped (via
+  `litebox_common_linux::errno`'s blanket `TryOpError::TryAgain -> Errno::EAGAIN` conversion) to
+  `Errno::EAGAIN` and the request CANCELLED.
+
+**Bug found: `EAGAIN` is the wrong errno for a non-blocking connect() that has not yet been claimed
+by the listener's `accept()` loop.** POSIX reserves `EAGAIN` for connect(2) specifically to mean "no
+more ephemeral ports available" -- the "come back later, this is still in progress" signal is
+`EINPROGRESS`, and real client libraries (libdbus among them) explicitly special-case it to mean
+"poll for writability, this is not a failure". `litebox_shim_linux::syscalls::net::connect` (the TCP
+path, `net.rs:804-807`) ALREADY carries the correct override (`TryOpError::TryAgain =>
+Errno::EINPROGRESS`) -- the AF_UNIX path in `unix.rs` never got the same treatment and fell through
+to the generic blanket conversion instead.
+
+**FIXED**, mirroring the proven-correct TCP pattern exactly, in both `UnixStream::connect` (the
+same-process path) and `UnixStream::connect_cross_process` (the rendezvous path),
+`litebox_shim_linux/src/syscalls/unix.rs`. Live-verified on a rebuilt debug binary: the new
+diagnostic ("request not yet claimed (non-blocking), cancelling and returning EINPROGRESS") fires
+exactly where the old EAGAIN-return used to, and a full `connect_cross_process` outcome tally on the
+post-fix boot showed 22 posted / 20 completed / 2 EINPROGRESS / 0 timeouts / 0 hard failures --
+materially cleaner than the pre-fix run (which had at least one outright `TryAgain`-mapped-to-EAGAIN
+failure in the identical call shape).
+
+**Honest finding, NOT fixed this pass**: the SAME branch that used to return the wrong errno also
+unconditionally calls `unix_shared_connect_queue.cancel(request_idx)` on that same "not yet claimed"
+outcome -- so a non-blocking connect that does not complete synchronously within the one syscall is
+torn down immediately and can never complete later, no matter how long or how correctly the caller
+polls afterward (real POSIX non-blocking connect() semantics let the kernel continue the handshake
+in the background; a caller is not expected to re-issue `connect()` in a tight loop). A proper fix
+needs `UnixStreamState::Init` (or a new `Connecting(request_idx)` variant) to persist the pending
+request across calls, plus wiring `check_io_events`/epoll readiness for the fd to also poll
+`unix_shared_connect_queue.poll_result` for that stored index. Scoped out of this pass deliberately
+-- a half-implemented state-machine change risked regressing the SAME connect path 29 prior passes
+worked hard to make sound, with no time budget left this pass for the live re-verification such a
+change would need. Exact pickup: AGENTS.md's own Track B list, item referencing
+`UnixStreamState::Connecting`.
+
+### Result 3: DE_FAILED still fires after the fix -- and a likely-more-fundamental, NEW lead found
+
+Re-ran the full boot with the fix applied (debug binary, `unix=debug` still enabled). `DE_FAILED`
+still fired. Could not directly re-observe the literal "Cannot open display" text this pass -- `/tmp/
+de.log`/`/tmp/de2.log` were BOTH empty when the script's own `sed` tried to display them (`[de]`/
+`[de2]`-tagged lines never appeared in either thirtieth-pass boot's combined log despite `DE_FAILED`
+firing both times), confirming the SEPARATE, already-known, still-open writable-layer-visibility gap
+(AGENTS.md pickup item 6) applies here too -- Xvfb/xfce4-session are long-lived processes whose LATER
+writes to files opened before/around their own fork point are invisible to a sibling/parent process
+reading the same path, exactly as documented for `/tmp/de.log` before.
+
+While hunting for `xfce4-session`'s own connect activity in the `unix=debug` trace, found a fatal
+signal neither run's summary had previously called out by name: decoding the raw `comm` bytes in the
+`fatal signal: terminating task` log line (`[88, 118, 102, 98, 0, ...]` = ASCII "Xvfb") shows **Xvfb
+itself receives a real, guest-raised `SIGABRT` (signal 6)**, not a host-side crash. This happened in
+BOTH the pre-fix run (pid 12676, elapsed 197.55s) and the post-fix run (pid 14844, elapsed 190.98s)
+-- at nearly IDENTICAL X11-transport-ring byte offsets both times (`write_pos` 315140 and 315140/
+315076 respectively, on connection slot 3, the same slot carrying `xfce4-session`'s own X11 traffic
+from Result 2). This is fully deterministic, not a race: two independent runs, same code path
+(mostly -- one had the connect() fix, one didn't), landing on the same byte count to within 64
+bytes. Both times, immediately before the abort, `/proc/<xvfb-pid>/maps` was opened and failed
+(`errno=2`, litebox has no `/proc/PID/maps` support) TWELVE-PLUS times in rapid succession --
+consistent with Xvfb's own internal crash handler (glibc's SIGABRT paths -- heap corruption
+detection, a failed assertion, or a stack-smashing check -- commonly try to symbolize a backtrace via
+`/proc/self/maps` before actually terminating) repeatedly failing to get the introspection data it
+wants, then aborting anyway.
+
+**This is a strong, new, likely-more-fundamental candidate for the real remaining blocker**: if the
+X SERVER itself dies mid-session, no client connected to it -- xfce4-session, xfwm4, xprop, anything
+-- can possibly succeed afterward, which would trivially explain "Cannot open display" (and the WM
+never setting `_NET_SUPPORTING_WM_CHECK`) far more directly than any connect-plumbing bug. NOT yet
+root-caused: Xvfb's own crash reason (the text glibc would normally print to stderr, e.g. `malloc():
+corrupted top size` or `*** stack smashing detected ***`) is written to `/tmp/xvfb.log`, which is
+subject to the exact same writable-layer-visibility gap that hid `/tmp/de2.log` this pass. Grepped
+the docs archive tree for a prior match on this exact signature (`Xvfb` + `SIGABRT`/`abort` at this
+elapsed-time/byte-offset shape) -- the only prior Xvfb-crash entries found (`docs/
+AGENTS_ARCHIVE_2026-09-10.md`'s `libselinux.so.1` crash, `docs/webtop-alpine-mate-2026-09-07.md`'s
+pid-1 SIGSEGV, `docs/track-b-fork-fix-progress.md`'s already-root-caused-and-fixed Xvfb crash) are
+all different bugs, already closed, from earlier sessions before `LITEBOX_PROCESS_FORK=1` and the
+shared AF_UNIX connection plane existed. This appears to be a genuinely new finding.
+
+**Next step, precisely scoped**: either (a) `cdb -pv` attached to the live Xvfb winpid BEFORE the
+~190s mark (poll `Get-Process` for the Xvfb child, matching its guest pid via the `execve` trace or
+the `[process_fork_diag]` winpid-to-guest-pid correlation already used elsewhere) to catch the abort
+signal in the act and read its real backtrace/register state, or (b) a targeted, minimal extension of
+the existing `SharedFilePublishTable` pattern (or a small standalone diagnostic) specifically to let
+`/tmp/xvfb.log`'s real content reach a reader in a different process, so the glibc/Xvfb-printed abort
+reason can simply be read from the existing log instead of needing a live debugger session at all.
+
+### Host state, files touched
+
+RAM ranged roughly 4.6-9.1GB free across this pass's boots (both debug binary, `LITEBOX_PROCESS_FORK=1`,
+`--resume-from` seeded tars), no critical lows, all `litebox_runner_linux_on_windows_userland.exe`
+and stray `powershell.exe` wrapper processes cleanly WMI-`Terminate`d between attempts (one file-lock
+recovery needed mid-pass: a stuck `powershell.exe` wrapper from a completed-but-not-yet-reaped boot
+held the debug `.exe` open, blocking a rebuild -- killed by PID, rebuild then succeeded).
+
+**Committed**: `litebox_shim_linux/src/syscalls/unix.rs` (the `EAGAIN` -> `EINPROGRESS` fix in both
+`connect`/`connect_cross_process`).
+
+**LOCAL-ONLY, not committed** (gitignored `.wfgy/`): `.wfgy/getenv_probe.c`/`.so` (kept as a reusable
+diagnostic tool -- see this pass's own "Method" section above for the exact build line), `.wfgy/
+webtop_stack.sh`'s own `LD_PRELOAD=/tmp/getenv_probe.so` export line and `GETENV_TRACE_DUMP_BEGIN`/
+`END` markers around the existing `/tmp/de2.log` diagnostic (harmless to leave in; costs nothing when
+`/tmp/getenv_probe.so` isn't present in a given seed tar, since the export merely names a path that
+then fails to load with a normal non-fatal LD_PRELOAD warning), `.wfgy/webtop_seed_probe.tar` (the
+probe-augmented seed tar), and the various `.wfgy/*.log`/`.utf8.log` boot logs this pass's evidence is
+drawn from.

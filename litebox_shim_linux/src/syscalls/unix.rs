@@ -1385,7 +1385,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             },
             || self.try_connect(&backlog, client_cred),
         )
-        .map_err(Errno::from);
+        // AGENTS.md 30th pass: a non-blocking connect() that has not yet completed must surface
+        // EINPROGRESS, never EAGAIN -- POSIX contract for connect(2) specifically (EAGAIN there
+        // means something else entirely, "no free local port"), and the exact one callers branch
+        // on to decide "come back later via poll/select" vs. "this attempt itself failed". The
+        // blanket `TryOpError -> Errno` conversion this used to fall through to
+        // (`litebox_common_linux::errno`'s `TryOpError::TryAgain => Errno::EAGAIN`) is correct for
+        // every OTHER TryOpError use in this file (sendto/recvfrom genuinely want EAGAIN) but wrong
+        // here -- `litebox_shim_linux::syscalls::net::connect` already carries the identical
+        // override for the TCP path; this mirrors it for AF_UNIX.
+        .map_err(|err| match err {
+            TryOpError::TryAgain => Errno::EINPROGRESS,
+            other => Errno::from(other),
+        });
         litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result");
         result
     }
@@ -1472,6 +1484,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 );
                 task.global.unix_shared_connect_queue.cancel(request_idx);
                 return Err(Errno::ECONNREFUSED);
+            }
+            Err(TryOpError::TryAgain) => {
+                // AGENTS.md 30th pass: a non-blocking cross-process connect that has not yet been
+                // claimed by the listener's own accept() loop is genuinely still IN PROGRESS, not
+                // a failure -- POSIX connect(2) reserves EAGAIN for "no ephemeral port available"
+                // and uses EINPROGRESS for exactly this "come back later" case, which is also the
+                // one real AF_UNIX/TCP client libraries (libdbus among them) explicitly special-
+                // case to mean "poll for writability, don't treat this as an error". The blanket
+                // `TryOpError::TryAgain -> Errno::EAGAIN` conversion this used to fall through to
+                // (`litebox_common_linux::errno`) surfaced the wrong one here, and this whole
+                // branch used to ALSO cancel the just-posted queue request on every such call --
+                // i.e. every non-blocking connect attempt that did not complete synchronously
+                // within the same syscall was torn down immediately, so it could never complete
+                // later no matter how long the caller polled. Only the errno is fixed this pass
+                // (mirrors `litebox_shim_linux::syscalls::net::connect`'s existing, proven-correct
+                // override for the analogous TCP path); NOT cancelling and instead giving the
+                // caller a way to reattach to the same still-pending `request_idx` on a later
+                // `connect()`/poll needs its own state-machine change to `UnixStreamState::Init`
+                // and is left as a precisely-scoped follow-up (see AGENTS.md pickup list) rather
+                // than risked half-done in this pass.
+                litebox_util_log::debug!(
+                    self_pid:% = self_pid,
+                    request_idx:% = request_idx;
+                    "DIAG connect_cross_process: request not yet claimed (non-blocking), cancelling \
+                     and returning EINPROGRESS"
+                );
+                task.global.unix_shared_connect_queue.cancel(request_idx);
+                return Err(Errno::EINPROGRESS);
             }
             Err(e) => {
                 litebox_util_log::debug!(

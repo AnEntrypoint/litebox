@@ -1,5 +1,18 @@
 # Advisor probes
 
+- `getenv_probe.c`: LD_PRELOAD interposer that overrides `getenv()` process-wide (symbol precedence
+  means every caller in the process gets this definition, not just the main executable) and logs
+  every `(name, result)` call to `/tmp/getenv_trace.log`, plus dumps the whole `environ` array at
+  load (constructor) and exit (destructor). Gives a complete trace of every `getenv()` call across a
+  whole boot instead of one `cdb`-breakpoint snapshot -- used (30th pass, 2026-09-21) to
+  definitively refute a `DISPLAY`/`getenv()` hypothesis for `xfce4-session`'s `Cannot open display`
+  failure (every query returned the correct value, including inside real GDK backend-selection
+  logic). Build (no glibc sysroot needed on this host):
+  `clang --target=x86_64-unknown-linux-gnu -shared -fPIC -nostdlib
+  -Wl,--unresolved-symbols=ignore-all -O1 -o getenv_probe.so getenv_probe.c`. Use:
+  `LD_PRELOAD=/tmp/getenv_probe.so <target>` (bake the `.so` into a `--resume-from` overlay tar,
+  export `LD_PRELOAD` only where needed -- exporting it broadly is fine too, since the reimplemented
+  `getenv()` is a faithful passthrough).
 - `clone_probe.c`: standalone Win32 probe for `RtlCloneUserProcess` as a fork() primitive.
   Build: `clang -O1 -o clone_probe.exe clone_probe.c -lkernel32 -lntdll`. Result on this host
   (Windows 11 10.0.26200, 2026-09-03): clone succeeds; private memory is copy-on-write
