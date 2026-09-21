@@ -2288,3 +2288,250 @@ webtop_stack.sh`'s own `LD_PRELOAD=/tmp/getenv_probe.so` export line and `GETENV
 then fails to load with a normal non-fatal LD_PRELOAD warning), `.wfgy/webtop_seed_probe.tar` (the
 probe-augmented seed tar), and the various `.wfgy/*.log`/`.utf8.log` boot logs this pass's evidence is
 drawn from.
+
+## Thirty-first pass, 2026-09-21 -- Xvfb's real abort text caught live for the first time; root
+mechanism narrowed to a genuine SIGSEGV, not resource exhaustion; a live cdb capture surfaced a
+SEPARATE, pre-existing FS_BASE-reset fault class hitting Xvfb's own process far earlier than the
+deterministic crash; the deterministic crash's own exact trigger remains open.
+
+Picked up the thirtieth pass's own blocker: Xvfb SIGABRTs deterministically ~190-197s into every
+boot, with /tmp/xvfb.log's real content hidden by the writable-layer-visibility gap (pickup item
+6) and no debugger session yet attempted.
+
+### Method 1: a permanent, targeted stderr-capture diagnostic (no debugger needed)
+
+Rather than time a live cdb attach against a ~190s+ window with unpredictable log-buffering lag,
+added a HOST-SIDE (Rust tracing) mirror of every fd==2 write: litebox_shim_linux/src/syscalls/
+file.rs's sys_write already computed a bounded preview for its own sys_write debug event but
+that event shares a target (module path) with sys_read and every other file.rs syscall, so
+enabling it to see stderr text also floods the log with every read in the whole boot -- confirmed
+live: LITEBOX_LOG=...,litebox_shim_linux::syscalls::file=debug alone produced 400MB+ of log in
+under 9 real seconds (mostly a single large sys_read loop from an OCI layer load), unusable and a
+real risk to host disk/CPU -- killed immediately, RAM/disk recovered cleanly (WMI Terminate, no
+stuck processes). Fixed by adding a SEPARATELY-TARGETED tracing event (litebox_diag::
+stderr_capture, gated on nothing but its own LITEBOX_LOG debug level) emitted only for fd == 2,
+alongside the existing one -- this bypasses the whole writable-layer-visibility gap entirely, since
+it is host-side tracing output, not a guest file read by another process.
+
+Booted with LITEBOX_LOG=warn,...,litebox_diag::stderr_capture=debug (debug binary,
+LITEBOX_PROCESS_FORK=1, plain webtop_seed.tar, no probe). Caught Xvfb's REAL crash text live,
+for the first time in this entire investigation, at elapsed 198.35s (matches the thirtieth pass's
+190-197s range closely):
+
+```
+(EE) Backtrace:
+(EE) 0: /usr/bin/Xvfb (?+0x0) [0x20101b20ed]
+(EE) 1: /lib/x86_64-linux-gnu/libc.so.6 (?+0x0) [0x7fefedd7adf0]
+... (12 frames total, Xvfb+libc addresses only)
+(EE) Segmentation fault at address 0x7feffecdd400
+Fatal server error:
+(EE) Caught signal 11 (Segmentation fault). Server aborting
+```
+
+Root finding: the SIGABRT this whole investigation had been chasing is NOT the real event. It
+is the tail of Xorg's own SIGSEGV handler (OsSigHandler/FatalError): Xvfb catches a real,
+guest-level SIGSEGV(11), prints this backtrace via its own crash-reporting code, then calls
+abort() deliberately -- which is what produces the signal=Signal(6) fatal signal: terminating
+task line this investigation had been keying off since the thirtieth pass. The real fault is the
+SIGSEGV, at guest address 0x7feffecdd400 (~19.2MB below TASK_ADDR_MAX =
+0x7FEFFFFF0000), not the SIGABRT.
+
+Symbolized the backtrace against the real (stripped) Xvfb ELF pulled straight from
+.litebox-cache's cached layer tars (tar -tf each cache entry for usr/bin/Xvfb$, extracted
+one): frame 0's offset (0x1b20ed) falls inside .text (0x33900-0x1fbf00 per readelf -S),
+i.e. genuine code, not a trampoline-stub or corrupted region. nm/readelf -sW's sparse .dynsym
+(2004 entries, none within tens of KB of the target offsets) could not resolve real function names
+-- no matching -dbgsym package available offline -- so per-function attribution stayed unresolved
+by this route.
+
+### Method 2: manual X11 wire-protocol decode of the bytes Xvfb read right before crashing
+
+Added a second diagnostic, mirroring try_recvfrom's (the Local-transport path) existing
+LITEBOX_DRM_TRACE-gated hex-prefix trace onto try_recvfrom_shared (the Shared-transport path
+Xvfb's own X11 socket actually uses) -- litebox_shim_linux/src/syscalls/unix.rs. First attempt
+gated it on drm_trace_enabled()'s AtomicBool like its sibling; live-verified DEAD (zero hits
+with LITEBOX_DRM_TRACE=1 exported to the whole process tree while sibling debug-level events in
+the SAME module fired thousands of times in the SAME processes) because that flag is set exactly
+once by the top-level runner's own run() on process start, a call a LITEBOX_PROCESS_FORK=1
+cross-process-fork CHILD's own resume path never re-invokes -- so it silently stays false in
+every fork child, Xvfb included, the one process this trace exists to observe. Re-gated on the
+module's own LITEBOX_LOG debug level instead (already proven live, across every other diagnostic
+this multi-day investigation built, to re-initialize correctly per fork child). Rebuilt, reran.
+
+Correlated the resulting hex dumps against elapsed-time windows matching three independent crashes
+(198.35s, 198.82s, 200.59s elapsed -- boots 3/4/5) and found the SAME shape every time: a burst of
+16 back-to-back 32-byte replies (write_pos 314564->315076, bit-identical across all three
+independent boots), then, after a short gap, one more try_recvfrom_shared reading exactly 1720
+bytes, two more 32-byte replies (write_pos ->315108->315140, again bit-identical across boots),
+then the crash. Manually decoded the 1720-byte payload against the X11 wire format by hand: a
+ChangeProperty request (opcode 18) for a CARDINAL-typed, format-32 property containing a real,
+well-formed 16x16 _NET_WM_ICON (width=16, height=16, followed by 256 ARGB pixel words whose
+values look like genuine gradient/edge icon pixel data, e.g. 0x00FFFFFF = fully-transparent
+white), immediately followed by the start of a SECOND ChangeProperty (opcode 18 again, length=
+0x0108=264 units=1056 bytes, matching its own header+data-length fields exactly). Nothing in the
+decoded bytes is malformed -- no oversized/negative/overflowing length field, no truncated
+header, no protocol violation this manual decode could find. This rules out the simplest
+"litebox's transport corrupts an X11 length field, guest walks off a buffer" theory, at least for
+the specific bytes visible in this window.
+
+### Method 3: a live cdb capture -- real access violation caught, but a different (older,
+pre-existing) fault class than the deterministic crash
+
+Built a two-stage PID-identification pipeline to attach cdb non-invasively BEFORE the crash
+rather than guessing timing:
+
+1. LITEBOX_PROCESS_FORK=1's own [process_fork_diag] logging already prints, for every
+   fork-resumed shell, "guest fd 255 reopened on /webtop_stack.sh at offset N" -- N is the byte
+   offset the shell's own buffered read of the script has reached. Computed the literal byte
+   offset of the script's /usr/bin/Xvfb launch line (.wfgy/webtop_stack.sh line 280) as
+   ~18686; live logs consistently show offset 18647 for the fork that is about to launch Xvfb
+   (within the expected small slack from buffered-read granularity) -- a reliable, boot-order-
+   independent signal for "Xvfb's own fork is imminent", found BEFORE Xvfb ever writes anything.
+2. Confirmed (by reading the actual log sequence) that this SAME shell process then reports
+   "exiting with encoded status 0xc0de0000" -- LITEBOX_PROCESS_FORK=1 does not do execve() as an
+   in-place image swap; the pre-exec fork process EXITS with a sentinel status and the outer
+   runner spawns a BRAND NEW real Windows process (full fresh OCI-image-layer reload included,
+   ~5s cost measured live in this contended environment) to host the exec target. The very next
+   "task-resume-probe (child, winpid=N): built Task ..." line after that specific sentinel exit is
+   the REAL Xvfb process's own winpid -- confirmed live across two boots that the guest-visible
+   pid= field stderr_capture reports for comm="Xvfb" and this winpid= are the SAME number
+   (litebox reuses the real Windows PID as the guest pid for a cross-process-forked child, one
+   fewer indirection than assumed).
+
+A PowerShell orchestrator watches the boot's own combined log for exactly this offset-then-sentinel-
+then-winpid sequence and attaches immediately. First attempt used cdb -pv (non-invasive attach);
+live-refuted that this can ever catch a live exception -- -pv explicitly prints "WARNING: Process
+N is not attached as a debuggee -- The process can be examined but debug events will not be
+received", i.e. it is read-only introspection, never exception-catching, contrary to this
+investigation's own prior assumption (AGENTS.md's -pv/qd guidance is about SAFE attach/detach,
+not about exception delivery). Second attempt used a real, invasive cdb -p <pid> -c "sxe -c
+\"r;k;.exr -1;!analyze -v;qd\" av;g" (break on first-chance access violation, dump registers/
+stack/exception record/auto-analysis, then cleanly detach via qd, never a bare q).
+
+This DID catch a real, live access violation -- but only 22 seconds into Xvfb's own process
+life, nowhere near the ~190-220s deterministic crash window:
+
+```
+rax=2727952a82d76100 rbx=0 rcx=00007fefffeebbe5 rdx=... rsi=ffffffff rdi=00007fefffeebbe4
+rip=00007feff619464a rsp=00007fefffeeb470 rbp=00007fefffeebbb0
+00007feff619464a 64482b042528000000   sub rax, qword ptr fs:[28h]
+Attempt to read from address 0000000000000028
+AV.Dereference: NullClassPtr   AV.Fault: Read
+```
+
+64 48 2b 04 25 28 00 00 00 disassembles as sub rax, fs:[0x28] -- this IS %fs:0x28, the
+canonical glibc/GCC stack-protector-canary check (__stack_chk_guard, TLS-relative on Linux
+x86-64) embedded in ordinary compiled code, executing with an effective fs BASE of zero (the
+literal fault address is 0x28, not fs_base+0x28), which read from near-NULL and faulted.
+
+This is NOT a new bug. litebox_platform_windows_userland/src/lib.rs already has an entire,
+previously-built "FS_BASE-reset" repair mechanism (search FS_BASE-reset in that file and
+docs/veh-exception-handler-design.md) for a documented, live-confirmed Windows behavior: Windows
+clears a thread's FS_BASE MSR back to 0 on its own initiative as part of ordinary scheduling, and
+an in-guest %fs:-relative instruction then faults indistinguishably from a real guest segfault;
+the repair detects this shape (rdfsbase() == 0 AND the faulting instruction decodes as having an
+FS segment-override prefix AND a nonzero SAVED fs_base value exists to restore) and does
+wrfsbase(saved) + EXCEPTION_CONTINUE_EXECUTION, transparently, with no guest-visible effect --
+this is presumably why NEITHER this pass NOR any of the prior 30 ever saw this class produce a
+final crash on its own: it is normally repaired invisibly, possibly many times per boot per
+thread. Confirmed NOT the same mechanism as the deterministic crash: this capture's fault
+address is 0x28; the deterministic, stderr_capture-verified crash's own fault addresses (three
+independent boots, Method 1/2 above) were 0x7feffecdd400 (boots 3/4/5, bit-identical across all
+three) and 0x1f60400 (boot 6, when Xvfb's own load base also shifted to a different value between
+runs) -- neither anywhere near 0x28, and the boot-6 shift shows the deterministic crash's fault
+address itself is NOT a fixed constant, ruling out a simple fixed-guard-page theory for THAT crash
+and instead suggesting a wild/stale-pointer dereference whose resulting value depends on overall
+address-space layout history.
+
+Honest, not-yet-closed conclusion: this pass definitively separated two distinct phenomena
+that had been conflated as "the Xvfb crash" -- (a) a pre-existing, mostly-already-handled
+FS_BASE-reset class, real and live-reproduced but apparently harmless in the general case, and (b)
+the STILL-UNEXPLAINED deterministic SIGSEGV at ~190-220s, whose own fault address is NOT 0x28/
+FS-related, occurs 2 replies after Xvfb drains a large (1720-byte), protocol-well-formed batch of
+pipelined X11 requests, and lands at an address that shifts with overall address-space-layout
+history rather than staying fixed. Ran out of session time before building a cdb script that
+correctly distinguishes "routine, repairable FS_BASE-reset AV -- let litebox's own VEH handle it
+and keep running" from "a different, unrepaired AV -- stop and capture" (needed:
+conditional-continue scripting, e.g. checking .exr -1's fault address against a small-value
+threshold before deciding gh (continue, handled) vs stopping, which real testing would need
+another 1-2 full ~500s+ boot cycles this environment's slow forking makes expensive).
+
+### Ruled out this pass (do not re-attempt without new evidence)
+
+- Trampoline-stub top-down-band collision (advisor/probes/README.md's old "3F" investigation)
+  -- the deterministic crash's fault addresses (0x7feffecdd400, 0x1f60400) do not consistently
+  sit in that specific band across runs (boot 6 moved to a low address entirely), and Xvfb's own
+  process is the result of a normal fork()+execve() (a fresh ELF image, no post-exec relocation
+  healing ever applies), so fork_verify's stale-pointer-healing class structurally cannot apply
+  to Xvfb's own crash regardless of address.
+- ADVISORY-001 section 3N tcache safe-linking corruption -- same reasoning: that class is specific to
+  a FORK-WITHOUT-EXEC child inheriting a relocated, partially-healed heap; Xvfb is a freshly-exec'd
+  image, never relocated, and the boot script already carries the GLIBC_TUNABLES workaround.
+- SharedByteRing's own read/write correctness (litebox_shim_linux/src/syscalls/unix.rs) --
+  read closely: both try_write_all/try_write and try_read take the SAME Mutex<RingCursor>
+  lock for their entire byte-copy loop, not just the cursor update, so the Ordering::Relaxed on
+  individual AtomicU8 store/load calls is correctly covered by the mutex's own acquire/release
+  semantics -- not a data race as initially suspected. The free-space/used arithmetic
+  (write_pos.wrapping_sub(read_pos)) cannot legitimately underflow given try_read only ever
+  advances read_pos by n = avail.min(out.len()), so read_pos can never pass write_pos
+  through that path alone. SharedUnixConnTable's dead-slot reclaim requires BOTH the client's and
+  server's owning OS process to be CONFIRMED DEAD (is_process_alive) before reusing a slot,
+  which by construction cannot race a still-executing endpoint's own Drop (a dead process cannot
+  still be running Rust code to call Drop later) -- the "stale Drop frees a just-reused slot"
+  race this pass considered is not reachable via the documented reclaim path. None of this rules
+  out a bug elsewhere in the same file (e.g. the connect/rendezvous protocol's own slot-index
+  hand-off, not audited this pass), but the core ring mechanics read as sound.
+- Large-icon-size-driven allocation overflow -- the decoded _NET_WM_ICON is a genuine, tiny
+  16x16 icon (256 pixels); not a plausible trigger for an integer-overflow-class bug.
+
+### Pickup, precisely scoped
+
+Two live, complementary options, neither attempted to completion this pass:
+1. Finish the live-cdb script: auto-continue (gh) on any access violation whose .exr -1
+   fault address looks like the FS_BASE-reset pattern (small value, e.g. < 0x10000, AND/OR the
+   faulting instruction decodes with an 0x64/FS-override prefix byte -- same predicate
+   faulting_instruction_has_fs_override already implements host-side, could be mirrored in a cdb
+   script or just used as the go/no-go signal by eyeballing consecutive captures), and only
+   actually stop+dump on the FIRST access violation that does NOT match -- that should be the real,
+   still-unexplained crash, this time with full live registers and a real stack a debugger can
+   walk (unlike the stripped-binary, no-symbols static analysis this pass had to rely on).
+2. Symbol resolution: no -dbgsym/debug-info package was available offline for the exact cached
+   Debian Xvfb/libc6 build; fetching one (matching the exact BuildID this pass recorded,
+   sha1=6440f00c805782c9a39a5acd92855079e9fffc92, from a Debian symbol server if network access
+   is available in a future session) would let !analyze/k resolve real function names instead
+   of raw offsets, turning the same live-cdb capture from option 1 into an immediately
+   actionable stack trace.
+Either alone would very likely close this out; item 1 is cheaper (no network dependency) and was
+the one already 90% built this pass (the PID-identification pipeline is proven reliable across two
+independent live boots -- the ONLY missing piece is the conditional-continue predicate in the cdb
+script itself).
+
+### Host state, files touched
+
+RAM ranged 3.9-7.2GB free across this pass's ~9 full boot cycles plus the live-cdb attempts (all
+debug binary; each boot in this environment currently costs roughly 450-700s wall-clock end to end
+before Xvfb's crash appears in an observable log, due to LITEBOX_PROCESS_FORK=1's own per-fork
+AND per-exec cost -- confirmed this pass to be a FULL new Windows process plus full OCI-image-layer
+reload, not merely a lightweight fork -- compounding with this repo's already-known ~5s/fork
+baseline over the ~90+ forks webtop_stack.sh's own nginx-setup section alone performs before
+Xvfb ever launches). One runaway log (400MB in <9s from the file=debug mis-targeting, Method 1's
+own first attempt) killed and deleted immediately, no lasting host impact. All litebox_runner_
+linux_on_windows_userland.exe and cdb.exe processes cleanly WMI-Terminate'd (or Stop-Process
+-Force for cdb.exe) between every attempt; verified zero stray processes and RAM recovery
+(3.9GB -> 6.9-7.2GB) before ending the pass.
+
+Committed: litebox_shim_linux/src/syscalls/file.rs (litebox_diag::stderr_capture target),
+litebox_shim_linux/src/syscalls/unix.rs (diag-unix-shared-read-bytes hex preview, LITEBOX_LOG-
+gated). Both are permanent, low-noise, opt-in diagnostics -- safe to leave enabled by default (off
+unless the corresponding LITEBOX_LOG target is granted), genuinely useful for ANY future guest
+stderr-capture or shared-AF_UNIX-transport investigation, not just this one.
+
+LOCAL-ONLY, not committed (gitignored .wfgy/): .wfgy/xvfb_abort_probe_boot{1..6}.ps1/.log
+(boots 3-5 are the ones with the byte-identical write_pos evidence; boot 1's runaway log was
+deleted), .wfgy/xvfb_live_cdb_orchestrator{,2}.ps1 and their boot wrapper scripts (the two-stage
+PID-identification pipeline -- orchestrator2's detection logic, gated on the offset-then-sentinel-
+then-winpid sequence, is the one that worked; orchestrator1's naive "first comm=Xvfb stderr line"
+detection fires too late, essentially AT the crash itself, since Xvfb appears to be silent on
+stderr during normal operation and only ever writes anything as part of its own crash handler --
+reusable code, wrong trigger, kept for the next pass to fix), .wfgy/xvfb_live_cdb2_*.log (the
+live cdb capture).
