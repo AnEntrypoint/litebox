@@ -691,6 +691,21 @@ where
         let stale_handles: Vec<smoltcp::iface::SocketHandle> =
             self.socket_set.iter().map(|(handle, _)| handle).collect();
         for handle in stale_handles {
+            // Live-caught (2026-09-21): dead-holder detection itself is not exclusive across
+            // processes racing to acquire this same poisoned lock -- two separate cross-process
+            // children can each independently observe "recorded holder process is dead" within
+            // the same tick (confirmed live: two DIFFERENT per-process elapsed-time clocks, see
+            // this module's own `init_logging()` warning, both logged that exact message within
+            // the same wall-clock window) and both proceed to call this function concurrently
+            // against the SAME shared `Network`. Whichever wins the race removes `handle` first;
+            // without this check the loser's own `stale_handles` snapshot (collected from the
+            // SAME `socket_set` before either side touched it) still names it, and calling
+            // `remove` a second time panics exactly like any other stale-handle call site this
+            // module already guards. `socket_set_contains` is the same guard `remove_dead_
+            // sockets`/`close_pending_sockets`/`drain_socket_channel_buffers` already use.
+            if !Self::socket_set_contains(&self.socket_set, handle) {
+                continue;
+            }
             // `SocketSet::remove` clears the slot back to its `SocketStorage::EMPTY` starting
             // state and hands back the `Socket` value -- `core::mem::forget`, deliberately NOT a
             // normal drop, is the whole point here, and was itself a real, live-caught bug the

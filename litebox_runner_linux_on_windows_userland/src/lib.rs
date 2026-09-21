@@ -1797,7 +1797,25 @@ fn diag_process_fork_task_resume_probe(
                 }
             );
             let pump_shim = shim.clone();
-            std::thread::spawn(move || {
+            // Live-caught (2026-09-21): this pump thread's `detached_pipe_read`/`detached_pipe_write`
+            // calls route through the SAME shim/`Task`-adjacent machinery ordinary guest execution
+            // does (`WaitState`/blocking-wait plumbing), but -- unlike every OTHER guest-work-capable
+            // thread in this codebase (`INITIAL_GUEST_THREAD_STACK_SIZE` at `run()`'s own
+            // `guest_thread`, `diag_process_fork_globalstate_probe`'s dedicated thread just above)
+            // -- this one used the bare `std::thread::spawn` default (Windows' ~1 MiB), the EXACT
+            // same defect class `diag_process_fork_globalstate_probe`'s own doc comment already
+            // root-caused and fixed for its sibling thread on 2026-09-17. Live-reproduced: a
+            // cross-process-fork child piping into another (`env | grep`, or any subshell wrapping
+            // one) hit a real host `STATUS_STACK_OVERFLOW` ("thread '<unknown>' has overflowed its
+            // stack") specifically inside a pipe-carrying fork's bootstrap, non-deterministically
+            // (reproduces reliably once concurrent cross-process children are already competing for
+            // the host, matching the shape of the real `webtop_stack.sh` boot's `xfce4-session`
+            // launch racing the selkies-bind-watchdog/tail-f loops) -- exactly the kind of
+            // load-dependent stack pressure a too-small default stack produces, not a logic bug in
+            // the pump loop itself. Fixed the same way as its sibling: an explicit, generous stack.
+            std::thread::Builder::new()
+                .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
+                .spawn(move || {
                 let mut buf = [0u8; 4096];
                 match dir {
                     // Drain what the guest wrote into the inherited handle, then close it: that
@@ -1852,7 +1870,8 @@ fn diag_process_fork_task_resume_probe(
                 drop(host_end);
                 // Safety: this thread is the sole owner of `handle`, and closes it exactly once.
                 unsafe { pf::close_inherited_handle(handle) };
-            });
+            })
+                .expect("failed to spawn cross-process fork child's pipe pump thread");
         }
     }
 
@@ -1932,7 +1951,14 @@ fn diag_process_fork_task_resume_probe(
     // mirroring `run()`'s own construction verbatim, so this child's guest execution gets the
     // same continuous network pump the default (non-process-fork) path always had.
     let net_shim = shim.clone();
-    std::thread::spawn(move || {
+    // Same `INITIAL_GUEST_THREAD_STACK_SIZE` fix as the pipe-pump thread above, same class of
+    // defect (a `std::thread::spawn` default-stack thread doing guest-work-adjacent work in this
+    // fork-child bootstrap) -- fixed proactively alongside it rather than waiting for its own
+    // separate live repro, since it is spawned from the identical bootstrap under the identical
+    // concurrent-fork host load this session live-caught overflowing the pipe-pump thread.
+    std::thread::Builder::new()
+        .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
+        .spawn(move || {
         const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
         const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
         loop {
@@ -1964,7 +1990,8 @@ fn diag_process_fork_task_resume_probe(
             };
             platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
         }
-    });
+    })
+        .expect("failed to spawn cross-process fork child's net_worker thread");
 
     eprintln!(
         "[process_fork_diag] task-resume-probe (child, winpid={}): built Task, set fs_base={:#x}, calling \

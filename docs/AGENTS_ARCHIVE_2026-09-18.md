@@ -1937,3 +1937,150 @@ cleanly WMI-`Terminate`d between attempts and at session end.
 `DIAG_DISPLAY` diagnostic line is LOCAL-ONLY (gitignored `.wfgy/`), not part of any commit -- remove
 or keep at a future session's discretion; it costs nothing to leave in.
 
+## Twenty-ninth pass, 2026-09-21 -- three real bugs found+fixed; 28th pass's DE_FAILED hypothesis REFUTED with direct evidence, root cause narrowed
+
+Picked up the 28th pass's precisely-evidenced `DE_FAILED`/`DISPLAY`-loss blocker. Read
+`fork_verify.rs` (thread-based fork's post-`fork()` stale-pointer single-step healer) in full,
+`litebox/src/mm/mod.rs`'s `AddressRelocations`/`PageManager::duplicate`, `litebox_shim_linux/src/
+syscalls/process.rs`'s `sys_execve`/`copy_vector`, and `litebox_shim_linux/src/loader/stack.rs`'s
+`UserStack::init` line by line.
+
+**Bug 1, FIXED**: `sys_execve` called `self.global.platform.end_fork_child_verification()`
+(clears `tls.fork_verify`, the SAME `Arc<AddressRelocations>` `current_thread_fork_relocations()`
+reads) BEFORE `copy_vector` ever read `argv`/`envp`. `copy_vector`'s reads are raw `UserPtr`
+dereferences (`addr: usize`, guest-address-equals-host-address, no translation layer at all) --
+exactly the one class of stale pointer `fork_verify`'s own doc comment says its single-step
+healing structurally cannot reach: that mechanism only ever observes GUEST CPU instructions as
+they execute; nothing in `dash`/`bash`'s own compiled code ever reads `environ`'s INDIVIDUAL
+entries before calling `execve` (the libc wrapper just loads `environ`'s own address into a
+syscall register and traps straight to the kernel) -- this shim's own `copy_vector` is the FIRST
+and ONLY code that ever dereferences each entry, and by design it runs as ordinary host Rust code
+with `TF` cleared. A `setenv`-rebuilt `environ` array (e.g. a shell's `export FOO=bar` right before
+a `fork()`+`execve()`) can therefore reach here holding entries `PageManager::duplicate` copied
+byte-for-byte but never address-translated -- and a raw, untranslated read through them silently
+lands in the STILL-LIVE, STILL-MAPPED parent's own memory (thread-based `fork()` shares one Windows
+process address space, so a stale source address never faults) instead of erroring.
+
+Fix: capture `current_thread_fork_relocations()` into a local BEFORE calling
+`end_fork_child_verification()`, thread it through `copy_vector` (and the `pathname` read too), and
+add a `heal()` helper mirroring `fork_verify`'s own case (3) (translate a stale, `is_in_source`
+pointer via `AddressRelocations::translate`) but applied explicitly to the one well-understood,
+fully-bounded pointer shape this syscall's ABI guarantees -- not the blind, unbounded "guess
+whether an arbitrary syscall argument might be a pointer" attempt `fork_verify.rs`'s own doc
+comment already records as tried and reverted for making things worse. Commit: `litebox_shim_
+linux/src/syscalls/process.rs`.
+
+**Bug 2, FIXED, live-caught mid-repro**: `Network::reset_after_poisoning` (`litebox/src/net/
+mod.rs`) collects `stale_handles` from `self.socket_set.iter()`, then calls
+`self.socket_set.remove(handle)` for each -- but dead-holder detection is not exclusive across
+processes: a debug-binary boot under `LITEBOX_PROCESS_FORK=1` hit `smoltcp::iface::socket_set::
+SocketSet::remove`'s own `"handle does not refer to a valid socket"` panic INSIDE this exact
+function, live, with two DIFFERENT per-process elapsed-time clocks (proof of two different
+processes, per `init_logging()`'s own per-child reset) both logging `RawMutex::
+poll_until_value_changes: recorded holder process is dead` in the same wall-clock window --
+i.e. two processes independently observed the same poisoned lock and both ran this recovery
+concurrently, and the loser's own `stale_handles` snapshot (taken before either side touched
+anything) still names a handle the winner already removed. Fixed with the same
+`socket_set_contains` guard the three already-safe sibling functions (`remove_dead_sockets`/
+`close_pending_sockets`/`drain_socket_channel_buffers`) already use. Commit: `litebox/src/net/
+mod.rs`.
+
+**Bug 3, FIXED, live-caught, 100%-reproducible in isolation**: `LITEBOX_PROCESS_FORK=1` +
+`/bin/true | /bin/true` in a freshly-pulled `debian:stable-slim` guest hit a real host
+`STATUS_STACK_OVERFLOW` ("thread '<unknown>' has overflowed its stack"), non-deterministically
+(reliable once concurrent cross-process children are already competing for the host -- matches
+the real `webtop_stack.sh` boot's shape exactly: `xfce4-session`'s own launch races the
+selkies-bind-watchdog/`tail -f` loops). This is the SAME defect class a 2026-09-17 pass already
+root-caused and fixed for ONE thread in this exact bootstrap
+(`diag_process_fork_globalstate_probe`'s own dedicated `INITIAL_GUEST_THREAD_STACK_SIZE`/32 MiB
+thread, added specifically because that one ran on a fresh `CreateProcessW` child's bare ~1 MiB
+default main-thread stack) recurring in TWO SIBLING spawns that pass never touched, both still
+bare `std::thread::spawn` with no `.stack_size()`: the fork-child's own pipe-pump thread (drains a
+carried guest pipe via `LinuxShim::detached_pipe_read`/`detached_pipe_write`, which routes through
+the same shim/`WaitState` machinery ordinary guest execution does) and its `net_worker` thread
+(both in `litebox_runner_linux_on_windows_userland/src/lib.rs`), plus the parent-side pipe-pump
+counterpart in `litebox_platform_windows_userland/src/lib.rs` (simpler raw-handle I/O, less likely
+to be the actual overflow site, but fixed for consistency with its sibling). All three given the
+same `INITIAL_GUEST_THREAD_STACK_SIZE`/`GUEST_THREAD_STACK_SIZE` (32 MiB) treatment. Verified: the
+`/bin/true | /bin/true` repro crashed reliably pre-fix (debug and release binaries both), zero
+overflow post-fix across repeated runs of the same repro and of a nested subshell+double-pipe
+variant that also crashed pre-fix. One NEW, NOT-yet-root-caused observation from this same testing:
+post-fix, a nested `(cmd1 | cmd2; exec cmd3) < file 2>&1 | sed ...` construct that used to crash now
+instead HANGS (the top-level shell never reaches its own next line, process tree left with one
+surviving PID) -- not yet investigated; noted for a future pass, does not block the main
+investigation since `webtop_stack.sh` itself never uses this exact nested shape.
+
+**The 28th pass's own leading hypothesis -- "the cross-process-fork child doesn't receive an
+accurate copy of the parent's current process memory at the fork instant" -- is REFUTED by this
+pass's direct, live, per-syscall evidence, not merely superseded by bugs 1-3 above (none of which
+turned out to be the real `DE_FAILED` cause either).** Enabled the ALREADY-EXISTING (never
+enabled) `litebox_shim_linux::syscalls::process=trace` log level (the `execve: copied argv/envp
+entry` site, unchanged) on a real release-binary `.wfgy/webtop_stack.sh` + `LITEBOX_PROCESS_FORK=1`
+boot and captured the REAL `xfce4-session` `sys_execve` call's own envp array as `copy_vector`
+read it: entry idx=11 (of 24) was `bytes=[68, 73, 83, 80, 76, 65, 89, 61, 58, 49]`, i.e. the ASCII
+bytes of `DISPLAY=:1` exactly, read BEFORE the ELF loader ever touches the new stack. This IS the
+`LITEBOX_PROCESS_FORK=1` cross-process path (confirmed via the `[process_fork_diag] task-resume-
+probe`/`vmem-adopt-probe` lines bracketing it) -- so bug 1's thread-based-only fix was never even
+relevant to this specific fork call; cross-process forks never arm `fork_verify` at all (by
+design -- `spawn_process_fork_child`'s own `copy_one_group` forces each group to the SAME address
+in the child via `VirtualAlloc2`+`MEM_ADDRESS_REQUIREMENTS`, a hard requirement, so no relocation
+and hence no stale-pointer class exists there in the first place).
+
+`litebox_shim_linux/src/loader/stack.rs::UserStack::init` was then read in full against this
+confirmed-correct input: `push_cstrings` places `vals[0]` at the lowest address and records each
+string's own offset; `push_pointers` writes `ptr[i] = stack_top + offsets[i]` in ascending `i`,
+matching the recorded offsets exactly; `argc` (`self.push_usize(argv.len())`) uses the SAME `argv`
+slice `push_cstrings(&argv)` did. No defect found by inspection, and a group-copy failure aborts
+the whole cross-process spawn (`fail_teardown!`) rather than silently zero-filling one region, so a
+partial/incomplete stack would show up as `execve` never even reaching guest code, not as a
+successfully-running process reporting an empty variable.
+
+Given the stack build looks correct, tested whether `getenv()`/`environ` (as opposed to the
+`envp` argument to `main()`, which `env`(1) uses directly and does NOT prove `getenv()` works at
+all) is broken in general: `/usr/bin/printenv DISPLAY` (a real `getenv()` call) in the EXACT same
+invocation shape `xfce4-session` uses (`export DISPLAY=:1` after 10 warm-up forks, then
+`< /tmp/empty > /tmp/out.log 2>&1 &` followed by `wait`, in the real `debian-xfce` image, no pipe,
+no subshell) printed `:1` correctly. Combined with the 28th pass's own already-recorded evidence
+that `xset q` (also a real `getenv("DISPLAY")`+`XOpenDisplay` caller) succeeds, this rules out a
+general `environ`/`getenv()` defect too. **`xfce4-session` is the one thing, among `env`,
+`printenv`, and `xset`, that fails in this exact shape.** Confirmed it is a real dynamically-linked
+ELF (`7f 45 4c 46` magic, 272904 bytes, not a wrapper script) with a real `--display=DISPLAY` GTK
+option (`xfce4-session --help`) -- so the failure is inside its OWN process after a demonstrably
+correct `execve`, not in anything litebox's fork/exec/env machinery does. Also incidentally
+observed live: `xfce4-session --help` itself spawns a `dbus-daemon` child that SIGSEGVs
+(`fatal signal: terminating task signal=Signal(11)`) in the background after printing its own
+help text successfully -- a real, separate, not-yet-investigated crash, low priority (doesn't
+block `--help` itself, not yet seen to block the real boot's own dbus-daemon).
+
+**Leading hypothesis for the next pass**: `xfce4-session` pulls in FAR more shared libraries than
+`xset`/coreutils (GTK, glib, pango, cairo, dbus-glib, libxfce4util, ...) -- something specific to
+loading/relocating that much larger dependency graph (an `mmap` collision with something only a
+process this large's address-space footprint reaches, a specific relocation type one of those
+libraries uses that `xset` never exercises, or a static-constructor ordering issue) is the most
+likely remaining place to look. **Needs a `cdb` session attached to a live `xfce4-session` child**
+(real webtop boot, debug binary, catch it between `execve` and its own `Cannot open display`
+message) reading its OWN `environ` pointer and the memory it points to directly, or an
+`strace`-equivalent trace of just that one child's `mmap`/`open` calls during dynamic linking,
+compared side by side against `xset`'s. Two full boots this pass (debug AND release binaries)
+still reached the identical `DE_FAILED`, panic-free, after all three fixes above -- confirms none
+of bugs 1-3 were masking the real cause, narrows it, does not close it.
+
+**Ruled out, with live evidence, do not re-attempt without new information**: fork-time memory
+duplication/relocation (envp trace proves correct content pre-loader); the ELF loader's stack
+layout (inspected line by line against the confirmed-correct input); a general `environ`/
+`getenv()` regression (`printenv` succeeds in the identical shape); the writable-layer
+file-visibility gap as `xfce4-session`'s OWN cause (it fails with no pipe, no subshell, and its
+own printed error message is proof it ran far enough that ITS OWN redirect target's visibility to
+a LATER reader is moot -- that gap is real for OTHER cases, per item 6 of the pickup list, just not
+this one); the bug-3 stack overflow as `xfce4-session`'s own cause (still reproduces identically
+post-fix).
+
+**Host state**: RAM ranged 0.66-6.6GB free across roughly twenty boot/repro attempts this pass
+(both debug and release binaries, `debian:stable-slim` isolated repros and the full `debian-xfce`
+webtop boot), killed via WMI `Terminate` between attempts; one boot lock contention (a prior run's
+8-hour `HOLD` loop still holding `boot.lock`) resolved by killing the stale process and clearing
+the lock file by hand. `.wfgy/webtop_stack.sh`'s own transient `DIAG_ENVPROBE` diagnostic (added,
+found to trigger bug 3, then REMOVED again once bug 3 was fixed and a cleaner non-piped repro
+existed) is LOCAL-ONLY (gitignored `.wfgy/`), not part of any commit; `.wfgy/webtop_seed.tar` was
+regenerated from the clean (post-revert) script.
+

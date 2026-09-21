@@ -108,53 +108,25 @@ Use `LITEBOX_DIAG_FORK_TIMING=1` for the next cost question.
 original symptom this investigation began from, genuinely not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Passes 4-17 (2026-09-17/18), all FIXED and live-verified — full narrative: `docs/
-AGENTS_ARCHIVE_2026-09-17.md`/`_2026-09-18.md`.** (4) nginx-self-test pipe-EOF wedge, fixed via
-`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` explicit handle allow-list. (8) `Network::socket_set` made
-shared-arena-native (256-slot fixed array). (10) post-`NGINX_STARTED` CPU livelock —
-`LocalPortAllocator`/`closing_in_background` converted to fixed `[u16; 65535]` arrays
-(`interface` remains open; `queued_for_closure` fixed twenty-eighth pass). (11) `RawMutex` poison-on-dead-holder scheme;
-`Socket::Drop` cross-process-heap-free fixed via `core::mem::forget`. (12) by-name `Xvfb`/
-`dbus-daemon` cross-process-fork exclusion relaxed (`SafeZoneAllocator::dealloc`'s spinlock
-livelock found, **still open**). (13) shared cross-process AF_UNIX connection data plane DESIGNED
-+ IMPLEMENTED (`SharedUnixConnTable`/`SharedUnixConnectQueue`). (14/15) isolated AF_UNIX repro
-PASSED; real full-boot-stall root cause was a smoltcp stale-`SocketHandle` panic killing
-`net_worker` threads platform-wide, FIXED via `catch_unwind` + `force_reset_network_after_panic()`
-(the `wait_on_tun` two-holder-deadlock theory was WRONG). (16) `webtop_stack.sh`'s `[ -S "$XSOCK" ]`
-never true on this shim, fixed: `-S` → `-e`.
-(17) `xset q`'s silent kill CAUGHT LIVE + FIXED (`memfds`/`shared_files` per-process-shadowed).
-
-**Eighteenth pass** — systematic `GlobalState` field audit (3 more defects fixed: `unix_addr_
-table`/`fifo_registry` per-process-shadowed, `sysv_shm` fixed 128-slot array), a debug build for
-reliable `cdb` symbols. Still open, deeper redesign needed: `pty_registry`/`daemon_pty_masters`/
-`flock_registry`/`drm`/`evdev` (pickup list). Found the real blocked thread: guest `ppoll()`
-parked on a Condvar, AF_UNIX bounded-15ms-repoll running but `has_pending(...)` never flips true.
-Archive.
-
-**Nineteenth pass** — live `cdb -pv` repro of the ppoll stall, `has_pending`/queue logic REFUTED as
-the bug; found an unconfirmed `Init`-state gap in `UnixInitStream::check_io_events`. Archive.
-
-**Twentieth pass** — FIXED the `SharedUnixConnTable` slot leak on externally killed clients
-(commit `05d279d`; dead-holder check + reclaim, `SHARED_UNIX_CONN_CAPACITY` 8->64). Confirmed the
-AF_UNIX bounded-15ms-repoll IS engaged and re-scanning -- not the bug. Found (not yet fixed) a
-second `wait4(-1)` stall with no bounded-repoll fallback. Full detail: archive.
-
-**Twenty-first pass** — FIXED the `wait4(-1)` stall (commit `a771692`): no bounded-repoll
-fallback on `pid == -1`. **Twenty-second/twenty-third passes** — `_nofork_tick()` sleep-forks-
-every-iteration fix (script-only) + its own dash-`$SECONDS` regression fix; AF_UNIX rendezvous
-"livelock" theory raised then REFUTED by the twenty-fourth pass. **Twenty-fourth pass** — live
-per-request instrumentation proved the AF_UNIX rendezvous mechanism itself sound (one real connect
-per boot, ~23ms, no timing/address-mismatch); real blocker found upstream (`$XSOCK` wait loop never
-completing); also fixed `sys_wait4`'s `pid > 0` no-repoll gap. Browser milestone not reached by any
-of these three passes. Full detail (all three): archive. RAM ranged 1.4-4.8GB free throughout,
-recovered fully after each kill.
-
-**Twenty-fifth pass** — CONFIRMED a bound AF_UNIX path needs only presence, not content, sync:
-FIXED via `SharedUnixAddrPresenceTable` consulted on `ENOENT` (`litebox::fs::devices::
-cross_process_bound_unix_socket_status`, `do_stat`/`do_access` in `litebox_shim_linux/src/
-syscalls/file.rs`) — closed the `$XSOCK` stall for good. Also widened
-`SHARED_UNIX_CROSS_CONNECT_TIMEOUT` 3s->15s (real contention starved the listener's 15ms re-poll).
-Superseded by the twenty-sixth pass's deeper fix below. Archive.
+**Passes 4-25 (2026-09-17/20), all FIXED/REFUTED and live-verified — full narrative, one entry per
+pass: `docs/AGENTS_ARCHIVE_2026-09-17.md`/`_2026-09-18.md`.** Landed: nginx pipe-EOF handle
+allow-list; `Network::socket_set`/`LocalPortAllocator`/`closing_in_background` made shared-arena
+fixed arrays; `RawMutex` poison-on-dead-holder scheme; by-name Xvfb/dbus-daemon fork exclusion
+relaxed; shared cross-process AF_UNIX connection plane (`SharedUnixConnTable`/
+`SharedUnixConnectQueue`) designed+implemented+leak-fixed; a platform-wide smoltcp
+stale-`SocketHandle` panic fixed via `catch_unwind`+`force_reset_network_after_panic()`;
+`webtop_stack.sh`'s `[ -S "$XSOCK" ]`→`-e` fix; `xset q`'s silent kill fixed (`memfds`/
+`shared_files` per-process-shadowed); a `GlobalState` field audit (`unix_addr_table`/
+`fifo_registry` per-process-shadowed, `sysv_shm` fixed array); `sys_wait4`'s `pid==-1`/`pid>0`
+no-repoll gaps both fixed; the `$XSOCK` stall closed for good via `SharedUnixAddrPresenceTable`
+consulted on `ENOENT`. REFUTED along the way (recorded so they are never re-tried): the
+`wait_on_tun` two-holder-deadlock theory, `has_pending`/queue logic as the ppoll-stall cause, the
+AF_UNIX rendezvous "livelock" theory (24th pass: live per-request instrumentation proved the
+mechanism itself sound, one real connect per boot, ~23ms, no timing/address mismatch). Still open
+from this range: `SafeZoneAllocator::dealloc`'s spinlock livelock (no dead-holder recovery, unlike
+`RawMutex`); `pty_registry`/`daemon_pty_masters`/`flock_registry`/`drm`/`evdev` need a deeper
+redesign than a flat fixed array (non-POD payload); `UnixInitStream::check_io_events`'s static
+`Init`-state report (unconfirmed).
 
 **Twenty-sixth pass (2026-09-20) — ROOT-CAUSED AND FIXED the "Xvfb never reads `xset q`'s bytes"
 gap; `XVFB_UP` printed for the first time ever.** Root cause: `EpollFile::
@@ -204,6 +176,40 @@ speculation) — `accept`, `connect`, `get_local_addr`, `get_remote_addr_for_han
 `DescriptorEntry` cross-subsystem-downcast panic in `drain_entries_full_covered_by`
 (`matches_subsystem` guard, mirroring `iter`/`iter_mut`). Full evidence: archive.
 
+**Twenty-ninth pass (2026-09-21) — three more real, independent bugs found+fixed live; the
+28th pass's own `DE_FAILED` hypothesis REFUTED with direct per-syscall evidence, root cause
+narrowed. Full narrative, every repro command, every ruled-out alternative: archive.** (1)
+**FIXED**: `sys_execve`'s `copy_vector` read `argv`/`envp` via raw `UserPtr` reads AFTER
+`end_fork_child_verification()` had already cleared the SAME translation map
+`fork_verify`'s single-step healing needs but structurally can never apply here (host-side
+syscall-handler pointer-chasing, not a guest CPU instruction) — fixed by capturing the map first.
+Real fix for the **thread-based fork** path only. Commit: `litebox_shim_linux/src/syscalls/
+process.rs`. (2) **FIXED, live-caught**: `Network::reset_after_poisoning` itself called
+`socket_set.remove(handle)` on a handle its own snapshot had just collected, but two processes can
+independently run this same dead-holder recovery concurrently and race each other over it — same
+`socket_set_contains` guard its three sibling functions already use. Commit: `litebox/src/net/
+mod.rs`. (3) **FIXED, live-caught, 100%-reproducible**: `LITEBOX_PROCESS_FORK=1` +
+`/bin/true | /bin/true` hit a real `STATUS_STACK_OVERFLOW` — the SAME defect class a 2026-09-17
+pass fixed for ONE thread in the fork-child bootstrap (bare `std::thread::spawn` default ~1 MiB
+stack), recurring in two sibling spawns that pass never touched (the fork-child's pipe-pump and
+`net_worker` threads, `litebox_runner_linux_on_windows_userland/src/lib.rs`, plus the parent-side
+pipe-pump counterpart in `litebox_platform_windows_userland/src/lib.rs`) — all three given the
+same `INITIAL_GUEST_THREAD_STACK_SIZE`/32 MiB fix. **None of bugs 1-3 turned out to be the real
+`DE_FAILED` cause.** A live `execve`-trace of the REAL boot's actual `xfce4-session` fork (enabling
+the already-present `litebox_shim_linux::syscalls::process=trace` log level) proved its envp array
+holds correct `DISPLAY=:1` bytes before the loader ever runs — refuting the 28th pass's "child
+doesn't get an accurate memory copy" theory outright. The ELF loader's own stack-building code
+(`litebox_shim_linux/src/loader/stack.rs::UserStack::init`) was inspected line by line against
+this confirmed-correct input and found structurally sound. `/usr/bin/printenv` (a REAL `getenv()`
+call, unlike `env`(1) which reads its own `envp` `main()` argument directly and proves nothing
+about `getenv()`) reads `DISPLAY` correctly in the exact same invocation shape `xfce4-session`
+uses — ruling out a general `environ`/`getenv()` regression too. **`xfce4-session` alone fails
+this shape; `env`, `printenv`, and (per the 28th pass's own evidence) `xset` all succeed in it** —
+narrowing the real cause to something inside `xfce4-session`'s own process (most likely its much
+larger GTK/glib/pango/cairo/dbus-glib shared-library dependency graph vs. `xset`/coreutils' much
+smaller one). Two full boots (debug AND release) this pass still reach the identical `DE_FAILED`,
+panic-free, after all three fixes — confirms none were masking the real cause.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
@@ -217,21 +223,13 @@ event/wait.rs:224`'s `unreachable!()` on garbage thread state (dozens per boot, 
 panic historically, NOT yet debugger-confirmed — do not patch blind). ~~(3) `DBUS_FAILED`~~ —
 CLOSED, twenty-eighth pass (`SharedFilePublishTable`, `litebox_shim_linux/src/syscalls/file.rs` —
 extends `SharedUnixAddrPresenceTable`'s pattern to small file CONTENT); `[s] DBUS_UP` now prints
-every boot. **Current sole blocker to the browser/terminal/apps milestone, precisely evidenced,
-twenty-eighth pass**: `DE_FAILED` — both `startwm.sh` and the direct `xfce4-session` fallback fail
-with `xfce4-session: Cannot open display: .` (`$DISPLAY` empty) inside the forked child that execs
-it, even though `export DISPLAY=:1` (line 51) is correctly visible to every EARLIER fork (Xvfb
-itself, `xset q`'s successful connect). A direct stdout-only diagnostic (bypassing the
-writable-layer-file class entirely) confirmed the PARENT shell's own live environment is CORRECT
-(`DISPLAY=[:1]`) immediately before the fork that loses it — neither a script bug nor the
-writable-layer-visibility class; the cross-process-fork CHILD is not receiving an accurate copy of
-the parent's current process memory (wherever dash's exported-variable table lives) at the fork
-instant. `sys_execve` (`litebox_shim_linux/src/syscalls/process.rs`) reads `envp` from the
-ALREADY-FORKED child's own current memory, no cross-process step there — the bug is upstream, in
-the memory-adoption step (`vmem-adopt-probe`). NOT yet root-caused with a debugger — needs its own
-`cdb`/debug-binary session (mirror the eighteenth-pass `GlobalState` field-audit method: compare
-the parent's real live memory at the fork instant against the child's adopted region) before
-attempting a fix. Two boots reproduced this identically. Full evidence: archive. (4) finish the
+every boot. **Current sole blocker to the browser/terminal/apps milestone, twenty-ninth pass
+(see that pass's own summary above for the full refutation chain)**: `DE_FAILED` —
+`xfce4-session` alone reports `Cannot open display: .` despite a proven-correct `envp` at the
+loader boundary and proven-correct `getenv()` in `printenv`/`xset` in the identical shape; needs a
+`cdb` session on a live `xfce4-session` child at its own `getenv`/`XOpenDisplay` call site next,
+likely implicating its much larger GTK/glib/pango/cairo/dbus-glib dependency graph. Archive for
+every ruled-out alternative. (4) finish the
 `Network` shared-arena redesign (`interface` remains
 — `queued_for_closure` is now fixed, see (1b)); (4b) `pty_registry`/`daemon_pty_masters`/
 `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) genuinely need
@@ -360,13 +358,10 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-28th passes: Xvfb/dbus relaxed; shared
-  AF_UNIX connection plane; isolated repro PASSED; `wait_on_tun` REFUTED + smoltcp-panic FIXED;
-  `xset` silent kill FIXED; GlobalState field audit + debug binary; `SharedUnixConnTable` leak +
-  `wait4(-1)` no-repoll stall both FIXED; sleep-fork-per-iteration FIXED; epoll EPOLLET ready-set
-  bug FIXED (`XVFB_UP` first-ever); writable-layer surgical pre-create landed; `DBUS_FAILED`
-  CLOSED (`SharedFilePublishTable`); five further `reset_after_poisoning` crash bugs fixed; two
-  panic-free full boots to `DE_LAUNCHED`; new DISPLAY-loss blocker found, not yet root-caused),
+- **Archives** (newest first) — `_2026-09-18.md` (12th-29th passes: shared AF_UNIX connection
+  plane; `xset`/epoll/DBUS_FAILED all CLOSED; two panic-free boots to `DE_LAUNCHED`; 29th pass's
+  three more fixes + the DISPLAY-loss blocker's REFUTED hypothesis and narrowed pickup — see
+  AGENTS.md's own 29th-pass entry above for the summary, this file for the full trace/repro detail),
   `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`

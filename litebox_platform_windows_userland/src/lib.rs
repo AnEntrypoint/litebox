@@ -12562,7 +12562,18 @@ fn spawn_fork_child_pipe_pump(
     bridge: litebox::platform::ForkPipeBridge,
     child_process: usize,
 ) {
-    std::thread::spawn(move || {
+    // Same defensive stack-size fix as the CHILD-side pipe pump this one mirrors
+    // (`litebox_runner_linux_on_windows_userland`'s own pump thread, fixed the same pass after a
+    // live-reproduced `STATUS_STACK_OVERFLOW` on a pipe-carrying cross-process fork under
+    // concurrent host load) -- this parent-side half does plainer I/O (no shim/`Task` machinery
+    // at all, just `ForkPipeBridge::read`/`write` over a raw Windows pipe handle) so it is less
+    // likely to be the actual overflow site, but giving it the same generous, already-established
+    // `GUEST_THREAD_STACK_SIZE` headroom costs nothing and keeps both halves of this one bridge
+    // consistent rather than leaving one fixed and its sibling still on a bare 1 MiB default.
+    const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(GUEST_THREAD_STACK_SIZE)
+        .spawn(move || {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 
         match bridge {
@@ -12641,7 +12652,8 @@ fn spawn_fork_child_pipe_pump(
         }
         // Safety: this thread is the sole owner of `local`, and closes it exactly once.
         unsafe { CloseHandle(local as HANDLE) };
-    });
+    })
+        .expect("failed to spawn cross-process fork parent's pipe pump thread");
 }
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {

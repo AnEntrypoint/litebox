@@ -6054,13 +6054,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         envp: UserPtr<UserPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
+        // Translates `ptr`'s address into the destination address space if it is still a
+        // stale, pre-`fork()` (source-range) value -- the array-of-pointers shape of `argv`/
+        // `envp` is exactly the case `fork_verify`'s single-step healing (in
+        // `litebox_platform_windows_userland::fork_verify`) cannot reach: that mechanism only
+        // ever observes GUEST CPU instructions as they execute (decoded via `iced-x86` while
+        // `EFLAGS.TF` is armed), and heals a memory slot only once some guest instruction
+        // actually reads through it. Nothing in `dash`/`bash`'s own compiled code walks
+        // `environ`'s INDIVIDUAL entries before calling `execve` -- the libc wrapper just loads
+        // `environ`'s own address into a syscall argument register and traps straight to the
+        // kernel (here: this shim). This function's own `copy_vector` is therefore the FIRST and
+        // ONLY code that ever dereferences each entry, and it runs as ordinary host Rust code
+        // with `TF` cleared (`fork_verify`'s own doc comment: the syscall trampoline clears `TF`
+        // before any host instruction runs) -- so a `putenv`/`setenv`-rebuilt `environ` array
+        // (e.g. a shell's `export FOO=bar` right before this `fork()`+`execve()`, which glibc
+        // implements by `malloc`ing a brand-new array+string that no guest instruction has read
+        // back since) reaches here holding entries that were copied byte-for-byte by
+        // `PageManager::duplicate` but never address-translated, and a raw, untranslated read
+        // through them silently lands in the STILL-LIVE, STILL-MAPPED parent's own memory
+        // (thread-based `fork()` shares one Windows process address space, so a stale source
+        // address never faults -- see `AddressRelocations::is_in_source`'s doc comment) instead
+        // of erroring: the exact live-confirmed root cause of `DISPLAY=:1`, `export`ed
+        // immediately before the fork that execs `xfce4-session`, reading back empty.
+        //
+        // This mirrors `fork_verify`'s own case (3) (heal a slot's stale stored pointer on read)
+        // but applied explicitly to the one well-understood, fully-bounded pointer shape this
+        // syscall's ABI guarantees (`argv`/`envp`/`pathname` are pointers, and array entries are
+        // themselves pointers, nothing else) -- not the blind, unbounded "guess whether an
+        // arbitrary syscall argument might be a pointer" attempt this module's own history
+        // (`fork_verify.rs`'s doc comment) already tried and reverted for making things worse.
+        fn heal<T>(
+            ptr: UserPtr<T>,
+            relocations: Option<&litebox::mm::AddressRelocations>,
+        ) -> UserPtr<T> {
+            let addr = ptr.as_usize();
+            if addr == 0 {
+                return ptr;
+            }
+            match relocations {
+                Some(r) if r.is_in_source(addr) => match r.translate(addr) {
+                    Some(translated) => UserPtr::from_usize(translated),
+                    None => ptr,
+                },
+                _ => ptr,
+            }
+        }
+
         fn copy_vector<Platform: ShimPlatform>(
             mut base: UserPtr<UserPtr<core::ffi::c_char>>,
             which: &str,
+            relocations: Option<&litebox::mm::AddressRelocations>,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
+                base = heal(base, relocations);
                 let p: UserPtr<core::ffi::c_char> = {
                     // read pointer-sized entries
                     match base.read_at_offset::<Platform>(0) {
@@ -6071,6 +6119,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if p.as_usize() == 0 {
                     break;
                 }
+                let p = heal(p, relocations);
                 let Some(cs) = p.to_cstring::<Platform>() else {
                     return Err(Errno::EFAULT);
                 };
@@ -6093,12 +6142,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(out)
         }
 
+        // Captured BEFORE `end_fork_child_verification()` below -- that call clears
+        // `tls.fork_verify` (`fork_verify::end()`), which is the SAME map
+        // `current_thread_fork_relocations()` reads; calling it first would silently throw away
+        // the one piece of information `heal()` above needs, for a thread that is (by far) the
+        // most likely to actually be carrying stale `argv`/`envp` pointers -- one that just
+        // forked. `None` here (the overwhelmingly common case: an ordinary `execve` with no
+        // fork() in this thread's very recent past) makes `heal()` above a pure no-op, so this
+        // costs nothing on the normal path.
+        let fork_relocations = self.global.platform.current_thread_fork_relocations();
+
         // `execve` replaces the address space wholesale: any stale pointer into the parent's
         // pre-`fork()` ranges is unreachable from here on, so post-`fork()` verification (if it
-        // was armed for this thread) has served its purpose and must stop.
+        // was armed for this thread) has served its purpose and must stop. Deferred until after
+        // `fork_relocations` above is captured, and after `copy_vector` below has used it --
+        // ending verification only clears `fork_verify`'s OWN single-step bookkeeping, not the
+        // `Arc` this function now holds its own clone of.
         self.global.platform.end_fork_child_verification();
 
         // Copy pathname
+        let pathname = heal(pathname, fork_relocations.as_deref());
         let Some(path_cstr) = pathname.to_cstring::<Platform>() else {
             return Err(Errno::EFAULT);
         };
@@ -6128,12 +6191,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
-            copy_vector::<Platform>(argv, "argv")?
+            copy_vector::<Platform>(argv, "argv", fork_relocations.as_deref())?
         };
         let envp_vec = if envp.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
-            copy_vector::<Platform>(envp, "envp")?
+            copy_vector::<Platform>(envp, "envp", fork_relocations.as_deref())?
         };
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
