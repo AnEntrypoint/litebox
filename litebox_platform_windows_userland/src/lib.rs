@@ -1376,18 +1376,27 @@ unsafe extern "system" fn vectored_exception_handler(
             // never when the fault is going to reach `EXCEPTION_CONTINUE_SEARCH`/deliver a real
             // SIGSEGV to the guest.
             || (exception_record.ExceptionCode == 0xC000_0005_u32.cast_signed()
-                && (exception_record.ExceptionInformation[1] < 0x1_0000
-                    // Pass-42: ALSO dump on the GP-fault-shaped variant of this same crash (see
-                    // `exception_handler`'s own `read_write_flag == 0 && faulting_address == !0`
-                    // reclassification a few hundred lines below): a local repro of the apk/jq
-                    // crash was observed to fault with `ExceptionInformation[1] ==
-                    // 0xffff_ffff_ffff_ffff` at the SAME `rip` this investigation's CI captures
-                    // have repeatedly shown for the `addr=0x18` shape, rather than a small
-                    // near-null offset -- evidently which exact shape appears depends on what
-                    // happens to be mapped at the leaked pointer's `+0x80`/dtv-slot offset on a
-                    // given run, not a different bug. Remove alongside the rest of this gate once
-                    // root-caused.
-                    || exception_record.ExceptionInformation[1] == usize::MAX)
+                // Xvfb-deterministic-crash pass (2026-09-21): the pass-37/42 address-magnitude
+                // restriction this line used to carry (`< 0x1_0000 || == usize::MAX`) was scoped
+                // to one specific prior investigation (apk/jq's near-null/GP-fault crash), not a
+                // genuine overhead requirement -- the comment two screens below already
+                // establishes that the ONLY high-frequency AV source is the FS_BASE-reset class,
+                // and that class is excluded on its own terms by the `faulting_instruction_has_
+                // fs_override` check a few lines down, independent of fault-address magnitude.
+                // A live cdb capture this pass caught the SAME FS_BASE-reset class firing through
+                // a large, non-near-null fault address (`fs:[r12]` register-indirect TLS access,
+                // `r12=0xfffffffffffffc60`, still carrying the `0x64` FS-override prefix byte) --
+                // proof the magnitude restriction was never a correct proxy for "is this the
+                // repairable class", only ever a coincidence of which specific instruction shape
+                // the earlier investigation happened to hit. Dropping the restriction here lets
+                // this same low-overhead, in-process, event-driven dump also catch the
+                // large-fault-address deterministic Xvfb SIGSEGV (`0x7feffecdd400`-shaped,
+                // AGENTS.md's 31st pass) WITHOUT needing an external debugger attach at all --
+                // load-bearing because attaching cdb was independently found, this same pass, to
+                // freeze Xvfb's thread long enough per FS_BASE-reset dump to itself trip the
+                // `xset q`/`XVFB_UP` liveness race and starve the boot of the X11 traffic volume
+                // the real crash needs, making the debugger unable to observe the bug it was
+                // attached to catch.
                 && !(unsafe { litebox_common_linux::rdfsbase() } == 0
                     && context_snapshot.Rip != 0
                     && WindowsUserland::get_thread_fs_base() != 0
