@@ -1252,7 +1252,25 @@ unsafe extern "system" fn vectored_exception_handler(
     // all three were actually a downstream, already-corrupted-execution-state artifact fault, not
     // the real bug). `eprintln!` is fundamentally not safe to call first on a thread in this
     // state; only a raw `WriteFile` with no allocation and no lock is trustworthy here.
-    if veh_trace_enabled() || diag_fataldump_enabled() {
+    //
+    // 32nd-pass fix: `diag_fataldump_enabled()` alone (LITEBOX_DIAG_FATALDUMP=1, without also
+    // requesting the deliberately-expensive `veh_trace_enabled()` full instruction trace) used to
+    // fire this same raw dump on EVERY exception, including EXCEPTION_SINGLE_STEP -- routine,
+    // high-frequency (per-instruction) events during `fork_verify`'s own thread-based-fork
+    // single-step healing, completely unrelated to what a "fatal dump" exists to catch. Live-hit
+    // this pass: a fork that fell back to the thread-based path (cross-process fork ineligibility,
+    // e.g. an uncarriable `unix-socket` fd) hit a single-step healing loop that never converged,
+    // and `LITEBOX_DIAG_FATALDUMP=1` turned each of its thousands of single-stepped instructions
+    // into a full raw register dump + `WriteFile`, flooding the log and stalling the boot for
+    // minutes -- the exact "expensive diagnostic perturbs timing enough to hide the real crash"
+    // failure mode this gate was originally split out to avoid, just via a different exception
+    // code than the one the original split anticipated. `veh_trace_enabled()`'s own behavior is
+    // UNCHANGED (it is deliberately a full per-instruction trace and single-stepping through it is
+    // its whole purpose); only the `diag_fataldump_enabled()`-alone path now skips single-step.
+    if veh_trace_enabled()
+        || (diag_fataldump_enabled()
+            && exception_record.ExceptionCode != Win32_Foundation::EXCEPTION_SINGLE_STEP)
+    {
         #[allow(
             clippy::cast_possible_truncation,
             reason = "diagnostic-only; this platform is x86_64-only, register values fit in usize"
