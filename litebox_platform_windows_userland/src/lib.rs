@@ -7724,7 +7724,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // fresh address instead of one already claimed by someone else.
             let hint_foreign_claim = fixed_address_behavior == FixedAddressBehavior::Hint
                 && find_foreign_claim(suggested_range.clone(), current_claim_owner()).is_some();
-            if (has_committed_page || hint_foreign_claim)
+            // See `overlaps_shared_kernel_heap`'s own doc comment: the shared kernel heap's
+            // `MEM_RESERVE` fallback view is invisible to both `has_committed_page` (COMMIT-only)
+            // and `find_foreign_claim` (never registered in `CLAIMED_RANGES`) without this.
+            let hint_shared_heap_hit = fixed_address_behavior == FixedAddressBehavior::Hint
+                && overlaps_shared_kernel_heap(&suggested_range);
+            if (has_committed_page || hint_foreign_claim || hint_shared_heap_hit)
                 && fixed_address_behavior == FixedAddressBehavior::Hint
             {
                 // If any page in the suggested range is already committed, and the caller
@@ -7747,9 +7752,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     placement_floor = suggested_range.start;
                 }
                 base_addr = core::ptr::null_mut();
-            } else if has_committed_page
+            } else if (has_committed_page || overlaps_shared_kernel_heap(&suggested_range))
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
             {
+                return Err(AllocationError::AddressInUse);
+            } else if fixed_address_behavior == FixedAddressBehavior::Replace
+                && overlaps_shared_kernel_heap(&suggested_range)
+            {
+                // A genuine `MAP_FIXED` request landing exactly on the shared kernel heap's own
+                // live mapping cannot be relocated (that is what `Replace` means) and must never
+                // be allowed to silently commit into another subsystem's live section -- fail
+                // loudly rather than corrupt it. Astronomically rare in practice (would need a
+                // guest fixed-address load to exactly hit this process's own OS-chosen fallback
+                // address), unlike the `Hint`-mode case above.
                 return Err(AllocationError::AddressInUse);
             } else if fixed_address_behavior == FixedAddressBehavior::Replace
                 && {
@@ -10328,6 +10343,43 @@ fn shared_heap_cursor() -> &'static core::sync::atomic::AtomicUsize {
 /// address-consistent with siblings that landed at the fixed base.
 static SHARED_KERNEL_HEAP_ACTUAL_BASE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// The host address range this process's own mapping of the shared kernel heap section
+/// currently occupies, or `None` before [`init_shared_kernel_heap`] has run.
+///
+/// Root-caused 44th-pass-follow-up (2026-09-22): when [`init_shared_kernel_heap`]'s fixed
+/// placement at [`SHARED_KERNEL_HEAP_BASE`] fails and it falls back to an OS-chosen address (see
+/// that function's own `landed != SHARED_KERNEL_HEAP_BASE` branch), the resulting view is a
+/// `SEC_RESERVE` section -- real Windows state `MEM_RESERVE`, never `MEM_COMMIT` -- landing
+/// (confirmed live, `.wfgy/de_only_pass44_run2.log`) in the SAME general high-canonical-address
+/// band (`0x7fef...`) `get_unmmaped_area`'s own top-down guest placement walk uses. Nothing
+/// previously made this range visible to `allocate_pages`'s collision checks: `has_committed_page`
+/// only flags `MEM_COMMIT` (not `MEM_RESERVE`), and the range was never registered in
+/// `CLAIMED_RANGES` via `claim_range`, so a `Hint`-mode guest allocation landing exactly on it hit
+/// neither guard, fell through to `allocate_pages`'s `MEM_RESERVE` branch ("the region is already
+/// reserved, we just need to commit it" -- an assumption only true for litebox's OWN prior
+/// `reserve_and_commit` reservations), and silently committed guest pages directly into the shared
+/// arena's own section reservation. A later guest `munmap`/`mprotect` on that same range then
+/// queries real Windows state that no longer matches either side's bookkeeping (observed:
+/// `mbi_state=MEM_FREE`), and `process_memory_range_by_regions`'s own `VirtualFree`/`VirtualProtect`
+/// call fails (`ERROR_INVALID_ADDRESS`, 487) -- surfacing as the `lib.rs:7396` panic. This helper
+/// closes the visibility gap at its source: every `allocate_pages` collision check below now also
+/// treats this range as permanently foreign, regardless of `MEM_COMMIT` vs `MEM_RESERVE`.
+fn shared_kernel_heap_occupied_range() -> Option<core::ops::Range<usize>> {
+    let base = SHARED_KERNEL_HEAP_ACTUAL_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        None
+    } else {
+        Some(base..base + SHARED_KERNEL_HEAP_SIZE)
+    }
+}
+
+/// True if `range` overlaps this process's own live mapping of the shared kernel heap section --
+/// see [`shared_kernel_heap_occupied_range`] for why this must be checked independently of
+/// `has_committed_page`/`find_foreign_claim`.
+fn overlaps_shared_kernel_heap(range: &core::ops::Range<usize>) -> bool {
+    shared_kernel_heap_occupied_range().is_some_and(|h| h.start < range.end && h.end > range.start)
+}
 
 /// Raw Win32 `HANDLE` value (as `usize`) of the section backing THIS process's shared-kernel-heap
 /// view -- either the section [`init_shared_kernel_heap`] created itself, or one inherited from a
