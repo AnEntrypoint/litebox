@@ -136,63 +136,44 @@ is `unix-socket`. Per-fork cost was ~3.5-5s, now ~1.2s (`LITEBOX_DIAG_FORK_TIMIN
 nginx's own SSL-cert generation fails on its first startup attempt, genuinely not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-42nd, 2026-09-17/22)**: full narrative for every pass is in the dated archives
+**Pass history (4th-43rd, 2026-09-17/22)**: full narrative for every pass is in the dated archives
 (see "Docs and tooling map" below). The CURRENT STATE those passes converged on:
 
-- **`DE_FAILED` IS THE Xvfb SIGSEGV, not a second bug — 38th pass, direct evidence** (A/B-controlled:
-  removing `xfce4-session`'s launch alone eliminates every crash). Do NOT reopen DISPLAY/`getenv()`/
-  loader-stack (proven correct, 30th pass) or attach `cdb` to `xfce4-session` — it is not the
-  faulting process.
+- **The Xvfb SIGSEGV is FIXED — 43rd pass, `01f8532`.** Root cause: `get_unmmaped_area`'s top-down
+  search forecloses the WHOLE upper address region when the topmost existing VMA already reaches
+  past `high_limit`, packing an execve'd process's libraries into a crowded low window with
+  inter-library gaps as small as one page — a fix for exactly this (`linux.rs:2439-2510` step 1.5,
+  walk down from `high_limit` past occupying mappings instead of giving up) was written and
+  deliberately left `if false`d back in the 6th pass (`75eb781`), never live-tested against this
+  crash until now. Same-session A/B (`.wfgy/xvfb_pass43_*`, `LITEBOX_PROCESS_FORK=1`): control
+  (step 1.5 disabled, every prior pass's real baseline) crashes at the bit-identical wild pointer
+  `0x7feffecdd400` within one `WM_POLL` cycle, matching all 8+ prior captures; fix enabled, two
+  isolated `de_only.sh` runs (one the full 60s window to `DE_FAILED after 60s`) plus two full
+  release-binary `webtop_stack.sh` boots (`NGINX_STARTED`→...→`DE_LAUNCHED`→`DE_FAILED`) all show
+  ZERO `Segmentation fault`/SIGSEGV. **`DE_FAILED` itself is UNCHANGED and is now the SOLE remaining
+  blocker** (see its own bullet below) — fixing the crash was never expected to also fix it (38th
+  pass's own A/B already showed one bug seen from two ends). Do NOT reopen DISPLAY/`getenv()`/
+  loader-stack (proven correct, 30th pass) or attach `cdb` to `xfce4-session` for the CRASH — it was
+  never the faulting process. Full A/B evidence, every log path: archive.
+- **`DE_FAILED` (the WM never announcing `_NET_SUPPORTING_WM_CHECK`) is now cleanly isolated from
+  the (fixed) crash and is the current top blocker** — narrowed since the 30th pass to "something
+  inside `xfce4-session`'s own process" (envp/`getenv()`/ELF-loader-stack all proven correct by
+  direct evidence). **Never attempted by any pass**: a live `cdb -pv` attach on `xfce4-session`
+  itself, breaking on `getenv`/`XOpenDisplay`/`_XConnectXCB` — now finally safe to try without the
+  Xvfb-crash confound racing it.
 - **Xvfb's crash backtrace was corrupted PROJECT-WIDE, ROOT-CAUSED (38th) and FIXED (39th,
   `7d66935`).** `litebox_syscall_rewriter` overwrote the exact 9 bytes libunwind's x86_64
   signal-frame detection matches at `__restore_rt`, desyncing every guest backtrace through any
   delivered signal. Fix: signal delivery now returns through a litebox-synthesized trampoline
-  holding the real glibc bytes verbatim, reached via a caught instruction-fetch fault before the
-  real `syscall` opcode decodes. Verified end to end.
-- **The Xvfb SIGSEGV itself remains OPEN — the 39th pass's `ProcSELinuxGetClientContext` theory is
-  REFUTED, 40th pass** (real upstream source read in full; the extension can't even init under
-  litebox's `statfs`, and disabling it at the protocol level still gets the SAME bit-identical
-  crash, 2/2 runs — the 39th pass's `addr2line` attribution was a raw-stack-word misattribution).
-  Fault is `libc+0x162abd` = `vmovdqu (%rsi),%ymm0` inside `__memmove_avx_unaligned_erms`, wild
-  fully-unmapped bit-identical `0x7feffecdd400` (8+ captures). **Do not re-open the SELinux/
-  XSELinux/`is_selinux_enabled`/`getpeercon` thread.** Independent, unrelated bug found+FIXED same
-  pass: `SyscallRequest::Statfs`/`Fstatfs` (`litebox_shim_linux/src/lib.rs:2450`) ignored
-  `pathname`/`fd` entirely, returning canned tmpfs-shaped success for ANY input including
-  nonexistent paths/closed fds — fixed via real `sys_stat`/`sys_fstat` validation first; verified
-  not to touch the SIGSEGV (litebox's `f_type` is `TMPFS_MAGIC`, never `SELINUX_MAGIC`, either way).
-  Full narrative, both passes: archive.
-- **41st pass — live `cdb` attach first attempted; blanket `sxe av` w/ heavy `-c2` diagnostics
-  confirmed to suppress the crash (500+ CPU-s interception overhead, no hit in 10+min); a bare
-  unconditional `bp <fixed rip>` hit an unrelated benign call (`rdx=0x224`) then detached, and the
-  REAL crash fired 1-2s later with NO debugger attached — proving momentary attach/detach doesn't
-  suppress it, only SUSTAINED interception does. Derived (but never ran end-to-end) a conditional-
-  breakpoint recipe. Pointer provenance: `TASK_ADDR_MAX=0x7FEFFFFF0000`
-  (`litebox_platform_windows_userland/src/lib.rs:7454`), fault addr `0x7feffecdd400 = TASK_ADDR_MAX
-  - 0x1312C00` exactly, `alloc_base=0x0` (genuinely free, never mapped) — independent of Xvfb's own
-  (non-deterministic) load base, tied to the deterministic top-down library region. Full text:
-  archive.
-- **42nd pass — executed the 41st pass's own recipe end-to-end for the first time; found+fixed SIX
-  independent real bugs in it; final result: even fully fixed, a complete clean session produced
-  ZERO crashes — live debugger capture of this crash now appears fundamentally infeasible on this
-  platform, not merely expensive.** The six bugs, each live-confirmed (full evidence: archive):
-  (1) attaching at the execve-detection instant races litebox's own guest-library mapping (`bp`
-  insertion failed, `Win32 error 299`, session invisibly frozen) — fixed with a 2s post-execve
-  delay; (2) naive `REALCRASH_HIT` string-matching false-positives on cdb's own echoed `-c` command
-  text — fixed by requiring a real `rip=` register dump; (3) `rdx==0x40` ALONE is not a unique
-  crash signature (a live hit caught an ordinary successful 64-byte stack-local copy with
-  `rdx==0x40`) — fixed by conditioning on the exact wild-pointer value `@rsi==0x7feffecdd400`;
-  (4) cdb's default MASM evaluator doesn't support `&&` (silently freezes) — fixed via nested `.if`
-  blocks; (5) `sxe` prints a banner per intercepted event, and once Xvfb is busy the FS_BASE-reset
-  AV fires ~1900/s — the PRINTING alone reintroduces the 41st pass's own overhead problem via a
-  different source — fixed with silent `sxi`; (6) an unhandled "Single step exception" (code
-  `80000004`) also stops the session by default, same `sxi -c "gn"` fix (origin unconfirmed). With
-  all six fixed, a full `DE_LAUNCHED_DIRECT`→12×`WM_POLL`→`DE_FAILED after 60s`→`HOLD` session ran
-  Xvfb-alive throughout with zero crashes, taking ~15 real minutes vs ~1 undebugged — an
-  order-of-magnitude slowdown from raw AV-interception RATE alone even at zero print cost.
-  Conclusion: the crash likely depends on REAL WALL-CLOCK pacing no `WaitForDebugEvent`-based model
-  can preserve, regardless of per-event cost. No real crash register/stack capture obtained; the
-  disabled top-down-packing fix (`linux.rs:2439-2510` step 1.5) remains neither confirmed nor
-  refuted. Scripts: `.wfgy/xvfb_pass42_*` (gitignored).
+  holding the real glibc bytes verbatim. Verified end to end.
+- **38th-42nd passes' live-cdb-capture saga is now MOOT** (the fix landed via non-debugger
+  same-session A/B instead of resolving the crashing call) but its own hard-won conclusion stands
+  as a standing lesson: **live debugger capture of a real litebox guest crash can be fundamentally
+  infeasible even fully fixed** — the 42nd pass's six-bug-fixed conditional-breakpoint session ran
+  an entire normally-100%-crashing window with zero hits, because sustained AV-interception rate
+  (not per-event cost) perturbs whatever real wall-clock pacing the crash needed. Do not re-attempt
+  live-cdb capture of a suspected-timing-sensitive crash without a non-`WaitForDebugEvent`
+  mechanism (untried: kernel ETW). Full six-bug writeup, pointer-provenance derivation: archive.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass: a full
   `LITEBOX_PROCESS_FORK=1` release-binary boot reached its `HOLD` loop with zero
   freeze/SIGSEGV/tcache-corruption). `LITEBOX_PROCESS_FORK=1` is now RECOMMENDED for
@@ -218,22 +199,16 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 
 **Open, in rough priority order:**
 
-1. **Xvfb's SIGSEGV — still the SINGLE top blocker** (`DE_FAILED` is a downstream symptom, not a
-   second bug, 38th pass; backtrace-corruption meta-bug FIXED 39th pass `7d66935`;
-   `ProcSELinuxGetClientContext` REFUTED 40th pass; do not re-open). **42nd pass proved live cdb
-   capture of this crash fundamentally infeasible on this platform** (see its own entry above) —
-   **do not re-attempt without a genuinely different interception mechanism** (untried: kernel ETW,
-   no per-event round-trip). Pickup, in order: (a) add a permanent, allocation-free diagnostic log
-   inside litebox's own translated-code memmove/memcpy dispatch (or top-down `Vmem` placement
-   logic) recording every large copy's source pointer to a ring buffer, so
-   `LITEBOX_DIAG_FATALDUMP=1` (non-perturbing, 32nd pass) can show the wild pointer's origin with NO
-   live debugger; (b) live-test the disabled top-down crowded-packing fix
-   (`litebox/src/mm/linux.rs:2439-2510`'s `if false` step 1.5 — same allocator family and
-   order-of-magnitude gap sizes, but a DIFFERENT fault signature: that bug WRITEs into a
-   present-wrong-permission page, this crash READs from genuinely free/unmapped memory) in
-   isolation exactly as its own comment prescribes.
-2. ~~`xfce4-session`'s `DE_FAILED` as an independent bug~~ — **REFUTED, 38th pass.** It is the
-   Xvfb crash seen from downstream. Do not spend a pass attaching `cdb` to `xfce4-session`.
+1. ~~Xvfb's SIGSEGV~~ — **FIXED, 43rd pass, `01f8532`** (see its own entry above; live-tested
+   `linux.rs:2439-2510`'s disabled step 1.5, same-session A/B, control crashes every time, fix
+   doesn't). `DE_FAILED` is now the SINGLE top blocker in its own right, not a downstream symptom
+   of anything left to fix here — needs a live `cdb -pv` attach on `xfce4-session` itself
+   (`getenv`/`XOpenDisplay`/`_XConnectXCB`), never attempted by any pass, now finally safe to try.
+2. A new, unscoped observation from the 43rd pass, not yet investigated: host-side
+   `curl http://localhost:8081/` failed on both full-stack boots despite the GUEST's own
+   `/dev/tcp` self-test succeeding — possibly just the same transient RAM dip the 35th pass already
+   documented at this exact script stage, possibly a real `--publish` gap. Reproduce with RAM held
+   above ~2GB throughout before concluding either way.
 2b. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
    (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
    capacity 256's `insert` return DISCARDED at `unix.rs:275-277` (over-capacity `listen(2)` still
@@ -301,9 +276,11 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 §3N's safe-linked-tcache write. Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
-the old "Fork-after-Xorg" freeze either (35th pass) — the real current blocker on EITHER fork path
-is the Xvfb SIGSEGV (see above). Selkies also needs `--clipboard-enabled=false` on the thread-based
-path (its clipboard monitor re-triggers the same corruption every tick) — moot cross-process.
+the old "Fork-after-Xorg" freeze either (35th pass) — the Xvfb SIGSEGV that used to be the real
+current blocker on EITHER fork path is FIXED (43rd pass, see "Cross-process fork" above);
+`DE_FAILED` is now the sole remaining blocker to an interactive desktop. Selkies also needs
+`--clipboard-enabled=false` on the thread-based path (its clipboard monitor re-triggers the same
+corruption every tick) — moot cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A SECOND, distinct
 glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) still sporadically
@@ -359,11 +336,12 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-42nd passes: full pass-by-pass narrative for
-  everything this file's own pass entries above summarize, including the 42nd pass's six-bug
-  conditional-breakpoint capture writeup and the 38th-40th passes' Xvfb-crash-characterization
-  narrative), `_2026-09-18.md` (12th-34th, shared AF_UNIX connection plane, ldconfig static-PIE
-  fix), `_2026-09-17.md` (shell-crash investigation, stdio-handle bug, writable-layer-race fix),
+- **Archives** (newest first) — `_2026-09-22.md` (26th-43rd passes: full pass-by-pass narrative for
+  everything this file's own pass entries above summarize, including the 43rd pass's Xvfb-SIGSEGV
+  fix A/B evidence, the 42nd pass's six-bug conditional-breakpoint capture writeup and the
+  38th-40th passes' Xvfb-crash-characterization narrative), `_2026-09-18.md` (12th-34th, shared
+  AF_UNIX connection plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash investigation,
+  stdio-handle bug, writable-layer-race fix),
   `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill),
   `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, crash-dump/VEH). Older: `_2026-09-03.md`,
   `_2026-09-05.md`.

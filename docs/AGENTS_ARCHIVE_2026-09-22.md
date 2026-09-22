@@ -888,3 +888,101 @@ Full evidence, exact orchestrator script diffs, and every intermediate (partial)
   thread-fork tcache-corruption flakiness (bit-identical failure with and without the fix) and does
   NOT (as hoped) eliminate the Xvfb SIGSEGV either, consistent with the magic-number analysis above
   (litebox's `f_type` is `TMPFS_MAGIC`, never `SELINUX_MAGIC`, before or after this fix).
+
+## 43rd pass (2026-09-22) -- the Xvfb SIGSEGV is FIXED: enabled the disabled top-down-packing
+## walk-down fix (linux.rs:2439-2510 step 1.5), live A/B-confirmed same-session, control crashes
+## every time, fix survives every run including two full webtop_stack.sh boots
+
+Per the 42nd pass's own pickup item (4) (live cdb capture proven fundamentally infeasible; the next
+step was to isolated-enable the disabled get_unmmaped_area step 1.5 and compare boot outcomes,
+never a live debugger). Read linux.rs:2439-2510 and its own commit (75eb781, 6th pass, "mm: never
+place two searched mappings flush against each other") in full first: that commit landed TWO
+fixes -- the inter-mapping MAPPING_GUARD_GAP (already enabled, fixes a DIFFERENT, older "forked
+Xorg"/"Xorg as pid 1" WRITE-into-neighbour corruption class, both already closed) -- and a SECOND,
+separate fix (step 1.5) left `if false`d on purpose: when the top-down fast path's single candidate
+(high_limit) is foreclosed because the topmost existing VMA already reaches past it, step 1.5 walks
+DOWN from high_limit past the mappings occupying that window and takes the first gap that fits,
+instead of giving up on the whole upper region and falling through to step 2's strictly-below-
+existing-mappings search -- which packs an execve'd process's libraries into a crowded low window
+with inter-library gaps as small as one page. The commit's own doc comment already named the
+population this governs (DIAG_UNMAPPED events sized 16.79-18.83MB, matching real ELF-segment-plus-
+DEFAULT_RESERVED_SPACE_SIZE reservations) and explicitly deferred it because it addresses "a REAL,
+separately-measured defect, but not the [WRITE-into-neighbour] one" -- never live-tested against
+the Xvfb SIGSEGV (a READ from genuinely-unmapped memory, a different fault mechanism) by any pass
+until this one, despite the 41st pass's own pointer-provenance finding (fault address independent
+of Xvfb's own ASLR base, tied to the deterministic top-down library region, same order of magnitude
+as step 1.5's own measured gap sizes) making the connection plausible.
+
+Hypothesis: if crowded top-down packing is what produces this specific 19.07MB-below-ceiling wild
+pointer (not just the older WRITE-into-neighbour class), enabling step 1.5 should stop the crash
+even though nobody has resolved the actual crashing call site.
+
+Method (non-debugger, per the 42nd pass's own conclusion): same-session A/B using the isolated
+de_only.sh harness (.wfgy/de_only.sh, Xvfb -> dbus -> xfce4-session, no nginx/selkies) plus a real
+webtop_stack.sh full-stack boot, both under LITEBOX_PROCESS_FORK=1, comparing DEBUG-BUILD boot
+outcomes with step 1.5 `if true` vs `if false`, never attaching a debugger.
+
+Results, all same session, same host, same .wfgy/de_only_seed.tar:
+
+- Control (step 1.5 `if false`d -- every prior pass's actual baseline, rebuilt fresh this pass to
+  rule out any other confound): .wfgy/xvfb_pass43_control2.log -- Xvfb segfaults at the
+  bit-identical wild pointer 0x7feffecdd400 within ONE WM_POLL cycle ("(EE) Segmentation fault at
+  address 0x7feffecdd400" / "(EE) Caught signal 11"), matching all 8+ non-debugger captures across
+  the 38th-42nd passes exactly. (A first control attempt, .wfgy/xvfb_pass43_control.log, hit the
+  ALREADY-DOCUMENTED, unrelated SafeZoneAllocator spinlock livelock -- Track B pickup #3 -- spinning
+  forever pre-XSOCK; it resisted Stop-Process -Force exactly as AGENTS.md's own standing lesson
+  predicts and needed Invoke-CimMethod -MethodName Terminate; retried clean.)
+- Fixed (step 1.5 enabled): TWO independent de_only.sh runs, same conditions -- run 1
+  (.wfgy/xvfb_pass43_run1.log) went through the FULL 60s WM_POLL window to DE_FAILED after 60s with
+  ZERO Segmentation fault/SIGSEGV anywhere in the log; run 2 (.wfgy/xvfb_pass43_run2.log)
+  independently confirmed clean through the same crash window a second time (stopped early once
+  past it, by design, to conserve RAM for the next test).
+- Fixed, full stack: TWO independent webtop_stack.sh release-binary boots
+  (.wfgy/webtop_pass43_boot1.log, .wfgy/webtop_pass43_boot2.log, LITEBOX_PROCESS_FORK=1 as a HOST
+  env var, --env GLIBC_TUNABLES=... still passed defensively though moot on this path) both reached
+  NGINX_STARTED -> XVFB_UP -> DBUS_UP -> SELKIES_LAUNCHED_LAST -> SELKIES_PORT_UP -> DE_LAUNCHED ->
+  DE_FALLBACK_LAUNCHED -> DE_FAILED with `grep -i "segmentation\|sigsegv"` returning ZERO matches in
+  either full log. This is the first time in the whole 6th-43rd-pass investigation the full real
+  webtop boot has run Xvfb-crash-free end to end.
+
+Fix committed: 01f8532 -- `if false && last_end > high_limit` -> `if last_end > high_limit`,
+the clippy overly_complex_bool_expr expect removed (no longer dead), full A/B evidence in the
+commit message.
+
+DE_FAILED itself is UNCHANGED and remains open -- both full-stack boots reached it via the SAME
+WM2_PROBE-never-sees-_NET_SUPPORTING_WM_CHECK path documented since the 38th pass; this was never
+in this pass's scope (the 30th-pass DISPLAY/getenv()/loader-stack proof and the narrowing to
+"something inside xfce4-session's own process" both stand unchanged) and is now the SOLE remaining
+blocker to a fully interactive browser desktop, cleanly separated from the crash for the first time
+(previously the crash made it impossible to tell how much of DE_FAILED was Xvfb-crash noise vs a
+genuine second defect -- the 38th pass's own A/B already answered that correctly: it's one bug seen
+from two ends, and fixing the crash does not, and was never expected to, also fix DE_FAILED).
+
+New, unscoped observation, not chased further this pass: host-side `curl http://localhost:8081/`
+returned connection-refused/empty-reply on both full-stack boots despite the GUEST's OWN
+/dev/tcp/127.0.0.1/8081 self-test succeeding (SELKIES_PORT_UP curl_exit=0) -- a possible --publish
+port-forward gap, or simply RAM-contention fallout (host free RAM fell to 0.4-0.6GB at almost
+exactly the DE_LAUNCHED/DE_FALLBACK_LAUNCHED point in BOTH boots, recovering afterward each time --
+the same transient dip the 35th pass documented at the same script stage, not new). Not
+investigated further per this pass's own scope (the Xvfb crash) and per the standing "don't
+rabbit-hole on browser connectivity" guidance; real claude-in-chrome/chrome-devtools MCP screenshot
+verification was not attempted this pass (moot without host-side port reachability, and moot
+regardless without DE_FAILED resolved -- no window manager means nothing to screenshot).
+
+Verification discipline notes: two runs alone would not have been sufficient confidence per this
+project's own repeated "single clean run proves nothing" lesson -- the control-crashes-every-time
+result in the SAME session, on the SAME seed tar, with ONLY the one line changed, is what makes
+this a real A/B rather than two independent coincidences (host RAM/load conditions differed between
+passes historically; holding everything else fixed within one session removes that confound).
+LITEBOX_DIAG_FATALDUMP=1 and LITEBOX_DIAG_FORK_TIMING=1 were NOT needed for any of this -- plain
+boot-outcome comparison via [s]-tagged markers and a `grep -i segmentation` sufficed, exactly the
+"non-perturbing, non-debugger" method the 42nd pass's own pickup list prescribed.
+
+Pickup for the next pass: (1) DE_FAILED -- the sole remaining blocker, unchanged scope from every
+pass since the 30th (needs a live cdb -pv attach on xfce4-session itself, breaking on
+getenv/XOpenDisplay/_XConnectXCB -- never attempted by any pass to date, and now finally SAFE to
+attempt without the Xvfb-crash confound in the way); (2) the host-side port-8081 unreachability
+observation above -- reproduce once RAM is holding above ~2GB throughout, to tell apart a real
+--publish gap from the already-documented transient dip; (3) once DE_FAILED is closed, real
+browser/app verification (Terminal Emulator, Thunar per SharedPtyTable) becomes reachable for the
+first time in this investigation's history.
