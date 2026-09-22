@@ -128,7 +128,7 @@ is `unix-socket`. Per-fork cost was ~3.5-5s, now ~1.2s (`LITEBOX_DIAG_FORK_TIMIN
 nginx's own SSL-cert generation fails on its first startup attempt, genuinely not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-46th, 2026-09-17/22)**: full narrative for every pass is in the dated archives
+**Pass history (4th-47th, 2026-09-17/22)**: full narrative for every pass is in the dated archives
 (see "Docs and tooling map" below). The CURRENT STATE those passes converged on:
 
 - **The ORIGINAL Xvfb SIGSEGV is FIXED — 43rd pass, `01f8532`** (`get_unmmaped_area`'s top-down
@@ -156,51 +156,56 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   proved a separate Windows fork child opening `/dev/pts/<id>` fresh post-`fork()`). Mechanism:
   "Shared-memory foundations" below.
 - **44th-45th passes (2026-09-22)** — `xfce4-session` reached real pre-session setup for the first
-  time (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`) after two D-Bus/fd-carrying fixes, then hit a
-  second Xvfb SIGSEGV (`0x4000400`, same signature as the 43rd-pass-fixed crash) before `xfwm4`.
-  45th pass fixed two real host-process bugs (`5d63ec6`, `32dd3d5`) chasing a SEPARATE host-process
-  Rust panic hit in the same logs (`lib.rs:7396`, see next bullet) but left it only partially fixed,
-  RAM contention blocked further live verification that pass. Full narrative: archive.
+  time (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`), then hit a second Xvfb SIGSEGV (`0x4000400`,
+  same signature as the 43rd-pass-fixed crash) before `xfwm4`. 45th pass fixed two real host-process
+  bugs (`5d63ec6`, `32dd3d5`) chasing a separate host-process panic (`lib.rs:7396`, next bullet).
+  Full narrative: archive.
 - **The `lib.rs:7396` host-process panic (`process_memory_range_by_regions`'s `assert!`) is FIXED —
-  46th pass, `c5a8884`.** Third mechanism: `Vmem::new_adopting_existing_memory`
-  (`litebox/src/mm/linux.rs`) adopted `PROT_NONE` (no `VM_READ`/`VM_WRITE`/`VM_EXEC`) regions into a
-  cross-process fork child's `vmas`, even though `litebox_shim_linux::syscalls::process::do_clone`'s
-  OWN copy-plan loop (the real production group-builder — NOT this crate's `Vmem::duplicate`, whose
-  own grouping is diagnostic-only and was a dead end this pass spent real time on first) explicitly
-  excludes `PROT_NONE` regions from every copy group by design ("has no bytes anyone can legitimately
-  read, so it has nothing to copy"). Live diagnostic (`LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP=1`)
-  confirmed the crashing span `0x7fef60030000-0x7fef64000000` matches exactly: a small `flags=0x73`
-  (RW) head immediately followed by a `flags=0x70` (`PROT_NONE`) tail, `covered_by_group=false`, a
-  glibc-arena-shaped reserve-then-grow region. Same fix shape as the 45th pass's `VM_SHARED` skip:
-  excluded from adoption entirely (`flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty()`), so a
-  later guest touch faults honestly and teardown finds nothing tracked to route into a real Windows
-  call. **Live-verified: 0 panics across 5 post-fix `de_only.sh` boots** (`LITEBOX_PROCESS_FORK=1`,
-  `.wfgy/de_only_pass46_run{8,9,10,11}.log` + one `LITEBOX_DIAG_FATALDUMP=1` run), vs. a reliable
-  per-boot crash before. Diagnostic pitfall worth recording: a cross-process fork CHILD re-execs this
-  binary but takes `main()`'s `is_diagnostic_resume_child()` branch and NEVER reaches `run()` — a
-  runtime toggle wired only at the top of `run()` (`set_mapping_guard_gap_disabled`'s own placement)
-  silently never takes effect in any fork descendant.
-- **The SECOND Xvfb SIGSEGV is CONFIRMED STILL PRESENT, clean sample untainted by the panic above:
-  4 of 5 post-fix boots crash, bit-identical fault address `0x37f0400` every time** (vs. the
-  44th-45th passes' `0x4000400` — same crash FAMILY, different wild pointer, consistent with a
-  genuinely stale value rather than a fixed offset). `LITEBOX_DIAG_FATALDUMP=1` (no debugger) DOES
-  capture this crash cleanly without suppressing it (2 of 3 attempts still crashed under it) —
-  genuine new evidence, never obtained by any prior pass: `rip=0x7fefedeababd` (inside Xvfb/libc,
-  NOT the corrupted-backtrace address), instruction bytes `c5 fe 6f 06` = `vmovdqu ymm0, [rsi]`
-  (AVX 32-byte load), `rsi=0x37f0400` (wild source pointer), `rdx=0x40` (64-byte copy length),
-  `rdi=0x9c11572b38` (destination, same `0x9c1...`-prefixed coordinate space as the corrupted
-  backtrace frame — thread-fork-verification address translation, not raw guest coordinates) —
-  `.wfgy/de_only_pass46_fataldump2.log` around `Segmentation fault at address 0x37f0400`. Matches
-  the ORIGINAL (43rd-pass-fixed) crash's own characterization exactly (glibc AVX memcpy/memmove
-  from a wild, unmapped pointer) — almost certainly the SAME defect class via a different trigger.
-  **Pickup**: (1) disassemble Xvfb/glibc around `rip=0x7fefedeababd` to find where `rsi` was loaded
-  from — the prior blocker ("exact Xvfb call site emitting the bad pointer still OPEN") is now
-  unblocked by a real, repeatable, non-debugger capture method (`LITEBOX_DIAG_FATALDUMP=1` does NOT
-  reliably suppress the crash — the 38th-42nd passes' infeasibility finding was specifically about
-  `cdb`/`WaitForDebugEvent`, not this VEH-based capture); (2) one `LITEBOX_DIAG_FATALDUMP=1` run
-  reached `DE_FAILED` with ZERO crash AND zero `[xvfb]`/`[de2]` piped output (both processes ran,
-  stderr never reached the parent log) — unexplored, possibly relevant to `DE_FAILED` occurring
-  independently of this crash. No run reached a working WM; no browser/app verification attempted.
+  46th pass, `c5a8884`.** `Vmem::new_adopting_existing_memory` (`litebox/src/mm/linux.rs`) adopted
+  `PROT_NONE` regions into a cross-process fork child's `vmas` even though `do_clone`'s own
+  copy-plan loop already excludes them from every copy group by design — a later guest
+  `munmap`/`mprotect` on the untracked-but-adopted region routed into a real `VirtualFree` call
+  against memory the child never committed. Same fix shape as the 45th pass's `VM_SHARED` skip:
+  excluded from adoption entirely. **Live-verified: 0 panics across 5 post-fix boots.** Diagnostic
+  pitfall worth recording: a cross-process fork CHILD re-execs this binary but takes `main()`'s
+  `is_diagnostic_resume_child()` branch and NEVER reaches `run()` — a runtime toggle wired only at
+  the top of `run()` silently never takes effect in any fork descendant.
+- **The SECOND Xvfb SIGSEGV (`0x37f0400`) — disassembled for real, 47th pass, 2026-09-22.**
+  `rip=0x7fefedeababd` resolves byte-exact (unique in the file) to libc.so.6 file offset
+  `0x162abd` — glibc's ordinary 33-64-byte `memmove`/`memcpy` path, not the large/prefetch-loop
+  copy the raw address arithmetic first suggested (that was a wrong bias guess trusting
+  `VirtualQuery`'s `AllocationBase` verbatim instead of re-deriving the offset from the crash
+  page's own raw byte window) — a ubiquitous small-struct-copy site, not attributable to one
+  caller without DWARF (libc6 build-id `c495b62edadd6c356265942ec1282d98058a7b41`, confirmed
+  absent from Debian's/Ubuntu's debuginfod, 18th pass). The 46th pass's `rdi=0x9c1...`
+  "thread-fork-verification address translation" theory is REFUTED — the SAME capture's own
+  `reverse_translate_and_read_for_diagnostics` line already said "no reverse translation found";
+  `0x9c1...` is an ordinary high guest heap/mmap address, unrelated to `fork_verify`.
+  **Real bug found instead, live-reproduced in the SAME boot as a `0x37f0400` SIGSEGV**
+  (`.wfgy/de_only_investigate_run1.log`): a reproducible
+  `buddy_system_allocator-0.11.0/src/lib.rs:165` panic ("index out of bounds: the len is 34 but
+  the index is 53") on several unrelated host threads. `34` is `SafeZoneAllocator`'s own `ORDER`;
+  `53` is not a `Heap::free_list` class any real `Layout` reaching this allocator can produce —
+  `Heap`'s own internal `spin::Mutex`-protected `free_list` was corrupted by a thread interrupted
+  mid-mutation, the EXACT failure mode `slab_allocator_code_addrs` already root-caused+fixed for
+  `slabmalloc::ZoneAllocator` — but `rip_in_global_allocator` never got a matching anchor for
+  `buddy_system_allocator`'s OWN out-of-line `Heap::alloc`/`dealloc` (a SEPARATE `spin::Mutex`
+  from `SafeZoneAllocator`'s own). **FIXED, `c79625f`**:
+  `litebox::mm::allocator::buddy_allocator_code_addrs::<ORDER>()` adds `Heap::<ORDER>::alloc`/
+  `dealloc` and `LockedHeapWithRescue<ORDER>`'s `GlobalAlloc` wrappers as anchors. Confirmed real,
+  independently live (corrupted process-wide Rust allocator state) — **not yet proven to be THE
+  SIGSEGV cause**: the post-fix 6-boot verification batch was killed mid-first-run by a host-RAM
+  pressure reap (environmental — `FreePhysicalMemory` recovered to 6.5GB within a minute, not a
+  result, explicitly not to be retried automatically per the reaper's own note). The one partial
+  post-fix run reached `DE_LAUNCHED_DIRECT` cleanly, zero crash/panic, before being killed — not a
+  sample. Residual smaller gap, not yet fixed: `SafeZoneAllocator::new`'s inline OOM `rescue`
+  closure is its own function, not yet an anchor (lower priority, not the path the reproduced
+  panic hit). **Pickup**: re-run `.wfgy/de_only_postfix_batch.ps1` (already written) via `Bash
+  run_in_background` running `powershell.exe -File` DIRECTLY, never `Start-Job` from a separate
+  `PowerShell` tool call (jobs don't survive past that call's own process exit, hit live this
+  pass) once RAM is confirmed quiet; if `0x37f0400` stops recurring, push through to
+  `xfwm4`/`_NET_SUPPORTING_WM_CHECK` and real browser/app verification — no run has reached a
+  working WM yet.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
