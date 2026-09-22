@@ -154,152 +154,38 @@ identical invocation shape — narrowing the failure to something inside `xfce4-
 process. Full narrative, every repro command, every ruled-out alternative for all four passes:
 archive.
 
-**Thirtieth pass (2026-09-21) — the DISPLAY/getenv hypothesis DEFINITIVELY REFUTED with direct
-live evidence; one real POSIX errno-contract bug found+FIXED in the AF_UNIX cross-process connect
-path; a NEW, likely-more-fundamental lead found: Xvfb itself SIGABRTs deterministically ~190-197s
-into every full boot.** Built an LD_PRELOAD interposer (`getenv_probe.so`, host-cross-compiled via
-`clang --target=x86_64-unknown-linux-gnu -shared -fPIC -nostdlib
--Wl,--unresolved-symbols=ignore-all`, no sysroot needed) that overrides `getenv()` process-wide and
-logs every call (name + real result, read directly from `environ`) to `/tmp/getenv_trace.log`,
-injected via `LD_PRELOAD=/tmp/getenv_probe.so` exported near the top of `webtop_stack.sh` (so every
-process forked after `export DISPLAY=:1` loads it). Live result: 19
-separate `GETENV query name=DISPLAY` calls across the full boot, ALL returning `result=[:1]`,
-including two complete `GDK_BACKEND` → `WAYLAND_DISPLAY` → `DISPLAY` backend-probe sequences (real
-GDK/GTK backend-selection logic, matching xfce4-session's own process count — one per launch
-attempt) — `getenv(DISPLAY)` is proven correct at every single call site, including deep inside
-GDK. This closes the DISPLAY/`getenv()`/`environ` line of investigation for good; do not re-open it
-without new information. Enabling `litebox_shim_linux::syscalls::unix=debug` on the same boot then
-found the real mechanism: `[unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT
-guest pid` fires repeatedly during the `xfce4-session` launch window, and tracing
-`connect_cross_process` end to end showed BOTH real bugs it masks. (1) **FIXED**: a non-blocking
-AF_UNIX `connect()` that has not yet been claimed by the listener's `accept()` loop surfaced
-`Errno::EAGAIN` (via the blanket `TryOpError::TryAgain -> Errno::EAGAIN` conversion in
-`litebox_common_linux/src/errno/mod.rs`) instead of the POSIX-mandated `EINPROGRESS` — the exact
-signal real client libraries (libdbus among them) branch on to mean "poll for writability, this is
-not a failure"; `litebox_shim_linux::syscalls::net::connect` already carries the identical
-`TryAgain -> EINPROGRESS` override for the analogous TCP path, so this mirrors an already-proven
-pattern. Fixed in both `UnixStream::connect` and `UnixStream::connect_cross_process`
-(`litebox_shim_linux/src/syscalls/unix.rs`), live-verified: the boot's own new
-"request not yet claimed (non-blocking) ... returning EINPROGRESS" log line fires as designed, and
-a live `connect_cross_process` outcome tally on the post-fix boot showed 22 posted / 20 completed /
-2 EINPROGRESS / 0 timeouts / 0 hard failures — materially cleaner than the pre-fix boot's outright
-failure on the same call shape. (2) **NOT yet fixed, precisely scoped**: that same branch also
-unconditionally cancels the just-posted `SharedUnixConnectQueue` request on a non-blocking
-not-yet-ready outcome, so a connection attempt that does not complete synchronously within the one
-syscall can never complete later no matter how long the caller polls — needs a
-`UnixStreamState::Connecting(request_idx)`-shaped state so a repeat `connect()`/poll on the same fd
-reattaches to the SAME pending request instead of abandoning it; left as its own scoped follow-up
-rather than risked half-implemented. **DE_FAILED still fires after fix (1) alone** — expected, since
-fix (2) is unresolved and a wholly separate, likely more fundamental issue was found: `Xvfb` itself
-hits a real SIGABRT at ≈190-197s into every full boot — see the thirty-first pass immediately below
-for its REAL abort text (caught live for the first time) and root mechanism.
+**Passes 30-33 (2026-09-21/22), all FIXED/REFUTED, live-verified — full narrative:
+`docs/AGENTS_ARCHIVE_2026-09-18.md`.** DISPLAY/`getenv()`/`environ` REFUTED FOR GOOD as the
+`DE_FAILED` cause (LD_PRELOAD interposer, 19/19 real calls across a full boot returned the correct
+`:1`, including inside GDK's own backend probe). AF_UNIX `connect_cross_process`'s
+`EAGAIN`→`EINPROGRESS` errno-contract bug found+FIXED (mirrors the TCP path's existing override); a
+second, related `SharedUnixConnectQueue` cancel-on-non-blocking gap found, scoped, left open
+(`UnixStreamState::Connecting(request_idx)` needed). **Xvfb's own real crash root-caused**: a
+SEPARATE, deterministic SIGSEGV ~190-207s into every full boot (not the `DE_FAILED` cause) — glibc's
+AVX2 memcpy/memmove reading 64+ bytes from a wild, fully-unmapped pointer
+(`0x7feffecdd400 == TASK_ADDR_MAX - 0x1312C00`, bit-identical `rip`/fault-address across boots);
+`cdb` attach REFUTED as a capture method (perturbs the exact X11-traffic race the crash needs) —
+use `LITEBOX_DIAG_FATALDUMP=1` (no debugger) instead; exact Xvfb call site emitting the bad pointer
+still OPEN (needs real CFI-based unwinding or upstream Xvfb/glibc source cross-reference).
+`ldconfig`/any static-PIE binary's double-relocation SIGSEGV root-caused+FIXED (`84a98bf`):
+`ElfLoader::load` was still applying `R_X86_64_RELATIVE`/RELR relocations itself for a no-`PT_INTERP`
+`ET_DYN` binary on top of static-PIE's own glibc/musl self-relocation, corrupting every RELR-covered
+pointer to ~2x its value — fixed by never applying loader-side relocations to the main executable,
+matching real kernel `binfmt_elf.c` behavior. `xfce4-session`'s own `Cannot open display: .` at
+`DE_FAILED` remains OPEN, narrowed to "something inside `xfce4-session`'s own process" (envp/
+`getenv()`/loader-stack all proven correct by direct evidence) — **current top blocker to the
+browser/apps milestone, alongside the still-open Xvfb call site** — needs a live `cdb` attach on
+`xfce4-session` itself (breaking on `getenv`/`XOpenDisplay`/`_XConnectXCB`), never yet attempted by
+any pass, only once host RAM is genuinely quiet (6+ GB free, no heavy unrelated host load — three
+33rd-pass attempts and one 34th-pass attempt at 1.6-4GB free all died pre-Xvfb to the SAME
+already-documented thread-fork tcache corruption class before ever reaching `xfce4-session`).
 
-**Thirty-first pass (2026-09-21)** — Xvfb's real abort text caught live for the first time
-(`litebox_diag::stderr_capture` in `file.rs`'s `sys_write`): the SIGABRT chased since the
-thirtieth pass is the TAIL of Xorg's own crash handler after a real SIGSEGV(11), guest address
-`0x7feffecdd400`, bit-identical across boots. A live `cdb` attach caught an access violation
-(`sub rax, fs:[0x28]`) but it was a SEPARATE, already-handled "FS_BASE-reset" class (Windows
-clears FS_BASE on its own initiative, silently repaired by the existing VEH), firing 22s into
-Xvfb's life, not the real crash.
-
-**Thirty-second pass (2026-09-21) — cdb REFUTED as viable for this crash (attaching it starves
-the boot of the very X11 traffic the crash needs); a low-overhead in-process diagnostic caught
-the REAL fault clean, twice, with hardware ground truth; exact Xvfb call site still open.**
-Finishing the 31st pass's own cdb pickup (auto-continue via `gn` on every first-chance AV,
-`.wfgy/xvfb_live_cdb_orchestrator3.ps1`) worked exactly as scripted, but attaching cdb to Xvfb's
-own pid measurably perturbs it: two consecutive boots hit `XVFB_FAILED`/`DE_FAILED` immediately
-after attach (vs. clean boots with no debugger) — Windows freezes the whole debugged process
-during each first-chance-exception script (confirmed via `!analyze -v`'s own elapsed-time field),
-and the FS_BASE-reset class fires often enough that this loses the already-narrow `xset q`
-liveness race, which then starves `DE_LAUNCHED`'s own X11 traffic the crash is byte-volume-
-correlated with. **cdb is structurally unable to observe this bug.** Instead, broadened
-`litebox_platform_windows_userland/src/lib.rs`'s existing `diag_fataldump_enabled()` gate
-(`26fe95c`): it already did a full register/stack/code-bytes dump as a synchronous `eprintln!`
-inside the VEH handler (no debugger, no freeze), just gated to a small address-magnitude range
-from an unrelated older investigation — dropping that restriction (the real overhead guard,
-`faulting_instruction_has_fs_override`, is independent of address magnitude) let it also catch
-this crash. `LITEBOX_DIAG_FATALDUMP=1`, no debugger: two independent boots reached the real
-fault with `XVFB_UP`/`DBUS_UP`/`DE_LAUNCHED` all firing normally first, at ~207s into Xvfb's own
-life, bit-identical `rip=0x7fefede9dabd` and fault address `0x7feffecdd400` both times.
-Byte-matched (`objdump -d` against the same-BuildID runtime `libc.so.6`) to glibc's own AVX2
-memcpy/memmove multiarch routine (`vmovdqu (%rsi),%ymm0`, file offset `0x162abd`) reading 64+
-bytes from a source pointer that is COMPLETELY UNMAPPED on the host (`type=0x0 alloc_base=0x0`)
-— not FS_BASE-related (no `0x64` prefix), not a litebox transport bug (`SharedByteRing` re-read
-as sound), a genuine wild pointer Xvfb itself computed. `0x7feffecdd400` = `TASK_ADDR_MAX -
-0x1312C00`, exactly ~19.2MB below the top of the guest address space. Xorg's own self-printed
-backtrace was found NOT trustworthy past frame 0 (frames 1-9 of 13 fail `dladdr()` entirely; live
-evidence, don't re-trust `(EE) Backtrace:` addresses without cross-checking a real section
-table). Root cause of WHICH Xvfb call site feeds the bad pointer remains open — needs real
-CFI-based unwinding (no tool for this readily available this pass) or upstream Xvfb source
-cross-reference; full evidence, every ruled-out hypothesis, exact repro, and the flakiness
-profile (2 clean captures / 6 attempts, unrelated to the fix): archive.
-
-**Thirty-third pass (2026-09-22) — NEW, unrelated bug found+FIXED: `ldconfig` (and any other
-static-PIE binary) double-relocated and reliably SIGSEGVs, in total isolation, no fork/concurrency
-needed; the `Xvfb`-liveness-at-`DE_FAILED` question answered from existing log evidence, not
-re-verified live this pass (see why below).**
-
-`ldconfig` SIGSEGV (three separate hits in a real `debian-xfce` boot, `comm=ldconfig`, all
-`Signal(11)`) reproduces standalone: `litebox_runner...exe -Z --oci-image
-docker.io/linuxserver/webtop:debian-xfce -- /usr/sbin/ldconfig -p` SIGSEGVs 100% of the time with
-ZERO other guest processes alive — ruling out every fork/collision/concurrent-corruption hypothesis
-outright. `readelf -h` on the real cached binary: `Type: DYN`, `static-pie linked`, no `PT_INTERP`.
-Root cause: `litebox_shim_linux/src/loader/elf.rs`'s `ElfLoader::load` applied
-`R_X86_64_RELATIVE`/RELR relocations itself for any no-`PT_INTERP` `ET_DYN` (static-PIE) binary, on
-the premise (stated in its own prior comment) that this matches what the real kernel's
-`binfmt_elf.c` does. It does not — `binfmt_elf.c` never processes `PT_DYNAMIC` relocations for ANY
-ELF type; a static-PIE binary's OWN libc startup (glibc's `_dl_relocate_static_pie`, musl's
-`_dlstart_c`) unconditionally self-relocates before `main()`, precisely so it works under a kernel
-with zero relocation support, and has no way to detect a loader already did this for it. Litebox's
-extra pass double-applied the fixups: `apply_relr_relocations`'s formula adds `base_addr` to a
-slot's PRE-EXISTING content (RELR carries no explicit addend), so a second, redundant application
-adds `base_addr` again, corrupting every RELR-covered pointer to roughly double its correct value
-— confirmed via a live `LITEBOX_DIAG_FATALDUMP=1` VEH register capture: crash instruction `add
-(%rbx),%rdx` (bytes `48 03 13`), `rbx=0x2200f12a0` (unmapped, `alloc_base=0x0`) sitting almost
-exactly at 2×`r8`/`r11` (`0x1100f12a0`, itself base-address-shaped against `main_base=0x110000000`
-from the same boot's own `diag-elf-load` trace). Plain (non-RELR) `DT_RELA` fixups are idempotent
-under double application (same fixed `base+addend` formula, same target, both times), so this bug
-was silently latent — this is almost certainly the FIRST static-PIE binary using the modern
-RELR-compressed encoding this whole 32-pass investigation ever ran to this point (every previously-
-diagnosed binary was either dynamically-linked `ET_DYN` with a real interpreter, or non-PIE
-`ET_EXEC`). **Fix (`84a98bf`)**: never apply relocations from litebox's own loader for either
-branch — the main executable now always loads with `apply_relocations=false`, matching real kernel
-behavior uniformly. Verified: the same isolated `ldconfig -p` repro now runs to completion and
-prints the real library cache. `apply_relocations`/`apply_relr_relocations`
-(`litebox_common_linux/src/loader.rs`) are now unreachable and can be deleted in a future pass once
-confirmed there is no other caller.
-
-**`Xvfb`-liveness question, answered from EXISTING evidence (`.wfgy/final_verify_boot2.log`, a
-release-binary boot captured by the orchestrating session just before this pass), not a fresh live
-check**: that log's `XVFB_FAILED` (fired ~75s in, before `DBUS_UP`) has ZERO Xvfb fatal-signal /
-crash-diagnostic lines anywhere near it or afterward — unlike the thirty-second pass's own
-deterministic Xvfb memcpy SIGSEGV, which always produces a distinct `fatal signal`+`[veh-regs]`
-pair when it fires, and did not fire in this log at all. The only fatal signals in that whole boot
-were one `sh` SIGABRT at ~8s and the three (now-fixed) `ldconfig` SIGSEGVs at ~78-96s. This is
-consistent with the already-documented (26th/30th pass) `xset q` liveness-check race: Xvfb almost
-certainly stayed alive and never crashed in this run; the EARLY `XVFB_FAILED` marker is the
-health-check itself losing a narrow startup-timing race, not evidence of a real death. The
-downstream `xfce4-session: Cannot open display: .` at `DE_FAILED` (~171s) remains the pass-28/29/30
-mystery, already refuted down to "something inside `xfce4-session`'s own process" — this pass adds
-no new evidence there.
-
-**Why no fresh live re-verification**: three consecutive attempts this pass (one debug binary via
-`Start-Process` array args — also re-confirms AGENTS.md's own `Start-Process` redirect warning is
-at minimum unreliable, not merely "instant exit with zero output"; one debug binary via the
-correct `& ... *> log` form; one release binary via the correct form) all died within the first
-10-45s — well BEFORE Xvfb ever starts — repeatedly hitting `bash` printing glibc's own `double free
-or corruption (out)` immediately followed by SIGSEGV, over and over, during `webtop_stack.sh`'s
-own `NGINX_SELFTEST` curl-retry loop. This is the SECOND, already-documented ADVISORY-001
-corruption signature ("Open here" section, above) that the `GLIBC_TUNABLES` workaround does not
-fully close under heavy fork load — explicitly NOT to be re-attempted as a tunable-coverage gap
-without evidence of a THIRD mechanism, and none was found here. Host state at the time: unusually
-heavy concurrent load from unrelated processes (`Discord`/`chrome`/this session's own `claude`
-process together consuming most available CPU) and free RAM down to ~4GB from a healthier ~6.6GB
-at session start — the most likely aggravating factor, consistent with this corruption class's own
-documented sensitivity to fork-load/timing. Pickup: rerun the full `webtop_stack.sh` boot
-(release binary, this pass's `ldconfig` fix already in place) once host load is quieter; if the
-same early `bash` corruption recurs even then, that would be new evidence worth its own pass rather
-than a repeat of already-settled Track B territory.
+**Thirty-fourth pass (2026-09-22) — fork-eligibility mechanism confirmed by static code reading; no
+by-name gate exists, the only gate is a global opt-in env var + a per-fork fd-kind scan; flipping
+that env var on for the real desktop boot is confirmed still NOT a safe narrow win (a real, separate,
+possibly-stale "Fork-after-Xorg" freeze risk, never re-tested since); live re-verification blocked
+again by the SAME pre-Xvfb host-load condition the 33rd pass hit.** Full evidence, exact line
+numbers, and the precise pickup for both open threads: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -474,11 +360,13 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-18.md` (12th-32nd passes, full trace/repro detail for
+- **Archives** (newest first) — `_2026-09-18.md` (12th-34th passes, full trace/repro detail for
   everything AGENTS.md's own pass entries above summarize — shared AF_UNIX connection plane;
   DBUS_FAILED/DISPLAY-getenv()/AF_UNIX-errno all CLOSED; Xvfb's real SIGSEGV root-caused to a
   glibc memcpy reading an unmapped pointer, cdb refuted as a viable capture method, exact Xvfb
-  call site still open (32nd)), `_2026-09-17.md` (shell-crash investigation, stdio-handle
+  call site still open (32nd); ldconfig static-PIE double-relocation SIGSEGV fixed (33rd);
+  fork-eligibility mechanism confirmed by static reading, `LITEBOX_PROCESS_FORK=1` boot-wide flip
+  confirmed still not a safe narrow win (34th)), `_2026-09-17.md` (shell-crash investigation, stdio-handle
   bug, 12 registry/pointer/lock fixes, writable-layer-race fix), `_2026-09-16.md` (popup-menu
   re-test, Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md`
   (fork fd eligibility, OCI cache, s6-boot, browser config, crash-dump/VEH, CoW). Older:
