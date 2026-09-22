@@ -212,14 +212,34 @@ CURRENT STATE those passes converged on:
   (`__libc_start_*`), fault address `0x7feffecdd400` — bit-identical to the 32nd pass's register
   capture, so this is the same deterministic bug. `.wfgy/xvfb.debug` (matching
   `BuildID sha1=6440f00c805782c9a39a5acd92855079e9fffc92`) has the DWARF. **Symbolization is NOT
-  yet resolved**: `_start` is at `0x3fa00`, but no PAGE-ALIGNED load base maps the outermost Xvfb
-  frame `0x158100447e1` into `_start`'s 34-byte range (`0x447e1 - 0x3fa00 = 0x4FE1`, unaligned),
-  and the naive base `0x15810000000` yields an incoherent chain (SELinux + `XkbCopyKeymap` +
-  `glxProbeDriver` + `fbBlt` together). Next pass must resolve the base before trusting any
-  symbol — the leading hypothesis is that litebox's own ELF REWRITER shifts Xvfb's layout, so a
-  plain base subtraction against stock DWARF is invalid. `cdb` remains refuted as a capture
-  method for this crash (it perturbs the X11-traffic race); the pipe-stderr capture above
-  supersedes it and needs no debugger.
+  yet resolved, and THE BASE IS NOT THE REASON** — a second independent capture
+  (`.wfgy/de_only_2.log`) settled that. **The crash is 100% deterministic: 2/2 runs, byte-identical
+  module offsets, identical fault address, identical DE stderr.** Across the two runs only the
+  load base moved (`0x15810000000` vs `0x7810000000`, both 256MB-aligned) while every offset was
+  identical, and the glibc addresses did not move at all. The offsets are therefore exactly:
+  frame0 `0x1b20ed`, **frame3 `0x74391` (the Xvfb caller of the faulting memcpy — the call site
+  wanted)**, frame4 `0x7530a`, frame5 `0x67f14`, frame6 `0xf631d`, frame7 `0x8254b`,
+  frame8 `0x15444b`, frame9 `0x158514`, frame12 `0x447e1`. Against stock `.wfgy/xvfb.debug` those
+  offsets give an INCOHERENT chain (SELinux + `XkbCopyKeymap` + `glxProbeDriver` + `fbBlt`
+  together) and frame12 lands in `fbBlt` rather than `_start` (`0x3fa00`, delta `0x4DE1`).
+  Since the base is now proven correct, the remaining explanation is that **litebox's runtime ELF
+  REWRITER shifts the running Xvfb's layout relative to stock DWARF** (it inserts syscall
+  trampolines; AGENTS.md already records it corrupting `libLLVM.so.19.1`'s `.dynsym`).
+  **CONSTANT-SHIFT TESTED AND IT DOES NOT RESOLVE IT** (38th pass): every delta in the only
+  admissible window `0x4DBF..0x4DE1` (the range that puts frame12 inside `_start`'s 34 bytes)
+  leaves frames 3-9 incoherent — `PanoramiXCopyPlane` + `PanoramiXPolyArc` +
+  `XineramaXvShmPutImage` + `input_option_set_value` + `ProcessVelocityData2D`, which is not a
+  call chain, and Xvfb does not even run Panoramix. Note frame12 mapping to `_start` is CIRCULAR
+  evidence (the delta was solved to make it do that), so it confirms nothing on its own.
+  **Leading conclusion, needs one confirmation: frames 3-9 are not a true call chain at all** —
+  xorg's `xorg_backtrace()` falls back to glibc `backtrace()`, a frame-pointer walk, and on a
+  `-fomit-frame-pointer` build that yields plausible-but-stale STACK WORDS. That matches the
+  32nd pass's own independent observation that "a naive raw-stack-word scan surfaced 4
+  plausible-but-probably-stale candidates". If so, only frames 1-2 (signal frame + the faulting
+  glibc memcpy) are trustworthy, the call site is still NOT in hand, and the next pass needs
+  genuine CFI unwinding rather than more symbolization of these nine offsets. `cdb` remains refuted as a
+  capture method for this crash (it perturbs the X11-traffic race); the pipe-stderr capture
+  above supersedes it entirely and needs no debugger.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass, live evidence: a
   full `LITEBOX_PROCESS_FORK=1` release-binary boot reached its designed idle `HOLD` loop with zero
   freeze/SIGSEGV/tcache-corruption). `LITEBOX_PROCESS_FORK=1` is now the RECOMMENDED flag for
