@@ -252,7 +252,26 @@ raw-stack-word scan surfaced 4 plausible-but-probably-stale candidates) or upstr
 cross-reference (network access confirmed working — `debuginfod.debian.net` answered in one
 request) to determine whether this is a litebox-shim bug or a genuine upstream Xvfb defect. Use
 `LITEBOX_DIAG_FATALDUMP=1` (no debugger — attaching one was proven this pass to starve the boot
-of the traffic the crash needs), NOT cdb, for the next capture.
+of the traffic the crash needs), NOT cdb, for the next capture. **Also found and fixed this same
+pass, unrelated regression**: `LITEBOX_DIAG_FATALDUMP=1` alone was ALSO firing `diag_raw_regdump`
+on every `EXCEPTION_SINGLE_STEP` (routine, per-instruction, during `fork_verify`'s thread-based-
+fork healing) — live-hit as a multi-minute full-stack-boot stall when one fork fell back to the
+thread-based path and its own single-step healing loop never converged; fixed (`f1da614`,
+skips single-step for the `diag_fataldump_enabled()`-alone path, `veh_trace_enabled()` unchanged).
+**Release-binary full-stack attempt (`.wfgy/webtop_stack.sh`, `--publish 8081:8081`) this same
+pass**: reached `XVFB_UP`/`DBUS_UP`/`SELKIES_PORT_UP`/`DE_LAUNCHED` cleanly post-fix — the fix
+above is load-bearing for the release binary too, not just debug. Host RAM then fell to ~720MB
+free right at that point (recovered to ~2.2GB moments later, fully recovered after kill) —
+**never got a confirmed browser render this pass**: both `chrome-devtools` MCP (connection
+timeout) and `claude-in-chrome` (extension not connected) were unavailable in this environment,
+and a plain `curl http://localhost:8081/` timed out during the low-RAM window — inconclusive
+whether that was the RAM pressure, the imminent Xvfb crash, or selkies itself. Also hit one
+genuine ~9-hour HOST SLEEP mid-session (`LastBootUpTime` unchanged, so suspend/resume not a
+reboot) that silently paused a boot attempt for hours — an environmental risk for any future
+long-running session on this host, worth disabling sleep before the next attempt. **Pickup**: fix
+(or ask the user to fix) browser-tool connectivity first, then repeat the release-binary boot
+(now cheap and reliable past `DE_LAUNCHED`) and connect promptly after `SELKIES_PORT_UP`/
+`DE_LAUNCHED` fire, before investigating the RAM spike further.
 ~~DISPLAY/getenv() as the DE_FAILED cause~~ — REFUTED FOR GOOD, thirtieth pass (see
 that pass's own entry above for the LD_PRELOAD-interposer evidence). ~~AF_UNIX connect()
 EAGAIN-vs-EINPROGRESS~~ — FIXED, thirtieth pass; that same code path's
