@@ -842,7 +842,36 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// cross-process fork.
     ///
     /// Returns the `Vmem` plus the number of regions adopted and the number of `VM_SHARED`
-    /// regions seen and deliberately skipped (never inserted into `vmas`).
+    /// (+ `PROT_NONE`, see below) regions seen and deliberately skipped (never inserted into
+    /// `vmas`).
+    ///
+    /// # `PROT_NONE` regions get the SAME treatment as `VM_SHARED` -- 46th pass, 2026-09-22
+    ///
+    /// `litebox_shim_linux::syscalls::process::do_clone`'s own real copy-plan computation (the
+    /// group-building loop feeding `copy_one_group`, NOT this crate's own `Vmem::duplicate` --
+    /// that function's grouping is used only by a diagnostic/verification path, never by the real
+    /// production cross-process fork) explicitly filters its `groups` to regions with at least one
+    /// of `VM_READ`/`VM_WRITE`/`VM_EXEC` set, with the documented rationale "a `PROT_NONE` region
+    /// ... has no bytes anyone can legitimately read, so it has nothing to copy -- and litebox
+    /// never commits one". That is correct and deliberate, but it means a `PROT_NONE` region gets
+    /// EXACTLY the same "tracked in `vmas` but never actually backed by real Windows memory in
+    /// THIS child process" treatment a `VM_SHARED` region does -- and adopting it anyway hits the
+    /// bit-identical failure mode this function's own doc comment above documents for `VM_SHARED`:
+    /// a later guest `munmap`/`mprotect` (most commonly at ordinary process-exit teardown, which
+    /// walks and releases every tracked VMA) routes straight into a REAL `VirtualFree`/
+    /// `VirtualProtect` call against an address Windows correctly reports `MEM_FREE` for,
+    /// panicking `litebox_platform_windows_userland::process_memory_range_by_regions`'s
+    /// `assert!(success, ...)`. Confirmed live, 46th pass: two independent boots, both still
+    /// hitting the bit-identical `0x7fef60030000-0x7fef64000000` region AFTER the 45th pass's
+    /// `VM_SHARED`-only fix landed, with a live diagnostic (`LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP`)
+    /// showing the crashing span is a glibc-arena-shaped pair -- a small `flags=0x73` (RW) head
+    /// immediately followed by a large `flags=0x70` (`PROT_NONE`, no `VM_READ`/`VM_WRITE`/`VM_EXEC`
+    /// bit set, only the `VM_MAY*` bits) tail -- and `do_clone`'s own group filter (confirmed by
+    /// reading, quoted above) never gives that tail span a group, so `copy_one_group` never
+    /// reserves or commits real memory there in the child. Skipping adoption here closes the gap
+    /// the same way the `VM_SHARED` fix does: a later guest touch faults honestly (no VMA found,
+    /// same outcome `do_clone`'s own comment already says is "exactly as it should" happen for an
+    /// inaccessible region), and teardown finds nothing tracked to route into a real Windows call.
     pub(super) fn new_adopting_existing_memory(
         platform: &'static Platform,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
@@ -863,10 +892,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
-            if flags.contains(VmFlags::VM_SHARED) {
-                // See this function's own doc comment: deliberately NOT inserted into `vmas` --
-                // there is no real backing for it in this (adopting) process, and pretending
-                // otherwise is what produced a live, reproducible host-process panic.
+            if flags.contains(VmFlags::VM_SHARED)
+                || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty()
+            {
+                // See this function's own doc comment (both the `VM_SHARED` paragraph and the
+                // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into `vmas`
+                // -- there is no real backing for either kind in this (adopting) process, and
+                // pretending otherwise is what produced a live, reproducible host-process panic.
                 shared += 1;
                 continue;
             }
