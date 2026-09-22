@@ -1577,11 +1577,30 @@ fn diag_process_fork_vmem_adopt_probe(
     // dangling `shared_handle: None` was a live, reproducible crash) -- exclude them here too, or
     // this probe's own comparison would misreport every single run as a MISMATCH for an outcome
     // that is now the intended, correct behavior rather than a real discrepancy.
+    //
+    // 52nd pass (2026-09-22): this filter went stale the moment the 46th pass gave `PROT_NONE`
+    // regions (no `VM_READ`/`VM_WRITE`/`VM_EXEC` bit set) the exact same "skip adoption" treatment
+    // as `VM_SHARED` in `Vmem::new_adopting_existing_memory` (see that function's own doc comment,
+    // "PROT_NONE regions get the SAME treatment as VM_SHARED") -- this filter was never updated to
+    // match, so it kept every `PROT_NONE` region in `sorted_expected` while `tracked` (built by the
+    // now-46th-pass-aware real code) correctly has none. A live full `webtop_stack.sh` boot
+    // (`.wfgy/webtop_release_boot6.log`) showed this stale gap firing as "MISMATCH -- 34 differing
+    // region(s), count 34 vs 117" on every single cross-process fork child for the whole run --
+    // alarming-looking, but a process with many threads (thread-stack guard pages) and many mmap'd
+    // shared libraries (glibc arena/malloc guard gaps) genuinely has dozens of legitimate
+    // `PROT_NONE` regions, so a large true count of them (83 here) was never a sign that real
+    // memory adoption was broken -- it was this diagnostic-only comparison comparing the real,
+    // correctly-filtered `tracked` set against a stale, unfiltered `expected` set. Filtering
+    // `PROT_NONE` out here too makes the comparison match what the real adoption code actually
+    // does, instead of reporting a phantom mismatch on every boot.
     let mut sorted_expected: Vec<_> = expected
         .iter()
         .filter(|(_, flag_bits, _)| {
-            !litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits)
-                .contains(litebox::mm::linux::VmFlags::VM_SHARED)
+            let flags = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
+            !flags.contains(litebox::mm::linux::VmFlags::VM_SHARED)
+                && !flags
+                    .intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
+                    .is_empty()
         })
         .cloned()
         .collect();
