@@ -648,7 +648,32 @@ where
     /// correctly, genuinely shared rather than at `GlobalState`'s own top level.
     pub fn rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>) {
         self.device = phy::Device::new(litebox.x.platform);
-        self.litebox = litebox.clone();
+        // 49th pass (2026-09-22), root-caused live via RUST_BACKTRACE=full on a reproducible
+        // `buddy_system_allocator-0.11.0/src/lib.rs:165` "index out of bounds: the len is 34 but
+        // the index is 53" panic, 3/3 independent occurrences with the BIT-IDENTICAL backtrace:
+        // `net_worker (fork child)`'s first `perform_network_interaction()` call locks this shared
+        // `Network`, calls this function, and a plain `self.litebox = litebox.clone()` here DROPS
+        // the OLD `self.litebox` in place -- but `self` (this whole `Network`) lives in the
+        // cross-process-SHARED kernel arena (this struct's own doc comment above), so the OLD
+        // value's `Arc` inner pointer was captured by whichever process last called this function
+        // (the parent, or a sibling fork child) and is meaningless, and possibly already-exited-
+        // process-owned, raw bytes in THIS process's address space -- exactly the "stale-shared-
+        // pointer" defect class this doc comment already describes for `litebox`/`device`, just
+        // not yet applied to the ASSIGNMENT here that actually triggers a drop. An ordinary
+        // `Arc::drop` on that foreign pointer walks into `Arc::drop_slow` (observed live: strong
+        // count read as the foreign process's own transient value, hit what looks like zero) and
+        // free the FD table's `Vec<Option<IndividualEntry>>` through THIS process's real global
+        // allocator using a `Layout` reconstructed from foreign/unrelated memory -- corrupting
+        // `buddy_system_allocator::Heap::free_list` with a garbage size class instead of
+        // page-faulting cleanly, because the bytes happen to look like a plausible (if huge)
+        // `RawVec` capacity rather than an invalid pointer. Same reasoning, same fix shape, as
+        // `reset_after_poisoning`'s own `core::mem::forget` a few lines below (which fixed the
+        // identical hazard for `SocketSet::remove`'s returned `Socket` -- see that function's own
+        // doc comment) -- `mem::forget` the stale value instead of letting it drop normally: safe
+        // because it is never reachable through `Network` again after this call, and because it
+        // was never this process's allocation to free in the first place.
+        let stale_litebox = core::mem::replace(&mut self.litebox, litebox.clone());
+        core::mem::forget(stale_litebox);
     }
 
     /// Resets every mutable networking collection back to the same safe, empty starting point

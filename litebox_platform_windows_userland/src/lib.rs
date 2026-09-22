@@ -5964,6 +5964,36 @@ impl ThreadHandle {
             std::io::Error::last_os_error()
         );
 
+        // 49th-pass diagnostic (buddy_system_allocator free-list corruption investigation): this
+        // whole block below is reached ONLY when `target_tls.is_in_guest.get()` was true (the
+        // `!is_in_guest` branch above already returned). The suspend-safety retry loop above this
+        // function only protects the case where the target is caught mid-mutation of the global
+        // allocator's own state; that retry loop's own probe already confirmed `rip` was NOT
+        // flagged by `rip_in_global_allocator` (or the probe failed) by the time we got here. This
+        // print re-checks that same predicate on the FINAL context (the one actually redirected
+        // below) to catch a race between the last probe and this real `GetThreadContext`/
+        // `SetThreadContext` pair, and to establish, with live evidence, whether a redirect ever
+        // happens with `rip` inside/near the allocator despite `is_in_guest` being true -- the
+        // open question between the fork-quiesce-routing hypothesis (a) and the data-race
+        // hypothesis (b) in AGENTS.md's 48th-pass pickup.
+        {
+            let rip = context.Rip.trunc();
+            if rip_in_global_allocator(rip) {
+                // Always-on (not gated behind LITEBOX_DIAG_INTERRUPT): this specific combination
+                // -- redirecting a thread's Rip while it is ALSO inside the global allocator's own
+                // code -- is exactly the corruption mechanism the retry loop above exists to
+                // prevent, and per its own doc comment should never reach here. If it ever does,
+                // that is the smoking gun for hypothesis (a); silence here across a full boot is
+                // real evidence against it. `diag_raw_print` is suspend-window-safe (no alloc/lock).
+                diag_raw_print(
+                    b"[diag-interrupt-GUEST-REDIRECT-IN-ALLOCATOR] rip=0x",
+                    rip,
+                    b" attempts=0x",
+                    attempt as usize,
+                );
+            }
+        }
+
         let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
             ..switch_to_guest_end as *const () as usize)
             .contains(&(context.Rip.trunc()))

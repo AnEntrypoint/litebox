@@ -78,7 +78,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// site goes through `GlobalStateHandle::pipes` (`litebox_shim_linux`), which calls this before
     /// returning access -- never call the 9 methods below through a path that skips it.
     pub fn rebind_per_process_fields(&self, litebox: &LiteBox<Platform>) {
-        *self.litebox.lock() = litebox.clone();
+        // 49th pass (2026-09-22): same fix as `litebox::net::Network::rebind_per_process_fields`
+        // (see that function's own doc comment for the live-caught mechanism and evidence) -- a
+        // plain assignment through the guard here drops the OLD `LiteBox`/`Arc` in place, but that
+        // old value's inner pointer was captured by whichever process last called this function
+        // and is foreign, possibly-dangling memory in THIS process's address space. This struct's
+        // OWN doc comment already documents the crash this causes (`STATUS_ACCESS_VIOLATION`
+        // inside a `Descriptors` `Vec`'s `drop`, reached while tearing down a pipe's `WriteEnd`) --
+        // `mem::forget` the stale value instead of letting it drop normally, for the identical
+        // reason `Network::rebind_per_process_fields`/`reset_after_poisoning` already do.
+        let mut guard = self.litebox.lock();
+        let stale = core::mem::replace(&mut *guard, litebox.clone());
+        core::mem::forget(stale);
     }
 
     /// Create a unidirectional communication channel for sending messages of (slices of) bytes.
