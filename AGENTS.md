@@ -73,13 +73,13 @@ cheap for a small repro, too noisy for a full desktop boot.
   (`litebox_shim_linux/src/syscalls/process.rs`) before assuming a new kind needs old treatment.
   A pty fd, unlike a socket, is safely RE-OPENABLE by id afterward via `SharedPtyTable` — run
   dbus-daemon non-forking, and for XFCE use `xfce4-session`, never `startxfce4`.
-- **A guest diagnostic must reach the console through a PIPE, never a file, and never command
-  substitution** (38th pass). `cmd > /tmp/f` + parent read fails silently under
-  `LITEBOX_PROCESS_FORK=1` (child writes its own writable-layer snapshot). `VAR=$(external-cmd)`
-  returns EMPTY (`litebox_shim_linux/src/syscalls/process.rs:2646-2649`'s fork-carry scan filters
-  `raw >= 3`, so guest fds 0/1/2 are never carried — **STILL OPEN**; `cmd | reader` and
-  `$(builtin)` work, one fork with the redirect already applied). `cmd 2>&1 | sed 's/^/[tag] /' &`
-  WORKS — use it for every guest diagnostic. Full mechanism: archive.
+- **A guest diagnostic must reach the console through a PIPE or `$( )`, never a bare file redirect**
+  (38th pass). `cmd > /tmp/f` + parent read fails silently under `LITEBOX_PROCESS_FORK=1` (child
+  writes its own writable-layer snapshot). `VAR=$(external-cmd)` used to return EMPTY (the
+  fork-carry scan hard-cut fds 0/1/2 at `raw >= 3` — **FIXED 44th pass**,
+  `raw_fd_is_plain_stdio_device`, `process.rs`/`file.rs`) — both `cmd | reader &` and
+  `VAR=$(external-cmd)` now genuinely work. `cmd 2>&1 | sed 's/^/[tag] /' &` remains the pattern to
+  use for streaming output. Full mechanism: archive.
 - **`.wfgy/webtop_stack.sh` is NOT what boots — `.wfgy/webtop_seed.tar` embeds a FROZEN COPY**
   (`--resume-from`), so editing the host script alone changes nothing. Re-tar after every edit
   (`tar -xf` to a stage dir, overwrite, `tar -cf webtop_seed.tar webtop_stack.sh tmp config`) and
@@ -188,6 +188,56 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   the parent wrote post-`fork()`; fixed two real bugs: a fork-eligibility scan refusing the whole
   fork over any open pty fd, and `PtyStateRef::Local` setters never mirroring lock/termios state
   into the shared slot). Mechanism: "Shared-memory foundations" below.
+- **44th pass (2026-09-22) — two real bugs FIXED+verified; `DE_FAILED`'s previously-understood
+  cause is closed, but a SECOND, deeper blocker (a related/same-class Xvfb crash) was newly exposed
+  and is now open.** (1) `try_cross_process_fork`'s fd-eligibility scan (`process.rs:2646-2666`)
+  hard-cut at `raw >= 3`, so a redirected 0/1/2 (`cmd 2>&1 | sed &`'s SECOND fork, or ANY
+  `$(external-cmd)` two-fork comsub) silently lost its real pipe and got a fresh, wrong
+  `CreateProcessW`-inherited stdio handle instead — root cause of "guest diagnostics must travel by
+  pipe" (38th-39th passes) NEVER actually being fixed by switching to `$( )`/pipes, since the SAME
+  gap ate the redirected fd at the fork boundary regardless. Fixed: fds 0/1/2 are now scanned like
+  any other fd unless `raw_fd_is_plain_stdio_device` (new, `file.rs`, keyed on `StdioStream`
+  metadata surviving a `dup2`) says they're still the untouched device node. Live-verified: a full
+  `webtop_stack.sh` release-binary boot (`.wfgy/webtop_pass44_boot1.log`) now shows genuinely
+  non-empty `WM1_PROBE`/`WM2_PROBE`/`PRE_DE_XDPYINFO` content (`_NET_SUPPORTING_WM_CHECK: not
+  found.`, real `xdpyinfo` output) for the first time ever — every prior pass's `$( )` captures of
+  these were silently empty regardless of the real answer. (2) `connect_cross_process`'s
+  non-blocking-miss arm (`unix.rs`, ~1594) unconditionally `cancel()`led the just-posted
+  `SharedUnixConnectQueue` request before returning `EINPROGRESS` — so ANY correct non-blocking
+  AF_UNIX client (poll for writable, don't retry `connect()`) could poll forever on a request this
+  shim had already withdrawn. Live-caught as the loop `xfce4-session` sits in forever: a debug trace
+  (`litebox_shim_linux::syscalls::unix=debug`) shows `self_pid` matching xfce4-session's own guest
+  pid hit exactly this arm, and `tid=27`/`tid=21572` (its own guest tid across two runs) NEVER calls
+  `clone()`/`fork()` again afterward -- zero session-client children, not even `xfwm4`. Fixed: new
+  `UnixStreamState::Connecting(UnixConnectingStream)` keeps the request alive; `check_io_events`
+  (now mutating, `with_state` not `with_state_ref`) re-checks `poll_result` on every poll/epoll tick
+  and completes the connection in place; a repeated `connect()` on the same fd also re-checks
+  (`EALREADY` while pending, completes if ready) rather than re-posting. Live-verified via
+  `.wfgy/de_only_pass44_run2.log`: `xfce4-session` now genuinely progresses for the first time ever
+  past its D-Bus setup -- `iceauth`, `ssh-agent`, `gpg-agent`, `xfconfd`,
+  `dbus-update-activation-environment` all `execve` for the first time in this whole investigation's
+  history (none appear in ANY prior pass's log). **`DE_FAILED` is STILL OPEN**: before `xfwm4` is
+  ever reached, Xvfb SIGSEGVs again -- `.wfgy/de_only_pass44_run2.log:46383-46392`, fault address
+  `0x4000400` (NOT the 43rd pass's `0x7feffecdd400`), but backtrace frame0's offset is
+  BIT-IDENTICAL (`0x1b20ed`, still inside `.eh_frame_hdr`, still the same broken-unwind signature)
+  -- strong evidence this is the SAME underlying wild-pointer-read defect the 32nd-43rd passes
+  chased, just reached via a trigger condition the 43rd pass's crowded-top-down-packing fix (step
+  1.5) does not cover -- plausibly because `xfce4-session`'s now-much-deeper startup (five more
+  real binaries `dlopen`-ing their own library trees) produces a differently-crowded top-down
+  window than the fix's own validated repro did. Also real but likely NOT fatal on its own (GLib
+  `CRITICAL` doesn't `abort()` by default): `xfce4-session`'s real stderr, readable for the first
+  time via the now-working pipe fix, shows `libxfce4util-WARNING: Failed to get a ConsoleKit proxy:
+  Could not connect: Connection refused` (expected -- no system bus is started, matching real-world
+  bare-Docker XFCE reports) immediately followed by a burst of `GLib-GObject-CRITICAL: invalid
+  (NULL) pointer instance` / `g_signal_connect_data` / `g_dbus_proxy_call_sync_internal` assertion
+  failures -- xfce4-session's own ConsoleKit-absent code path not null-checking before use; almost
+  certainly cosmetic noise real XFCE-in-Docker deployments already tolerate, not chased further this
+  pass. **Pickup, in order**: (1) root-cause the NEW Xvfb fault (same class as the fixed one, same
+  broken backtrace -- needs the 32nd pass's own non-debugger methodology: `LITEBOX_DIAG_FATALDUMP=1`
+  captures plus pointer-provenance analysis against the crowded top-down window `xfce4-session`'s
+  now-much-larger dlopen set produces); (2) once Xvfb survives past `xfce4-session`'s pre-session
+  setup, re-verify `_NET_SUPPORTING_WM_CHECK` is reached for real; (3) only then is real
+  browser/app verification reachable -- NOT attempted this pass (DE_FAILED still fires).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -195,15 +245,24 @@ Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the mini
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
 `DE_FAILED` cause (REFUTED FOR GOOD); AF_UNIX `connect()` `EAGAIN`-vs-`EINPROGRESS`; `pty_registry`/
-`daemon_pty_masters` (`syscalls::pty::SharedPtyTable`, now live-verified cross-process, 37th pass).
+`daemon_pty_masters` (`syscalls::pty::SharedPtyTable`, now live-verified cross-process, 37th pass);
+cross-process fork's fd-eligibility scan dropping a redirected 0/1/2 (44th pass,
+`raw_fd_is_plain_stdio_device`); `SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap
+(44th pass, `UnixStreamState::Connecting`, item 5 below — DONE, not just scoped).
 
 **Open, in rough priority order:**
 
-1. ~~Xvfb's SIGSEGV~~ — **FIXED, 43rd pass, `01f8532`** (see its own entry above; live-tested
-   `linux.rs:2439-2510`'s disabled step 1.5, same-session A/B, control crashes every time, fix
-   doesn't). `DE_FAILED` is now the SINGLE top blocker in its own right, not a downstream symptom
-   of anything left to fix here — needs a live `cdb -pv` attach on `xfce4-session` itself
-   (`getenv`/`XOpenDisplay`/`_XConnectXCB`), never attempted by any pass, now finally safe to try.
+1. **`DE_FAILED`'s ORIGINAL cause (the D-Bus non-blocking-connect stall) is FIXED — 44th pass** (see
+   its own entry above). A SECOND, deeper blocker was exposed by that fix and is now the single top
+   blocker: a fresh Xvfb SIGSEGV (fault `0x4000400`, backtrace frame0 offset `0x1b20ed` —
+   bit-identical to the 43rd-pass-fixed crash, so almost certainly the SAME wild-pointer-read defect
+   via a trigger condition step 1.5's crowded-top-down-packing fix doesn't cover) that kills Xvfb
+   while `xfce4-session`'s pre-session setup (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`, all
+   reached for the first time ever) is still running, before `xfwm4` is ever attempted. Needs its
+   own root-cause pass, same non-debugger A/B methodology as the 43rd pass's own (`cdb` attach is
+   the SAME "sustained AV-interception perturbs crash timing" trap the 41st-42nd passes already
+   proved infeasible for this crash family — do not re-attempt without a non-`WaitForDebugEvent`
+   capture mechanism).
 2. A new, unscoped observation from the 43rd pass, not yet investigated: host-side
    `curl http://localhost:8081/` failed on both full-stack boots despite the GUEST's own
    `/dev/tcp` self-test succeeding — possibly just the same transient RAM dip the 35th pass already
@@ -224,8 +283,8 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 4. Debugger-root-cause `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state
    (dozens per boot, most frequent panic historically, NOT yet debugger-confirmed — do not patch
    blind).
-5. `SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap (`UnixStreamState::
-   Connecting(request_idx)` needed) — scoped, not yet fixed.
+5. ~~`SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap~~ — **FIXED, 44th pass**
+   (`UnixStreamState::Connecting`, see its own entry above).
 6. `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) remain open — same
    non-POD-payload obstacle pty's own `PtyEnd::Shared{Master,Slave}`/`SharedPtyTable` pattern gives
    a concrete template for, not yet applied; not on the Xvfb/selkies boot path, lower urgency.
