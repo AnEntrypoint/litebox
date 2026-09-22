@@ -331,53 +331,53 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
     /// Use the entry at `fd` as read-only.
     ///
-    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`. Also returns
+    /// `None` -- rather than panicking -- if `fd`'s index does not resolve in THIS table at all.
+    ///
+    /// That second case is not merely defensive: a `TypedFd` can end up read back against a
+    /// `Descriptors` table other than the one that created it whenever one process's fd index
+    /// travels into a cross-process-shared structure and a DIFFERENT process (most commonly a
+    /// freshly cross-process-forked child, whose own table starts out far smaller than the
+    /// parent's) later resolves it -- see `Self::drain_entries_full_covered_by`'s own doc comment
+    /// for the fully-diagnosed sibling instances of this exact defect class
+    /// (`Network::queued_for_closure`). Live-caught here too, unfixed until now: `index out of
+    /// bounds: the len is 1 but the index is 13` inside a cross-process-forked child barely past
+    /// `CreateProcessW`, `litebox/src/fd/mod.rs:422` (`docs/AGENTS_ARCHIVE_2026-09-22.md`, 54th
+    /// pass) -- a foreign index a `None`-tolerant `.get()` now simply treats as "not open here"
+    /// instead of taking down the entire guest process it happened to land in.
     pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
     {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().read();
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.read();
         Some(f(entry.as_subsystem::<Subsystem>()))
     }
 
     /// Use the entry at `fd` as mutably.
     ///
-    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`. See
+    /// [`Self::with_entry`]'s doc comment for why an out-of-bounds/foreign index is `None`, not a
+    /// panic, here too.
     pub fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
+        let mut entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.write();
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
     /// Obtain a handle to the underlying entry for the `fd`.
     ///
-    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the table.
+    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the
+    /// table. See that method's doc comment for why an out-of-bounds/foreign index is `None`, not
+    /// a panic, here too.
     pub fn entry_handle<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<EntryHandle<Platform, Subsystem>> {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let entry = self.entries[fd.x.as_usize()?].as_ref()?;
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
@@ -398,10 +398,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
-        let mut entry = self.entries[usize::try_from(internal_fd.raw).unwrap()]
-            .as_ref()
-            .unwrap()
-            .write();
+        let idx = usize::try_from(internal_fd.raw).ok()?;
+        let mut entry = self.entries.get(idx)?.as_ref()?.write();
         if entry.matches_subsystem::<Subsystem>() {
             Some(f(entry.as_subsystem_mut::<Subsystem>()))
         } else {
@@ -413,30 +411,35 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
     /// deadlocks. Prefer using [`Self::with_entry`] when possible, to make life easier.
+    ///
+    /// Returns `None` (never panics) if `fd`'s index does not resolve in this table -- see
+    /// [`Self::with_entry`]'s doc comment.
     pub(crate) fn get_entry<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
-        Some(crate::sync::RwLockReadGuard::map(
-            self.entries[fd.x.as_usize()?].as_ref().unwrap().read(),
-            |e| e.as_subsystem::<Subsystem>(),
-        ))
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        Some(crate::sync::RwLockReadGuard::map(entry.read(), |e| {
+            e.as_subsystem::<Subsystem>()
+        }))
     }
 
     /// Get the entry at `fd`, mutably.
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
     /// deadlocks. Prefer using [`Self::with_entry_mut`] when possible, to make life easier.
+    /// Returns `None` (never panics) if `fd`'s index does not resolve in this table -- see
+    /// [`Self::with_entry`]'s doc comment.
     pub(crate) fn get_entry_mut<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
-        Some(crate::sync::RwLockWriteGuard::map(
-            self.entries[fd.x.as_usize()?].as_ref().unwrap().write(),
-            |e| e.as_subsystem_mut::<Subsystem>(),
-        ))
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        Some(crate::sync::RwLockWriteGuard::map(entry.write(), |e| {
+            e.as_subsystem_mut::<Subsystem>()
+        }))
     }
 
     /// Apply `f` on metadata at an fd, if it exists.
@@ -445,10 +448,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// both [`Self::set_fd_metadata`] and [`Self::set_entry_metadata`]) are run on the same
     /// fd, this will only return the value from the fd one, which will shadow the file one. If no
     /// fd-specific one is set, this returns the entry-specific one.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn with_metadata<Subsystem, T, R>(
         &self,
         fd: &TypedFd<Subsystem>,
@@ -458,9 +457,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
-            .as_ref()
-            .unwrap();
+        let idx = fd.x.as_usize().ok_or(MetadataError::ClosedFd)?;
+        let ind_entry = self
+            .entries
+            .get(idx)
+            .and_then(Option::as_ref)
+            .ok_or(MetadataError::ClosedFd)?;
         match ind_entry.metadata.get::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -473,10 +475,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Similar to [`Self::with_metadata`] but mutable.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn with_metadata_mut<Subsystem, T, R>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -486,9 +484,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
-            .as_mut()
-            .unwrap();
+        let idx = fd.x.as_usize().ok_or(MetadataError::ClosedFd)?;
+        let ind_entry = self
+            .entries
+            .get_mut(idx)
+            .and_then(Option::as_mut)
+            .ok_or(MetadataError::ClosedFd)?;
         match ind_entry.metadata.get_mut::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -508,10 +509,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Returns the old metadata if any such metadata exists.
     ///
     /// Silently drops the store if the FD has been closed out.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn set_entry_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -521,9 +518,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        self.entries[fd.x.as_usize()?]
-            .as_ref()
-            .unwrap()
+        self.entries
+            .get(fd.x.as_usize()?)?
+            .as_ref()?
             .x
             .write()
             .metadata
@@ -537,10 +534,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// opened for the same entry.
     ///
     /// Silently drops the store if the FD has been closed out.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn set_fd_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -550,9 +543,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        self.entries[fd.x.as_usize()?]
-            .as_mut()
-            .unwrap()
+        self.entries
+            .get_mut(fd.x.as_usize()?)?
+            .as_mut()?
             .metadata
             .insert(metadata)
     }
