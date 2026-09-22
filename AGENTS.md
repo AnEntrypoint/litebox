@@ -7,9 +7,8 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 `docs/*.md` in the map below — read those for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not in a separate memory file. **This file is compacted whenever it grows
-past ~30KB** — newest compaction: 2026-09-22, 48th pass (folded the superseded 47th-pass
-"not yet proven" hedge into a real, now-negative result).
+line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-22,
+50th pass (trimmed stale Track B items for the finding below).
 
 ## The cheap repro — start here
 
@@ -109,8 +108,8 @@ cheap for a small repro, too noisy for a full desktop boot.
   gitignored); untrack anything `git add -A` sweeps.
 - **Guest-reachable code returns an errno, never a panic** — the host process IS the entire guest
   session, so an `unimplemented!()`/`unreachable!()`/panic, or unbounded recursion, on any
-  guest-reachable path kills every guest process at once. Bitten many times (OOM, metadata ops, open
-  flags, nested `epoll_ctl`, corrupted guest contexts); full fixed-bug list with shas: archive.
+  guest-reachable path kills every guest process at once (OOM, metadata ops, open flags, nested
+  `epoll_ctl`, corrupted guest contexts — full fixed-bug list with shas: archive).
 
 ## Cross-process fork (`LITEBOX_PROCESS_FORK=1`)
 
@@ -192,6 +191,36 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   `LITEBOX_DIAG_FATALDUMP=1`, debug build) with zero recurrence, vs. 100% reproduction (every fork
   child, ~3-4s in) before the fix. The separate, pre-existing second Xvfb SIGSEGV (`0x37f0400`,
   next bullet) is untouched by this fix and still occurs in most of these same runs.
+- **50th pass (2026-09-22) — the second Xvfb SIGSEGV's full register state is BIT-IDENTICAL across
+  independent boots (not just `rip`) except for ASLR-dependent module bases, and `DE_FAILED` is
+  RECONFIRMED purely downstream of Xvfb dying — the 49th-pass addendum's "zero-SIGSEGV,
+  DE_FAILED-anyway" boot was mis-read (below).** `rip=0x7fefedeababd` (glibc
+  `__memmove_avx_unaligned_erms`'s between-32-64-byte path, confirmed by the disassembled bytes:
+  `cmp rdx,0x40; ja …; vmovdqu ymm0,[rsi]`), `rdx=0x40`, `rsp=0x7fefffeed658`, `rbp=1`, `rcx=3`,
+  `r8..r15` all bit-identical across `.wfgy/verify49_fix_run{1,6}.log` (different boots, different
+  ASLR bases). `rdi` (dest, a valid tracked heap chunk) has a module-relative OFFSET that's also
+  bit-identical (`0x156e8d8`) — only its base moves with ASLR. `rsi` (src, the fault address
+  `0x37f0400`) is the odd one: it does NOT move with ASLR at all, unlike `rdi` — ruling out
+  "ordinary corrupted heap/module pointer", pointing instead at a NULL-plus-fixed-offset bug or a
+  fixed (non-ASLR'd) address litebox itself hands the guest. Raw-stack-scan candidates
+  (`DIAG-STACKWALK` vs `.wfgy/xvfb.debug`, build-id `6440f00c8057…` matches) resolve to real
+  functions — `ProcSELinuxGetClientContext`/`SELinuxReceive` (Xext/xselinux_{ext,hooks}.c),
+  `ConstructClientResourceBytes` (Xext/xres.c) — via `dixLookupPrivate`'s devPrivates-array
+  indexing, but NOT proven as the true caller (`0x1b20ed`, Xvfb's own backtrace frame, falls
+  inside `.eh_frame_hdr`, the already-documented broken-unwind signature; leads, not a confirmed
+  chain). No fix attempted — insufficient certainty
+  for this project's "verify before fixing" rule; upstream Xorg source (fetched) has no memcpy in
+  either function, consistent with deeper, non-adjacent real frames. **`DE_FAILED` correlation,
+  re-checked from raw logs, not just a "Segmentation fault"-string grep**: `.wfgy/
+  webtop_pass49_boot1.log` (the addendum's own "zero SIGSEGV" boot) DOES show `fatal signal:
+  terminating task signal=Signal(6) … comm=[88,118,102,98…]` (decodes to `Xvfb`) at t=76.0s, ~40s
+  before `WM1_PROBE`/`DE_FAILED` — Xvfb dies via bare SIGABRT with no "(EE) Segmentation fault"
+  text printed (lost mid-abort, or a second abort path), not a crash-free run. Every sampled boot
+  this pass (6 `de_only.sh` + this 1 full-stack) shows Xvfb dying via a fatal signal before the WM
+  connects — `DE_FAILED` is the same downstream symptom every time, not an independent third bug.
+  **Pickup**: a conditional `cdb` breakpoint on `rip==0x7fefedeababd && rsi==0x37f0400` (now known
+  to the exact register, not just "some crash sometime") should be cheaper than the ORIGINAL
+  crash's refuted live-cdb attempts, whose problem was timing, not register state.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -205,39 +234,29 @@ fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_s
 
 **Open, in rough priority order:**
 
-1. **`DE_FAILED`'s ORIGINAL cause (the D-Bus non-blocking-connect stall) is FIXED — 44th pass**; the
-   `buddy_system_allocator` free-list corruption that was conflated with it is ALSO FIXED — 49th
-   pass, `8b64698`. The single remaining top blocker is the SECOND Xvfb SIGSEGV (`0x37f0400`,
-   genuinely separate, unrelated mechanism) — see the "Cross-process fork" section above.
-2. A new, unscoped observation from the 43rd pass, not yet investigated: host-side
-   `curl http://localhost:8081/` failed on both full-stack boots despite the GUEST's own
-   `/dev/tcp` self-test succeeding — possibly just the same transient RAM dip the 35th pass already
-   documented at this exact script stage, possibly a real `--publish` gap. Reproduce with RAM held
-   above ~2GB throughout before concluding either way.
-2b. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
+1. **The single remaining top blocker is the SECOND Xvfb SIGSEGV (`0x37f0400`) — `DE_FAILED` is
+   its downstream symptom, RECONFIRMED 50th pass (every sampled boot dies via this or a same-class
+   SIGABRT before the WM connects), not an independent third bug.** See "Cross-process fork"
+   above's 50th-pass entry for the register-level evidence and the `cdb` conditional-breakpoint
+   pickup. Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th
+   passes) is unreachable to re-check until this is fixed (no WM ⇒ nothing selkies-side to serve).
+2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
    (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
-   capacity 256's `insert` return DISCARDED at `unix.rs:275-277` (over-capacity `listen(2)` still
-   succeeds, clients later get `ECONNREFUSED`); a key >108 bytes silently bails in
-   `insert`/`post`/`try_claim`/`has_pending`; `SharedUnixConnectQueue` capacity 64 returns `EAGAIN`;
-   `SharedUnixConnTable` capacity 64 leaves a request `REQ_CLAIMED` FOREVER (`unix.rs:430-435`,
-   `cancel` only CASes `REQ_PENDING→REQ_EMPTY`) — a monotonic slot leak for the fork family's life.
-   Also `SHARED_UNIX_CONN_BUF` is only 2048 bytes/direction; cross-process accept ignores the
-   listener backlog entirely (`unix.rs:420-452`). Abstract sockets checked and CORRECT.
+   capacity-256 overflow is silently discarded (`unix.rs:275-277`); a key >108 bytes silently bails;
+   `SharedUnixConnectQueue`/`SharedUnixConnTable` (both capacity 64) leak a `REQ_CLAIMED` slot
+   forever on cancel (`unix.rs:430-435`); `SHARED_UNIX_CONN_BUF` is 2048 bytes/direction; backlog is
+   ignored entirely on cross-process accept. Abstract sockets checked and CORRECT.
 3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
    dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in
    `dealloc`, high blast radius, own dedicated pass.
 4. Debugger-root-cause `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state
    (dozens per boot, most frequent panic historically, NOT yet debugger-confirmed — do not patch
    blind).
-6. `flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) remain open — same
-   non-POD-payload obstacle pty's own `PtyEnd::Shared{Master,Slave}`/`SharedPtyTable` pattern gives
-   a concrete template for, not yet applied; not on the Xvfb/selkies boot path, lower urgency.
-7. `timerfd`/`signalfd` are the next-cheapest carriable fd kinds before `socket`/`unix-socket`/
-   `epoll` (`pty` is no longer purely uncarriable — a cross-process opener can re-acquire one by id
-   via `pts_open`'s shared fallback even though the fd itself isn't carried across `fork()`).
-8. The writable-layer-visibility gap for LARGE/unbounded content (`/tmp/de.log`/`/tmp/de2.log`/
-   `/tmp/xvfb.log`, `/tmp/wm1`/`/tmp/wm2`) remains open — `SharedFilePublishTable`'s 256-byte cap
-   must NOT be widened to cover it; needs its own design (chunked publish or a shared-arena ring).
+5. `flock_registry`/`drm`/`evdev` (`GlobalState` fields) remain open, same non-POD-payload obstacle
+   `SharedPtyTable` gives a template for; `timerfd`/`signalfd` are the next-cheapest carriable fd
+   kinds before `socket`/`unix-socket`/`epoll`; the writable-layer-visibility gap for LARGE content
+   (`/tmp/de.log` etc.) needs its own chunked-publish design, NOT a widened `SharedFilePublishTable`
+   cap. All three lower-urgency, not on the Xvfb/selkies boot path.
 
 ## Container images and OCI loading
 
@@ -254,14 +273,10 @@ Rewritten layers cached under `.litebox-cache/`, keyed so a rewriter change self
 Tags verified live, never from the name: `linuxserver/webtop:alpine-mate` ships MATE not XFCE;
 `alpine-xfce` doesn't exist; `debian-xfce`/`ubuntu-xfce` ship real XFCE.
 
-**X server choice**: for the DRM/wgpu on-screen (`--gui`) path use `Xorg` with `modesetting` —
-litebox's virtual DRM device is legacy-KMS + dumb-buffer + XRGB8888 only, no atomic modeset/GBM/EGL,
-so a GBM-first compositor lands on its least-tested fallback, and `Xvfb` never touches DRM/KMS at all
-(zero page-flips). For browser/selkies, `Xvfb` IS correct — its `-shmem` framebuffer works now that
-SysV shared memory exists.
-
-**Durable artifacts**: `C:\dev\litebox-webtop\webtop_seatd.tar` (stock MATE webtop); the
-`.wfgy/xfce-build/` weston+XFCE tar is superseded by the stock-image path.
+**X server choice**: for on-screen DRM/wgpu (`--gui`) use `Xorg` with `modesetting` — litebox's
+virtual DRM is legacy-KMS + dumb-buffer + XRGB8888 only (no atomic modeset/GBM/EGL), so a
+GBM-first compositor lands on its least-tested fallback and `Xvfb` never touches DRM/KMS at all.
+For browser/selkies, `Xvfb` IS correct — its `-shmem` framebuffer works now SysV shm exists.
 
 ## A real desktop renders in a browser
 
@@ -290,12 +305,10 @@ glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) st
 hits selkies on the THREAD-based fork path under heavy fork load — Track B territory, not a
 tunable-coverage gap; do not re-attempt `GLIBC_TUNABLES` without evidence of a THIRD mechanism.
 
-### The ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)
-
-Real blocker was the guest-side patcher silently crashing on `shutil.copy2()`'s `copystat()` (no
-`listxattr` shim) before ever patching `selkies.py`; fixed (`478e640`). Port-8081 double-bind fix
-live-verified over 17 boot cycles + a 6000-connection stress test, zero recurrence. Detail: `docs/
-AGENTS_ARCHIVE_2026-09-16.md`.
+**ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)**: real blocker was the
+guest-side patcher silently crashing on `shutil.copy2()`'s `copystat()` (no `listxattr` shim)
+before ever patching `selkies.py` (`478e640`); port-8081 double-bind fix live-verified over 17
+boot cycles + a 6000-connection stress test. Detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -338,22 +351,22 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-45th passes: full pass-by-pass narrative for
+- **Archives** (newest first) — `_2026-09-22.md` (26th-50th passes: full pass-by-pass narrative for
   everything this file's own pass entries above summarize), `_2026-09-18.md` (12th-34th, shared
-  AF_UNIX connection plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash investigation,
-  stdio-handle bug, writable-layer-race fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter),
-  `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot,
-  crash-dump/VEH). Older: `_2026-09-03.md`, `_2026-09-05.md`.
+  AF_UNIX plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash, stdio-handle bug,
+  writable-layer-race fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md`
+  (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, crash-dump/VEH).
+  Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache). `docs/veh-exception-handler-design.md` —
   read before touching VEH.
-- Desktop logs: `docs/webtop-debian-selkies-2026-09-06.md`, `webtop-alpine-mate-2026-09-07.md`,
-  `webtop-debian-xfce-2026-09-08.md`, `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`.
+- Desktop logs: `docs/webtop-debian-{selkies,xfce}-2026-09-0{6,8}.md`,
+  `webtop-xfce-code-vs-data-2026-09-08.md`, `fork-fs-veh-2026-09-08.md`.
 - Consult before deriving: `docs/premade-library-research.md`, `docs/drm-dumb-buffer-ioctl-reference.md`,
   `docs/diag-timeline-field-semantics.md` (before any `DIAG_TIMELINE` `comm`-field hypothesis).
-- `docs/macos.md` — Apple Silicon guest-execution context switch is a stub, deferred. Designs NOT
-  implemented: `docs/session-daemon-design.md`, `docs/fork-region-grouping-design.md`.
+- `docs/macos.md` — Apple Silicon guest-execution stub, deferred. NOT implemented:
+  `docs/session-daemon-design.md`, `docs/fork-region-grouping-design.md`.
 - `advisor/probes/` — diagnostics (`decode_frame.py`, `symbolize_litebox_crash.py`, `dup_probe.c`,
-  `drm_flip_probe.c`, `clone_probe.c`, `socketpair_fork_probe.c`, `pty_fork_probe.c` — cross-process
-  pty I/O verification) plus `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`.
+  `drm_flip_probe.c`, `clone_probe.c`, `socketpair_fork_probe.c`, `pty_fork_probe.c`) plus
+  `MEASUREMENT-PITFALLS.md`, `DISK-HYGIENE.md`.
 - `.gm/memories/` — older per-topic notes, superseded by this file/archives.
