@@ -94,14 +94,41 @@ for a small repro, too noisy for a full desktop boot.
     desktop did. (Small files DO sometimes survive via `SharedFilePublishTable`'s 256-byte
     publish — `read -r A < /tmp/addr` genuinely works for dbus's address — so this fails
     NON-deterministically by size, which is worse than failing outright.)
-  - `VAR=$(cmd)` — **command substitution returns EMPTY for an external command under
-    `LITEBOX_PROCESS_FORK=1`, while `$?` is still correct.** Live: `XSETQ=$(xset q 2>&1)` gave
-    `rc=0` and zero bytes in the same boot where a bare `xset q > /dev/null 2>&1 && echo UP`
-    reported UP. The exit status is trustworthy; the captured TEXT is not. Any past finding that
-    rests on the text captured by `$( )` from a forked child must be re-derived.
-  - `cmd 2>&1 | sed 's/^/[tag] /' &` — **WORKS**, child-to-child through a pipe, and is the only
-    shape proven to deliver a guest process's real output. This is how `xfce4-session`'s and
-    Xvfb's true stderr were read for the first time. Use it for every guest diagnostic.
+  - `VAR=$(external-cmd)` — returns **EMPTY** under `LITEBOX_PROCESS_FORK=1` while `$?` is still
+    correct, and the command's real output goes to the HOST CONSOLE instead. **ROOT-CAUSED, 38th
+    pass, to one line**: `litebox_shim_linux/src/syscalls/process.rs:2646-2649`'s carry scan is
+    `raw_descriptors.iter_alive().filter(|&raw| raw >= 3)` — **guest fds 0/1/2 are never carried
+    across a cross-process fork**. The child instead rebuilds them unconditionally as fresh
+    `/dev/stdin|stdout|stderr` opens (`adopt_forked_process` →
+    `initialize_stdio_in_shared_descriptors_table`, `litebox_shim_linux/src/lib.rs:981`, body
+    `:1410-1440`), which resolve to the CHILD process's own `GetStdHandle`
+    (`litebox_platform_windows_userland/src/lib.rs:9671-9689`). So **any guest process that
+    redirected its own stdout onto a pipe BEFORE forking silently loses that redirection in the
+    child**. The authorising comment at `process.rs:2630-2633` ("a cross-process child cannot
+    carry anything past the 0/1/2 stdio slots") is STALE — true only when fd 1 really is the host
+    console. Parent↔child pipe I/O itself is sound and was REFUTED as the cause (the bridge
+    relays correctly; `.wfgy/de_only_2.log` shows `total_relayed…=4/187/838` on the working
+    shapes and `=0` ×13 on every fork+exec case).
+  - **Why `$( )` fails but `|` works — it is fork DEPTH, not who holds the read end.**
+    `cmd | reader &` and `$( builtin )` are ONE fork per stage, so the `dup2(pipe,1)` happens
+    after the fork inside the child's own rebuilt fd table and sticks. `$( external-cmd )` is
+    TWO forks: bash forks the comsub subshell, that subshell does `dup2(3,1)`, then forks AGAIN
+    to exec the binary — and at that second fork stdout is already a pipe end sitting at fd 1,
+    below the `raw >= 3` cut, so it is dropped. The discriminator is **"was stdout already
+    redirected at fork time"**.
+  - `cmd 2>&1 | sed 's/^/[tag] /' &` — **WORKS**, and is the shape proven to deliver a guest
+    process's real output. This is how `xfce4-session`'s and Xvfb's true stderr were read for the
+    first time. Use it for every guest diagnostic.
+  - **FIX, scoped but NOT yet implemented** (own pass, top of the pickup list): at
+    `process.rs:2646-2649` scan ALL alive fds, not `>= 3`; for each of 0/1/2 skip it only when it
+    is still the plain `/dev/stdX` device node (detectable via the `StdioStream` metadata set at
+    `lib.rs:1435`) since host handle inheritance already covers that, and otherwise classify it
+    exactly like any other fd (pipe → `Sink`/`Source` bridge, regular file → `ForkInheritedFile`,
+    eventfd → `ForkInheritedEventfd`, else the existing uncarriable/cloexec/pty rules). Delete the
+    stale comment. The child side needs NO change — the install loop runs after the stdio rebuild
+    and `sys_dup`'s exact form (`file.rs:6330-6334`) already displaces an occupied target.
+    `spawn_exec_collision_child` (`platform lib.rs:12250-12255`) has the SAME defect and the same
+    signature, disclosed in its own comment.
 - **`.wfgy/webtop_stack.sh` is NOT what boots — `.wfgy/webtop_seed.tar` embeds a FROZEN COPY**
   (`--resume-from`), so editing the host script alone changes nothing. Re-tar after every edit
   (`tar -xf` to a stage dir, overwrite, `tar -cf webtop_seed.tar webtop_stack.sh tmp config`) and
@@ -196,8 +223,13 @@ CURRENT STATE those passes converged on:
   the DE's AT-SPI warning (:5702) → `DE_FAILED` (:10535). The X server dies underneath the DE.
   The crash is **triggered by the DE's own X11 traffic, not by elapsed time** — it landed here
   within ~30s of the DE launching, versus the "~190-207s into every full boot" the 32nd pass
-  recorded, because this isolation harness starts the DE far earlier. So the two open blockers
-  were never two: **there is ONE bug, the Xvfb SIGSEGV.** Do NOT reopen DISPLAY/`getenv()`/envp/
+  recorded, because this isolation harness starts the DE far earlier. **A/B-CONTROLLED, 38th
+  pass**: the identical harness with ONLY the `xfce4-session` launch removed
+  (`.wfgy/de_noDE_1.log`, `.wfgy/de_noDE.sh`) ran to completion with **zero Xvfb crashes**, well
+  past the point the DE runs die, while still serving `xset`/`xdpyinfo`/12 `xprop` polls — so the
+  trigger is `xfce4-session`'s SPECIFIC X11 traffic, not elapsed time and not X client
+  connections in general. So the two open blockers were never two: **there is ONE bug, the Xvfb
+  SIGSEGV.** Do NOT reopen DISPLAY/`getenv()`/envp/
   the ELF loader stack (all independently proven correct, 30th pass, LD_PRELOAD interposer,
   19/19 correct `:1` reads) and do NOT spend another pass on a `cdb -pv` attach to
   `xfce4-session` — it is not the faulting process.
@@ -220,24 +252,39 @@ CURRENT STATE those passes converged on:
   frame0 `0x1b20ed`, **frame3 `0x74391` (the Xvfb caller of the faulting memcpy — the call site
   wanted)**, frame4 `0x7530a`, frame5 `0x67f14`, frame6 `0xf631d`, frame7 `0x8254b`,
   frame8 `0x15444b`, frame9 `0x158514`, frame12 `0x447e1`. Against stock `.wfgy/xvfb.debug` those
-  offsets give an INCOHERENT chain (SELinux + `XkbCopyKeymap` + `glxProbeDriver` + `fbBlt`
-  together) and frame12 lands in `fbBlt` rather than `_start` (`0x3fa00`, delta `0x4DE1`).
-  Since the base is now proven correct, the remaining explanation is that **litebox's runtime ELF
-  REWRITER shifts the running Xvfb's layout relative to stock DWARF** (it inserts syscall
-  trampolines; AGENTS.md already records it corrupting `libLLVM.so.19.1`'s `.dynsym`).
-  **CONSTANT-SHIFT TESTED AND IT DOES NOT RESOLVE IT** (38th pass): every delta in the only
-  admissible window `0x4DBF..0x4DE1` (the range that puts frame12 inside `_start`'s 34 bytes)
-  leaves frames 3-9 incoherent — `PanoramiXCopyPlane` + `PanoramiXPolyArc` +
-  `XineramaXvShmPutImage` + `input_option_set_value` + `ProcessVelocityData2D`, which is not a
-  call chain, and Xvfb does not even run Panoramix. Note frame12 mapping to `_start` is CIRCULAR
-  evidence (the delta was solved to make it do that), so it confirms nothing on its own.
-  **Leading conclusion, needs one confirmation: frames 3-9 are not a true call chain at all** —
-  xorg's `xorg_backtrace()` falls back to glibc `backtrace()`, a frame-pointer walk, and on a
-  `-fomit-frame-pointer` build that yields plausible-but-stale STACK WORDS. That matches the
-  32nd pass's own independent observation that "a naive raw-stack-word scan surfaced 4
-  plausible-but-probably-stale candidates". If so, only frames 1-2 (signal frame + the faulting
-  glibc memcpy) are trustworthy, the call site is still NOT in hand, and the next pass needs
-  genuine CFI unwinding rather than more symbolization of these nine offsets. `cdb` remains refuted as a
+  offsets give an incoherent chain. **RESOLVED, 38th pass: the Xvfb frames 0 and 3-9 are GARBAGE,
+  and litebox itself is why.** Do not spend another minute symbolizing them.
+  - The rewriter-shifts-layout theory is **REFUTED by bytes**: the actual rewritten `/usr/bin/Xvfb`
+    pulled out of `.litebox-cache` (4 copies, md5-identical, Build ID
+    `6440f00c805782c9a39a5acd92855079e9fffc92` = exact match to `.wfgy/xvfb.debug`) has program
+    headers and section addresses **byte-identical** to stock (`.text 0x33900` len `0x166a45`,
+    entry `0x3fa00`). `litebox_syscall_rewriter` patches IN PLACE (5-byte `jmp` + `nop` padding
+    into a trampoline region mapped +16MiB away, `DEFAULT_RESERVED_SPACE_SIZE`). **Zero address
+    movement**, so both constant- and non-uniform-shift are dead.
+  - The frames are **not code**: sweeping all 1.2M byte-aligned bases in the feasible range
+    against the 20532 real return addresses, best agreement is 4/9 at a non-page-aligned base —
+    exactly chance (p≈0.0139/frame); no page-aligned base reaches 3/9. At the true base 0/9 are
+    return addresses and frame0 (`0x1b20ed`) is in `.eh_frame_hdr`, not executable at all.
+    Base-independent kill shot: `f12 - f9 = -0x113D33` while `_start - main = -0x10`.
+  - **ROOT CAUSE — a real litebox defect that corrupts EVERY guest backtrace in this project.**
+    libunwind's x86_64 `unw_is_signal_frame()` identifies the sigreturn trampoline by matching
+    the literal 9 bytes `48 c7 c0 0f 00 00 00 0f 05` (`mov $0xf,%rax; syscall`) at the IP. In the
+    REWRITTEN libc, `__restore_rt` now reads `e9 40 42 1b 00` (`jmp`) + `90 90 90 90` — the
+    rewriter replaced exactly those 9 bytes, and zero raw `syscall` instructions remain anywhere
+    in the rewritten libc. So signal-frame detection fails, libunwind never reads the `ucontext`,
+    and the walk desyncs into its RBP-chain fallback — which is why every frame prints `?+0x0`
+    and why only the ends (the `__restore_rt` word, the faulting IP, the `__libc_start_main`
+    pair) are real. **Fix the rewriter to preserve the sigreturn signature in `__restore_rt` (or
+    special-case `rt_sigreturn` trampolines) and every guest backtrace in this project starts
+    working.** That is the highest-leverage diagnostic fix available and is NOT yet implemented.
+  - **What IS trustworthy from the capture**: `f2 = libc+0x162abd` = `vmovdqu (%rsi),%ymm0`, the
+    32-64-byte path of `__memmove/__memcpy_avx_unaligned_erms`, with `%rsi = 0x7feffecdd400` —
+    the first concrete confirmation of AGENTS.md's AVX2 claim at instruction granularity. Useful
+    constants: libc base `0x7fefedd3b000` in BOTH runs (glibc Debian 2.41-12+deb13u3); the fault
+    address sits ~20MB below `TASK_ADDR_MAX` (`0x7ff000000000`), well above libc's top, i.e. in
+    the high mmap/stack region and inside NEITHER module. The Xvfb call site remains unrecovered;
+    next capture should be `LITEBOX_DIAG_FATALDUMP=1` (guest rsp/rbp + raw stack) unwound offline
+    against `.eh_frame`, not another symbolization attempt. `cdb` remains refuted as a
   capture method for this crash (it perturbs the X11-traffic race); the pipe-stderr capture
   above supersedes it entirely and needs no debugger.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass, live evidence: a
