@@ -234,6 +234,73 @@ CFI-based unwinding (no tool for this readily available this pass) or upstream X
 cross-reference; full evidence, every ruled-out hypothesis, exact repro, and the flakiness
 profile (2 clean captures / 6 attempts, unrelated to the fix): archive.
 
+**Thirty-third pass (2026-09-22) — NEW, unrelated bug found+FIXED: `ldconfig` (and any other
+static-PIE binary) double-relocated and reliably SIGSEGVs, in total isolation, no fork/concurrency
+needed; the `Xvfb`-liveness-at-`DE_FAILED` question answered from existing log evidence, not
+re-verified live this pass (see why below).**
+
+`ldconfig` SIGSEGV (three separate hits in a real `debian-xfce` boot, `comm=ldconfig`, all
+`Signal(11)`) reproduces standalone: `litebox_runner...exe -Z --oci-image
+docker.io/linuxserver/webtop:debian-xfce -- /usr/sbin/ldconfig -p` SIGSEGVs 100% of the time with
+ZERO other guest processes alive — ruling out every fork/collision/concurrent-corruption hypothesis
+outright. `readelf -h` on the real cached binary: `Type: DYN`, `static-pie linked`, no `PT_INTERP`.
+Root cause: `litebox_shim_linux/src/loader/elf.rs`'s `ElfLoader::load` applied
+`R_X86_64_RELATIVE`/RELR relocations itself for any no-`PT_INTERP` `ET_DYN` (static-PIE) binary, on
+the premise (stated in its own prior comment) that this matches what the real kernel's
+`binfmt_elf.c` does. It does not — `binfmt_elf.c` never processes `PT_DYNAMIC` relocations for ANY
+ELF type; a static-PIE binary's OWN libc startup (glibc's `_dl_relocate_static_pie`, musl's
+`_dlstart_c`) unconditionally self-relocates before `main()`, precisely so it works under a kernel
+with zero relocation support, and has no way to detect a loader already did this for it. Litebox's
+extra pass double-applied the fixups: `apply_relr_relocations`'s formula adds `base_addr` to a
+slot's PRE-EXISTING content (RELR carries no explicit addend), so a second, redundant application
+adds `base_addr` again, corrupting every RELR-covered pointer to roughly double its correct value
+— confirmed via a live `LITEBOX_DIAG_FATALDUMP=1` VEH register capture: crash instruction `add
+(%rbx),%rdx` (bytes `48 03 13`), `rbx=0x2200f12a0` (unmapped, `alloc_base=0x0`) sitting almost
+exactly at 2×`r8`/`r11` (`0x1100f12a0`, itself base-address-shaped against `main_base=0x110000000`
+from the same boot's own `diag-elf-load` trace). Plain (non-RELR) `DT_RELA` fixups are idempotent
+under double application (same fixed `base+addend` formula, same target, both times), so this bug
+was silently latent — this is almost certainly the FIRST static-PIE binary using the modern
+RELR-compressed encoding this whole 32-pass investigation ever ran to this point (every previously-
+diagnosed binary was either dynamically-linked `ET_DYN` with a real interpreter, or non-PIE
+`ET_EXEC`). **Fix (`84a98bf`)**: never apply relocations from litebox's own loader for either
+branch — the main executable now always loads with `apply_relocations=false`, matching real kernel
+behavior uniformly. Verified: the same isolated `ldconfig -p` repro now runs to completion and
+prints the real library cache. `apply_relocations`/`apply_relr_relocations`
+(`litebox_common_linux/src/loader.rs`) are now unreachable and can be deleted in a future pass once
+confirmed there is no other caller.
+
+**`Xvfb`-liveness question, answered from EXISTING evidence (`.wfgy/final_verify_boot2.log`, a
+release-binary boot captured by the orchestrating session just before this pass), not a fresh live
+check**: that log's `XVFB_FAILED` (fired ~75s in, before `DBUS_UP`) has ZERO Xvfb fatal-signal /
+crash-diagnostic lines anywhere near it or afterward — unlike the thirty-second pass's own
+deterministic Xvfb memcpy SIGSEGV, which always produces a distinct `fatal signal`+`[veh-regs]`
+pair when it fires, and did not fire in this log at all. The only fatal signals in that whole boot
+were one `sh` SIGABRT at ~8s and the three (now-fixed) `ldconfig` SIGSEGVs at ~78-96s. This is
+consistent with the already-documented (26th/30th pass) `xset q` liveness-check race: Xvfb almost
+certainly stayed alive and never crashed in this run; the EARLY `XVFB_FAILED` marker is the
+health-check itself losing a narrow startup-timing race, not evidence of a real death. The
+downstream `xfce4-session: Cannot open display: .` at `DE_FAILED` (~171s) remains the pass-28/29/30
+mystery, already refuted down to "something inside `xfce4-session`'s own process" — this pass adds
+no new evidence there.
+
+**Why no fresh live re-verification**: three consecutive attempts this pass (one debug binary via
+`Start-Process` array args — also re-confirms AGENTS.md's own `Start-Process` redirect warning is
+at minimum unreliable, not merely "instant exit with zero output"; one debug binary via the
+correct `& ... *> log` form; one release binary via the correct form) all died within the first
+10-45s — well BEFORE Xvfb ever starts — repeatedly hitting `bash` printing glibc's own `double free
+or corruption (out)` immediately followed by SIGSEGV, over and over, during `webtop_stack.sh`'s
+own `NGINX_SELFTEST` curl-retry loop. This is the SECOND, already-documented ADVISORY-001
+corruption signature ("Open here" section, above) that the `GLIBC_TUNABLES` workaround does not
+fully close under heavy fork load — explicitly NOT to be re-attempted as a tunable-coverage gap
+without evidence of a THIRD mechanism, and none was found here. Host state at the time: unusually
+heavy concurrent load from unrelated processes (`Discord`/`chrome`/this session's own `claude`
+process together consuming most available CPU) and free RAM down to ~4GB from a healthier ~6.6GB
+at session start — the most likely aggravating factor, consistent with this corruption class's own
+documented sensitivity to fork-load/timing. Pickup: rerun the full `webtop_stack.sh` boot
+(release binary, this pass's `ldconfig` fix already in place) once host load is quieter; if the
+same early `bash` corruption recurs even then, that would be new evidence worth its own pass rather
+than a repeat of already-settled Track B territory.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
