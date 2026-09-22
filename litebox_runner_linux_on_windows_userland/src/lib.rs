@@ -666,6 +666,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         Tar { mmap: MmappedFile },
         OciLayers {
             layers: Vec<std::borrow::Cow<'static, [u8]>>,
+            resolved_layers_json: String,
         },
     }
 
@@ -700,6 +701,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         RootfsSource::OciLayers {
             layers: pulled.layers,
+            resolved_layers_json,
         }
     } else {
         let tar_file = cli_args
@@ -826,8 +828,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
         match rootfs_source {
             RootfsSource::Tar { mmap } => shim_builder.default_fs(in_mem, mmap.data.into()),
-            RootfsSource::OciLayers { layers } => {
-                shim_builder.default_fs_multi_layer(in_mem, layers)
+            RootfsSource::OciLayers {
+                layers,
+                resolved_layers_json,
+            } => match read_merged_rootfs_index_cache(&resolved_layers_json) {
+                Some(entries) => {
+                    shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, layers, entries)
+                }
+                None => {
+                    let (fs, freshly_built) = shim_builder.default_fs_multi_layer(in_mem, layers);
+                    if let Some(entries) = &freshly_built {
+                        write_merged_rootfs_index_cache(&resolved_layers_json, entries);
+                    }
+                    fs
+                }
             }
         }
     };
@@ -1421,8 +1435,30 @@ fn diag_process_fork_globalstate_probe_inner() {
     }
 
     // `default_fs` is `default_fs_multi_layer` with a one-element list, so a tar and an OCI layer
-    // stack converge here exactly as they do in `run()`.
-    let fs = shim_builder.default_fs_multi_layer(in_mem, tar_layers);
+    // stack converge here exactly as they do in `run()`. `layer_digests_json` is only `Some` on
+    // the real `--oci-image` multi-layer path (see its own binding above) -- that's the SAME
+    // input the top-level `run()` boot used to key its own merged-index cache entry, so a fork
+    // child reads the exact entry its ancestor (or an earlier sibling) already populated instead
+    // of re-parsing+re-folding all `tar_layers` from scratch. See `merged_rootfs_index_cache_key`/
+    // `MergedRootfsIndexCache*`'s own doc comments for the full mechanism and the measured cost
+    // this removes (3.2-3.5s of the ~3.9s this child otherwise spends before it can even resume
+    // guest execution).
+    let fs = match &layer_digests_json {
+        Some(digests_json) => match read_merged_rootfs_index_cache(digests_json) {
+            Some(entries) => {
+                shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, tar_layers, entries)
+            }
+            None => {
+                let (fs, freshly_built) =
+                    shim_builder.default_fs_multi_layer(in_mem, tar_layers);
+                if let Some(entries) = &freshly_built {
+                    write_merged_rootfs_index_cache(digests_json, entries);
+                }
+                fs
+            }
+        },
+        None => shim_builder.default_fs_multi_layer(in_mem, tar_layers).0,
+    };
     diag_elapsed!("default_fs_multi_layer returned (rootfs indexed/merged)");
     let fs = std::sync::Arc::new(fs);
 
@@ -2152,6 +2188,170 @@ fn diag_process_fork_task_resume_probe(
         "[process_fork_diag] task-resume-probe (child): exiting with encoded status {encoded:#x}"
     );
     std::process::exit(encoded.cast_signed());
+}
+
+/// Format version for the on-disk merged-rootfs-index cache this module reads/writes (bump
+/// whenever `litebox::fs::tar_ro::{encode,decode}_merged_live_entries`'s wire format -- or
+/// anything else about what this cache stores -- changes shape; mirrors
+/// `litebox_syscall_rewriter::REWRITER_CACHE_VERSION`'s own bump discipline one cache layer down
+/// the pipeline).
+///
+/// # Why this cache exists
+///
+/// Measured live (`LITEBOX_DIAG_FORK_TIMING=1`, a real `debian-xfce` boot,
+/// `LITEBOX_PROCESS_FORK=1`): `default_fs_multi_layer returned (rootfs indexed/merged)` landed at
+/// 3.9-4.1s from a cross-process fork child's own start, of which `rootfs layers ready` (all 17
+/// per-layer cache entries served from the EXISTING `.litebox-cache` disk cache) landed at only
+/// 0.58-0.67s -- meaning `TarIndex::from_layers`'s own tar-parse-plus-whiteout-fold, not the
+/// layer bytes themselves, is 3.2-3.5s of EVERY SINGLE fork's startup, the dominant share by far.
+/// A live boot's WM-startup phase alone showed 12+ forks in well under a minute, each one
+/// independently, redundantly re-deriving the EXACT SAME merge result the very first process in
+/// the boot tree already computed -- concurrently-alive fork children were observed each holding
+/// ~800 MiB of working set for this, with host free RAM falling ~2.4 GiB in that same window
+/// (`docs/AGENTS_ARCHIVE_2026-09-22.md`, 56th pass). Since the base OCI layers never change
+/// within one boot, this merge is a pure, deterministic function of the resolved layer digest
+/// list -- exactly the kind of repeated, avoidable work `.litebox-cache`'s existing per-layer
+/// cache already exists to eliminate one stage earlier in this same pipeline. This cache applies
+/// the identical idea one stage later: cache the MERGE's own result, not just its raw inputs.
+const MERGED_ROOTFS_INDEX_CACHE_VERSION: u32 = 1;
+
+/// Build a compact, filesystem-safe cache-file identifier from `resolved_layers_json` (the same
+/// already-resolved-digest-list JSON string both `run()`'s own boot and every cross-process fork
+/// child already carry -- see `FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`). Not itself a correctness
+/// boundary: `read_merged_rootfs_index_cache` embeds and re-checks the FULL JSON string inside
+/// the cache file before trusting its contents, so a hash collision here can only ever cause an
+/// extra cache miss, never a wrong-data cache hit.
+fn merged_rootfs_index_cache_key(resolved_layers_json: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resolved_layers_json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn merged_rootfs_index_cache_path(cache_key: &str) -> std::path::PathBuf {
+    std::path::Path::new(".litebox-cache").join(format!(
+        "mergedidx_{cache_key}_v{MERGED_ROOTFS_INDEX_CACHE_VERSION}.bin"
+    ))
+}
+
+/// Look up a previously cached, whiteout-resolved rootfs merge for `cache_key`
+/// ([`merged_rootfs_index_cache_key`]'s output). `None` on ANY doubt -- missing file, I/O error,
+/// malformed contents, or (belt-and-suspenders against a hash collision in the cache_key itself)
+/// an embedded key that doesn't byte-for-byte match `resolved_layers_json` -- exactly the same
+/// "any doubt is a cache miss" discipline `litebox_packager::oci::cache::read_cached_layer`
+/// already applies one stage earlier in this pipeline. A miss just means the caller pays the real
+/// `TarRo::from_layers` cost this pass, same as if this cache didn't exist.
+fn read_merged_rootfs_index_cache(
+    resolved_layers_json: &str,
+) -> Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>> {
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let cache_key = merged_rootfs_index_cache_key(resolved_layers_json);
+    let path = merged_rootfs_index_cache_path(&cache_key);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            if diag {
+                eprintln!("[diag-mergedidx] MISS reading {}: {e}", path.display());
+            }
+            return None;
+        }
+    };
+    let Some(key_len) = bytes
+        .get(0..4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .map(|n| n as usize)
+    else {
+        if diag {
+            eprintln!("[diag-mergedidx] MISS {}: truncated key_len", path.display());
+        }
+        return None;
+    };
+    let Some(stored_key) = bytes
+        .get(4..4usize.checked_add(key_len)?)
+        .and_then(|s| core::str::from_utf8(s).ok())
+    else {
+        if diag {
+            eprintln!("[diag-mergedidx] MISS {}: truncated/invalid stored key", path.display());
+        }
+        return None;
+    };
+    if stored_key != resolved_layers_json {
+        if diag {
+            eprintln!(
+                "[diag-mergedidx] MISS {}: key mismatch (stored {} bytes, expected {} bytes)",
+                path.display(),
+                stored_key.len(),
+                resolved_layers_json.len()
+            );
+        }
+        return None;
+    }
+    let result = litebox::fs::tar_ro::decode_merged_live_entries(bytes.get(4 + key_len..)?);
+    if diag {
+        match &result {
+            Some(entries) => eprintln!(
+                "[diag-mergedidx] HIT {} ({} entries)",
+                path.display(),
+                entries.len()
+            ),
+            None => eprintln!("[diag-mergedidx] MISS {}: decode failed", path.display()),
+        }
+    }
+    result
+}
+
+/// Persist `entries` (a [`litebox::fs::tar_ro::TarRo::live_entries_after_merge`] result) as the
+/// cache entry for `resolved_layers_json`, for [`read_merged_rootfs_index_cache`] to find on a
+/// later, equivalent fork or boot. Best-effort and non-fatal, matching every other cache in this
+/// pipeline: a write failure (read-only filesystem, disk full, a losing race against a sibling
+/// fork writing the SAME entry concurrently) just means this pass, and every pass until someone
+/// succeeds, keeps paying the real build cost -- never worse than not having this cache.
+///
+/// Write-temp-then-rename, not a direct write: several sibling fork children can race to
+/// populate the SAME cache entry (they all compute the identical bytes, by construction), and a
+/// reader must never observe a torn/partial file mid-write -- same atomicity discipline
+/// `litebox_packager::oci::cache::write_cached_layer_inner` already uses one stage earlier.
+fn write_merged_rootfs_index_cache(
+    resolved_layers_json: &str,
+    entries: &[litebox::fs::tar_ro::MergedLiveEntry],
+) {
+    let cache_key = merged_rootfs_index_cache_key(resolved_layers_json);
+    let final_path = merged_rootfs_index_cache_path(&cache_key);
+    let Some(dir) = final_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(4 + resolved_layers_json.len());
+    bytes.extend_from_slice(&(resolved_layers_json.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(resolved_layers_json.as_bytes());
+    bytes.extend_from_slice(&litebox::fs::tar_ro::encode_merged_live_entries(entries));
+
+    let tmp_path = dir.join(format!(
+        ".tmp-mergedidx-{}-{}",
+        std::process::id(),
+        cache_key
+    ));
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    if std::fs::write(&tmp_path, &bytes).is_ok() {
+        let renamed = std::fs::rename(&tmp_path, &final_path);
+        if diag {
+            eprintln!(
+                "[diag-mergedidx] WROTE {} ({} entries, {} bytes) ok={}",
+                final_path.display(),
+                entries.len(),
+                bytes.len(),
+                renamed.is_ok()
+            );
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp_path);
+        if diag {
+            eprintln!("[diag-mergedidx] write FAILED for {}", final_path.display());
+        }
+    }
 }
 
 /// Export the writable upper layer of a layered file system (every file the guest created or

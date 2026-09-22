@@ -460,9 +460,17 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             self.platform,
             in_mem_fs,
             vec![tar_data],
+            // No caller of this single-pre-merged-tar path has any use for the resulting
+            // live-entry list (only the OCI multi-layer path's own redundant-rebuild problem
+            // needs it), so don't pay `live_entries_after_merge`'s own extra tree walk to produce
+            // one nobody will read.
+            MergeInput::BuildFresh {
+                capture_for_caller: false,
+            },
             self.proc_self_info.clone(),
             self.pts_registry.clone(),
         )
+        .0
     }
 
     /// Create a default layered file system whose read-only lower layer is built from MULTIPLE
@@ -472,19 +480,64 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// `litebox::fs::tar_ro::TarRo::from_layers`). Whiteout/opaque-whiteout merging across
     /// `tar_layers` happens entirely inside `TarRo::from_layers`, so this crate never sees or
     /// needs a pre-merged single tar for this path.
+    ///
+    /// The second return value is `Some(entries)` -- [`litebox::fs::tar_ro::TarRo::
+    /// live_entries_after_merge`]'s own output, captured as a side effect of the real
+    /// `TarRo::from_layers` build this method just did -- whenever the caller can usefully cache
+    /// it for a later, cheaper [`Self::default_fs_multi_layer_with_cached_merge`] call (see that
+    /// method's own doc comment for why). This crate has no on-disk cache of its own -- that
+    /// policy, and the disk I/O it needs, belongs to the caller (`litebox_runner_linux_on_
+    /// windows_userland`, which already owns `.litebox-cache`'s per-layer sibling cache).
     pub fn default_fs_multi_layer(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_layers: Vec<Cow<'static, [u8]>>,
+    ) -> (
+        DefaultFS<Platform>,
+        Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+    ) {
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            tar_layers,
+            MergeInput::BuildFresh {
+                capture_for_caller: true,
+            },
+            self.proc_self_info.clone(),
+            self.pts_registry.clone(),
+        )
+    }
+
+    /// Same as [`Self::default_fs_multi_layer`], but skips `TarRo::from_layers`'s own tar-parse
+    /// and whiteout-fold phases by building straight from an already-known
+    /// `TarRo::live_entries_after_merge` list instead (`TarRo::from_merged_live_entries`).
+    ///
+    /// Exists so a cross-process `LITEBOX_PROCESS_FORK=1` child -- which re-derives this SAME
+    /// read-only rootfs from scratch on every single fork, since each is a genuinely separate
+    /// Windows process with no shared heap for a `HashMap`/`BTreeMap`-shaped structure (see
+    /// `GlobalState`'s own "nested collections not actually shared" limitation) -- doesn't have
+    /// to pay `TarIndex::from_layers`'s full cost (measured live: 3.2-3.5s per fork, the dominant
+    /// share of total fork-child startup time) merely to rediscover a merge result that is, by
+    /// construction, bit-for-bit identical to the one the very first process in this fork tree
+    /// already computed. See `litebox::fs::tar_ro::TarRo::from_merged_live_entries`'s own doc
+    /// comment for why reusing that list instead of recomputing it is sound.
+    pub fn default_fs_multi_layer_with_cached_merge(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_layers: Vec<Cow<'static, [u8]>>,
+        merged_entries: Vec<litebox::fs::tar_ro::MergedLiveEntry>,
     ) -> DefaultFS<Platform> {
         default_fs(
             &self.litebox,
             self.platform,
             in_mem_fs,
             tar_layers,
+            MergeInput::UseCached(merged_entries),
             self.proc_self_info.clone(),
             self.pts_registry.clone(),
         )
+        .0
     }
 
     /// Build the shim.
@@ -1166,6 +1219,21 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
+/// How [`default_fs`] should obtain its `/`-mount `TarRo` backend.
+enum MergeInput {
+    /// Call `TarRo::from_layers` for real. `capture_for_caller` says whether to ALSO pay
+    /// `TarRo::live_entries_after_merge`'s own extra `O(final entry count)` tree walk afterward
+    /// and hand the result back through [`default_fs`]'s second return value -- worth it for
+    /// [`LinuxShimBuilder::default_fs_multi_layer`] (whose caller can cache the result for a
+    /// later, far cheaper rebuild), wasted work for [`LinuxShimBuilder::default_fs`]'s single-
+    /// pre-merged-tar callers, none of which have any use for it.
+    BuildFresh { capture_for_caller: bool },
+    /// Skip `TarRo::from_layers` entirely and build straight from an already-known
+    /// `live_entries_after_merge` list via `TarRo::from_merged_live_entries` -- see that
+    /// function's own doc comment for the soundness argument.
+    UseCached(Vec<litebox::fs::tar_ro::MergedLiveEntry>),
+}
+
 /// Create a default layered file system with the given in-memory layer and one or more
 /// (bottom-to-top) tar layers backing the read-only lower layer.
 fn default_fs<Platform: ShimPlatform>(
@@ -1173,9 +1241,23 @@ fn default_fs<Platform: ShimPlatform>(
     platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_layers: Vec<Cow<'static, [u8]>>,
+    merge_input: MergeInput,
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
-) -> LinuxFS<Platform> {
+) -> (
+    LinuxFS<Platform>,
+    Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+) {
+    // Populated as a side effect of the `/`-mount closure below, ONLY on the
+    // `BuildFresh { capture_for_caller: true }` branch -- `Composer::builder().mount`'s closure
+    // must return just the backend itself (`TarRo`), so there is no direct return path for this;
+    // a `RefCell` captured by reference is the plainest way to smuggle a second output out of a
+    // closure whose signature the caller (`Composer`) fixes. Read back once, immediately after
+    // `.build()` below returns (single-threaded, synchronous -- the closure has already run by
+    // then), never touched concurrently.
+    let freshly_built_entries: core::cell::RefCell<
+        Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+    > = core::cell::RefCell::new(None);
     // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
     // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
     let cpu_count = platform.cpu_count();
@@ -1334,13 +1416,25 @@ fn default_fs<Platform: ShimPlatform>(
     let tar_ro = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
-                litebox::fs::tar_ro::TarRo::from_layers(tar_layers, allocator)
+            .mount("/", |allocator| match merge_input {
+                MergeInput::UseCached(entries) => {
+                    litebox::fs::tar_ro::TarRo::from_merged_live_entries(
+                        tar_layers, entries, allocator,
+                    )
+                }
+                MergeInput::BuildFresh { capture_for_caller } => {
+                    let built = litebox::fs::tar_ro::TarRo::from_layers(tar_layers, allocator);
+                    if capture_for_caller {
+                        *freshly_built_entries.borrow_mut() =
+                            Some(built.live_entries_after_merge());
+                    }
+                    built
+                }
             })
             .build()
             .unwrap(),
     );
-    litebox::fs::layered::FileSystem::new(
+    let fs = litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
@@ -1350,7 +1444,8 @@ fn default_fs<Platform: ShimPlatform>(
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    )
+    );
+    (fs, freshly_built_entries.into_inner())
 }
 
 /// The `(min, max)` priority values Linux reports for a scheduling `policy`.

@@ -75,6 +75,214 @@ impl TarRo {
             tar_index: TarIndex::from_layers(layers, inode_allocator),
         }
     }
+
+    /// Every live (post-whiteout-merge) file/symlink this backend's tree holds, as a flat list
+    /// independent of the internal `dirs` tree's shape -- walked back out of the tree
+    /// [`from_layers`] already built, not retained separately. Paired with
+    /// [`from_merged_live_entries`] so a caller can cache this exact list and skip
+    /// [`from_layers`]'s two most expensive phases (parsing every layer's raw tar headers, then
+    /// folding them through whiteout resolution) on a later, equivalent build.
+    ///
+    /// [`from_layers`]: Self::from_layers
+    /// [`from_merged_live_entries`]: Self::from_merged_live_entries
+    #[must_use]
+    pub fn live_entries_after_merge(&self) -> Vec<MergedLiveEntry> {
+        let mut out = Vec::new();
+        self.tar_index.walk_live_entries(0, "", &mut out);
+        out
+    }
+
+    /// Rebuild a `TarRo` directly from a previously captured [`live_entries_after_merge`] list
+    /// and the SAME `layers` bytes it was captured against, skipping [`from_layers`]'s tar-parse
+    /// and whiteout-fold phases entirely -- only the comparatively cheap "build a directory tree
+    /// out of a flat live-entry list" phase (`O(final entry count)`, not `O(every entry any layer
+    /// ever contributed)`) still runs.
+    ///
+    /// # Why this is sound
+    ///
+    /// [`from_layers`] is a pure function of `layers`' bytes: the same layer bytes, applied in
+    /// the same order, always fold to the exact same live-entry set -- whiteout resolution has no
+    /// hidden input (no clock, no randomness, no host state). So a `live_entries_after_merge`
+    /// list captured from an earlier [`from_layers`] call against these SAME layer bytes is
+    /// exactly what a fresh [`from_layers`] call would compute again; this function only skips
+    /// redoing that work. The caller owns keying its cache of the captured list by something that
+    /// changes whenever the layer bytes could (e.g. the sorted OCI layer digest list plus the
+    /// rewriter version) -- this function does no validation that `entries` actually matches
+    /// `layers`, the same trust boundary `litebox_packager::oci::cache::read_cached_layer`
+    /// already accepts one level down the pipeline, for the per-layer bytes this builds on.
+    ///
+    /// [`from_layers`]: Self::from_layers
+    /// [`live_entries_after_merge`]: Self::live_entries_after_merge
+    #[must_use]
+    pub fn from_merged_live_entries(
+        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+        entries: Vec<MergedLiveEntry>,
+        inode_allocator: InodeAllocator,
+    ) -> Self {
+        Self {
+            tar_index: TarIndex::from_merged_live_entries(layers, entries, inode_allocator),
+        }
+    }
+}
+
+/// One post-whiteout-merge file or symlink, as [`TarRo::live_entries_after_merge`]/
+/// [`TarRo::from_merged_live_entries`] exchange it. `path` carries no leading `/`, matching the
+/// convention every path stored inside [`TarIndex`] already uses.
+#[derive(Clone)]
+pub struct MergedLiveEntry {
+    /// Full path from the tree root, no leading `/` (e.g. `"usr/bin/bash"`).
+    pub path: String,
+    /// What kind of entry this is, and its kind-specific data.
+    pub kind: MergedLiveEntryKind,
+}
+
+/// [`MergedLiveEntry`]'s kind-specific payload -- deliberately just the fields [`IndexedFile`]/
+/// [`IndexedSymlink`] hold minus `node_info`, which [`TarRo::from_merged_live_entries`] always
+/// re-allocates fresh (an inode number only needs to be self-consistent within the ONE process
+/// that allocated it; nothing requires it to match a value some earlier process, or an earlier
+/// build in this same process, happened to compute).
+#[derive(Clone)]
+pub enum MergedLiveEntryKind {
+    /// A regular file. `data_range` indexes into `layers[layer_idx]`, exactly as
+    /// [`IndexedFile::data_range`] does.
+    File {
+        /// Which `layers` element (by index) this file's bytes live in.
+        layer_idx: usize,
+        /// Byte range within `layers[layer_idx]` holding this file's contents.
+        data_range: Range<usize>,
+        /// POSIX permission bits.
+        mode: Mode,
+        /// Owning uid/gid.
+        owner: UserInfo,
+    },
+    /// A symlink.
+    Symlink {
+        /// The link's target, exactly as stored in the originating tar entry.
+        target: String,
+        /// Owning uid/gid.
+        owner: UserInfo,
+    },
+}
+
+/// 4-byte tag identifying [`encode_merged_live_entries`]'s output, bumped whenever the wire
+/// format changes shape (never whenever the semantics it captures change -- that is what a
+/// caller's own cache KEY, e.g. the OCI layer digest list, is for). [`decode_merged_live_entries`]
+/// refuses anything not starting with the CURRENT tag rather than guess at an old layout.
+const MERGED_LIVE_ENTRIES_MAGIC: [u8; 4] = *b"MLE1";
+
+/// Serialize `entries` into a compact binary format `TarRo::from_merged_live_entries`'s caller
+/// can write to a cache file and later hand to [`decode_merged_live_entries`] -- a deliberately
+/// simple, hand-rolled little-endian layout rather than a general serde-based one: this crate is
+/// `no_std`, the shape is small and fixed, and both ends live in this one module.
+#[must_use]
+pub fn encode_merged_live_entries(entries: &[MergedLiveEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + entries.len() * 48);
+    out.extend_from_slice(&MERGED_LIVE_ENTRIES_MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        write_len_prefixed_str(&mut out, &entry.path);
+        match &entry.kind {
+            MergedLiveEntryKind::File {
+                layer_idx,
+                data_range,
+                mode,
+                owner,
+            } => {
+                out.push(0);
+                out.extend_from_slice(&(*layer_idx as u64).to_le_bytes());
+                out.extend_from_slice(&(data_range.start as u64).to_le_bytes());
+                out.extend_from_slice(&(data_range.end as u64).to_le_bytes());
+                out.extend_from_slice(&mode.bits().to_le_bytes());
+                out.extend_from_slice(&owner.user.to_le_bytes());
+                out.extend_from_slice(&owner.group.to_le_bytes());
+            }
+            MergedLiveEntryKind::Symlink { target, owner } => {
+                out.push(1);
+                write_len_prefixed_str(&mut out, target);
+                out.extend_from_slice(&owner.user.to_le_bytes());
+                out.extend_from_slice(&owner.group.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn write_len_prefixed_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Decode what [`encode_merged_live_entries`] produced. `None` on ANY doubt about validity --
+/// wrong magic, truncated input, an out-of-range length, invalid UTF-8, or an unrecognized kind
+/// tag -- rather than partially trust a corrupt or foreign-format cache file. Mirrors
+/// `litebox_packager::oci::cache::read_cached_layer`'s own "any doubt is a cache miss" discipline
+/// one level down the pipeline.
+#[must_use]
+pub fn decode_merged_live_entries(bytes: &[u8]) -> Option<Vec<MergedLiveEntry>> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = pos.checked_add(n)?;
+        let slice = bytes.get(*pos..end)?;
+        *pos = end;
+        Some(slice)
+    };
+    let read_u16 = |pos: &mut usize| -> Option<u16> {
+        Some(u16::from_le_bytes(take(pos, 2)?.try_into().ok()?))
+    };
+    let read_u32 = |pos: &mut usize| -> Option<u32> {
+        Some(u32::from_le_bytes(take(pos, 4)?.try_into().ok()?))
+    };
+    let read_u64 = |pos: &mut usize| -> Option<u64> {
+        Some(u64::from_le_bytes(take(pos, 8)?.try_into().ok()?))
+    };
+    let read_str = |pos: &mut usize| -> Option<String> {
+        let len = read_u32(pos)? as usize;
+        let raw = take(pos, len)?;
+        core::str::from_utf8(raw).ok().map(String::from)
+    };
+
+    if take(&mut pos, 4)? != MERGED_LIVE_ENTRIES_MAGIC {
+        return None;
+    }
+    let count = read_u32(&mut pos)? as usize;
+    let mut out = Vec::with_capacity(count.min(1 << 20));
+    for _ in 0..count {
+        let path = read_str(&mut pos)?;
+        let tag = *take(&mut pos, 1)?.first()?;
+        let kind = match tag {
+            0 => {
+                let layer_idx = read_u64(&mut pos)? as usize;
+                let start = read_u64(&mut pos)? as usize;
+                let end = read_u64(&mut pos)? as usize;
+                if end < start {
+                    return None;
+                }
+                let mode = Mode::from_bits_truncate(read_u32(&mut pos)?);
+                let user = read_u16(&mut pos)?;
+                let group = read_u16(&mut pos)?;
+                MergedLiveEntryKind::File {
+                    layer_idx,
+                    data_range: start..end,
+                    mode,
+                    owner: UserInfo { user, group },
+                }
+            }
+            1 => {
+                let target = read_str(&mut pos)?;
+                let user = read_u16(&mut pos)?;
+                let group = read_u16(&mut pos)?;
+                MergedLiveEntryKind::Symlink {
+                    target,
+                    owner: UserInfo { user, group },
+                }
+            }
+            _ => return None,
+        };
+        out.push(MergedLiveEntry { path, kind });
+    }
+    // Trailing garbage past the last entry is tolerated (forward-compatible growth room), not
+    // rejected -- only a SHORT read (an in-range access failing) is treated as corruption above.
+    Some(out)
 }
 
 impl super::backend::private::Sealed for TarRo {}
@@ -750,6 +958,165 @@ impl TarIndex {
     fn file_data(&self, file_idx: usize) -> &[u8] {
         let file = &self.files[file_idx];
         &self.layers[file.layer_idx][file.data_range.clone()]
+    }
+
+    /// Depth-first walk of the already-built `dirs` tree, appending every file/symlink it
+    /// reaches as a [`MergedLiveEntry`] -- the inverse of [`Self::from_merged_live_entries`]'s
+    /// own tree-build loop. `prefix` is the path of `dir_idx` itself (`""` for the root, no
+    /// leading or trailing `/`), matching every path already stored in this index.
+    fn walk_live_entries(&self, dir_idx: usize, prefix: &str, out: &mut Vec<MergedLiveEntry>) {
+        for (name, child) in &self.dirs[dir_idx].children {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                alloc::format!("{prefix}/{name}")
+            };
+            match *child {
+                IndexedChild::File(idx) => {
+                    let file = &self.files[idx];
+                    out.push(MergedLiveEntry {
+                        path,
+                        kind: MergedLiveEntryKind::File {
+                            layer_idx: file.layer_idx,
+                            data_range: file.data_range.clone(),
+                            mode: file.mode,
+                            owner: file.owner,
+                        },
+                    });
+                }
+                IndexedChild::Symlink(idx) => {
+                    let symlink = &self.symlinks[idx];
+                    out.push(MergedLiveEntry {
+                        path,
+                        kind: MergedLiveEntryKind::Symlink {
+                            target: symlink.target.clone(),
+                            owner: symlink.owner,
+                        },
+                    });
+                }
+                IndexedChild::Dir(idx) => {
+                    self.walk_live_entries(idx, &path, out);
+                }
+            }
+        }
+    }
+
+    /// The tail half of [`Self::from_layers`] (build a `dirs` tree from a flat live-entry list),
+    /// fed by a previously captured [`MergedLiveEntry`] list instead of a freshly parsed-and-
+    /// folded `live` map -- skips [`Self::parse_layer`] and the whiteout fold entirely. See
+    /// [`TarRo::from_merged_live_entries`]'s own doc comment for the soundness argument.
+    fn from_merged_live_entries(
+        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+        entries: Vec<MergedLiveEntry>,
+        inode_allocator: InodeAllocator,
+    ) -> Self {
+        let mut files = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut dirs = alloc::vec![IndexedDir {
+            owner: None,
+            node_info: inode_allocator.next(),
+            children: HashMap::new(),
+        }];
+        let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
+        // `entries` comes from `walk_live_entries`'s depth-first walk, which visits every entry
+        // under the same directory consecutively -- so, overwhelmingly, an entry's immediate
+        // parent is the SAME directory the entry right before it was just placed in. Remembering
+        // that one (parent path, parent dir index) pair turns the common case into an O(1)
+        // string comparison instead of `ensure_ancestors`'s full split-and-hash-lookup of every
+        // ancestor component, which is what made an earlier version of this function take nearly
+        // as long as the `TarIndex::from_layers` rebuild it exists to replace (measured live: a
+        // 71k-entry `debian-xfce` merge's tree-build phase alone, without this, cost ~1.8s of a
+        // fork child's ~2.4s total -- see `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 56th pass).
+        let mut last_parent: Option<(alloc::string::String, usize)> = None;
+
+        for entry in entries {
+            let (parent_path, name) = match entry.path.rsplit_once('/') {
+                Some((p, n)) => (p, n),
+                None => ("", entry.path.as_str()),
+            };
+            match entry.kind {
+                MergedLiveEntryKind::File {
+                    layer_idx,
+                    data_range,
+                    mode,
+                    owner,
+                } => {
+                    // Never trust a cached entry's byte range blindly: `Self::file_data` indexes
+                    // `layers[layer_idx][data_range]` unchecked, so an out-of-bounds cache entry
+                    // (a stale cache surviving a layer-bytes change some other invalidation
+                    // signal missed, or plain disk corruption) would panic a guest-reachable read
+                    // instead of just serving a wrong/missing file -- see this crate's standing
+                    // "guest-reachable code returns an errno, never a panic" rule. Silently
+                    // dropping the one bad entry (best-effort, matching
+                    // `litebox_packager::oci::cache::read_cached_layer`'s own "any doubt, skip
+                    // it" discipline) is strictly safer than trusting it or aborting the whole
+                    // rebuild over one entry.
+                    let Some(layer_len) = layers.get(layer_idx).map(|l| l.len()) else {
+                        continue;
+                    };
+                    if data_range.end > layer_len {
+                        continue;
+                    }
+                    let file_idx = files.len();
+                    files.push(IndexedFile {
+                        layer_idx,
+                        data_range,
+                        mode,
+                        owner,
+                        node_info: inode_allocator.next(),
+                    });
+                    let parent_dir_idx = match &last_parent {
+                        Some((cached_parent, idx)) if cached_parent == parent_path => *idx,
+                        _ => {
+                            let (idx, _name) = ensure_ancestors(
+                                &mut dirs,
+                                &mut dirs_by_path,
+                                &entry.path,
+                                owner,
+                                &inode_allocator,
+                            );
+                            last_parent = Some((parent_path.into(), idx));
+                            idx
+                        }
+                    };
+                    dirs[parent_dir_idx]
+                        .children
+                        .insert(name.into(), IndexedChild::File(file_idx));
+                }
+                MergedLiveEntryKind::Symlink { target, owner } => {
+                    let symlink_idx = symlinks.len();
+                    symlinks.push(IndexedSymlink {
+                        target,
+                        owner,
+                        node_info: inode_allocator.next(),
+                    });
+                    let parent_dir_idx = match &last_parent {
+                        Some((cached_parent, idx)) if cached_parent == parent_path => *idx,
+                        _ => {
+                            let (idx, _name) = ensure_ancestors(
+                                &mut dirs,
+                                &mut dirs_by_path,
+                                &entry.path,
+                                owner,
+                                &inode_allocator,
+                            );
+                            last_parent = Some((parent_path.into(), idx));
+                            idx
+                        }
+                    };
+                    dirs[parent_dir_idx]
+                        .children
+                        .insert(name.into(), IndexedChild::Symlink(symlink_idx));
+                }
+            }
+        }
+
+        Self {
+            layers,
+            files,
+            dirs,
+            symlinks,
+        }
     }
 }
 
