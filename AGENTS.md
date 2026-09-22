@@ -248,6 +248,87 @@ CURRENT STATE those passes converged on:
   NOT (as hoped) eliminate the Xvfb SIGSEGV either, consistent with the magic-number analysis above
   (litebox's `f_type` is `TMPFS_MAGIC`, never `SELINUX_MAGIC`, before or after this fix). Full
   evidence and log paths: `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 40th-pass entry.
+- **41st pass (2026-09-22) — live `cdb` attach finally attempted; the "cdb perturbs the race" belief
+  is CONFIRMED, not refuted, by a clean 3-way A/B; pointer provenance narrowed with live register
+  evidence; still no fix.** Rebuilt `target/debug` clean at current HEAD (`35f7c92`). **(1) Clean
+  control, no debugger**: `.wfgy/xvfb_control42_boot.log`, `LITEBOX_PROCESS_FORK=1`,
+  `LITEBOX_DIAG_FATALDUMP=1`, no cdb — crashed within ONE `WM_POLL` cycle (~10s after
+  `xfce4-session` starts), bit-identical `0x7feffecdd400`, matching every prior pass. **(2) Live
+  `cdb -p` attach with `sxe -c "gn" -c2 "r;k;.exr -1;u . L20;!analyze -v;qd" av`** (auto-continue
+  every first-chance AV cheaply — required to ever intercept the real one, since litebox's own VEH
+  returns `EXCEPTION_CONTINUE_SEARCH` on the unrecovered fault, which under a real debugger routes to
+  a genuine second-chance event, confirmed by reading `litebox_platform_windows_userland/src/lib.rs`
+  before attaching): attach succeeded cleanly (`.wfgy/xvfb_cdb41_22012.log`), boot proceeded through
+  `DBUS_UP`→`DE_LAUNCHED_DIRECT`→all 12 `WM_POLL` iterations→`DE_FAILED after 60s`→600s `HOLD`
+  loop with Xvfb alive and burning CPU throughout (208s→262s+) — **but NO second-chance AV ever
+  fired in 10+ minutes**, vastly outside the crash's normal ~10-30s window; cdb itself burned
+  500-600+ CPU-seconds intercepting the frequent benign first-chance AVs (litebox's own documented
+  FS_BASE-reset recovery class), host RAM dipped to ~1.1GB free at one point (recovered). Killed and
+  discarded (not one of this project's forbidden concurrent-full-verification runs — this is the
+  lightweight `de_only.sh` isolation harness, and the two were never run overlapping). **(3) A
+  single, UNCONDITIONAL one-shot `bp <fixed rip>` breakpoint** (no `sxe`, zero exception-interception
+  overhead — `rip` is bit-identical across every capture, live and static, so a plain code breakpoint
+  is valid): hit almost immediately, but on an unrelated, harmless call through the SAME
+  `__memmove_avx_unaligned_erms` dispatch point (`rdx=0x224`, 548 bytes, read succeeded) — this libc
+  entry point is shared by many ordinary memmove/memcpy call sites, not just the crashing one. The
+  command auto-detached (`qd`) after this one hit, confirmed Xvfb still alive
+  (`.wfgy/xvfb_bp44_13552.log`) — and **within the next 1-2 seconds, with NO debugger attached at
+  all, the real crash fired** at the bit-identical address (`.wfgy/xvfb_bp44_boot.log:6484`). A
+  same-PID reattach attempt 2 seconds later got `NTSTATUS 0xC000010A` ("attempt to access an exiting
+  process") — Xvfb was already mid-death. **Verdict**: a bare, momentary attach+detach does NOT
+  suppress the crash (it fired essentially the instant debugger overhead was removed) — it is
+  specifically SUSTAINED interception/overhead (catching and handling every one of the frequent
+  benign first-chance AVs) that reliably delays/prevents it, not "any debugger presence" per se. The
+  32nd-pass caution was directionally right for the ONLY interception method every pass before this
+  one could have used (blanket `sxe av`); it does not apply to a zero-overhead code breakpoint.
+  **Concrete recipe for a future clean live capture, not yet executed**: a SINGLE persistent cdb
+  session, attached once (no detach/reattach gap), with a CONDITIONAL breakpoint —
+  `bp 0x7fefede9dabd ".if (@rdx = 0x40) {r;k;.exr -1;u . L20;!analyze -v;qd} .else {gc}"` (the
+  `.if`/`.else` cdb block syntax, `gc` = go-from-conditional-breakpoint, cheaper than a full `g`) —
+  filters out the many unrelated calls through this same dispatch point at near-zero cost and should
+  finally catch the ACTUAL crashing call with live register/stack access, never needing `sxe` at all.
+  This exact one-shot version (without the `.if` filter) was verified syntactically valid and DOES
+  attach/set/hit correctly (see step 3 above) — only the conditional-filter variant remains
+  untested end-to-end as one continuous session. **Pointer provenance, now with live register
+  confirmation** (previously only inferred from static capture logs): `TASK_ADDR_MAX` for this
+  platform is exactly `0x7FEFFFFF0000` (`HOST_ALLOCATOR_REGION_MIN - 0x10000`,
+  `litebox_platform_windows_userland/src/lib.rs:7443,7454` — NOT the `lpMaximumApplicationAddress`
+  the boot log's own "Max user address" line prints, which is a different, Windows-host-only value);
+  fault address `0x7feffecdd400` = `TASK_ADDR_MAX - 0x1312C00` exactly (19,999,744 bytes / 19.07 MiB
+  below the ceiling — arithmetic now verified, not just asserted). `rip=0x7fefede9dabd`,
+  `rdx=0x40` (64 bytes) and the live disassembly (`vmovdqu ymm0,[rsi]` / `cmp rdx,40h` / `ja` / the
+  paired tail-copy `vmovdqu ymm1,[rsi+rdx-20h]` — glibc's real `(32,64]`-byte memmove fast path) are
+  bit-identical across every capture, this pass included. **New finding**: `rdi`/`rax` (destination,
+  inside Xvfb's own non-PIE image) sit at a FIXED offset from Xvfb's own load base
+  (`+0x1572d88`), but Xvfb's own base itself is NOT fixed across boots (`0xc4100000000` one run,
+  `0x14c10000000` another, both this pass) — while `rsi`/the fault address stays bit-identical
+  regardless, and glibc's own base is ALSO bit-identical across every boot
+  (`0x7fefedd3b000`, ~271 MiB below the fault address — ruling out "just past glibc's own mapped
+  image" as the source). The wild source pointer is therefore computed entirely independent of
+  Xvfb's own (apparently non-deterministic) placement, and must derive from the DETERMINISTIC
+  top-down shared-library-region layout alone. Windows' own view of the fault address:
+  `type=0x0 protect=0x1 alloc_base=0x0` (`.wfgy/de_only_postfix_1.log:4146`,
+  `.wfgy/xvfb_control42_boot.log`, both bit-identical) — genuinely FREE, unreserved memory, never
+  mapped by litebox OR Windows. This is a DIFFERENT failure signature from the already-known,
+  already-disabled "crowded top-down packing" bug (`litebox/src/mm/linux.rs:2439-2510`'s `if false`
+  step 1.5, a WRITE into a PRESENT-but-wrong-permission page) — that disabled fix is real and
+  plausibly related (same top-down-allocator root cause family, and its own doc comment cites
+  measured gap sizes, 16.79-18.83 MB, in the same order of magnitude as this crash's 19.07 MB), but
+  is NOT a confirmed match for THIS crash's exact mechanism (free vs. present-wrong-permission) and
+  should not be blind-enabled without live confirmation. **The exact caller remains unresolved** —
+  no capture this pass got a trustworthy resolved stack for the ACTUAL crashing call (the live `k`
+  walk only ever captured the harmless, unrelated hit); the 40th pass's `ProcSELinuxGetClientContext`
+  attribution stays REFUTED and closed. **Net state**: cdb-perturbation question answered for good
+  (own root cause: sustained AV-interception overhead, not attachment itself); pointer provenance
+  narrowed (independent of Xvfb's own base, tied to the deterministic library region, genuinely
+  unmapped not mis-permissioned); no fix landed. **Pickup, in order**: (1) run the conditional-
+  breakpoint recipe above as ONE continuous session (never detach before the real hit) to finally get
+  a live, trustworthy register/stack capture of the ACTUAL crashing call, then resolve its caller
+  against `.wfgy/xvfb.debug` and cross-check with a second independent capture before trusting it
+  (this project's own standing lesson, twice-learned now); (2) once a real caller is known, decide
+  whether the disabled `litebox/src/mm/linux.rs:2439-2510` step-1.5 top-down-packing fix is actually
+  the same root cause (live-test by enabling it in isolation, on its own, exactly as its own comment
+  already prescribes) or a separate-but-related defect needing its own fix.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass, live evidence: a
   full `LITEBOX_PROCESS_FORK=1` release-binary boot reached its designed idle `HOLD` loop with zero
   freeze/SIGSEGV/tcache-corruption). `LITEBOX_PROCESS_FORK=1` is now the RECOMMENDED flag for
@@ -283,15 +364,25 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 1. **Xvfb's SIGSEGV — still the SINGLE top blocker** (`DE_FAILED` is a downstream symptom, not a
    second bug, 38th pass). The backtrace-corruption meta-bug that blocked investigating it is FIXED
    (39th pass, `7d66935`). The 39th pass's `ProcSELinuxGetClientContext` lead is REFUTED (40th
-   pass, real source read + the crash reproduces 2/2 with the `SELinux` X extension explicitly
-   disabled — see above); do not re-open it. Pickup, in order: (a) live `cdb -pv` attach on Xvfb
-   itself under `LITEBOX_PROCESS_FORK=1` (use `.wfgy/de_only.sh`/`de_only_seed.tar` for a fast,
-   clean ~2-minute repro to the crash — no `LITEBOX_DIAG_FATALDUMP` needed once a debugger is
-   attached), breaking on `__memmove_avx_unaligned_erms` or catching the access violation directly,
-   to get a REAL call stack instead of another raw-stack-word guess — not attempted by any pass to
-   date; (b) failing that, CFI-based unwinding against `.wfgy/xvfb.debug`'s DWARF `.eh_frame`; (c)
-   once a real caller is known, re-derive which litebox-emulated syscall (if any) it depends on
-   before assuming a litebox bug — the SELinux lead's own lesson this pass.
+   pass); do not re-open it. **41st pass**: live `cdb` attach finally attempted — blanket
+   `sxe av` interception reliably suppresses the crash (confirmed root cause: sustained
+   exception-handling overhead, not debugger presence per se — a bare attach+detach did NOT stop
+   it), so it is NOT a viable capture method; a plain unconditional breakpoint at the deterministic
+   `rip=0x7fefede9dabd` works (near-zero overhead, verified live) but fires on unrelated calls
+   through the same shared libc dispatch point. Pickup, in order: (a) ONE continuous cdb session,
+   attached once, with the CONDITIONAL breakpoint
+   `bp 0x7fefede9dabd ".if (@rdx = 0x40) {r;k;.exr -1;u . L20;!analyze -v;qd} .else {gc}"` (never
+   detach before the real hit — a detach/reattach gap is exactly when the 41st pass's own attempt
+   lost the race) to finally get a real, trustworthy register/stack capture of the ACTUAL crashing
+   call, not a nearby unrelated one; (b) resolve its caller against `.wfgy/xvfb.debug` and
+   cross-check with a second independent capture before trusting it (this project's own standing
+   lesson, twice-learned: 39th pass's raw-stack-word misattribution, 40th pass's own correction);
+   (c) once a real caller is known, live-test whether the already-known, already-DISABLED top-down
+   crowded-packing fix (`litebox/src/mm/linux.rs:2439-2510`'s `if false` step 1.5 — same allocator
+   family, same order-of-magnitude gap sizes, but a DIFFERENT fault signature: that bug is a WRITE
+   into a present-wrong-permission page, this crash is a READ from genuinely free/unmapped memory,
+   confirmed live `alloc_base=0x0`) is the same root cause or a separate one, by enabling it in
+   isolation exactly as its own comment prescribes.
 2. ~~`xfce4-session`'s `DE_FAILED` as an independent bug~~ — **REFUTED, 38th pass.** It is the
    Xvfb crash seen from downstream. Do not spend a pass attaching `cdb` to `xfce4-session`.
 2b. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
