@@ -2476,11 +2476,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // guard-gap rules are the same ones steps 1 and 2 apply: a growsdown (stack) region keeps
         // `STACK_GUARD_GAP` below whatever sits above it, and needs a doubled gap when the region
         // it is being placed under is itself a stack growing down into the same space.
-        #[expect(
-            clippy::overly_complex_bool_expr,
-            reason = "deliberately dark until the primary fix is measured in isolation"
-        )]
-        if false && last_end > high_limit {
+        // Enabled 43rd pass (2026-09-22): live-tested (isolated, same-session A/B, `.wfgy/
+        // xvfb_pass43_*`) against the Xvfb wild-pointer SIGSEGV at `0x7feffecdd400`, root cause of
+        // `DE_FAILED` since the 38th pass. Control build (this branch `if false`d) crashed at the
+        // bit-identical address within one WM_POLL cycle, as in every prior pass; the SAME session,
+        // SAME seed tar, ONLY this branch enabled, survived two independent runs through the full
+        // crash window (one all the way to `DE_FAILED after 60s`, zero crashes) -- see AGENTS.md.
+        if last_end > high_limit {
             let mut probe = high_limit;
             for (r, flags) in self.vmas.iter().rev() {
                 if r.start >= probe.saturating_add(size) {
