@@ -159,6 +159,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
             .ok_or(Errno::EBADF)?;
         handle.with_entry(|entry| netlink_op(entry))
     }
+
+    /// `true` only for a Unix-domain socket fd that is BOTH unbound (never `bind()`ed to a real
+    /// filesystem/abstract address) AND unconnected-to-a-named-peer -- i.e. one half of a
+    /// `socketpair(2)` result, real Linux's own definition of "unnamed" for this address family
+    /// (`unix(7)`: "an unnamed socket has no [...] pathname"). `false` for every other socket
+    /// kind/state, including a normal `connect()`ed client socket (X11, D-Bus): those always carry
+    /// a real peer address even though `getsockname()` on the CLIENT side is also often
+    /// `Unnamed` -- so this checks the PEER address too, not just the local one, to actually
+    /// distinguish "no real address was ever involved" (`socketpair`) from "this end just never
+    /// called `bind()`" (an ordinary autobind-free client). See `try_cross_process_fork`'s use of
+    /// this (`litebox_shim_linux/src/syscalls/process.rs`): a `socketpair(2)` pair is real Linux's
+    /// own mechanism for pre-`exec()` parent<->child bookkeeping (`dbus-daemon`'s babysitter
+    /// protocol, confirmed live against upstream `dbus-spawn-unix.c`'s `_dbus_socketpair` call use
+    /// this exact shape), so unlike an ordinary named-address CLOEXEC socket, dropping this kind
+    /// silently produces WRONG guest-visible behavior rather than a merely-unavailable-post-exec
+    /// fd -- see that call site's own doc comment for the full evidence chain.
+    pub(crate) fn raw_fd_is_addressless_unix_socket_pair(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        raw_fd: usize,
+    ) -> bool {
+        let Ok(raw_fd_u32) = u32::try_from(raw_fd) else {
+            return false;
+        };
+        self.with_socket_netlink(
+            global,
+            raw_fd_u32,
+            |_inet| Ok(false),
+            |unix| Ok(unix.get_local_addr() == UnixSocketAddr::Unnamed
+                && unix.get_peer_addr() == Some(UnixSocketAddr::Unnamed)),
+            |_netlink| Ok(false),
+        )
+        .unwrap_or(false)
+    }
 }
 
 /// Linux's `struct sockaddr_nl` (verified against the real kernel

@@ -56,11 +56,74 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessId, GetProcessTimes, INFINITE,
     InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows_sys::Win32::Foundation::FILETIME;
+
+/// Converts a `FILETIME` (100ns ticks since 1601-01-01) to a raw `u64`, matching how the two
+/// halves are meant to be combined (`dwLowDateTime`/`dwHighDateTime` per MSDN, not a native
+/// 64-bit read -- the struct is not guaranteed 8-byte aligned).
+fn filetime_to_u64(ft: FILETIME) -> u64 {
+    (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+}
+
+/// 53rd-pass diagnostic (`docs/AGENTS_ARCHIVE_2026-09-22.md`'s own pickup): real, independent
+/// Windows-level evidence for whether a cross-process-forked child's process HANDLE is being
+/// reported exited/signaled prematurely, ahead of `WaitForSingleObject`'s own return value --
+/// `dbus-daemon`'s activation babysitter was observed reporting "Process X exited, reason
+/// unknown" under 1ms after `fork()`, while the real target binary's `execve` did not appear
+/// until thousands of log lines (and materially later wall-clock time) afterward. Reads the
+/// process's OWN `GetProcessTimes` creation timestamp (set by the kernel at `CreateProcessW`
+/// time, independent of anything litebox's own code believes) and diffs it against
+/// `GetSystemTimeAsFileTime`'s "now" to report a real, kernel-sourced elapsed-ms-since-creation
+/// figure alongside the wait outcome -- this is NOT `Instant::now()` bookkeeping that could itself
+/// be wrong, it is what Windows itself says about this exact process. `eprintln!` (not
+/// `litebox_util_log`) deliberately: this module's other diagnostics use the same convention, and
+/// it must be visible with zero log-filter configuration required (see this pass's exact
+/// AGENTS.md-recorded default `EnvFilter`, which silences most `debug!` call sites by default).
+fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
+    unsafe {
+        let pid = GetProcessId(handle);
+        let mut creation = core::mem::zeroed::<FILETIME>();
+        let mut exit = core::mem::zeroed::<FILETIME>();
+        let mut kernel = core::mem::zeroed::<FILETIME>();
+        let mut user = core::mem::zeroed::<FILETIME>();
+        let got_times =
+            GetProcessTimes(handle, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user) != 0;
+        let mut now = core::mem::zeroed::<FILETIME>();
+        GetSystemTimeAsFileTime(&raw mut now);
+        let now_ticks = filetime_to_u64(now);
+        let creation_ticks = filetime_to_u64(creation);
+        let elapsed_ms_since_creation = if got_times && now_ticks >= creation_ticks {
+            (now_ticks - creation_ticks) / 10_000
+        } else {
+            u64::MAX
+        };
+        let mut exit_code: u32 = 0;
+        let got_exit_code = GetExitCodeProcess(handle, &raw mut exit_code) != 0;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
+        let wait_str = match wait_result {
+            WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
+            WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
+            WAIT_FAILED_V => "WAIT_FAILED",
+            _ => "WAIT_OTHER",
+        };
+        eprintln!(
+            "[wait4_diag] {tag} pid={pid} handle={handle:p} wait_result={wait_result:#x}({wait_str}) \
+             GetLastError={get_last_error} got_process_times={got_times} \
+             elapsed_ms_since_CreateProcessW={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
+             exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
+            if exit_code == STILL_ACTIVE { "STILL_ACTIVE" } else { "real_exit_code" },
+            exit_code == STILL_ACTIVE
+        );
+    }
+}
 
 /// Windows' `STILL_ACTIVE` sentinel (`GetExitCodeProcess` returns this as the "exit code" for a
 /// process that has not yet terminated) -- not re-exported by `windows_sys` at this crate's
@@ -4199,7 +4262,15 @@ fn copy_one_group(
 /// cross-process spawn primitive produces) that the caller has not already closed.
 pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
     unsafe {
-        WaitForSingleObject(handle, INFINITE);
+        // 53rd-pass diagnostic: capture real Windows-level evidence (kernel process-creation
+        // timestamp, actual WaitForSingleObject return value) BEFORE this call's own
+        // GetExitCodeProcess, to settle whether this blocking wait is genuinely returning early
+        // (a litebox-side bug) or genuinely correctly reporting a real, fast exit (pointing the
+        // bug elsewhere, e.g. inside the spawned child itself). See `diag_log_wait_evidence`'s doc
+        // comment for the full rationale and AGENTS_ARCHIVE_2026-09-22.md's 53rd-pass pickup.
+        let wait_result = WaitForSingleObject(handle, INFINITE);
+        let last_error = GetLastError();
+        diag_log_wait_evidence("wait_for_process_exit(blocking/INFINITE)", handle, wait_result, last_error);
         let mut exit_code: u32 = 0;
         if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             eprintln!(
@@ -4226,7 +4297,22 @@ pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
 pub unsafe fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
     unsafe {
         const WAIT_OBJECT_0: u32 = 0;
-        if WaitForSingleObject(handle, 0) != WAIT_OBJECT_0 {
+        let wait_result = WaitForSingleObject(handle, 0);
+        // 53rd-pass diagnostic: this poll is called from tight repoll loops (see
+        // `sys_wait4`'s callers in `litebox_shim_linux/src/syscalls/process.rs`) -- logging every
+        // WAIT_TIMEOUT would flood the log and perturb timing, so only the transition that
+        // matters for the premature-exit hypothesis (this poll concluding WAIT_OBJECT_0, i.e.
+        // "I think this process is gone") is logged. See `diag_log_wait_evidence`'s doc comment.
+        if wait_result == WAIT_OBJECT_0 {
+            let last_error = GetLastError();
+            diag_log_wait_evidence(
+                "try_wait_for_process_exit(WNOHANG poll)->WAIT_OBJECT_0",
+                handle,
+                wait_result,
+                last_error,
+            );
+        }
+        if wait_result != WAIT_OBJECT_0 {
             return None;
         }
         let mut exit_code: u32 = 0;

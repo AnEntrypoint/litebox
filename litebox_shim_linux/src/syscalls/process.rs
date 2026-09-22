@@ -2843,6 +2843,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // D-Bus connections every desktop process holds and every one of them opens
                     // `SOCK_CLOEXEC` precisely so a spawned child will not inherit it.
                     //
+                    // 54th-pass fix (`docs/AGENTS_ARCHIVE_2026-09-22.md`): a `socketpair(2)`
+                    // result is exactly the "child USES this fd before exec" case the general
+                    // CLOEXEC-drop rule below documents as broken -- and real processes use it for
+                    // precisely that reason. Live-traced root cause: `dbus-daemon`'s own service
+                    // activation forks a "babysitter" whose FIRST action (`write_pid`, real
+                    // upstream `dbus/dbus-spawn-unix.c`: `babysitter_pipe = _dbus_socketpair(...,
+                    // TRUE, ...)`, i.e. CLOEXEC, used well before any `exec()` of the real target)
+                    // writes its own pid back to the daemon over exactly this kind of fd. Dropping
+                    // it silently (the general rule below) left the daemon's own end of that
+                    // *specific pair* referencing a peer that was NEVER given a live copy in the
+                    // cross-process child from the moment of fork -- observed live as the daemon
+                    // reading an immediate EOF/HUP and logging "Activated service '<X>' failed:
+                    // Process <X> exited, reason unknown" within ~1ms of the fork() call
+                    // returning, EVERY TIME, for EVERY D-Bus service activation
+                    // (`org.a11y.Bus`/`org.xfce.Xfconf`/`org.a11y.atspi.Registry` all hit this),
+                    // which is upstream of the `xfwm4`-never-launches/`GLib-GIO-CRITICAL`-flood
+                    // symptom the 43rd-53rd passes chased. Confirmed NOT a premature-exit-report
+                    // bug in `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier`
+                    // (the leading hypothesis going into this pass): live `GetProcessTimes`-based
+                    // instrumentation on both call sites (`wait4_diag` in
+                    // `litebox_platform_windows_userland/src/process_fork.rs` and `lib.rs`) proved
+                    // the real Windows process for one such babysitter stayed alive for a REAL,
+                    // `GetProcessTimes`-sourced 3856ms after its own `CreateProcessW`, while the
+                    // daemon's "exited, reason unknown" print landed under 1ms after the fork()
+                    // syscall returned to the guest -- 3.8+ real seconds BEFORE either
+                    // `WaitForSingleObject` call this pass instrumented had returned anything at
+                    // all for that handle. `raw_fd_is_addressless_unix_socket_pair` (`net.rs`)
+                    // distinguishes this narrow case (BOTH ends `Unnamed`, real Linux's own
+                    // definition of a `socketpair(2)` result) from the overwhelming common case of
+                    // an ordinary named-peer CLOEXEC client socket (X11/D-Bus connections, 95.1% of
+                    // all cross-process-fork CLOEXEC drops per the measurement below) -- those keep
+                    // being silently dropped exactly as before, so this fix does not reintroduce
+                    // the thread-based-fork tcache-corruption exposure for the common case, only
+                    // for the narrow pre-exec-IPC one that was actually wrong.
+                    None if self.raw_fd_is_cloexec(*raw_fd)
+                        && self.raw_fd_subsystem_name(*raw_fd) == "unix-socket"
+                        && self.raw_fd_is_addressless_unix_socket_pair(*raw_fd) =>
+                    {
+                        uncarriable += 1;
+                        uncarriable_cloexec += 1;
+                        let subsystem = "unix-socket-pair(addressless,pre-exec-IPC)";
+                        if !uncarriable_kinds.iter().any(|k| *k == subsystem) {
+                            uncarriable_kinds.push(subsystem);
+                        }
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = raw_fd;
+                            "clone: cross-process fork() cannot carry this fd -- addressless unix-socket-pair (socketpair), likely pre-exec IPC (e.g. dbus babysitter protocol), refusing rather than silently dropping"
+                        );
+                    }
                     // THE DEVIATION, stated rather than hidden. Linux keeps a `CLOEXEC` fd alive in
                     // the child between `fork()` and `execve()`; Windows has no such gap, because
                     // it has no fork. A child that USES one of these fds before exec sees `EBADF`

@@ -9,6 +9,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-22,
 53rd pass (drained the 44th-52nd pass narrative to the archive; see the pass-history section below).
+54th pass (same day) fixed a real bug (D-Bus service activation) but did not re-compact — watch size.
 
 ## The cheap repro — start here
 
@@ -78,17 +79,18 @@ litebox_diag::stderr_capture=debug` is workable on the `de_only.sh` isolation ha
   (`litebox_shim_linux/src/syscalls/process.rs`) before assuming a new kind needs old treatment.
   A pty fd, unlike a socket, is safely RE-OPENABLE by id afterward via `SharedPtyTable` — run
   dbus-daemon non-forking, and for XFCE use `xfce4-session`, never `startxfce4`.
-- **`wait4()`/`kill()` to a cross-process fork child are asymmetric, and `wait4()` is now ALSO
-  suspect, not just `kill()`** — `kill()` to a `cross_process_children`-tracked pid returns `ESRCH`
-  unconditionally (pass 141, `litebox_shim_linux/src/syscalls/signal/mod.rs:1003-1018`, a documented
-  gap, not a bug: the pid is real and reachable via `wait4`, just not signalable yet). 53rd pass found
-  a SEPARATE, NOT-yet-explained issue in the same area: `dbus-daemon`'s own internal `fork()` for
-  D-Bus service activation gets reported as "already exited" by something in the
-  `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier` path
-  (`litebox_platform_windows_userland/src/process_fork.rs:4226`,
-  `litebox_shim_linux/src/syscalls/process.rs:3363`) within ~1ms of guest-visible time after the fork
-  succeeds — while the real spawned process is demonstrably still alive and simply hasn't reached its
-  own `execve` yet. NOT root-caused to an exact line — do not patch blind; see Track B item 1.
+- **`wait4()`/`kill()` to a cross-process fork child are asymmetric** — `kill()` to a
+  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (pass 141,
+  `litebox_shim_linux/src/syscalls/signal/mod.rs:1003-1018`, a documented gap, not a bug: the pid is
+  real and reachable via `wait4`, just not signalable yet). **The 53rd pass's premature-exit-report
+  hypothesis for `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier` is REFUTED
+  (54th pass, direct evidence)** — real bug was a fd-carrying policy gap, fixed same pass; see
+  Cross-process fork section.
+- **A `socketpair(2)`-originated fd (both ends `Unnamed`) is NOT safe to drop as CLOEXEC across a
+  cross-process fork, unlike a named-peer CLOEXEC client socket** — real processes (`dbus-daemon`'s
+  babysitter) use it for pre-`exec()` bookkeeping; dropping it makes the child's peer look
+  instantly gone to the parent. `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) now refuses
+  (falls back to thread-based fork) this narrow case instead of silently dropping it (54th pass).
 - **A guest diagnostic must reach the console through a PIPE or `$( )`, never a bare file redirect**
   — `cmd > /tmp/f` + parent read fails silently under `LITEBOX_PROCESS_FORK=1` (child writes its
   own writable-layer snapshot). `cmd 2>&1 | sed 's/^/[tag] /' &` is the pattern for streaming
@@ -195,27 +197,39 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   `g_dbus_error_is_remote_error` around D-Bus autostart calls; **`xfwm4` itself never appears
   ANYWHERE in the log**; a separate new bug, `gpg-agent`'s fatal glibc `malloc.c:3846`
   heap-corruption SIGABRT, not yet root-caused.
-- **53rd pass (2026-09-22)** — traced the `GLib-GIO-CRITICAL` flood to its real cause: D-Bus SERVICE
-  ACTIVATION genuinely fails for every service xfce4-session needs (`org.a11y.Bus`, `org.xfce.
-  Xfconf`, later `org.a11y.atspi.Registry`). `dbus-daemon` logs `Activated service 'X' failed:
-  Process X exited, reason unknown` within ~1ms of guest-visible time after its own
-  `try_cross_process_fork` for the activation babysitter succeeds — while the real target binary
-  (`at-spi-bus-launcher`/`xfconfd`) is demonstrably still alive and merely slow to reach its own
-  `execve` (that `execve` trace appears thousands of log lines, and materially later in wall-clock
-  time, AFTER the "exited" report already fired — `.wfgy/de_only_pass53_utf8.log:25484-28663`).
-  Fetched real `dbus-spawn-unix.c`/`bus/activation.c` (GitHub `d-bus/dbus` mirror,
-  gitlab.freedesktop.org still unreachable): "reason unknown" fires when dbus's babysitter reports
-  the child gone WITHOUT ever conveying a real `waitpid` status — pointing at
-  `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier` reporting a cross-process
-  child's Windows HANDLE as signaled/exited prematurely (see the standing-lessons bullet above).
-  **NOT yet root-caused to an exact line or fixed — do not patch blind.** A SEPARATE finding the same
-  pass: in an isolated `de_only.sh` re-run, `xfce4-session` never called `clone()` for a real process
-  EVEN ONCE the whole run (0 process-clones vs the 52nd pass's fuller boot reaching `iceauth`/
-  `ssh-agent`/`gpg-agent`) — xfce4-session's OWN very-early D-Bus-proxy construction (the first
-  `GLib-GObject-CRITICAL: invalid (NULL) pointer instance`, before ANY client fork in BOTH runs) is a
-  more consistently-reproducing, more upstream candidate blocker than "xfwm4 specifically." Also
-  reconfirmed: zero host panics/SIGSEGVs in this run — the 49th/51st-pass fixes hold. Full evidence,
-  exact timestamps, dbus source excerpts: archive.
+- **53rd pass (2026-09-22)** — traced the `GLib-GIO-CRITICAL` flood to D-Bus SERVICE ACTIVATION
+  genuinely failing for every service xfce4-session needs (`org.a11y.Bus`/`org.xfce.Xfconf`/
+  `org.a11y.atspi.Registry`), `dbus-daemon` logging `Activated service 'X' failed: Process X exited,
+  reason unknown` within ~1ms of its own activation-babysitter fork succeeding, and raised the
+  premature-exit-report hypothesis against `try_wait_for_cross_process_exit`/
+  `arm_cross_process_exit_notifier` — **the exact hypothesis the 54th pass below REFUTED with direct
+  evidence and traced to its real cause instead.** Full narrative/timestamps/dbus-source excerpts:
+  archive.
+- **54th pass (2026-09-22) — ROOT-CAUSED AND FIXED the D-Bus activation bug; 53rd pass's own top
+  hypothesis REFUTED with direct evidence.** `wait4_diag` instrumentation (`GetProcessTimes`-based,
+  added to both suspect call sites) proved one live `org.a11y.Bus` babysitter's real Windows process
+  stayed alive a genuine 3856ms after its own `CreateProcessW` while dbus's "exited, reason unknown"
+  print fired <1ms after `fork()` returned — 3.8+ real seconds before either `WaitForSingleObject`
+  call had returned anything for that handle at all. Real cause (confirmed against fetched upstream
+  `dbus-spawn-unix.c`): dbus's babysitter reports its pid back over a `_dbus_socketpair()`
+  (CLOEXEC, addressless) pair BEFORE any `exec()` — exactly the case `try_cross_process_fork`'s
+  blanket CLOEXEC-drop policy (`process.rs` line ~2846) documents as unsafe. Fixed: refuse (not
+  silently drop) an addressless unix-socket-pair CLOEXEC fd specifically (see standing lessons).
+  **Live-verified twice**: `Activated service 'org.a11y.Bus'/'org.xfce.Xfconf'` now print
+  `Successfully activated`, the `GLib-GIO-CRITICAL`/`GObject-CRITICAL` flood is GONE (zero in either
+  log), and `/usr/bin/xfwm4` genuinely `execve`s for the first time ever. **Still short of `DE_UP`**:
+  xfwm4 stays alive (periodic futex wakes past its own 150s+ elapsed clock) but never set
+  `_NET_SUPPORTING_WM_CHECK` in the observed window. New top suspect, reproduced twice: `index out of
+  bounds: the len is 1 but the index is 13` panic at `litebox/src/fd/mod.rs:422`, inside some
+  short-lived cross-process-forked child (not xfwm4's own main thread) — looks like a stale
+  `InternalFd`/slot index computed in one process reused against a freshly-rebuilt, near-empty
+  descriptor table in a different cross-process child; same root-pattern class as the
+  `Pipes.litebox`/`FutexManager` bugs before it, NOT yet root-caused. Host RAM cratered under 1GB
+  twice on `de_only.sh` ALONE (it now reaches much deeper into the boot, so far more processes
+  spawn) — both runs killed via `Invoke-CimMethod Terminate` before a freeze; `webtop_stack.sh` was
+  deliberately not attempted this pass given that fragility. Full evidence, log paths, exact diffs:
+  this pass's own commit (`litebox_platform_windows_userland/src/process_fork.rs`,
+  `litebox_shim_linux/src/syscalls/{process,net,file}.rs`).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -230,32 +244,29 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 
 **Open, in rough priority order:**
 
-1. **`DE_FAILED`'s real chain, narrowed twice this session (52nd then 53rd pass).** Concrete next
-   steps, in order: (i) confirm/refute whether `try_wait_for_cross_process_exit`
-   (`litebox_platform_windows_userland/src/process_fork.rs:4226`) or the async notifier thread
-   (`arm_cross_process_exit_notifier`, `litebox_shim_linux/src/syscalls/process.rs:3363`) reports a
-   cross-process child's Windows `HANDLE` as exited prematurely — add a temporary diagnostic
-   printing `WaitForSingleObject`'s raw return value and elapsed-ms-since-`CreateProcessW` at both
-   call sites, using `dbus-daemon`'s own service-activation fork as the repro
-   (`.wfgy/de_only.sh`, watch for `Activating service name=`); this is the most concrete lead in the
-   whole investigation and has never been instrumented directly. (ii) A live `cdb -pv` attach on
-   `xfce4-session` breaking on `g_bus_get_sync`/`g_dbus_proxy_new_sync` (now finally uncontaminated
-   by the Xvfb crash) to determine whether xfce4-session's OWN very-early D-Bus-proxy construction
-   (before ANY client fork) is what's actually stalling all client startup, `xfwm4` included — never
-   attempted by any pass despite being flagged available since the 44th. (iii) root-cause
-   `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (real heap corruption under
-   `LITEBOX_PROCESS_FORK=1`, previously assumed impossible on this path) — only reproduced once so
-   far (52nd pass), zero repro in the 53rd pass's own run (xfce4-session never got far enough to
-   spawn it), so treat as lower-urgency until (i)/(ii) land. (iv) the high `VM_SHARED` fork-child
-   region count (up to 84/117, even for a plain shell, 52nd pass) — confirm whether it's genuine
-   guest-level `MAP_SHARED` accumulation or a bug. Host-side `curl http://localhost:8081/`
-   connecting-but-HTTP-timing-out (43rd/49th passes) recheck depends on reaching a real WM first.
-2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
-   (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
-   capacity-256 overflow is silently discarded (`unix.rs:275-277`); a key >108 bytes silently bails;
-   `SharedUnixConnectQueue`/`SharedUnixConnTable` (both capacity 64) leak a `REQ_CLAIMED` slot
-   forever on cancel (`unix.rs:430-435`); `SHARED_UNIX_CONN_BUF` is 2048 bytes/direction; backlog is
-   ignored entirely on cross-process accept. Abstract sockets checked and CORRECT.
+1. **`DE_FAILED`'s real chain — D-Bus activation FIXED (54th pass), xfwm4 now launches; one new
+   blocker found.** Concrete next steps, in order: (i) root-cause `litebox/src/fd/mod.rs:422`'s
+   `index out of bounds: the len is 1 but the index is 13` panic (54th pass, reproduced twice
+   identically) — find which cross-process-forked child hits it and which call site holds a stale
+   `InternalFd`/descriptor-table slot index computed in one process but replayed against a
+   freshly-rebuilt (near-empty) table in another; likely on the path of either xfwm4's own startup
+   helpers or `de_only.sh`'s own polling-loop `xprop` invocations. (ii) once fixed, re-run
+   `de_only.sh` with a quiet host (8GB+ free, nothing else running) watching for
+   `_NET_SUPPORTING_WM_CHECK` — xfwm4 is confirmed genuinely alive (periodic futex wakes past its
+   own 150s+ elapsed clock) so it may just need this panic gone plus a longer clean window, not a
+   deeper fix. (iii) a live `cdb -pv` attach on `xfce4-session` breaking on
+   `g_bus_get_sync`/`g_dbus_proxy_new_sync` remains available but is now lower priority given (i)'s
+   more concrete, twice-reproduced evidence. (iv) root-cause `gpg-agent`'s fatal glibc
+   `malloc.c:3846` assertion — still only reproduced once (52nd pass). (v) the high `VM_SHARED`
+   fork-child region count (52nd pass) — unchanged priority. (vi) `de_only.sh` alone now craters
+   host RAM under 1GB within ~3-4 minutes once it reaches this far (54th pass, twice) — a real
+   resource-pacing question for `webtop_stack.sh`'s fuller boot, worth its own measurement pass
+   before the next full-stack attempt.
+2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything** (38th,
+   `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256 overflow silently discarded
+   (`unix.rs:275-277`); a key >108 bytes silently bails; `SharedUnixConnectQueue`/`SharedUnixConnTable`
+   (capacity 64) leak a `REQ_CLAIMED` slot forever on cancel (`unix.rs:430-435`); backlog ignored on
+   cross-process accept. Abstract sockets checked and CORRECT.
 3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
    dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in
    `dealloc`, high blast radius, own dedicated pass.
@@ -305,13 +316,14 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
 the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are fixed and CONFIRMED on a
-full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes) — the sole remaining blocker is
-`DE_FAILED`. `xfwm4` never launching is the most visible symptom, but the 53rd pass's own evidence
-now points more upstream, at a D-Bus-service-activation false-"exited" bug plus xfce4-session's own
-very-early D-Bus-proxy-construction failure (Track B item 1) — NOT confirmed "Cannot open display"
-(that framing was refuted by the 52nd pass). Selkies also needs `--clipboard-enabled=false` on the
-thread-based path (its clipboard monitor re-triggers the same corruption every tick) — moot
-cross-process.
+full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes). **The D-Bus service-activation
+false-"exited" bug is FIXED (54th pass)** — `xfwm4` now genuinely `execve`s (never happened in this
+investigation before) and the `GLib-GIO-CRITICAL` flood is gone. `DE_FAILED` still fires: xfwm4
+stays alive but never sets `_NET_SUPPORTING_WM_CHECK`, now suspected downstream of a separate,
+twice-reproduced `litebox/src/fd/mod.rs:422` panic in some other cross-process child (Track B item
+1) rather than anything D-Bus/display related — NOT "Cannot open display" (refuted, 52nd pass).
+Selkies also needs `--clipboard-enabled=false` on the thread-based path (its clipboard monitor
+re-triggers the same corruption every tick) — moot cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A SECOND, distinct
 glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) still sporadically

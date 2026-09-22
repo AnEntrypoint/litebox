@@ -12171,7 +12171,19 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // exists specifically to reach into the GUEST's own notify machinery through `on_exit`,
         // never to touch guest memory or state directly itself.
         std::thread::spawn(move || {
+            // 53rd-pass diagnostic (AGENTS_ARCHIVE_2026-09-22.md pickup): bracket the blocking
+            // wait with explicit start/end markers, keyed by the handle's raw pointer value, so a
+            // trace can pair this thread's own timing against `try_wait_for_cross_process_exit`
+            // polls elsewhere and against the guest-visible dbus activation-failure log line.
+            eprintln!(
+                "[wait4_diag] arm_cross_process_exit_notifier: background wait thread starting, handle={:p}",
+                handle.0 as windows_sys::Win32::Foundation::HANDLE
+            );
             self.wait_for_cross_process_exit(handle);
+            eprintln!(
+                "[wait4_diag] arm_cross_process_exit_notifier: blocking wait returned, invoking on_exit(), handle={:p}",
+                handle.0 as windows_sys::Win32::Foundation::HANDLE
+            );
             on_exit();
         });
     }
