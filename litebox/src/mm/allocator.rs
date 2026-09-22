@@ -201,6 +201,50 @@ pub fn slab_allocator_code_addrs() -> [usize; 4] {
     ]
 }
 
+/// Entry addresses of every out-of-line function inside `buddy_system_allocator` that mutates
+/// `SafeZoneAllocator`'s OWN buddy heap state (`Heap::<ORDER>::alloc`/`dealloc`, and the
+/// `LockedHeapWithRescue<ORDER>` `GlobalAlloc` wrappers that call them directly) -- the same
+/// "is `rip` currently inside the global allocator" ground truth [`slab_allocator_code_addrs`]
+/// established for `slabmalloc::ZoneAllocator`, extended to the OTHER allocator
+/// `SafeZoneAllocator` embeds.
+///
+/// # Why this exists -- found live, 2026-09-22, chasing the second Xvfb SIGSEGV
+///
+/// [`slab_allocator_code_addrs`]'s own doc comment already proved
+/// `rip_in_global_allocator`'s old single-window assumption ("slabmalloc's `ZoneAllocator`
+/// methods are inlined into `SafeZoneAllocator::alloc`/`dealloc`") FALSE -- they are genuinely
+/// out-of-line, ~4.3 MB away in a real release build. The exact same assumption was made, and
+/// never re-checked, for `buddy_system_allocator`'s OWN `Heap::alloc`/`Heap::dealloc` (called
+/// directly from `LockedHeapWithRescue::alloc`/`dealloc`, in turn called directly from
+/// `SafeZoneAllocator::alloc`/`dealloc` for the `BASE_PAGE_SIZE`/`LARGE_PAGE_SIZE`/large-object
+/// cases) -- `Heap::dealloc` is not trivial (a buddy-merge loop walking `free_list`), the exact
+/// shape of function LTO-off Rust reliably leaves out-of-line across a crate boundary (this
+/// project builds with LTO off, see `AGENTS.md`'s own standing note on release-binary `cdb`
+/// reads). Live-caught: a debug-build `de_only.sh` boot under `LITEBOX_PROCESS_FORK=1` hit a
+/// reproducible `buddy_system_allocator-0.11.0/src/lib.rs:165` panic ("index out of bounds: the
+/// len is 34 but the index is 53") on multiple unrelated host threads across one boot -- `34` is
+/// this exact `ORDER` (`SafeZoneAllocator<'static, 34, WindowsUserland>`), and `53` is not a
+/// class any real `Layout` reaching `Heap::alloc`/`dealloc` through `SafeZoneAllocator`'s own
+/// size dispatch can produce, i.e. this is `Heap::free_list` bookkeeping corrupted by an earlier
+/// thread that was interrupted mid-mutation -- the exact failure mode `slab_allocator_code_addrs`'s
+/// own doc comment already describes and fixed for `ZoneAllocator`, just via `Heap`'s own
+/// internal `spin::Mutex` (distinct from `SafeZoneAllocator::slab_allocator`'s `SpinMutex`), a
+/// SEPARATE lock with the identical "no suspend-safety window" gap. Same crash address family as
+/// AGENTS.md's tracked Xvfb SIGSEGV (a wild/stale pointer read) is consistent with this: any
+/// corrupted allocator state can hand out a garbage pointer, or corrupt an unrelated live
+/// allocation's bytes, to ordinary litebox host code staging guest-visible content.
+#[doc(hidden)]
+pub fn buddy_allocator_code_addrs<const ORDER: usize>() -> [usize; 4] {
+    [
+        buddy_system_allocator::Heap::<ORDER>::alloc as *const () as usize,
+        buddy_system_allocator::Heap::<ORDER>::dealloc as *const () as usize,
+        <buddy_system_allocator::LockedHeapWithRescue<ORDER> as GlobalAlloc>::alloc as *const ()
+            as usize,
+        <buddy_system_allocator::LockedHeapWithRescue<ORDER> as GlobalAlloc>::dealloc as *const ()
+            as usize,
+    ]
+}
+
 unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
     for SafeZoneAllocator<'static, ORDER, M>
 {

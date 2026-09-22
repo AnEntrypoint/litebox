@@ -5653,7 +5653,21 @@ fn rip_in_global_allocator(rip: usize) -> bool {
     if rip.abs_diff(alloc_addr) < WINDOW || rip.abs_diff(dealloc_addr) < WINDOW {
         return true;
     }
-    litebox::mm::allocator::slab_allocator_code_addrs()
+    if litebox::mm::allocator::slab_allocator_code_addrs()
+        .iter()
+        .any(|&a| rip.abs_diff(a) < WINDOW)
+    {
+        return true;
+    }
+    // See `litebox::mm::allocator::buddy_allocator_code_addrs`'s own doc comment (found live,
+    // 2026-09-22, chasing the second Xvfb SIGSEGV): `buddy_system_allocator`'s `Heap::alloc`/
+    // `dealloc` and the `LockedHeapWithRescue` wrappers that call them are genuinely out-of-line,
+    // exactly like `ZoneAllocator`'s methods were, and mutate their OWN separate `spin::Mutex` --
+    // a thread suspended inside them was just as invisible to this guard as a thread suspended
+    // inside `ZoneAllocator` used to be, live-caught via a reproducible
+    // `buddy_system_allocator::Heap::free_list` out-of-bounds panic under concurrent
+    // cross-process-fork load.
+    litebox::mm::allocator::buddy_allocator_code_addrs::<34>()
         .iter()
         .any(|&a| rip.abs_diff(a) < WINDOW)
 }
