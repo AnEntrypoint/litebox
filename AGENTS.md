@@ -8,8 +8,8 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not in a separate memory file. **This file is compacted whenever it grows
-past ~30KB** — newest compaction: 2026-09-22, 46th pass, full pre-compaction 44th-45th-pass
-narratives drained verbatim to `docs/AGENTS_ARCHIVE_2026-09-22.md`.
+past ~30KB** — newest compaction: 2026-09-22, 48th pass (folded the superseded 47th-pass
+"not yet proven" hedge into a real, now-negative result).
 
 ## The cheap repro — start here
 
@@ -170,42 +170,43 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   pitfall worth recording: a cross-process fork CHILD re-execs this binary but takes `main()`'s
   `is_diagnostic_resume_child()` branch and NEVER reaches `run()` — a runtime toggle wired only at
   the top of `run()` silently never takes effect in any fork descendant.
-- **The SECOND Xvfb SIGSEGV (`0x37f0400`) — disassembled for real, 47th pass, 2026-09-22.**
-  `rip=0x7fefedeababd` resolves byte-exact (unique in the file) to libc.so.6 file offset
-  `0x162abd` — glibc's ordinary 33-64-byte `memmove`/`memcpy` path, not the large/prefetch-loop
-  copy the raw address arithmetic first suggested (that was a wrong bias guess trusting
-  `VirtualQuery`'s `AllocationBase` verbatim instead of re-deriving the offset from the crash
-  page's own raw byte window) — a ubiquitous small-struct-copy site, not attributable to one
-  caller without DWARF (libc6 build-id `c495b62edadd6c356265942ec1282d98058a7b41`, confirmed
-  absent from Debian's/Ubuntu's debuginfod, 18th pass). The 46th pass's `rdi=0x9c1...`
-  "thread-fork-verification address translation" theory is REFUTED — the SAME capture's own
-  `reverse_translate_and_read_for_diagnostics` line already said "no reverse translation found";
-  `0x9c1...` is an ordinary high guest heap/mmap address, unrelated to `fork_verify`.
-  **Real bug found instead, live-reproduced in the SAME boot as a `0x37f0400` SIGSEGV**
-  (`.wfgy/de_only_investigate_run1.log`): a reproducible
-  `buddy_system_allocator-0.11.0/src/lib.rs:165` panic ("index out of bounds: the len is 34 but
-  the index is 53") on several unrelated host threads. `34` is `SafeZoneAllocator`'s own `ORDER`;
-  `53` is not a `Heap::free_list` class any real `Layout` reaching this allocator can produce —
-  `Heap`'s own internal `spin::Mutex`-protected `free_list` was corrupted by a thread interrupted
-  mid-mutation, the EXACT failure mode `slab_allocator_code_addrs` already root-caused+fixed for
-  `slabmalloc::ZoneAllocator` — but `rip_in_global_allocator` never got a matching anchor for
-  `buddy_system_allocator`'s OWN out-of-line `Heap::alloc`/`dealloc` (a SEPARATE `spin::Mutex`
-  from `SafeZoneAllocator`'s own). **FIXED, `c79625f`**:
-  `litebox::mm::allocator::buddy_allocator_code_addrs::<ORDER>()` adds `Heap::<ORDER>::alloc`/
-  `dealloc` and `LockedHeapWithRescue<ORDER>`'s `GlobalAlloc` wrappers as anchors. Confirmed real,
-  independently live (corrupted process-wide Rust allocator state) — **not yet proven to be THE
-  SIGSEGV cause**: the post-fix 6-boot verification batch was killed mid-first-run by a host-RAM
-  pressure reap (environmental — `FreePhysicalMemory` recovered to 6.5GB within a minute, not a
-  result, explicitly not to be retried automatically per the reaper's own note). The one partial
-  post-fix run reached `DE_LAUNCHED_DIRECT` cleanly, zero crash/panic, before being killed — not a
-  sample. Residual smaller gap, not yet fixed: `SafeZoneAllocator::new`'s inline OOM `rescue`
-  closure is its own function, not yet an anchor (lower priority, not the path the reproduced
-  panic hit). **Pickup**: re-run `.wfgy/de_only_postfix_batch.ps1` (already written) via `Bash
-  run_in_background` running `powershell.exe -File` DIRECTLY, never `Start-Job` from a separate
-  `PowerShell` tool call (jobs don't survive past that call's own process exit, hit live this
-  pass) once RAM is confirmed quiet; if `0x37f0400` stops recurring, push through to
-  `xfwm4`/`_NET_SUPPORTING_WM_CHECK` and real browser/app verification — no run has reached a
-  working WM yet.
+- **The SECOND Xvfb SIGSEGV (`0x37f0400`) — 47th pass's `buddy_allocator_code_addrs` fix
+  (`c79625f`) REFUTED as the cause, 48th pass, 2026-09-22, real evidence.** 47th pass disassembled
+  `rip=0x7fefedeababd` to libc.so.6's ordinary small `memmove`/`memcpy` path (not attributable to
+  one caller without DWARF) and live-caught a `buddy_system_allocator-0.11.0/src/lib.rs:165`
+  `Heap::free_list` index-out-of-bounds panic ("len is 34" = `ORDER`, "index is 53" = corrupted
+  class), landing the `c79625f` fix (adds `Heap::<ORDER>::alloc`/`dealloc` and
+  `LockedHeapWithRescue`'s `GlobalAlloc` wrappers as `rip_in_global_allocator` suspend-safety
+  anchors) on the theory that a thread interrupted mid-mutation there was corrupting the free
+  list. **48th pass ran the real post-fix verification the 47th pass's own RAM-pressure reap had
+  cut short** (binary confirmed rebuilt with `c79625f`, `cargo build` `Finished` with the commit
+  already compiled in) — 2/2 clean `de_only.sh` runs under `LITEBOX_PROCESS_FORK=1` +
+  `LITEBOX_DIAG_FATALDUMP=1` STILL hit the bit-identical `lib.rs:165` panic (run1:
+  `.wfgy/verify48_run1.log`, 3 occurrences WM_POLL n=2-4, THEN the SAME `0x37f0400` Xvfb SIGSEGV at
+  WM_POLL n=5; run2: `.wfgy/verify48_run2.log`, 2 occurrences WM_POLL n=2-3, no Xvfb crash within
+  the ~260s sampled window but the same corruption fired). **The fix's address coverage is not the
+  gap** — `Heap::dealloc`'s free-list merge loop (the actual panicking line) is written directly
+  inline in `Heap::dealloc`'s own body, which IS one of the fix's four anchors, read confirmed
+  (`buddy_system_allocator-0.11.0/src/lib.rs:156-175`). Two live candidates, neither yet tested:
+  (a) `rip_in_global_allocator` is only ever consulted from `ThreadHandle::interrupt`'s
+  `SuspendThread` retry loop (`lib.rs:5867`, the only call site) — if the actual fork-quiesce step
+  that corrupts this state does not route through that exact function, the anchor list is
+  irrelevant regardless of correctness; (b) the panicking threads are tagged `net_worker (fork
+  child)` — a genuine concurrent-thread data race on `Heap::free_list` (bypassing or racing
+  `LockedHeapWithRescue`'s own lock) rather than a suspend-timing bug would produce an identical
+  symptom and would not be fixed by any suspend-window widening at all. **Root cause still OPEN.**
+  Operational finding, same pass: `.wfgy/de_only_postfix_batch.ps1`'s `Start-Job`+`Stop-Job` does
+  NOT kill the native `litebox_runner*.exe` tree it starts — 11+ orphans from run 1 alone survived
+  into run 2, driving `FreePhysicalMemory` 6.7GB→2.99GB before a manual `Get-Process
+  litebox_runner* | Stop-Process -Force` recovered it instantly. Replaced with
+  `.wfgy/de_only_single_run.ps1` (`[System.Diagnostics.Process]::Start` + `Invoke-CimMethod
+  -MethodName Terminate` cleanup, not `Stop-Process`) — verified clean over 2 runs, 0 residual
+  processes each time. **Pickup**: does the corrupting suspend even route through
+  `ThreadHandle::interrupt` (the only `rip_in_global_allocator` call site) during a real
+  cross-process-fork quiesce? If not, find the real quiesce call site. In parallel, check whether
+  `net_worker` threads can race a guest thread into `Heap`/`SafeZoneAllocator` without
+  `LockedHeapWithRescue`'s own lock (a genuine SMP race would explain why address-coverage alone
+  made no difference). No run has reached a working WM; browser/app verification not reached.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -220,10 +221,8 @@ fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_s
 **Open, in rough priority order:**
 
 1. **`DE_FAILED`'s ORIGINAL cause (the D-Bus non-blocking-connect stall) is FIXED — 44th pass.** The
-   single top blocker is now the SECOND Xvfb SIGSEGV — see the "Cross-process fork" section's 46th
-   pass entry above for the current evidence (real register capture via
-   `LITEBOX_DIAG_FATALDUMP=1`, fault `0x37f0400`, `rip` inside a `vmovdqu` 32-byte AVX load) and
-   pickup (disassemble around that `rip` to find where the wild `rsi` was loaded from).
+   single top blocker is now the SECOND Xvfb SIGSEGV (`buddy_system_allocator` free-list
+   corruption, root cause still open post-48th-pass) — see the "Cross-process fork" section above.
 2. A new, unscoped observation from the 43rd pass, not yet investigated: host-side
    `curl http://localhost:8081/` failed on both full-stack boots despite the GUEST's own
    `/dev/tcp` self-test succeeding — possibly just the same transient RAM dip the 35th pass already
