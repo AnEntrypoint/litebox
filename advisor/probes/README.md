@@ -194,3 +194,39 @@ maybe_patch_exec_segment places stubs.
 bgshell_probe.sh was written for an intermittent "shell fragility" problem. That framing is
 withdrawn: pass_weston5 and pass_weston6 show bit-identical rip AND rsp, so the failure is
 deterministic and much narrower than "backgrounding is unreliable". Prefer tramp_fork_probe.
+
+## pty_fork_probe.c (+ prebuilt `pty_fork_probe`) -- cross-process pty I/O over `SharedPtyTable`
+
+Verifies the `SharedPtyTable` redesign (`acb8615`) actually delivers bytes across a genuine
+`LITEBOX_PROCESS_FORK=1` process boundary, not just within one process. Opens `/dev/ptmx`,
+unlocks + reads its id, `fork()`s, then the PARENT writes a pid-tagged marker to the master
+strictly AFTER the fork() call returns while the CHILD (which has no local `pty_registry` entry
+for an id it didn't allocate) independently opens `/dev/pts/<id>` and polls it for the marker.
+
+Build: `clang --target=x86_64-unknown-linux-gnu -nostdlib -nostdinc -ffreestanding
+-fno-stack-protector -static -O1 -o pty_fork_probe pty_fork_probe.c`. Run:
+`-- /pty_fork_probe` with the HOST (not `--env`) environment variable `LITEBOX_PROCESS_FORK=1`
+set before invoking the runner -- `spawn_cross_process_fork_child`
+(`litebox_platform_windows_userland/src/lib.rs`) reads it via a bare `std::env::var_os` on the
+HOST side, so passing it as a guest `--env` (as the runner's own `--gui`/`--env` flags might
+suggest by analogy) silently no-ops the whole cross-process path with zero log output, the
+opposite mistake of the `GLIBC_TUNABLES` guest-env lesson elsewhere in this project's own
+AGENTS.md. Confirm via `[process_fork_diag] task-resume-probe (child, winpid=...)` that the
+child ran in a genuinely separate Windows process, not the shim's own eligibility log alone.
+
+Found and fixed two real bugs live, not probe artifacts (`docs/AGENTS_ARCHIVE_2026-09-22.md`):
+(1) `try_cross_process_fork` (`litebox_shim_linux/src/syscalls/process.rs`) treated ANY open pty
+fd as wholly uncarriable and refused the entire fork rather than dropping it like a close-on-exec
+fd, silently defeating the whole `SharedPtyTable` redesign for any process holding an open pty at
+fork time -- every fork after `ptmx_open` fell back to the thread-based path and its own
+tcache-corruption class instead. (2) `PtyStateRef::Local`'s mutating setters (`set_locked` and
+friends) never mirrored into the `SharedPtyTable` slot, so a local master's real `TIOCSPTLCK(0)`
+unlock never reached the shared table -- a cross-process `pts_open` saw the pty as permanently
+locked (`EIO`) forever, even though the owning process had genuinely unlocked it.
+
+Also fixed IN THE PROBE ITSELF, not litebox: a `char buf[N] = "literal"` local array initializer
+lowers, at `-O1`, to an aligned SSE `movaps` sized to the destination array -- this freestanding,
+no-crt0 binary's `_start` -> `main` call chain does not reliably guarantee 16-byte stack alignment
+at every call site the way real crt0 does, so this faulted with a genuine `STATUS_ACCESS_VIOLATION`
+on the `movaps` itself. Fixed by a manual byte-copy loop (`copy_str`) instead -- worth remembering
+for any FUTURE freestanding probe that declares a local buffer with a string-literal initializer.

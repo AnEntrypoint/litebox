@@ -2691,6 +2691,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut uncarriable_cloexec = 0usize;
         // Close-on-exec fds deliberately left behind rather than refused. See the arm below.
         let mut dropped_cloexec = 0usize;
+        // pty fds deliberately left behind rather than refused. See the arm below.
+        let mut dropped_pty = 0usize;
         for raw_fd in &beyond_stdio_fds {
             let carried = i32::try_from(*raw_fd)
                 .ok()
@@ -2782,6 +2784,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             flags,
                         });
                     }
+                    // A pty fd (master OR slave) does not block the fork, and is not carried
+                    // directly -- there is no inheritable Windows HANDLE behind either end
+                    // (`PtyHalf`'s `crate::channel::Channel`/`Arc<Pollee>` are private-heap
+                    // `Arc`s, the same class of pointer `SharedPtyTable` exists to route around,
+                    // see `syscalls::pty`'s own "Shared cross-process pty data plane" doc
+                    // comment). Unlike an ordinary uncarriable fd, dropping this one does not
+                    // strand the child: `SharedPtyTable::publish` already made this pty's
+                    // existence, control state and byte rings visible by id to EVERY process the
+                    // moment `ptmx_open`/`attach_pty_stdio` created it, so a child that needs the
+                    // slave re-opens `/dev/pts/<id>` itself post-fork
+                    // (`GlobalStateHandle::pts_open`'s `PtyEnd::SharedSlave` fallback) exactly as
+                    // real devpts already requires "any process that knows the id" to do --
+                    // matching this exact fork/open-by-id shape (`forkpty()`: parent holds the
+                    // master, forks, child opens the slave fresh). Before `SharedPtyTable`
+                    // landed (`acb8615`), refusing here was the only sound choice (a plain
+                    // uncarriable ptmx fd otherwise silently defeats the ENTIRE cross-process
+                    // fork path for its owning process, forcing every fork after
+                    // `attach_pty_stdio`-style pty use onto the thread-based fallback and its own
+                    // known tcache-corruption class) -- confirmed live: `pty_fork_probe.c`
+                    // SIGSEGV'd under exactly this refusal-then-thread-fallback path before this
+                    // fix, see `docs/AGENTS_ARCHIVE_2026-09-22.md`.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "pty" => {
+                        dropped_pty += 1;
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = raw_fd;
+                            "clone: dropping a pty fd rather than refusing the fork; SharedPtyTable lets the child re-open it by id instead"
+                        );
+                    }
                     // A close-on-exec fd does not block the fork, and is not carried.
                     //
                     // This is the Win32 rendering of what the guest already declared, not a
@@ -2844,6 +2874,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 uncarriable_cloexec:% = uncarriable_cloexec,
                 kinds:? = uncarriable_kinds,
                 dropped_cloexec:% = dropped_cloexec,
+                dropped_pty:% = dropped_pty,
                 carried_pipes:% = inherited_pipes.len(),
                 carried_files:% = inherited_files.len(),
                 carried_eventfds:% = inherited_eventfds.len();
@@ -2862,6 +2893,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_util_log::debug!(
             tid:% = self.tid.get(),
             dropped_cloexec:% = dropped_cloexec,
+            dropped_pty:% = dropped_pty,
             carried_pipes:% = inherited_pipes.len(),
             carried_files:% = inherited_files.len(),
             carried_eventfds:% = inherited_eventfds.len();

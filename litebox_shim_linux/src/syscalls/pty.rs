@@ -641,77 +641,103 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
 /// (`syscalls::file`) and this module's own [`PtyEnd::write`] read/write termios/winsize/fg_pgid/
 /// locked state through one uniform interface regardless of which transport a given `PtyEnd` uses.
 pub(crate) enum PtyStateRef<'a, Platform: ShimPlatform> {
-    Local(&'a Arc<PtyPair<Platform>>),
+    // Carries the `SharedPtyTable` too, not just the local `Arc<PtyPair>` -- see each `set_*`
+    // method below for why: a LOCAL end (the pty's owning process) is exactly the side every
+    // control-state mutation (`TIOCSPTLCK`, `TCSETS`, `TIOCSWINSZ`, `TIOCSPGRP`, `TIOCPKT`) is
+    // issued against in the ordinary `forkpty()`-shaped case this table exists for (parent holds
+    // the master, forks, child opens the slave), so leaving these writes LOCAL-only would mean
+    // the child's cross-process `pts_open`/`try_read_side`/`try_write_side` fallback forever
+    // observes the SharedPtyTable slot's stale `publish()`-time state -- confirmed live: a real
+    // `TIOCSPTLCK(0)` unlock on the local master left `shared_pty.is_locked(id)` permanently
+    // `true`, so a fork child's `open("/dev/pts/<id>")` failed `EIO` forever even though the
+    // owning process had genuinely unlocked it (docs/AGENTS_ARCHIVE_2026-09-22.md's pty
+    // cross-process I/O verification pass).
+    Local(&'a Arc<PtyPair<Platform>>, &'a SharedPtyTable<Platform>),
     Shared(u32, &'a SharedPtyTable<Platform>),
 }
 
 impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
     pub(crate) fn id(&self) -> u32 {
         match self {
-            Self::Local(p) => p.id,
+            Self::Local(p, _) => p.id,
             Self::Shared(id, _) => *id,
         }
     }
 
     pub(crate) fn get_termios(&self) -> Termios {
         match self {
-            Self::Local(p) => p.get_termios(),
+            Self::Local(p, _) => p.get_termios(),
             Self::Shared(id, t) => t.get_termios(*id),
         }
     }
 
     pub(crate) fn set_termios(&self, v: Termios) {
         match self {
-            Self::Local(p) => p.set_termios(v),
+            Self::Local(p, shared) => {
+                p.set_termios(v.clone());
+                shared.set_termios(p.id, v);
+            }
             Self::Shared(id, t) => t.set_termios(*id, v),
         }
     }
 
     pub(crate) fn get_winsize(&self) -> Winsize {
         match self {
-            Self::Local(p) => p.get_winsize(),
+            Self::Local(p, _) => p.get_winsize(),
             Self::Shared(id, t) => t.get_winsize(*id),
         }
     }
 
     pub(crate) fn set_winsize(&self, v: Winsize) {
         match self {
-            Self::Local(p) => p.set_winsize(v),
+            Self::Local(p, shared) => {
+                p.set_winsize(v.clone());
+                shared.set_winsize(p.id, v);
+            }
             Self::Shared(id, t) => t.set_winsize(*id, v),
         }
     }
 
     pub(crate) fn get_fg_pgid(&self) -> i32 {
         match self {
-            Self::Local(p) => p.get_fg_pgid(),
+            Self::Local(p, _) => p.get_fg_pgid(),
             Self::Shared(id, t) => t.get_fg_pgid(*id),
         }
     }
 
     pub(crate) fn set_fg_pgid(&self, v: i32) {
         match self {
-            Self::Local(p) => p.set_fg_pgid(v),
+            Self::Local(p, shared) => {
+                p.set_fg_pgid(v);
+                shared.set_fg_pgid(p.id, v);
+            }
             Self::Shared(id, t) => t.set_fg_pgid(*id, v),
         }
     }
 
     pub(crate) fn is_locked(&self) -> bool {
         match self {
-            Self::Local(p) => p.is_locked(),
+            Self::Local(p, _) => p.is_locked(),
             Self::Shared(id, t) => t.is_locked(*id),
         }
     }
 
     pub(crate) fn set_locked(&self, v: bool) {
         match self {
-            Self::Local(p) => p.set_locked(v),
+            Self::Local(p, shared) => {
+                p.set_locked(v);
+                shared.set_locked(p.id, v);
+            }
             Self::Shared(id, t) => t.set_locked(*id, v),
         }
     }
 
     pub(crate) fn set_packet_mode(&self, v: bool) {
         match self {
-            Self::Local(p) => p.set_packet_mode(v),
+            Self::Local(p, shared) => {
+                p.set_packet_mode(v);
+                shared.set_packet_mode(p.id, v);
+            }
             Self::Shared(id, t) => t.set_packet_mode(*id, v),
         }
     }
@@ -869,7 +895,7 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     /// [`SharedPtyTable`] slot) -- see [`PtyStateRef`].
     pub(crate) fn pty_state<'a>(&'a self, shared: &'a SharedPtyTable<Platform>) -> PtyStateRef<'a, Platform> {
         match self {
-            PtyEnd::Master(h) | PtyEnd::Slave(h) => PtyStateRef::Local(&h.pair),
+            PtyEnd::Master(h) | PtyEnd::Slave(h) => PtyStateRef::Local(&h.pair, shared),
             PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => PtyStateRef::Shared(h.id, shared),
         }
     }
