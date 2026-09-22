@@ -483,23 +483,20 @@ struct DeliverFault;
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns the already-allocated sigreturn trampoline's guest address, or 0 if
     /// [`Task::ensure_sigreturn_trampoline`] has never been called for this address space.
-    /// Used to recognize a trap at exactly this address as the trampoline's own `brk`, not a
-    /// genuine guest breakpoint (see aarch64's `LinuxShimEntrypoints::exception`).
-    #[cfg(target_arch = "aarch64")]
+    /// Used to recognize a trap at exactly this address as the trampoline's own synthetic trap
+    /// (`brk` on aarch64, a non-executable page on x86_64), not a genuine guest breakpoint/fault
+    /// (see `LinuxShimEntrypoints::exception` for both architectures).
     pub(crate) fn sigreturn_trampoline_addr(&self) -> usize {
         self.signals.borrow().sigreturn_trampoline.get()
     }
 
-    /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline
-    /// (a tiny `brk #0xdead` stub), allocating it via a real guest `mmap` on first
-    /// use and caching the address for the lifetime of this address space (see
-    /// `SignalState::sigreturn_trampoline`'s doc comment for why it's invalidated on `execve`
-    /// but preserved across `clone`/`fork`). Returns 0 if the allocation itself fails (e.g. the
-    /// guest is out of address space) -- the caller treats that the same as "no restorer
-    /// available" (see `write_signal_frame`'s aarch64 doc comment).
-    ///
-    /// aarch64-only: x86_64 glibc always supplies its own real restorer transparently, so no
-    /// synthesized one is ever needed there.
+    /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline,
+    /// allocating it via a real guest `mmap` on first use and caching the address for the
+    /// lifetime of this address space (see `SignalState::sigreturn_trampoline`'s doc comment for
+    /// why it's invalidated on `execve` but preserved across `clone`/`fork`). Returns 0 if the
+    /// allocation itself fails (e.g. the guest is out of address space) -- the caller treats
+    /// that the same as "no restorer available" (see `write_signal_frame`'s per-arch doc
+    /// comment).
     ///
     /// Uses `brk #0xdead` (a debug breakpoint trap, SIGTRAP) rather than the real
     /// `mov x8, #139 ; svc #0` (139 = __NR_rt_sigreturn) an earlier version of this trampoline
@@ -512,6 +509,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `rt_sigreturn` instead, corrupting this thread's actual execution state. `brk` traps
     /// unconditionally and unambiguously (host code never executes this specific immediate),
     /// routing cleanly to `exception_signal_handler`'s SIGTRAP dispatch instead.
+    ///
+    /// x86_64's own version (below) exists for a different, newer reason -- see its own doc
+    /// comment -- and does not use this comment's `brk`/seccomp rationale at all.
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
         // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
@@ -556,6 +556,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_common_linux::ProtFlags::PROT_READ_EXEC,
         );
         if !write_ok {
+            return 0;
+        }
+        self.signals.borrow().sigreturn_trampoline.set(addr);
+        addr
+    }
+
+    /// x86_64 equivalent of the aarch64 function directly above, but for a different underlying
+    /// reason: x86_64 glibc DOES always transparently supply a real restorer (`action.restorer`,
+    /// almost always `__restore_rt`) via `SA_RESTORER`, so historically `write_signal_frame` just
+    /// used it directly and no synthesized trampoline existed here at all. The problem is what
+    /// that real restorer's body actually is: exactly `mov $0xf,%rax ; syscall` (the literal 9
+    /// bytes `48 c7 c0 0f 00 00 00 0f 05`), nothing else -- the whole function. Because
+    /// `litebox_syscall_rewriter` must intercept EVERY guest `syscall` instruction (there is no
+    /// seccomp/ptrace on this platform, and an unpatched `syscall` on Windows userland reaches a
+    /// real NT syscall dispatch with a Linux syscall number in `rax`, not a catchable fault), it
+    /// overwrites those exact 9 bytes in place with a `jmp`+padding to its own trampoline. That
+    /// destroys the literal byte pattern glibc's own unwind fallback (and every other tool that
+    /// lacks real CFI, including this project's own `advisor/probes/symbolize_litebox_crash.py`
+    /// and, most importantly, Xvfb's OWN in-process `xorg_backtrace()` -> glibc `backtrace()`
+    /// call, which runs INSIDE the guest with no litebox involvement at all) pattern-matches to
+    /// recognize "this return address is a signal frame, stop here" -- desyncing every guest
+    /// backtrace that ever walks through a delivered signal (root-caused
+    /// `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 38th pass).
+    ///
+    /// The fix restores the EXACT SAME 9 real bytes (not a different, litebox-specific
+    /// signature) into a freshly `mmap`'d guest page instead of glibc's static `.text` -- so
+    /// `litebox_syscall_rewriter`'s offline, load-time-only scan (an explicit non-goal is ever
+    /// patching dynamically generated code, see that crate's own module doc comment) never sees
+    /// or touches it. The page is left `PROT_READ` only, NEVER `PROT_EXEC`: the bytes must stay
+    /// byte-for-byte readable (both by real glibc's own in-guest unwind fallback and by this
+    /// project's own tooling, neither of which executes them, only reads them as data to
+    /// pattern-match) but must never actually execute for real, since executing a genuine
+    /// `syscall` opcode here would reach the real host kernel exactly like an unpatched one
+    /// anywhere else. Reaching it via the signal handler's `ret` therefore always raises an
+    /// instruction-fetch access violation (Windows: DEP/NX, `ExceptionInformation[0] == 8`) at
+    /// exactly this address before the `syscall` byte would ever be decoded -- caught by
+    /// `LinuxShimEntrypoints::exception`'s x86_64 branch and redirected straight into
+    /// `sys_rt_sigreturn`, the same as aarch64's `brk` trap achieves via a different hardware
+    /// mechanism. `write_signal_frame` (`signal/x86_64.rs`) prefers this trampoline's address
+    /// over the guest's own `action.restorer` whenever allocation succeeds, falling back to the
+    /// real restorer only if it doesn't (e.g. guest out of address space) -- preserving the
+    /// previous behavior as a safety net rather than a hard requirement.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
+        // The real glibc x86_64 `__restore_rt` body, verbatim: `mov $0xf,%rax ; syscall`
+        // (0xf == __NR_rt_sigreturn). Never executed for real here (the page stays non-exec) --
+        // present purely so anything reading these bytes as data sees the real ABI signature.
+        const TRAMPOLINE_CODE: [u8; 9] = [0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05];
+        let existing = self.signals.borrow().sigreturn_trampoline.get();
+        if existing != 0 {
+            return existing;
+        }
+        let Ok(page) = self.sys_mmap(
+            0,
+            litebox::mm::linux::PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+            litebox_common_linux::MapFlags::MAP_PRIVATE
+                | litebox_common_linux::MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        ) else {
+            return 0;
+        };
+        let addr = page.as_usize();
+        let write_ok = UserPtrMut::<[u8; 9]>::from_usize(addr)
+            .write_at_offset::<Platform>(0, TRAMPOLINE_CODE)
+            .is_some();
+        // Drop write AND exec permission -- PROT_READ only. See this function's doc comment for
+        // why the page must never be executable.
+        let mprotect_ok = self
+            .sys_mprotect(
+                page,
+                litebox::mm::linux::PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_READ,
+            )
+            .is_ok();
+        if !write_ok || !mprotect_ok {
             return 0;
         }
         self.signals.borrow().sigreturn_trampoline.set(addr);
@@ -1054,9 +1131,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    #[cfg(target_arch = "aarch64")]
+                    // Both architectures now synthesize their own trampoline (see
+                    // `ensure_sigreturn_trampoline`'s two `#[cfg]`'d bodies above); a target with
+                    // neither `#[cfg]` arm (i.e. neither aarch64 nor x86_64) falls back to 0,
+                    // matching the old behavior for any such target.
+                    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                     let sigreturn_trampoline = self.ensure_sigreturn_trampoline();
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let sigreturn_trampoline = 0;
                     if let Err(DeliverFault) = self.signals.borrow().deliver_signal(
                         self.global.platform,

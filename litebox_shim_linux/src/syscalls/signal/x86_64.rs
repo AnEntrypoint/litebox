@@ -63,11 +63,26 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
-        _sigreturn_trampoline: usize,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
-        if !action.flags.contains(SaFlags::RESTORER) {
+        // Prefer litebox's own synthesized trampoline (see `Task::ensure_sigreturn_trampoline`'s
+        // x86_64 doc comment) over the guest's real `action.restorer` (glibc always sets this via
+        // `SA_RESTORER`, almost always to `__restore_rt`) whenever it was allocated. Returning
+        // through the real restorer routes through its actual `mov $0xf,%rax ; syscall` body,
+        // which `litebox_syscall_rewriter` must overwrite in place to intercept -- destroying the
+        // literal 9-byte signal-frame signature every non-CFI unwinder (including glibc's own, and
+        // Xvfb's in-guest `xorg_backtrace()`) pattern-matches. Falling back to `action.restorer`
+        // only when trampoline allocation itself failed (guest out of address space) keeps the
+        // previous behavior as a safety net rather than a hard requirement; falling back to a
+        // hard error only when NEITHER is available matches the previous RESTORER-required
+        // contract for that case.
+        let restorer = if sigreturn_trampoline != 0 {
+            sigreturn_trampoline
+        } else if action.flags.contains(SaFlags::RESTORER) {
+            action.restorer
+        } else {
             return Err(DeliverFault);
-        }
+        };
 
         let last_exception = self.last_exception.get();
 
@@ -97,7 +112,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         };
 
         let frame = SignalFrame {
-            return_address: action.restorer,
+            return_address: restorer,
             ucontext: Ucontext {
                 flags: 0,
                 link: 0, // core::ptr::null_mut(),

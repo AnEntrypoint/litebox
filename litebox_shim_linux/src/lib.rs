@@ -194,6 +194,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 Err(_) => ContinueOperation::Terminate,
             };
         }
+        // x86_64's synthesized sigreturn trampoline (see `ensure_sigreturn_trampoline`'s x86_64
+        // doc comment) holds the REAL glibc `__restore_rt` bytes verbatim but is mapped
+        // `PROT_READ` only, never `PROT_EXEC` -- reaching it via the signal handler's `ret`
+        // therefore always raises an instruction-fetch access violation (translated to
+        // `Exception::PAGE_FAULT` by the platform layer) at exactly this address, before the real
+        // `syscall` byte would ever be decoded. `ctx.rip` landing exactly on the trampoline's own
+        // address is this trap's unambiguous signature -- no other guest code legitimately
+        // fetches from this specific litebox-owned page.
+        #[cfg(target_arch = "x86_64")]
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && ctx.rip == self.task.sigreturn_trampoline_addr()
+            && ctx.rip != 0
+        {
+            return match self.task.sys_rt_sigreturn(ctx) {
+                Ok(_) => ContinueOperation::Resume,
+                Err(_) => ContinueOperation::Terminate,
+            };
+        }
         #[cfg(target_arch = "x86_64")]
         let is_kernel_page_fault =
             info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT;
