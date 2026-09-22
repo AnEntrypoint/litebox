@@ -1571,7 +1571,20 @@ fn diag_process_fork_vmem_adopt_probe(
     // reconstructed bookkeeping MATCHES the parent's real layout, boundaries and permissions
     // included (the CONTENTS at those addresses are already correct by construction, having been
     // `WriteProcessMemory`'d there verbatim -- this is the Rust-level bookkeeping catching up).
-    let mut sorted_expected = expected.clone();
+    //
+    // 45th pass (2026-09-22): `VM_SHARED` regions are now deliberately EXCLUDED from `tracked`
+    // (see `Vmem::new_adopting_existing_memory`'s own doc comment for why adopting them with a
+    // dangling `shared_handle: None` was a live, reproducible crash) -- exclude them here too, or
+    // this probe's own comparison would misreport every single run as a MISMATCH for an outcome
+    // that is now the intended, correct behavior rather than a real discrepancy.
+    let mut sorted_expected: Vec<_> = expected
+        .iter()
+        .filter(|(_, flag_bits, _)| {
+            !litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits)
+                .contains(litebox::mm::linux::VmFlags::VM_SHARED)
+        })
+        .cloned()
+        .collect();
     sorted_expected.sort_by_key(|(r, _, _)| r.start);
     let layout_matches = tracked == sorted_expected;
     let mismatches = sorted_expected

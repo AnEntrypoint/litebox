@@ -816,12 +816,33 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// Shared (`VM_SHARED`) regions cannot be adopted: a `VmArea`'s
     /// [`VmArea::shared_handle`] is a live platform handle in the PARENT's handle table with no
-    /// meaning in another process. Such regions are adopted with their flags intact but no handle,
-    /// and are reported by the returned count so a caller can surface the discrepancy rather than
-    /// silently mis-describing them.
+    /// meaning in another process, and a Windows cross-process fork's own reservation-group copy
+    /// (`copy_one_group`/`group_relocations`) deliberately never recreates real backing for a
+    /// `VM_SHARED` source region either (see `GroupRelocation`'s own doc comment: "`VM_SHARED`
+    /// regions are relocated independently" -- no such independent path actually exists for the
+    /// Windows cross-process-fork child today). Such regions are therefore skipped entirely here
+    /// (not inserted into `vmas`) rather than adopted with a dangling `shared_handle: None` --
+    /// root-caused live (45th pass, 2026-09-22): a previous revision DID insert them with an
+    /// ordinary-looking `VmArea` (`shared_handle: None`, `view_len: 0`), which made
+    /// `Vmem::remove_mapping`'s `shared_overlaps` check (keyed on `VmArea::view_extent()`, which
+    /// returns `None` whenever `shared_handle` is `None`) treat the region as ordinary PRIVATE
+    /// memory -- routing a later guest `munmap`/`mprotect` on it straight into
+    /// `WindowsUserland::deallocate_pages`/`update_permissions`'s real `VirtualFree`/
+    /// `VirtualProtect` calls, against an address this child process never actually committed any
+    /// real memory at (Windows correctly reports `MEM_FREE`), panicking
+    /// `litebox_platform_windows_userland::process_memory_range_by_regions`'s own
+    /// `assert!(success, ...)` (confirmed live via two independent boots hitting the bit-identical
+    /// region `0x7fef60030000-0x7fef64000000` and error signature). Skipping adoption instead
+    /// means a later guest access to that address faults honestly (a real, attributable page
+    /// fault at the actual point of use) rather than silently believing a phantom mapping exists
+    /// until an unrelated later cleanup operation panics the whole host process. Real
+    /// cross-process content sharing for `VM_SHARED` regions (duplicating the underlying platform
+    /// handle into the child, the same way pipes/files are already carried) remains unimplemented
+    /// -- this only stops the crash, it does not restore correct shared-memory semantics across a
+    /// cross-process fork.
     ///
-    /// Returns the `Vmem` plus the number of regions adopted and the number of those that carried
-    /// `VM_SHARED` (i.e. adopted without a usable handle, as above).
+    /// Returns the `Vmem` plus the number of regions adopted and the number of `VM_SHARED`
+    /// regions seen and deliberately skipped (never inserted into `vmas`).
     pub(super) fn new_adopting_existing_memory(
         platform: &'static Platform,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
@@ -843,7 +864,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
             if flags.contains(VmFlags::VM_SHARED) {
+                // See this function's own doc comment: deliberately NOT inserted into `vmas` --
+                // there is no real backing for it in this (adopting) process, and pretending
+                // otherwise is what produced a live, reproducible host-process panic.
                 shared += 1;
+                continue;
             }
             vmem.vmas.insert(
                 range,
