@@ -1196,3 +1196,27 @@ Now that the allocator corruption is gone, a full `webtop_stack.sh` boot is wort
 48th pass's own note that a still-firing host panic "changes downstream process timing/ordering"
 cuts both ways — fixing a real, frequent, early-boot corruption bug may shift whether/when the Xvfb
 crash triggers, for better or worse, and this pass did not yet re-run the full stack to check.
+
+### 49th pass addendum — full `webtop_stack.sh` boot re-verified post-fix, no regression
+
+Rebuilt the RELEASE binary with the same fix (`8b64698`) and ran a full `webtop_stack.sh` boot
+(`.wfgy/webtop_pass49_boot1.log`, `LITEBOX_PROCESS_FORK=1`, `--publish 8081:8081`). Reached the SAME
+best-documented state as every prior pass since the 44th — `NGINX_STARTED` → `XVFB_UP` → `DBUS_UP` →
+`SELKIES_LAUNCHED_LAST` → `SELKIES_PORT_UP curl_exit=0` → `DE_LAUNCHED` → `DE_FAILED` (via
+`xprop: unable to open display ':1'`) → the script's own `HOLD` loop — with ZERO
+`buddy_system_allocator` panics and, this run, ZERO Xvfb `Segmentation fault` text either (the
+second Xvfb SIGSEGV is timing-sensitive and doesn't fire every boot, consistent with prior passes).
+`DE_FAILED` itself is unchanged and NOT this pass's finding — still the same "Cannot open display"
+symptom the 30th-48th passes already narrowed to "something inside `xfce4-session`'s own process",
+never yet debugged with a live `cdb -pv` attach. Host-side `curl http://127.0.0.1:8081/` (the
+`--publish` port) connects at the TCP level (`netstat` confirms `LISTENING`, and a real 3-way
+handshake completes) but the HTTP request itself times out with 0 bytes received — the SAME
+unresolved observation the 43rd pass already recorded (Track B pickup item 2), reproduced again
+here with healthy RAM (~5-8GB free throughout, ruling out the transient-RAM-dip explanation this
+time) — worth a dedicated pass of its own, not chased further here. No Chrome browser extension was
+connected this session (`list_connected_browsers` returned empty) and the `chrome-devtools` MCP
+server failed to connect (`CONNECT_TIMEOUT`), so no screenshot was possible; the host-side curl
+timeout would have blocked one regardless. Terminal Emulator/Thunar app verification needs a
+working WM, not reached this pass (`DE_FAILED` persists) — remains blocked on the same two
+still-open items as every pass since the 44th: the second Xvfb SIGSEGV and `DE_FAILED`'s own root
+cause inside `xfce4-session`.
