@@ -1059,3 +1059,46 @@ A `LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP=1`/`LITEBOX_DIAG_MM=1` follow-up run to 
 pass (`.wfgy/de_only_pass45c_diag.log`, PowerShell `NativeCommandError`, "another ... release the
 lock" -- a leftover `litebox_runner` process was still holding a file lock; host RAM had fallen to
 ~3-4.5GB free by then). Not re-attempted this pass.
+
+## 44th-45th passes (2026-09-22), drained verbatim from AGENTS.md by the 46th pass's compaction
+
+**44th pass** — two real bugs FIXED+verified (fd 0/1/2 dropped at the cross-process fork boundary;
+a premature AF_UNIX connect-request cancellation that stalled `xfce4-session` forever on its own
+D-Bus connect). With both fixed, `xfce4-session` genuinely progresses for the first time ever --
+`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`/`dbus-update-activation-environment` all `execve` (none
+appear in any prior pass's log). Before `xfwm4` is reached, Xvfb SIGSEGVs again at fault address
+`0x4000400` (backtrace frame0 offset `0x1b20ed`, bit-identical to the 43rd-pass-fixed crash's own
+signature) -- `.wfgy/de_only_pass44_run2.log:46383-46392`.
+
+**45th pass** — TWO real host-process bugs found+fixed (`5d63ec6`, `32dd3d5`); the Xvfb `0x4000400`
+SIGSEGV was NOT reproduced across 2 post-fix boots (was present in 1 of 2 pre-fix boots), suggestive
+but NOT proven fixed; a separate, still-OPEN third host-process-panic mechanism blocked full
+confidence either way. Root-caused and fixed a DIFFERENT, previously-undiagnosed bug hit in the SAME
+44th-pass logs: a HOST-process Rust panic (`litebox_platform_windows_userland/src/lib.rs:7396`,
+`process_memory_range_by_regions`'s own `assert!`) firing inside short-lived cross-process-fork
+children (`ssh-agent`, `xprop`, etc.) at the bit-identical region `0x7fef60030000-0x7fef64000000`,
+Windows reporting `MEM_FREE`. (1) `allocate_pages`'s collision checks never accounted for the shared
+kernel heap's `SEC_RESERVE` fallback view -- fixed, but tested+REFUTED as the cause of this specific
+address (every process in the crashing fork tree lands its shared kernel heap at the FIXED base, not
+the fallback); kept as a real, independent fix. (2) `Vmem::new_adopting_existing_memory` adopted a
+`VM_SHARED` region into a cross-process fork child's `vmas` with `shared_handle: None`, which
+`Vmem::remove_mapping`'s `shared_overlaps` check (keyed on `VmArea::view_extent()`, `None` whenever
+`shared_handle` is `None`) then misclassified as ordinary PRIVATE memory, routing a later guest
+`munmap`/`mprotect` straight into `deallocate_pages`/`update_permissions`'s real Windows calls
+against an address this child never actually committed real memory at (`copy_one_group`/
+`group_relocations` never recreates `VM_SHARED` backing for a Windows cross-process-fork child at
+all). Fixed by skipping `VM_SHARED` regions at adoption entirely -- real cross-process content
+sharing for them remains unimplemented. **After BOTH fixes, the bit-identical `lib.rs:7396` panic on
+the SAME address STILL recurred** (during `ssh-agent`'s own exit) -- a THIRD, still-unidentified
+mechanism also produced it; a follow-up diagnostic boot (`LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP=1`/
+`LITEBOX_DIAG_MM=1`) failed to even launch this pass (Windows file-lock contention against a leftover
+process, host RAM down to ~3-4.5GB free) and was not re-attempted. `DE_FAILED` was reached in every
+run this pass (4/4); no run reached a working window manager; no browser/app verification was
+possible.
+
+## Minor standing gotchas drained by the 46th-pass compaction
+
+A freestanding no-libc probe's local `char buf[N] = "literal"` array initializer can crash: clang
+`-O1` lowers it to an aligned SSE `movaps`, and a hand-written `_start` doesn't always give the same
+alignment guarantee real crt0 does. Use a manual byte-copy loop instead (37th pass,
+`advisor/probes/pty_fork_probe.c`'s own `copy_str`).
