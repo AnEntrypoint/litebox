@@ -401,15 +401,38 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
 
         // Load the main ELF file first so that it gets privileged addresses.
         //
-        // Only a true static-PIE main executable (no PT_INTERP) needs its
-        // relocations applied externally here, matching the real kernel's
-        // binfmt_elf.c. When an interpreter is present, ld.so relocates both
-        // itself and the main executable via its own internal machinery
-        // (e.g. musl's _dlstart_c self-relocation); applying relocations here
-        // too would double-relocate and corrupt the image.
-        let info = self
-            .main
-            .load_mapped(global.platform, self.interp.is_none())?;
+        // NEVER apply relocations here, for either branch. The real Linux kernel's
+        // `binfmt_elf.c` does not process `PT_DYNAMIC`/`R_X86_64_RELATIVE` relocations for
+        // ANY ELF type -- it only maps `PT_LOAD` segments at a chosen base and hands off via
+        // `AT_PHDR`/`AT_ENTRY`/`AT_BASE`. Relocation is always performed by code that runs
+        // AFTER the kernel hands off, never by the kernel itself:
+        //  - dynamically-linked (`PT_INTERP` present): `ld.so` relocates both itself and the
+        //    main executable via its own internal machinery.
+        //  - static-PIE (`ET_DYN`, no `PT_INTERP`): the C library's OWN `_start`/crt code
+        //    (glibc's `_dl_relocate_static_pie`, musl's `_dlstart_c`/`__dls2`) unconditionally
+        //    self-relocates via its `_DYNAMIC` section before calling `__libc_start_main` --
+        //    this is the entire point of static-PIE support: it must work under a kernel with
+        //    no relocation-processing capability, so glibc/musl never skip this step and have
+        //    no way to detect whether a loader already did it for them.
+        // A previous version of this loader applied `R_X86_64_RELATIVE`/RELR relocations here
+        // for the static-PIE (no-PT_INTERP) branch, on the mistaken premise that the kernel
+        // does this and litebox needed to emulate it. Live-caught (2026-09-22, `ldconfig`
+        // under `debian-xfce`, real static-PIE binary, isolated single-process repro with zero
+        // fork/concurrency): the RELR decoder's own relocation formula reads the PRE-EXISTING
+        // slot value and adds `base_addr` to it (RELR carries no explicit addend -- the
+        // existing content IS the addend, by design). Applying it once here and then AGAIN via
+        // glibc's own unconditional self-relocation added `base_addr` TWICE to every
+        // RELR-covered slot, corrupting them into doubled/garbage pointers -- confirmed via a
+        // live VEH register capture showing `rbx` (a pointer freshly loaded from one such slot)
+        // holding almost exactly double a genuine base-address-shaped sibling register, then
+        // faulting as `add (%rbx),%rdx` dereferenced it. Removing the external relocation pass
+        // entirely (relying solely on the binary's own self-relocation, exactly matching real
+        // kernel behavior for every ELF type) is the correct fix, not a narrower "only skip
+        // RELR" patch: plain `DT_RELA` `R_X86_64_RELATIVE` fixups are idempotent under double
+        // application (same fixed formula, same target, both times) and were merely silently
+        // redundant, not visibly broken, so this bug could easily have re-surfaced on the very
+        // next static-PIE binary using RELR encoding rather than legacy RELA.
+        let info = self.main.load_mapped(global.platform, false)?;
 
         // Load the interpreter ELF file, if any. The interpreter always
         // self-relocates itself before running any of its own library code,
