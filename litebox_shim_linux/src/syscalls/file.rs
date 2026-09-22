@@ -1775,7 +1775,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                    handle.with_entry(|end| {
+                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.shared_pty)
+                    })
                 },
                 |fd| {
                     let handle = self
@@ -1947,7 +1949,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.write(&self.wait_cx(), buf))
+                    handle.with_entry(|end| end.write(&self.wait_cx(), buf, &self.global.shared_pty))
                 },
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2567,8 +2569,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `dup()`'d fd surviving the original fd's close.
                 if let Some(end) = &entry
                     && end.is_master()
+                    && let Some(id) = end.local_id()
                 {
-                    self.global.ptmx_closed(end.pair().id);
+                    self.global.ptmx_closed(id);
                 }
                 // do not hold any locks while dropping the entry
                 drop(entry);
@@ -4794,7 +4797,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// shared on the pty's [`super::pty::PtyPair`] so master and slave observe the same tty
     /// state, exactly as real Linux's master/slave pair do.
     fn pty_ioctl(&self, end: &super::pty::PtyEnd<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
-        let pair = end.pair();
+        let pair = end.pty_state(&self.global.shared_pty);
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
                 termios_ptr
@@ -4825,7 +4828,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if !end.is_master() {
                     return Err(Errno::ENOTTY);
                 }
-                ptr.write_at_offset::<Platform>(0, pair.id)
+                ptr.write_at_offset::<Platform>(0, pair.id())
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
@@ -4847,8 +4850,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Err(Errno::ENOTTY);
                 }
                 let flags = OFlags::from_bits_truncate(*flags as u32);
-                let slave = self.global.pts_open(pair.id)?;
-                let path = alloc::ffi::CString::new(alloc::format!("/dev/pts/{}", pair.id))
+                let slave = self.global.pts_open(pair.id())?;
+                let path = alloc::ffi::CString::new(alloc::format!("/dev/pts/{}", pair.id()))
                     .map_err(|_| Errno::EINVAL)?;
                 self.insert_raw_pty_fd(slave, flags, path)
             }

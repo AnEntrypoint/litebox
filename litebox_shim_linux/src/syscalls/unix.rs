@@ -2943,7 +2943,12 @@ const CONN_SLOT_OCCUPIED: u32 = 1;
 /// from either side's process is always serialized through real, dereferenceable local memory --
 /// no raw pointer is ever handed from one process to another; each side only ever touches its OWN
 /// copy of the `Arc`-free, inline-in-the-shared-arena bytes.
-struct SharedByteRing<Platform: ShimPlatform> {
+/// `pub(crate)`, not module-private: reused directly (per this codebase's own "reuse
+/// `SharedByteRing`/`SharedArc`/the shared kernel arena infrastructure directly, don't reinvent"
+/// convention) by `syscalls::pty::SharedPtyTable` for the cross-process pty master<->slave byte
+/// data plane -- the exact same shape (a fixed ring plus cross-process `RawMutex`-backed cursor)
+/// AF_UNIX already proved sound here, just keyed by pty id instead of a connection slot.
+pub(crate) struct SharedByteRing<Platform: ShimPlatform> {
     cursor: Mutex<Platform, RingCursor>,
     buf: [AtomicU8; SHARED_UNIX_CONN_BUF],
 }
@@ -2959,14 +2964,14 @@ struct RingCursor {
 }
 
 impl<Platform: ShimPlatform> SharedByteRing<Platform> {
-    fn new_empty() -> Self {
+    pub(crate) fn new_empty() -> Self {
         Self {
             cursor: Mutex::new(RingCursor::default()),
             buf: core::array::from_fn(|_| AtomicU8::new(0)),
         }
     }
 
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         *self.cursor.lock() = RingCursor::default();
     }
 
@@ -2998,7 +3003,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// Only used for the one case [`Self::try_write_all`] can never resolve no matter how empty
     /// the ring is -- a single message bigger than the whole ring -- see
     /// [`SHARED_UNIX_CONN_BUF`]'s doc comment.
-    fn try_write(&self, data: &[u8]) -> usize {
+    pub(crate) fn try_write(&self, data: &[u8]) -> usize {
         if data.is_empty() {
             return 0;
         }
@@ -3021,7 +3026,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// still open" and "empty and shut down" by design -- callers distinguish via
     /// [`Self::is_shutdown`]/[`Self::is_empty`], mirroring `channel::ReadEnd::peek_and_consume_one`'s
     /// own EAGAIN-vs-ESHUTDOWN split.
-    fn try_read(&self, out: &mut [u8]) -> usize {
+    pub(crate) fn try_read(&self, out: &mut [u8]) -> usize {
         let mut cursor = self.cursor.lock();
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let n = out.len().min(avail);
@@ -3033,7 +3038,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         n
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         let cursor = self.cursor.lock();
         cursor.write_pos == cursor.read_pos
     }
@@ -3043,11 +3048,11 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
     }
 
-    fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.cursor.lock().write_shutdown = true;
     }
 
-    fn is_shutdown(&self) -> bool {
+    pub(crate) fn is_shutdown(&self) -> bool {
         self.cursor.lock().write_shutdown
     }
 

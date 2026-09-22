@@ -126,8 +126,9 @@ AF_UNIX rendezvous "livelock" theory (24th pass: live per-request instrumentatio
 mechanism itself sound, one real connect per boot, ~23ms, no timing/address mismatch). Still open
 from this range: `SafeZoneAllocator::dealloc`'s spinlock livelock (no dead-holder recovery, unlike
 `RawMutex`); `pty_registry`/`daemon_pty_masters`/`flock_registry`/`drm`/`evdev` need a deeper
-redesign than a flat fixed array (non-POD payload); `UnixInitStream::check_io_events`'s static
-`Init`-state report (unconfirmed).
+redesign than a flat fixed array (non-POD payload) — the `pty_registry`/`daemon_pty_masters` slice
+is now DONE, 36th pass (`syscalls::pty::SharedPtyTable`), `flock_registry`/`drm`/`evdev` still
+open; `UnixInitStream::check_io_events`'s static `Init`-state report (unconfirmed).
 
 **Twenty-sixth pass (2026-09-20)** — FIXED `EpollFile::repoll_stdin_and_timerfd_interests` reading
 `is_still_ready` (always false for `EPOLLET`), not `event.is_some()`; `XVFB_UP` printed for
@@ -187,6 +188,104 @@ possibly-stale "Fork-after-Xorg" freeze risk, never re-tested since); live re-ve
 again by the SAME pre-Xvfb host-load condition the 33rd pass hit.** Full evidence, exact line
 numbers, and the precise pickup for both open threads: archive.
 
+**Thirty-fifth pass (2026-09-22) — the "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE.**
+Evidence: an already-on-disk real full boot (`.wfgy/webtop_release_boot5.log`, `LITEBOX_PROCESS_
+FORK=1`, release binary, current code per `git log`/binary-mtime cross-check) shows the full `[s]`
+marker sequence `XVFB_UP` → `DBUS_UP` → `SELKIES_LAUNCHED_LAST` → `DE_LAUNCHED` → `DE_FAILED` → the
+script's own designed idle `HOLD` loop, with ZERO freeze/SIGSEGV/tcache-corruption anywhere — the
+SAME final `DE_FAILED` state the thread-based path reaches, just via the cross-process path with no
+crash class at all. **New bug found+FIXED from the same log**: the `SELKIES_PORT_UP` readiness
+gate's 170-iteration `curl`-polling loop pays the FULL cross-process-child rootfs-rebuild cost per
+`curl` fork (170x), almost certainly causing the log's own `SELKIES_PORT_SELFTEST_FAILED` and
+`rc=137` OOM-kill — rewritten (`.wfgy/webtop_stack.sh`, gitignored/disk-only) to a zero-fork bash
+`/dev/tcp/HOST/PORT` builtin check (same for the smaller 20-iteration `NGINX_SELFTEST` gate),
+`bash -n`-clean, NOT yet live-verified. **Fresh live re-verification blocked this pass by the worst
+host-RAM condition of the whole investigation** (0.4-1.3GB free throughout, confirmed unrelated to
+litebox; a calibration re-run of the 09-17 pass's 24/24-clean minimal bare-fork repro died the same
+non-diagnostic way the 34th pass saw at a BETTER 1.95GB — RAM remains the dominant confound, not a
+regression). **`LITEBOX_PROCESS_FORK=1` is now the RECOMMENDED flag for `.wfgy/webtop_stack.sh`**
+given the freeze evidence, superseding the 12th-34th-pass caution — evidenced-safe-pending-
+reconfirmation, not fully closed until a fresh boot completes under workable RAM. **Pickup**: (1)
+once RAM is genuinely quiet (~1.8GB+ sustained), re-run the full boot (debug binary first) to
+confirm the fork-cost fix actually gets `SELKIES_PORT_UP` and no OOM-kill; (2) `DE_FAILED` is
+unaffected and remains the sole real blocker on BOTH fork paths — still needs the live `cdb -pv`
+attach on `xfce4-session` (`getenv`/`XOpenDisplay`/`_XConnectXCB`), not attempted by any pass to
+date; treat the recurring `Cannot open display: .` text as this GTK/Xt build's generic
+connection-failed fallback message, not literal evidence of `getenv("DISPLAY")`'s real return value
+(that string recurs for totally unrelated root causes elsewhere in this project's own history — see
+archive). Full evidence, exact log line numbers, fix mechanics: archive.
+
+**Thirty-sixth pass (2026-09-22) — `pty_registry`/`daemon_pty_masters` cross-process redesign
+(pickup item 4b's pty slice): landed and compile/unit-verified; live cross-process byte-transfer
+NOT yet confirmed.** Root cause matched the SAME defect class already fixed nine times over
+(`litebox`/`proc_self_info`/`pts_registry`/`elf_patch_cache`/`exec_ranges_cache`/
+`segment_scan_cache`/`memfds`/`shared_files`/`unix_addr_table`/`fifo_registry`): both fields lived
+directly on the byte-shared `GlobalState` struct as raw `BTreeMap<u32, PtyFd<Platform>>`s, whose
+node pointers (and the `Arc<crate::channel::Channel>`/`Arc<Pollee>` they point at) are meaningless
+outside the process that allocated them — a live crash waiting to happen the first time any
+cross-process-forked child touched a pty, never yet hit only because no earlier pass's boot
+happened to exercise it. UNLIKE `fifo_registry` (whose own doc comment explicitly disclaimed any
+cross-process need), `pty_registry`'s own original doc comment claims real cross-process need
+("any process that knows the id ... can open it", matching real devpts) — so a bare per-process
+shadow (this fix's first half, `litebox_shim_linux/src/lib.rs`, eleventh instance of the pattern)
+was not suffient alone. Added `syscalls::pty::SharedPtyTable<Platform>` (new, `litebox_shim_linux/
+src/syscalls/pty.rs`) as the genuine cross-process-visible half: an 8-slot fixed array (sized down
+from an initial 32 after live-reproducing the SAME by-value-`GlobalState`-construction
+`STATUS_STACK_OVERFLOW` `SHARED_UNIX_CONN_CAPACITY`'s own doc comment already documents — confirmed
+this pass, via `cargo test -p litebox_shim_linux --lib syscalls::pty::`, that the identical failure
+mode is PRE-EXISTING/environmental at the test harness's default thread stack size regardless of
+this table, since it reproduces on unmodified `main` too; passes cleanly with `RUST_MIN_STACK` set
+large, e.g. 64 MiB), each slot POD (termios/winsize/fg_pgid/locked/packet-mode, all `Copy`-safe) plus
+two `syscalls::unix::SharedByteRing`s (reused directly, promoted `pub(crate)` in `unix.rs`, exact
+same shape already proven sound for AF_UNIX) for the master<->slave byte data plane. Wired into
+`ptmx_open`/`ptmx_closed`/`attach_pty_stdio` (publish/release alongside the local registry),
+`pty_exists`/`live_pty_ids` (union of local + shared), and TWO new consumption paths: (a)
+`GlobalStateHandle::pts_open`'s cross-process fallback -- constructs a fresh LOCAL
+`PtyEnd::SharedSlave` fd-table entry when `id` is absent from this process's own registry but
+present in `SharedPtyTable`; (b) `LinuxShim::pty_master_read`/`pty_master_write`'s fallback to
+`SharedPtyTable::try_read_side`/`try_write_side` directly when `daemon_pty_masters` doesn't have
+the id locally. A new `PtyStateRef` enum (`Local(&Arc<PtyPair>)` vs `Shared(id, &SharedPtyTable)`)
+lets `pty_ioctl` (`syscalls/file.rs`) and `PtyEnd::write`'s ONLCR-termios lookup work uniformly
+across both transports with no duplicated logic. A new `poll_shared` helper (bounded 15ms re-poll,
+mirroring `syscalls::unix::wait_on_events_polling`'s own loop shape) backs blocking reads/writes on
+the shared path, since -- matching AF_UNIX's own already-documented finding -- no genuine
+cross-process wakeup exists; a `PtyEnd::Shared{Master,Slave}` end's `IOPollable` impl conservatively
+reports both `IN`/`OUT` always-possible rather than reaching for an `unsafe` 'static-erased table
+reference or a second `FS` generic parameter on `PtyEnd`/`PtySubsystem`/`PtyFd` (both explicitly
+out of scope this pass, documented in `pty.rs`'s own new "Shared cross-process pty data plane"
+module doc comment alongside every other scope limit: no cooked-mode ONLCR/echo/DSR-reply
+synthesis over the shared transport, no per-consumer close tracking on a `Shared*` end's own
+`Drop`). Every ordinary LOCAL read/write additionally best-effort-mirrors its bytes into the
+matching shared ring, so cross-process visibility works for a pty ANY process allocated, not only
+ones a foreign process explicitly re-opens.
+
+**Verification, precisely scoped**: (1) `cargo check -p litebox_runner_linux_on_windows_userland`
+clean (real target, `backend_tracing` feature included, matching how this crate is actually built --
+a bare `cargo check -p litebox_shim_linux` alone fails on an UNRELATED pre-existing issue,
+`syscalls/file.rs`'s stderr-capture block hardcoding `litebox_util_log::__private::tracing`
+without requesting the `backend_tracing` feature itself, confirmed pre-existing via `git stash`
+against unmodified `main`, not touched this pass, out of scope). (2) All 14 pre-existing
+`syscalls::pty::tests` cases pass unchanged (`RUST_MIN_STACK=67108864 cargo test -p
+litebox_shim_linux --lib syscalls::pty:: --features litebox_util_log/backend_tracing`) -- proves
+zero regression in the local, same-process transport (every echo/ONLCR/DSR/winsize/hangup/EPIPE
+case). (3) A real guest boot (`debian:stable-slim`, debug binary, single host process, no
+`LITEBOX_PROCESS_FORK`) running `/bin/sh -c 'script -qc "echo pty_ok" ...'` successfully allocated
+a pty (`ptmx_open`/`TIOCGPTN`/`TIOCSPTLCK` all through the new `SharedPtyTable`-publishing path),
+forked+`TIOCSCTTY`'d+`exec`'d its child (process tree showed `script`(pid2)/`sh`(pid3) both alive)
+with no crash/panic/stack-corruption -- then stalled in `script`'s own interactive read-from-
+real-stdin copy loop once given non-interactive/piped stdio (a harness-vs-tool mismatch consistent
+with this project's own recurring "ash DSR-query hang"/"sys_ppoll stuck" theme, not a new
+crash/panic; two attempts, one with piped empty stdin hit a real Unix `SIGPIPE`(13) on `script`'s
+own output-copy write once its host-side stdout pipe context made that legitimate). **NOT
+verified**: genuine cross-process pty I/O (`PtyEnd::SharedSlave`, `pts_open`'s shared fallback,
+`pty_master_read`/`write`'s shared fallback) -- no `LITEBOX_PROCESS_FORK=1` boot was attempted this
+pass (host RAM ~2.7GB free throughout, but time-budgeted toward the design/implementation/local-
+regression work instead); needs a follow-up pass with either a tiny custom freestanding guest
+binary (matching this project's own "freestanding guest binaries built on the HOST" working
+practice, avoiding `script`'s interactive-terminal assumption) driving `/dev/ptmx` +
+`LITEBOX_PROCESS_FORK=1` fork + a child re-opening `/dev/pts/<id>` by number, or a `--pty-mode`
+session-daemon repro exercising `pty_master_read`/`write`'s new fallback directly.
+
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 (-1) ~~Build the minimal isolated cross-process AF_UNIX repro~~ — DONE, fourteenth pass. (0)
@@ -231,13 +330,18 @@ EAGAIN-vs-EINPROGRESS~~ — FIXED, thirtieth pass; that same code path's
 request-cancellation-on-first-non-blocking-miss behavior is its own separate, precisely-scoped, NOT
 yet fixed follow-up — see that pass's own entry above for the exact
 `UnixStreamState::Connecting(request_idx)` reasoning. (4) finish the `Network` shared-arena redesign (`interface`
-remains — `queued_for_closure` is fixed, twenty-eighth pass); (4b) `pty_registry`/
-`daemon_pty_masters`/`flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit)
-genuinely need cross-process visibility per their own doc comments but hold non-POD payload
-(Arc-based state, `Pollee` observer lists), so need a deeper redesign than `sysv_shm`'s
-flat-Copy-slot-array fix — not yet touched by any pass, not on the Xvfb/selkies boot path so lower
-urgency; (5) after (0)-(4), `timerfd`/`signalfd` are the next-cheapest carriable fd kinds before
-attempting `socket`/`unix-socket`/`pty`/`epoll`. (6) The general writable-layer-visibility gap for
+remains — `queued_for_closure` is fixed, twenty-eighth pass); ~~(4b) `pty_registry`/
+`daemon_pty_masters`~~ — DONE, thirty-sixth pass (`syscalls::pty::SharedPtyTable`,
+`litebox_shim_linux/src/syscalls/pty.rs`); compile+local-regression-verified, live cross-process
+byte transfer still pending a `LITEBOX_PROCESS_FORK=1` repro (see that pass's own entry above).
+`flock_registry`/`drm`/`evdev` (`GlobalState` fields, eighteenth-pass audit) remain open — same
+non-POD-payload (Arc-based state, `Pollee` observer lists) obstacle the pty fix's own `PtyEnd::
+Shared{Master,Slave}`/`SharedPtyTable` pattern now gives a concrete template for, not yet applied to
+any of the three; not on the Xvfb/selkies boot path so lower urgency; (5) after (0)-(4),
+`timerfd`/`signalfd` are the next-cheapest carriable fd kinds before attempting
+`socket`/`unix-socket`/`epoll` (`pty` itself is no longer purely uncarriable — see the 36th pass:
+a cross-process opener can now re-acquire a pty by id via `pts_open`'s shared fallback even though
+the fd itself still isn't carried across `fork()`). (6) The general writable-layer-visibility gap for
 LARGE/unbounded content (`/tmp/de.log`/`/tmp/de2.log`/`/tmp/xvfb.log`, `/tmp/wm1`/`/tmp/wm2` —
 reconfirmed real, thirtieth pass: neither `[de]` nor `[de2]`-tagged output ever appeared in either
 thirtieth-pass boot log despite `DE_FAILED` firing both times) remains open —
@@ -287,10 +391,15 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 safe-linked-tcache write (the `fork_verify: stale CODE pointer` warning right before it is a red
 herring; translation is correct). Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
 0:glibc.malloc.mxfast=0` as an `--env` runner flag (a bare host-shell prefix does NOT reach the guest).
-Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fork`);
-`LITEBOX_PROCESS_FORK=1` removes the class properly but can't run a desktop until the AF_UNIX gap
-below closes. Selkies also needs `--clipboard-enabled=false` (its clipboard monitor re-triggers the
-same corruption every tick).
+Glibc-only workaround, not a fix (PRD `glibc-tunables-workaround-pending-zero-fork`) for the
+THREAD-based path specifically. **`LITEBOX_PROCESS_FORK=1` removes that whole crash class by
+construction (no relocation, so no safe-linked-pointer mistranslation is possible) and, per the
+35th pass above, no longer hits the old "Fork-after-Xorg" freeze either** — the AF_UNIX gap this
+paragraph used to cite as the blocker was independently closed by the 13th/28th passes; the real
+current blocker on EITHER fork path is `DE_FAILED` (see the 35th-pass pickup above), not AF_UNIX.
+Selkies also needs `--clipboard-enabled=false` on the thread-based path (its clipboard monitor
+re-triggers the same corruption every tick) — moot on the cross-process path for the same reason
+`GLIBC_TUNABLES` is.
 
 **Sixth/seventh pass (closed)** — writable-layer-adoption race fixed via the existing
 atomic-rename primitive; live-verified 5/5 boots, zero recurrence. Detail: archive.
@@ -341,7 +450,11 @@ on the private per-process heap, meaningless to an attaching process (PRD:
 `pty_registry`, `daemon_pty_masters`, `flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`,
 `shared_files`): `unix_addr_table`/`fifo_registry`/`memfds`/`shared_files` are now
 per-process-shadowed on `GlobalStateHandle`, `sysv_shm` is a real shared-arena-native fixed array.
-`pty_registry`/`daemon_pty_masters`/`flock_registry` remain open (pickup list).
+`pty_registry`/`daemon_pty_masters` are ALSO now per-process-shadowed (36th pass), with a genuine
+cross-process companion restored separately via `syscalls::pty::SharedPtyTable` (a plain
+`GlobalState` field, same pattern as `unix_addr_presence` below) rather than shadowed away, since
+(unlike the other four) real cross-process pty visibility is actually needed. `flock_registry`
+remains open (pickup list).
 `SharedUnixAddrPresenceTable` (`syscalls/unix.rs`) established the reusable flat-table PATTERN
 (`sysv_shm` and the AF_UNIX connection-DATA layer both reused it next): fixed-256-slot,
 pure-atomic, lock-free `(kind, key bytes<=108, owner pid)` side-index. `Pipes.litebox`'s stale

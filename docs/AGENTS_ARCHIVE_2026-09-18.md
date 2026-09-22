@@ -2894,3 +2894,138 @@ reason to suspect either one has regressed. No further boot attempts made this p
 confirmed -- forcing the full desktop boot on top of a host state that already breaks a single bare
 fork would only reproduce this same non-diagnostic silent death sooner, per this project's own
 standing "never force a doomed attempt" discipline.
+
+## Thirty-fifth pass, 2026-09-22 -- Fork-after-Xorg freeze CONFIRMED GONE under LITEBOX_PROCESS_FORK=1 (evidence from an already-on-disk real full boot log); new fork-cost bug found+fixed in the SELKIES_PORT_UP/NGINX_SELFTEST readiness gates; fresh live re-verification blocked by the worst host RAM condition of the whole investigation (0.4-1.3GB free, never sustaining above ~1.3GB)
+
+Evidence source: .wfgy/webtop_release_boot5.log (.wfgy/webtop_release_boot5.ps1), a real, complete,
+already-on-disk full boot -- LITEBOX_PROCESS_FORK=1, release binary, run 06:16-06:46 same day
+(2026-09-22), i.e. before this pass started (08:xx) but after the 33rd pass's ldconfig
+double-relocation fix (84a98bf, committed 07:41:51 -- binary mtimes, 07:12 debug/07:35 release, show
+it was actually compiled before that commit landed, i.e. the same session built, tested, then
+committed; confirmed this pass via cargo build: both -p litebox_runner_linux_on_windows_userland
+debug and release builds completed in 1-11s with zero recompilation work, meaning the current
+on-disk binaries are byte-identical to what boot5.log exercised -- this log is valid evidence
+against the CURRENT committed code, not stale).
+
+Full [s] marker sequence, in order, verbatim, no freeze anywhere in between (grep -n '^\[s\] ',
+UTF-16LE-decoded via iconv -f UTF-16LE -t UTF-8, PowerShell's *> redirect default encoding):
+NGINX_CONFIGURED -> NGINX_STARTED -> XVFB_UP -> DBUS_UP -> SELKIES_BACKPRESSURE_PATCH_STAGE_DONE ->
+PATCH_MARKER_CHECK path=UNRESOLVED count=0 (the selkies.py backpressure patch skip-reason, a
+separate known-open item, not investigated further this pass) -> SELKIES_LAUNCHED_LAST ->
+SELKIES_BIND_WATCHDOG_STARTED -> [~170 repeated cross-process-child "rebuilding rootfs from OCI
+image" bootstraps, see below] -> SELKIES_PORT_SELFTEST_FAILED after 170s -> SK_TAIL_BEGIN ->
+DE_LAUNCHED (image startwm.sh) -> DE_VIA_STARTWM=no -> DIAG_DISPLAY=[:1] HOME=[/config]
+DBUS_SESSION_BUS_ADDRESS=[unix:path=/tmp/dbus-l53jthICi8,guid=...] -> DE_FALLBACK_LAUNCHED ->
+DE_FAILED -> HOLD t=20s through HOLD t=600s (the script's own designed while E -lt 28800; sleep 20;
+E=$((E+20)) idle tail -- not a hang, this is the intentional post-failure hold loop, confirmed by
+its own steadily-incrementing t= value every 20s with zero gaps). This is the exact same final state
+(DE_FAILED) the thread-based fork path already reaches on this same image/script -- reached here via
+the cross-process path with zero freeze, zero SIGSEGV, zero tcache-corruption signature anywhere in
+the 56051-line log (the only "fatal" hits are three unrelated litebox_shim_linux::syscalls::signal:
+fatal lines, already expected from ordinary guest process termination, not a corruption signature).
+
+The old "Fork-after-Xorg PERMANENT freeze" (docs/AGENTS_ARCHIVE_2026-09-16.md's
+xorg-fork-freeze-7f3a9c session, thread 8 stuck mid-fork_verify single-step healing) is CONFIRMED
+GONE on this exact repro shape. That old freeze was specifically about a fork happening while
+Xvfb/xfconfd were concurrently forking under the THREAD-based path's fork_verify single-step healing
+machinery -- a mechanism that does not exist at all on the cross-process path
+(spawn_cross_process_fork_child never single-steps anything; it adopts VMA layout directly, see the
+[process_fork_diag] vmem-adopt-probe lines throughout this log confirming exact byte-for-byte VMA
+round-trips on every one of the many forks this boot performed). This is consistent with, and is the
+first live confirmation of, the 34th pass's own hypothesis that the freeze's likely root cause was
+one of the many things fixed across the 26th-33rd passes' worth of unrelated fork_verify/single-step/
+diag_fataldump work, even though no pass explicitly targeted the freeze itself.
+
+New bug found from the same log, root-caused and FIXED this pass: between SELKIES_LAUNCHED_LAST
+(line ~19825 of the UTF-8-decoded log) and SELKIES_PORT_SELFTEST_FAILED (line ~50891) sits ~31000
+lines of repeated [process_fork_diag] globalstate-probe (child): rebuilding rootfs from OCI image
+docker.io/linuxserver/webtop:debian-xfce / full 17-layer cache-hit re-listing / vmem-adopt-probe /
+task-resume-probe blocks -- roughly 170 repetitions, matching exactly the SELKIES_PORT_UP readiness
+gate's own i=0; while [ $i -lt 170 ]; do curl -s -o /dev/null -m 2 "http://127.0.0.1:${CWS}/"; ...;
+sleep 1; done loop (.wfgy/webtop_stack.sh, was lines ~751-764). Root cause: under
+LITEBOX_PROCESS_FORK=1, a curl fork (a real, heavyish PIE ELF binary, unlike sleep) is eligible for
+and takes the cross-process route, and every cross-process child pays the full "rebuild guest rootfs
+from the OCI image, re-adopt VMA layout, resume the parent's writable layer" bootstrap cost before it
+can even exec curl -- 170 of those back to back is real, substantial CPU/RAM/wall-clock cost sitting
+directly in the middle of the boot, at the exact same time selkies itself is trying to start up and
+bind its own port. This is almost certainly the real cause of both SELKIES_PORT_SELFTEST_FAILED
+(selkies starved of CPU/RAM by its own readiness-gate loop racing it) and the log's later [s]
+SELKIES_SUPERVISOR: attempt=1 exited rc=137 -- respawning (137 = 128+9, SIGKILL, i.e. an OOM-kill) a
+few thousand lines after DE_FAILED. This is exactly the "FORK BUDGET" class of problem this file's
+own standing comments (_nofork_tick, the xprop-based DE_UP check, the removed ss/netstat
+diagnostics) already established and fixed for other loops in this same script -- this one loop was
+simply never converted when those fixes landed, because on the THREAD-based path a curl fork is
+comparatively cheap and this cost was invisible.
+
+Fix applied (.wfgy/webtop_stack.sh -- gitignored, /.wfgy/ in .gitignore:223, so this fix lives only
+on disk, not in git history; AGENTS.md is the durable record of it): both the 170-iteration
+SELKIES_PORT_UP gate and the smaller 20-iteration NGINX_SELFTEST gate (originally lines ~236-248,
+also forked curl up to 20x, same class of cost, smaller magnitude) rewritten to use bash's own
+/dev/tcp/HOST/PORT redirection target, which is a shell builtin (exec 3<>"/dev/tcp/127.0.0.1/${PORT}"
+with no command after exec -- modifies only the current shell's own fd table and returns the
+redirection's own exit status; deliberately not wrapped in a ( ... ) subshell, which would fork and
+defeat the entire point -- caught and fixed in self-review before this was ever run live) instead of
+a forked curl, combined with the already-existing _nofork_tick helper instead of sleep. Semantics
+preserved exactly: the SELKIES_PORT_UP gate's original curl check only ever tested rc != 7
+(CURLE_COULDNT_CONNECT, a pure TCP-connect-level failure, never an HTTP-level one) -- a bare
+/dev/tcp connect attempt gives the identical connect-succeeded/failed signal. The NGINX_SELFTEST
+gate's original check needed the actual HTTP status code (-w "%{http_code}", comparing to 200) --
+replaced with a hand-rolled printf 'GET / HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'
+>&3 write followed by read -r -t 3 status_line <&3 and a builtin set -- $status_line; code="$2"
+word-split (no awk/cut, which would themselves fork) to extract the status code, with read -t 3
+preserving curl's original -m 3 bound. Combined effect: this whole readiness-wait sequence is now 0
+forks across up to 190 combined iterations (was up to 360 -- 170+20 curl plus 170+20 sleep). bash -n
+.wfgy/webtop_stack.sh syntax-checked clean. Not yet live-verified -- see the RAM section below for
+why; the next pass's first full boot re-run against this fixed script IS this fix's actual live
+verification, and should be watched specifically for whether SELKIES_PORT_UP now fires instead of
+SELKIES_PORT_SELFTEST_FAILED, and whether the rc=137 OOM-kill recurs.
+
+Why no fresh live boot was attempted this pass, precise numbers: host free RAM was checked
+repeatedly throughout this pass via Get-CimInstance Win32_OperatingSystem and ranged 0.4-1.3GB,
+confirmed via Get-Process | Sort-Object WorkingSet -Descending to be dominated by processes
+completely unrelated to litebox (agentplug-runner ~730-740MB, Discord ~630-690MB, two claude host
+processes ~590-670MB each, chrome ~400-630MB across several tabs, firefox ~400MB, MsMpEng ~500MB) --
+worse than the 34th pass's own already-bad 1.6-1.9GB starting condition. Two bounded polls (3
+minutes then a further 5 minutes, checking every 15-20s, never a blind/indefinite sleep) never saw
+free RAM sustain above ~1.3GB; it frequently dipped as low as 388-540MB mid-poll. A calibration
+re-run of the 09-17 pass's own 24/24-clean minimal bare-fork repro (bash -c 'echo OUTER_START;
+/bin/bash -c "echo INNER_SHELL_OK; id; echo INNER_DONE"', LITEBOX_PROCESS_FORK=1 set as a real host
+env var, debug binary, cached docker.io/library/debian:stable-slim) was run once at ~1.15-1.2GB free
+and died the exact same silent, non-diagnostic way the 34th pass documented at a better 1.95GB free
+(OUTER_START printed, then only the === LITEBOX process tree === diagnostic dump with pid=1 ppid=0
+comm=/bin/bash, then nothing -- no INNER_SHELL_OK, no OUTER_EXIT=, no fatal-signal line, no .dmp,
+process confirmed exited via Get-Process returning zero matches). This directly confirms (again, at
+an even worse RAM level, with the same non-diagnostic signature) that low host RAM remains the
+dominant confound for this whole investigation thread, not a code regression -- forcing the full
+desktop boot on top of this RAM state would only reproduce this same non-diagnostic silent death
+sooner, consistent with every prior pass's own "never force a doomed attempt" finding. cargo build
+-p litebox_runner_linux_on_windows_userland (both debug and release) completed successfully at this
+same RAM level in 1-11s each (already up to date, no recompilation needed) -- confirms the RAM
+sensitivity is specific to the guest-boot/cross-process-fork path itself, not a general
+host-build/tooling failure at this RAM level.
+
+Process hygiene: Get-Process litebox_runner_linux_on_windows_userland,litebox-presenter confirmed
+zero matches at task start and zero matches after the one calibration attempt (it exited on its own,
+no explicit kill needed). No litebox_runner/litebox-presenter/cdb process left running at pass end.
+Host RAM at pass end: ~0.6-0.7GB free (still degraded, unrelated to litebox, same top consumers as
+throughout).
+
+Pickup, precise, in order for the next pass: (1) once host RAM is genuinely quiet (this project's
+own standing ~1.8GB+ sustained threshold, no heavy unrelated host load), re-run the full
+LITEBOX_PROCESS_FORK=1 + .wfgy/webtop_stack.sh boot, DEBUG binary first per this task's own safety
+guidance, to confirm (a) still no freeze under the now-fork-optimized readiness gates, (b)
+SELKIES_PORT_UP now fires instead of SELKIES_PORT_SELFTEST_FAILED, (c) no rc=137 OOM-kill: this is
+the live verification this pass's own fix has not yet received. (2) DE_FAILED is unaffected by any
+of this pass's changes and remains the sole real blocker on both fork paths to the browser/apps
+milestone -- still needs the live cdb -pv attach on a live xfce4-session child (breakpoints on
+getenv/XOpenDisplay/_XConnectXCB), not attempted by any pass to date despite being the stated next
+step since (at least) the 29th pass. Re-read note for that session: the literal string
+"xfce4-session: Cannot open display: ." recurs identically across this whole project's history for
+totally different real root causes -- docs/AGENTS_ARCHIVE_2026-09-03.md:1037/1401/3611 show it
+produced by Xwayland's own Wayland connection dying before xfce4-session ever ran (a completely
+different architecture, no relation to today's Xvfb-based setup), while this session's own
+DIAG_DISPLAY=[:1] line proves the env is correct and no Xwayland is involved at all -- strongly
+suggesting the literal "." is this GTK/Xt build's generic/fallback connection-failed message text,
+not literal evidence of what getenv("DISPLAY") returned at the real call site. Only a live debugger
+session can settle this, which is exactly why it is the correct next step rather than further
+log/string archaeology.

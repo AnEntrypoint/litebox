@@ -537,6 +537,14 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // comment (2026-09-18 systematic audit).
         let my_fifo_registry =
             Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
+        // Eleventh instance of the SAME defect -- see `GlobalStateHandle::pty_registry`'s doc
+        // comment. The genuine cross-process capability these two fields' ORIGINAL doc comments
+        // (also preserved there) actually need is restored separately by `GlobalState::
+        // shared_pty` below, not by these per-process copies.
+        let my_pty_registry =
+            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
+        let my_daemon_pty_masters =
+            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -564,10 +572,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
-                        pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-                        daemon_pty_masters: litebox::sync::RwLock::new(
-                            alloc::collections::BTreeMap::new(),
-                        ),
+                        shared_pty: syscalls::pty::SharedPtyTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
@@ -589,6 +594,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             shared_files: my_shared_files,
             unix_addr_table: my_unix_addr_table,
             fifo_registry: my_fifo_registry,
+            pty_registry: my_pty_registry,
+            daemon_pty_masters: my_daemon_pty_masters,
         })
     }
 }
@@ -869,12 +876,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
     /// Read bytes from the master side of a pty allocated via [`Self::load_program_attach_pty`],
     /// keyed by the pty id that call returned. Callable from any thread with no `Task` in scope
-    /// (see `GlobalState::daemon_pty_masters`'s doc comment) -- this is what lets a plain
+    /// (see `GlobalStateHandle::daemon_pty_masters`'s doc comment) -- this is what lets a plain
     /// background thread in the runner drain a session's pty output concurrently with
     /// `run_thread` running the guest on its own thread. Blocking: waits for at least one byte
     /// using a throwaway, this-call-only `litebox::event::wait::WaitState` (never the guest's own), matching
     /// [`Self::perform_network_interaction`]'s precedent of driving shim-internal I/O from a
     /// caller with no guest `Task` in scope.
+    ///
+    /// Cross-process fallback: if `pty_id` is absent from THIS process's own local
+    /// `daemon_pty_masters` (it was allocated by a DIFFERENT process in the fork family, or this
+    /// process attached to the shared kernel state after `attach_pty_stdio` already ran
+    /// elsewhere), reads directly from `syscalls::pty::SharedPtyTable` instead -- see that type's
+    /// own doc comment for the full design and explicit scope limits.
     pub fn pty_master_read(&self, pty_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
         // Resolve the master's `EntryHandle` (which holds its own `Arc` clone of the entry's
         // lock, independent of the descriptor table itself -- see `EntryHandle`'s doc comment)
@@ -891,35 +904,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         // dropping the table guards before the blocking call fixes it.
         let handle = {
             let masters = self.0.daemon_pty_masters.read();
-            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
-            self.0
-                .litebox
-                .descriptor_table()
-                .entry_handle(master)
-                .ok_or(Errno::ENXIO)?
+            masters
+                .get(&pty_id)
+                .and_then(|master| self.0.litebox.descriptor_table().entry_handle(master))
         };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf))
+        match handle {
+            Some(handle) => {
+                handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf, &self.0.shared_pty))
+            }
+            None => syscalls::pty::poll_shared(&cx, false, || {
+                self.0.shared_pty.try_read_side(pty_id, true, buf)
+            }),
+        }
     }
 
     /// Write bytes to the master side of a pty allocated via [`Self::load_program_attach_pty`].
-    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale AND
-    /// (as of the fix noted there) the lock-ordering rationale for resolving the `EntryHandle`
-    /// and dropping the table guards before the blocking `end.write(&cx, buf)` call below.
+    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale, the
+    /// lock-ordering rationale for resolving the `EntryHandle` and dropping the table guards
+    /// before the blocking `end.write(&cx, buf, ...)` call below, AND the cross-process fallback.
     pub fn pty_master_write(&self, pty_id: u32, buf: &[u8]) -> Result<usize, Errno> {
         let handle = {
             let masters = self.0.daemon_pty_masters.read();
-            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
-            self.0
-                .litebox
-                .descriptor_table()
-                .entry_handle(master)
-                .ok_or(Errno::ENXIO)?
+            masters
+                .get(&pty_id)
+                .and_then(|master| self.0.litebox.descriptor_table().entry_handle(master))
         };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf))
+        match handle {
+            Some(handle) => handle
+                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf, &self.0.shared_pty)),
+            None => syscalls::pty::poll_shared(&cx, false, || {
+                self.0.shared_pty.try_write_side(pty_id, true, buf)
+            }),
+        }
     }
 
     /// Constructs a `LinuxShimEntrypoints`/`Task` for a process-based-fork child whose guest
@@ -1505,7 +1525,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .and_then(|h| {
                             h.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
-                                end.is_slave().then(|| end.pair().clone())
+                                end.is_slave().then(|| end.local_pair().cloned()).flatten()
                             })
                         })
                 },
@@ -2901,6 +2921,41 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     fifo_registry: Arc<
         litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>>,
     >,
+    /// Eleventh instance of the SAME defect class this struct's own doc comment documents ten
+    /// times over: a real cross-process-forked child's copy of this `BTreeMap<u32,
+    /// syscalls::pty::PtyFd<Platform>>`'s root pointer is the first creator's, meaningless in its
+    /// own address space -- the exact same live hazard as `elf_patch_cache`/`unix_addr_table`/etc,
+    /// just never yet caught live for pty because no earlier pass's boot reached a cross-process
+    /// pty touch. Unlike `fifo_registry` (whose own doc comment explicitly disclaimed any
+    /// cross-process need), `syscalls::pty::SharedPtyTable`'s own doc comment on `GlobalState`
+    /// below establishes real cross-process pty registration/data specifically because
+    /// `pty_registry`'s doc comment (right below) DOES claim genuine cross-process need ("any
+    /// process that knows the id ... can open it", matching real devpts) -- so this field alone is
+    /// shadowed per-process exactly like the ten before it (fixing the crash), while
+    /// `SharedPtyTable` (a plain, pointer-free `GlobalState` field, same free-riding-on-
+    /// `GlobalState`'s-own-sharing rationale as `unix_addr_presence`) separately restores the
+    /// genuine cross-process capability this one alone can no longer provide.
+    ///
+    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value). The slave
+    /// fd held here is never installed into any process's own fd table directly; each
+    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
+    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
+    /// underlying entry, for every open THIS process itself performs. A DIFFERENT process's
+    /// `open("/dev/pts/<id>")` for an id THIS process allocated instead takes
+    /// `GlobalStateHandle::pts_open`'s `SharedPtyTable`-backed cross-process fallback.
+    pty_registry: Arc<
+        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>>,
+    >,
+    /// Same reasoning as [`Self::pty_registry`] immediately above. Registry of allocated ptys'
+    /// master-side fd, keyed by pty id, populated only for a pty created via
+    /// `Task::attach_pty_stdio` (the session-daemon `--pty-mode` path) -- see that field's
+    /// original doc comment (preserved verbatim on `LinuxShim::pty_master_read`'s own doc comment)
+    /// for the full rationale. `LinuxShim::pty_master_read`/`pty_master_write` fall back to
+    /// `SharedPtyTable` directly when THIS process's own copy of this map doesn't have the
+    /// requested id (i.e. it was allocated by a different process in the fork family).
+    daemon_pty_masters: Arc<
+        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>>,
+    >,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -2918,6 +2973,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             shared_files: self.shared_files.clone(),
             unix_addr_table: self.unix_addr_table.clone(),
             fifo_registry: self.fifo_registry.clone(),
+            pty_registry: self.pty_registry.clone(),
+            daemon_pty_masters: self.daemon_pty_masters.clone(),
         }
     }
 }
@@ -3126,31 +3183,24 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
-    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value).
-    ///
-    /// The slave fd held here is never installed into any process's own fd table directly; each
-    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
-    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
-    /// underlying entry. Shim-wide (not per-process) because `/dev/pts/<id>` is a global
-    /// namespace: any process that knows the id (e.g. via a fd inherited across `fork()`, or by
-    /// reading `/proc/self/fd` in a real Linux guest) can open it.
-    pty_registry: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
-    >,
-    /// Registry of allocated ptys' master-side fd, keyed by pty id, populated only for a pty
-    /// created via `Task::attach_pty_stdio` (the session-daemon `--pty-mode` path).
-    /// Ordinary guest-driven `/dev/ptmx` opens (`ptmx_open`) never populate this -- the master fd
-    /// there lives purely in the opening process's own fd table, reachable only via the guest's
-    /// own syscalls, matching real Linux. This registry exists so a HOST-side caller (the runner,
-    /// via [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]) can drive the master
-    /// side of a session-daemon pty from a plain background thread with no `Task` in scope --
-    /// `PtyFd` read/write only need the shared `syscalls::pty::PtyEnd` entry itself, not a
-    /// process's fd table, so no per-thread `Task` is needed to use it.
-    daemon_pty_masters: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
-    >,
+    // NOTE: this struct deliberately has NO `pty_registry`/`daemon_pty_masters` fields --
+    // ELEVENTH instance of the SAME cross-process-garbage-pointer defect class documented on
+    // `GlobalStateHandle`'s own doc comment. Unlike `fifo_registry` (whose own doc comment
+    // explicitly disclaimed any cross-process need), `pty_registry`'s ORIGINAL doc comment here
+    // (preserved on `GlobalStateHandle::pty_registry`) explicitly claimed one: "any process that
+    // knows the id ... can open it", matching real devpts. `GlobalStateHandle` carries its own,
+    // always-freshly-constructed-per-process `pty_registry`/`daemon_pty_masters` fields instead
+    // (fixing the crash, exactly like the ten instances before it), and the genuine cross-process
+    // capability those two fields' doc comments actually need is restored separately by
+    // `shared_pty` below -- do not re-add fields with these names here.
+    /// Shared-arena-native, fixed-capacity, pointer-free companion to the per-process
+    /// `pty_registry`/`daemon_pty_masters` (see [`syscalls::pty::SharedPtyTable`]'s own doc
+    /// comment for the full design and its explicit scope limits): existence, control state
+    /// (termios/winsize/locked/fg_pgid/packet-mode), and the master<->slave byte data plane for
+    /// every currently-allocated pty, visible to every process in the fork family regardless of
+    /// which one allocated it. A plain field of this same struct, same free-riding-on-
+    /// `GlobalState`'s-own-sharing rationale as `unix_addr_presence`.
+    shared_pty: syscalls::pty::SharedPtyTable<Platform>,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
     /// The live pipe behind each open FIFO, keyed by the FIFO's `(dev, ino)`.
