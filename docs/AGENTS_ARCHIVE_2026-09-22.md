@@ -1376,3 +1376,152 @@ SIGSEGV/segmentation-fault text, and zero gpg-agent activity at all (consistent 
 never reaching client-spawn this run) in the full .wfgy/de_only_pass53_utf8.log - the 49th/51st-pass
 fixes (buddy allocator, SysV shm) continue to hold with zero recurrence on yet another independent
 run.
+
+## 54th pass (2026-09-22) -- D-Bus service-activation false-"exited" bug ROOT-CAUSED and FIXED;
+## xfwm4 execve'd for the first time ever; drained verbatim from AGENTS.md by the 55th pass's compaction
+
+wait4_diag instrumentation (GetProcessTimes-based, added to both try_wait_for_cross_process_exit,
+process_fork.rs, and arm_cross_process_exit_notifier, lib.rs) proved one live org.a11y.Bus
+babysitter's real Windows process stayed alive a genuine 3856ms after its own CreateProcessW while
+dbus's "exited, reason unknown" print fired <1ms after fork() returned to the guest -- 3.8+ real
+seconds before either WaitForSingleObject call had returned anything for that handle at all. This
+REFUTED the 53rd pass's premature-exit-report hypothesis with direct evidence.
+
+Real cause (confirmed against fetched upstream dbus-spawn-unix.c): dbus's activation babysitter
+reports its pid back over a _dbus_socketpair() (CLOEXEC, addressless) pair BEFORE any exec() --
+exactly the case try_cross_process_fork's blanket CLOEXEC-drop policy (process.rs line ~2846)
+documents as unsafe: dropping that fd silently left the daemon's own end of that specific pair
+referencing a peer that was never given a live copy in the cross-process child, read as an immediate
+EOF/HUP. Fixed: raw_fd_is_addressless_unix_socket_pair (net.rs) distinguishes a genuine
+socketpair(2) result (both ends Unnamed) from an ordinary named-peer CLOEXEC client socket
+(X11/D-Bus connections, 95.1% of all cross-process-fork CLOEXEC drops measured over a real
+debian-xfce boot) -- only the narrow addressless case now refuses the whole cross-process fork
+(falls back to thread-based) instead of silently dropping the fd (commit 66265d9).
+
+Live-verified twice (.wfgy/de_only_pass54_fixverify.log, de_only_pass54_lean.log, both UTF-16LE):
+Activated service 'org.a11y.Bus'/'org.xfce.Xfconf' now print Successfully activated, the
+GLib-GIO-CRITICAL/GObject-CRITICAL flood is GONE (zero in either log), and /usr/bin/xfwm4
+genuinely execve's for the first time in this entire multi-week investigation.
+
+Still short of DE_UP: xfwm4 stays alive (periodic futex wakes past its own 150s+ elapsed clock)
+but never sets _NET_SUPPORTING_WM_CHECK in the observed window. New top suspect this pass, reproduced
+twice: index out of bounds: the len is 1 but the index is 13 panic at litebox/src/fd/mod.rs:422
+(exact log line: de_only_pass54_fixverify.log:462972, UTF-16LE, thread <unnamed> (28128)), inside
+some cross-process-forked process whose own Descriptors table had only 1 entry at the time -- not
+yet root-caused this pass (see the 55th pass below for the actual root cause and fix). Host RAM
+cratered UNDER 1GB TWICE on de_only.sh ALONE (it now reaches much deeper into the boot, so far more
+processes spawn) -- both runs killed via Invoke-CimMethod Terminate before a freeze; webtop_stack.sh
+was deliberately not attempted this pass given that fragility.
+
+## 55th pass (2026-09-22) -- fd/mod.rs:422 panic ROOT-CAUSED and FIXED; a SEPARATE, serious
+## RAM-exhaustion issue identified as the current proximate blocker to DE_UP, not yet fixed
+
+Root cause of the fd/mod.rs:422 panic, confirmed by code reading (not yet by a live debugger --
+the live repro captured by the 54th pass was sufficient: exact file:line, exact panic message, exact
+call stack shape). litebox::fd::Descriptors (litebox/src/fd/mod.rs) is a genuinely PER-PROCESS,
+PRIVATE structure -- a fresh cross-process-forked child's own table starts small (as few as 1 entry,
+built up one insert() call at a time by adopt_forked_process/the child's own initialize_stdio_in_
+shared_descriptors_table and, later, install_file_at_fd/install_eventfd_at_fd/install_pipe_*_at_
+fd). TypedFd's inner index is only ever meaningful against the SAME Descriptors instance that
+insert()ed it. The 28th pass already root-caused and partially fixed exactly this defect class for
+ONE call site (drain_entries_full_covered_by, used against Network::queued_for_closure, a
+genuinely cross-process-shared fd queue where one process's pushed TypedFd index is read back by
+every OTHER process's own periodic tick) -- see that pass's own three-part doc comment, still in
+fd/mod.rs, for the fullest available description of the general defect ("a TypedFd one process
+pushed encodes an index into THAT process's own private entries, meaningless -- out of bounds, or
+resolving to an unrelated live entry -- in a different process's table"). That fix made ONLY
+drain_entries_full_covered_by use self.entries.get(idx) (bounds-checked, None-tolerant) instead
+of self.entries[idx] (panics on out-of-bounds) -- every OTHER accessor in the same file
+(with_entry, with_entry_mut, entry_handle, get_entry, get_entry_mut,
+with_entry_mut_via_internal_fd, with_metadata, with_metadata_mut, set_entry_metadata,
+set_fd_metadata) was never swept the same way, and get_entry (line 422 at the time of the panic)
+was exactly one of the un-swept ones.
+
+This session did not conclusively identify WHICH specific caller fed a foreign/stale index into
+get_entry for this particular panic (the surrounding log window at the exact panic line
+carried no task-resume-probe/globalstate-probe markers to anchor it to a specific child's
+bootstrap step, and the massively-interleaved multi-process combined log makes attribution by
+timestamp alone unreliable -- host_tid=28128 reused across the log for at least two different real
+Windows threads at different points, consistent with OS TID reuse after a thread exits). Given (a)
+this is the exact SAME general defect class as three already-fixed bugs this project has fixed this
+way before (Network::queued_for_closure, Pipes.litebox's stale pointer, FutexManager's
+stack-allocated LoanList sharing hang -- see AGENTS.md's shared-memory-foundations section), (b)
+AGENTS.md's own hard, non-negotiable invariant that guest-reachable code must return an errno and
+never panic (the host process IS the entire guest session -- one bad index must not kill it), and
+(c) the fix is a mechanical, low-risk, purely-defensive bounds-check with no behavior change for
+any legitimately-in-bounds caller, the correct and sufficient fix was to sweep ALL of this file's
+direct-indexing accessors to the same None-tolerant pattern, rather than hunt further for the
+exact caller. Done, commit faa74c6: cargo check -p litebox clean, cargo test -p litebox --lib
+fd:: 4/4 pass, cargo check -p litebox_shim_linux clean (pre-existing, unrelated backend_tracing
+feature-gate error confirmed present on git stash too -- not caused by this change; the real runner
+crate that always enables that feature built and ran fine, cargo build -p
+litebox_runner_linux_on_windows_userland succeeded).
+
+Live verification, two independent LITEBOX_PROCESS_FORK=1 de_only.sh boots on the rebuilt debug
+runner (.wfgy/de_only_pass55_verify.log, full LITEBOX_LOG incl. syscalls::process=debug; and
+.wfgy/de_only_pass55b_lean.log, leaner LITEBOX_LOG=warn,litebox_diag::stderr_capture=debug, both
+UTF-16LE): neither run reproduced the fd/mod.rs panic or ANY panic text at all. Both runs
+independently progressed past DBUS_UP/DE_LAUNCHED_DIRECT into the _NET_SUPPORTING_WM_CHECK
+poll loop and showed the SAME real forward progress signal -- xprop -root _NET_SUPPORTING_WM_CHECK's
+own error text changed from "no such atom on any window" (the atom name has never been interned) to
+"not found" (the atom name IS now interned -- something, most plausibly xfwm4, made a real
+XInternAtom call -- but the property is not yet SET on the root window) between roughly poll 4-5 of
+12. This is genuine, reproducible evidence that SOMETHING is actively doing real X11 work in this
+window, not merely hung.
+
+But BOTH runs died from RAM exhaustion at almost the exact same point before either reached DE_UP
+or DE_FAILED's own 60s timeout, independently confirming the 54th pass's own "host RAM cratered
+under 1GB" observation as a real, reproducible, SEPARATE blocker -- not a one-off: run 1
+(de_only_pass55_verify.log) went from 3.6GB free (poll 6) to 738MB free to fully gone (root runner
+process no longer resolvable by PID, only two bare-77-char-command-line ORPHANED cross-process
+children left running, exactly AGENTS.md's own documented "dead root runner, orphans keep running"
+signature) within about 30 seconds, between poll 6 and poll 7 -- no panic, no RUN EXIT line, the log
+simply stops, consistent with an un-caught host-level OOM kill of the root process rather than a guest
+panic. Cleaned up via Invoke-CimMethod -MethodName Terminate on the two orphaned bare-command-line
+children once Get-CimInstance showed them as the only survivors (their full --oci-image root was
+already gone -- Terminate on it separately returned "Not found", confirming it self-terminated before
+the cleanup call landed); RAM recovered fully to ~9.2GB free the instant they were gone, confirming no
+leak persists once the process tree is down. Run 2 (de_only_pass55b_lean.log, deliberately trimmed
+LITEBOX_LOG to rule out logging overhead as the cause) reached the same poll-6-to-7 danger window at
+2.87GB free and was heading toward the identical trajectory (2.5GB, then 1.95GB -- the SAME 1.95GB
+floor a completely unrelated calibration re-run hit in the 34th pass) when this pass deliberately
+terminated it proactively rather than let a second uncontrolled OOM happen; RAM recovered to ~9.1GB
+free immediately after. Trimming the log level did NOT meaningfully change the RAM trajectory or its
+timing (both runs crossed 4GB free within one poll cycle of DE_LAUNCHED_DIRECT and were below 3GB by
+poll 5-6) -- the leak/cost is in actual guest-process/fork proliferation during this exact window
+(dbus service activation + xfce4-session's own client-spawn fan-out + the poll loop's own per-poll
+xprop fork), not primarily logging volume, though de_only_pass55b_lean.log was STILL 75MB despite
+the trimmed filter (guest stderr_capture=debug alone captures a large volume once XFCE's session
+clients start producing their own GTK/GLib warning noise).
+
+Conclusion: the _NET_SUPPORTING_WM_CHECK-never-set symptom is, as of this pass, NOT confirmed to
+be a DE_FAILED-causing logic bug in xfwm4 or a litebox syscall bug at all -- every run that has
+reached this exact window since the 54th pass's D-Bus fix landed has died from RAM exhaustion before
+the window's own natural 60s timeout could even elapse, with real evidence (the atom-interning
+progress) that something was still actively working right up until the kill. This reframes the
+current top blocker: it may be that xfwm4 genuinely completes and sets the atom given enough
+sustained RAM -- this has never actually been observed to fail on its own merits, only to run out of
+host memory first. Pickup, precisely scoped: (1) do NOT re-attempt this exact repro back-to-back
+without a substantial RAM-recovery pause and a below-4GB-committed baseline check first (this pass's
+host was measured healthy at 8-9GB free before each of its two attempts and still hit the SAME danger
+zone by poll 6, so the fork-proliferation cost itself is the dominant factor, not a dirty starting
+state); (2) investigate WHERE the RAM is actually going in this exact window -- top suspects, not yet
+measured: xfce4-session's own session-client fan-out (each new client is a fresh cross-process fork,
+and per process_fork.rs's own doc comment on LITEBOX_DIAG_SHARED_HEAP_INHERIT, every plain
+external-command-style fork that is NOT using that still-off-by-default flag rebuilds its own full
+in-memory merged OCI rootfs from the layer cache privately, a single ~173MB+ host allocation PER
+FORK, reclaimed only once that short-lived process exits -- a de_only.sh boot forks xset/
+xdpyinfo/xprop x13+/sleep x dozens/dbus-daemon's activation babysitters/every xfce4-session
+client on top of this same per-fork cost, which is a very plausible dominant mechanism and was
+NOT the reason LITEBOX_DIAG_SHARED_HEAP_INHERIT=1 was left off -- that flag was left off because
+the same 173MB-class allocation does not fit the shared heap's own fixed 64MiB cap anyway, so turning
+it on does not fix this without ALSO enlarging that heap, which is real, separate, unscoped work);
+(3) a genuine fix likely needs either a materially larger shared kernel heap (currently a hard 64MiB
+cap, shared_kernel_arena_alloc) with LITEBOX_DIAG_SHARED_HEAP_INHERIT finally promoted to default,
+or a way to avoid a full rootfs rebuild for a short-lived external command's cross-process fork
+entirely (e.g. sharing the ALREADY-rewritten/merged layer data read-only across the whole fork family
+rather than re-merging it fresh per fork) -- both are real, scoped, but substantial follow-on
+engineering, not a quick patch; (4) once (2)/(3) narrow the real allocation site, re-attempt this
+exact de_only.sh repro to determine for the first time whether xfwm4 genuinely reaches
+_NET_SUPPORTING_WM_CHECK given enough sustained RAM, before assuming any further xfwm4-specific
+logic bug exists at all.
