@@ -263,3 +263,264 @@ real `--initial-files` tar boot of the freestanding probe under the DEBUG runner
 0. Files: `advisor/probes/pty_fork_probe.c` (+ prebuilt `advisor/probes/pty_fork_probe`),
 `litebox_shim_linux/src/syscalls/process.rs` (fd-eligibility `dropped_pty` arm),
 `litebox_shim_linux/src/syscalls/pty.rs` (`PtyStateRef::Local`'s second field + mirrored setters).
+
+## 38th pass (2026-09-22) — Xvfb SIGSEGV full symbolization narrative, verbatim pre-compaction text
+
+DE_FAILED A/B-CONTROLLED: re-ran the isolation harness with ONLY the `xfce4-session` launch removed
+(`.wfgy/de_noDE.sh`) — zero Xvfb crashes, well past the point the DE runs die, while still serving
+`xset`/`xdpyinfo`/12 `xprop` polls. With the DE present the crash is 2/2 deterministic. Trigger is
+`xfce4-session`'s SPECIFIC X11 traffic, not elapsed time, not X clients in general. `DE_FAILED` is
+downstream of the Xvfb crash; one bug, not two.
+
+Xvfb's own built-in `xorg_backtrace()` prints its frames to stderr on the fatal signal; always
+emitted, always thrown away, because the harness sent Xvfb's stderr to `/tmp/xvfb.log` (unreadable
+by the parent under `LITEBOX_PROCESS_FORK=1`) instead of a pipe. `... 2>&1 | sed 's/^/[xvfb] /' &`
+fixed that. Captured frames, `.wfgy/de_only_1.log`: 13 frames, Xvfb text addresses in the
+`0x158100xxxxx` band, glibc frames at `0x7fefedd7adf0` (signal frame) / `0x7fefede9dabd` (the
+faulting AVX2 memcpy/memmove) / `0x7fefedd64ca8`+`0x7fefedd64d65` (`__libc_start_*`), fault address
+`0x7feffecdd400` — bit-identical to the 32nd pass's register capture. `.wfgy/xvfb.debug` (BuildID
+`6440f00c805782c9a39a5acd92855079e9fffc92`) has the DWARF.
+
+Second independent capture (`.wfgy/de_only_2.log`) reproduced byte-identical module offsets and
+fault address; only the load base moved (`0x15810000000` vs `0x7810000000`, both 256MB-aligned)
+while every offset and the glibc addresses stayed fixed. Offsets: frame0 `0x1b20ed`, frame3
+`0x74391`, frame4 `0x7530a`, frame5 `0x67f14`, frame6 `0xf631d`, frame7 `0x8254b`, frame8
+`0x15444b`, frame9 `0x158514`, frame12 `0x447e1`.
+
+Tested the constant-shift hypothesis against stock `.wfgy/xvfb.debug` across the whole admissible
+delta window `0x4DBF..0x4DE1` (the range putting frame12 inside `_start`'s 34 bytes) — does not
+resolve: frames 3-9 stay incoherent at every delta (`PanoramiXCopyPlane` + `PanoramiXPolyArc` +
+`XineramaXvShmPutImage` + `input_option_set_value` + `ProcessVelocityData2D` is not a call chain,
+and Xvfb does not run Panoramix at all). `frame12` mapping to `_start` is CIRCULAR (the delta was
+solved to make it do so) and proves nothing by itself.
+
+The rewriter-shifts-layout theory is REFUTED by bytes: the actual rewritten `/usr/bin/Xvfb` pulled
+from `.litebox-cache` (4 copies, md5-identical, matching BuildID) has program headers and section
+addresses byte-identical to stock (`.text 0x33900` len `0x166a45`, entry `0x3fa00`).
+`litebox_syscall_rewriter` patches IN PLACE (5-byte `jmp` + `nop` padding into a trampoline region
+mapped +16MiB away). Zero address movement, so both constant- and non-uniform-shift are dead.
+Base-independent kill shot: `f12 - f9 = -0x113D33` while `_start - main = -0x10`. Sweeping all 1.2M
+byte-aligned bases in the feasible range against the 20532 real return addresses: best agreement
+4/9 at a non-page-aligned base, exactly chance (p≈0.0139/frame); no page-aligned base reaches 3/9.
+At the true base 0/9 are return addresses and frame0 (`0x1b20ed`) is in `.eh_frame_hdr`, not
+executable at all.
+
+ROOT CAUSE, established this pass: libunwind's x86_64 `unw_is_signal_frame()` identifies the
+sigreturn trampoline by matching the literal 9 bytes `48 c7 c0 0f 00 00 00 0f 05`
+(`mov $0xf,%rax; syscall`) at the IP. In the rewritten libc, `__restore_rt` now reads `e9 40 42 1b
+00` (`jmp`) + `90 90 90 90` — the rewriter replaced exactly those 9 bytes, and zero raw `syscall`
+instructions remain anywhere in the rewritten libc. Signal-frame detection fails, the ucontext is
+never read, and the walk desyncs into its RBP-chain fallback — every frame prints `?+0x0` and only
+the ends (the `__restore_rt` word, the faulting IP, the `__libc_start_main` pair) are real.
+Salvaged from the capture: `f2 = libc+0x162abd` = `vmovdqu (%rsi),%ymm0`, the 32-64-byte path of
+`__memmove/__memcpy_avx_unaligned_erms`, with `%rsi = 0x7feffecdd400` — first instruction-granular
+confirmation of the AVX2 claim. libc base `0x7fefedd3b000` in both runs (glibc Debian
+2.41-12+deb13u3); the fault address sits ~20MB below `TASK_ADDR_MAX` (`0x7ff000000000`), well above
+libc's top, i.e. in the high mmap/stack region, inside NEITHER module.
+
+xfce4-session's real stderr had never been readable by any prior pass: the harness sent it to
+`/tmp/de2.log`, unreadable by a parent under `LITEBOX_PROCESS_FORK=1`. Read for the first time via
+a pipe, it contains NO "Cannot open display" at all — it contains an AT-SPI dbind-WARNING, which
+GTK only emits AFTER `gtk_init` has already succeeded. The DE opens the display fine; Xvfb then
+SIGSEGVs at the bit-identical `0x7feffecdd400` and the X server dies underneath it. Ordering in
+`.wfgy/de_only_1.log` is unambiguous: `DE_LAUNCHED` :3818 → Xvfb SIGSEGV :5655 → DE AT-SPI warning
+:5702 → `DE_FAILED` :10535.
+
+New standing lessons, each live-proven this pass: guest diagnostics must travel by PIPE; `cmd >
+/tmp/f` + parent read fails by SIZE, and `VAR=$(cmd)` returns EMPTY for an external command while
+`$?` stays correct — root-caused to `litebox_shim_linux/src/syscalls/process.rs:2646-2649`'s
+cross-process-fork carry-scan filtering `raw >= 3`, so guest fds 0/1/2 are never carried, silently
+breaking any process that redirects stdout to a pipe before forking; fix shape recorded, not yet
+implemented. `.wfgy/webtop_seed.tar` embeds a FROZEN copy of `webtop_stack.sh`; the 35th pass's
+`/dev/tcp` gate rewrite had never executed in a guest because the tar predated it. A boot whose log
+stops is usually a dead ROOT RUNNER, not a hang: children carry a bare 77-char command line, the
+root carries the full `--oci-image` argument list — diagnose with one `Get-CimInstance` line rather
+than assuming a stall.
+
+## 39th pass (2026-09-22) — sigreturn-signature fix landed + verified; Xvfb call site narrowed by a direct raw-stack read
+
+**Task 1, DONE and live-verified.** Implemented the fix the 38th pass's root-cause identified but
+did not build: mirrored aarch64's existing `Task::ensure_sigreturn_trampoline` pattern onto x86_64
+(`litebox_shim_linux/src/syscalls/signal/mod.rs`), `write_signal_frame`
+(`signal/x86_64.rs`) now prefers it over the guest's `action.restorer`, and a new x86_64 branch in
+`LinuxShimEntrypoints::exception` (`litebox_shim_linux/src/lib.rs`) catches the resulting
+instruction-fetch fault and redirects into `sys_rt_sigreturn`. Full mechanism and rationale: this
+commit's own message (`7d66935`) and the three files' doc comments. Key design point not obvious
+from the diff: the trampoline page holds the REAL glibc `__restore_rt` bytes verbatim
+(`48 c7 c0 0f 00 00 00 0f 05`), not a litebox-specific signature — `PROT_READ`-only (never
+`PROT_EXEC`) is what makes catching execution safe without ever letting the real `syscall` opcode
+decode, so the byte content stays meaningful to ANY non-CFI unwinder that pattern-matches it,
+including glibc's own in-guest fallback and Xvfb's own `xorg_backtrace()`, not just this project's
+tooling. `litebox_syscall_rewriter` itself is untouched — glibc's real `__restore_rt` still gets
+patched like any other syscall site, but is now genuinely dead code (nothing returns there anymore
+once a trampoline is allocated), so no `REWRITER_CACHE_VERSION` bump was needed.
+
+Verification: `cargo build -p litebox_runner_linux_on_windows_userland` clean (debug profile).
+Functional round-trip repro (`bash -c 'trap : USR1; kill -USR1 $$; echo AFTER_TRAP; echo DONE'`
+under the debug runner, `.wfgy/sigreturn_repro1.log`) completed with `AFTER_TRAP`/`DONE` printed and
+exit 0 — proves delivery → handler → new trampoline → instruction-fetch fault →
+`sys_rt_sigreturn` → correct context restoration works end to end (a broken restore would have
+hung, crashed, or skipped `AFTER_TRAP`). Re-ran `.wfgy/de_only.sh` (the existing Xvfb/xfce4-session
+isolation harness) with the fix in place (`.wfgy/de_only_postfix_1.log`): the SAME bit-identical
+SIGSEGV still reproduces (`addr=0x7feffecdd400 rip=0x7fefede9dabd`, libc base `0x7fefedd3b000`,
+matching every prior capture exactly — confirms the fix does not touch the actual crash mechanism,
+only backtrace fidelity), `DE_FAILED after 60s` still fires (Task 2 unaffected, expected). Xvfb's
+own `xorg_backtrace()` output changed shape in exactly the direction predicted: instead of the old
+13-frame walk (`0`, then `3`-`9`, then `12`) built by continuing past a corrupted signal frame into
+stale stack words, it now prints only
+```
+0: /usr/bin/Xvfb (?+0x0) [0xc4101b20ed]
+1: ? (?+0x0) [0x7feffff08000]
+```
+— frame0's offset (`0x1b20ed`) matches the OLD frame0 exactly (same fixed internal signal-handling
+address, unaffected by the fix, as expected), and frame1 is a page-aligned address at the very top
+of the guest address space, consistent with landing on the freshly `mmap`'d trampoline page rather
+than continuing into libc/Xvfb .text — the walker no longer treats the signal boundary as ordinary
+code and stops there instead of wandering into 11 more frames of stale RBP-chain garbage. This is
+circumstantial (no direct log line prints the trampoline's own address to confirm the match
+numerically) but consistent with the fix working as designed; a follow-up pass wanting certainty
+should log the trampoline address at allocation time (`LITEBOX_LOG` trace on the signal module) and
+diff it directly against this frame1 value.
+
+**Task 2, narrowed but NOT fixed.** `LITEBOX_DIAG_FATALDUMP=1`'s raw `DIAG-STACKWALK` dump at the
+moment of THIS pass's fault (`.wfgy/de_only_postfix_1.log:4155-4188`) gives a qword read directly
+off the guest stack at `rsp=0x7fefffeed698` (the fault is inside `__memmove_avx_unaligned_erms`'s
+hot AVX2 loop, a leaf routine with no extra stack push in the fast path, so `[rsp+0]` is the genuine
+return address into the caller, not a frame-pointer guess): `0xc410074391`. With this run's Xvfb
+load base `0xc4100000000`, that is offset `0x74391` — the SAME offset the 38th pass's `xorg_backtrace()`
+walk called "frame3", now confirmed by an INDEPENDENT mechanism (a direct raw-stack read, not a
+unwind walk that could itself be corrupted) to be the real, immediate caller of the crashing memmove,
+not a stale/coincidental word. `addr2line -e .wfgy/xvfb.debug -f -C -i 0x74391` (DWARF-backed,
+`.wfgy/xvfb_runtime.bin`'s bare `.symtab` disagreed and is less trustworthy — it lacks line-table
+info entirely, confirmed by comparing the same query against both files) resolves this to
+`ProcSELinuxGetClientContext`, `Xext/xselinux_ext.c:305` — the XSELinux extension's request handler
+for the `GetClientContext` protocol request, i.e. Xvfb crashes while building/copying a reply to a
+client that asked for its SELinux security context. The next four offsets up the OLD frame-pointer
+walk (`0x7530a`→`SELinuxReceive` `xselinux_hooks.c:412`, `0x67f14`→`dixLookupPrivate`/
+`CheckScreenPrivate` `saver.c:201`, `0xf631d`→`XkbCopyKeymap`, `0x8254b`→`glxProbeDriver`,
+`0x15444b`→`acceleratePointerPredictable`, `0x158514`→`AddResource`, `0x447e1`→`fbBlt`) resolve to
+mutually-unrelated Xorg subsystems (SELinux, Xkb, GLX, pointer acceleration, resource management, fb
+blit) with no plausible real call relationship to each other or to frame3 — confirms the 38th pass's
+own "probably not a true call chain" verdict for everything past the immediate caller: only the
+literal top-of-stack word (frame3/`0x74391`) is trustworthy from this capture, matching this pass's
+Task 1 fix landing correctly (the walker now correctly refuses to wander past the signal boundary
+rather than fabricating 8 more frames of plausible-looking noise).
+
+## Shared-memory foundations — full mechanism (drained from AGENTS.md's 39th-pass compaction, all DONE)
+
+`RawMutex`: no longer calls `WaitOnAddress`/`WakeByAddressSingle` (process-local per MSDN) -- manual
+wait queue + one auto-reset kernel `Event` per OS thread, cross-process half real
+(`DuplicateHandle`-based); gained `poisoned: AtomicBool` + owner-death recovery;
+`resolve_waiter_event`'s stale-pid panic fixed via a fixed-32-slot pointer-free `WaiterQueue`.
+Shared kernel heap: a small 64 MiB, standalone, bounded `shared_kernel_arena_alloc` (`lib.rs`, NOT
+wired to `GlobalAlloc`) backs `SharedArc<T>` (`value`+`strong: AtomicUsize`) for
+`LiteBoxX`/`GlobalState` placement; `SLAB_ALLOC` stays on the private per-process path (a shared
+bump allocator exhausted an 8 GiB pool in 45-90 execs).
+
+Root cause of the whole `GlobalState`-sharing class, precisely characterized: `SharedArc::new`
+shares only `T`'s literal inline bytes -- any REGISTRY that was a `BTreeMap`/similar has its NODES
+on the private per-process heap, meaningless to an attaching process (PRD:
+`globalstate-nested-collections-not-actually-shared`). Of the original list (`unix_addr_table`,
+`pty_registry`, `daemon_pty_masters`, `flock_registry`, `fifo_registry`, `sysv_shm`, `memfds`,
+`shared_files`): `unix_addr_table`/`fifo_registry`/`memfds`/`shared_files` are now
+per-process-shadowed on `GlobalStateHandle`, `sysv_shm` is a real shared-arena-native fixed array.
+`pty_registry`/`daemon_pty_masters` are ALSO now per-process-shadowed, with a genuine cross-process
+companion restored separately via `syscalls::pty::SharedPtyTable` (a plain `GlobalState` field, same
+pattern as `unix_addr_presence` below) rather than shadowed away, since real cross-process pty
+visibility is actually needed (real devpts semantics: "any process that knows the id can open it")
+-- this table is now live-verified genuinely cross-process (37th pass: a separate Windows process
+opened a pty by id and read bytes a different Windows process wrote after `fork()`, over the table's
+`SharedByteRing`s; two real mirroring bugs found+fixed to get there). `flock_registry` remains open
+-- same non-POD-payload obstacle the pty fix's own pattern (fixed POD control state +
+`SharedByteRing` data plane, no raw `Arc`/pointer ever crosses the process boundary) now gives a
+concrete template for.
+
+`SharedUnixAddrPresenceTable` (`syscalls/unix.rs`) established the reusable flat-table PATTERN
+(`sysv_shm`, the AF_UNIX connection-DATA layer, and `SharedPtyTable` all reused it next): fixed-slot,
+pure-atomic, lock-free `(kind, key bytes<=108, owner pid)` side-index, or a POD-control-state
+variant for a table like `SharedPtyTable` that also needs mutable per-slot fields. `Pipes.litebox`'s
+stale pointer (fixed via `GlobalStateHandle::pipes()`) and `FutexManager`'s stack-allocated
+`LoanList` sharing hang (fixed: each process gets its own fresh `FutexManager`) were two more
+instances of the same raw-pointer-frozen-into-shared-bytes root pattern. A mutable-state table
+built on this pattern still needs every WRITE path individually audited for shared-side mirroring
+-- `SharedPtyTable`'s own control-state setters (`set_locked` etc.) were originally wired ONLY into
+the local `Arc`-backed side and silently never reached the shared slot until the 37th pass's live
+cross-process test caught it; a table with read-only/publish-once shared state (like
+`SharedUnixAddrPresenceTable`) doesn't have this failure mode, but any table modeling ongoing
+mutable control state does. `SafeZoneAllocator::alloc`'s spinlock livelock (distinct mechanism, no
+dead-holder recovery unlike `RawMutex`) is still open.
+
+## Guest-diagnostic-must-travel-by-pipe — full mechanism (drained from AGENTS.md's 39th-pass compaction)
+
+Three separate live-proven failure shapes, 38th pass, that invalidated a large amount of this
+project's historical "we saw nothing, so nothing happened" reasoning:
+
+`cmd > /tmp/f` then the parent reading `/tmp/f` — the forked CHILD writes into its own
+writable-layer snapshot; the parent reads its own and sees nothing. Known gap, but its reach was
+badly underestimated: it silently broke `xprop -root > /tmp/wm1; grep -q "window id" /tmp/wm1`,
+i.e. the `DE_UP` check itself, so `DE_FAILED` could be reported no matter what the desktop did.
+(Small files DO sometimes survive via `SharedFilePublishTable`'s 256-byte publish — `read -r A <
+/tmp/addr` genuinely works for dbus's address — so this fails NON-deterministically by size, worse
+than failing outright.)
+
+`VAR=$(external-cmd)` returns EMPTY under `LITEBOX_PROCESS_FORK=1` while `$?` stays correct, and
+the command's real output goes to the HOST CONSOLE instead. Root-caused to one line:
+`litebox_shim_linux/src/syscalls/process.rs:2646-2649`'s cross-process-fork carry scan is
+`raw_descriptors.iter_alive().filter(|&raw| raw >= 3)` — guest fds 0/1/2 are never carried across a
+cross-process fork. The child instead rebuilds them unconditionally as fresh
+`/dev/stdin|stdout|stderr` opens (`adopt_forked_process` → `initialize_stdio_in_shared_descriptors_table`,
+`litebox_shim_linux/src/lib.rs:981`, body `:1410-1440`), which resolve to the CHILD process's own
+`GetStdHandle` (`litebox_platform_windows_userland/src/lib.rs:9671-9689`). So any guest process
+that redirected its own stdout onto a pipe BEFORE forking silently loses that redirection in the
+child. The authorising comment at `process.rs:2630-2633` ("a cross-process child cannot carry
+anything past the 0/1/2 stdio slots") is STALE — true only when fd 1 really is the host console.
+Parent↔child pipe I/O itself is sound and was REFUTED as the cause (the bridge relays correctly;
+`.wfgy/de_only_2.log` shows `total_relayed…=4/187/838` on the working shapes and `=0` ×13 on every
+fork+exec case).
+
+Why `$( )` fails but `|` works is fork DEPTH, not who holds the read end: `cmd | reader &` and
+`$( builtin )` are ONE fork per stage, so `dup2(pipe,1)` happens after the fork inside the child's
+own rebuilt fd table and sticks. `$( external-cmd )` is TWO forks — bash forks the comsub subshell,
+that subshell does `dup2(3,1)`, then forks AGAIN to exec the binary — and at that second fork
+stdout is already a pipe end sitting at fd 1, below the `raw >= 3` cut, so it's dropped. The
+discriminator is "was stdout already redirected at fork time". `cmd 2>&1 | sed 's/^/[tag] /' &`
+WORKS and is the shape proven to deliver a guest process's real output (how `xfce4-session`'s and
+Xvfb's true stderr were read for the first time) — use it for every guest diagnostic.
+
+FIX, scoped but NOT yet implemented (top of the pickup list): at `process.rs:2646-2649` scan ALL
+alive fds, not `>= 3`; for each of 0/1/2 skip it only when it's still the plain `/dev/stdX` device
+node (detectable via the `StdioStream` metadata set at `lib.rs:1435`) since host handle inheritance
+already covers that, and otherwise classify it exactly like any other fd (pipe → `Sink`/`Source`
+bridge, regular file → `ForkInheritedFile`, eventfd → `ForkInheritedEventfd`, else the existing
+uncarriable/cloexec/pty rules). Delete the stale comment. The child side needs NO change — the
+install loop runs after the stdio rebuild and `sys_dup`'s exact form (`file.rs:6330-6334`) already
+displaces an occupied target. `spawn_exec_collision_child` (`platform lib.rs:12250-12255`) has the
+SAME defect and the same signature, disclosed in its own comment. **Not attempted this (39th)
+pass** — flagged in the task brief as needing its own dedicated, verified pass; still open.
+
+Working hypothesis, NOT confirmed: `libselinux.so.1` is a real runtime dependency of this Xvfb build
+(independently noted at `litebox_platform_windows_userland/src/lib.rs:8436`, an unrelated
+already-fixed memory-claim bug that happened to be observed via this same library's load), so the
+XSELinux extension is compiled in and its Proc handler is reachable regardless of whether real
+kernel SELinux enforcement is active — a client (plausibly `xfce4-session` itself, or a library it
+pulls in such as AT-SPI/dbus-glib, matching the A/B result that only the DE's own traffic triggers
+this) can issue a `GetClientContext` request on any system. `litebox_shim_linux` has ZERO
+SELinux-specific file/syscall emulation (`grep -i selinux` over the crate: no hits) — no
+`/sys/fs/selinux`, no `security_getenforce` special-casing — so whatever Xvfb/libselinux do to
+determine "am I enforcing" falls through to generic VFS emulation (almost certainly `ENOENT`,
+correctly reporting SELinux as absent). Whether the crash is (a) a genuine upstream Xvfb/libselinux
+defect on the "SELinux compiled in but disabled" fallback path for building a default/unconfined
+context string reply, independent of litebox, or (b) litebox's generic VFS/getsockopt emulation
+returning a malformed value some SELinux-adjacent lookup (e.g. a peer-credential check feeding
+`XaceIsLocal`-style logic) doesn't validate before copying, was NOT distinguished this pass — source
+for `xselinux_ext.c`/`xselinux_hooks.c` could not be fetched this pass (gitlab.freedesktop.org
+blocked by Anubis anti-bot protection; the GitHub mirror path guessed was wrong and not
+re-attempted). **Pickup, in order**: (1) fetch the real Xvfb source (try `apt source
+xserver-xorg-core` inside a throwaway guest, or a correct GitHub mirror path/tag, rather than
+gitlab.freedesktop.org) and read `ProcSELinuxGetClientContext` (`xselinux_ext.c:305`) plus whatever
+it calls to build the reply, to determine the exact memcpy/length source; (2) if it traces back to a
+litebox-emulated syscall, fix that syscall's return shape; (3) if it's a genuine upstream Xvfb
+defect only reachable because SELinux is compiled in but inert, the cheapest real fix may be
+disabling `XSELinux` at Xvfb's own build/init (`-extension SELinux` disable flag, if Xvfb's CLI
+exposes one) rather than chasing a glibc/Xorg bug unrelated to litebox itself — verify this
+disables the crash without disabling anything the desktop path actually needs first.
