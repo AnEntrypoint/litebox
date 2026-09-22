@@ -1405,6 +1405,7 @@ fn default_fs<Platform: ShimPlatform>(
                     mem_total_kb,
                     mem_avail_kb,
                     BOOT_UPTIME_SECS,
+                    proc_self_info.clone(),
                 )
             })
             .mount("/proc/self", |allocator| {

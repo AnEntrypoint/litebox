@@ -2482,7 +2482,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 exit_status
             } else {
-                child_process.wait_for_exit()
+                // Bounded-repoll fallback -- the THIRD combination of the same lost-wake hazard
+                // already fixed above for `pid == -1` (twenty-first pass) and cross-process
+                // `pid > 0` (twenty-fourth pass), never ported to THIS one: a thread-based
+                // child, waited on by its SPECIFIC pid. `child_process.wait_for_exit()` used to
+                // call straight into `Process::nr_threads`'s own unbounded `block(n)` -- a raw
+                // `WaitOnAddress`-based wait with no timeout and no re-check -- relying entirely
+                // on `Task::prepare_for_exit`'s wake arriving and the futex word having
+                // genuinely changed by the time this thread re-observes it. Live-caught, 58th
+                // pass: two `cdb -pv` snapshots on a real `xfce4-session` process, taken 18s
+                // apart, showed a BYTE-IDENTICAL `NtWaitForAlertByThreadId -> RtlWaitOnAddress
+                // -> KERNELBASE!WaitOnAddress` frame for the thread that had just called
+                // `sys_wait4(pid=<ssh-agent-launching child>, options=0)` -- the same signature
+                // already used to diagnose the `pid == -1` case's own lost-wake bug (see that
+                // branch's doc comment above), parked forever even though `try_wait_for_exit`
+                // would answer immediately once the child's `nr_threads` genuinely reaches zero.
+                // Poll `try_wait_for_exit` directly on our own bound instead of trusting a single
+                // unbounded `block` call.
+                let mut exit_status = None;
+                loop {
+                    match self
+                        .wait_cx()
+                        .with_timeout(WAIT4_REPOLL_INTERVAL)
+                        .wait_until(|| {
+                            exit_status = child_process.try_wait_for_exit();
+                            exit_status.is_some()
+                        }) {
+                        Ok(()) => break,
+                        Err(litebox::event::wait::WaitError::TimedOut) => continue,
+                        Err(litebox::event::wait::WaitError::Interrupted) => {
+                            // Same race as the `pid == -1`/cross-process branches' own
+                            // `Interrupted` handling above: re-check synchronously before
+                            // surfacing a spurious `EINTR`.
+                            exit_status = child_process.try_wait_for_exit();
+                            if exit_status.is_none() {
+                                return Err(Errno::EINTR);
+                            }
+                            break;
+                        }
+                    }
+                }
+                exit_status.expect("loop only exits Ok/break-with-Interrupted once exit_status is set")
             };
             (child_pid, exit_status)
         };

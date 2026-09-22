@@ -193,8 +193,12 @@ fn format_uptime(uptime_secs: u64) -> Vec<u8> {
 }
 
 /// A [`Backend`] serving the static/host-derived `/proc` flat files that need no per-process state
-/// -- the exact set is `ProcfsEntry::ALL`. Mounted at `/proc`; deliberately not a general procfs
-/// (gm mutable `mut-1789043963534`).
+/// -- the exact set is `ProcfsEntry::ALL`, PLUS one subdirectory per pid [`ProcSelfTable`] tracks
+/// (`stat`/`status`/`cmdline`/`comm`, reusing the same renderers `/proc/self` uses -- see
+/// [`ProcfsDirHandle::Pid`]). Mounted at `/proc`; still not a GENERAL procfs -- only pids this
+/// table knows about are visible, real Linux's full `/proc/<pid>` file set is not reproduced (no
+/// `exe`/`fd`/`maps`/`environ`). Real Linux's own `ps`/`procps` library needs at minimum its own
+/// `/proc/<self-pid>/stat` to open successfully -- see gm mutable `mut-1789043963534`.
 pub struct Procfs<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -206,6 +210,9 @@ where
     mem_total_kb: u64,
     mem_avail_kb: u64,
     boot_uptime_secs: u64,
+    /// The SAME table `/proc/self` reads through, keyed by pid -- lets `/proc/<pid>/*` answer for
+    /// any pid this process's `execve`/`clone` history has recorded, not just the caller's own.
+    proc_self_info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
 }
 
 impl<Platform> Procfs<Platform>
@@ -215,7 +222,9 @@ where
     /// Construct a new `Procfs` backend.
     ///
     /// `cpu_count` must be the real host logical-CPU count (GLib thread-pool sizing depends on it);
-    /// `boot_uptime_secs` is fixed for this backend's lifetime. See gm mutable `mut-1789043963534`.
+    /// `boot_uptime_secs` is fixed for this backend's lifetime. `proc_self_info` must be the same
+    /// table instance passed to `/proc/self`'s own [`ProcSelf::new`] -- see gm mutable
+    /// `mut-1789043963534`.
     #[must_use]
     pub fn new(
         litebox: &LiteBox<Platform>,
@@ -224,6 +233,7 @@ where
         mem_total_kb: u64,
         mem_avail_kb: u64,
         boot_uptime_secs: u64,
+        proc_self_info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
     ) -> Self {
         let root_inode = allocator.next();
         Self {
@@ -234,13 +244,28 @@ where
             mem_total_kb,
             mem_avail_kb,
             boot_uptime_secs,
+            proc_self_info,
         }
     }
 }
 
-/// Directory handle: only the backend's mount root exists (a flat namespace).
-#[derive(Debug, Clone, Copy)]
-pub struct ProcfsDirHandle;
+/// Directory handle: the mount root (flat global files, plus one subdirectory per known pid), or a
+/// specific pid's own subdirectory (flat: `stat`/`status`/`cmdline`/`comm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcfsDirHandle {
+    Root,
+    Pid(i32),
+}
+
+/// Parses a `/proc` path component as a pid directory name -- real Linux's own rule: an unsigned
+/// decimal integer, no sign, nothing else (so `+1`/`01`-with-exotic-meaning/`-1` are never
+/// mistaken for a pid; real `/proc` itself only ever names directories this way).
+fn parse_pid_component(s: &str) -> Option<i32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i32>().ok()
+}
 
 /// Which of the flat files this handle names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +296,39 @@ impl ProcfsEntry {
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
     }
+}
+
+/// Which of the flat per-pid files a `/proc/<pid>/*` handle names -- a small, deliberate subset of
+/// [`ProcSelfEntry`] (real `ps`/`procps` needs only these to open successfully and render a
+/// listing; `exe`/`environ`/`maps`/etc. would need this table to also carry another process's
+/// page-manager closure, which it does not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcPidEntry {
+    Stat,
+    Status,
+    Cmdline,
+    Comm,
+}
+
+impl ProcPidEntry {
+    const ALL: &'static [(&'static str, ProcPidEntry)] = &[
+        ("stat", ProcPidEntry::Stat),
+        ("status", ProcPidEntry::Status),
+        ("cmdline", ProcPidEntry::Cmdline),
+        ("comm", ProcPidEntry::Comm),
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
+    }
+}
+
+/// Which backend file a `/proc` [`ProcfsFileHandle`] names: one of the flat root files, or one of
+/// [`ProcPidEntry`]'s files under a specific pid's own subdirectory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcfsFileKind {
+    Global(ProcfsEntry),
+    Pid(i32, ProcPidEntry),
 }
 
 /// Node info for each entry -- distinct, stable, fake inode numbers (mirrors
@@ -315,7 +373,7 @@ const PROCFS_CMDLINE_NODE_INFO: NodeInfo = NodeInfo {
 /// open time) content so `read`/`file_status` need no further backend state lookups.
 #[derive(Debug, Clone)]
 pub struct ProcfsFileHandle {
-    entry: ProcfsEntry,
+    kind: ProcfsFileKind,
     content: Vec<u8>,
 }
 
@@ -338,7 +396,7 @@ where
     Platform: RawSyncPrimitivesProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(ProcfsDirHandle)
+        WalkingDirHandle::from_typed::<Self>(ProcfsDirHandle::Root)
     }
 
     fn walk_directories<'a>(
@@ -346,20 +404,39 @@ where
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let from = from.into_typed::<Self>();
-        if let Some(&component) = components.first() {
+        let mut current = from.into_typed::<Self>();
+        let mut walked = Vec::with_capacity(components.len());
+        for &component in components {
+            if current != ProcfsDirHandle::Root {
+                // A pid directory is itself flat: `stat`/`status`/etc. are files, never a further
+                // subdirectory, matching real Linux.
+                return Ok(WalkOutcome {
+                    components: walked,
+                    last: WalkingDirHandle::from_typed::<Self>(current),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            if let Some(pid) = parse_pid_component(component) {
+                if self.proc_self_info.read().get(pid).is_some() {
+                    walked.push(super::backend::WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    current = ProcfsDirHandle::Pid(pid);
+                    continue;
+                }
+            }
             if ProcfsEntry::from_name(component).is_none() {
                 return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
             }
             return Ok(WalkOutcome {
-                components: vec![],
-                last: WalkingDirHandle::from_typed::<Self>(from),
+                components: walked,
+                last: WalkingDirHandle::from_typed::<Self>(current),
                 stop_reason: WalkStopReason::StoppedAtNonDirectory,
             });
         }
         Ok(WalkOutcome {
-            components: vec![],
-            last: WalkingDirHandle::from_typed::<Self>(from),
+            components: walked,
+            last: WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
@@ -384,37 +461,81 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
-        let entry = ProcfsEntry::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let dir = dir.into_typed::<Self>();
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        let content = match entry {
-            ProcfsEntry::CpuInfo => format_cpuinfo(self.cpu_count),
-            ProcfsEntry::MemInfo => format_meminfo(self.mem_total_kb, self.mem_avail_kb),
-            ProcfsEntry::Mounts => format_mounts(),
-            ProcfsEntry::Uptime => format_uptime(self.boot_uptime_secs),
-            ProcfsEntry::Filesystems => format_filesystems(),
-            ProcfsEntry::Stat => format_stat_global(self.cpu_count),
-            ProcfsEntry::Cmdline => format_kernel_cmdline(),
+        let (kind, content) = match dir {
+            ProcfsDirHandle::Root => {
+                let entry = ProcfsEntry::from_name(name)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                let content = match entry {
+                    ProcfsEntry::CpuInfo => format_cpuinfo(self.cpu_count),
+                    ProcfsEntry::MemInfo => format_meminfo(self.mem_total_kb, self.mem_avail_kb),
+                    ProcfsEntry::Mounts => format_mounts(),
+                    ProcfsEntry::Uptime => format_uptime(self.boot_uptime_secs),
+                    ProcfsEntry::Filesystems => format_filesystems(),
+                    ProcfsEntry::Stat => format_stat_global(self.cpu_count),
+                    ProcfsEntry::Cmdline => format_kernel_cmdline(),
+                };
+                (ProcfsFileKind::Global(entry), content)
+            }
+            ProcfsDirHandle::Pid(pid) => {
+                let entry = ProcPidEntry::from_name(name)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                // The process may have exited between the `readdir` that found this pid and this
+                // `open` -- real Linux reports the same ENOENT for that race.
+                let info = self
+                    .proc_self_info
+                    .read()
+                    .get(pid)
+                    .cloned()
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                let content = match entry {
+                    ProcPidEntry::Stat => format_stat(&info),
+                    ProcPidEntry::Status => format_status(&info),
+                    ProcPidEntry::Cmdline => info.cmdline.clone(),
+                    ProcPidEntry::Comm => format!("{}\n", info.comm).into_bytes(),
+                };
+                (ProcfsFileKind::Pid(pid, entry), content)
+            }
         };
         Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(ProcfsFileHandle { entry, content }),
+            item: FileHandle::from_typed::<Self>(ProcfsFileHandle { kind, content }),
             permissions: PermissionCheck::ByBackend,
         })
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let _handle = handle.into_typed::<Self>();
-        Ok(ProcfsEntry::ALL
-            .iter()
-            .map(|(n, _)| DirEntry {
-                name: String::from(*n),
-                file_type: FileType::RegularFile,
-                ino_info: None,
-            })
-            .collect())
+        let handle = handle.into_typed::<Self>();
+        match handle {
+            ProcfsDirHandle::Root => {
+                let mut entries: Vec<DirEntry> = ProcfsEntry::ALL
+                    .iter()
+                    .map(|(n, _)| DirEntry {
+                        name: String::from(*n),
+                        file_type: FileType::RegularFile,
+                        ino_info: None,
+                    })
+                    .collect();
+                entries.extend(self.proc_self_info.read().pids().into_iter().map(|pid| {
+                    DirEntry {
+                        name: format!("{pid}"),
+                        file_type: FileType::Directory,
+                        ino_info: None,
+                    }
+                }));
+                Ok(entries)
+            }
+            ProcfsDirHandle::Pid(_) => Ok(ProcPidEntry::ALL
+                .iter()
+                .map(|(n, _)| DirEntry {
+                    name: String::from(*n),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                })
+                .collect()),
+        }
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -447,12 +568,8 @@ where
 
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let h = h.get_typed::<Self>();
-        Ok(FileStatus {
-            file_type: FileType::RegularFile,
-            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
-            size: h.content.len(),
-            owner: UserInfo::ROOT,
-            node_info: match h.entry {
+        let node_info = match h.kind {
+            ProcfsFileKind::Global(entry) => match entry {
                 ProcfsEntry::CpuInfo => PROCFS_CPUINFO_NODE_INFO,
                 ProcfsEntry::MemInfo => PROCFS_MEMINFO_NODE_INFO,
                 ProcfsEntry::Mounts => PROCFS_MOUNTS_NODE_INFO,
@@ -461,19 +578,41 @@ where
                 ProcfsEntry::Stat => PROCFS_STAT_NODE_INFO,
                 ProcfsEntry::Cmdline => PROCFS_CMDLINE_NODE_INFO,
             },
+            // Fake but stable per (pid, entry) -- dev 8 is unused by every other node in this file
+            // (global entries use 6, `/proc/self` uses 7).
+            ProcfsFileKind::Pid(pid, entry) => NodeInfo {
+                dev: 8,
+                ino: (pid as i64).unsigned_abs() as usize * 8 + entry as usize,
+                rdev: None,
+            },
+        };
+        Ok(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            size: h.content.len(),
+            owner: UserInfo::ROOT,
+            node_info,
             blksize: 0x1000,
             atime: Timestamp::default(),
             mtime: Timestamp::default(),
         })
     }
 
-    fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let node_info = match *h.get_typed::<Self>() {
+            ProcfsDirHandle::Root => self.root_inode.clone(),
+            ProcfsDirHandle::Pid(pid) => NodeInfo {
+                dev: 8,
+                ino: (pid as i64).unsigned_abs() as usize * 8 + 100,
+                rdev: None,
+            },
+        };
         Ok(FileStatus {
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: UserInfo::ROOT,
-            node_info: self.root_inode.clone(),
+            node_info,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
             atime: Timestamp::default(),
             mtime: Timestamp::default(),
@@ -588,6 +727,17 @@ impl ProcSelfTable {
         caller
             .and_then(|pid| self.by_pid.get(&pid))
             .or_else(|| self.most_recent.and_then(|pid| self.by_pid.get(&pid)))
+    }
+
+    /// The entry for a SPECIFIC pid, regardless of caller identity -- backs `/proc/<pid>/*`, unlike
+    /// [`Self::resolve`] which answers `/proc/self` for whichever process is asking.
+    fn get(&self, pid: i32) -> Option<&ProcSelfInfo> {
+        self.by_pid.get(&pid)
+    }
+
+    /// Every pid this table currently has an entry for, for `/proc`'s own directory listing.
+    fn pids(&self) -> Vec<i32> {
+        self.by_pid.keys().copied().collect()
     }
 }
 

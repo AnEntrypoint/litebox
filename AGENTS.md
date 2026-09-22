@@ -8,8 +8,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-23,
-57th pass (see the pass-history section below; 26th-56th pass narrative lives in
-`docs/AGENTS_ARCHIVE_2026-09-22.md`).
+58th pass (pass-history section below; 26th-57th narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
 
@@ -128,10 +127,9 @@ on the `de_only.sh` isolation harness instead.
   top-level program, never via a runtime-built `/bin/sh -c` wrapper. Never trust a container tag
   name for its WM/session contents — verify by registry manifest + blob tar-listing or a live
   in-guest `/usr/bin` listing. Never record a test count not watched run to completion; never
-  leave a suite red for an environmental reason. **`de_only.sh` and `webtop_stack.sh` don't always
-  reach the same `xfce4-session` startup depth on a given run** (53rd pass: one `de_only.sh` run
-  never called `clone()` for a single session client, vs. the 52nd pass's fuller boot reaching
-  `iceauth`/`ssh-agent`/`gpg-agent`) — real run-to-run non-determinism, not a harness bug.
+  leave a suite red for an environmental reason. **The 53rd pass's "`xfce4-session` startup depth
+  varies run to run" was itself a RAM-exhaustion artifact (fixed 56th/57th) — 58th pass's 3/3 clean
+  runs all reach the IDENTICAL depth** (`iceauth`+`ssh-agent` spawned, then hangs — see Track B item 1).
 - **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`,
   gitignored); untrack anything `git add -A` sweeps.
 - **Guest-reachable code returns an errno, never a panic** — the host process IS the entire guest
@@ -156,7 +154,7 @@ per-fork cost on an `--oci-image` boot is the rootfs rebuild, not this (56th pas
 open: nginx's own SSL-cert generation fails on its first startup attempt, not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-56th, 2026-09-17/22)**: full narrative in the dated archives ("Docs and tooling
+**Pass history (4th-58th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
 map" below). The CURRENT STATE those passes converged on:
 
 - **The ORIGINAL Xvfb SIGSEGV is FIXED — 43rd pass, `01f8532`** (`get_unmmaped_area`'s top-down
@@ -185,41 +183,41 @@ map" below). The CURRENT STATE those passes converged on:
   RECOMMENDED for `.wfgy/webtop_stack.sh`.
 - **`pty_registry`/`daemon_pty_masters` cross-process redesign is DONE, genuine cross-process pty
   I/O LIVE-PROVEN** (36th/37th pass). Mechanism: "Shared-memory foundations" below.
-- **44th-49th passes** — `xfce4-session` first reached real pre-session setup. Fixed en route: fd
-  0/1/2 dropped at the fork boundary, an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption host
-  panic (`c5a8884`), a `buddy_system_allocator` free-list corruption (`8b64698`). 7/7 clean boots.
-- **52nd-53rd passes** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone; REFUTED "Cannot
-  open display" for good; found `xfwm4` masked by a `GLib-GIO-CRITICAL` flood from D-Bus SERVICE
-  ACTIVATION failing. `gpg-agent`'s fatal glibc `malloc.c:3846` heap-corruption SIGABRT, still open
-  (reproduced once). Full narrative: archive.
-- **54th pass (2026-09-22) — ROOT-CAUSED AND FIXED the D-Bus activation bug** (`66265d9`): a
-  `socketpair(2)`-originated CLOEXEC fd (dbus-daemon's own activation babysitter reporting its pid
-  pre-`exec()`) was being silently dropped by the general CLOEXEC-drop policy; now refused (falls
-  back to thread-based fork) instead. **Live-verified**: D-Bus service activation succeeds, the
-  `GLib-GIO-CRITICAL` flood is gone, and `/usr/bin/xfwm4` genuinely `execve`s for the first time in
-  this whole investigation. Surfaced a new, twice-reproduced panic (`fd/mod.rs:422`) as the next
-  suspect, not yet root-caused that pass. Full narrative: archive.
-- **55th pass (2026-09-22) — FIXED the `fd/mod.rs:422` panic (`faa74c6`); identified a SEPARATE,
-  serious RAM-exhaustion issue as the current proximate blocker to `DE_UP`.** Root cause: a
-  `TypedFd`'s index is only valid against the SAME `Descriptors` instance that `insert()`ed it (the
-  28th pass fixed this defect class for one accessor; this pass swept the other 9). Live-verified via
-  two independent `de_only.sh` boots: neither reproduced the panic, and both showed real xfwm4-plausible
-  X11 progress — but both then died of host RAM exhaustion at the same point (~30-40s into the WM-poll
-  loop) before reaching `DE_UP`. See Track B item 1 and "A real desktop renders in a browser" for the
-  current status this reframes into; full narrative/log lines/RAM trajectories: archive.
-- **56th pass (2026-09-22) — measured and FIXED the RAM-exhaustion mechanism (`2d18a4e`).**
-  `LITEBOX_DIAG_FORK_TIMING=1` showed `TarIndex::from_layers` (the rootfs merge) taking 3.2-3.5s of
-  every fork's ~3.9-4.1s startup — re-parsing+re-whiteout-folding all 17 layers from scratch EVERY
-  fork despite the result never changing mid-boot. Fixed: cache the built merge on disk, keyed like
-  `.litebox-cache`'s per-layer cache (`litebox/src/fs/tar_ro.rs`'s new `TarRo::
-  live_entries_after_merge`/`from_merged_live_entries`). Live-verified: per-fork cost → ~2.3-2.5s; a
-  fresh boot reached WM_POLL n=8/12 and a genuinely NEW marker no previous pass reached under
-  sustained RAM pressure (`_NET_SUPPORTING_WM_CHECK` "no such atom" → "not found") before RAM still
-  ran out at t≈140s (~20 processes accumulated). NOT a full fix — process-COUNT accumulation over a
-  longer boot is the next bottleneck. Track B item 1.
-- **57th pass (2026-09-23) — rebuilt the release binary (the 56th pass's own binary PREDATED
-  `2d18a4e` by ~1hr) and answered "reaping lag vs genuine concurrency" DEFINITIVELY: NEITHER — see
-  Track B item 1 for the full finding, evidence and current pickup.**
+- **44th-49th passes** — `xfce4-session` first reached real pre-session setup (fixed en route: fd
+  0/1/2 at the fork boundary, an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption panic
+  `c5a8884`, a `buddy_system_allocator` corruption `8b64698`). 7/7 clean boots.
+- **52nd-56th passes** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone, REFUTED "Cannot
+  open display" for good; D-Bus activation's dropped-CLOEXEC-fd bug FIXED (54th, `66265d9`, `xfwm4`
+  genuinely `execve`d for the first time ever right after); `fd/mod.rs:422` panic FIXED (55th,
+  `faa74c6`); per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`). Each fix surfaced the next
+  newly-reachable blocker (RAM exhaustion, then process-count). `gpg-agent`'s fatal glibc
+  `malloc.c:3846` SIGABRT, reproduced once (52nd), still open. Full narrative: archive.
+- **57th pass (2026-09-23)** — rebuilt the release binary (56th's own binary predated its fix by
+  ~1hr) and confirmed RAM no longer kills the boot (2/2, plateaus ~3.1-3.3GB free, no crash through
+  60s WM_POLL + 160s+ HOLD). Surfaced `ps -ef`'s crash and `xfwm4` never launching, both below.
+- **58th pass (2026-09-23) — FIXED `ps -ef`'s crash; ROOT-CAUSED (not yet fixed) `xfwm4`'s
+  non-launch, now 100% reproducible.** `ps -ef` crashed with `fatal library error, lookup self`:
+  real procps (`src/ps/global.c:509`) needs its OWN pid's `/proc/<pid>/stat`, but `Procfs` (`/proc`)
+  had ZERO numeric pid subdirectories, not even for the caller's own pid. Fixed:
+  `litebox/src/fs/procfs.rs` now serves one subdirectory per pid the shared `ProcSelfTable` already
+  tracks (`stat`/`status`/`cmdline`/`comm`, reusing `/proc/self`'s own renderers) —
+  `ProcfsDirHandle::Pid`/`ProcPidEntry`/`ProcSelfTable::get`/`pids`. Verified 2/2 clean (still not a
+  general procfs, by design — self + whatever pids this process's own fork history populated).
+  `xfwm4`: 3/3 boots now stall at the IDENTICAL point (previously misdiagnosed as non-determinism)
+  — `xfce4-session` spawns `iceauth`+`ssh-agent` then goes silent forever, never reaching `xfwm4`.
+  Root cause: `ssh-agent`'s own daemonizing fork holds a bound AF_UNIX listening socket
+  (uncarriable), forcing ITS inner fork to a THREAD-based (same-Windows-process) child; that
+  long-lived agent keeps the HOSTING Windows process alive forever, so `wait_for_process_exit`/
+  `try_wait_for_cross_process_exit` (`process_fork.rs:4263`/`4297`, `WaitForSingleObject` on the raw
+  process HANDLE) never signals — the exact handle the exit-notifier armed on appears once (the arm)
+  and never again in a full boot log grep. Two `cdb -pv` snapshots of `xfce4-session`'s blocked
+  thread, 18s apart, show a byte-identical `WaitOnAddress`-family frame. NOT fixed — needs exit
+  detection keyed to the guest TASK's `exit_group()`, not Windows-process lifetime; candidate: the
+  child's initial OS THREAD handle (captured then closed at `process_fork.rs:2132`) instead of the
+  process handle, pending confirming `run_thread_inner`'s completion condition is scoped to one
+  task, not misled by a same-process descendant — own pass, do not patch blind. Also ported (real,
+  low-risk, did NOT alone fix this case): `sys_wait4`'s thread-based specific-pid branch
+  (`process.rs:2468`) was missing the bounded-repoll/`Interrupted`-recheck its siblings got 21st/24th.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -240,15 +238,15 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
    NOT reaping lag, NOT raw process-count — 57th pass proved fork count alone is free (flat WS over
    24 sequential forks) and process count stays bounded (9-16, all individually plausible). The
    real, still-open cost is PER-PROCESS: Xvfb/dbus-daemon/xfce4-session each cost 600MB-1.3GB
-   WS/Private (15-40x real-Linux RSS) vs. 5-130MB for every trivial command/pipe-filter — allocation
-   site not yet found (needs `cdb`/memory-profile on an ISOLATED Xvfb-alone repro, not the rootfs
-   merge — that's cache-HIT-cheap, ~100ms, ruled out).** CURRENT top blockers, both newly reachable
-   only because RAM no longer cuts the boot short: (i) `ps -ef` now genuinely runs (never did
-   before) and fails with guest text `fatal library error, lookup self` instead of a listing — real,
-   2/2 reproduced, not root-caused; (ii) `xfwm4` did NOT `execve` in either 57th-pass run (did in
-   54th/55th) — non-determinism already documented, cause still open. (iii) `gpg-agent`'s fatal
-   glibc `malloc.c:3846` assertion, reproduced once (52nd). (iv) high `VM_SHARED` fork-child region
-   count (52nd).
+   WS/Private (15-40x real-Linux RSS) — allocation site not yet found (needs `cdb`/memory-profile on
+   an isolated Xvfb-alone repro, not the rootfs merge, cache-HIT-cheap, ruled out).** `ps -ef`'s
+   crash is FIXED (58th, see above). **Sole real blocker to `DE_UP`: `xfwm4` never launches —
+   ROOT-CAUSED not yet fixed, 58th pass (see above): a cross-process child that daemonizes via a
+   thread-based-fallback fork (the classic bind-socket-then-fork-and-exit idiom — `ssh-agent`,
+   `gpg-agent`, many real daemons) hangs its own parent's `wait4` forever, since exit detection keys
+   on Windows-process, not guest-task, lifetime.** (ii) `gpg-agent`'s fatal glibc `malloc.c:3846`
+   assertion (52nd), maybe the SAME mechanism — recheck once wait4 is fixed. (iii) high `VM_SHARED`
+   fork-child region count (52nd).
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything** (38th,
    `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256 overflow silently discarded
    (`unix.rs:275-277`); a key >108 bytes silently bails; `SharedUnixConnectQueue`/`SharedUnixConnTable`
@@ -365,12 +363,12 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-55th passes: full pass-by-pass narrative for
-  everything this file's own pass entries above summarize), `_2026-09-18.md` (12th-34th, shared
-  AF_UNIX plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash, stdio-handle bug,
-  writable-layer-race fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md`
-  (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, crash-dump/VEH).
-  Older: `_2026-09-03.md`, `_2026-09-05.md`.
+- **Archives** (newest first) — `_2026-09-22.md` (26th-57th passes, full narrative for everything
+  this file's own entries summarize), `_2026-09-18.md` (12th-34th, shared AF_UNIX plane, ldconfig
+  static-PIE fix), `_2026-09-17.md` (shell-crash, stdio-handle bug, writable-layer-race fix),
+  `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill),
+  `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, crash-dump/VEH). Older: `_2026-09-03.md`,
+  `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache). `docs/veh-exception-handler-design.md` —
   read before touching VEH.
