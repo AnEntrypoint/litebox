@@ -8,7 +8,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-22,
-51st pass (trimmed the 49th-pass narrative to make room for the finding below).
+53rd pass (drained the 44th-52nd pass narrative to the archive; see the pass-history section below).
 
 ## The cheap repro — start here
 
@@ -30,12 +30,18 @@ One ~81MB layer, `[cache] HIT` after the first pull, real GNU coreutils instead 
   (`litebox_platform_windows_userland/src/lib.rs`) reads it via a bare `std::env::var_os` on the HOST
   side; setting it via `--env` instead silently no-ops the whole cross-process path with ZERO log
   output (looks identical to "not eligible", but isn't even attempted) — confirmed live, 37th pass.
+- **Boot logs launched via PowerShell redirection (`*> file.log`) are UTF-16LE, not UTF-8** — a plain
+  `grep`/`Select-String` against them silently returns zero matches even when the text is really
+  there. Always `iconv -f UTF-16LE -t UTF-8` (or PowerShell's own `Get-Content -Encoding Unicode`)
+  first — confirmed live, 53rd pass, on `.wfgy/webtop_release_boot6.log`.
 
 **Log level**: default is `warn,litebox_platform_windows_userland::fork_verify=error` (`fork_verify`
 pinned to `error` since it warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error`
 by reflex; use `fork_verify=warn` when a fork heal is the subject. A bare `LITEBOX_LOG=debug`
 (blanket) is the fastest way to rule out "which module's silent early-return ate my decision" —
-cheap for a small repro, too noisy for a full desktop boot.
+cheap for a small repro, too noisy for a full desktop boot; targeting just
+`litebox_shim_linux::syscalls::process=debug,litebox_shim_linux::syscalls::unix=debug,
+litebox_diag::stderr_capture=debug` is workable on the `de_only.sh` isolation harness.
 
 ## Standing lessons and hard constraints
 
@@ -72,6 +78,17 @@ cheap for a small repro, too noisy for a full desktop boot.
   (`litebox_shim_linux/src/syscalls/process.rs`) before assuming a new kind needs old treatment.
   A pty fd, unlike a socket, is safely RE-OPENABLE by id afterward via `SharedPtyTable` — run
   dbus-daemon non-forking, and for XFCE use `xfce4-session`, never `startxfce4`.
+- **`wait4()`/`kill()` to a cross-process fork child are asymmetric, and `wait4()` is now ALSO
+  suspect, not just `kill()`** — `kill()` to a `cross_process_children`-tracked pid returns `ESRCH`
+  unconditionally (pass 141, `litebox_shim_linux/src/syscalls/signal/mod.rs:1003-1018`, a documented
+  gap, not a bug: the pid is real and reachable via `wait4`, just not signalable yet). 53rd pass found
+  a SEPARATE, NOT-yet-explained issue in the same area: `dbus-daemon`'s own internal `fork()` for
+  D-Bus service activation gets reported as "already exited" by something in the
+  `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier` path
+  (`litebox_platform_windows_userland/src/process_fork.rs:4226`,
+  `litebox_shim_linux/src/syscalls/process.rs:3363`) within ~1ms of guest-visible time after the fork
+  succeeds — while the real spawned process is demonstrably still alive and simply hasn't reached its
+  own `execve` yet. NOT root-caused to an exact line — do not patch blind; see Track B item 1.
 - **A guest diagnostic must reach the console through a PIPE or `$( )`, never a bare file redirect**
   — `cmd > /tmp/f` + parent read fails silently under `LITEBOX_PROCESS_FORK=1` (child writes its
   own writable-layer snapshot). `cmd 2>&1 | sed 's/^/[tag] /' &` is the pattern for streaming
@@ -103,7 +120,10 @@ cheap for a small repro, too noisy for a full desktop boot.
   top-level program, never via a runtime-built `/bin/sh -c` wrapper. Never trust a container tag
   name for its WM/session contents — verify by registry manifest + blob tar-listing or a live
   in-guest `/usr/bin` listing. Never record a test count not watched run to completion; never
-  leave a suite red for an environmental reason.
+  leave a suite red for an environmental reason. **`de_only.sh` and `webtop_stack.sh` don't always
+  reach the same `xfce4-session` startup depth on a given run** (53rd pass: one `de_only.sh` run
+  never called `clone()` for a single session client, vs. the 52nd pass's fuller boot reaching
+  `iceauth`/`ssh-agent`/`gpg-agent`) — real run-to-run non-determinism, not a harness bug.
 - **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`,
   gitignored); untrack anything `git add -A` sweeps.
 - **Guest-reachable code returns an errno, never a panic** — the host process IS the entire guest
@@ -127,116 +147,75 @@ is `unix-socket`. Per-fork cost was ~3.5-5s, now ~1.2s (`LITEBOX_DIAG_FORK_TIMIN
 nginx's own SSL-cert generation fails on its first startup attempt, genuinely not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-47th, 2026-09-17/22)**: full narrative for every pass is in the dated archives
+**Pass history (4th-53rd, 2026-09-17/22)**: full narrative for every pass is in the dated archives
 (see "Docs and tooling map" below). The CURRENT STATE those passes converged on:
 
 - **The ORIGINAL Xvfb SIGSEGV is FIXED — 43rd pass, `01f8532`** (`get_unmmaped_area`'s top-down
   search forecloses the whole upper region once the topmost VMA reaches `high_limit`, crowding
-  libraries into a gap-starved low window; a fix written+`if false`d in the 6th pass, `linux.rs`
-  step 1.5, was finally live-tested and closes it). Same-session A/B, control crashes at the
-  bit-identical wild pointer `0x7feffecdd400` every time, fix shows zero SIGSEGV. Do NOT reopen
-  DISPLAY/`getenv()`/loader-stack (proven correct, 30th pass) for THIS crash. A SECOND, later Xvfb
-  crash (same signature, different trigger, a SysV-shm cross-process-attach bug) is ALSO now fixed
-  — 51st pass, below.
+  libraries into a gap-starved low window). Do NOT reopen DISPLAY/`getenv()`/loader-stack (proven
+  correct, 30th pass) for THIS crash. **A SECOND Xvfb crash (same signature, different trigger) is
+  ALSO fixed — 51st pass, `c2112bc`**: `sys_shmat` handed back a `SysvShmSegment.addr` real only in
+  the CREATING process, so under `LITEBOX_PROCESS_FORK=1` a different real Windows process attaching
+  a SysV-shm/MIT-SHM segment got a numeric address with zero real backing (matching the crash's
+  fixed, non-ASLR'd fault address `0x37f0400`, register-state-proven bit-identical across boots by
+  the 50th pass). Fix: every `shmat` (including the creator's own) now opens a NAMED
+  `CreateFileMappingW` object and maps it into its own address space, matching real Linux (`shmat`
+  addresses are never cross-process-identical there either). **Both confirmed gone on a full
+  `webtop_stack.sh` boot — 52nd pass** (`.wfgy/webtop_release_boot6.log`, zero
+  `sigsegv`/`panic`/`segmentation` anywhere).
 - **Xvfb's crash backtrace was corrupted PROJECT-WIDE, ROOT-CAUSED (38th) and FIXED (39th,
   `7d66935`)**: `litebox_syscall_rewriter` overwrote the 9 bytes libunwind's x86_64 signal-frame
   detection matches at `__restore_rt`. Fixed via a litebox-synthesized trampoline holding the real
   glibc bytes verbatim.
 - **Live `cdb`/`WaitForDebugEvent` capture of a timing-sensitive guest crash was proven infeasible
-  38th-42nd pass** (sustained AV-interception rate perturbs the crash's own wall-clock pacing; a
-  six-bug-fixed conditional-breakpoint session ran an entire normally-100%-crashing window with
-  zero hits) — **narrower than it sounds**: this is specifically about `cdb`, not about live capture
-  in general — `LITEBOX_DIAG_FATALDUMP=1` (VEH-based, in-process, no debugger) DOES capture this
-  crash family without reliably suppressing it, confirmed 46th pass (below).
-- **"Fork-after-Xorg PERMANENT freeze" is CONFIRMED GONE** (35th pass, a full
-  `LITEBOX_PROCESS_FORK=1` release boot reached `HOLD` with zero freeze/SIGSEGV/corruption).
-  `LITEBOX_PROCESS_FORK=1` is RECOMMENDED for `.wfgy/webtop_stack.sh`.
+  38th-42nd pass** (sustained AV-interception rate perturbs the crash's own wall-clock pacing) —
+  narrower than it sounds: specific to `cdb`, not live capture in general —
+  `LITEBOX_DIAG_FATALDUMP=1` (VEH-based, in-process, no debugger) DOES capture this crash family
+  without suppressing it (46th pass).
+- **"Fork-after-Xorg PERMANENT freeze" is CONFIRMED GONE** (35th pass). `LITEBOX_PROCESS_FORK=1` is
+  RECOMMENDED for `.wfgy/webtop_stack.sh`.
 - **`pty_registry`/`daemon_pty_masters` cross-process redesign is DONE, genuine cross-process pty
-  I/O LIVE-PROVEN** (36th: `syscalls::pty::SharedPtyTable`; 37th: `advisor/probes/pty_fork_probe.c`
-  proved a separate Windows fork child opening `/dev/pts/<id>` fresh post-`fork()`). Mechanism:
-  "Shared-memory foundations" below.
-- **44th-45th passes** — `xfce4-session` first reached real pre-session setup (`iceauth`/`ssh-agent`/
-  `gpg-agent`/`xfconfd`), then hit the second Xvfb SIGSEGV before `xfwm4` (fixed 51st, see above); en
-  route, 45th pass fixed two host-process bugs (`5d63ec6`, `32dd3d5`). Full narrative: archive.
-- **The `lib.rs:7396` host-process panic (`process_memory_range_by_regions`'s `assert!`) is FIXED —
-  46th pass, `c5a8884`.** `Vmem::new_adopting_existing_memory` (`litebox/src/mm/linux.rs`) adopted
-  `PROT_NONE` regions into a cross-process fork child's `vmas` even though `do_clone`'s own
-  copy-plan loop already excludes them from every copy group by design — a later guest
-  `munmap`/`mprotect` on the untracked-but-adopted region routed into a real `VirtualFree` call
-  against memory the child never committed. Same fix shape as the 45th pass's `VM_SHARED` skip:
-  excluded from adoption entirely. **Live-verified: 0 panics across 5 post-fix boots.** Diagnostic
-  pitfall worth recording: a cross-process fork CHILD re-execs this binary but takes `main()`'s
-  `is_diagnostic_resume_child()` branch and NEVER reaches `run()` — a runtime toggle wired only at
-  the top of `run()` silently never takes effect in any fork descendant.
-- **The `buddy_system_allocator` free-list corruption panic ("len is 34, index is 53") is FIXED —
-  49th pass, `8b64698`.** `Network`/`Pipes::rebind_per_process_fields` (`litebox/src/net/mod.rs`,
-  `litebox/src/pipes.rs`) plain-assigned their shared-arena `litebox` field, dropping the OLD value
-  in place — always some OTHER process's private-heap `Arc<LiteBoxX>` pointer frozen into shared
-  bytes, so `Arc::drop` read a bogus refcount and freed an unrelated, still-live FD-table `Vec`
-  through THIS process's allocator with a garbage `Layout`, corrupting `Heap::free_list`. Fix:
-  `mem::forget` the stale value, mirroring `reset_after_poisoning`'s established pattern for the
-  identical hazard on `SocketSet::remove`. **Verified 7/7 clean `de_only.sh` boots**, zero
-  recurrence vs. 100% reproduction pre-fix. Full mechanism/backtrace: archive.
-- **50th pass** — the second Xvfb SIGSEGV's full register state proven bit-identical across
-  independent boots: `rip=0x7fefedeababd` (glibc `__memmove_avx_unaligned_erms`'s 32-64-byte AVX2
-  path), `rdx=0x40`. `rdi` (dest) is a real per-process heap chunk (offset fixed, base moves with
-  ASLR, as expected); `rsi` (src, fault address `0x37f0400`) does NOT move with ASLR at all — the
-  key clue the 51st pass root-caused (next bullet). Live `cdb` was NOT re-attempted this pass
-  (skipped, not merely deferred: the 41st-42nd passes already proved sustained `cdb`
-  AV-interception fully suppresses this whole crash *family* — same dispatch point, adjacent `rip`
-  — regardless of how cheap each breakpoint handler is, and static+`LITEBOX_DIAG_FATALDUMP=1`
-  evidence alone was sufficient to root-cause without paying that cost).
-- **51st pass (2026-09-22) — SysV shm cross-process-attach bug ROOT-CAUSED and FIXED, no `cdb`
-  needed.** `sys_shmat` (`litebox_shim_linux/src/syscalls/mm.rs`) handed back a bare `SysvShmSegment.addr`
-  — a real mapping ONLY in the CREATING process — to every attacher; under
-  `LITEBOX_PROCESS_FORK=1`, a genuinely different real Windows process (e.g. Xvfb attaching a
-  segment an X11 MIT-SHM CLIENT created, never fork-related to Xvfb) got that numeric value with
-  ZERO backing memory of its own, exactly matching `rsi`'s "fixed, non-ASLR'd" signature (a value
-  copied verbatim out of the shared `GlobalState` table, not derived from this process's own mmap
-  placement) and `LITEBOX_DIAG_FATALDUMP=1`'s own `[veh] fault addr=0x37f0400 protect=0x0` (reserved,
-  never committed, in THIS process). Old design assumed the pre-cross-process-fork "one shared host
-  address space" model, stale since `LITEBOX_PROCESS_FORK=1` existed. **Fix**: `shmget` no longer
-  maps anything (matches real Linux); every `shmat`, including the creator's own first one, opens a
-  NAMED platform shared-memory object (`create_named_shared_memory`, new `PageManagementProvider`
-  method, Windows impl = `CreateFileMappingW(name="Local\litebox_sysvshm_<shmid>")`, idempotent
-  create-or-open exactly like `xproc_sync::CrossProcessEvent`'s existing named-kernel-object
-  pattern) and maps it into ITS OWN address space via the existing `map_existing_shared_pages`
-  primitive (same one `syscalls::file`'s memfd/`wl_shm` bridging already uses) — the returned
-  address is per-process, matching real Linux `shmat` (never cross-process-identical there either).
-  `shmdt`'s reverse lookup moved to a new per-process `FilesState::shm_attachments` table (shares
-  correctly via the existing `CLONE_FILES`-vs-`fork_duplicate` split `FilesState` already has).
-  **Verified**: 10/10 clean `de_only.sh` boots (`LITEBOX_PROCESS_FORK=1`, `LITEBOX_DIAG_FATALDUMP=1`,
-  debug build; 7 short + 3 reaching WM_POLL n=7/60s with zero truncation-related ambiguity), ZERO
-  recurrence of either Xvfb SIGSEGV signature (`0x7feffecdd400` or `0x37f0400`).
-- **52nd pass (2026-09-22) — full `webtop_stack.sh` boot re-verified past the 51st-pass fix: BOTH
-  Xvfb SIGSEGVs confirmed gone on the full stack too** (`.wfgy/webtop_release_boot6.log`, release
-  binary, `LITEBOX_PROCESS_FORK=1`, `--publish 8081:8081`, `stderr_capture=debug` for real guest
-  stderr) — zero `sigsegv`/`panic`/`segmentation` matches in the whole boot. `DE_FAILED` still fires,
-  but **the 30th-49th passes' "Cannot open display" framing is REFUTED for this run — that string
-  appears nowhere**; `xdpyinfo` succeeds (`rc=0`) right before each WM launch attempt and
-  `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` are confirmed correctly set. Fresh evidence instead, read via
-  the guest-stderr channel (no `cdb` needed): (a) `xfce4-session` (pid 6948) runs deep into startup
-  (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`, later `xfsettingsd`/`xfdesktop`/`Thunar` all really
-  `execve`) but floods `GLib-GIO-CRITICAL: g_dbus_proxy_call_sync_internal`/`g_dbus_error_is_remote_
-  error: assertion 'error != NULL' failed` around its D-Bus autostart-lookup calls; (b) **`xfwm4`
-  itself never appears ANYWHERE in the log** — zero mentions, not even a failed-exec trace — while
-  later autostart entries (`xfsettingsd`/`xfdesktop`/`Thunar`) DO launch: the single most concrete
-  lead for the next pass, plausibly downstream of (a)'s broken D-Bus round-trips if `xfce4-session`
-  queries D-Bus for the WM command before launching it; (c) a new, separate bug: `gpg-agent` (pid
-  119) hit a fatal glibc heap-corruption assertion (`malloc.c:3846 (__libc_calloc): assertion '!mem
-  || ...' failed`, SIGABRT) ~1.2s into `startwm.sh` — real heap corruption reachable even under
-  `LITEBOX_PROCESS_FORK=1`, not yet root-caused; (d) the always-on `vmem-adopt-probe` diagnostic
-  showed every fork child with a startlingly high `VM_SHARED` region count (up to 84/117, even for
-  the plain top-level shell) — a `VM_SHARED` region gets zero real backing in a fork child by design
-  (45th pass), so if this is inflated by a bug rather than genuine guest `MAP_SHARED` use, every
-  fork generation's memory bookkeeping degrades further than intended, a plausible contributor to
-  (c); worth its own pass. Fixed in passing (`39a878b`): the probe's own comparison filter was stale
-  (only excluded `VM_SHARED`, never updated for the 46th pass's `PROT_NONE` exclusion), so it
-  misreported "MISMATCH" on nearly every fork regardless of real correctness — now matches what
-  `Vmem::new_adopting_existing_memory` actually does. Host RAM fell to ~2.3GB free by `HOLD` (37 live
-  `litebox_runner` processes) — killed via `Invoke-CimMethod -MethodName Terminate`, recovered to
-  ~9GB in seconds. No browser/app verification reached (`DE_FAILED` still blocks it). Full evidence:
-  this commit's message + `.wfgy/webtop_release_boot6.log` (gitignored, on disk).
+  I/O LIVE-PROVEN** (36th/37th pass). Mechanism: "Shared-memory foundations" below.
+- **44th-49th passes** — `xfce4-session` first reached real pre-session setup (`iceauth`/`ssh-agent`/
+  `gpg-agent`/`xfconfd`). Fixed en route: fd 0/1/2 dropped at the fork boundary
+  (`raw_fd_is_plain_stdio_device`), an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption host panic
+  (`c5a8884`), and a `buddy_system_allocator` free-list corruption — `Network`/
+  `Pipes::rebind_per_process_fields` (`litebox/src/net/mod.rs`, `litebox/src/pipes.rs`)
+  plain-assigned their shared-arena `litebox` field, dropping an OLD, OTHER-process `Arc<LiteBoxX>`
+  pointer in place and corrupting `Heap::free_list` when its drop glue ran through this process's
+  allocator; fixed via `mem::forget` on the stale value (`8b64698`), mirroring
+  `reset_after_poisoning`'s established pattern. Verified 7/7 clean `de_only.sh` boots, zero
+  recurrence. Full narrative every pass: archive.
+- **52nd pass (2026-09-22)** — full `webtop_stack.sh` confirmed BOTH Xvfb SIGSEGVs gone on the full
+  stack (see above). `DE_FAILED` still fires, but the 30th-49th passes' "Cannot open display" framing
+  is REFUTED — that string appears nowhere this run; `xdpyinfo` succeeds and `DISPLAY`/
+  `DBUS_SESSION_BUS_ADDRESS` are confirmed correct. New evidence via `stderr_capture=debug`:
+  `xfce4-session` reaches `iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`, later `xfsettingsd`/
+  `xfdesktop`/`Thunar` too, but floods `GLib-GIO-CRITICAL: g_dbus_proxy_call_sync_internal`/
+  `g_dbus_error_is_remote_error` around D-Bus autostart calls; **`xfwm4` itself never appears
+  ANYWHERE in the log**; a separate new bug, `gpg-agent`'s fatal glibc `malloc.c:3846`
+  heap-corruption SIGABRT, not yet root-caused.
+- **53rd pass (2026-09-22)** — traced the `GLib-GIO-CRITICAL` flood to its real cause: D-Bus SERVICE
+  ACTIVATION genuinely fails for every service xfce4-session needs (`org.a11y.Bus`, `org.xfce.
+  Xfconf`, later `org.a11y.atspi.Registry`). `dbus-daemon` logs `Activated service 'X' failed:
+  Process X exited, reason unknown` within ~1ms of guest-visible time after its own
+  `try_cross_process_fork` for the activation babysitter succeeds — while the real target binary
+  (`at-spi-bus-launcher`/`xfconfd`) is demonstrably still alive and merely slow to reach its own
+  `execve` (that `execve` trace appears thousands of log lines, and materially later in wall-clock
+  time, AFTER the "exited" report already fired — `.wfgy/de_only_pass53_utf8.log:25484-28663`).
+  Fetched real `dbus-spawn-unix.c`/`bus/activation.c` (GitHub `d-bus/dbus` mirror,
+  gitlab.freedesktop.org still unreachable): "reason unknown" fires when dbus's babysitter reports
+  the child gone WITHOUT ever conveying a real `waitpid` status — pointing at
+  `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier` reporting a cross-process
+  child's Windows HANDLE as signaled/exited prematurely (see the standing-lessons bullet above).
+  **NOT yet root-caused to an exact line or fixed — do not patch blind.** A SEPARATE finding the same
+  pass: in an isolated `de_only.sh` re-run, `xfce4-session` never called `clone()` for a real process
+  EVEN ONCE the whole run (0 process-clones vs the 52nd pass's fuller boot reaching `iceauth`/
+  `ssh-agent`/`gpg-agent`) — xfce4-session's OWN very-early D-Bus-proxy construction (the first
+  `GLib-GObject-CRITICAL: invalid (NULL) pointer instance`, before ANY client fork in BOTH runs) is a
+  more consistently-reproducing, more upstream candidate blocker than "xfwm4 specifically." Also
+  reconfirmed: zero host panics/SIGSEGVs in this run — the 49th/51st-pass fixes hold. Full evidence,
+  exact timestamps, dbus source excerpts: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -246,25 +225,31 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `DE_FAILED` cause (REFUTED FOR GOOD); AF_UNIX `connect()` `EAGAIN`-vs-`EINPROGRESS`; `pty_registry`/
 `daemon_pty_masters` (`syscalls::pty::SharedPtyTable`, live-verified cross-process, 37th pass);
 fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_stdio_device`);
-`SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap (44th, `UnixStreamState::Connecting`).
+`SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap (44th, `UnixStreamState::Connecting`);
+both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 
 **Open, in rough priority order:**
 
-1. **Both Xvfb SIGSEGVs are FIXED and CONFIRMED on the full stack — 51st/52nd passes.** `DE_FAILED`
-   is STILL OPEN but the pre-51st-pass "Cannot open display" framing is REFUTED for the 52nd pass's
-   own run (see that bullet above) — do not re-assume it without fresh evidence. Concrete next steps,
-   in order: (i) `xfwm4` never appears in the log at all — trace why `xfce4-session` never launches
-   it (a live `cdb -pv` attach on `xfce4-session`, breaking on its WM-spawn/`g_spawn_*` call sites,
-   is now finally uncontaminated by the Xvfb crash and worth attempting fresh; the always-on
-   `litebox_diag::stderr_capture=debug` channel is a cheaper first move and hasn't been fully mined
-   yet — only ~95 fragments for pid 6948 were reconstructed this pass); (ii) root-cause the
-   `GLib-GIO-CRITICAL`/D-Bus-proxy-assertion flood — likely upstream of (i); (iii) root-cause
+1. **`DE_FAILED`'s real chain, narrowed twice this session (52nd then 53rd pass).** Concrete next
+   steps, in order: (i) confirm/refute whether `try_wait_for_cross_process_exit`
+   (`litebox_platform_windows_userland/src/process_fork.rs:4226`) or the async notifier thread
+   (`arm_cross_process_exit_notifier`, `litebox_shim_linux/src/syscalls/process.rs:3363`) reports a
+   cross-process child's Windows `HANDLE` as exited prematurely — add a temporary diagnostic
+   printing `WaitForSingleObject`'s raw return value and elapsed-ms-since-`CreateProcessW` at both
+   call sites, using `dbus-daemon`'s own service-activation fork as the repro
+   (`.wfgy/de_only.sh`, watch for `Activating service name=`); this is the most concrete lead in the
+   whole investigation and has never been instrumented directly. (ii) A live `cdb -pv` attach on
+   `xfce4-session` breaking on `g_bus_get_sync`/`g_dbus_proxy_new_sync` (now finally uncontaminated
+   by the Xvfb crash) to determine whether xfce4-session's OWN very-early D-Bus-proxy construction
+   (before ANY client fork) is what's actually stalling all client startup, `xfwm4` included — never
+   attempted by any pass despite being flagged available since the 44th. (iii) root-cause
    `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (real heap corruption under
-   `LITEBOX_PROCESS_FORK=1`, previously assumed impossible on this path); (iv) the high `VM_SHARED`
-   fork-child region count (up to 84/117, even for a plain shell) — confirm whether it's a genuine
-   guest-level `MAP_SHARED` accumulation or a bug silently shrinking what a fork child actually
-   inherits. Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th
-   passes) recheck depends on reaching a real WM first.
+   `LITEBOX_PROCESS_FORK=1`, previously assumed impossible on this path) — only reproduced once so
+   far (52nd pass), zero repro in the 53rd pass's own run (xfce4-session never got far enough to
+   spawn it), so treat as lower-urgency until (i)/(ii) land. (iv) the high `VM_SHARED` fork-child
+   region count (up to 84/117, even for a plain shell, 52nd pass) — confirm whether it's genuine
+   guest-level `MAP_SHARED` accumulation or a bug. Host-side `curl http://localhost:8081/`
+   connecting-but-HTTP-timing-out (43rd/49th passes) recheck depends on reaching a real WM first.
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
    (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
    capacity-256 overflow is silently discarded (`unix.rs:275-277`); a key >108 bytes silently bails;
@@ -321,8 +306,10 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
 the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are fixed and CONFIRMED on a
 full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes) — the sole remaining blocker is
-`DE_FAILED`, now narrowed to `xfwm4` never launching at all (NOT "Cannot open display" — that framing
-was refuted this pass; see Track B item 1). Selkies also needs `--clipboard-enabled=false` on the
+`DE_FAILED`. `xfwm4` never launching is the most visible symptom, but the 53rd pass's own evidence
+now points more upstream, at a D-Bus-service-activation false-"exited" bug plus xfce4-session's own
+very-early D-Bus-proxy-construction failure (Track B item 1) — NOT confirmed "Cannot open display"
+(that framing was refuted by the 52nd pass). Selkies also needs `--clipboard-enabled=false` on the
 thread-based path (its clipboard monitor re-triggers the same corruption every tick) — moot
 cross-process.
 
@@ -359,8 +346,9 @@ private per-process heap, meaningless to an attaching process. Of the original u
 list (`unix_addr_table`/`pty_registry`/`daemon_pty_masters`/`flock_registry`/`fifo_registry`/
 `sysv_shm`/`memfds`/`shared_files`): all but `flock_registry` are fixed (per-process-shadowed, a
 shared-arena fixed array, or — for `pty_registry`/`daemon_pty_masters` — both a shadow AND a
-live-verified cross-process companion, `syscalls::pty::SharedPtyTable`). Reusable pattern
-(`SharedUnixAddrPresenceTable`, reused by `sysv_shm`/AF_UNIX/`SharedPtyTable`): fixed-slot,
+live-verified cross-process companion, `syscalls::pty::SharedPtyTable`). `sysv_shm` moved from a
+shared-address-table design to per-process named-object mapping (51st pass, see above). Reusable
+pattern (`SharedUnixAddrPresenceTable`, reused by AF_UNIX/`SharedPtyTable`): fixed-slot,
 pure-atomic, lock-free `(kind, key bytes<=108, owner pid)` side-index. **A mutable-state table on
 this pattern needs every WRITE path audited for shared-side mirroring** — `SharedPtyTable`'s own
 setters originally only reached the local side (37th-pass live catch). Still open: `flock_registry`
@@ -377,7 +365,7 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-50th passes: full pass-by-pass narrative for
+- **Archives** (newest first) — `_2026-09-22.md` (26th-53rd passes: full pass-by-pass narrative for
   everything this file's own pass entries above summarize), `_2026-09-18.md` (12th-34th, shared
   AF_UNIX plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash, stdio-handle bug,
   writable-layer-race fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md`
