@@ -1688,6 +1688,39 @@ impl ToSyscallResult for Result<u32, Errno> {
     }
 }
 
+/// Builds the canned tmpfs-shaped `statfs`/`fstatfs` reply and writes it to `buf` -- shared by
+/// `SyscallRequest::Statfs`/`SyscallRequest::Fstatfs`, each of which validates its own target
+/// (path via `sys_stat`, fd via `sys_fstat`) exists/is open BEFORE calling this, so a nonexistent
+/// path or a stale/never-opened fd gets a real `ENOENT`/`EBADF` instead of this canned success
+/// (previously `pathname`/`fd` were ignored entirely -- `Statfs { pathname: _, .. }` -- so ANY
+/// path or fd number, including ones that don't exist, reported a successful tmpfs statfs).
+fn write_tmpfs_statfs<Platform: ShimPlatform>(
+    buf: UserPtrMut<litebox_common_linux::Statfs>,
+) -> Result<usize, Errno> {
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const BSIZE: i64 = 4096;
+    // 16 GiB of 4 KiB blocks, all reported free. Any caller doing a real capacity check gets a
+    // plausible answer; nothing here is a durable store to fill up.
+    const BLOCKS: u64 = (16 * 1024 * 1024 * 1024) / 4096;
+    let statfs = litebox_common_linux::Statfs {
+        f_type: TMPFS_MAGIC,
+        f_bsize: BSIZE,
+        f_blocks: BLOCKS,
+        f_bfree: BLOCKS,
+        f_bavail: BLOCKS,
+        f_files: 1 << 20,
+        f_ffree: 1 << 20,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: BSIZE,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    buf.write_at_offset::<Platform>(0, statfs)
+        .ok_or(Errno::EFAULT)
+        .map(|()| 0)
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
@@ -2447,29 +2480,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // declining to place lock files -- get the behaviour that is actually correct here.
             // Block counts are reported as a large, non-zero capacity rather than 0: callers
             // routinely treat 0 free blocks as "disk full" and refuse to write.
-            SyscallRequest::Statfs { pathname: _, buf } | SyscallRequest::Fstatfs { fd: _, buf } => {
-                const TMPFS_MAGIC: i64 = 0x0102_1994;
-                const BSIZE: i64 = 4096;
-                // 16 GiB of 4 KiB blocks, all reported free. Any caller doing a real capacity
-                // check gets a plausible answer; nothing here is a durable store to fill up.
-                const BLOCKS: u64 = (16 * 1024 * 1024 * 1024) / 4096;
-                let statfs = litebox_common_linux::Statfs {
-                    f_type: TMPFS_MAGIC,
-                    f_bsize: BSIZE,
-                    f_blocks: BLOCKS,
-                    f_bfree: BLOCKS,
-                    f_bavail: BLOCKS,
-                    f_files: 1 << 20,
-                    f_ffree: 1 << 20,
-                    f_fsid: [0, 0],
-                    f_namelen: 255,
-                    f_frsize: BSIZE,
-                    f_flags: 0,
-                    f_spare: [0; 4],
-                };
-                buf.write_at_offset::<Platform>(0, statfs)
-                    .ok_or(Errno::EFAULT)
-                    .map(|()| 0)
+            //
+            // Both arms validate FIRST (`sys_stat`/`sys_fstat`) that the target actually exists /
+            // the fd is actually open before reporting this canned success -- this used to ignore
+            // `pathname`/`fd` entirely (`pathname: _`/`fd: _`) and report a successful tmpfs-shaped
+            // statfs for ANY path or fd number, including ones that don't exist/aren't open. That
+            // is genuinely wrong on its own (a `statfs()` existence probe on a nonexistent path,
+            // or an `fstatfs()` on a stale/closed/never-opened fd, must fail, not silently
+            // succeed) and was specifically investigated as a candidate for the Xvfb
+            // `ProcSELinuxGetClientContext` SIGSEGV (39th pass): libselinux's `is_selinux_enabled()`
+            // (`libselinux/src/init.c` `verify_selinuxmnt`) calls `statfs("/sys/fs/selinux", ...)`
+            // and only treats SELinux as present if `f_type == SELINUX_MAGIC` (0xf97cff8c) --
+            // since this handler always returns `TMPFS_MAGIC` (0x01021994), the magic never
+            // matches even with the existence bug, so that specific theory does NOT hold (the
+            // XSELinux protocol extension's own `AddExtension` call is gated on
+            // `is_selinux_enabled()` in `Xext/xselinux_ext.c`'s `SELinuxExtensionInit` and should
+            // never even run in this guest) -- but the existence-blind behavior is a real,
+            // independent correctness bug on its own and is fixed here regardless.
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_stat(path)?;
+                        write_tmpfs_statfs::<Platform>(buf)
+                    })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => {
+                self.sys_fstat(fd)?;
+                write_tmpfs_statfs::<Platform>(buf)
             }
             // Advisory only: the hint is accepted and deliberately ignored (see the dispatch
             // site's comment on why refusing an advisory hint is pure downside).

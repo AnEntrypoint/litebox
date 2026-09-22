@@ -201,21 +201,53 @@ CURRENT STATE those passes converged on:
   `litebox_shim_linux/src/lib.rs`). Verified: signal round-trip works end to end; Xvfb's own
   backtrace post-fix now correctly stops at the signal boundary instead of wandering 11 frames
   into stale RBP-chain garbage. Full narrative: commit `7d66935`, `docs/AGENTS_ARCHIVE_2026-09-22.md`.
-- **The Xvfb SIGSEGV itself remains OPEN, call site narrowed with direct evidence, 39th pass.**
-  Fault is `libc+0x162abd` = `vmovdqu (%rsi),%ymm0` inside `__memmove_avx_unaligned_erms` (libc
-  base `0x7fefedd3b000`), reading a wild, fully-unmapped, bit-identical `0x7feffecdd400` across
-  every capture. `LITEBOX_DIAG_FATALDUMP=1`'s raw stack dump gives `[rsp+0]` (a genuine return
-  address — this AVX2 leaf routine pushes no extra stack) = Xvfb offset `0x74391`, which
-  `addr2line -e .wfgy/xvfb.debug` (DWARF; more trustworthy than `xvfb_runtime.bin`'s bare
-  `.symtab`) resolves to **`ProcSELinuxGetClientContext`, `Xext/xselinux_ext.c:305`** — Xvfb
-  crashes building/copying a reply to an `XSELinux` `GetClientContext` request. Deeper
-  frame-pointer-walked frames resolve to mutually-unrelated subsystems (Xkb/GLX/pointer-accel/fb
-  blit) with no plausible call relationship, confirming only the immediate caller is trustworthy.
-  `litebox_shim_linux` has ZERO SELinux-specific emulation, so whatever Xvfb/`libselinux.so.1` (a
-  real dependency of this build) do to check enforcement falls through to generic VFS emulation.
-  NOT determined: litebox-shim bug vs. genuine upstream Xvfb/libselinux defect on this
-  compiled-in-but-inert path. Xvfb source could not be fetched this pass (gitlab.freedesktop.org
-  anti-bot-blocked). Full evidence and pickup: `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 39th-pass entry.
+- **The Xvfb SIGSEGV itself remains OPEN — the 39th pass's `ProcSELinuxGetClientContext` theory is
+  REFUTED, 40th pass, direct empirical evidence, real upstream source now in hand.** Fault is
+  `libc+0x162abd` = `vmovdqu (%rsi),%ymm0` inside `__memmove_avx_unaligned_erms`, reading a wild,
+  fully-unmapped, bit-identical `0x7feffecdd400` across every capture (now 8+ captures, 40th pass
+  included). Real `Xext/xselinux_ext.c`/`xselinux_hooks.c`/libselinux `init.c`/`getpeercon.c`
+  fetched this pass (`github.com/XQuartz/xorg-server`, `github.com/SELinuxProject/selinux` —
+  gitlab.freedesktop.org is still anti-bot-blocked but this mirror isn't) and read in full:
+  `ProcSELinuxGetClientContext` (`xselinux_ext.c:290-305`) does NOT touch `/proc` at all — it looks
+  up an already-connected X client by resource ID (`dixLookupClient`) and replies with a SID set at
+  CONNECT time by `SELinuxLabelClient` (`xselinux_hooks.c:112-152`), which calls libselinux's
+  `getpeercon_raw(fd, &ctx)` (`getsockopt(SOL_SOCKET, SO_PEERSEC)`) and falls back to
+  `SELinuxDefaultClientLabel()` on ANY failure — confirmed this pass that litebox's `getsockopt`
+  already answers unmapped options (no `SO_PEERSEC`/31 variant exists in `SocketOption`,
+  `litebox_common_linux/src/lib.rs:2235-2251`) with `ENOPROTOOPT`
+  (`litebox_shim_linux/src/syscalls/net.rs:2569-2572`), which is exactly the failure shape
+  `getpeercon_raw` already handles by falling back — NOT a bug. More importantly: the XSELinux
+  protocol handler is only ever registered via `AddExtension` inside `SELinuxExtensionInit`
+  (`xselinux_ext.c:690-712`) if `is_selinux_enabled()` returns true, which itself requires
+  `statfs("/sys/fs/selinux", …).f_type == SELINUX_MAGIC` (`libselinux/src/init.c`
+  `verify_selinuxmnt`) — a check litebox's `statfs` could never satisfy (see the fix below), so by
+  the real source the extension should never even init. **Decisive test, 40th pass**: reran
+  `.wfgy/de_only.sh` under `LITEBOX_PROCESS_FORK=1` (sidesteps the thread-fork tcache-corruption
+  class entirely, giving a clean, fast, reproducible path to the crash — 2/2 runs,
+  `.wfgy/de_only_statfsfix_pfork_1.log`) with Xvfb launched with `-extension "SELinux"` added
+  (explicitly disabling the extension at the protocol level, `.wfgy/de_only_noselinux_seed.tar`):
+  **the SAME bit-identical `0x7feffecdd400` SIGSEGV still occurs, 2/2 runs**
+  (`.wfgy/de_only_noselinux_1.log`, `.wfgy/de_only_noselinux_2.log`). An explicitly-disabled
+  extension cannot be the crash site — the 39th pass's `addr2line`-based attribution to
+  `ProcSELinuxGetClientContext`/`xselinux_ext.c:305` was a misattribution (the `[rsp+0]`
+  raw-stack-word read, though a sounder method than a frame-pointer walk, was not actually the true
+  return address this time — do not re-trust a single raw-stack-word capture without an independent
+  cross-check again). **Do not re-open the SELinux/XSELinux/`is_selinux_enabled`/`getpeercon`
+  thread — fully closed, 40th pass.** The real crash site is UNKNOWN again; next step needs a
+  genuine live debugger attach on Xvfb itself (`cdb -pv`, breaking on `__memmove_avx_unaligned_erms`
+  or its caller) or CFI-based unwinding, neither attempted by any pass to date — a raw-stack-word
+  scan alone has now produced one confirmed-wrong lead and should not be trusted alone again.
+  **Independent, unrelated bug found+FIXED same pass**: `SyscallRequest::Statfs`/`Fstatfs`
+  (`litebox_shim_linux/src/lib.rs:2450` pre-fix) ignored `pathname`/`fd` entirely
+  (`pathname: _`/`fd: _`) and unconditionally returned a canned tmpfs-shaped success for ANY path
+  or fd number, including nonexistent/closed ones — a real, independent correctness bug (statfs on
+  a nonexistent path, or fstatfs on a bad fd, must fail) now fixed by validating via `sys_stat`/
+  `sys_fstat` first (a real function, `write_tmpfs_statfs`, factored out and reused by both);
+  live-verified via an A/B stash/rebuild/rerun that it does NOT regress the pre-existing
+  thread-fork tcache-corruption flakiness (bit-identical failure with and without the fix) and does
+  NOT (as hoped) eliminate the Xvfb SIGSEGV either, consistent with the magic-number analysis above
+  (litebox's `f_type` is `TMPFS_MAGIC`, never `SELINUX_MAGIC`, before or after this fix). Full
+  evidence and log paths: `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 40th-pass entry.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass, live evidence: a
   full `LITEBOX_PROCESS_FORK=1` release-binary boot reached its designed idle `HOLD` loop with zero
   freeze/SIGSEGV/tcache-corruption). `LITEBOX_PROCESS_FORK=1` is now the RECOMMENDED flag for
@@ -250,16 +282,16 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 
 1. **Xvfb's SIGSEGV — still the SINGLE top blocker** (`DE_FAILED` is a downstream symptom, not a
    second bug, 38th pass). The backtrace-corruption meta-bug that blocked investigating it is FIXED
-   (39th pass, `7d66935`) and the real caller is identified (`ProcSELinuxGetClientContext`,
-   `Xext/xselinux_ext.c:305` — see above). Pickup, in order: (a) get real Xvfb source (`apt source
-   xserver-xorg-core` inside a throwaway guest, or a working GitHub mirror — gitlab.freedesktop.org
-   is anti-bot-blocked) and read that function plus whatever it calls to build the
-   `GetClientContext` reply, to find the exact bad-pointer/length source; (b) if it traces to a
-   litebox-emulated syscall (peer-credential/getsockopt-shaped, given `libselinux.so.1` is a real
-   dependency of this build), fix that syscall's return shape; (c) if it's a genuine upstream
-   Xvfb/libselinux defect on the "extension compiled in but inert" path, the cheapest real fix may
-   be disabling the `SELinux` extension at Xvfb's own init/CLI rather than chasing an unrelated
-   glibc/Xorg bug — verify it doesn't disable anything the desktop path actually needs first.
+   (39th pass, `7d66935`). The 39th pass's `ProcSELinuxGetClientContext` lead is REFUTED (40th
+   pass, real source read + the crash reproduces 2/2 with the `SELinux` X extension explicitly
+   disabled — see above); do not re-open it. Pickup, in order: (a) live `cdb -pv` attach on Xvfb
+   itself under `LITEBOX_PROCESS_FORK=1` (use `.wfgy/de_only.sh`/`de_only_seed.tar` for a fast,
+   clean ~2-minute repro to the crash — no `LITEBOX_DIAG_FATALDUMP` needed once a debugger is
+   attached), breaking on `__memmove_avx_unaligned_erms` or catching the access violation directly,
+   to get a REAL call stack instead of another raw-stack-word guess — not attempted by any pass to
+   date; (b) failing that, CFI-based unwinding against `.wfgy/xvfb.debug`'s DWARF `.eh_frame`; (c)
+   once a real caller is known, re-derive which litebox-emulated syscall (if any) it depends on
+   before assuming a litebox bug — the SELinux lead's own lesson this pass.
 2. ~~`xfce4-session`'s `DE_FAILED` as an independent bug~~ — **REFUTED, 38th pass.** It is the
    Xvfb crash seen from downstream. Do not spend a pass attaching `cdb` to `xfce4-session`.
 2b. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
@@ -402,10 +434,12 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-39th passes: `XVFB_UP`/`SharedFilePublishTable`/
+- **Archives** (newest first) — `_2026-09-22.md` (26th-40th passes: `XVFB_UP`/`SharedFilePublishTable`/
   `DBUS_FAILED`/AF_UNIX-errno fixes, the full Xvfb-crash symbolization narrative + the
-  sigreturn-trampoline fix and call-site narrowing, "Fork-after-Xorg freeze" confirmed gone, the
-  full `SharedPtyTable` design+verification, and the drained Shared-memory-foundations/pipe-diagnostic
+  sigreturn-trampoline fix and call-site narrowing (39th), the `ProcSELinuxGetClientContext` lead
+  REFUTED + the `statfs`/`fstatfs` path-blind-success bug fixed (40th), "Fork-after-Xorg freeze"
+  confirmed gone, the full `SharedPtyTable` design+verification, and the drained
+  Shared-memory-foundations/pipe-diagnostic
   full-mechanism writeups), `_2026-09-18.md` (12th-34th, shared AF_UNIX connection plane, ldconfig
   static-PIE fix), `_2026-09-17.md` (shell-crash investigation, stdio-handle bug, writable-layer-race
   fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill),

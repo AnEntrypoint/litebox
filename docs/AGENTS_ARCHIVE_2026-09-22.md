@@ -524,3 +524,109 @@ defect only reachable because SELinux is compiled in but inert, the cheapest rea
 disabling `XSELinux` at Xvfb's own build/init (`-extension SELinux` disable flag, if Xvfb's CLI
 exposes one) rather than chasing a glibc/Xorg bug unrelated to litebox itself — verify this
 disables the crash without disabling anything the desktop path actually needs first.
+
+## 40th pass (2026-09-22) — `ProcSELinuxGetClientContext` lead REFUTED by direct experiment; real `statfs`/`fstatfs` correctness bug found+fixed
+
+**Task: verify the 39th pass's `ProcSELinuxGetClientContext`/`xselinux_ext.c:305` hypothesis
+against real source, root-cause litebox's side, fix it, and push to a full boot if fixed.**
+
+**Real source obtained.** `gitlab.freedesktop.org/xorg/xserver` is still anti-bot-blocked, but
+`github.com/XQuartz/xorg-server` (a real, actively-synced mirror — confirmed via
+`api.github.com/repos/XQuartz/xorg-server/contents/Xext`, which lists `xselinux_ext.c`,
+`xselinux_hooks.c`, `xselinux_label.c`, `xselinuxint.h` exactly as literal filenames) and
+`github.com/SELinuxProject/selinux` (libselinux's actual upstream) both fetched cleanly via plain
+`curl`. Read in full: `Xext/xselinux_ext.c`, `Xext/xselinux_hooks.c`, `libselinux/src/init.c`,
+`libselinux/src/getpeercon.c`, `libselinux/src/enabled.c`.
+
+**`ProcSELinuxGetClientContext` (xselinux_ext.c:290-305) does NOT read `/proc` or issue any raw
+syscall of its own** — the 39th pass's own working hypothesis ("almost certainly reads
+`/proc/<pid>/attr/current` or similar") was the wrong shape. The real function looks up an
+ALREADY-CONNECTED X client by X resource ID (`dixLookupClient`) and replies with a SID cached on
+that client's `devPrivates` at CONNECT time, via `SELinuxSendContextReply`. That caching happens in
+`SELinuxLabelClient` (`xselinux_hooks.c:112-152`): it calls libselinux's `getpeercon_raw(fd, &ctx)`
+and, on ANY failure, falls back to `SELinuxDefaultClientLabel()` — never a hard error on that path.
+`getpeercon_raw` (libselinux `getpeercon.c`) is exactly `getsockopt(fd, SOL_SOCKET, SO_PEERSEC,
+buf, &size)` on a `calloc`-zeroed buffer; on ANY negative return (any errno other than `ERANGE`,
+which triggers one resize-and-retry) it frees the buffer and returns -1 with `*context` untouched —
+the caller's `< 0` check then takes the fallback. **Checked litebox's actual `getsockopt`**:
+`SocketOption` (`litebox_common_linux/src/lib.rs:2235-2251`) has no `SO_PEERSEC`(31) variant, so
+`SocketOptionName::try_from(SOL_SOCKET, 31)` returns `None`, and `sys_getsockopt`
+(`litebox_shim_linux/src/syscalls/net.rs:2569-2572`) answers with `ENOPROTOOPT` — exactly the shape
+`getpeercon_raw` already handles via its fallback. **Not a bug.**
+
+**The bigger finding: by this real source, the XSELinux protocol extension shouldn't even be
+reachable in this guest.** `SELinuxExtensionInit` (`xselinux_ext.c:690-712`) calls
+`AddExtension(SELINUX_EXTENSION_NAME, ...)` — the only place `ProcSELinuxDispatch` (and therefore
+`ProcSELinuxGetClientContext`) becomes reachable at all — ONLY if `is_selinux_enabled()` returns
+true first. `is_selinux_enabled()` (`libselinux/src/enabled.c`) is `return selinux_mnt &&
+has_selinux_config;`. `selinux_mnt` is set by `init_lib()`'s constructor calling
+`init_selinuxmnt()` -> `verify_selinuxmnt(SELINUXMNT)` (`SELINUXMNT` = `/sys/fs/selinux`), which
+does `statfs(mnt, &sfbuf)` and only calls `set_selinuxmnt` if `sfbuf.f_type == SELINUX_MAGIC`
+(`0xf97cff8c`). litebox's `statfs`/`fstatfs` handler unconditionally reports `f_type: TMPFS_MAGIC`
+(`0x01021994`) — never `SELINUX_MAGIC` — so `selinux_mnt` should stay `NULL` and
+`is_selinux_enabled()` should be false, regardless of whether the path even resolves. By this
+analysis the extension registration, and therefore `ProcSELinuxGetClientContext`, should be
+structurally unreachable.
+
+**Decisive experiment, resolving the contradiction**: rather than trust either the 39th pass's
+`addr2line` resolution or this pass's own source-reading over the other, ran the actual crash
+repro with the `SELinux` extension EXPLICITLY disabled at Xvfb's own command line
+(`-extension "SELinux"`, confirmed the correct protocol name via `#define SELINUX_EXTENSION_NAME
+"SELinux"` in `xselinux.h`), added to a copy of `.wfgy/de_only.sh` seeded as
+`.wfgy/de_only_noselinux_seed.tar`. Used `LITEBOX_PROCESS_FORK=1` (per the 35th pass, sidesteps the
+thread-based-fork tcache-corruption class entirely) to get a clean, ~2-minute, reliable repro path
+instead of fighting that unrelated flakiness. **Result, 2/2 runs**
+(`.wfgy/de_only_noselinux_1.log:4205`, `.wfgy/de_only_noselinux_2.log`): Xvfb still crashes with the
+SAME bit-identical `Segmentation fault at address 0x7feffecdd400`, comm=Xvfb, same shape as every
+prior capture. **An explicitly-disabled X extension cannot be the crash site.** The 39th pass's
+`addr2line -e .wfgy/xvfb.debug` resolution of the raw `[rsp+0]` stack word to
+`ProcSELinuxGetClientContext`/`xselinux_ext.c:305` was therefore a misattribution — plausible
+mechanism: the 39th pass reasoned this leaf AVX2 routine "pushes no extra stack" so `[rsp+0]` must
+be the true return address, but that reasoning doesn't account for whatever happened in the fatal-
+dump handler's own prologue between the fault and the read, or for stale/leftover stack content
+from a prior call at that same address never having been overwritten. **Lesson recorded**: a single
+raw-stack-word read is better evidence than a frame-pointer walk, but is NOT sufficient alone
+without cross-checking against an independent mechanism (a live debugger attach, or a second read
+from a genuinely different vantage point) — don't re-commit this same category of mistake next
+pass.
+
+**Independent bug found+FIXED while reading the `statfs` path for the above analysis**:
+`SyscallRequest::Statfs { pathname: _, buf } | SyscallRequest::Fstatfs { fd: _, buf }`
+(`litebox_shim_linux/src/lib.rs:2450`, pre-fix) discarded `pathname`/`fd` entirely and
+unconditionally wrote a canned tmpfs-shaped `struct statfs` success for ANY path (even one that
+doesn't exist) or ANY fd (even a closed/never-opened one). This is a real, independent correctness
+violation of this project's own "guest-reachable code returns a real errno" rule, unrelated to
+whether it explains the Xvfb crash (the magic-number analysis above shows it doesn't — `f_type`
+stays `TMPFS_MAGIC` either way). **Fix** (same file): `Statfs` now resolves the path and calls
+`self.sys_stat(path)?` before building the reply; `Fstatfs` calls `self.sys_fstat(fd)?` first; the
+canned-reply construction itself was factored into a new free function `write_tmpfs_statfs` to
+avoid duplicating the struct literal. Compiles clean (`cargo build -p
+litebox_runner_linux_on_windows_userland`, debug profile, only pre-existing unrelated dead-code
+warnings).
+
+**Regression check, A/B, live-verified**: stashed the fix, rebuilt, reran the ORIGINAL
+`.wfgy/de_only.sh` (no `LITEBOX_PROCESS_FORK`, matching the 39th pass's own shape) — hit the
+pre-existing thread-based-fork tcache-corruption class immediately (every forked `bash` subshell
+crashing with SIGSEGV/SIGABRT from ~13s in, `/tmp/.X11-unix/X1` never created, all X probes
+`rc=139`; `.wfgy/de_only_baseline_ab_1.log`). Popped the stash, rebuilt, reran the identical
+command (`.wfgy/de_only_statfsfix_1.log`) — **bit-identical failure, same line numbers, same
+signal sequence** — proves this pre-existing flakiness (a SECOND, already-documented corruption
+signature per AGENTS.md's own "still sporadically hits selkies" note) is a pure function of host
+RAM/timing this session, NOT caused by the `statfs` fix. The fix is safe to keep. Under
+`LITEBOX_PROCESS_FORK=1` (which sidesteps that whole class), the `statfs` fix in place, the Xvfb
+crash still reproduces bit-identically (`.wfgy/de_only_statfsfix_pfork_1.log:4181`) — confirming,
+as predicted by the magic-number analysis, that this fix alone does not touch the real bug.
+
+**Net state at end of 40th pass**: the Xvfb SIGSEGV is UNCHANGED and still the sole real blocker;
+the specific `ProcSELinuxGetClientContext` lead is closed for good (do not re-open without new
+evidence of a different kind — see the lesson above); a real, verified, unrelated `statfs`/
+`fstatfs` bug is fixed and committed. **Pickup, in order**: (1) a genuine live `cdb -pv` attach on
+Xvfb itself, under `LITEBOX_PROCESS_FORK=1` for a fast/clean repro path (`.wfgy/de_only_seed.tar`,
+~2 minutes to the crash, no `LITEBOX_DIAG_FATALDUMP` needed once a debugger has the process),
+breaking on `__memmove_avx_unaligned_erms` or catching the AV directly to read the REAL register
+state and call stack — not attempted by any pass to date, the single most promising next step; (2)
+failing that, real CFI-based unwinding against `.wfgy/xvfb.debug`'s DWARF `.eh_frame` (a naive
+raw-stack-word scan has now produced one CONFIRMED-WRONG lead in addition to the 32nd pass's
+"4 plausible-but-probably-stale candidates" — stop trusting it alone); (3) full webtop boot /
+browser-render verification remains blocked on (1)/(2) resolving first — not attempted this pass,
+correctly, since the actual blocker is unchanged.
