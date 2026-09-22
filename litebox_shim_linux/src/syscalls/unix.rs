@@ -318,6 +318,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     }
 }
 
+/// A non-blocking cross-process `connect()` that returned `EINPROGRESS`: the request stays
+/// posted in `global.unix_shared_connect_queue`, and this socket's own `poll`/`epoll_wait` path
+/// (via `UnixStream::check_io_events`) re-checks `poll_result(request_idx)` on every call --
+/// exactly the polling shape `wait_on_events_polling`'s bounded-repoll callers already use
+/// elsewhere in this codebase (`Backlog::check_io_events`'s own `has_pending` half of this same
+/// rendezvous) -- until the listener's `accept()` claims and completes it.
+///
+/// FIXES the bug `connect_cross_process`'s own `TryOpError::TryAgain` arm used to describe as a
+/// precisely-scoped, not-yet-fixed follow-up (`docs/AGENTS_ARCHIVE_2026-09-22.md`): that arm used
+/// to unconditionally `cancel()` the just-posted request on every non-blocking miss, so a caller
+/// that correctly polls for writability after `EINPROGRESS` (every real AF_UNIX client library,
+/// GLib/GIO's `GSocketClient` among them) could poll forever -- the request it was waiting on had
+/// already been withdrawn moments after being posted, so the listener's `accept()` could never
+/// claim it. Live-caught as the reason a real `xfce4-session` boot never reaches
+/// `_NET_SUPPORTING_WM_CHECK`: its own D-Bus connect (`self_pid` matches its own guest pid in a
+/// `LITEBOX_PROCESS_FORK=1` boot's `unix.rs` debug trace) hits exactly this arm and then never
+/// forks a single child process again -- consistent with GDBus/GIO's real connect-then-poll-for-
+/// writable design blocking forever on a connection this shim had already thrown away.
+struct UnixConnectingStream<Platform: ShimPlatform, FS: ShimFS> {
+    /// This client's own request index into `global.unix_shared_connect_queue`, from `post()`.
+    request_idx: usize,
+    /// The address this connect was aimed at -- becomes the completed stream's peer address,
+    /// exactly as `connect_cross_process`'s own synchronous-completion path already builds it.
+    peer_addr: UnixSocketAddr,
+    global: GlobalStateHandle<Platform, FS>,
+    /// Registered observers wait on this like any other not-yet-ready fd; nothing here ever
+    /// wakes them directly (no genuine cross-process wakeup exists -- see this module's own
+    /// "Shared cross-process AF_UNIX connection data plane" doc comment), so completion is only
+    /// ever discovered by a fresh `check_io_events` call, matching every other shared-queue
+    /// consumer in this file.
+    pollee: Pollee<Platform>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectingStream<Platform, FS> {
+    /// Non-blocking, non-consuming-on-miss: `Some(connected)` once the listener's `accept()` has
+    /// claimed and completed this request, `None` while still pending. Mirrors
+    /// `connect_cross_process`'s own synchronous-completion construction exactly (`is_client:
+    /// true`, `UnixSocketAddr::Unnamed` local address, `server_cred` read back from the slot the
+    /// listener allocated).
+    fn try_complete(&self) -> Option<UnixConnectedStream<Platform, FS>> {
+        let slot = self
+            .global
+            .unix_shared_connect_queue
+            .poll_result(self.request_idx)?;
+        Some(UnixConnectedStream::new_shared(
+            self.global.clone(),
+            slot,
+            true,
+            UnixSocketAddr::Unnamed,
+            self.peer_addr.clone(),
+            self.global.unix_shared_conn_table.get(slot).server_cred(),
+        ))
+    }
+}
+
 /// Connection backlog for a listening Unix socket.
 ///
 /// Manages the queue of pending connections and the maximum backlog limit.
@@ -1241,6 +1296,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
 enum UnixStreamState<Platform: ShimPlatform, FS: ShimFS> {
     Init(UnixInitStream<Platform, FS>),
     Listen(UnixListenStream<Platform, FS>),
+    /// A non-blocking cross-process `connect()` still awaiting the listener's `accept()`. See
+    /// [`UnixConnectingStream`]'s own doc comment for why this state exists.
+    Connecting(UnixConnectingStream<Platform, FS>),
     Connected(UnixConnectedStream<Platform, FS>),
 }
 
@@ -1313,6 +1371,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     // a different error code (e.g., EADDRINUSE).
                     Err(Errno::EINVAL)
                 }
+                UnixStreamState::Connecting(_) => Err(Errno::EISCONN),
                 UnixStreamState::Connected(_) => Err(Errno::EISCONN),
             }
         })
@@ -1336,6 +1395,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     listen.listen(backlog);
                     Ok(())
                 }
+                UnixStreamState::Connecting(_) => Err(Errno::EISCONN),
                 UnixStreamState::Connected(_) => Err(Errno::EISCONN),
             };
             (state, ret)
@@ -1371,6 +1431,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
             },
             UnixStreamState::Listen(s) => (UnixStreamState::Listen(s), Err(Errno::EINVAL)),
+            UnixStreamState::Connecting(s) => {
+                (UnixStreamState::Connecting(s), Err(Errno::EALREADY))
+            }
             UnixStreamState::Connected(s) => (UnixStreamState::Connected(s), Err(Errno::EISCONN)),
         })
         .map_err(|err| match err {
@@ -1385,6 +1448,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
         litebox_util_log::debug!(addr:? = addr; "TRACE unix_connect: entry");
+        // A repeated `connect()` on an fd already awaiting a posted cross-process request (real
+        // POSIX behaviour after a non-blocking `EINPROGRESS`: the caller either polls for
+        // writability -- handled entirely by `check_io_events` below, never here -- or calls
+        // `connect()` again, which must report `EALREADY` while still pending and complete the
+        // socket in place once the listener's `accept()` has claimed it, rather than starting a
+        // brand new request and abandoning this one).
+        let already_connecting = self.with_state(|state| match state {
+            UnixStreamState::Connecting(connecting) => {
+                if let Some(connected) = connecting.try_complete() {
+                    (UnixStreamState::Connected(connected), Some(Ok(())))
+                } else {
+                    (UnixStreamState::Connecting(connecting), Some(Err(Errno::EALREADY)))
+                }
+            }
+            other => (other, None),
+        });
+        if let Some(result) = already_connecting {
+            litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result (already connecting)");
+            return result;
+        }
         let backlog = match self.lookup(task, &addr) {
             Ok(b) => b,
             Err(Errno::ECONNREFUSED) => {
@@ -1514,27 +1597,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 // a failure -- POSIX connect(2) reserves EAGAIN for "no ephemeral port available"
                 // and uses EINPROGRESS for exactly this "come back later" case, which is also the
                 // one real AF_UNIX/TCP client libraries (libdbus among them) explicitly special-
-                // case to mean "poll for writability, don't treat this as an error". The blanket
-                // `TryOpError::TryAgain -> Errno::EAGAIN` conversion this used to fall through to
-                // (`litebox_common_linux::errno`) surfaced the wrong one here, and this whole
-                // branch used to ALSO cancel the just-posted queue request on every such call --
-                // i.e. every non-blocking connect attempt that did not complete synchronously
-                // within the same syscall was torn down immediately, so it could never complete
-                // later no matter how long the caller polled. Only the errno is fixed this pass
-                // (mirrors `litebox_shim_linux::syscalls::net::connect`'s existing, proven-correct
-                // override for the analogous TCP path); NOT cancelling and instead giving the
-                // caller a way to reattach to the same still-pending `request_idx` on a later
-                // `connect()`/poll needs its own state-machine change to `UnixStreamState::Init`
-                // and is left as a precisely-scoped follow-up (see AGENTS.md pickup list) rather
-                // than risked half-done in this pass.
+                // case to mean "poll for writability, don't treat this as an error".
+                //
+                // FIXED (this pass): this branch used to unconditionally `cancel()` the
+                // just-posted queue request right here -- i.e. every non-blocking connect attempt
+                // that did not complete synchronously within the same syscall was torn down
+                // immediately, so it could never complete later no matter how long the caller
+                // polled for writability, which is exactly what a correct non-blocking client is
+                // supposed to do after `EINPROGRESS`. Live-caught as the reason a real
+                // `xfce4-session` boot never reaches `_NET_SUPPORTING_WM_CHECK`: its own
+                // (GDBus/GIO-driven) D-Bus connect hits this exact arm and then never forks a
+                // single child process again, consistent with a connect-then-poll-for-writable
+                // client blocking forever on a request this shim had already thrown away.
+                //
+                // Fix: leave the request posted, and transition this socket to
+                // `UnixStreamState::Connecting` (see its own doc comment) so `check_io_events`
+                // and a later `connect()` on the same fd can both re-check
+                // `unix_shared_connect_queue.poll_result(request_idx)` until the listener's
+                // `accept()` claims and completes it.
                 litebox_util_log::debug!(
                     self_pid:% = self_pid,
                     request_idx:% = request_idx;
-                    "DIAG connect_cross_process: request not yet claimed (non-blocking), cancelling \
-                     and returning EINPROGRESS"
+                    "DIAG connect_cross_process: request not yet claimed (non-blocking), staying \
+                     posted and returning EINPROGRESS"
                 );
-                task.global.unix_shared_connect_queue.cancel(request_idx);
-                return Err(Errno::EINPROGRESS);
+                let connecting = UnixConnectingStream {
+                    request_idx,
+                    peer_addr: addr.clone(),
+                    global: task.global.clone(),
+                    pollee: Pollee::new(),
+                };
+                return self.with_state(|state| match state {
+                    UnixStreamState::Init(_) => {
+                        (UnixStreamState::Connecting(connecting), Err(Errno::EINPROGRESS))
+                    }
+                    // Lost a race with something else mutating this fd's state (e.g. a
+                    // concurrent `close()`/`shutdown()` reusing the slot) between the lookup at
+                    // the top of this function and here -- withdraw the request rather than leak
+                    // it on a state this socket will never revisit.
+                    other => {
+                        task.global.unix_shared_connect_queue.cancel(request_idx);
+                        (other, Err(Errno::EINPROGRESS))
+                    }
+                });
             }
             Err(e) => {
                 litebox_util_log::debug!(
@@ -1702,12 +1807,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 .as_ref()
                 .map_or(UnixSocketAddr::Unnamed, UnixSocketAddr::from),
             UnixStreamState::Listen(listen) => UnixSocketAddr::from(listen.get_local_addr()),
+            // Matches the `UnixSocketAddr::Unnamed` local address `connect_cross_process`
+            // actually constructs the eventual `Connected` stream with.
+            UnixStreamState::Connecting(_) => UnixSocketAddr::Unnamed,
             UnixStreamState::Connected(connect) => connect.get_local_addr(),
         })
     }
     fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
         self.with_state_ref(|state| match state {
-            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => None,
+            // Real Linux's `getpeername()` on a still-connecting socket returns `ENOTCONN`, not a
+            // stale/optimistic address -- `None` here maps to that at the syscall layer exactly
+            // like `Init`'s own `None` already does.
+            UnixStreamState::Init(_)
+            | UnixStreamState::Listen(_)
+            | UnixStreamState::Connecting(_) => None,
             UnixStreamState::Connected(connect) => Some(connect.get_peer_addr()),
         })
     }
@@ -1720,13 +1833,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(init) => init.pollee.register_observer(observer, mask),
             UnixStreamState::Listen(listen) => listen.register_observer(observer, mask),
+            UnixStreamState::Connecting(connecting) => {
+                connecting.pollee.register_observer(observer, mask);
+            }
             UnixStreamState::Connected(connect) => {
                 connect.pollee.register_observer(observer, mask);
             }
         });
     }
     fn check_io_events(&self) -> Events {
-        self.with_state_ref(|state| match state {
+        // Mutating (`with_state`, not `with_state_ref`): a `Connecting` socket whose request has
+        // just been claimed must transition to `Connected` HERE, in the same call that observes
+        // it -- `SharedUnixConnectQueue::poll_result` consumes the completion exactly once (see
+        // its own doc comment), so a read-only check that discarded a positive result would lose
+        // it forever, leaving the socket `Connecting` (and therefore permanently not-writable)
+        // even though the connection genuinely completed.
+        self.with_state(|state| match state {
             UnixStreamState::Init(init) => {
                 // Fresh Init reports OUT|HUP (HUP because not connected). After a
                 // shutdown(SHUT_RD) on an Init socket, Linux additionally reports IN
@@ -1736,22 +1858,51 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 if init.read_shutdown.load(Ordering::Acquire) {
                     events |= Events::IN;
                 }
-                events
+                (UnixStreamState::Init(init), events)
             }
-            UnixStreamState::Listen(listen) => listen.backlog.check_io_events(&listen.global),
-            UnixStreamState::Connected(conn) => conn.check_io_events(),
+            UnixStreamState::Listen(listen) => {
+                let events = listen.backlog.check_io_events(&listen.global);
+                (UnixStreamState::Listen(listen), events)
+            }
+            UnixStreamState::Connecting(connecting) => match connecting.try_complete() {
+                Some(connected) => {
+                    let events = connected.check_io_events();
+                    (UnixStreamState::Connected(connected), events)
+                }
+                // Still pending: not readable, not writable, not hung up -- a poller must keep
+                // waiting (or re-`epoll_wait`) rather than being told this fd is ready for
+                // anything yet.
+                None => (UnixStreamState::Connecting(connecting), Events::empty()),
+            },
+            UnixStreamState::Connected(conn) => {
+                let events = conn.check_io_events();
+                (UnixStreamState::Connected(conn), events)
+            }
         })
     }
 
     fn shutdown(&self, how: ShutdownHow) {
-        self.with_state_ref(|state| match state {
-            UnixStreamState::Init(init) => init.shutdown(how),
-            UnixStreamState::Listen(listen) => {
-                if how.is_shutdown_read() {
-                    listen.backlog.shutdown();
+        self.with_state(|state| {
+            match &state {
+                UnixStreamState::Init(init) => init.shutdown(how),
+                UnixStreamState::Listen(listen) => {
+                    if how.is_shutdown_read() {
+                        listen.backlog.shutdown();
+                    }
                 }
+                // A still-pending connect has no data-transfer state to shut down yet; withdraw
+                // the posted request (best-effort, matches the timeout path above) so a socket
+                // the guest is about to abandon doesn't leave its request occupying a shared
+                // queue slot until the listener eventually claims and orphans it.
+                UnixStreamState::Connecting(connecting) => {
+                    connecting
+                        .global
+                        .unix_shared_connect_queue
+                        .cancel(connecting.request_idx);
+                }
+                UnixStreamState::Connected(conn) => conn.shutdown(how),
             }
-            UnixStreamState::Connected(conn) => conn.shutdown(how),
+            (state, ())
         });
     }
 }
