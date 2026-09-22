@@ -155,11 +155,9 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   I/O LIVE-PROVEN** (36th: `syscalls::pty::SharedPtyTable`; 37th: `advisor/probes/pty_fork_probe.c`
   proved a separate Windows fork child opening `/dev/pts/<id>` fresh post-`fork()`). Mechanism:
   "Shared-memory foundations" below.
-- **44th-45th passes (2026-09-22)** — `xfce4-session` reached real pre-session setup for the first
-  time (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`), then hit a second Xvfb SIGSEGV (`0x4000400`,
-  same signature as the 43rd-pass-fixed crash) before `xfwm4`. 45th pass fixed two real host-process
-  bugs (`5d63ec6`, `32dd3d5`) chasing a separate host-process panic (`lib.rs:7396`, next bullet).
-  Full narrative: archive.
+- **44th-45th passes** — `xfce4-session` first reached real pre-session setup (`iceauth`/`ssh-agent`/
+  `gpg-agent`/`xfconfd`), then hit the second Xvfb SIGSEGV before `xfwm4` (fixed 51st, see above); en
+  route, 45th pass fixed two host-process bugs (`5d63ec6`, `32dd3d5`). Full narrative: archive.
 - **The `lib.rs:7396` host-process panic (`process_memory_range_by_regions`'s `assert!`) is FIXED —
   46th pass, `c5a8884`.** `Vmem::new_adopting_existing_memory` (`litebox/src/mm/linux.rs`) adopted
   `PROT_NONE` regions into a cross-process fork child's `vmas` even though `do_clone`'s own
@@ -209,13 +207,36 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   correctly via the existing `CLONE_FILES`-vs-`fork_duplicate` split `FilesState` already has).
   **Verified**: 10/10 clean `de_only.sh` boots (`LITEBOX_PROCESS_FORK=1`, `LITEBOX_DIAG_FATALDUMP=1`,
   debug build; 7 short + 3 reaching WM_POLL n=7/60s with zero truncation-related ambiguity), ZERO
-  recurrence of either Xvfb SIGSEGV signature (`0x7feffecdd400` or `0x37f0400`) — a background
-  6-more-run batch was killed mid-flight by the harness's own low-host-RAM safety reaper (not a
-  litebox issue; do not re-run unprompted per that reaper's own guidance). **NOT yet re-verified**:
-  a full `webtop_stack.sh` boot (nginx+selkies, heavier RAM) past this fix, and whether `DE_FAILED`
-  (a SEPARATE, already-narrowed-to-"inside xfce4-session's own process" issue, 30th/38th passes)
-  now resolves on its own or needs its own still-never-attempted live `cdb -pv` attach on
-  `xfce4-session` itself (43rd-pass pickup item 1, still open, not touched this pass either).
+  recurrence of either Xvfb SIGSEGV signature (`0x7feffecdd400` or `0x37f0400`).
+- **52nd pass (2026-09-22) — full `webtop_stack.sh` boot re-verified past the 51st-pass fix: BOTH
+  Xvfb SIGSEGVs confirmed gone on the full stack too** (`.wfgy/webtop_release_boot6.log`, release
+  binary, `LITEBOX_PROCESS_FORK=1`, `--publish 8081:8081`, `stderr_capture=debug` for real guest
+  stderr) — zero `sigsegv`/`panic`/`segmentation` matches in the whole boot. `DE_FAILED` still fires,
+  but **the 30th-49th passes' "Cannot open display" framing is REFUTED for this run — that string
+  appears nowhere**; `xdpyinfo` succeeds (`rc=0`) right before each WM launch attempt and
+  `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` are confirmed correctly set. Fresh evidence instead, read via
+  the guest-stderr channel (no `cdb` needed): (a) `xfce4-session` (pid 6948) runs deep into startup
+  (`iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`, later `xfsettingsd`/`xfdesktop`/`Thunar` all really
+  `execve`) but floods `GLib-GIO-CRITICAL: g_dbus_proxy_call_sync_internal`/`g_dbus_error_is_remote_
+  error: assertion 'error != NULL' failed` around its D-Bus autostart-lookup calls; (b) **`xfwm4`
+  itself never appears ANYWHERE in the log** — zero mentions, not even a failed-exec trace — while
+  later autostart entries (`xfsettingsd`/`xfdesktop`/`Thunar`) DO launch: the single most concrete
+  lead for the next pass, plausibly downstream of (a)'s broken D-Bus round-trips if `xfce4-session`
+  queries D-Bus for the WM command before launching it; (c) a new, separate bug: `gpg-agent` (pid
+  119) hit a fatal glibc heap-corruption assertion (`malloc.c:3846 (__libc_calloc): assertion '!mem
+  || ...' failed`, SIGABRT) ~1.2s into `startwm.sh` — real heap corruption reachable even under
+  `LITEBOX_PROCESS_FORK=1`, not yet root-caused; (d) the always-on `vmem-adopt-probe` diagnostic
+  showed every fork child with a startlingly high `VM_SHARED` region count (up to 84/117, even for
+  the plain top-level shell) — a `VM_SHARED` region gets zero real backing in a fork child by design
+  (45th pass), so if this is inflated by a bug rather than genuine guest `MAP_SHARED` use, every
+  fork generation's memory bookkeeping degrades further than intended, a plausible contributor to
+  (c); worth its own pass. Fixed in passing (`39a878b`): the probe's own comparison filter was stale
+  (only excluded `VM_SHARED`, never updated for the 46th pass's `PROT_NONE` exclusion), so it
+  misreported "MISMATCH" on nearly every fork regardless of real correctness — now matches what
+  `Vmem::new_adopting_existing_memory` actually does. Host RAM fell to ~2.3GB free by `HOLD` (37 live
+  `litebox_runner` processes) — killed via `Invoke-CimMethod -MethodName Terminate`, recovered to
+  ~9GB in seconds. No browser/app verification reached (`DE_FAILED` still blocks it). Full evidence:
+  this commit's message + `.wfgy/webtop_release_boot6.log` (gitignored, on disk).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -229,15 +250,21 @@ fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_s
 
 **Open, in rough priority order:**
 
-1. **The SECOND Xvfb SIGSEGV (`0x37f0400`) is FIXED — 51st pass, see "Cross-process fork" above.**
-   10/10 clean `de_only.sh` verification, not yet re-verified on a full `webtop_stack.sh` boot.
-   `DE_FAILED` (`xfce4-session`'s own "Cannot open display", narrowed to inside its own process
-   since the 30th/38th passes, DISPLAY/envp/loader-stack all independently proven correct) is now
-   the priority: confirm whether it was purely downstream of this crash all along (in which case a
-   fresh boot may already reach a real WM) or is a genuinely separate defect still needing the
-   never-yet-attempted live `cdb -pv` attach on `xfce4-session` itself (43rd-pass pickup, still
-   open). Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th passes)
-   recheck depends on reaching a real WM first.
+1. **Both Xvfb SIGSEGVs are FIXED and CONFIRMED on the full stack — 51st/52nd passes.** `DE_FAILED`
+   is STILL OPEN but the pre-51st-pass "Cannot open display" framing is REFUTED for the 52nd pass's
+   own run (see that bullet above) — do not re-assume it without fresh evidence. Concrete next steps,
+   in order: (i) `xfwm4` never appears in the log at all — trace why `xfce4-session` never launches
+   it (a live `cdb -pv` attach on `xfce4-session`, breaking on its WM-spawn/`g_spawn_*` call sites,
+   is now finally uncontaminated by the Xvfb crash and worth attempting fresh; the always-on
+   `litebox_diag::stderr_capture=debug` channel is a cheaper first move and hasn't been fully mined
+   yet — only ~95 fragments for pid 6948 were reconstructed this pass); (ii) root-cause the
+   `GLib-GIO-CRITICAL`/D-Bus-proxy-assertion flood — likely upstream of (i); (iii) root-cause
+   `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (real heap corruption under
+   `LITEBOX_PROCESS_FORK=1`, previously assumed impossible on this path); (iv) the high `VM_SHARED`
+   fork-child region count (up to 84/117, even for a plain shell) — confirm whether it's a genuine
+   guest-level `MAP_SHARED` accumulation or a bug silently shrinking what a fork child actually
+   inherits. Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th
+   passes) recheck depends on reaching a real WM first.
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
    (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
    capacity-256 overflow is silently discarded (`unix.rs:275-277`); a key >108 bytes silently bails;
@@ -292,11 +319,12 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 §3N's safe-linked-tcache write. Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
-the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are now fixed (43rd/51st
-passes); the current sole blocker to an interactive desktop is `DE_FAILED` itself (`xfce4-session`'s
-own "Cannot open display", see Track B item 1 above) — not yet re-checked post-51st-pass on a full
-`webtop_stack.sh` boot. Selkies also needs `--clipboard-enabled=false` on the thread-based path
-(its clipboard monitor re-triggers the same corruption every tick) — moot cross-process.
+the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are fixed and CONFIRMED on a
+full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes) — the sole remaining blocker is
+`DE_FAILED`, now narrowed to `xfwm4` never launching at all (NOT "Cannot open display" — that framing
+was refuted this pass; see Track B item 1). Selkies also needs `--clipboard-enabled=false` on the
+thread-based path (its clipboard monitor re-triggers the same corruption every tick) — moot
+cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A SECOND, distinct
 glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) still sporadically
