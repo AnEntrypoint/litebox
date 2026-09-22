@@ -986,3 +986,76 @@ observation above -- reproduce once RAM is holding above ~2GB throughout, to tel
 --publish gap from the already-documented transient dip; (3) once DE_FAILED is closed, real
 browser/app verification (Terminal Emulator, Thunar per SharedPtyTable) becomes reachable for the
 first time in this investigation's history.
+
+## 44th pass full detail (drained from AGENTS.md by the 45th pass's own compaction)
+
+- **44th pass (2026-09-22) — two real bugs FIXED+verified; `DE_FAILED`'s previously-understood
+  cause is closed, but a SECOND, deeper blocker (a related/same-class Xvfb crash) was newly exposed
+  and is now open.** (1) `try_cross_process_fork`'s fd-eligibility scan (`process.rs:2646-2666`)
+  hard-cut at `raw >= 3`, so a redirected 0/1/2 (`cmd 2>&1 | sed &`'s SECOND fork, or ANY
+  `$(external-cmd)` two-fork comsub) silently lost its real pipe and got a fresh, wrong
+  `CreateProcessW`-inherited stdio handle instead — root cause of "guest diagnostics must travel by
+  pipe" (38th-39th passes) NEVER actually being fixed by switching to `$( )`/pipes, since the SAME
+  gap ate the redirected fd at the fork boundary regardless. Fixed: fds 0/1/2 are now scanned like
+  any other fd unless `raw_fd_is_plain_stdio_device` (new, `file.rs`, keyed on `StdioStream`
+  metadata surviving a `dup2`) says they're still the untouched device node. Live-verified: a full
+  `webtop_stack.sh` release-binary boot (`.wfgy/webtop_pass44_boot1.log`) now shows genuinely
+  non-empty `WM1_PROBE`/`WM2_PROBE`/`PRE_DE_XDPYINFO` content (`_NET_SUPPORTING_WM_CHECK: not
+  found.`, real `xdpyinfo` output) for the first time ever — every prior pass's `$( )` captures of
+  these were silently empty regardless of the real answer. (2) `connect_cross_process`'s
+  non-blocking-miss arm (`unix.rs`, ~1594) unconditionally `cancel()`led the just-posted
+  `SharedUnixConnectQueue` request before returning `EINPROGRESS` — so ANY correct non-blocking
+  AF_UNIX client (poll for writable, don't retry `connect()`) could poll forever on a request this
+  shim had already withdrawn. Live-caught as the loop `xfce4-session` sits in forever: a debug trace
+  (`litebox_shim_linux::syscalls::unix=debug`) shows `self_pid` matching xfce4-session's own guest
+  pid hit exactly this arm, and `tid=27`/`tid=21572` (its own guest tid across two runs) NEVER calls
+  `clone()`/`fork()` again afterward -- zero session-client children, not even `xfwm4`. Fixed: new
+  `UnixStreamState::Connecting(UnixConnectingStream)` keeps the request alive; `check_io_events`
+  (now mutating, `with_state` not `with_state_ref`) re-checks `poll_result` on every poll/epoll tick
+  and completes the connection in place; a repeated `connect()` on the same fd also re-checks
+  (`EALREADY` while pending, completes if ready) rather than re-posting. Live-verified via
+  `.wfgy/de_only_pass44_run2.log`: `xfce4-session` now genuinely progresses for the first time ever
+  past its D-Bus setup -- `iceauth`, `ssh-agent`, `gpg-agent`, `xfconfd`,
+  `dbus-update-activation-environment` all `execve` for the first time in this whole investigation's
+  history (none appear in ANY prior pass's log). **`DE_FAILED` is STILL OPEN**: before `xfwm4` is
+  ever reached, Xvfb SIGSEGVs again -- `.wfgy/de_only_pass44_run2.log:46383-46392`, fault address
+  `0x4000400` (NOT the 43rd pass's `0x7feffecdd400`), but backtrace frame0's offset is
+  BIT-IDENTICAL (`0x1b20ed`, still inside `.eh_frame_hdr`, still the same broken-unwind signature)
+  -- strong evidence this is the SAME underlying wild-pointer-read defect the 32nd-43rd passes
+  chased, just reached via a trigger condition the 43rd pass's crowded-top-down-packing fix (step
+  1.5) does not cover -- plausibly because `xfce4-session`'s now-much-deeper startup (five more
+  real binaries `dlopen`-ing their own library trees) produces a differently-crowded top-down
+  window than the fix's own validated repro did. Also real but likely NOT fatal on its own (GLib
+  `CRITICAL` doesn't `abort()` by default): `xfce4-session`'s real stderr, readable for the first
+  time via the now-working pipe fix, shows `libxfce4util-WARNING: Failed to get a ConsoleKit proxy:
+  Could not connect: Connection refused` (expected -- no system bus is started, matching real-world
+  bare-Docker XFCE reports) immediately followed by a burst of `GLib-GObject-CRITICAL: invalid
+  (NULL) pointer instance` / `g_signal_connect_data` / `g_dbus_proxy_call_sync_internal` assertion
+  failures -- xfce4-session's own ConsoleKit-absent code path not null-checking before use; almost
+  certainly cosmetic noise real XFCE-in-Docker deployments already tolerate, not chased further that
+  pass.
+
+## 45th pass full evidence (log paths, live commands)
+
+Pre-fix baseline: `.wfgy/de_only_pass44_run1.log` (clean, 0 host-panics, 0 Xvfb SIGSEGV),
+`.wfgy/de_only_pass44_run2.log` (6 host-panics at `lib.rs:7396` between lines 35886-45659, PLUS a
+genuine Xvfb SIGSEGV at line ~46383, fault address `0x4000400`, backtrace `Xvfb (?+0x0)
+[0x4101b20ed]`). Post-fix (both fixes, `5d63ec6`+`32dd3d5`): `.wfgy/de_only_pass45_run1.log` (0
+host-panics), `.wfgy/de_only_pass45_run2.log` (3 host-panics, same address), `.wfgy/
+de_only_pass45b_run1.log` (5 host-panics, same address, one during `ssh-agent`'s own exit at line
+41331) -- zero Xvfb SIGSEGV in any of the three post-fix runs, but sample size (3) is too small to
+claim that class is fixed, especially since the host-panic bug still firing on every post-fix run
+changes downstream process timing/ordering (a possible confound for a crash this project has
+previously shown to be timing-sensitive). Repro command (isolation harness, ~100-500s per run,
+much cheaper than the full `webtop_stack.sh`):
+
+```
+$env:LITEBOX_PROCESS_FORK = "1"
+& .\target\release\litebox_runner_linux_on_windows_userland.exe --env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0 --oci-image docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/de_only_seed.tar -- /bin/bash /de_only.sh *> out.log
+```
+
+A `LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP=1`/`LITEBOX_DIAG_MM=1` follow-up run to compare
+`0x7fef60030000` against real `copy_one_group` reservation-group boundaries failed to launch this
+pass (`.wfgy/de_only_pass45c_diag.log`, PowerShell `NativeCommandError`, "another ... release the
+lock" -- a leftover `litebox_runner` process was still holding a file lock; host RAM had fallen to
+~3-4.5GB free by then). Not re-attempted this pass.

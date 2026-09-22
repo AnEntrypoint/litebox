@@ -188,56 +188,50 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   the parent wrote post-`fork()`; fixed two real bugs: a fork-eligibility scan refusing the whole
   fork over any open pty fd, and `PtyStateRef::Local` setters never mirroring lock/termios state
   into the shared slot). Mechanism: "Shared-memory foundations" below.
-- **44th pass (2026-09-22) — two real bugs FIXED+verified; `DE_FAILED`'s previously-understood
-  cause is closed, but a SECOND, deeper blocker (a related/same-class Xvfb crash) was newly exposed
-  and is now open.** (1) `try_cross_process_fork`'s fd-eligibility scan (`process.rs:2646-2666`)
-  hard-cut at `raw >= 3`, so a redirected 0/1/2 (`cmd 2>&1 | sed &`'s SECOND fork, or ANY
-  `$(external-cmd)` two-fork comsub) silently lost its real pipe and got a fresh, wrong
-  `CreateProcessW`-inherited stdio handle instead — root cause of "guest diagnostics must travel by
-  pipe" (38th-39th passes) NEVER actually being fixed by switching to `$( )`/pipes, since the SAME
-  gap ate the redirected fd at the fork boundary regardless. Fixed: fds 0/1/2 are now scanned like
-  any other fd unless `raw_fd_is_plain_stdio_device` (new, `file.rs`, keyed on `StdioStream`
-  metadata surviving a `dup2`) says they're still the untouched device node. Live-verified: a full
-  `webtop_stack.sh` release-binary boot (`.wfgy/webtop_pass44_boot1.log`) now shows genuinely
-  non-empty `WM1_PROBE`/`WM2_PROBE`/`PRE_DE_XDPYINFO` content (`_NET_SUPPORTING_WM_CHECK: not
-  found.`, real `xdpyinfo` output) for the first time ever — every prior pass's `$( )` captures of
-  these were silently empty regardless of the real answer. (2) `connect_cross_process`'s
-  non-blocking-miss arm (`unix.rs`, ~1594) unconditionally `cancel()`led the just-posted
-  `SharedUnixConnectQueue` request before returning `EINPROGRESS` — so ANY correct non-blocking
-  AF_UNIX client (poll for writable, don't retry `connect()`) could poll forever on a request this
-  shim had already withdrawn. Live-caught as the loop `xfce4-session` sits in forever: a debug trace
-  (`litebox_shim_linux::syscalls::unix=debug`) shows `self_pid` matching xfce4-session's own guest
-  pid hit exactly this arm, and `tid=27`/`tid=21572` (its own guest tid across two runs) NEVER calls
-  `clone()`/`fork()` again afterward -- zero session-client children, not even `xfwm4`. Fixed: new
-  `UnixStreamState::Connecting(UnixConnectingStream)` keeps the request alive; `check_io_events`
-  (now mutating, `with_state` not `with_state_ref`) re-checks `poll_result` on every poll/epoll tick
-  and completes the connection in place; a repeated `connect()` on the same fd also re-checks
-  (`EALREADY` while pending, completes if ready) rather than re-posting. Live-verified via
-  `.wfgy/de_only_pass44_run2.log`: `xfce4-session` now genuinely progresses for the first time ever
-  past its D-Bus setup -- `iceauth`, `ssh-agent`, `gpg-agent`, `xfconfd`,
-  `dbus-update-activation-environment` all `execve` for the first time in this whole investigation's
-  history (none appear in ANY prior pass's log). **`DE_FAILED` is STILL OPEN**: before `xfwm4` is
-  ever reached, Xvfb SIGSEGVs again -- `.wfgy/de_only_pass44_run2.log:46383-46392`, fault address
-  `0x4000400` (NOT the 43rd pass's `0x7feffecdd400`), but backtrace frame0's offset is
-  BIT-IDENTICAL (`0x1b20ed`, still inside `.eh_frame_hdr`, still the same broken-unwind signature)
-  -- strong evidence this is the SAME underlying wild-pointer-read defect the 32nd-43rd passes
-  chased, just reached via a trigger condition the 43rd pass's crowded-top-down-packing fix (step
-  1.5) does not cover -- plausibly because `xfce4-session`'s now-much-deeper startup (five more
-  real binaries `dlopen`-ing their own library trees) produces a differently-crowded top-down
-  window than the fix's own validated repro did. Also real but likely NOT fatal on its own (GLib
-  `CRITICAL` doesn't `abort()` by default): `xfce4-session`'s real stderr, readable for the first
-  time via the now-working pipe fix, shows `libxfce4util-WARNING: Failed to get a ConsoleKit proxy:
-  Could not connect: Connection refused` (expected -- no system bus is started, matching real-world
-  bare-Docker XFCE reports) immediately followed by a burst of `GLib-GObject-CRITICAL: invalid
-  (NULL) pointer instance` / `g_signal_connect_data` / `g_dbus_proxy_call_sync_internal` assertion
-  failures -- xfce4-session's own ConsoleKit-absent code path not null-checking before use; almost
-  certainly cosmetic noise real XFCE-in-Docker deployments already tolerate, not chased further this
-  pass. **Pickup, in order**: (1) root-cause the NEW Xvfb fault (same class as the fixed one, same
-  broken backtrace -- needs the 32nd pass's own non-debugger methodology: `LITEBOX_DIAG_FATALDUMP=1`
-  captures plus pointer-provenance analysis against the crowded top-down window `xfce4-session`'s
-  now-much-larger dlopen set produces); (2) once Xvfb survives past `xfce4-session`'s pre-session
-  setup, re-verify `_NET_SUPPORTING_WM_CHECK` is reached for real; (3) only then is real
-  browser/app verification reachable -- NOT attempted this pass (DE_FAILED still fires).
+- **44th pass (2026-09-22) — two real bugs FIXED+verified (fd 0/1/2 dropped at the cross-process
+  fork boundary; a premature AF_UNIX connect-request cancellation that stalled `xfce4-session`
+  forever on its own D-Bus connect).** With both fixed, `xfce4-session` genuinely progresses for
+  the first time ever -- `iceauth`/`ssh-agent`/`gpg-agent`/`xfconfd`/
+  `dbus-update-activation-environment` all `execve` (none appear in any prior pass's log). Before
+  `xfwm4` is reached, Xvfb SIGSEGVs again at fault address `0x4000400` (backtrace frame0 offset
+  `0x1b20ed`, bit-identical to the 43rd-pass-fixed crash's own signature) --
+  `.wfgy/de_only_pass44_run2.log:46383-46392`. Full detail, exact fix diffs, GLib-CRITICAL noise
+  analysis: archive.
+- **45th pass (2026-09-22) — TWO real host-process bugs found+fixed (`5d63ec6`, `32dd3d5`); the
+  Xvfb `0x4000400` SIGSEGV was NOT reproduced across 2 post-fix boots (was present in 1 of 2
+  pre-fix boots), suggestive but NOT proven fixed; a separate, still-OPEN third host-process-panic
+  mechanism now blocks full confidence either way.** Root-caused and fixed a DIFFERENT,
+  previously-undiagnosed bug hit in the SAME 44th-pass logs: a HOST-process Rust panic
+  (`litebox_platform_windows_userland/src/lib.rs:7396`, `process_memory_range_by_regions`'s own
+  `assert!`) firing inside short-lived cross-process-fork children (`ssh-agent`, `xprop`, etc.) at
+  the bit-identical region `0x7fef60030000-0x7fef64000000`, Windows reporting `MEM_FREE`. (1)
+  `allocate_pages`'s collision checks never accounted for the shared kernel heap's `SEC_RESERVE`
+  fallback view -- fixed, but tested+REFUTED as the cause of this specific address (every process
+  in the crashing fork tree lands its shared kernel heap at the FIXED base, not the fallback); kept
+  as a real, independent fix. (2) `Vmem::new_adopting_existing_memory` adopted a `VM_SHARED` region
+  into a cross-process fork child's `vmas` with `shared_handle: None`, which
+  `Vmem::remove_mapping`'s `shared_overlaps` check (keyed on `VmArea::view_extent()`, `None`
+  whenever `shared_handle` is `None`) then misclassified as ordinary PRIVATE memory, routing a
+  later guest `munmap`/`mprotect` straight into `deallocate_pages`/`update_permissions`'s real
+  Windows calls against an address this child never actually committed real memory at
+  (`copy_one_group`/`group_relocations` never recreates `VM_SHARED` backing for a Windows
+  cross-process-fork child at all). Fixed by skipping `VM_SHARED` regions at adoption entirely --
+  real cross-process content sharing for them remains unimplemented. **After BOTH fixes, the
+  bit-identical `lib.rs:7396` panic on the SAME address STILL recurred** (during `ssh-agent`'s own
+  exit) -- a THIRD, still-unidentified mechanism also produces it; a follow-up diagnostic boot
+  (`LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP=1`/`LITEBOX_DIAG_MM=1`, to compare
+  `0x7fef60030000` against real `copy_one_group` reservation-group boundaries) failed to even
+  launch this pass (Windows file-lock contention against a leftover process, host RAM down to
+  ~3-4.5GB free) and was not re-attempted. **DE_FAILED was reached in every run this pass (4/4); no
+  run reached a working window manager; no browser/app verification was possible.** Full evidence,
+  log line numbers, exact repro commands: archive. Pickup, in order: (1) re-run the diagnostic boot
+  once RAM is quiet to find whether `0x7fef60030000` falls inside any printed reservation-group
+  range (if not: a second, more general `group_relocations()`/`vma_layout()` coverage gap, same
+  shape as the `VM_SHARED` one but not limited to shared regions); (2) once that panic is fully
+  closed, re-verify from scratch whether the Xvfb `0x4000400` SIGSEGV is actually gone (2 clean
+  runs is not enough given this crash class's own documented high determinism -- do not declare it
+  fixed on this evidence alone); (3) only then does real browser/app verification become
+  meaningful.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
