@@ -8,7 +8,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-22,
-50th pass (trimmed stale Track B items for the finding below).
+51st pass (trimmed the 49th-pass narrative to make room for the finding below).
 
 ## The cheap repro — start here
 
@@ -136,7 +136,8 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   step 1.5, was finally live-tested and closes it). Same-session A/B, control crashes at the
   bit-identical wild pointer `0x7feffecdd400` every time, fix shows zero SIGSEGV. Do NOT reopen
   DISPLAY/`getenv()`/loader-stack (proven correct, 30th pass) for THIS crash. A SECOND, later Xvfb
-  crash (same signature, different trigger) remains open — see the 46th-pass entry below, current.
+  crash (same signature, different trigger, a SysV-shm cross-process-attach bug) is ALSO now fixed
+  — 51st pass, below.
 - **Xvfb's crash backtrace was corrupted PROJECT-WIDE, ROOT-CAUSED (38th) and FIXED (39th,
   `7d66935`)**: `litebox_syscall_rewriter` overwrote the 9 bytes libunwind's x86_64 signal-frame
   detection matches at `__restore_rt`. Fixed via a litebox-synthesized trampoline holding the real
@@ -170,57 +171,51 @@ nginx's own SSL-cert generation fails on its first startup attempt, genuinely no
   `is_diagnostic_resume_child()` branch and NEVER reaches `run()` — a runtime toggle wired only at
   the top of `run()` silently never takes effect in any fork descendant.
 - **The `buddy_system_allocator` free-list corruption panic ("len is 34, index is 53") is FIXED —
-  49th pass, 2026-09-22, `8b64698`, root cause NOT suspend-timing (hypothesis a) or a genuine SMP
-  race (hypothesis b) but a THIRD mechanism: `Network`/`Pipes::rebind_per_process_fields`
-  (`litebox/src/net/mod.rs`, `litebox/src/pipes.rs`) plain-assigning their `litebox` field.** Both
-  structs live in the cross-process-shared kernel arena; a plain `self.litebox = litebox.clone()`
-  drops the OLD value in place, but that old value is always some OTHER process's private-heap
-  `Arc<LiteBoxX>` pointer frozen into shared bytes — `Arc::drop` on it reads a bogus refcount and,
-  looking like the last reference, frees the (unrelated, still-live-elsewhere) FD-table `Vec`
-  through THIS process's real allocator with a Layout reconstructed from garbage, corrupting
-  `Heap::free_list` instead of cleanly faulting. `RUST_BACKTRACE=full` on 3/3 independent
-  occurrences showed the bit-identical chain every time: `net_worker (fork child)`'s first
-  `perform_network_interaction()` → `rebind_per_process_fields` → `Arc::drop_slow` →
-  `Descriptors`' `Vec::drop` → corrupted-`Layout` `dealloc` → panic. Fix: `mem::forget` the stale
-  value instead of dropping it, mirroring `reset_after_poisoning`'s own established pattern a few
-  lines below (which fixed the identical hazard for `SocketSet::remove`). Hypothesis (a) was
-  live-refuted first, cheaply: a new always-on diagnostic in `ThreadHandle::interrupt` (`lib.rs`)
-  fires if a redirect is ever attempted while `rip` is inside the global allocator — zero
-  occurrences across every run, including 4 independent panics in one run, proving the redirect
-  mechanism was never involved. **Verified 7/7 clean `de_only.sh` boots** (`LITEBOX_PROCESS_FORK=1`,
-  `LITEBOX_DIAG_FATALDUMP=1`, debug build) with zero recurrence, vs. 100% reproduction (every fork
-  child, ~3-4s in) before the fix. The separate, pre-existing second Xvfb SIGSEGV (`0x37f0400`,
-  next bullet) is untouched by this fix and still occurs in most of these same runs.
-- **50th pass (2026-09-22) — the second Xvfb SIGSEGV's full register state is BIT-IDENTICAL across
-  independent boots (not just `rip`) except for ASLR-dependent module bases, and `DE_FAILED` is
-  RECONFIRMED purely downstream of Xvfb dying — the 49th-pass addendum's "zero-SIGSEGV,
-  DE_FAILED-anyway" boot was mis-read (below).** `rip=0x7fefedeababd` (glibc
-  `__memmove_avx_unaligned_erms`'s between-32-64-byte path, confirmed by the disassembled bytes:
-  `cmp rdx,0x40; ja …; vmovdqu ymm0,[rsi]`), `rdx=0x40`, `rsp=0x7fefffeed658`, `rbp=1`, `rcx=3`,
-  `r8..r15` all bit-identical across `.wfgy/verify49_fix_run{1,6}.log` (different boots, different
-  ASLR bases). `rdi` (dest, a valid tracked heap chunk) has a module-relative OFFSET that's also
-  bit-identical (`0x156e8d8`) — only its base moves with ASLR. `rsi` (src, the fault address
-  `0x37f0400`) is the odd one: it does NOT move with ASLR at all, unlike `rdi` — ruling out
-  "ordinary corrupted heap/module pointer", pointing instead at a NULL-plus-fixed-offset bug or a
-  fixed (non-ASLR'd) address litebox itself hands the guest. Raw-stack-scan candidates
-  (`DIAG-STACKWALK` vs `.wfgy/xvfb.debug`, build-id `6440f00c8057…` matches) resolve to real
-  functions — `ProcSELinuxGetClientContext`/`SELinuxReceive` (Xext/xselinux_{ext,hooks}.c),
-  `ConstructClientResourceBytes` (Xext/xres.c) — via `dixLookupPrivate`'s devPrivates-array
-  indexing, but NOT proven as the true caller (`0x1b20ed`, Xvfb's own backtrace frame, falls
-  inside `.eh_frame_hdr`, the already-documented broken-unwind signature; leads, not a confirmed
-  chain). No fix attempted — insufficient certainty
-  for this project's "verify before fixing" rule; upstream Xorg source (fetched) has no memcpy in
-  either function, consistent with deeper, non-adjacent real frames. **`DE_FAILED` correlation,
-  re-checked from raw logs, not just a "Segmentation fault"-string grep**: `.wfgy/
-  webtop_pass49_boot1.log` (the addendum's own "zero SIGSEGV" boot) DOES show `fatal signal:
-  terminating task signal=Signal(6) … comm=[88,118,102,98…]` (decodes to `Xvfb`) at t=76.0s, ~40s
-  before `WM1_PROBE`/`DE_FAILED` — Xvfb dies via bare SIGABRT with no "(EE) Segmentation fault"
-  text printed (lost mid-abort, or a second abort path), not a crash-free run. Every sampled boot
-  this pass (6 `de_only.sh` + this 1 full-stack) shows Xvfb dying via a fatal signal before the WM
-  connects — `DE_FAILED` is the same downstream symptom every time, not an independent third bug.
-  **Pickup**: a conditional `cdb` breakpoint on `rip==0x7fefedeababd && rsi==0x37f0400` (now known
-  to the exact register, not just "some crash sometime") should be cheaper than the ORIGINAL
-  crash's refuted live-cdb attempts, whose problem was timing, not register state.
+  49th pass, `8b64698`.** `Network`/`Pipes::rebind_per_process_fields` (`litebox/src/net/mod.rs`,
+  `litebox/src/pipes.rs`) plain-assigned their shared-arena `litebox` field, dropping the OLD value
+  in place — always some OTHER process's private-heap `Arc<LiteBoxX>` pointer frozen into shared
+  bytes, so `Arc::drop` read a bogus refcount and freed an unrelated, still-live FD-table `Vec`
+  through THIS process's allocator with a garbage `Layout`, corrupting `Heap::free_list`. Fix:
+  `mem::forget` the stale value, mirroring `reset_after_poisoning`'s established pattern for the
+  identical hazard on `SocketSet::remove`. **Verified 7/7 clean `de_only.sh` boots**, zero
+  recurrence vs. 100% reproduction pre-fix. Full mechanism/backtrace: archive.
+- **50th pass** — the second Xvfb SIGSEGV's full register state proven bit-identical across
+  independent boots: `rip=0x7fefedeababd` (glibc `__memmove_avx_unaligned_erms`'s 32-64-byte AVX2
+  path), `rdx=0x40`. `rdi` (dest) is a real per-process heap chunk (offset fixed, base moves with
+  ASLR, as expected); `rsi` (src, fault address `0x37f0400`) does NOT move with ASLR at all — the
+  key clue the 51st pass root-caused (next bullet). Live `cdb` was NOT re-attempted this pass
+  (skipped, not merely deferred: the 41st-42nd passes already proved sustained `cdb`
+  AV-interception fully suppresses this whole crash *family* — same dispatch point, adjacent `rip`
+  — regardless of how cheap each breakpoint handler is, and static+`LITEBOX_DIAG_FATALDUMP=1`
+  evidence alone was sufficient to root-cause without paying that cost).
+- **51st pass (2026-09-22) — SysV shm cross-process-attach bug ROOT-CAUSED and FIXED, no `cdb`
+  needed.** `sys_shmat` (`litebox_shim_linux/src/syscalls/mm.rs`) handed back a bare `SysvShmSegment.addr`
+  — a real mapping ONLY in the CREATING process — to every attacher; under
+  `LITEBOX_PROCESS_FORK=1`, a genuinely different real Windows process (e.g. Xvfb attaching a
+  segment an X11 MIT-SHM CLIENT created, never fork-related to Xvfb) got that numeric value with
+  ZERO backing memory of its own, exactly matching `rsi`'s "fixed, non-ASLR'd" signature (a value
+  copied verbatim out of the shared `GlobalState` table, not derived from this process's own mmap
+  placement) and `LITEBOX_DIAG_FATALDUMP=1`'s own `[veh] fault addr=0x37f0400 protect=0x0` (reserved,
+  never committed, in THIS process). Old design assumed the pre-cross-process-fork "one shared host
+  address space" model, stale since `LITEBOX_PROCESS_FORK=1` existed. **Fix**: `shmget` no longer
+  maps anything (matches real Linux); every `shmat`, including the creator's own first one, opens a
+  NAMED platform shared-memory object (`create_named_shared_memory`, new `PageManagementProvider`
+  method, Windows impl = `CreateFileMappingW(name="Local\litebox_sysvshm_<shmid>")`, idempotent
+  create-or-open exactly like `xproc_sync::CrossProcessEvent`'s existing named-kernel-object
+  pattern) and maps it into ITS OWN address space via the existing `map_existing_shared_pages`
+  primitive (same one `syscalls::file`'s memfd/`wl_shm` bridging already uses) — the returned
+  address is per-process, matching real Linux `shmat` (never cross-process-identical there either).
+  `shmdt`'s reverse lookup moved to a new per-process `FilesState::shm_attachments` table (shares
+  correctly via the existing `CLONE_FILES`-vs-`fork_duplicate` split `FilesState` already has).
+  **Verified**: 10/10 clean `de_only.sh` boots (`LITEBOX_PROCESS_FORK=1`, `LITEBOX_DIAG_FATALDUMP=1`,
+  debug build; 7 short + 3 reaching WM_POLL n=7/60s with zero truncation-related ambiguity), ZERO
+  recurrence of either Xvfb SIGSEGV signature (`0x7feffecdd400` or `0x37f0400`) — a background
+  6-more-run batch was killed mid-flight by the harness's own low-host-RAM safety reaper (not a
+  litebox issue; do not re-run unprompted per that reaper's own guidance). **NOT yet re-verified**:
+  a full `webtop_stack.sh` boot (nginx+selkies, heavier RAM) past this fix, and whether `DE_FAILED`
+  (a SEPARATE, already-narrowed-to-"inside xfce4-session's own process" issue, 30th/38th passes)
+  now resolves on its own or needs its own still-never-attempted live `cdb -pv` attach on
+  `xfce4-session` itself (43rd-pass pickup item 1, still open, not touched this pass either).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -234,12 +229,15 @@ fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_s
 
 **Open, in rough priority order:**
 
-1. **The single remaining top blocker is the SECOND Xvfb SIGSEGV (`0x37f0400`) — `DE_FAILED` is
-   its downstream symptom, RECONFIRMED 50th pass (every sampled boot dies via this or a same-class
-   SIGABRT before the WM connects), not an independent third bug.** See "Cross-process fork"
-   above's 50th-pass entry for the register-level evidence and the `cdb` conditional-breakpoint
-   pickup. Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th
-   passes) is unreachable to re-check until this is fixed (no WM ⇒ nothing selkies-side to serve).
+1. **The SECOND Xvfb SIGSEGV (`0x37f0400`) is FIXED — 51st pass, see "Cross-process fork" above.**
+   10/10 clean `de_only.sh` verification, not yet re-verified on a full `webtop_stack.sh` boot.
+   `DE_FAILED` (`xfce4-session`'s own "Cannot open display", narrowed to inside its own process
+   since the 30th/38th passes, DISPLAY/envp/loader-stack all independently proven correct) is now
+   the priority: confirm whether it was purely downstream of this crash all along (in which case a
+   fresh boot may already reach a real WM) or is a genuinely separate defect still needing the
+   never-yet-attempted live `cdb -pv` attach on `xfce4-session` itself (43rd-pass pickup, still
+   open). Host-side `curl http://localhost:8081/` connecting-but-HTTP-timing-out (43rd/49th passes)
+   recheck depends on reaching a real WM first.
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything**
    (38th-pass static audit, `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable`
    capacity-256 overflow is silently discarded (`unix.rs:275-277`); a key >108 bytes silently bails;
@@ -294,10 +292,10 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 §3N's safe-linked-tcache write. Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
-the old "Fork-after-Xorg" freeze either (35th pass). The ORIGINAL Xvfb SIGSEGV and the ORIGINAL
-`DE_FAILED` cause are both fixed (43rd/44th passes); the current sole blocker to an interactive
-desktop is the SECOND Xvfb SIGSEGV — see "Cross-process fork" above's 46th-pass entry for the
-live evidence and pickup. Selkies also needs `--clipboard-enabled=false` on the thread-based path
+the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are now fixed (43rd/51st
+passes); the current sole blocker to an interactive desktop is `DE_FAILED` itself (`xfce4-session`'s
+own "Cannot open display", see Track B item 1 above) — not yet re-checked post-51st-pass on a full
+`webtop_stack.sh` boot. Selkies also needs `--clipboard-enabled=false` on the thread-based path
 (its clipboard monitor re-triggers the same corruption every tick) — moot cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A SECOND, distinct

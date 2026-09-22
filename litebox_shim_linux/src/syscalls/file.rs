@@ -345,6 +345,17 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     /// resolve a path given relative to that fd (`dirfd`-relative resolution). Only file fds
     /// (as opposed to sockets/pipes/etc, which cannot serve as a `dirfd`) are ever inserted here.
     fd_paths: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, CString>>,
+    /// This process's own live SysV `shmat` attachments: THIS process's local mapping address ->
+    /// `shmid`. `shmdt(shmaddr)` needs this to find which segment to detach, because (since the
+    /// 51st pass, see `syscalls::mm::SysvShmSegment`'s own doc comment) a `shmat` address is now
+    /// per-process, not a single value shared cross-process via `GlobalState`. Deliberately lives
+    /// here rather than on `GlobalState`: it is address-space-scoped state, and piggybacking on
+    /// `FilesState`'s own existing `CLONE_FILES`-vs-`fork_duplicate` split (see that type's own
+    /// doc comment) gives it the same sharing shape address-space-scoped state needs for free
+    /// -- shared with a real thread (`CLONE_FILES`, same process), copied (not aliased) into a
+    /// forked child, exactly matching that a fork's child starts with the SAME attachments at the
+    /// SAME (snapshot-carried) addresses, but diverges independently after that.
+    shm_attachments: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, i32>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
@@ -424,6 +435,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(raw_descriptor_store),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
             fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
+            shm_attachments: litebox::sync::RwLock::new(self.shm_attachments.read().clone()),
         }
     }
 }
@@ -437,6 +449,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             ),
             max_fd: AtomicUsize::new(usize::MAX),
             fd_paths: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            shm_attachments: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         }
     }
 
@@ -457,6 +470,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 
     fn forget_fd_path(&self, raw_fd: usize) {
         self.fd_paths.write().remove(&raw_fd);
+    }
+
+    /// Records that this process's own `shmat` mapped `shmid` at `addr` (a LOCAL address, valid
+    /// only in this process -- see [`Self::shm_attachments`]'s own doc comment).
+    pub(crate) fn record_shm_attachment(&self, addr: usize, shmid: i32) {
+        self.shm_attachments.write().insert(addr, shmid);
+    }
+
+    /// `shmdt(shmaddr)`'s lookup: consumes and returns the `shmid` this process's `shmat`
+    /// attached at `addr`, or `None` if this process never attached anything there.
+    pub(crate) fn take_shm_attachment(&self, addr: usize) -> Option<i32> {
+        self.shm_attachments.write().remove(&addr)
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the

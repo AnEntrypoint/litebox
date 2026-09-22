@@ -286,6 +286,44 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(SharedMemoryError::UnsupportedByPlatform)
     }
 
+    /// Creates, or opens if it already exists, a NAMED platform-level shared-memory object of
+    /// `size` bytes, identified by `name` rather than by a per-process handle value.
+    ///
+    /// [`Self::create_shared_memory`]'s handle is only ever meaningful in the process that
+    /// created it (or one it was explicitly carried into, e.g. via a fork-time `DuplicateHandle`
+    /// step) -- see that method's own doc comment: "the SAME handle... after a fork". It has no
+    /// answer for two guest processes that are NOT in a fork ancestor/descendant relationship at
+    /// all (ordinary siblings spawned independently, e.g. two ELF execs from the same shell) but
+    /// that still need to attach the SAME underlying memory -- exactly the real-Linux SysV
+    /// `shmget`/`shmat` contract (any process that knows the id can attach, regardless of
+    /// lineage), and exactly the real X11 MIT-SHM handshake (a client creates a segment, tells
+    /// the SERVER -- a genuinely unrelated process -- its id over the wire; the server then
+    /// attaches it locally). A raw handle cannot do this; a NAME can, by construction: any
+    /// process on the same host session can ask its OS for "the shared-memory object called
+    /// `name`" and get a handle to the SAME underlying object, with no cross-process call at all.
+    ///
+    /// This mirrors [`crate::sync`]'s existing `CrossProcessEvent`/named-kernel-object design
+    /// (`litebox_platform_windows_userland::xproc_sync`) for exactly the same reason stated
+    /// there: idempotent create-or-open by name is the only primitive that survives an arbitrary,
+    /// not-necessarily-fork-related process relationship on this platform.
+    ///
+    /// Every caller passing the same `name` MUST pass the same `size` (real behavior: on a
+    /// platform whose underlying primitive fixes size at creation, e.g. Windows
+    /// `CreateFileMappingW`, `size` is honored only for the FIRST caller and silently ignored --
+    /// not rejected -- for every later one, exactly as [`Self::create_shared_memory`]'s own doc
+    /// comment already documents for the single-handle case).
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`]; see
+    /// [`Self::create_shared_memory`]'s doc comment.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
     /// Maps `handle` (from [`Self::create_shared_memory`]) into the address space at
     /// `suggested_range`, with the given semantics -- the same request shape as
     /// [`Self::allocate_pages`], since from the caller's perspective this is just another way to

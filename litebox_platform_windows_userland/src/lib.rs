@@ -8839,6 +8839,54 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(handle as usize)
     }
 
+    fn create_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        let size_u64 = size as u64;
+        // `Local\` scopes the object to this login session, matching every other named
+        // kernel object this codebase creates (`xproc_sync::CrossProcessEvent::open`'s own doc
+        // comment) -- every litebox process here is a descendant of the same runner in the same
+        // session, so a session-scoped name is sufficient and avoids the `SeCreateGlobalPrivilege`
+        // requirement `Global\` would add for no benefit.
+        let wide: std::vec::Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into
+        // high/low 32-bit halves, not a single 64-bit parameter.
+        #[expect(clippy::cast_possible_truncation)]
+        let handle = unsafe {
+            CreateFileMappingW(
+                Win32_Foundation::INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                Win32_Memory::PAGE_EXECUTE_READWRITE,
+                (size_u64 >> 32) as u32,
+                size_u64 as u32,
+                wide.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            litebox_util_log::error!(
+                name:% = name, size:% = size, win32_err:% = err;
+                "diag-shm: create_named_shared_memory FAILED"
+            );
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        // `ERROR_ALREADY_EXISTS` here is the normal, expected outcome for every caller after the
+        // first (see `CrossProcessEvent::open`'s own doc comment for the identical reasoning) --
+        // `handle` refers to the pre-existing object in that case, sized as the FIRST caller
+        // requested, exactly as this method's own doc comment states.
+        if diag_mm_enabled() {
+            let existed = unsafe { GetLastError() } == Win32_Foundation::ERROR_ALREADY_EXISTS;
+            litebox_util_log::debug!(
+                handle:% = handle as usize, name:% = name, size:% = size, existed:% = existed,
+                pid:% = std::process::id();
+                "diag-shm: create_named_shared_memory"
+            );
+        }
+        Ok(handle as usize)
+    }
+
     fn map_shared_memory(
         &self,
         handle: Self::SharedMemoryHandle,

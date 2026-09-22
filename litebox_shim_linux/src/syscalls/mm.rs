@@ -71,21 +71,38 @@ fn cow_mmap_enabled() -> bool {
 
 /// One System V shared-memory segment.
 ///
-/// litebox runs every guest process inside ONE real host address space (see `Vmem::duplicate`'s
-/// "Known deviation" section), which makes SysV shm unusually simple here: a segment is just an
-/// ordinary anonymous mapping, and because the address is valid in every guest process, `shmat`
-/// can hand back the same pointer to all of them instead of establishing a second mapping. That
-/// is genuine sharing, not an approximation -- writes through one attachment are immediately
-/// visible to the others, which is exactly what callers rely on.
+/// **This is NOT a single host address valid in every guest process.** An earlier revision of
+/// this type assumed "litebox runs every guest process inside ONE real host address space",
+/// which was true of the original thread-based fork model (every guest "process" a thread inside
+/// one Windows process) but is false the moment `LITEBOX_PROCESS_FORK=1`'s cross-process fork
+/// path is taken: a guest process attaching a segment it did not create is then a genuinely
+/// separate Windows process, with its own private address space, in which the CREATOR's
+/// `addr` was never mapped to anything at all. `shmat` handing that raw numeric value back
+/// produced a real, wild, unmapped pointer in the attaching process -- read by whatever copy
+/// eventually touched it, an ordinary `memmove`/`memcpy` -- root-caused to this exact defect via
+/// the live `LITEBOX_DIAG_FATALDUMP=1` register capture of the second Xvfb SIGSEGV (51st pass):
+/// `rsi` (the wild source pointer) never moved with Xvfb's own ASLR base across independent
+/// boots, which is exactly what a value copied verbatim out of the shared `GlobalState` table
+/// (rather than derived from this process's own, ASLR'd, mmap placement) looks like from the
+/// crash site. The X11 MIT-SHM extension makes this reachable on every real desktop boot: a
+/// client creates a segment and tells the SERVER (Xvfb, never fork-related to the client) its id
+/// over the wire; the server's own `shmat` is exactly the non-creator attach this bug breaks.
+///
+/// Fixed (51st pass) by keying each segment to a NAMED platform shared-memory object
+/// (`PageManagementProvider::create_named_shared_memory`, `Local\litebox_sysvshm_<shmid>`)
+/// instead of a bare address: every attacher, including the creator's own first `shmat`, now
+/// opens that name and establishes a REAL mapping in ITS OWN address space via the existing
+/// `map_existing_shared_pages` machinery (same primitive `syscalls::file`'s memfd/`wl_shm`
+/// bridging already uses) -- see `Task::sys_shmat`. The resulting address is per-process (real
+/// Linux `shmat` addresses are never guaranteed identical across processes either), so this type
+/// no longer carries one at all.
 #[derive(Clone, Copy)]
 pub(crate) struct SysvShmSegment {
-    /// Base address of the backing anonymous mapping.
-    addr: usize,
     /// Size in bytes, rounded up to a page.
     size: usize,
     /// The `key` this segment was created for, or `IPC_PRIVATE` (0).
     key: i32,
-    /// Number of live `shmat` attachments.
+    /// Number of live `shmat` attachments across every process combined.
     attaches: usize,
     /// Set by `shmctl(IPC_RMID)`. Real Linux keeps a removed segment alive until the last
     /// detach, and so does this.
@@ -155,15 +172,6 @@ impl SysvShmTable {
         Some(&mut self.slots[i].as_mut().unwrap().segment)
     }
 
-    fn get_by_addr_mut(&mut self, addr: usize) -> Option<(i32, &mut SysvShmSegment)> {
-        let i = self
-            .slots
-            .iter()
-            .position(|slot| matches!(slot, Some(s) if s.segment.addr == addr))?;
-        let slot = self.slots[i].as_mut().unwrap();
-        Some((slot.shmid, &mut slot.segment))
-    }
-
     fn remove(&mut self, shmid: i32) {
         if let Some(i) = self.index_of_id(shmid) {
             self.slots[i] = None;
@@ -223,17 +231,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let page = litebox::mm::linux::PAGE_SIZE;
         let rounded = size.checked_next_multiple_of(page).ok_or(Errno::EINVAL)?;
 
-        // Ordinary anonymous, readable/writable guest memory -- see this type's doc comment for
-        // why that is sufficient to be genuinely shared here.
-        let ptr = self
-            .do_mmap_anonymous(
-                None,
-                rounded,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            )
-            .map_err(|_| Errno::ENOMEM)?;
-
+        // No memory is actually created here -- matching real Linux, where `shmget` only
+        // reserves an id/size and the first REAL mapping happens at `shmat` time, in whichever
+        // process calls it (see `SysvShmSegment`'s own doc comment for why this changed: the
+        // previous single-canonical-address design was wrong under cross-process fork).
         let shmid = self
             .global
             .next_shmid
@@ -242,7 +243,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .insert(
                 shmid,
                 SysvShmSegment {
-                    addr: ptr.as_usize(),
                     size: rounded,
                     key,
                     attaches: 0,
@@ -251,7 +251,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .map_err(|_| Errno::ENOMEM)?;
         litebox_util_log::debug!(
-            key:% = key, shmid:% = shmid, size:% = rounded, addr:% = ptr.as_usize();
+            key:% = key, shmid:% = shmid, size:% = rounded;
             "sysv shm: created segment"
         );
         Ok(usize::try_from(shmid).unwrap())
@@ -259,37 +259,102 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// `shmat(shmid, shmaddr, shmflg)`.
     ///
-    /// Returns the segment's existing address. A non-null `shmaddr` asking to place the segment
-    /// somewhere specific is refused with `EINVAL` rather than honoured: there is one address
-    /// space here, so the segment already lives at exactly one address and cannot also appear at
-    /// another. Callers that pass `NULL` -- which is every caller in practice, including Xlib's
-    /// MIT-SHM -- are unaffected.
+    /// Establishes a REAL mapping of the segment in the CALLING process's own address space --
+    /// every process does this independently (including the creator's own first attach), via a
+    /// named platform shared-memory object keyed by `shmid` (see `SysvShmSegment`'s own doc
+    /// comment for why: a bare address handed to a non-creating process, the previous design,
+    /// is wild/unmapped there under cross-process fork). The returned address is therefore
+    /// per-process, matching real Linux (`shmat` gives no cross-process address guarantee
+    /// either). A non-null `shmaddr` asking to place the segment somewhere specific is refused
+    /// with `EINVAL` rather than honoured -- no caller in practice needs it (every real caller,
+    /// including Xlib's MIT-SHM, passes `NULL`).
     pub(crate) fn sys_shmat(
         &self,
         shmid: i32,
         shmaddr: usize,
         _shmflg: i32,
     ) -> Result<usize, Errno> {
-        let mut table = self.global.sysv_shm.lock();
-        let Some(seg) = table.get_mut(shmid) else {
-            return Err(Errno::EINVAL);
-        };
-        if shmaddr != 0 && shmaddr != seg.addr {
+        if shmaddr != 0 {
             log_unsupported!("shmat with a caller-chosen address ({shmaddr:#x})");
             return Err(Errno::EINVAL);
         }
-        seg.attaches += 1;
-        Ok(seg.addr)
+        let size = {
+            let mut table = self.global.sysv_shm.lock();
+            let Some(seg) = table.get_mut(shmid) else {
+                return Err(Errno::EINVAL);
+            };
+            seg.attaches += 1;
+            seg.size
+        };
+        let rollback_attach = || {
+            let mut table = self.global.sysv_shm.lock();
+            if let Some(seg) = table.get_mut(shmid) {
+                seg.attaches = seg.attaches.saturating_sub(1);
+            }
+        };
+        // Idempotent create-or-open by name (see `create_named_shared_memory`'s own doc comment):
+        // the FIRST attacher (almost always the creator's own first `shmat`, since `shmget`
+        // itself no longer maps anything -- see `SysvShmSegment`'s doc comment) creates the real
+        // object; every later attacher, in any process, opens the SAME one by shmid.
+        let name = alloc::format!("Local\\litebox_sysvshm_{shmid}");
+        let handle = match self.global.platform.create_named_shared_memory(&name, size) {
+            Ok(h) => h,
+            Err(_) => {
+                rollback_attach();
+                return Err(Errno::ENOMEM);
+            }
+        };
+        let Some(len) = litebox::mm::linux::NonZeroPageSize::new(size) else {
+            rollback_attach();
+            return Err(Errno::EINVAL);
+        };
+        // SAFETY: `handle` is a real shared-memory object sized to match `len`; mapping it at a
+        // platform-chosen (non-fixed) address is sound -- no guest code has observed this address
+        // range before this call returns it.
+        let ptr = match unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                len,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            Ok(p) => p,
+            Err(_) => {
+                rollback_attach();
+                return Err(Errno::ENOMEM);
+            }
+        };
+        let addr = ptr.as_usize();
+        self.files.borrow().record_shm_attachment(addr, shmid);
+        litebox_util_log::debug!(
+            shmid:% = shmid, addr:% = addr, size:% = size;
+            "sysv shm: attached segment"
+        );
+        Ok(addr)
     }
 
     /// `shmdt(shmaddr)`.
+    ///
+    /// Matches the pre-51st-pass implementation's own scope: releases this process's
+    /// bookkeeping (the shared attach count, and now the per-process reverse-lookup entry --
+    /// see `FilesState::shm_attachments`'s doc comment) but does not actually `munmap` the local
+    /// mapping. That was already true before this pass (the previous implementation never called
+    /// `sys_munmap` either) and remains a real, pre-existing, documented gap -- not one this
+    /// pass's fix introduces or widens -- because MIT-SHM/`-shmem` clients in practice keep a
+    /// segment attached for the whole connection lifetime, never calling `shmdt` at all, so it is
+    /// not on any path this investigation's own boot needs.
     pub(crate) fn sys_shmdt(&self, shmaddr: usize) -> Result<usize, Errno> {
-        let mut table = self.global.sysv_shm.lock();
-        let Some((shmid, seg)) = table.get_by_addr_mut(shmaddr) else {
+        let Some(shmid) = self.files.borrow().take_shm_attachment(shmaddr) else {
             return Err(Errno::EINVAL);
         };
-        seg.attaches = seg.attaches.saturating_sub(1);
-        let drop_now = seg.removed && seg.attaches == 0;
+        let mut table = self.global.sysv_shm.lock();
+        let drop_now = if let Some(seg) = table.get_mut(shmid) {
+            seg.attaches = seg.attaches.saturating_sub(1);
+            seg.removed && seg.attaches == 0
+        } else {
+            false
+        };
         if drop_now {
             table.remove(shmid);
         }
