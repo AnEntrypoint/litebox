@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-22)
+# litebox — current state (2026-09-23)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -7,8 +7,8 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 `docs/*.md` in the map below — read those for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-22,
-56th pass (see the pass-history section below; 26th-55th pass narrative lives in
+line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-23,
+57th pass (see the pass-history section below; 26th-56th pass narrative lives in
 `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
@@ -92,10 +92,11 @@ on the `de_only.sh` isolation harness instead.
   `litebox/src/fd/mod.rs` now returns `None` rather than panicking on this (55th pass, `faa74c6`) —
   a live-caught instance of the same class as the `Network::queued_for_closure`/`Pipes.litebox`/
   `FutexManager` bugs before it.
-- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot still craters host RAM, but far later now** — the
-  56th pass fixed the dominant per-fork cost (merged-rootfs-index cache, see "Cross-process fork"
-  section's own pass-history entry); check `FreePhysicalMemory` throughout any such boot regardless.
-  See Track B item 1.
+- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot no longer crashes on RAM (57th pass, 2/2)** —
+  plateaus ~3.1-3.3GB free; still check `FreePhysicalMemory` throughout regardless. **Confirm the
+  release binary's mtime postdates the newest relevant commit before trusting a boot result** — the
+  56th pass's own fix (`2d18a4e`) was ~1hr NEWER than the binary a rebuild-less re-run would have
+  used (57th pass). See Track B item 1.
 - **A guest diagnostic must reach the console through a PIPE or `$( )`, never a bare file redirect**
   — `cmd > /tmp/f` + parent read fails silently under `LITEBOX_PROCESS_FORK=1` (child writes its
   own writable-layer snapshot). `cmd 2>&1 | sed 's/^/[tag] /' &` is the pattern for streaming
@@ -184,15 +185,13 @@ map" below). The CURRENT STATE those passes converged on:
   RECOMMENDED for `.wfgy/webtop_stack.sh`.
 - **`pty_registry`/`daemon_pty_masters` cross-process redesign is DONE, genuine cross-process pty
   I/O LIVE-PROVEN** (36th/37th pass). Mechanism: "Shared-memory foundations" below.
-- **44th-49th passes** — `xfce4-session` first reached real pre-session setup (`iceauth`/`ssh-agent`/
-  `gpg-agent`/`xfconfd`). Fixed en route: fd 0/1/2 dropped at the fork boundary, an AF_UNIX
-  connect-cancel race, a `PROT_NONE`-adoption host panic (`c5a8884`), a `buddy_system_allocator`
-  free-list corruption (`mem::forget` fix, `8b64698`). Verified 7/7 clean `de_only.sh` boots.
-- **52nd-53rd passes** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone; REFUTED
-  "Cannot open display" for good (`xdpyinfo`/`DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` all correct);
-  found `xfwm4` masked by a `GLib-GIO-CRITICAL` flood traced to D-Bus SERVICE ACTIVATION failing for
-  every service xfce4-session needs. Also found `gpg-agent`'s fatal glibc `malloc.c:3846`
-  heap-corruption SIGABRT, still open (reproduced once). Full narrative both: archive.
+- **44th-49th passes** — `xfce4-session` first reached real pre-session setup. Fixed en route: fd
+  0/1/2 dropped at the fork boundary, an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption host
+  panic (`c5a8884`), a `buddy_system_allocator` free-list corruption (`8b64698`). 7/7 clean boots.
+- **52nd-53rd passes** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone; REFUTED "Cannot
+  open display" for good; found `xfwm4` masked by a `GLib-GIO-CRITICAL` flood from D-Bus SERVICE
+  ACTIVATION failing. `gpg-agent`'s fatal glibc `malloc.c:3846` heap-corruption SIGABRT, still open
+  (reproduced once). Full narrative: archive.
 - **54th pass (2026-09-22) — ROOT-CAUSED AND FIXED the D-Bus activation bug** (`66265d9`): a
   `socketpair(2)`-originated CLOEXEC fd (dbus-daemon's own activation babysitter reporting its pid
   pre-`exec()`) was being silently dropped by the general CLOEXEC-drop policy; now refused (falls
@@ -218,6 +217,9 @@ map" below). The CURRENT STATE those passes converged on:
   sustained RAM pressure (`_NET_SUPPORTING_WM_CHECK` "no such atom" → "not found") before RAM still
   ran out at t≈140s (~20 processes accumulated). NOT a full fix — process-COUNT accumulation over a
   longer boot is the next bottleneck. Track B item 1.
+- **57th pass (2026-09-23) — rebuilt the release binary (the 56th pass's own binary PREDATED
+  `2d18a4e` by ~1hr) and answered "reaping lag vs genuine concurrency" DEFINITIVELY: NEITHER — see
+  Track B item 1 for the full finding, evidence and current pickup.**
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -233,17 +235,20 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 **Open, in rough priority order:**
 
 1. **`DE_FAILED`'s real chain — D-Bus activation FIXED (54th), `fd/mod.rs:422` panic FIXED (55th),
-   per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`) — CURRENT blocker is SLOWER, later RAM
-   exhaustion from raw process-COUNT accumulation, not per-fork cost.** A 56th-pass boot survived to
-   WM_POLL n=8/12 (a new `_NET_SUPPORTING_WM_CHECK` "not found" marker, never reached under
-   sustained RAM pressure before) before ~20 concurrently-alive processes exhausted RAM at t≈140s.
-   Next: (i) `ps -ef` mid-boot or `LITEBOX_DIAG_FORK_TIMING=1`'s own per-fork timestamps would show
-   whether those ~20 are short-lived forks whose exit lags their spawn (check
-   `try_wait_for_cross_process_exit`) or genuinely long-lived, individually-reasonable (~20-50MB)
-   xfce4-session helpers that never exit (may just need more host RAM for this verification);
-   (ii) a `cdb -pv` attach on `xfce4-session`/`xfwm4`, lower priority until (i) settles whether
-   xfwm4 itself would succeed given enough RAM. (iii) `gpg-agent`'s fatal glibc `malloc.c:3846`
-   assertion, reproduced once (52nd). (iv) high `VM_SHARED` fork-child region count (52nd).
+   per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`) — RAM no longer kills the boot at all
+   (57th pass, verified 2/2, plateaus ~3.1-3.3GB free, no crash through 60s WM_POLL + 160s+ HOLD).
+   NOT reaping lag, NOT raw process-count — 57th pass proved fork count alone is free (flat WS over
+   24 sequential forks) and process count stays bounded (9-16, all individually plausible). The
+   real, still-open cost is PER-PROCESS: Xvfb/dbus-daemon/xfce4-session each cost 600MB-1.3GB
+   WS/Private (15-40x real-Linux RSS) vs. 5-130MB for every trivial command/pipe-filter — allocation
+   site not yet found (needs `cdb`/memory-profile on an ISOLATED Xvfb-alone repro, not the rootfs
+   merge — that's cache-HIT-cheap, ~100ms, ruled out).** CURRENT top blockers, both newly reachable
+   only because RAM no longer cuts the boot short: (i) `ps -ef` now genuinely runs (never did
+   before) and fails with guest text `fatal library error, lookup self` instead of a listing — real,
+   2/2 reproduced, not root-caused; (ii) `xfwm4` did NOT `execve` in either 57th-pass run (did in
+   54th/55th) — non-determinism already documented, cause still open. (iii) `gpg-agent`'s fatal
+   glibc `malloc.c:3846` assertion, reproduced once (52nd). (iv) high `VM_SHARED` fork-child region
+   count (52nd).
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything** (38th,
    `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256 overflow silently discarded
    (`unix.rs:275-277`); a key >108 bytes silently bails; `SharedUnixConnectQueue`/`SharedUnixConnTable`
@@ -300,16 +305,11 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
 the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are fixed and CONFIRMED on a
-full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes). **The D-Bus service-activation
-false-"exited" bug is FIXED (54th pass)** — `xfwm4` now genuinely `execve`s (never happened in this
-investigation before) and the `GLib-GIO-CRITICAL` flood is gone. **The `fd/mod.rs:422` panic that
-briefly looked like the next blocker is also FIXED (55th pass, `faa74c6`)**, and the dominant
-per-fork RAM cost the 55th pass surfaced next is ALSO FIXED (56th pass, `2d18a4e`, merged-rootfs-
-index cache). `DE_FAILED` still fires, but progressively later and for progressively less-known
-reasons: the 56th pass's own boot reached `_NET_SUPPORTING_WM_CHECK`'s "not found" state (a NEW
-marker, never reached before) before RAM exhaustion from raw process-count accumulation cut it off
-around t≈140s — see Track B item 1 for the current investigation this reframes into. NOT "Cannot
-open display" (refuted, 52nd pass). Selkies also needs
+full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes). D-Bus service-activation
+false-"exited" (54th), the `fd/mod.rs:422` panic (55th, `faa74c6`), and per-fork RAM cost (56th,
+`2d18a4e`) are all FIXED — a `de_only.sh` boot now runs the entire 60s+160s window with ZERO
+crash/OOM (57th pass). `DE_FAILED` still fires — NOT "Cannot open display" (refuted, 52nd), NOT RAM
+exhaustion any more (57th) — see Track B item 1 for the current live blockers. Selkies also needs
 `--clipboard-enabled=false` on the thread-based path (its clipboard monitor re-triggers the same
 corruption every tick) — moot cross-process.
 
