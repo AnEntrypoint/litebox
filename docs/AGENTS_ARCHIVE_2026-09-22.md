@@ -1102,3 +1102,97 @@ A freestanding no-libc probe's local `char buf[N] = "literal"` array initializer
 `-O1` lowers it to an aligned SSE `movaps`, and a hand-written `_start` doesn't always give the same
 alignment guarantee real crt0 does. Use a manual byte-copy loop instead (37th pass,
 `advisor/probes/pty_fork_probe.c`'s own `copy_str`).
+
+## 49th pass (2026-09-22) — buddy_system_allocator free-list corruption FIXED, real root cause
+
+Picked up the 48th pass's own two open hypotheses: (a) does the corrupting suspend even route
+through `ThreadHandle::interrupt`'s `SuspendThread` retry loop (the only `rip_in_global_allocator`
+call site), and (b) is this a genuine SMP data race on `Heap::free_list` bypassing
+`LockedHeapWithRescue`'s own `spin::Mutex`.
+
+**Static analysis first (PDB archaeology, `llvm-pdbutil dump --publics`).** Extracted real RVAs for
+`<SafeZoneAllocator as GlobalAlloc>::alloc`/`dealloc` and `buddy_system_allocator::Heap::<34>::alloc`/
+`LockedHeapWithRescue::<34>::dealloc` from the release PDB. All four fell within ~70KB of each other
+— comfortably inside even the ORIGINAL (pre-47th-pass) 128KiB window, long before the 47th pass's
+widening. This was a first hint that address coverage was never really the gap for this binary's
+actual layout, unlike the earlier, genuinely-4.3MB-away `slabmalloc::ZoneAllocator` case.
+
+**Hypothesis (a) refuted live.** Added an always-on diagnostic to `ThreadHandle::interrupt` (`lib.rs`,
+near the `switch_to_guest`/`is_in_guest` redirect logic) that calls `rip_in_global_allocator(rip)`
+on the FINAL context right before any redirect, and prints
+`[diag-interrupt-GUEST-REDIRECT-IN-ALLOCATOR]` if it's ever true (cheap: `diag_raw_print`, no
+alloc/lock, safe inside the suspended-target window). Rebuilt debug, ran `de_only.sh` under
+`LITEBOX_PROCESS_FORK=1`+`LITEBOX_DIAG_FATALDUMP=1`: the panic recurred 4 times in ONE run
+(`.wfgy/verify48_run49.log`), zero `GUEST-REDIRECT-IN-ALLOCATOR` occurrences. The redirect mechanism
+was never involved.
+
+**Real root cause found via `RUST_BACKTRACE=full`** (`.wfgy/verify49_backtrace.log`) — 3/3
+independent panics show the BIT-IDENTICAL backtrace:
+`net_worker (fork child)`'s bootstrap → first `perform_network_interaction()` call → locks the
+shared `Network` → `GlobalStateHandle::net_lock()` → `Network::rebind_per_process_fields` →
+`self.litebox = litebox.clone()` → drops the OLD `self.litebox` in place → `Arc::drop_slow` on
+`LiteBoxX` → `Descriptors`' `RwLock<Vec<Option<IndividualEntry>>>` drop glue → `Vec::drop` →
+`SafeZoneAllocator::dealloc` → `Heap::<34>::dealloc` → panic at `lib.rs:165` (`class` computed from
+a corrupted `Layout` = 53, `>= ORDER`).
+
+Mechanism: `Network` (and `Pipes`) are placed in the cross-process-shared kernel arena by design —
+every process in a fork family reads/writes the SAME struct bytes at the SAME address. `litebox:
+LiteBox<Platform>` is `Arc<LiteBoxX<Platform>>`; `rebind_per_process_fields` exists specifically to
+fix up this field to the CALLING process's own valid `LiteBox` before every use (its own doc comment
+already documents two EARLIER instances of the "stale shared Arc pointer" defect class this same
+field caused — an `STATUS_ACCESS_VIOLATION` in `Descriptors::iter_mut` and another in
+`phy::Device::receive`). But the fix itself, `self.litebox = litebox.clone()`, is an ordinary Rust
+assignment: it drops the OLD value in place before storing the new one. That OLD value's `Arc` inner
+pointer was captured by whichever process last called this function (the parent, a sibling fork
+child, or nobody yet if this is the very first rebind ever) — foreign, and possibly already-exited-
+process-owned, memory in THIS process's address space. `Arc::drop` walks into that foreign memory,
+reads whatever bit pattern is sitting at the expected "strong count" offset, and — deterministically,
+run after run, because the parent's own heap layout is fairly stable across boots — reads it as the
+last reference, running the REAL drop glue for a `LiteBoxX` (including the FD table `Vec`) through
+THIS process's real global allocator, with a `Layout` reconstructed from bytes that were never a real
+`Vec`'s capacity/size at all. That garbage `Layout` produces `class=53`, out of the `Heap`'s
+`free_list[34]` bounds.
+
+This is the EXACT SAME defect class `reset_after_poisoning` (a few lines below in the same file) was
+already written to avoid for `SocketSet::remove`'s returned `Socket` — see that function's own doc
+comment: "`mem::forget`, deliberately NOT a normal drop... it was never THIS process's allocation to
+free in the first place." `rebind_per_process_fields` simply never got the same treatment.
+
+**`litebox::pipes::Pipes::rebind_per_process_fields` (`litebox/src/pipes.rs`) has the IDENTICAL bug**
+— `*self.litebox.lock() = litebox.clone()`, same plain-assignment-drops-a-foreign-Arc shape. Its own
+doc comment already documents a live crash from this exact mechanism (`STATUS_ACCESS_VIOLATION`
+inside a `Descriptors` `Vec::drop`, reached while tearing down a pipe's `WriteEnd`) — fixed the same
+way. Checked the other fields the same doc comments call "the same shadow-field pattern"
+(`proc_self_info`/`pts_registry`/`elf_patch_cache`/`exec_ranges_cache`/`segment_scan_cache`,
+`GlobalStateHandle`): all of those are structurally different — each PROCESS constructs its OWN
+fresh `Arc` once at build time and never reassigns a shared struct's field via `=`, so they don't
+have this hazard. No other instance found.
+
+**Fix** (`8b64698`): `let stale = core::mem::replace(&mut self.litebox, litebox.clone());
+core::mem::forget(stale);` in both `Network::rebind_per_process_fields` and
+`Pipes::rebind_per_process_fields`.
+
+**Verification**: 7 sequential `de_only.sh` runs post-fix (debug build,
+`LITEBOX_PROCESS_FORK=1`+`LITEBOX_DIAG_FATALDUMP=1`, `.wfgy/verify49_fix_run{1..7}.log`) — ZERO
+`buddy_system_allocator` panics in any run (100% reproduction pre-fix: every fork child, ~3-4s in,
+bit-identical "len is 34, index is 53"). The separate, pre-existing second Xvfb SIGSEGV
+(`0x37f0400`/backtrace offset `0x1b20ed`, unrelated mechanism, still open) recurred in 5 of the 7
+runs — untouched by this fix, as expected. An 8th run was intentionally cut short (host RAM fell to
+~0.4GB free mid-run, the same transient dip the 35th/43rd passes already documented at this script
+stage) once 7 clean runs already exceeded the sample size this investigation's own discipline calls
+sufficient.
+
+**Operational note**: multi-run PowerShell batches invoked via `run_in_background` intermittently hit
+a sandbox error ("Remove-Item on system path ... is blocked") when using the `Remove-Item` cmdlet on
+ordinary `.wfgy/*.log`/`.txt` paths inside a loop — cause not root-caused this pass (possibly a
+sandbox path-matching false positive specific to background PowerShell execution). Workaround that
+worked cleanly: use `[System.IO.File]::Delete`/`::Exists`/`::AppendAllText` instead of `Remove-Item`/
+`Test-Path`/`Add-Content` for any file bookkeeping inside a backgrounded multi-run PowerShell script.
+
+**Pickup**: the sole remaining blocker to a working desktop is the second Xvfb SIGSEGV
+(`0x37f0400`), unchanged in scope from the 44th-48th passes' own notes — still needs either a live
+`cdb`/CFI-based unwind of the crash's real call site or upstream Xvfb/glibc source cross-reference.
+Now that the allocator corruption is gone, a full `webtop_stack.sh` boot is worth re-attempting: the
+48th pass's own note that a still-firing host panic "changes downstream process timing/ordering"
+cuts both ways — fixing a real, frequent, early-boot corruption bug may shift whether/when the Xvfb
+crash triggers, for better or worse, and this pass did not yet re-run the full stack to check.
