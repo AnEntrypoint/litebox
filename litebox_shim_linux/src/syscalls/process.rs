@@ -2628,8 +2628,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // fork-carriable; it only stops rejecting Xvfb/dbus-daemon before that scan runs.
 
         // None of this shim's seven fd subsystems is backed by an inheritable Windows HANDLE, so
-        // a cross-process child cannot carry anything past the 0/1/2 stdio slots `CreateProcessW`
-        // hands it automatically. `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` overrides this for
+        // a cross-process child cannot carry anything past a PLAIN, unredirected 0/1/2 stdio slot
+        // -- those three `CreateProcessW` hands it automatically, for free. A guest that
+        // redirected 0/1/2 onto a pipe or regular file before forking (`cmd 2>&1 | sed`, any
+        // shell pipeline) is NOT covered by that free inheritance -- `dup2` replaced the
+        // descriptor-table entry, so the child's fresh `CreateProcessW`-inherited stdio handle is
+        // the WRONG object entirely. Those three fds are scanned and classified exactly like any
+        // other fd below (`raw_fd_is_plain_stdio_device` is the discriminator). Fixed
+        // 2026-09-22: this used to hard-cut at `raw >= 3`, which silently dropped every guest
+        // process's own redirected stdout/stderr on every cross-process fork -- root-caused as
+        // the reason `xprop`/`xdpyinfo`/`xfce4-session`'s own diagnostic output could never be
+        // read back through a `$(...)`/pipe capture from the parent shell
+        // (`docs/AGENTS_ARCHIVE_2026-09-22.md`, "Guest-diagnostic-must-travel-by-pipe"; that
+        // pass's own fix scoped exactly this change but did not implement it).
+        // `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` overrides ineligibility from any fd for
         // measurement only, accepting that the child loses those fds.
         litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_cross_process_fork entry");
         // `try_borrow`, not `borrow`: a panic here would unwind, and unwinding in this process
@@ -2643,11 +2655,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return None;
         };
-        let beyond_stdio_fds: alloc::vec::Vec<usize> = {
+        let alive_fds: alloc::vec::Vec<usize> = {
             let raw_descriptors = files.raw_descriptor_store.read();
-            raw_descriptors.iter_alive().filter(|&raw| raw >= 3).collect()
+            raw_descriptors.iter_alive().collect()
         };
         drop(files);
+        let beyond_stdio_fds: alloc::vec::Vec<usize> = alive_fds
+            .into_iter()
+            .filter(|&raw| raw >= 3 || !self.raw_fd_is_plain_stdio_device(raw))
+            .collect();
 
         // A pipe fd, either half, can be carried across the process boundary; anything else still
         // cannot.

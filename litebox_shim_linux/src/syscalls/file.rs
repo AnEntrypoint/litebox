@@ -6590,6 +6590,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(())
     }
 
+    /// True when `raw_fd` (0, 1, or 2) is still the plain, untouched `/dev/stdin`/`/dev/stdout`/
+    /// `/dev/stderr` fd this process started with -- i.e. it still carries `StdioStream`
+    /// metadata (attached by `initialize_stdio_in_shared_descriptors_table` at process start, or
+    /// by `stdio_stream_for_path` on a later explicit reopen of one of those three paths).
+    ///
+    /// A cross-process `fork()` child gets fds 0/1/2 for free from `CreateProcessW`'s own stdio
+    /// handle inheritance, so a plain stdio fd needs no carrying -- that is the ONE case the old
+    /// `raw >= 3` cutoff got right. But a guest that redirected 0/1/2 onto a pipe or regular file
+    /// before forking (`cmd 2>&1 | sed`, `exec 3<>path; dup2(3,1)`, any shell pipeline) replaces
+    /// the descriptor-table entry entirely via `dup2`, and the replacement carries no
+    /// `StdioStream` tag -- so this correctly returns `false` for a redirected 0/1/2, marking it
+    /// as needing the same real carrying (pipe bridge / file reopen) any other fd gets. See
+    /// `try_cross_process_fork`'s own use of this for the full mechanism and the observability
+    /// bug this was silently causing (`docs/AGENTS_ARCHIVE_2026-09-22.md`, "Guest-diagnostic-
+    /// must-travel-by-pipe").
+    pub(crate) fn raw_fd_is_plain_stdio_device(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &StdioStream| ())
+                        .is_ok()
+                },
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+            )
+            .unwrap_or(false)
+    }
+
     /// Name the fd subsystem `raw_fd` belongs to, for diagnostics.
     ///
     /// The cross-process `fork()` gate can only carry pipes, and "some fd was in the way" is a
