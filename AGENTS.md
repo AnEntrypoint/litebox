@@ -84,6 +84,52 @@ for a small repro, too noisy for a full desktop boot.
   by fd** — a pre-fork-created listening socket serves nothing to a forked child; a pty fd is
   dropped too, but (unlike a socket) is safely RE-OPENABLE by id afterward via `SharedPtyTable`
   (37th pass) — run dbus-daemon non-forking, and for XFCE use `xfce4-session`, never `startxfce4`.
+- **A guest diagnostic must reach the console through a PIPE, never a file, and never command
+  substitution** (38th pass, three separate live-proven failure shapes — this one rule invalidated
+  a large amount of this project's historical "we saw nothing, so nothing happened" reasoning):
+  - `cmd > /tmp/f` then the parent reading `/tmp/f` — the forked CHILD writes into its own
+    writable-layer snapshot; the parent reads its own and sees nothing. Known gap, but its REACH
+    was badly underestimated: it silently broke `xprop -root > /tmp/wm1; grep -q "window id"
+    /tmp/wm1`, i.e. the DE_UP CHECK ITSELF, so `DE_FAILED` could be reported no matter what the
+    desktop did. (Small files DO sometimes survive via `SharedFilePublishTable`'s 256-byte
+    publish — `read -r A < /tmp/addr` genuinely works for dbus's address — so this fails
+    NON-deterministically by size, which is worse than failing outright.)
+  - `VAR=$(cmd)` — **command substitution returns EMPTY for an external command under
+    `LITEBOX_PROCESS_FORK=1`, while `$?` is still correct.** Live: `XSETQ=$(xset q 2>&1)` gave
+    `rc=0` and zero bytes in the same boot where a bare `xset q > /dev/null 2>&1 && echo UP`
+    reported UP. The exit status is trustworthy; the captured TEXT is not. Any past finding that
+    rests on the text captured by `$( )` from a forked child must be re-derived.
+  - `cmd 2>&1 | sed 's/^/[tag] /' &` — **WORKS**, child-to-child through a pipe, and is the only
+    shape proven to deliver a guest process's real output. This is how `xfce4-session`'s and
+    Xvfb's true stderr were read for the first time. Use it for every guest diagnostic.
+- **`.wfgy/webtop_stack.sh` is NOT what boots — `.wfgy/webtop_seed.tar` embeds a FROZEN COPY**
+  (`--resume-from`), so editing the host script alone changes nothing. Re-tar after every edit
+  (`tar -xf` to a stage dir, overwrite, `tar -cf webtop_seed.tar webtop_stack.sh tmp config`) and
+  verify with `tar -xOf ... | grep`. Found the hard way twice: the 35th pass's `/dev/tcp`
+  readiness-gate rewrite was still absent from the tar on the 38th pass, so it had never once
+  run in a guest and "not yet live-verified" was an understatement.
+- **A boot whose log stops is usually a DEAD ROOT RUNNER, not a hang** — the root process hosts
+  the top-level shell, so when it dies the `[s]` markers stop while the orphaned cross-process
+  children (Xvfb, selkies) keep running and keep burning CPU, which reads exactly like a stall.
+  Diagnose in one command: `Get-CimInstance Win32_Process -Filter "Name='litebox_runner…'" |
+  ForEach-Object { $_.CommandLine.Length }` — every cross-process CHILD has the bare 77-char
+  exe-only command line (`process_fork.rs:1594-1599`), so **if no survivor carries the full
+  `--oci-image …` arg list, the root is gone.** Under host-RAM pressure this is an OOM-kill.
+- **Before ANY `cdb` attach, set `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1`** (and
+  `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`). Every runner spawns an external watchdog CHILD
+  (`process_fork.rs:4391`) that polls `GetProcessTimes` and calls `TerminateProcess` after 15s of
+  <10ms CPU delta, with **no "was a fault armed" precondition** — and a debugger-frozen process
+  makes exactly zero CPU progress, so it is killed ~15s into the session. On an already-running
+  boot, kill the target's watchdog child first (it is the small ~10-20MB process parented by the
+  target). These watchdogs also inflate the process count: roughly half the identical-command-line
+  runner processes are watchdogs, not guests.
+- **`DIAG_TIMELINE`/`sys_execve` log at `debug!`, NOT `error!`** — their own adjacent comments
+  claim "always visible regardless of the configured log filter", and that is wrong; under the
+  default filter they print nothing at all. Use
+  `LITEBOX_LOG=warn,litebox_shim_linux::syscalls::process=debug,litebox_platform_windows_userland::fork_verify=error`.
+  A cross-process fork child adopts its own **Windows PID as its guest pid**
+  (`runner…/lib.rs:1673`), so a large `pid=` on a `DIAG_TIMELINE execve` line is a real host PID
+  that `cdb -pv -p` accepts directly; `sys_execve: entry`'s `host_tid` is the other join.
 - **On host-side crashes, use `advisor/probes/symbolize_litebox_crash.py`, snapshotting `.exe`+`.pdb`
   next to the log** — a ring dump's `rva=` is only meaningful against the exact emitting build.
 - **Isolate the harness before blaming litebox** — launch guest probes directly as the runner's
@@ -138,32 +184,55 @@ closing `DBUS_FAILED`, AF_UNIX errno fix, the Xvfb crash characterization, the "
 freeze" risk confirmed gone, and the full `SharedPtyTable` design+verification narrative).** The
 CURRENT STATE those passes converged on:
 
-- **`DE_FAILED` (`xfce4-session`'s own `Cannot open display: .`) is the sole real blocker on BOTH
-  fork paths**, narrowed to "something inside `xfce4-session`'s own process" — envp, `getenv()`,
-  and the ELF loader's stack-building code are all proven correct by direct live evidence
-  (LD_PRELOAD interposer, 19/19 correct `DISPLAY=:1` reads across a full boot, including inside
-  GDK's own backend probe). Never attempted by any pass to date: a live `cdb -pv` attach on
-  `xfce4-session` itself, breaking on `getenv`/`XOpenDisplay`/`_XConnectXCB`, only once host RAM is
-  genuinely quiet (~1.8GB+ sustained — every attempt below that has died pre-Xvfb to the
-  thread-fork tcache-corruption class before ever reaching `xfce4-session`). Treat the recurring
-  `Cannot open display: .` text as this GTK/Xt build's generic connection-failed fallback message,
-  not literal proof of `getenv("DISPLAY")`'s real return value — that string recurs for unrelated
-  root causes elsewhere in this project's own history (archive).
-- **Xvfb's own real crash is root-caused but not fixed**: a separate, deterministic SIGSEGV
-  ~190-207s into every full boot (not the `DE_FAILED` cause) — glibc's AVX2 memcpy/memmove reading
-  64+ bytes from a wild, fully-unmapped pointer (`0x7feffecdd400 == TASK_ADDR_MAX - 0x1312C00`,
-  bit-identical `rip`/fault-address across boots). `cdb` attach is REFUTED as a capture method (it
-  perturbs the exact X11-traffic race the crash needs) — use `LITEBOX_DIAG_FATALDUMP=1` instead.
-  Exact call site still open: needs real CFI-based stack unwinding or an upstream Xvfb/glibc source
-  cross-reference (`debuginfod.debian.net` is reachable).
+- **`DE_FAILED` IS THE Xvfb SIGSEGV. `Cannot open display` is REFUTED as the mechanism — 38th
+  pass, direct live evidence.** `xfce4-session`'s own stderr had NEVER been readable by any prior
+  pass (see the observability bug below), so every pass reasoned about `DE_FAILED` from a message
+  it could not actually see. Read for the first time (`.wfgy/de_only_1.log:5702`), the DE's real
+  stderr contains **no `Cannot open display` at all** — it contains
+  `(xfce4-session:25524): dbind-WARNING **: AT-SPI: Error retrieving accessibility bus address`,
+  which GTK only ever emits **after `gtk_init` has already succeeded**. `xfce4-session` opens the
+  display fine. The ordering in that same log is unambiguous:
+  `DE_LAUNCHED_DIRECT` (:3818) → **Xvfb `Segmentation fault at address 0x7feffecdd400`** (:5655) →
+  the DE's AT-SPI warning (:5702) → `DE_FAILED` (:10535). The X server dies underneath the DE.
+  The crash is **triggered by the DE's own X11 traffic, not by elapsed time** — it landed here
+  within ~30s of the DE launching, versus the "~190-207s into every full boot" the 32nd pass
+  recorded, because this isolation harness starts the DE far earlier. So the two open blockers
+  were never two: **there is ONE bug, the Xvfb SIGSEGV.** Do NOT reopen DISPLAY/`getenv()`/envp/
+  the ELF loader stack (all independently proven correct, 30th pass, LD_PRELOAD interposer,
+  19/19 correct `:1` reads) and do NOT spend another pass on a `cdb -pv` attach to
+  `xfce4-session` — it is not the faulting process.
+- **Xvfb's crash now has a REAL BACKTRACE, captured without a debugger** (38th pass). Xvfb's own
+  built-in `xorg_backtrace()` prints its frames to stderr on the fatal signal; they were always
+  being emitted and always being thrown away, because the harness sent Xvfb's stderr to
+  `/tmp/xvfb.log` (a file the parent cannot read back) instead of through a pipe. Run Xvfb as
+  `... 2>&1 | sed 's/^/[xvfb] /' &` and the whole backtrace + `Segmentation fault at address`
+  line arrives in the console log. Captured frames, verbatim, `.wfgy/de_only_1.log`: 13 frames,
+  Xvfb text addresses in the `0x158100xxxxx` band, glibc frames at `0x7fefedd7adf0` (signal
+  frame) / `0x7fefede9dabd` (the faulting AVX2 memcpy/memmove) / `0x7fefedd64ca8`+`0x7fefedd64d65`
+  (`__libc_start_*`), fault address `0x7feffecdd400` — bit-identical to the 32nd pass's register
+  capture, so this is the same deterministic bug. `.wfgy/xvfb.debug` (matching
+  `BuildID sha1=6440f00c805782c9a39a5acd92855079e9fffc92`) has the DWARF. **Symbolization is NOT
+  yet resolved**: `_start` is at `0x3fa00`, but no PAGE-ALIGNED load base maps the outermost Xvfb
+  frame `0x158100447e1` into `_start`'s 34-byte range (`0x447e1 - 0x3fa00 = 0x4FE1`, unaligned),
+  and the naive base `0x15810000000` yields an incoherent chain (SELinux + `XkbCopyKeymap` +
+  `glxProbeDriver` + `fbBlt` together). Next pass must resolve the base before trusting any
+  symbol — the leading hypothesis is that litebox's own ELF REWRITER shifts Xvfb's layout, so a
+  plain base subtraction against stock DWARF is invalid. `cdb` remains refuted as a capture
+  method for this crash (it perturbs the X11-traffic race); the pipe-stderr capture above
+  supersedes it and needs no debugger.
 - **The "Fork-after-Xorg PERMANENT freeze" risk is CONFIRMED GONE** (35th pass, live evidence: a
   full `LITEBOX_PROCESS_FORK=1` release-binary boot reached its designed idle `HOLD` loop with zero
   freeze/SIGSEGV/tcache-corruption). `LITEBOX_PROCESS_FORK=1` is now the RECOMMENDED flag for
   `.wfgy/webtop_stack.sh`, evidenced-safe-pending-reconfirmation under workable host RAM. That same
   pass rewrote the `SELKIES_PORT_UP`/`NGINX_SELFTEST` readiness polls from a 170x-`curl`-fork loop
   (which was paying the full cross-process rootfs-rebuild cost per iteration, the likely OOM-kill
-  cause) to a zero-fork bash `/dev/tcp/HOST/PORT` builtin check — `bash -n`-clean, not yet
-  live-verified end to end.
+  cause) to a zero-fork bash `/dev/tcp/HOST/PORT` builtin check. **38th-pass correction: that
+  rewrite had never once executed in a guest** — `.wfgy/webtop_seed.tar` still carried the
+  pre-rewrite frozen copy (tar mtime 09-21 09:03, `grep -c dev/tcp` = 0), so "not yet
+  live-verified" understated it. Tar regenerated 38th pass; the gate now runs, and on its first
+  real execution reported `NGINX_SELFTEST_FAILED last_code=` (empty) — the `/dev/tcp` connect
+  path returns no HTTP status line, so this gate is **still not proven working** and needs its
+  own look, separately from the desktop question.
 - **`pty_registry`/`daemon_pty_masters` cross-process redesign is DONE and genuine cross-process
   pty I/O is now LIVE-PROVEN** (36th pass designed+implemented `syscalls::pty::SharedPtyTable`;
   37th pass proved it live and fixed two real bugs the 36th pass's own local-only testing had not
@@ -193,9 +262,32 @@ cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 
 **Open, in rough priority order:**
 
-1. **`xfce4-session`'s `DE_FAILED`** — see above; needs a live `cdb -pv` attach under quiet RAM.
-2. **Xvfb's own SIGSEGV call site** — see above; needs CFI unwinding or upstream source
-   cross-reference; use `LITEBOX_DIAG_FATALDUMP=1`, never `cdb`, to capture it.
+1. **Xvfb's SIGSEGV — now the SINGLE top blocker, since `DE_FAILED` is a downstream symptom of it
+   and not a second bug** (38th pass, see above). Pickup, in order: (a) resolve the load base so
+   the freshly-captured 13-frame backtrace can be symbolized against `.wfgy/xvfb.debug` — the
+   leading hypothesis is that litebox's own ELF rewriter shifts Xvfb's layout, making a plain
+   base subtraction against stock DWARF invalid, so check the rewriter's section/segment handling
+   before trusting any symbol; (b) with frame 3 (the Xvfb caller of the faulting glibc memcpy)
+   identified, determine whether the wild pointer `0x7feffecdd400` is a litebox-shim bug or a
+   genuine upstream Xvfb defect. Capture needs NO debugger — pipe Xvfb's stderr through `sed`
+   (see "Standing lessons") and the backtrace prints itself.
+2. ~~`xfce4-session`'s `DE_FAILED` as an independent bug~~ — **REFUTED, 38th pass.** It is the
+   Xvfb crash seen from downstream. Do not spend a pass attaching `cdb` to `xfce4-session`.
+2b. **AF_UNIX cross-process tables have FOUR silent exhaustion paths** (38th-pass static audit,
+   `litebox_shim_linux/src/syscalls/unix.rs`): `SharedUnixAddrPresenceTable` capacity 256
+   (`unix.rs:2585`) whose `insert` return value is DISCARDED at `unix.rs:275-277`, so an
+   over-capacity `listen(2)` still returns success and every later cross-process client gets
+   `ECONNREFUSED`; a key >108 bytes (`UNIX_ADDR_KEY_MAX`, `unix.rs:2579`) silently bails in all
+   four of `insert`/`post`/`try_claim`/`has_pending`; `SharedUnixConnectQueue` capacity 64
+   (`unix.rs:3247`) returns `EAGAIN`; `SharedUnixConnTable` capacity 64 (`unix.rs:2923`) leaves
+   the request `REQ_CLAIMED` **forever** (`unix.rs:430-435`) because `cancel` only CASes
+   `REQ_PENDING → REQ_EMPTY` (`unix.rs:3438-3443`) — a monotonic slot leak for the life of the
+   fork family. **None of the four logs anything at any level.** Also note
+   `SHARED_UNIX_CONN_BUF` is only **2048 bytes per direction** (`unix.rs:2935`), and the
+   cross-process accept path ignores the listener backlog entirely (`unix.rs:420-452` never reads
+   `state.limit`). Abstract sockets were checked and are CORRECT (`unix.rs:1313-1317` parses
+   `sun_path[0]==0`, a miss returns the right `ECONNREFUSED`, so libxcb's abstract-first probe
+   falls back cleanly) — not a suspect.
 3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
    dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in
    `dealloc`, high blast radius, own dedicated pass.
