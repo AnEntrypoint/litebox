@@ -1541,7 +1541,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             .unix_shared_connect_queue
             .post(kind, key_bytes, &client_cred)
         else {
-            // Queue full -- ordinary, guest-triggerable degrade, not a bug.
+            // Queue full -- ordinary, guest-triggerable degrade, not a bug, but real enough to be
+            // worth a visible signal now that `cancel`'s own leak-on-claim-race is fixed (62nd
+            // pass): this WARN should never fire in a healthy boot, so its presence in a future
+            // log is itself the diagnostic (a real exhaustion, or a NEW leak this fix didn't
+            // cover) rather than something a caller needs to react to.
+            litebox_util_log::warn!(
+                self_pid:% = self_pid, kind:% = kind, key_len:% = key_bytes.len();
+                "SharedUnixConnectQueue::post: queue full (all SHARED_UNIX_CONNECT_QUEUE_CAPACITY \
+                 slots busy) -- returning EAGAIN"
+            );
             return Err(Errno::EAGAIN);
         };
         litebox_util_log::debug!(
@@ -1588,7 +1597,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     request_idx:% = request_idx;
                     "DIAG connect_cross_process: request TIMED OUT, cancelling"
                 );
-                task.global.unix_shared_connect_queue.cancel(request_idx);
+                task.global
+                    .unix_shared_connect_queue
+                    .cancel(&task.global, addr, request_idx);
                 return Err(Errno::ECONNREFUSED);
             }
             Err(TryOpError::TryAgain) => {
@@ -1636,7 +1647,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     // the top of this function and here -- withdraw the request rather than leak
                     // it on a state this socket will never revisit.
                     other => {
-                        task.global.unix_shared_connect_queue.cancel(request_idx);
+                        task.global
+                            .unix_shared_connect_queue
+                            .cancel(&task.global, addr, request_idx);
                         (other, Err(Errno::EINPROGRESS))
                     }
                 });
@@ -1648,7 +1661,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     err:? = e;
                     "DIAG connect_cross_process: request failed with other error, cancelling"
                 );
-                task.global.unix_shared_connect_queue.cancel(request_idx);
+                task.global
+                    .unix_shared_connect_queue
+                    .cancel(&task.global, addr, request_idx);
                 return Err(Errno::from(e));
             }
         };
@@ -1895,10 +1910,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 // the guest is about to abandon doesn't leave its request occupying a shared
                 // queue slot until the listener eventually claims and orphans it.
                 UnixStreamState::Connecting(connecting) => {
-                    connecting
-                        .global
-                        .unix_shared_connect_queue
-                        .cancel(connecting.request_idx);
+                    connecting.global.unix_shared_connect_queue.cancel(
+                        &connecting.global,
+                        &connecting.peer_addr,
+                        connecting.request_idx,
+                    );
                 }
                 UnixStreamState::Connected(conn) => conn.shutdown(how),
             }
@@ -3582,14 +3598,76 @@ impl SharedUnixConnectQueue {
     }
 
     /// Client side: best-effort withdrawal of a still-unclaimed request (e.g. the connect
-    /// attempt's own deadline expired). If a listener concurrently claimed it in the meantime,
-    /// this is a no-op -- the listener's `complete()` still runs and the resulting slot is simply
-    /// never attached to by anyone, a bounded leak matching this table's existing degrade-rather-
-    /// than-panic philosophy (reclaimed when the whole fork family exits).
-    fn cancel(&self, idx: usize) {
+    /// attempt's own deadline expired). If a listener concurrently claimed it in the meantime (a
+    /// real, live race between this connect attempt's own timeout/error path and the listener's
+    /// `accept()`), drain and free the [`SharedUnixConnTable`] slot the listener allocated too,
+    /// rather than leaking it for the rest of the whole fork family's lifetime.
+    ///
+    /// FIXED (62nd pass, 2026-09-23): this used to just give up on losing the
+    /// `REQ_PENDING`->`REQ_EMPTY` race and walk away, leaving the request (and, once the
+    /// listener's own `complete()` ran a moment later, a real [`SharedUnixConnTable`] slot) stuck
+    /// non-`REQ_EMPTY`/non-`CONN_SLOT_EMPTY` until the whole fork family exited -- a real,
+    /// previously-only-theoretical leak this pass's own `LITEBOX_PROCESS_FORK=1` desktop-boot
+    /// investigation raised to a live concern: `SHARED_UNIX_CONNECT_QUEUE_CAPACITY` is 64, and a
+    /// real `xfce4-session` boot's ~28+ processes each racing several D-Bus/X11 connect attempts
+    /// under real host-RAM pressure (this same investigation's own measured ~8.5GB->under-1GB-in-
+    /// <90s cost) is exactly the shape that could exhaust it well before the fork family ever
+    /// exits, permanently `EAGAIN`-ing every later connect to an otherwise perfectly healthy
+    /// listener. Safe to drain here rather than call [`SharedUnixConnTable::free`] directly:
+    /// constructing this side's own [`UnixConnectedStream`] and immediately dropping it defers to
+    /// [`ConnTransport`]'s existing Drop-based both-sides-shut-down bookkeeping (the SAME path a
+    /// synchronously-completed connect that the caller immediately closes already goes through),
+    /// so the slot is only actually freed once the listener's own side ALSO later closes --
+    /// calling `free()` straight from here would race a listener still genuinely using the slot.
+    fn cancel<Platform: ShimPlatform, FS: ShimFS>(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        peer_addr: &UnixSocketAddr,
+        idx: usize,
+    ) {
         let req = &self.requests[idx];
-        let _ = req
+        if req
             .state
-            .compare_exchange(REQ_PENDING, REQ_EMPTY, Ordering::AcqRel, Ordering::Acquire);
+            .compare_exchange(REQ_PENDING, REQ_EMPTY, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+        // Lost the race: the listener's `try_claim` already moved this request to `REQ_CLAIMED`.
+        // Its own `complete()` call is a handful of instructions later, never a real wait, so a
+        // bounded spin (not a blocking wait -- no genuine cross-process wakeup exists for this,
+        // matching every other consumer of this queue) is the correct tool here.
+        for _ in 0..100_000 {
+            if req.state.load(Ordering::Acquire) == REQ_ACCEPTED {
+                let conn_slot = req.conn_slot.load(Ordering::Relaxed);
+                req.state.store(REQ_EMPTY, Ordering::Release);
+                if conn_slot != u32::MAX {
+                    litebox_util_log::debug!(
+                        idx:% = idx, conn_slot:% = conn_slot;
+                        "SharedUnixConnectQueue::cancel: lost the claim race, draining the \
+                         abandoned conn_slot instead of leaking it"
+                    );
+                    let server_cred = global.unix_shared_conn_table.get(conn_slot).server_cred();
+                    // Constructed only to be dropped immediately -- see this fn's own doc comment
+                    // for why this, not a direct `free()`, is the safe way to release it.
+                    drop(UnixConnectedStream::<Platform, FS>::new_shared(
+                        global.clone(),
+                        conn_slot,
+                        true,
+                        UnixSocketAddr::Unnamed,
+                        peer_addr.clone(),
+                        server_cred,
+                    ));
+                }
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        litebox_util_log::warn!(
+            idx:% = idx;
+            "SharedUnixConnectQueue::cancel: listener claimed this request but never completed \
+             it within a bounded spin -- leaking this slot (existing degrade-not-panic \
+             philosophy, self-healing once the whole fork family exits)"
+        );
     }
 }
