@@ -3226,6 +3226,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "clone: cross-process fork() copy plan"
         );
 
+        // Diagnostic-only (pass 78, `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`, off by default,
+        // read-only, no behavior change) -- the cross-process-fork twin of the thread-based
+        // classification above `do_clone`'s in-process `Vmem::duplicate` call site emits; see
+        // that one's own doc comment for the full rationale. Here `total_bytes` above already
+        // covers the GROUP span (64KiB-granule-widened, so it can include unmapped padding
+        // between regions); this classification instead sums each individual per-VMA `layout`
+        // length, so `file_ro_bytes + file_rw_bytes + anon_bytes` undercounts `total_bytes` by
+        // exactly that padding, not by double-counting or missing a region.
+        if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+            let mut file_ro_bytes: u64 = 0;
+            let mut file_ro_regions: u64 = 0;
+            let mut file_rw_bytes: u64 = 0;
+            let mut anon_bytes: u64 = 0;
+            let mut guard_bytes: u64 = 0;
+            for (range, flag_bits, is_file_backed) in &layout {
+                let len = (range.end - range.start) as u64;
+                let f = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
+                if f.intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS).is_empty() {
+                    guard_bytes += len;
+                } else if *is_file_backed && !f.contains(litebox::mm::linux::VmFlags::VM_WRITE) {
+                    file_ro_bytes += len;
+                    file_ro_regions += 1;
+                } else if *is_file_backed {
+                    file_rw_bytes += len;
+                } else {
+                    anon_bytes += len;
+                }
+            }
+            let copied_total = file_ro_bytes + file_rw_bytes + anon_bytes;
+            let skippable_pct = if copied_total > 0 {
+                file_ro_bytes * 100 / copied_total
+            } else {
+                0
+            };
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(),
+                file_ro_bytes:% = file_ro_bytes,
+                file_ro_regions:% = file_ro_regions,
+                file_rw_bytes:% = file_rw_bytes,
+                anon_bytes:% = anon_bytes,
+                guard_bytes:% = guard_bytes,
+                copied_total:% = copied_total,
+                skippable_pct:% = skippable_pct;
+                "[fork_vma_breakdown] cross-process fork() copy-plan classification"
+            );
+        }
+
         let group_relocations: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = groups
             .into_iter()
             .map(|g| {
@@ -3984,6 +4031,63 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 (Arc::new(dest_pm), relocations)
             };
+            // Diagnostic-only (pass 78, `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`, off by default,
+            // read-only, no behavior change): classifies every byte this fork's `Vmem::duplicate`
+            // eager-copy loop (`litebox/src/mm/linux.rs`) just wrote, to quantify the 77th pass's
+            // shared-library-COW theory (AGENTS.md "Where things stand") with a real number
+            // instead of a guess -- BEFORE any fix to the copy loop is attempted. `VM_SHARED`
+            // ranges are excluded (already re-mapped, not byte-copied, by `duplicate()`); a
+            // `PROT_NONE` range is excluded too (no `VM_ACCESS_FLAGS` bit set -- `duplicate()`
+            // never reads/writes its bytes, see that function's own `PROT_NONE` branch). Of what
+            // remains: `file_backed && !VM_WRITE` is the exact class the proposed fix would skip
+            // copying (a read-only file-backed mapping -- ELF `.text`/`.rodata` reached via
+            // `MAP_PRIVATE`, whose bytes are already available from the rootfs's own `mmap`);
+            // everything else (`file_backed && VM_WRITE` -- ELF `.data`/`.got`/`.bss`; and
+            // anonymous -- heap/stack/thread-arena) is memory this fork must keep copying
+            // regardless of any such fix.
+            if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+                let mut file_ro_bytes: u64 = 0;
+                let mut file_ro_regions: u64 = 0;
+                let mut file_rw_bytes: u64 = 0;
+                let mut anon_bytes: u64 = 0;
+                let mut shared_bytes: u64 = 0;
+                let mut guard_bytes: u64 = 0;
+                for (range, flag_bits, is_file_backed) in relocations.vma_layout() {
+                    let len = (range.end - range.start) as u64;
+                    let f = VmFlags::from_bits_truncate(flag_bits);
+                    if f.contains(VmFlags::VM_SHARED) {
+                        shared_bytes += len;
+                    } else if f.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty() {
+                        guard_bytes += len;
+                    } else if is_file_backed && !f.contains(VmFlags::VM_WRITE) {
+                        file_ro_bytes += len;
+                        file_ro_regions += 1;
+                    } else if is_file_backed {
+                        file_rw_bytes += len;
+                    } else {
+                        anon_bytes += len;
+                    }
+                }
+                let copied_total = file_ro_bytes + file_rw_bytes + anon_bytes;
+                let skippable_pct = if copied_total > 0 {
+                    file_ro_bytes * 100 / copied_total
+                } else {
+                    0
+                };
+                litebox_util_log::warn!(
+                    tid:% = self.tid.get(),
+                    child_tid:% = child_tid,
+                    file_ro_bytes:% = file_ro_bytes,
+                    file_ro_regions:% = file_ro_regions,
+                    file_rw_bytes:% = file_rw_bytes,
+                    anon_bytes:% = anon_bytes,
+                    shared_bytes:% = shared_bytes,
+                    guard_bytes:% = guard_bytes,
+                    copied_total:% = copied_total,
+                    skippable_pct:% = skippable_pct;
+                    "[fork_vma_breakdown] thread-based fork() eager-copy classification"
+                );
+            }
             // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a
             // no-op on every platform except `litebox_platform_windows_userland`, and a no-op
             // there too unless the env var is set. Runs on the PARENT's own thread, right after
