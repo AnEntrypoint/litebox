@@ -2278,3 +2278,147 @@ confirmed genuinely quiet per the standing RAM-budget lesson -- not attempted by
 Logs for this pass: `.wfgy/pass64_dbus_trace_run1.log` (65MB+, gitignored, debug binary,
 full `process/signal=trace,net/unix=debug` trace covering the fork/exec/kill window for pids
 39/40/19372 and 4 other same-shaped babysitter kills at pids 46/57/77/96).
+
+## 64th pass, continued (2026-09-23) -- the same-day fallback pickup: an exact fd and protocol
+step isolated for `xfwm4`'s own hang -- the most concrete `DE_FAILED` lead of the whole investigation
+
+Having closed off the dbus-daemon-babysitter lead above as unconnected, proceeded immediately to
+this pass's own recorded fallback (byte-level trace of `xfwm4`'s own D-Bus fd) rather than stopping
+at the dead end, per this project's own standing instruction.
+
+### Method
+
+Rebuilt nothing (no code changed this pass); re-ran `de_only_xcensus` on the RELEASE binary (faster
+than debug, and a log-level trace does not need `cdb`-grade symbols) with
+`LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error,litebox_shim_linux::
+syscalls::process=debug,litebox_shim_linux::syscalls::net=debug` -- deliberately OMITTING
+`syscalls::unix=debug` this run (AGENTS.md's own standing cost note: 150-300MB/minute, impractical
+past ~15s) on the discovery that `net.rs`'s own `sys_recvfrom`/`sys_sendto`/`sys_recvmsg` logging
+already captures AF_UNIX stream-socket traffic just fine (confirmed: `xfconfd`'s own SASL handshake
+in the 64th pass's first half appeared entirely under `syscalls::net`, never `syscalls::unix`) --
+this makes a full 60s+ boot's trace tractable where a `unix=debug` one would not be. Let the boot
+run all the way to a fresh `DE_FAILED` (confirmed: `WM_S0` owner `0x40008e`, `_NET_SUPPORTING_
+WM_CHECK=''`, byte-for-byte the same symptom as every prior pass), then killed it via
+`Invoke-CimMethod -MethodName Terminate`.
+
+### Identifying `xfwm4`'s own pid
+
+`grep -n "argv0=.*xfwm4"` on the fresh log shows the real PATH-search shape directly: FOUR failed
+`sys_execve`/`ENOENT` attempts (`/lsiopy/bin/xfwm4`, `/usr/local/sbin/xfwm4`, `/usr/local/bin/
+xfwm4`, `/usr/sbin/xfwm4`) followed by the real one, `/usr/bin/xfwm4`, `DIAG resolve_shebang: open
+result result=Ok(())` -- all logged under the SAME `tid`/`pid` (`20900` this run; NOT stable across
+boots, re-identify fresh every time). From here on, exact-token `grep -n "tid=20900"` (never a line-
+number window -- see the interleaving-hazard note in this file's earlier 64th-pass section) gives a
+strictly-ordered view of this one guest thread's own life.
+
+### The two D-Bus connections, byte for byte
+
+`xfwm4` opens exactly two AF_UNIX stream sockets over its whole traced life:
+
+```
+0.567994400s  sys_socket tid=20900 domain=1 type_and_flags=524289          (0x80001 = SOCK_STREAM|SOCK_CLOEXEC)
+   ... connects, AUTH EXTERNAL, BEGIN by 1.905449300s ...
+1.921538300s  sys_sendmsg tid=20900 fd=5 preview="[6c, 01, 01, 01, 59, ..."   (real D-Bus METHOD_CALL frames)
+1.921577600s  sys_sendmsg tid=20900 fd=5 preview="[6c, 01, 01, 01, 64, ..."
+1.921616100s  sys_sendmsg tid=20900 fd=5 preview="[6c, 01, 01, 01, 6f, ..."
+3.159553600s  sys_sendmsg tid=20900 fd=5 preview="[6c, 01, 00, 01, 30, ..."   (still alive, still working, later)
+
+3.314259900s  sys_socket tid=20900 domain=1 type_and_flags=526337          (0x80801 = SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK)
+3.314401200s   WARN [unix_addr_presence] ECONNREFUSED but address IS bound, by a DIFFERENT guest pid
+               self_pid=20900 owner_pid=18636                              (the already-known cross-process
+                                                                              AF_UNIX visibility gap, recovers)
+3.343274800s  sys_getsockopt tid=20900 sockfd=8 optname=Socket(ERROR) result=Ok(4)   (SO_ERROR poll after connect)
+3.343896200s  sys_sendto   tid=20900 fd=8 len=6  preview="AUTH\r\n"
+3.358968100s  sys_recvfrom tid=20900 fd=8 len=4096 preview="REJECTED ..."
+3.359018600s  sys_sendto   tid=20900 fd=8 len=15 preview="AUTH EXTERNAL\r\n"
+3.390432300s  sys_recvfrom tid=20900 fd=8 len=4096 preview="DATA\r\n"
+3.390486000s  sys_sendto   tid=20900 fd=8 len=6  preview="DATA\r\n"
+3.405571700s  sys_recvfrom tid=20900 fd=8 len=4096 preview="OK ..."
+3.405630300s  sys_sendto   tid=20900 fd=8 len=19 preview="NEGOTIATE_UNIX_FD..." (truncated in log)
+3.421008900s  sys_recvfrom tid=20900 fd=8 len=4096 preview="AGREE_UNIX_FD\r\n"
+3.421077200s  sys_sendto   tid=20900 fd=8 len=7  preview="BEGIN\r\n"
+   [[ ZERO further sendto/sendmsg/recvfrom/recvmsg on fd=8, for tid=20900, for the rest of the entire boot ]]
+```
+
+`fd=5` (blocking, no `SOCK_NONBLOCK`) is the FIRST connection `xfwm4` opens -- almost certainly its
+own GApplication/session-registration bus connection (opened well before any xfconf activity would
+plausibly start) -- and it demonstrably WORKS: real binary D-Bus `METHOD_CALL` frames go out and the
+process keeps functioning normally on it through at least t=3.16s.
+
+`fd=8` (NON-blocking, `SOCK_NONBLOCK` set) is a SECOND, separate connection opened later, at
+t=3.314s -- the timing (right as `xfwm4` would be past its early X11/window setup and into
+`initSettings()`) and the fact that it is a distinct connection at all (real GDBus normally caches
+and reuses ONE session-bus connection per process via `g_bus_get_sync`'s own internal singleton,
+so a genuinely SECOND connection appearing is itself notable) both point at this being
+`xfconf_init()`'s own `g_bus_get_sync` call, opened from a different code path or main-context than
+whatever set up `fd=5`. This connection's `connect()` hits the exact, already-documented
+`unix_addr_presence` cross-process visibility gap (self_pid=20900, owner_pid=18636 -- the real
+dbus-daemon) before litebox's `SharedUnixAddrPresenceTable`-based recovery lets it proceed. It then
+completes ITS OWN full SASL handshake correctly, all the way through `BEGIN` at t=3.421077200s --
+and then goes completely, permanently silent. Real GDBus's very next step after `BEGIN` is its own
+internal, mandatory `org.freedesktop.DBus.Hello` call (required before ANY other traffic on a fresh
+connection) -- if that call, or anything before it, never gets issued, `xfconf_init()` (and
+everything downstream of it, including `xfwm4`'s own `loadSettings()`/`setNetSupportedHint()`)
+would hang exactly like this: forever, silently, with no error to print.
+
+Corroborating: from t=9s onward, `tid=20900`'s own activity across the ENTIRE REST OF THE LOG
+(traced past `DE_FAILED` at t=60s+) reduces to a single sparse `futex WAKE` roughly every 10-20
+seconds (t=20.8s, 31.6s, 43.1s, 54.2s, 65.5s, 77.4s, 89.0s -- a GLib timeout-source heartbeat, not
+real work of any kind) -- exactly the signature of a process with a healthy main loop that has
+nothing left to actually service, matching "silently parked forever waiting on one dead fd" far
+more precisely than any prior pass's "somewhere inside `initSettings()`" framing.
+
+### Working theory for the next pass (NOT yet confirmed)
+
+`fd=8` is `SOCK_NONBLOCK` -- unlike `fd=5`, GDBus cannot just synchronously block on `send`/`recv`
+for this connection's OWN internal `Hello` handshake; it MUST register an epoll/poll interest and
+wait for a real readiness notification to know when it can write (or that a reply arrived) even for
+this very first internal call. If the non-standard ECONNREFUSED-then-retry connect path this fd
+took leaves its readiness/epoll-interest bookkeeping in a subtly incomplete state (compared to a
+normal, clean, first-attempt connect like `fd=5`'s), `xfwm4` would legitimately, correctly (from its
+own code's perspective) block forever in `epoll_wait`/`poll()` for an event litebox's shim never
+delivers -- with no error, no timeout, and nothing to print, matching every single observed symptom
+across all of the 60th-64th passes exactly. This is squarely the same DEFECT CLASS the 26th pass
+already found and fixed once, in a different call site
+(`EpollFile::repoll_stdin_and_timerfd_interests` reading `is_still_ready` instead of
+`event.is_some()`, always false for `EPOLLET`) -- not a wild guess, a recurrence of a known bug
+shape. NOT yet proven: this pass did not layer `syscalls::unix=debug`/`syscalls::epoll=debug` onto
+the same filtered trace (to keep the log tractable for a full-length boot), so `fd=8`'s actual
+`epoll_ctl` registration (if any) and its interest-flag state over time were not directly observed
+this pass.
+
+### Explicit non-actions this pass, and why
+
+- Did NOT layer `unix=debug`/`epoll=debug` onto this run -- the goal was a full-length trace to
+  `DE_FAILED` to see `xfwm4`'s ENTIRE post-stall lifetime (the sparse-heartbeat corroboration above
+  needed that), which the heavier filters would have made impractical past ~15s per AGENTS.md's own
+  cost note. A dedicated, SHORTER follow-up run (kill well before `DE_FAILED`, once `fd=8`'s own
+  socket number is confirmed stable-ish for this exact harness) is the right next step.
+- Did NOT modify any code -- the epoll/readiness theory is plausible and well-motivated but NOT
+  proven; patching `EpollFile`/`SharedUnixConnectQueue` on a theory alone would violate this
+  project's own "verify before fixing" discipline.
+- Did NOT attempt `cdb -pv` on `xfwm4` this pass -- the log-based fd/protocol-step isolation above
+  is strictly more informative per unit of RAM/wall-clock risk than a live attach would have been,
+  and is now the better-motivated next-next step once this specific epoll theory is checked first.
+
+### Precise pickup for the next pass
+
+Re-run `de_only_xcensus` (release binary is fine) with `syscalls::{process,net,unix,epoll}=debug`
+-- accept the log-volume cost by killing the boot manually once `xfwm4`'s own second (`SOCK_
+NONBLOCK`) D-Bus fd's `BEGIN` line appears (identify `xfwm4`'s pid fresh each run via its own
+`DIAG_TIMELINE execve`/PATH-search lines, it is not stable) rather than letting it run to
+`DE_FAILED`. Check specifically: does `epoll_ctl(ADD, fd=<that fd>, ...)` ever get called for this
+connection: what interest flags, and does `EpollFile`'s own readiness bookkeeping for it (`unix.rs`/
+`epoll.rs`) ever transition to ready afterward. If the registration never happens at all, the bug is
+upstream of epoll entirely (in the connect-retry path's own return value/fd state, `unix.rs`'s
+`SharedUnixConnectQueue`/`unix_addr_table`). If it registers but never reports ready, the bug is in
+`EpollFile`'s interest-tracking for a connection that came up via the ECONNREFUSED-retry path
+specifically (compare against `fd=5`'s clean-connect equivalent state as a control). Cross-reference
+real `xfce-mirror/xfconf` source (`xfconf/xfconf.c`, already fetched and read this pass -- confirms
+`xfconf_init()` itself does not force activation; the first REAL method call on the channel proxy
+does, via ordinary ownerless-name GDBus semantics) if the epoll theory is refuted, to fall back to
+the previously-recorded pickup (byte-level cross-reference against `xfconf_channel_new`'s exact call
+sequence) instead.
+
+Logs for this pass: `.wfgy/pass64_xfwm4_trace_run1.log` (release binary, `process/net=debug`, full
+boot to `DE_FAILED`, gitignored).
