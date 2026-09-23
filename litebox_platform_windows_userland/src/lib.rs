@@ -12253,7 +12253,27 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         if pid == 0 {
             return None;
         }
-        let tar_path = std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR)?;
+        // 75th pass: mirror the CHILD's own export-path-naming fallback exactly (see the
+        // `diag_process_fork_task_resume_probe` export call in the runner crate, which computes
+        // `tar_path_for_naming` the same way) -- `FORK_CHILD_TAR_PATH_ENV_VAR` is only ever set
+        // for an `--initial-files` boot (deliberately left unset for `--oci-image`, see that env
+        // var's own doc comment: "no single on-disk tar file exists to remount"), so the old
+        // bare `?` here made this function return `None` UNCONDITIONALLY on every `--oci-image`
+        // boot -- meaning `import_cross_process_writable_layer` never imported ANY cross-process
+        // fork child's writable-layer changes back into the parent on ANY OCI-image boot, ever.
+        // Confirmed live as a real defect, not a hypothetical one: a minimal repro (`bash -c
+        // 'mkdir -p /tmp/t2; ls -la /tmp/t2'` under `LITEBOX_PROCESS_FORK=1 --oci-image ...`)
+        // shows `mkdir` reporting success (exit 0) and the VERY NEXT sibling fork's `ls`
+        // immediately reporting `No such file or directory` for the same path, deterministically,
+        // for both `debian:stable-slim` and `linuxserver/webtop:debian-xfce` -- i.e. every
+        // OCI-image boot this whole investigation has ever exercised. Without the fallback below,
+        // the two sides silently disagree on the export filename's stem (child: `"oci-image"`;
+        // parent: nothing, so it never even tries to read one) and every sibling fork's writes
+        // are lost the moment that fork's process exits.
+        let tar_path = std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR).or_else(|| {
+            std::env::var_os(process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR)
+                .map(|_| std::ffi::OsString::from("oci-image"))
+        })?;
         let export_path =
             process_fork::cross_process_writable_export_path(std::path::Path::new(&tar_path), pid);
         let bytes = std::fs::read(&export_path).ok()?;
