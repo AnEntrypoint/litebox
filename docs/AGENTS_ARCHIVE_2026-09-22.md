@@ -1909,3 +1909,188 @@ state for a specific path right before/after the suspect `migrate_entry_up_for_m
 minimal non-desktop repro, to avoid the 28-process RAM cost of a full boot). (4) Budget RAM exactly as
 the 61st pass documented (~8.5GB -> under 1GB within 90s on `de_only.sh` alone) -- this pass hit the
 same cliff 4 times and killed cleanly each time via `Invoke-CimMethod -MethodName Terminate`.
+
+## 63rd pass (2026-09-23) -- the `/defaults/xfce/` readdir hypothesis REFUTED; `DE_FAILED`
+reconfirmed; one new concrete lead on the real blocker
+
+**Task**: root-cause and fix the 62nd pass's own `/defaults/xfce/`-appears-empty-to-a-later-forked-
+child hypothesis (Track B item 2b), matching this project's own "verify before fixing" discipline --
+build an isolated repro first, then check whether fixing it actually resolves `xfwm4`'s `DE_FAILED`
+hang via the same X11-census ground truth the 62nd pass established.
+
+### Reading `litebox/src/fs/layered.rs` (full file, both halves)
+
+The layered filesystem caches a path's classification (`EntryX::Upper`/`EntryX::Lower`/`Tombstone`)
+in `self.root: RwLock<RootDir>` on first `open()`. `read_dir`'s two branches (line ~1704):
+- `EntryX::Lower { fd }` -- "the easy case", delegates straight to `self.lower.read_dir(fd)`, no
+  union needed since (by the caching invariant) no upper entry exists for this path.
+- `EntryX::Upper { fd }` -- gets `self.upper.read_dir(fd)`, THEN tries `self.lower.open(path,
+  RDONLY, empty())` + `self.lower.read_dir(&lower_fd)` and unions the two, silently keeping
+  upper-only entries if the lower open/read_dir fails (`if let Ok(...)`, no error surfaced).
+
+`migrate_entry_up_for_metadata`'s directory branch (line ~423-470, reached from `chmod`/`chown`/
+`set_times` on a lower-only directory) creates an EMPTY upper-layer `mkdir` shadow (carrying the
+lower's mode/node-info, never its children) WITHOUT touching `self.root`'s cache for that path.
+`mkdir_migrating_ancestor_dirs` does the same thing for every ANCESTOR directory of a newly-created
+file under a lower-only tree (`open(..., O_CREAT)`, `mkdir`, `rename`, `link`, `symlink`,
+`make_fifo` all funnel through it). Both are the two natural, real ways an upper-layer directory
+shadow gets created over a still-lower-only directory during a real boot -- matching the 62nd pass's
+own framing exactly.
+
+Traced `litebox/src/fd/mod.rs`'s `RawDescriptorStorage::fork_duplicate` doc comment and confirmed:
+`self.litebox.descriptor_table()` (the `TypedFd` table `layered.rs`'s cached `EntryX::Lower`/
+`EntryX::Upper` entries index into) is a single GLOBAL table per `LiteBox` instance, not per-process
+-- ruling out a "stale foreign fd index" theory for THIS specific cache. What actually differs
+across a cross-process fork is that `spawn_cross_process_fork_child` REBUILDS THE ENTIRE ROOTFS FROM
+SCRATCH per forked child: re-parses the cached OCI-image tars (deterministic, byte-identical every
+time) and IMPORTS the parent's writable (upper) layer from a fresh tar-export snapshot
+(`litebox-container-fs-<pid>.tar`, confirmed live in every boot's own `[process_fork_diag]
+globalstate-probe (child): adopted the parent's writable layer from ...` line). So the CHILD's
+`layered::FileSystem.root` cache starts genuinely EMPTY (not a stale copy of the parent's) -- any
+upper-layer directory shadow the parent already created is inherited only via the freshly-imported
+TAR SNAPSHOT, and the child's very first `open()` of that path re-classifies it fresh (tries
+`self.upper.open()` first, finds the imported empty shadow, takes the `EntryX::Upper` branch, and
+must genuinely re-run the lower-open+union merge itself).
+
+### Isolated repro (before touching any code)
+
+Built a minimal script (`debian:stable-slim`, avoiding the larger webtop image, since the general
+shape of the bug -- not the specific `/defaults/xfce` path -- is what needs testing) that:
+1. `ls -a $DIR | wc -l` on `/etc` (50 entries, purely lower-layer at this point).
+2. `touch $DIR` (metadata op directly on the directory -- the `migrate_entry_up_for_metadata`
+   trigger) -- re-`ls` in the SAME process, then again in an explicitly forked (`( ... ) &`)
+   subshell.
+3. Separately, `: > $DIR2/trig_newfile` under `/usr/share/doc` (80 entries) -- the
+   `mkdir_migrating_ancestor_dirs` trigger via new-file-creation -- re-`ls` same-process and forked.
+4. A second run repeated step 2 with a GRANDCHILD (nested `( ( ... ) & wait ) & wait`) fork instead
+   of a single level, to more closely match `xfce4-session` forking `xfconfd`/dbus helpers which are
+   themselves forked children of a forked child.
+
+All under `LITEBOX_PROCESS_FORK=1` (host env var, current release binary, `target/release/
+litebox_runner_linux_on_windows_userland.exe`, mtime postdates commit `1522918`). Four separate
+boots, zero crashes, fully consistent results:
+- `/etc`: 50 (early) -> 50 (same-proc after touch) -> 50 (forked child after touch) -> 50
+  (grandchild after touch). Never empty, never wrong.
+- `/usr/share/doc`: 80 (early) -> 81 (same-proc after creating `trig_newfile`) -> 81 (forked child)
+  -- correctly INCLUDES the new file, not just the untouched lower content.
+
+A control run WITHOUT `LITEBOX_PROCESS_FORK=1` (default thread-based fork, even with the
+`GLIBC_TUNABLES` workaround `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0`)
+crashed on the very FIRST forked `ls` (`SIGABRT`/`SIGSEGV`, tcache corruption) -- confirming
+AGENTS.md's own characterization that the thread-based path's SECOND corruption signature (Track B,
+distinct from ADVISORY-001 3N, NOT fixed by the tunable) makes it currently unusable for testing
+ANY multi-fork hypothesis via subprocess forking. This means the isolated repro could only exercise
+the cross-process path -- a real scope limitation of this pass's negative result, noted honestly
+rather than glossed over.
+
+### Real production re-test
+
+Re-ran the 62nd pass's own `.wfgy/de_only_xcensus_run3.ps1` harness verbatim (copied to `run5.ps1`/
+`run5.log`, same `--resume-from .wfgy/de_only_xcensus_seed2.tar`, same real
+`docker.io/linuxserver/webtop:debian-xfce` image, `LITEBOX_PROCESS_FORK=1`, current rebuilt release
+binary). Converted the UTF-16LE log with `iconv -f UTF-16LE -t UTF-8` per AGENTS.md's own standing
+lesson. The `[s] XFCONF_DEFAULTSDIR >>>total 0` marker line the 62nd pass's own quick read stopped
+at is followed, in the SAME `$(...)`-captured multi-line block, by:
+
+    drwxrwxrwx 1 root root 4096 Jan  1  1970 .
+    drwxrwxrwx 1 root root 4096 Jan  1  1970 ..
+    -rw-r--r-- 1 root root 2267 Jan  1  1970 xfce4-panel.xml
+    -rw-r--r-- 1 root root 5437 Jan  1  1970 xfwm4.xml
+    -rw-r--r-- 1 root root 1907 Jan  1  1970 xsettings.xml
+
+i.e. `/defaults/xfce/` has its correct 3 files, read well into the boot (after `dbus-daemon`, after
+multiple prior forked children, at the exact point `de_only.sh`'s own diagnostic checks it). "total
+0" is `ls -la`'s ordinary leading block-count summary line, NOT an entry count -- a real, simple
+misreading in the 62nd pass's own quick pass over the log, not a real litebox bug. `XFCONF_USERDIR`
+(the destination of the earlier `cp /defaults/xfce/* ...` copy) shows the identical 3 files too,
+confirming the copy itself succeeded correctly as well.
+
+**Conclusion**: the layered-fs `read_dir` upper/lower merge is NOT broken, under the cross-process
+fork path, for either natural upper-shadow-creation trigger, across 4 isolated boots AND the real
+production boot. This is treated as a genuine, valuable NEGATIVE result per this project's own
+stated policy -- not forced into "fixed" when the evidence says otherwise. (Scope honestly
+acknowledged: the thread-based fork path remains untested for this hypothesis, blocked by its own
+separate, already-known, unrelated crash bug.)
+
+### `DE_FAILED` reconfirmed fresh, byte-for-byte the same symptom
+
+The same `run5` boot's own `WM_POLL`/`XCENSUS` loop (identical harness the 61st/62nd passes used):
+`WM_POLL n=1-2` "no such atom on any window", `n=3-12` "not found", `DE_FAILED after 60s`. The
+`XCENSUS` ground-truth census at `n=8`/`n=12` shows **25 real windows**: `xfce4-session.Xfce4-
+session`, `xfwm4.Xfwm4` (x2, one of them the tiny 5x5 WM-selection window at `0x40008e`),
+`xfsettingsd.Xfsettingsd`, `xfce4-panel.Xfce4-panel` (x3), `thunar-real.Thunar-real`, `wrapper-2.0.
+Wrapper-2.0` (x2), `xfdesktop.Xfdesktop` (x4, including a real 200x200 "Desktop" window) -- every
+real XFCE session component is genuinely alive and has created its windows. `XCENSUS_SELECTION
+WM_S0 owner=0x40008e` confirms `xfwm4` DOES own the window-manager selection (matching the 62nd
+pass's finding). `XCENSUS_ROOTPROP _NET_SUPPORTING_WM_CHECK=''` confirms `setNetSupportedHint()`
+is STILL never reached. Byte-for-byte the same blocker as the 61st/62nd passes, unaffected by
+anything this pass touched (as expected, since nothing was actually changed in `layered.rs`).
+
+### New lead: a second `dbus-daemon` gets `SIGKILL`ed right after a thread-based-fork fallback
+
+In the SAME `run5` log, at guest-relative t~17.618-18.267s (inside one particular forked child's own
+execution), three consecutive events:
+1. `17.618s WARN ... unsupported feature=getsockopt(level = 1, optname = 77/31/59)` (harmless,
+   unrelated `getsockopt` gaps, logged elsewhere in the same window too).
+2. `17.710s`/`17.847s WARN litebox_shim_linux::syscalls::process: clone: cross-process fork() not
+   eligible -- these fd subsystems cannot cross the process boundary yet ... kinds=["unix-socket-
+   pair(addressless,pre-exec-IPC)"] ...` -- TWO separate fork attempts, both forced onto the
+   thread-based fallback specifically because they hold a pre-exec addressless `socketpair(2)` fd
+   (the exact kind `raw_fd_is_addressless_unix_socket_pair` (54th pass) refuses to carry, matching
+   AGENTS.md's own standing lesson about `dbus-daemon`'s babysitter pattern).
+3. `18.267340700s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task
+   signal=Signal(9) pid=38 tid=38 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, ...]`
+   -- `comm` decodes to literally `"dbus-daemon\0"`. A `dbus-daemon` process, NOT the main
+   `--nofork` session bus de_only.sh itself started (which is independently confirmed alive
+   throughout via the successful `DBUS_LISTNAMES`/`DBUS_XFCONF_PROBE` calls elsewhere in the exact
+   same log) and NOT `xfconfd` (also independently confirmed alive via its own successful
+   `Introspect` reply), is killed by `SIGKILL` roughly 0.4-0.6s after falling onto the thread-based
+   fork fallback.
+
+This is a genuinely new, precisely-timestamped, previously-unrecorded observation. Plausible
+(NOT yet confirmed) causal link to `xfwm4`'s own hang: if this second `dbus-daemon` is a D-Bus
+service-activation helper (or a `dbus-launch`-style spawn triggered by something in the XFCE
+startup chain) that libxfconf/xfconfd's own machinery depends on, its crash -- landing in the
+already-known-crash-prone thread-based-fork territory (ADVISORY-001 3N-adjacent, a SEPARATE
+mechanism from anything this pass touched) -- could leave a GDBus method call from
+`xfconf_channel_new`/`initSettings()` waiting forever for a reply that will never arrive, with no
+error ever surfaced to `xfwm4` (matching the zero-stderr observation the 62nd pass already made).
+Equally plausible: this is an unrelated, parallel failure with no bearing on `xfwm4` at all. NOT
+resolved this pass either way -- flagged as the single most concrete, actionable next step, ahead of
+attempting a `cdb -pv` attach on `xfwm4` itself (which no pass has yet attempted and which needs
+genuinely quiet host RAM per the 32nd-35th passes' own repeated documented failures to get one).
+
+### Explicit non-actions this pass, and why
+
+- Did NOT modify `layered.rs` -- the evidence does not support a real defect there for either tested
+  trigger; patching code with no reproducing bug would be exactly the "patch over" behavior this
+  project's own standing instructions forbid.
+- Did NOT attempt the full `webtop_stack.sh` (nginx+selkies) boot or any browser/screenshot
+  verification -- `DE_FAILED` is unchanged from the 61st/62nd passes' own state, so a full-stack
+  attempt would cost real RAM/wall-clock for no new information until the actual blocker moves.
+- Did NOT attempt a `cdb -pv` attach on `xfwm4` or the crashed `dbus-daemon` -- both are real,
+  valuable next steps but a distinct, substantial undertaking (this project's own history shows
+  several PRIOR passes failing to even get a clean `cdb` attach window due to host RAM pressure
+  during the Xvfb-crash investigation) better scoped as its own dedicated pass.
+
+### Precise pickup for the next pass
+
+1. Identify who forks the second `dbus-daemon` (pid=38/tid=38 in this run) and why -- grep the SAME
+   boot's `execve`/`clone` trace (`litebox_shim_linux::syscalls::process=debug`) for the parent pid
+   of tid=38/tid=20012 (the two `clone: not eligible` warnings immediately preceding the kill), and
+   check whether it is anywhere in `xfce4-session`'s or `xfconfd`'s own process tree, or is a
+   fully independent `dbus-launch`/system-bus-activation artifact with no bearing on `xfwm4`.
+2. If it IS on `xfwm4`'s dependency chain: the fix is very likely in making a bare `dbus-daemon`
+   activation-helper fork survive the thread-based fallback (a narrower, more tractable problem
+   than the general Track B thread-fork tcache corruption, since only ONE specific spawn shape is
+   implicated) -- or in making `unix-socket-pair(addressless,pre-exec-IPC)` forks eligible for
+   cross-process fork after all (carrying the socketpair, not dropping or refusing it).
+3. If it is NOT on the chain: proceed to the previously-recorded pickup -- a byte-level trace of
+   `xfwm4`'s own D-Bus fd specifically, cross-referenced against real `libxfconf` source
+   (`github.com/xfce-mirror/xfconf`, still not fetched by any pass to date), or a genuine `cdb -pv`
+   attach on `xfwm4` itself breaking on `getenv`/`XOpenDisplay`-adjacent GDBus call sites, attempted
+   only once host RAM is confirmed genuinely quiet per the standing RAM-budget lesson.
+
+Logs for this pass: `.wfgy/de_only_xcensus_run5.log`/`_utf8.log` (real production re-test),
+scratchpad `readdir_repro1.log` through `repro4.log` (isolated repro; repro1 is the
+thread-based-fork-crash control, repro2-4 are the cross-process-fork clean results).
