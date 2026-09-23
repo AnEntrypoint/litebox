@@ -12136,13 +12136,22 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         &self,
         handle: litebox::platform::CrossProcessChildHandle,
     ) -> u32 {
+        // Pass 59: `handle.0` is the child TASK's initiating THREAD handle (registered by
+        // `spawn_cross_process_fork_child`, `lib.rs`), not the Windows PROCESS handle this used
+        // to be -- waiting on the whole process silently never signals once the child spawns any
+        // further OS thread of its own that outlives the original task (see
+        // `process_fork::wait_for_thread_exit`'s doc comment for the full mechanism and the real
+        // `ssh-agent` case that surfaced it). `diagnostic_cross_process_wait4_probe`'s own
+        // self-test is the one remaining PROCESS-handle producer/consumer pair, deliberately kept
+        // on the separate `process_fork::wait_for_process_exit`/`try_wait_for_process_exit`
+        // functions -- never routed through here.
+        //
         // Safety: `handle.0` is a `HANDLE` value registered via `Process::register_cross_process_child`,
-        // which only ever receives a real, currently-open process handle (see
-        // `diagnostic_cross_process_wait4_probe`, this pass's only producer) not yet closed --
+        // which only ever receives a real, currently-open thread handle here, not yet closed --
         // the registry entry's removal (`sys_wait4`'s `reap_cross_process_child`) is the only
         // thing that ever invalidates it, and that always happens strictly after this call.
         unsafe {
-            process_fork::wait_for_process_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
+            process_fork::wait_for_thread_exit(handle.0 as windows_sys::Win32::Foundation::HANDLE)
         }
     }
 
@@ -12152,7 +12161,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     ) -> Option<u32> {
         // Safety: same contract as `wait_for_cross_process_exit` above.
         unsafe {
-            process_fork::try_wait_for_process_exit(
+            process_fork::try_wait_for_thread_exit(
                 handle.0 as windows_sys::Win32::Foundation::HANDLE,
             )
         }
@@ -12201,10 +12210,12 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     ) -> Option<alloc::vec::Vec<u8>> {
         // The child's own export path is derived from its REAL Windows pid (see
         // `process_fork::cross_process_writable_export_path`'s doc comment) -- recover that pid
-        // from the still-open process `HANDLE` this registry entry carries, exactly as
-        // `spawn_process_fork_child`'s own diagnostics already do via `GetProcessId`.
+        // from the still-open THREAD `HANDLE` this registry entry carries (pass 59: no longer a
+        // process handle -- see `wait_for_cross_process_exit`'s doc comment) via
+        // `GetProcessIdOfThread`, the thread-handle counterpart of the `GetProcessId` this used
+        // to call.
         let raw_handle = handle.0 as windows_sys::Win32::Foundation::HANDLE;
-        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(raw_handle) };
+        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessIdOfThread(raw_handle) };
         if pid == 0 {
             return None;
         }
@@ -12353,15 +12364,23 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             &inherited_files,
             &inherited_eventfds,
         ) {
-            Ok(Some((pid, handle))) => {
+            Ok(Some((pid, process_handle, thread_handle))) => {
                 litebox_util_log::debug!(
                     pid:% = pid;
                     "spawn_cross_process_fork_child: child spawned and resumed successfully"
                 );
                 for (local, bridge) in pumps {
-                    spawn_fork_child_pipe_pump(local, bridge, handle as usize);
+                    spawn_fork_child_pipe_pump(local, bridge, process_handle as usize);
                 }
-                Some(litebox::platform::CrossProcessChildHandle(handle as usize))
+                // Pass 59: registered by the child's own initiating THREAD handle, not its
+                // Windows PROCESS handle -- see `wait_for_thread_exit`'s doc comment
+                // (`process_fork.rs`) for why process-handle-based waiting silently never
+                // signals once this child spawns any further OS thread of its own (e.g. its own
+                // internal fork() falling back to the thread-based path) that outlives the
+                // original guest task a parent's `wait4()` actually cares about.
+                Some(litebox::platform::CrossProcessChildHandle(
+                    thread_handle as usize,
+                ))
             }
             Ok(None) => {
                 litebox_util_log::warn!(

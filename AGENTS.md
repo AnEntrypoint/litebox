@@ -192,9 +192,9 @@ map" below). The CURRENT STATE those passes converged on:
   `faa74c6`); per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`). Each fix surfaced the next
   newly-reachable blocker (RAM exhaustion, then process-count). `gpg-agent`'s fatal glibc
   `malloc.c:3846` SIGABRT, reproduced once (52nd), still open. Full narrative: archive.
-- **57th pass (2026-09-23)** — rebuilt the release binary (56th's own binary predated its fix by
-  ~1hr) and confirmed RAM no longer kills the boot (2/2, plateaus ~3.1-3.3GB free, no crash through
-  60s WM_POLL + 160s+ HOLD). Surfaced `ps -ef`'s crash and `xfwm4` never launching, both below.
+- **57th pass** — rebuilt release binary (56th's predated its own fix), confirmed RAM no longer
+  kills the boot (2/2, plateaus ~3.1-3.3GB free). Surfaced `ps -ef`'s crash and `xfwm4` never
+  launching, both below.
 - **58th pass (2026-09-23) — FIXED `ps -ef`'s crash; ROOT-CAUSED (not yet fixed) `xfwm4`'s
   non-launch, now 100% reproducible.** `ps -ef` crashed with `fatal library error, lookup self`:
   real procps (`src/ps/global.c:509`) needs its OWN pid's `/proc/<pid>/stat`, but `Procfs` (`/proc`)
@@ -209,14 +209,35 @@ map" below). The CURRENT STATE those passes converged on:
   (uncarriable), forcing ITS inner fork to a THREAD-based (same-Windows-process) child; that
   long-lived agent keeps the HOSTING Windows process alive forever, so `wait_for_process_exit`/
   `try_wait_for_cross_process_exit` (`process_fork.rs:4263`/`4297`, `WaitForSingleObject` on the raw
-  process HANDLE) never signals — the exact handle the exit-notifier armed on appears once (the arm)
-  and never again in a full boot log grep. Two `cdb -pv` snapshots of `xfce4-session`'s blocked
-  thread, 18s apart, show a byte-identical `WaitOnAddress`-family frame. NOT fixed — needs exit
-  detection keyed to the guest TASK's `exit_group()`, not Windows-process lifetime; candidate: the
-  child's initial OS THREAD handle (captured then closed at `process_fork.rs:2132`) instead of the
-  process handle, pending confirming `run_thread_inner`'s completion condition is scoped to one
-  task, not misled by a same-process descendant — own pass, do not patch blind. Also ported (real,
-  low-risk, did NOT alone fix this case): `sys_wait4`'s thread-based specific-pid branch
+  process HANDLE) never signals.
+- **59th pass (2026-09-23) — task-scoped cross-process wait IMPLEMENTED + LIVE-VERIFIED correct;
+  a SECOND, deeper bug (real spinlock livelock, not a wait-signaling gap) is the actual
+  `ssh-agent`/`xfwm4` blocker, live-cdb-confirmed, not yet fixed.** Confirmed first (`lib.rs:3406`
+  `run_thread_inner`, `4381` `thread_start`): every guest task gets its OWN dedicated OS thread
+  running exactly one `run_thread_arch` call, terminating when it returns — 1:1 task-scoping holds
+  structurally. Implemented: `spawn_process_fork_child` (`process_fork.rs:1695`) no longer closes
+  the child's initial THREAD handle (was `process_fork.rs:2132`) — returns it too;
+  `CrossProcessChildHandle` (`litebox/platform/mod.rs:1485`) now carries that THREAD handle; new
+  `wait_for_thread_exit`/`try_wait_for_thread_exit` (`process_fork.rs`, `GetExitCodeThread`/
+  `GetProcessIdOfThread`) back `wait_for_cross_process_exit`/`try_wait_for_cross_process_exit`
+  (`lib.rs:12135`); `take_cross_process_writable_layer_export` switched to `GetProcessIdOfThread`.
+  `wait_for_process_exit`/`try_wait_for_process_exit` (process-handle) deliberately untouched —
+  `diagnostic_cross_process_wait4_probe`'s self-test still needs those. Rebuilt release, live-
+  verified (`.wfgy/de_only_pass59_run1.log`): fires correctly dozens of times (e.g. pid=23868
+  `sleep`, line 193889 — resolves the INSTANT `run_thread` returns, correct encoded status
+  `0xc0de0000`) — the wait mechanism itself is sound. BUT `ssh-agent` (tid=27264, Windows pid
+  27264) still never unblocks `xfce4-session`'s `wait4`: its `exit_group`→`prepare_for_exit` runs
+  clean through `close_all_fds`/`take_children` (`n_orphans=1`, its own thread-fork daemon) then
+  NEVER logs again for tid=27264 in a 450K-line boot log — `run_thread` genuinely never returns for
+  this task, so there's nothing yet for the fixed wait to observe. Live `cdb -p 27264 -pv` (process
+  confirmed still alive minutes later, per the bug's own "keeps the process alive forever" premise)
+  on host_tid=22180, taken TWICE ~30s apart: byte-identical stack with NO Win32 wait syscall at
+  frame 0 (a real block always shows `NtWaitForSingleObject`/`WaitOnAddress` there) — stable RSP,
+  parked mid-execution, the signature of a spinlock retry loop. Matches Track B item 3
+  (`SafeZoneAllocator::dealloc`, below) — first live evidence tying it to a real boot-blocking
+  symptom; exact frame not yet named (release binary, no symbols — pickup there). Own pass — do
+  not patch blind. Also ported (real, low-risk, did NOT alone fix this case): `sys_wait4`'s
+  thread-based specific-pid branch
   (`process.rs:2468`) was missing the bounded-repoll/`Interrupted`-recheck its siblings got 21st/24th.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
@@ -240,21 +261,22 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
    real, still-open cost is PER-PROCESS: Xvfb/dbus-daemon/xfce4-session each cost 600MB-1.3GB
    WS/Private (15-40x real-Linux RSS) — allocation site not yet found (needs `cdb`/memory-profile on
    an isolated Xvfb-alone repro, not the rootfs merge, cache-HIT-cheap, ruled out).** `ps -ef`'s
-   crash is FIXED (58th, see above). **Sole real blocker to `DE_UP`: `xfwm4` never launches —
-   ROOT-CAUSED not yet fixed, 58th pass (see above): a cross-process child that daemonizes via a
-   thread-based-fallback fork (the classic bind-socket-then-fork-and-exit idiom — `ssh-agent`,
-   `gpg-agent`, many real daemons) hangs its own parent's `wait4` forever, since exit detection keys
-   on Windows-process, not guest-task, lifetime.** (ii) `gpg-agent`'s fatal glibc `malloc.c:3846`
-   assertion (52nd), maybe the SAME mechanism — recheck once wait4 is fixed. (iii) high `VM_SHARED`
-   fork-child region count (52nd).
+   crash is FIXED (58th). Windows-process-vs-guest-task exit-detection gap FIXED+verified (59th,
+   see above). **Sole real blocker to `DE_UP`: `xfwm4` never launches — 59th pass live-cdb-narrowed
+   to item 3 below** (a daemonizing cross-process child's own thread-based-fallback fork gets
+   stuck, byte-identical stack across two snapshots, no Win32 wait syscall visible — a spin, not a
+   block). (ii) `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd), maybe the SAME
+   mechanism — recheck once item 3 is fixed. (iii) high `VM_SHARED` fork-child region count (52nd).
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything** (38th,
    `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256 overflow silently discarded
    (`unix.rs:275-277`); a key >108 bytes silently bails; `SharedUnixConnectQueue`/`SharedUnixConnTable`
    (capacity 64) leak a `REQ_CLAIMED` slot forever on cancel (`unix.rs:430-435`); backlog ignored on
    cross-process accept. Abstract sockets checked and CORRECT.
-3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
-   dead-holder-recovery treatment `RawMutex` already has — live-caught spinning forever in
-   `dealloc`, high blast radius, own dedicated pass.
+3. **`SafeZoneAllocator`'s `spin::mutex::SpinMutex` (`litebox/src/mm/allocator.rs`) needs the same
+   dead-holder-recovery treatment `RawMutex` already has — now the prime suspect for the `xfwm4`
+   blocker itself (59th pass live-cdb evidence, see above), not just a theoretical risk.** Pickup:
+   rebuild WITHOUT `--release` (symbols), repeat `.wfgy/de_only.sh`, `cdb -p <ssh-agent pid> -pv` on
+   the stuck thread to name the exact frame, then apply `RawMutex`'s fix.
 4. Debugger-root-cause `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state
    (dozens per boot, most frequent panic historically, NOT yet debugger-confirmed — do not patch
    blind).

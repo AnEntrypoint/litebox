@@ -1469,8 +1469,8 @@ impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>
     }
 }
 
-/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,
-/// stored in the shim's `Process::cross_process_children` registry (see
+/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS TASK, stored in
+/// the shim's `Process::cross_process_children` registry (see
 /// `litebox_shim_linux::syscalls::process::Process`'s doc comment) instead of the normal
 /// same-process `Arc<Process>` a thread-based `fork()` child uses.
 ///
@@ -1478,9 +1478,12 @@ impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>
 /// associated type on [`ForkChildVerificationProvider`], so `litebox_shim_linux`'s `Process`
 /// struct -- which is generic over `Platform: ShimPlatform` but must stay `Send`/`Sync` without
 /// per-platform `unsafe impl` boilerplate -- can hold it directly. The platform implementation is
-/// solely responsible for interpreting this value correctly (on Windows: a raw `HANDLE` value,
-/// kept alive for as long as this registry entry exists -- see the entry's own removal/`CloseHandle`
-/// discipline in `sys_wait4`).
+/// solely responsible for interpreting this value correctly (on Windows, as of pass 59: the
+/// child TASK's own initiating THREAD `HANDLE`, deliberately NOT the Windows process handle --
+/// see `litebox_platform_windows_userland::process_fork::wait_for_thread_exit`'s doc comment for
+/// why process-scoped waiting silently never signals once the child spawns any further OS thread
+/// of its own -- e.g. its own internal `fork()` falling back to the thread-based path -- that
+/// outlives the specific task a parent's `wait4()` actually asked about).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossProcessChildHandle(pub usize);
 

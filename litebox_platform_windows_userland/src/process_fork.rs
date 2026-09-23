@@ -56,7 +56,8 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessId, GetProcessTimes, INFINITE,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetExitCodeThread, GetProcessId,
+    GetProcessIdOfThread, GetProcessTimes, GetThreadTimes, INFINITE,
     InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
@@ -118,6 +119,53 @@ fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_
             "[wait4_diag] {tag} pid={pid} handle={handle:p} wait_result={wait_result:#x}({wait_str}) \
              GetLastError={get_last_error} got_process_times={got_times} \
              elapsed_ms_since_CreateProcessW={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
+             exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
+            if exit_code == STILL_ACTIVE { "STILL_ACTIVE" } else { "real_exit_code" },
+            exit_code == STILL_ACTIVE
+        );
+    }
+}
+
+/// Thread-handle counterpart to [`diag_log_wait_evidence`] (pass 59) -- same evidence shape, but
+/// through the THREAD-scoped Win32 APIs (`GetProcessIdOfThread`/`GetThreadTimes`/
+/// `GetExitCodeThread`) instead of their process-scoped namesakes, which either fail outright or
+/// answer a different question entirely when given a thread handle (`GetProcessId` on a thread
+/// handle does not return the owning process's pid; `GetExitCodeProcess` on a thread handle is a
+/// straight `HANDLE`-kind mismatch). Used by [`wait_for_thread_exit`]/[`try_wait_for_thread_exit`]
+/// only -- the process-handle-based callers keep using [`diag_log_wait_evidence`] unchanged.
+fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
+    unsafe {
+        let pid = GetProcessIdOfThread(handle);
+        let mut creation = core::mem::zeroed::<FILETIME>();
+        let mut exit = core::mem::zeroed::<FILETIME>();
+        let mut kernel = core::mem::zeroed::<FILETIME>();
+        let mut user = core::mem::zeroed::<FILETIME>();
+        let got_times =
+            GetThreadTimes(handle, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user) != 0;
+        let mut now = core::mem::zeroed::<FILETIME>();
+        GetSystemTimeAsFileTime(&raw mut now);
+        let now_ticks = filetime_to_u64(now);
+        let creation_ticks = filetime_to_u64(creation);
+        let elapsed_ms_since_creation = if got_times && now_ticks >= creation_ticks {
+            (now_ticks - creation_ticks) / 10_000
+        } else {
+            u64::MAX
+        };
+        let mut exit_code: u32 = 0;
+        let got_exit_code = GetExitCodeThread(handle, &raw mut exit_code) != 0;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
+        let wait_str = match wait_result {
+            WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
+            WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
+            WAIT_FAILED_V => "WAIT_FAILED",
+            _ => "WAIT_OTHER",
+        };
+        eprintln!(
+            "[wait4_diag] {tag} owning_pid={pid} thread_handle={handle:p} wait_result={wait_result:#x}({wait_str}) \
+             GetLastError={get_last_error} got_thread_times={got_times} \
+             elapsed_ms_since_thread_start={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
              exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
             if exit_code == STILL_ACTIVE { "STILL_ACTIVE" } else { "real_exit_code" },
             exit_code == STILL_ACTIVE
@@ -1653,7 +1701,7 @@ pub fn spawn_process_fork_child(
     child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
     inherited_files: &[litebox::platform::ForkInheritedFile],
     inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
-) -> Result<Option<(u32, HANDLE)>, String> {
+) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
         .as_os_str()
@@ -2126,11 +2174,21 @@ pub fn spawn_process_fork_child(
     // Success: the child is now running real, ongoing guest execution (pass 139's `Task`-resume
     // path, taken because `FORK_CHILD_GPRS_ENV_VAR`/`FORK_CHILD_VMA_LAYOUT_ENV_VAR` and the three
     // gate env vars above are set -- see `run_diagnostic_resume_child`'s and `main()`'s dispatch).
-    // Close the thread handle (no longer needed -- the process handle alone is enough to
-    // wait/kill by pid) and hand the caller the process handle and pid, alive, un-terminated.
-    unsafe {
-        CloseHandle(thread);
-    }
+    //
+    // Pass 59: `thread` is NO LONGER closed here -- it used to be, on the theory that "the
+    // process handle alone is enough to wait/kill by pid". That theory is exactly what broke
+    // `xfce4-session`'s `wait4()` on a real desktop boot: this child's OWN Windows process can
+    // outlive its ONE original guest task (`exit_group()` on that task's thread is not the same
+    // event as the whole Windows process exiting, the moment the child spawns any further OS
+    // thread of its own that outlives that task -- e.g. `ssh-agent`'s self-daemonizing `fork()`
+    // falling back to the thread-based path because it holds a bound `AF_UNIX` listening socket,
+    // an uncarriable fd). The caller now hands `thread` to
+    // `litebox::platform::CrossProcessChildHandle` instead of `process`, so
+    // `wait_for_thread_exit`/`try_wait_for_thread_exit` (task-scoped) are what `wait4()` actually
+    // blocks on -- see those functions' own doc comments for the full mechanism. `process` is
+    // still handed back too: `spawn_fork_child_pipe_pump` and
+    // `take_cross_process_writable_layer_export` (`GetProcessIdOfThread` aside, the writable-layer
+    // export path is keyed by the real Windows pid, not by either handle) still need it.
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] pre-return exe_wide len={} cap={} ptr={:p}",
@@ -2139,7 +2197,7 @@ pub fn spawn_process_fork_child(
             exe_wide.as_ptr()
         );
     }
-    Ok(Some((pid, process)))
+    Ok(Some((pid, process, thread)))
 }
 
 /// Pass 115's fd-inheritance probe: `DuplicateHandle`s the CURRENT (parent) process's real
@@ -4323,6 +4381,98 @@ pub unsafe fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
             );
             return Some(0);
         }
+        if exit_code == STILL_ACTIVE {
+            return None;
+        }
+        Some(exit_code)
+    }
+}
+
+/// Blocks until the specific OS thread behind `handle` terminates, then returns its raw exit
+/// code -- the TASK-scoped counterpart to [`wait_for_process_exit`]'s PROCESS-scoped wait.
+///
+/// # Why this exists (pass 59)
+///
+/// [`wait_for_process_exit`] answers "has the whole Windows process exited", which a genuine
+/// cross-process fork child normally satisfies at the exact moment its one guest task calls
+/// `exit_group()` -- because that task's OS thread (see `run_thread`'s doc comment: "this will
+/// run until the thread terminates") is normally that process's ONLY thread, so the thread
+/// terminating and the process terminating are the same event. That equivalence breaks the
+/// moment the cross-process child spawns ANY additional OS thread of its own that outlives the
+/// original task -- concretely, a same-process (thread-based) fork-fallback child of ITS OWN
+/// (e.g. `ssh-agent`'s self-daemonizing `fork()`, ineligible for cross-process treatment because
+/// it holds a bound `AF_UNIX` listening socket, an uncarriable fd class -- see
+/// `ThreadProvider::spawn_thread`/AGENTS.md's cross-process-fork eligibility scan). That
+/// fallback's daemon thread runs forever inside the SAME Windows process, so the process itself
+/// never exits even though the ORIGINAL task -- the one a parent's `wait4()` actually asked
+/// about -- finished long ago. Waiting on that task's own initiating thread handle instead
+/// (confirmed 1:1 with the task's lifetime: `spawn_thread`/`thread_start`'s OS thread runs
+/// exactly one `run_thread_arch` call then the `std::thread::Builder` closure returns, ending
+/// that thread, for both the root-process case and every `spawn_thread`-spawned case) answers
+/// the question at the right granularity regardless of what sibling threads a misbehaving-by-
+/// design child spawns afterward.
+///
+/// Deliberately a NEW, separate function rather than a `wait_for_process_exit` modification:
+/// [`diagnostic_cross_process_wait4_probe`]'s own self-test registers a genuine
+/// `std::process::Child`'s PROCESS handle (via `AsRawHandle`) to round-trip
+/// `CROSS_PROCESS_EXIT_MARKER` through a real `ExitProcess` call -- `GetExitCodeThread` on that
+/// handle would be a `HANDLE`-kind mismatch. Only the production
+/// [`litebox::platform::PlatformProvider::wait_for_cross_process_exit`]/
+/// `try_wait_for_cross_process_exit` call sites (`lib.rs`'s `WindowsUserland` impl) switch to
+/// this pair; the diagnostic probe keeps using the process-handle functions above, unchanged.
+///
+/// # Safety
+///
+/// `handle` must be a valid, open Windows THREAD `HANDLE` (the child task's initiating thread,
+/// as returned by [`spawn_process_fork_child`]) that the caller has not already closed.
+pub unsafe fn wait_for_thread_exit(handle: HANDLE) -> u32 {
+    unsafe {
+        let wait_result = WaitForSingleObject(handle, INFINITE);
+        let last_error = GetLastError();
+        diag_log_thread_wait_evidence("wait_for_thread_exit(blocking/INFINITE)", handle, wait_result, last_error);
+        let mut exit_code: u32 = 0;
+        if GetExitCodeThread(handle, &raw mut exit_code) == 0 {
+            eprintln!(
+                "[process_fork] wait_for_thread_exit: GetExitCodeThread failed, GetLastError={}",
+                GetLastError()
+            );
+        }
+        exit_code
+    }
+}
+
+/// Non-blocking poll variant of [`wait_for_thread_exit`] for `wait4(WNOHANG)` -- same relationship
+/// to it as [`try_wait_for_process_exit`] has to [`wait_for_process_exit`].
+///
+/// # Safety
+///
+/// Same contract as [`wait_for_thread_exit`].
+pub unsafe fn try_wait_for_thread_exit(handle: HANDLE) -> Option<u32> {
+    unsafe {
+        const WAIT_OBJECT_0: u32 = 0;
+        let wait_result = WaitForSingleObject(handle, 0);
+        if wait_result == WAIT_OBJECT_0 {
+            let last_error = GetLastError();
+            diag_log_thread_wait_evidence(
+                "try_wait_for_thread_exit(WNOHANG poll)->WAIT_OBJECT_0",
+                handle,
+                wait_result,
+                last_error,
+            );
+        }
+        if wait_result != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut exit_code: u32 = 0;
+        if GetExitCodeThread(handle, &raw mut exit_code) == 0 {
+            eprintln!(
+                "[process_fork] try_wait_for_thread_exit: GetExitCodeThread failed, GetLastError={}",
+                GetLastError()
+            );
+            return Some(0);
+        }
+        // `GetExitCodeThread` uses the SAME `STILL_ACTIVE` sentinel convention as
+        // `GetExitCodeProcess` for "not finished yet" -- see `try_wait_for_process_exit`.
         if exit_code == STILL_ACTIVE {
             return None;
         }
