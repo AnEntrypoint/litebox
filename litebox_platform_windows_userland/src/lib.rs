@@ -305,6 +305,14 @@ pub(crate) struct VehGates {
     pub(crate) forkverify_off: bool,
     /// `LITEBOX_DIAG_GS_BASE_REPAIR`
     pub(crate) gs_base_repair: bool,
+    /// `LITEBOX_DIAG_FS_BASE_REPAIR` (94th pass, mirrors `gs_base_repair` above): logs every time
+    /// ANY of the FS_BASE-reset repair sites (guest-mode AV repair, the single-step-path repair,
+    /// the host-mode repair, `RawMutex::block_or_maybe_timeout`'s wait loop) observes
+    /// `rdfsbase()==0`, whether or not a trusted `saved` value was available to repair with --
+    /// see each call site's own comment for why logging the "no trusted value" case matters at
+    /// least as much as logging a successful repair (the 93rd pass's live-verified-insufficient
+    /// fix only ever covered the successful-repair half of this story).
+    pub(crate) fs_base_repair: bool,
 }
 
 impl VehGates {
@@ -328,6 +336,7 @@ impl VehGates {
                 .filter(|&a| a != 0),
             forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
             gs_base_repair: std::env::var_os("LITEBOX_DIAG_GS_BASE_REPAIR").is_some(),
+            fs_base_repair: std::env::var_os("LITEBOX_DIAG_FS_BASE_REPAIR").is_some(),
         }
     }
 }
@@ -1902,6 +1911,19 @@ unsafe extern "system" fn vectored_exception_handler(
                         context_snapshot.Rip,
                     );
                 }
+                // `LITEBOX_DIAG_FS_BASE_REPAIR=1` (94th pass): host-mode sibling of the
+                // guest-mode site's own diagnostic below -- see that one's doc comment. If this
+                // site is where a real crash's repair-or-not decision actually happens (i.e.
+                // `tls.is_in_guest.get()` reads `false` for what is genuinely guest code, an
+                // independent bug from FS_BASE itself), the guest-mode site's diagnostic would
+                // never fire at all for that crash -- this is the other half of that same check.
+                if veh_gates().fs_base_repair {
+                    eprintln!(
+                        "[diag-fs-base-repair] tid={:?} rip={:#x} HOST-MODE repaired cleared FS_BASE back to {saved:#x}",
+                        std::thread::current().id(),
+                        context_snapshot.Rip,
+                    );
+                }
                 // Confirmed live via `cdb`-attached exception-record capture (AGENTS.md pass
                 // 302): under a sufficiently high FS_BASE-reset rate, Windows can clear the MSR
                 // again between this write and the retried instruction actually completing, so a
@@ -1915,7 +1937,28 @@ unsafe extern "system" fn vectored_exception_handler(
                     }
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
+            } else if veh_gates().fs_base_repair {
+                eprintln!(
+                    "[diag-fs-base-repair] tid={:?} rip={:#x} HOST-MODE DETECTED cleared FS_BASE but saved==0 -- cannot repair, falling through",
+                    std::thread::current().id(),
+                    context_snapshot.Rip,
+                );
             }
+        } else if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && veh_gates().fs_base_repair
+        {
+            // 94th pass: unconditionally log every HOST-MODE access violation's own `is_in_guest`/
+            // `rdfsbase`/`rip`/fault-address shape when this gate is on, regardless of whether the
+            // FS_BASE-reset condition matched -- so a crash that reaches this branch at all, for
+            // ANY reason, leaves a trace even if it doesn't match the narrow repair condition
+            // above (e.g. `rdfsbase() != 0` already, or no FS-override prefix at `rip`).
+            eprintln!(
+                "[diag-fs-base-repair] tid={:?} rip={:#x} HOST-MODE AV, no FS_BASE-reset match: rdfsbase={:#x} fault_addr={:#x}",
+                std::thread::current().id(),
+                context_snapshot.Rip,
+                unsafe { litebox_common_linux::rdfsbase() },
+                exception_record.ExceptionInformation[1],
+            );
         }
 
         // This might be a faulting guest memory access in LiteBox code. Try to
@@ -2525,6 +2568,17 @@ unsafe extern "system" fn vectored_exception_handler(
                     context_snapshot.Rip,
                 );
             }
+            // `LITEBOX_DIAG_FS_BASE_REPAIR=1` (94th pass, mirrors `LITEBOX_DIAG_GS_BASE_REPAIR`):
+            // logs every time this exact site actually observes AND repairs a cleared FS_BASE for
+            // a guest-mode fault. Reads the pre-resolved `veh_gates()` for the same reentrancy-
+            // safety reason `restore_thread_gs_base_if_cleared` does.
+            if veh_gates().fs_base_repair {
+                eprintln!(
+                    "[diag-fs-base-repair] tid={:?} rip={:#x} repaired cleared FS_BASE back to {saved:#x}",
+                    std::thread::current().id(),
+                    context_snapshot.Rip,
+                );
+            }
             // See the host-mode repair site above (AGENTS.md pass 302): a single write can lose
             // a race against another Windows-initiated FS_BASE reset under high-frequency
             // triggering, so verify and retry a bounded number of times before resuming.
@@ -2535,6 +2589,23 @@ unsafe extern "system" fn vectored_exception_handler(
                 }
             }
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // `saved == 0`: this site detected the exact FS_BASE-reset shape (AV, real rip, an
+        // FS-override-prefixed faulting instruction, rdfsbase()==0) but has NO trusted value to
+        // repair with -- `THREAD_FS_BASE` (the software shadow) itself reads 0 for this OS
+        // thread. Falls through to the normal exception path below, which is indistinguishable
+        // from a genuine guest segfault and kills the process. 94th-pass hypothesis: THIS is the
+        // xfce4-session/`__syscall_error` crash's real mechanism -- a vfork()'d child's new OS
+        // thread whose `THREAD_FS_BASE` shadow was never (yet) established at the moment of this
+        // particular fault, not a transient hardware MSR clear on an already-initialized thread.
+        // Logged unconditionally under the same gate as the successful-repair case above: this is
+        // the decisive, previously-missing half of the diagnostic picture.
+        else if veh_gates().fs_base_repair {
+            eprintln!(
+                "[diag-fs-base-repair] tid={:?} rip={:#x} DETECTED cleared FS_BASE but saved==0 -- cannot repair, falling through",
+                std::thread::current().id(),
+                context_snapshot.Rip,
+            );
         }
     }
 
@@ -2554,6 +2625,16 @@ unsafe extern "system" fn vectored_exception_handler(
         let saved = WindowsUserland::get_thread_fs_base();
         if saved != 0 {
             unsafe { litebox_common_linux::wrfsbase(saved) };
+        } else if veh_gates().fs_base_repair {
+            // 94th pass: same "no trusted value" gap as the guest-mode AV repair site above, but
+            // on the single-step (fork-verification) path -- fires per single-stepped instruction
+            // while this thread's `THREAD_FS_BASE` shadow is unset, so expect many lines if this
+            // ever fires at all; that volume is itself diagnostic evidence.
+            eprintln!(
+                "[diag-fs-base-repair] tid={:?} rip={:#x} single-step: DETECTED cleared FS_BASE but saved==0 -- cannot repair",
+                std::thread::current().id(),
+                context_snapshot.Rip,
+            );
         }
     }
 
@@ -6807,6 +6888,33 @@ impl RawMutex {
             // SAFETY: `event` is this thread's own valid, owned event handle.
             let rc2 =
                 unsafe { Win32_Threading::WaitForSingleObject(event, Win32_Threading::INFINITE) };
+            // 94th pass: this is a REAL, previously-uncovered `WaitForSingleObject` kernel
+            // round-trip on the exact same `RawMutex::block`/`wait_for_vfork_done` path
+            // `block_or_maybe_timeout`'s own main wait loop already repairs GS_BASE/FS_BASE
+            // after (see that loop's own two doc comments, immediately above `restore_thread_
+            // gs_base_if_cleared`/`restore_thread_fs_base`'s calls there) -- but this helper is
+            // a SEPARATE call site, only reached via the narrow "a real timeout raced a
+            // concurrent `wake_many`" branch just above, and it returns straight back to
+            // `block_or_maybe_timeout`'s caller WITHOUT ever passing back through that loop's own
+            // per-chunk repair. Every other `WaitForSingleObject`/`WaitForSingleObjectEx` call in
+            // this whole `RawMutex` implementation is now covered by a repair immediately after it
+            // returns except this one was -- closing it on the same "every kernel round-trip on
+            // this path is a legitimate place for Windows to have cleared either segment-base MSR
+            // under scheduling pressure" basis the other two sites already established, not a new
+            // theory. Live evidence (94th pass): the target `xfce4-session` crash produces ZERO
+            // `[veh]`/`diag-unrecov-av`/`diag-veh-no-tls` output anywhere in an unperturbed,
+            // undebugged log despite `exit_code=3221225477` (`STATUS_ACCESS_VIOLATION`) firing
+            // every single boot at a near-identical ~16.5-17s mark -- meaning this codebase's own
+            // VEH is never even being invoked for the fault that kills the process, matching the
+            // 90th pass's identical "zero VEH output" finding and the 91st pass's independently
+            // cross-session-confirmed mechanism (Windows' own exception dispatcher itself needs a
+            // valid GS_BASE to reach ANY registered VEH callback at all, so sufficiently bad
+            // GS_BASE corruption is invisible to every diagnostic that lives inside the VEH). This
+            // exact gap -- a real, reachable, previously-unrepaired kernel wait on the vfork-block
+            // path -- is the most concrete remaining candidate site left unfixed after 91st-93rd
+            // passes' own narrowing.
+            WindowsUserland::restore_thread_gs_base_if_cleared();
+            WindowsUserland::restore_thread_fs_base();
             assert_eq!(
                 rc2,
                 Win32_Foundation::WAIT_OBJECT_0,
@@ -6976,6 +7084,26 @@ impl RawMutex {
                     return UnblockedOrTimedOut::Unblocked;
                 }
             }
+            // 94th pass: this whole function is the `MAX_INLINE_WAITERS`-exhaustion fallback for
+            // `block_or_maybe_timeout` (see its own call site's warning, "waiter queue full,
+            // falling back to polling") -- i.e. the SAME `RawMutex::block`/`wait_for_vfork_done`
+            // path the main wait loop's own GS_BASE/FS_BASE repair comments document, just taken
+            // under heavy contention (`max_waiters=32` reached) instead of the ordinary event-wait
+            // path. `std::thread::sleep` is every bit as real a kernel round-trip as
+            // `WaitForSingleObject` (`NtDelayExecution` under the hood) -- the same "Windows can
+            // clear a segment-base MSR under scheduling pressure" mechanism applies here, yet this
+            // loop had NO repair call anywhere before this pass, unlike its `WaitForSingleObject`
+            // sibling a few hundred lines up. Live evidence this pass: a real
+            // `de_only_xcensus_seed3.tar` boot logged "waiter queue full ... max_waiters=32" at
+            // 15.24s into the run, ~1.66s before `xfce4-session`'s own deterministic
+            // `STATUS_ACCESS_VIOLATION` at elapsed_ms=16900 -- i.e. this exact fallback path is
+            // demonstrably live and active on this exact boot, immediately ahead of the crash this
+            // investigation is chasing, and heavy XFCE-session-startup lock contention is exactly
+            // the condition that would exhaust `MAX_INLINE_WAITERS` and route here. Repairing once
+            // per sleep iteration (200us cadence) is cheap (one `rdgsbase`/`rdfsbase`-and-compare
+            // each) relative to the sleep itself.
+            WindowsUserland::restore_thread_gs_base_if_cleared();
+            WindowsUserland::restore_thread_fs_base();
             std::thread::sleep(Duration::from_micros(200));
         }
     }

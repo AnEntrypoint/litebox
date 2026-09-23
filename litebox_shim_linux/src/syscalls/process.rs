@@ -7092,6 +7092,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     parent_ctx.rax = 0;
                     self.sys_arch_prctl(ArchPrctlArg::SetFs(fs_base)).unwrap();
+                    // 94th pass (FS_BASE-clear-under-vfork investigation, `LITEBOX_DIAG_FS_BASE_
+                    // REPAIR`'s sibling coverage for the shim side): records, once per forked/
+                    // vforked child, on the CHILD's own brand-new host thread, immediately after
+                    // this thread's FS_BASE has just been established -- the value set and this
+                    // thread's real host tid, so a later `[diag-fs-base-repair] ... saved==0`
+                    // line from the platform crate can be correlated back to "was this thread's
+                    // FS_BASE ever actually initialized, and to what". Cheap (once per clone, not
+                    // a hot path), always logged at debug level (no new gate needed -- ordinary
+                    // `LITEBOX_LOG=litebox_shim_linux=debug` already covers it).
+                    litebox_util_log::debug!(
+                        tid:% = self.tid.get(),
+                        host_tid:% = self.global.platform.host_debug_tid(),
+                        fs_base:% = alloc::format!("{fs_base:#x}"),
+                        readback:% = alloc::format!(
+                            "{:#x}",
+                            self.global
+                                .platform
+                                .get_arch_specific_register(&ArchSpecificRegister::FsBase)
+                                .unwrap_or(usize::MAX)
+                        );
+                        "clone/ForkedChild: child FS_BASE established"
+                    );
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
