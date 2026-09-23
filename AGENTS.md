@@ -7,10 +7,9 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 `docs/*.md` in the map below — read those for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. Last compacted under 30KB at the 65th pass;
-back over it again as of the 69th (pass-history section below; 26th-69th full narrative, including
-each pass's own complete evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`) — due
-another compaction pass soon, not done this pass to keep focus on the live investigation.
+line plus its pointer, not a separate memory file. Compacted at the 65th pass and again at the
+70th (pass-history section below; 26th-70th full narrative, including each pass's own complete
+evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
 
@@ -36,6 +35,14 @@ One ~81MB layer, `[cache] HIT` after the first pull, real GNU coreutils instead 
   `grep`/`Select-String` against them silently returns zero matches even when the text is really
   there. Always `iconv -f UTF-16LE -t UTF-8` (or PowerShell's own `Get-Content -Encoding Unicode`)
   first — confirmed live, 53rd pass, on `.wfgy/webtop_release_boot6.log`.
+- **`*> file.log` WORD-WRAPS any single tracing line longer than ~116-119 chars across MULTIPLE
+  physical lines, with no continuation marker** — PowerShell wraps a captured native-process
+  stderr line at its host/console buffer width; data is not lost, only split (confirmed by direct
+  repro: `python -c "sys.stderr.write('A'*300)" *> f` produces 3 physical lines for 1 logical
+  write). A naive line-based `grep`/regex over any long DEBUG line (hex payload previews
+  especially) silently sees only the first ~116-119 chars (70th pass). **Fix**: rejoin first — a
+  physical line NOT starting with the `<float>s` timestamp prefix is a continuation of the
+  previous logical line, concatenate it back on before applying any other regex.
 
 **Log level**: default is `warn,litebox_platform_windows_userland::fork_verify=error` (`fork_verify`
 pinned to `error` since it warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error`
@@ -79,13 +86,12 @@ target `litebox_shim_linux::syscalls::{process,unix}=debug` on `de_only.sh` inst
   before assuming a new kind needs old treatment. Run dbus-daemon non-forking; for XFCE use
   `xfce4-session`, never `startxfce4`.
 - **`wait4()`/`kill()` to a cross-process fork child are asymmetric** — `kill()` to a
-  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (pass 141, a documented gap,
-  not a bug: the pid is real and reachable via `wait4`, just not signalable yet).
+  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (documented gap, not a bug:
+  reachable via `wait4`, just not signalable yet).
 - **A `socketpair(2)`-originated fd (both ends `Unnamed`) is NOT safe to drop as CLOEXEC across a
-  cross-process fork, unlike a named-peer CLOEXEC client socket** — real processes (`dbus-daemon`'s
-  babysitter) use it for pre-`exec()` bookkeeping; dropping it makes the child's peer look
-  instantly gone to the parent. `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) now refuses
-  (falls back to thread-based fork) this narrow case instead of silently dropping it (54th pass).
+  cross-process fork** — unlike a named-peer CLOEXEC client socket, real processes (`dbus-daemon`'s
+  babysitter) use it for pre-`exec()` bookkeeping; `raw_fd_is_addressless_unix_socket_pair`
+  (`net.rs`) now refuses (falls back to thread-based fork) rather than silently dropping it (54th).
 - **A `TypedFd`'s index is only valid against the SAME `Descriptors` instance that `insert()`ed
   it** — reading one back against a DIFFERENT process's table is out-of-bounds or resolves to an
   unrelated entry; every accessor in `litebox/src/fd/mod.rs` returns `None` rather than panicking
@@ -116,6 +122,21 @@ target `litebox_shim_linux::syscalls::{process,unix}=debug` on `de_only.sh` inst
   `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`** — every runner spawns a watchdog child (`process_fork.rs:4391`)
   that `TerminateProcess`es after 15s of <10ms CPU delta, killing a debugger-frozen (zero-progress)
   target; kill the already-running target's own watchdog first if attaching mid-boot.
+- **`sys_write`/`sys_writev`'s DEBUG log line is under the `syscalls::file` target, not `net`** —
+  `sys_writev` (`file.rs:2990`) delegates to `sys_write` (`file.rs:1847`). A `LITEBOX_LOG` filter
+  enabling only `syscalls::{process,net}=debug` (every pass through the 69th) makes every
+  write-side socket syscall invisible by construction — not evidence the write never happened. Add
+  `syscalls::file=debug` only narrowly/briefly: it also logs every `sys_read`, 50MB+ within under a
+  second of guest time on a real `webtop_stack.sh` boot (70th pass) — `de_only.sh`-scale only.
+- **`FlushingStderr` (`litebox_runner_linux_on_windows_userland/src/lib.rs`) now buffers one whole
+  tracing EVENT and does exactly one locked `write_all`+`flush`, in `Drop`** — the prior version
+  acquired-and-released `std::io::stderr()`'s lock separately for `.write()` and `.flush()`, and
+  `tracing_subscriber::fmt` issues several `Write` calls per event, leaving a real window for two
+  guest threads' (= ordinary Windows threads in this one host process) concurrently logged events
+  to interleave bytes in the shared stderr stream. Matches the existing guest-visible
+  `STDOUT_WRITE_LOCK`/`STDERR_WRITE_LOCK` discipline. Fixed, compiles clean; NOT the explanation
+  for the 70th pass's own X11-reassembly desync (reproduced byte-identical on a fresh boot taken
+  AFTER this fix, so that gap is a real parsing issue, not corrupted input).
 - **`DIAG_TIMELINE`/`sys_execve` log at `debug!`, NOT `error!`** — use
   `LITEBOX_LOG=warn,litebox_shim_linux::syscalls::process=debug,litebox_platform_windows_userland::
   fork_verify=error`. A cross-process fork child's guest pid IS its real Windows PID
@@ -156,137 +177,107 @@ open: nginx's own SSL-cert generation fails on its first startup attempt, not ro
 **Pass history (4th-65th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
 map" below). The CURRENT STATE those passes converged on:
 
-- **Both Xvfb SIGSEGVs FIXED** (43rd/51st, confirmed on a full boot 52nd); D-Bus activation's
-  dropped-CLOEXEC-fd bug FIXED (`66265d9`); `fd/mod.rs:422` panic FIXED (`faa74c6`); per-fork
-  rootfs-rebuild RAM cost FIXED (`2d18a4e`); the `ssh-agent`/`xfwm4` permanent-freeze class (a
-  `RawMutex::WaiterQueue::with_lock` release-via-plain-statement bug) CLOSED for good, 60th/61st
-  (`61c235e`, confirmed 3/3 clean on RELEASE vs. 100% pre-fix). `DE_FAILED` (no
-  `_NET_SUPPORTING_WM_CHECK`) survived all of this. Full narrative: archive.
-- **62nd-64th — `xfwm4` narrowed to an exact fd/protocol step; one real leak fixed; `DE_FAILED`
-  UNCHANGED.** 3 independent live techniques (X11 ground-truth census, guest-stderr capture, `cdb
-  -pv`) agree `xfwm4` genuinely claims `WM_S0`, prints zero stderr, never reaches
-  `setNetSupportedHint` — this exact signature reconfirmed again on the 68th pass, below. REFUTED
-  along the way: the `/defaults/xfce/` readdir-empty-to-a-later-fork theory (63rd); the dbus-daemon
-  activation-babysitter `SIGKILL` (64th). Fixed: `SharedUnixConnectQueue::cancel`'s claim-race slot
-  leak (62nd, `unix.rs`). 64th pass isolated `xfwm4`'s SECOND (`SOCK_NONBLOCK`) D-Bus connection:
-  hits the known cross-process AF_UNIX visibility gap, recovers, completes SASL through `BEGIN`,
-  then a `tid`-filtered trace showed zero further traffic — theorized as an epoll-readiness gap.
-  Flagged NOT YET CONFIRMED — see 65th pass immediately below.
-- **65th** — the 64th pass's epoll-readiness theory REFUTED: a pid-filtered trace must follow the
-  WHOLE thread group (GDBus moved the fd's I/O onto a cloned sibling thread the filter never
-  looked at; the fd was never stuck). Standing gap found: `ps`/`/proc` cannot see ANY
-  cross-process-forked sibling (`GlobalState::proc_self_info`, `lib.rs:425`) — re-weigh any past
-  `ps`-based conclusion. Not fixed. Full evidence: archive.
-- **66th** — `DBUS_FAILED` re-diagnosed: NOT the 65th pass's write-visibility theory (`/tmp/addr`
-  publish verified working, twice, in isolation) — the REAL mechanism is an INPUT-side ENOENT: a
-  cross-process-forked child about to exec `dbus-daemon` gets `ENOENT` on its own `< /tmp/empty`
-  stdin redirect, so `dbus-daemon` never launches (`/tmp/addr` stays empty because nothing runs to
-  write it). Two fix attempts (`mkfifo`, a defensive-recreate guard) both failed on retest. Not
-  root-caused this pass — see 67th pass immediately below for the real cause+fix. Also: upstream
-  `xfwm4` `main.c`'s GLX/compositor path REFUTED as the `setNetSupportedHint` blocker (this image's
-  own shipped `xfwm4.xml` sets `use_compositing=false`, extracted from the cached OCI layer).
-- **67th (2026-09-23) — `DBUS_FAILED`'s real cause found+FIXED.** `publish_as_container_fs_snapshot`'s
-  byte-size "non-regression guard" (`process_fork.rs`) was discarding a healthy process's own
-  fresher, smaller export purely because an UNRELATED sibling branch's own larger export happened
-  to be the current "shared" snapshot — a different, smaller branch is not a regression, but raw
-  size can't tell the two apart. Live-caught via temporary `eprintln!` diagnostics
-  (`LITEBOX_DIAG_FORK_SNAPSHOT=1`, kept in-tree) firing 17 times in one `de_only.sh` boot,
-  discarding the root process's own export (which had `/tmp/empty`) for an unrelated Xvfb-lineage
-  snapshot. **Fix**: `WRITABLE_LAYER_IMPORT_OK` (`process_fork.rs`) — the size veto now only
-  applies when THIS process's own adoption of a real prior snapshot is known to have failed (set at
-  both `import_writable_layer` call sites in the runner crate), never for a healthy process
-  exporting its own current, different-but-correct view. Verified this pass: 0 regression-guard
-  fires across 2 post-fix boots vs. 17 in one pre-fix boot. **New Thread-2 finding**: a
-  debug-traced `de_only.sh` run this pass showed `xfwm4` was NEVER `execve`'d at all within 60s —
-  a DIFFERENT `DE_FAILED` depth than the 62nd-66th passes' "`xfwm4` runs, never calls
-  `setNetSupportedHint`". Upstream `xfwm4` source (`curl`'d directly): the pre-`setNetSupportedHint`
-  chain is `initSettings()` (`xfconf_init`/`xfconf_channel_new`/`loadSettings`, synchronous
-  D-Bus-backed libxfconf, never live-tested as the blocker) → `init_compositor_screen` (confirmed
-  no-op, `use_compositing=false`) → `sn_init_display` → `myDisplayAddScreen` →
-  `getNetCurrentDesktop` → `setUTF8StringHint` → `setNetSupportedHint`. Full evidence: archive.
-- **68th (2026-09-23) — the 67th-pass fix RE-VERIFIED stable on 4 REAL `webtop_stack.sh` full
-  boots (not just `de_only.sh`); `DE_FAILED` UNCHANGED, now with X11 ground truth on 3/4** (see
-  Track B item 1 for the full evidence — this entry covers method only). Rebuilt release binary
-  (already current at `3bdf088`, incremental, 1.4s). Inlined a ctypes/libX11 census
-  (`advisor/probes/webtop_xcensus.py`'s technique) directly into `.wfgy/webtop_stack.sh` so every
-  boot gets `XGetSelectionOwner`/`XQueryTree`/`XGetWindowProperty` ground truth, not just `xprop`
-  text (re-tarred into `webtop_seed.tar` per the standing freezing gotcha). **New writable-layer
-  finding**: a file the root process wrote before any fork was still `ENOENT` to a later `$()`
-  child (run1) — the existing visibility-gap bug class, this time parent-writes/child-reads
-  rather than the previously-documented reverse; worked around (not fixed) by holding the census
-  script in a bash VARIABLE instead of a file — variables live in the shell's own process memory,
-  which any fork copies wholesale regardless of writable-layer semantics — 100% reliable runs 2-4.
-  0 crashes/OOM/regression-guard-fires across all 5 boots this pass (4 full-stack + 1 `de_only.sh`
-  debug trace).
-- **69th (2026-09-23) — first-ever byte-level decode of `xfwm4`'s real D-Bus wire traffic; every
-  transport/`xfconfd`-side theory REFUTED; a genuinely new, still-unexplained periodic trigger
-  found.** Added a standing `sys_recvmsg` payload-preview diagnostic (`litebox_shim_linux/src/
-  syscalls/net.rs::do_recvmsg`, mirrors `sys_sendmsg`'s existing 4096B hex dump — recvmsg had none
-  before, so a trace saw a caller's own requests but never the peer's replies). Live `cdb -pv`
-  attach on `xfwm4`'s own host process (guest pid == host PID, both its GTK thread and its GDBus
-  worker thread) shows a clean, non-pathological `PollSet::wait` — same inconclusive-alone result
-  every prior single-snapshot attempt found. The real advance: reassembling the byte stream (not
-  single-line previews) proves `initSettings()`'s ENTIRE D-Bus call chain succeeds end-to-end —
-  `GetAllProperties("xfwm4")`, then `loadKeyBindings()`'s clone-defaults migration (~100 real
-  `GetProperty`/`SetProperty`/`PropertyChanged` round trips, all correct, all fast) — and even the
-  LAST step, `xfce_shortcuts_provider_get_shortcuts()`'s `GetAllProperties(.../"/xfwm4/custom")`,
-  gets a real, correct, ~30ms reply. But that exact same call is then RE-ISSUED, identically,
-  every ~10.7s, 17+ times over 180s+, `_NET_SUPPORTING_WM_CHECK` still empty throughout. Real
-  upstream `xfwm4` source (`settings.c`, fetched fresh) has exactly ONE mechanism that could cause
-  this: `cb_keys_changed`→`keymap_reload()`, driven by GDK's own "keys-changed" signal — meaning
-  something signals a keyboard-mapping change roughly every 10.7s, forever, and (working theory,
-  NOT proven) `g_dbus_connection_call_sync`'s own nested-main-loop iteration may let this
-  recursively re-enter `loadKeyBindings()` from inside the STILL-PENDING original `initSettings()`
-  call, stranding it forever even though every individual D-Bus round trip keeps succeeding. A
-  first attempt at reassembling `xfwm4`'s X11 stream to find the actual triggering event did NOT
-  converge (fd=3's write-side syscall is still unidentified — zero `sendto`/`sendmsg`/`write`
-  events captured despite a demonstrably live connection; the reply-length-aware X11 parser
-  desynced after the connection-setup reply and needs a rewrite, not a patch). Full evidence,
-  exact call sequence, and precise next-step pickup (X11 write-side syscall ID, a correct X11
-  reassembler, or an `LD_PRELOAD` interposer on `g_dbus_connection_call_sync`/
-  `g_main_context_iteration` to test the reentrancy theory directly): archive.
+- **43rd-61st, all FIXED, live-verified** (full narrative/shas: archive): both Xvfb SIGSEGVs
+  (43rd/51st); D-Bus activation's dropped-CLOEXEC-fd bug (`66265d9`); `fd/mod.rs:422` panic
+  (`faa74c6`); per-fork rootfs-rebuild RAM cost (`2d18a4e`); the `ssh-agent`/`xfwm4`
+  permanent-freeze class, a `RawMutex::WaiterQueue::with_lock` release-via-plain-statement bug
+  (`61c235e`, 3/3 clean on RELEASE vs. 100% pre-fix). `DE_FAILED` (no `_NET_SUPPORTING_WM_CHECK`)
+  survived all of it.
+- **62nd-66th — `xfwm4` narrowed to an exact fd/protocol step, `DE_FAILED` UNCHANGED throughout**
+  (full evidence: archive). 3 independent live techniques (X11 census, guest-stderr capture, `cdb
+  -pv`) agree `xfwm4` claims `WM_S0`, prints zero stderr, never reaches `setNetSupportedHint`.
+  Fixed: `SharedUnixConnectQueue::cancel`'s claim-race slot leak (62nd). REFUTED along the way: the
+  `/defaults/xfce/` readdir theory (63rd); the dbus-daemon babysitter `SIGKILL` (64th); the
+  epoll-readiness theory (65th — a pid-filtered trace must follow the WHOLE thread group, GDBus
+  moves fd I/O to a cloned sibling; `ps`/`/proc` is blind to every cross-process-forked sibling,
+  re-weigh any past `ps`-based conclusion); the 65th pass's own `/tmp/addr` write-visibility theory
+  for `DBUS_FAILED` (66th — real cause was an input-side `ENOENT` on a fork child's `< /tmp/empty`
+  stdin redirect, not yet fixed this pass); upstream `xfwm4`'s GLX/compositor path as the
+  `setNetSupportedHint` blocker (66th — this image ships `use_compositing=false`).
+- **67th — `DBUS_FAILED` root-caused+FIXED.** `publish_as_container_fs_snapshot`'s byte-size
+  "non-regression guard" (`process_fork.rs`) discarded a healthy process's own fresher, smaller
+  export because an unrelated sibling branch's larger export was the current "shared" snapshot.
+  **Fix**: `WRITABLE_LAYER_IMPORT_OK` — the size veto now fires only when THIS process's own prior
+  adoption is known to have failed. 0 regression-guard fires across 2 post-fix boots vs. 17 pre-fix.
+  Upstream `xfwm4` source read: `initSettings()` → `init_compositor_screen` (no-op) →
+  `sn_init_display` → `myDisplayAddScreen` → `getNetCurrentDesktop` → `setUTF8StringHint` →
+  `setNetSupportedHint` is the real pre-hint call chain.
+- **68th — the 67th-pass fix RE-VERIFIED stable on 4 real `webtop_stack.sh` full boots; `DE_FAILED`
+  UNCHANGED, X11 ground truth confirmed on 3/4.** Inlined a ctypes/libX11 census
+  (`advisor/probes/webtop_xcensus.py`'s technique) into `.wfgy/webtop_stack.sh`. 0
+  crashes/OOM/regression-guard-fires across 5 boots.
+- **69th — first-ever byte-level decode of `xfwm4`'s real D-Bus wire traffic; every
+  transport/`xfconfd`-side theory REFUTED.** Added a standing `sys_recvmsg` payload-preview
+  diagnostic (`litebox_shim_linux/src/syscalls/net.rs::do_recvmsg`, mirrors `sys_sendmsg`'s
+  existing hex dump — recvmsg had none before, so a trace saw requests but never replies).
+  Reassembling the byte stream proves `initSettings()`'s ENTIRE D-Bus call chain succeeds
+  end-to-end (`GetAllProperties("xfwm4")`, `loadKeyBindings()`'s ~100-property clone-defaults
+  migration, and the final `xfce_shortcuts_provider_get_shortcuts()` call all get real, correct,
+  fast replies) — but that final `GetAllProperties(.../"/xfwm4/custom")` call is then RE-ISSUED,
+  identically, every ~10.7s forever, `_NET_SUPPORTING_WM_CHECK` still empty throughout. Real
+  upstream `xfwm4` source has exactly ONE mechanism that could cause this: `cb_keys_changed`→
+  `keymap_reload()`, driven by GDK's "keys-changed" signal — working theory (NOT proven):
+  `g_dbus_connection_call_sync`'s nested-main-loop iteration lets this recursively re-enter
+  `loadKeyBindings()` from inside the still-pending original call, stranding it forever even
+  though every individual round trip keeps succeeding. Full evidence, exact call sequence: archive.
+- **70th — the ~10.7s retrigger INDEPENDENTLY REPRODUCED on a fresh boot; "`xfwm4` never writes
+  X11" REFUTED; GDK upstream confirms `keys-changed` is purely event-driven; root cause still
+  open** (pickup: Track B item 1, below). `sendto`/`sendmsg`/`write` never appearing was a LOGGING
+  gap, not behavioral: `sys_writev` delegates to `sys_write`, logged under `syscalls::file`, not
+  `net` (every prior filter enabled only `net`). Fixed two real logging-infra bugs (both under
+  "Standing lessons" above): `*> combined.log`'s silent line-wrap past ~116-119 chars, and
+  `FlushingStderr`'s two-lock write+flush race. Independently re-derived the D-Bus retrigger from
+  raw `sendmsg` previews on a fresh boot (no `cdb`): t=9.22/20.47/31.27/42.19s, deltas 10.8-11.3s,
+  matching the 69th pass's own finding. Reassembling `xfwm4`'s X11 RECV stream for the first time
+  (rejoin wrapped lines first) parses 155 clean Replies + 15 `PropertyNotify` + 2 Errors in under
+  1s of connection time, before `initSettings()` even starts — direct proof of substantial real
+  X11 write traffic. One 6976-byte Reply in that run has the right shape for a
+  `GetKeyboardMapping` reply (`byte1=7`, 1736 `KeySym`s, `min_keycode=8`/`max_keycode=255`/7
+  keysyms-per-keycode — GDK's own startup keymap read) and parses to an exact computed boundary,
+  but the bytes after do NOT parse as a valid Reply/Error/Event under standard framing —
+  reproduced BYTE-IDENTICAL on two independent boots (69th pass's log and this pass's fresh one),
+  so a real parser/protocol-understanding gap, not corrupted input. Fetched real GTK 3.24
+  `gdk/x11/gdkkeys-x11.c`/`gdkevents-x11.c`: `keys-changed` is emitted ONLY by
+  `_gdk_x11_keymap_keys_changed()`, called ONLY on a genuine `XkbNewKeyboardNotify`/`XkbMapNotify`
+  XKB event — no GDK-internal timer exists, so a real (if spurious) XKB event must be the trigger
+  if the reentrancy theory holds; no candidate periodic-XKB-event source found in litebox's own
+  emulation by code search. `DE_FAILED` reproduces identically post-fix (`XCENSUS_WINDOWS
+  total=16`, same as 69th). Did not reach `DE_UP`; no browser/app verification attempted. Byte
+  dumps, reassembly script, exact offsets: `.wfgy/pass70_*` (gitignored).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
-`DE_FAILED` cause (REFUTED FOR GOOD); AF_UNIX `connect()` `EAGAIN`-vs-`EINPROGRESS`; `pty_registry`/
-`daemon_pty_masters` (`syscalls::pty::SharedPtyTable`, live-verified cross-process, 37th pass);
-fork's fd-eligibility scan dropping a redirected 0/1/2 (44th, `raw_fd_is_plain_stdio_device`);
-`SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap (44th, `UnixStreamState::Connecting`);
-both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
+`DE_FAILED` cause; AF_UNIX `connect()` `EAGAIN`-vs-`EINPROGRESS`; `pty_registry`/
+`daemon_pty_masters` (`syscalls::pty::SharedPtyTable`, live-verified cross-process); fork's
+fd-eligibility scan dropping a redirected 0/1/2 (`raw_fd_is_plain_stdio_device`);
+`SharedUnixConnectQueue`'s cancel-on-first-non-blocking-miss gap (`UnixStreamState::Connecting`);
+both Xvfb SIGSEGVs.
 
 **Open, in rough priority order:**
 
 1. **`DE_FAILED`'s real chain — CLOSED sub-issues per above (`ssh-agent`/`xfwm4` freeze, 60th/61st;
-   `DBUS_FAILED`'s regression-guard cause, 67th, RE-VERIFIED stable 68th on 4 full-stack boots,
-   0 fires). `setNetSupportedHint` itself is the one still-open blocker, now with 68th-pass X11
-   ground truth confirming the exact symptom on 3/4 full boots** (`XCENSUS_SELECTION WM_S0
-   owner=0x60008e`, `XCENSUS_NETWMCHECK nitems=0`) and `xfwm4`'s own `execve` independently
-   confirmed live (run2 debug trace, `resolve_shebang: ... Ok(())`, pid=28340) — the full-stack
-   boot's `xfwm4` launch is RELIABLE, not the 67th-pass Thread-2 "never execve's" anomaly (that
-   anomaly is real but reproduces only on the separate `de_only.sh` harness, 68th pass — still
-   unexplained, possibly a stale-seed-tar artifact per the standing `webtop_seed.tar`-freezing
-   gotcha). **69th pass, byte-level D-Bus decode: `initSettings()`'s whole D-Bus chain (including
-   `loadKeyBindings()`'s ~100-property clone-defaults migration AND the final
-   `xfce_shortcuts_provider_get_shortcuts()` call) is CONFIRMED succeeding — `xfconfd`/the AF_UNIX
-   transport are REFUTED as the blocker for good.** The real, still-open mystery: that final
-   `GetAllProperties(.../"/xfwm4/custom")` call gets re-issued, cleanly, every ~10.7s forever
-   (matches real `xfwm4` source's ONLY periodic-reload path, `cb_keys_changed`→`keymap_reload()`,
-   itself driven by a GDK "keys-changed" signal whose own real trigger is unidentified) without
-   `initSettings()` ever returning. Pickup: identify `xfwm4`'s X11 write-side syscall (zero
-   `sendto`/`sendmsg`/`write` ever captured on its X fd despite a live connection) and build a
-   correct, reply-length-aware X11 stream reassembler to find the ~10.7s event (a first attempt
-   desynced after the connection-setup reply); or test the `g_dbus_connection_call_sync`
-   nested-main-loop reentrancy theory directly via an `LD_PRELOAD` interposer (same technique as
-   the 30th pass's `getenv_probe.so`). `ps`/`/proc` is blind to every
-   cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion. PER-PROCESS RAM
-   is the hard ceiling on any attempt (5-8GB free at boot start → 0.15-1.2GB during the
-   WM2/selkies-concurrent window on EVERY 68th-pass full-stack run) — kill fast right after the
-   census, via WMI `Terminate`, never wait for the script's own 600s `HOLD` loop. Secondary, lower
-   priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high `VM_SHARED`
-   fork-child region count (52nd).
+   `DBUS_FAILED`'s regression-guard cause, 67th, stable through 68th, 0 fires). `setNetSupportedHint`
+   itself is the one still-open blocker; 69th/70th (pass-history above) narrowed it to a ~10.7s
+   periodic `GetAllProperties(.../"/xfwm4/custom")` retrigger, independently reproduced twice,
+   matching `xfwm4`'s only periodic-reload path (`cb_keys_changed`→`keymap_reload()`, a GDK
+   "keys-changed" signal confirmed event-only by upstream source — no GDK timer).** Pickup, in
+   order: (a) root-cause the 70th pass's own deterministic X11-reassembler desync (~14KB in,
+   inside/after a legitimate `GetKeyboardMapping` reply, byte-identical on two boots so it's a
+   parser/protocol gap, not corrupted input — dump the exact boundary bytes against a byte-accurate
+   X11 spec, don't guess); (b) once the RECV stream parses past that point, check directly for a
+   `MappingNotify`(34)/XKB event at the already-timestamped ~10.7s boundaries (70th pass log:
+   t=9.22/20.47/31.27/42.19s); (c) if none exists, pivot to testing the reentrancy theory directly
+   via an `LD_PRELOAD` interposer on `g_dbus_connection_call_sync`/`g_main_context_iteration` (same
+   technique as the 30th pass's `getenv_probe.so`) rather than more passive tracing. `ps`/`/proc` is
+   blind to every cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion.
+   PER-PROCESS RAM is the hard ceiling on any attempt (5-8GB free at boot start → sub-1GB during
+   the WM2/selkies-concurrent window on most full-stack runs, 70th pass included) — kill fast via
+   WMI `Terminate` right after the census, never wait for the script's own 600s `HOLD` loop.
+   Secondary, lower priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high
+   `VM_SHARED` fork-child region count (52nd).
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass (`unix.rs`); did NOT
    resolve the `xfwm4` symptom above, so a real but insufficient fix for THIS symptom. Other AF_UNIX
    exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256
@@ -342,14 +333,12 @@ webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in 
 §3N's safe-linked-tcache write. Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
 0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
 only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
-the old "Fork-after-Xorg" freeze either (35th pass). BOTH Xvfb SIGSEGVs are fixed and CONFIRMED on a
-full `webtop_stack.sh` boot too (51st/52nd passes, zero crashes). D-Bus service-activation
-false-"exited" (54th), the `fd/mod.rs:422` panic (55th, `faa74c6`), and per-fork RAM cost (56th,
-`2d18a4e`) are all FIXED — a `de_only.sh` boot now runs the entire 60s+160s window with ZERO
-crash/OOM (57th pass). `DE_FAILED` still fires — NOT "Cannot open display" (refuted, 52nd), NOT RAM
-exhaustion any more (57th) — see Track B item 1 for the current live blockers. Selkies also needs
-`--clipboard-enabled=false` on the thread-based path (its clipboard monitor re-triggers the same
-corruption every tick) — moot cross-process.
+the old "Fork-after-Xorg" freeze either (35th pass). A `de_only.sh` boot runs its whole 60s+160s
+window with ZERO crash/OOM as of the 57th pass (fixes landed: cross-process fork section above).
+`DE_FAILED` still fires — NOT "Cannot open display" (refuted, 52nd), NOT RAM exhaustion (57th) —
+see Track B item 1 for the current live blockers. Selkies also needs `--clipboard-enabled=false`
+on the thread-based path (its clipboard monitor re-triggers the same corruption every tick) —
+moot cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A SECOND, distinct
 glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) still sporadically

@@ -354,28 +354,70 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
     });
 }
 
-/// A `tracing_subscriber` writer that flushes `std::io::stderr()` after every write.
+/// A `tracing_subscriber` writer that flushes `std::io::stderr()` after every write, and buffers
+/// one whole formatted log EVENT (`tracing_subscriber::fmt`'s `Format::format_event` issues
+/// several separate `Write` calls per event -- timestamp, level, target, fields, message, the
+/// trailing newline -- all against the SAME `MakeWriter`-constructed instance) into memory so it
+/// reaches the real OS handle as exactly one `write_all` call, itself performed while holding
+/// `std::io::stderr()`'s own internal lock for its entire duration (see `Drop` impl below).
 ///
-/// Without this, `tracing_subscriber::fmt()`'s default writer goes through ordinary
-/// `std::io::stderr()`, which Rust's standard library block-buffers whenever stderr is NOT a
-/// live console (any redirected file, anonymous pipe, or `.NET`/other process-launcher capture)
-/// -- flushed only on process exit, never per line. Confirmed live: a `.NET`
-/// `Process`-redirected run received literally zero bytes of litebox's own log output over a full
-/// 30 real seconds of active, high-volume (`LITEBOX_LOG=debug`) logging, with the entire log only
-/// appearing once the process was killed. This is a SEPARATE code path from
+/// Without the flush-per-event half of this, `tracing_subscriber::fmt()`'s default writer goes
+/// through ordinary `std::io::stderr()`, which Rust's standard library block-buffers whenever
+/// stderr is NOT a live console (any redirected file, anonymous pipe, or `.NET`/other
+/// process-launcher capture) -- flushed only on process exit, never per line. Confirmed live: a
+/// `.NET` `Process`-redirected run received literally zero bytes of litebox's own log output over
+/// a full 30 real seconds of active, high-volume (`LITEBOX_LOG=debug`) logging, with the entire
+/// log only appearing once the process was killed. This is a SEPARATE code path from
 /// `litebox_platform_windows_userland`'s own raw-`WriteFile`-based guest-process stdout (already
 /// fixed for exactly this reason) -- that fix never covered litebox's OWN tracing output, which is
 /// the vast majority of every diagnostic capture this project's own investigations rely on.
-struct FlushingStderr;
+///
+/// **The buffer-then-one-atomic-write half closes a real, structurally-demonstrated race**: every
+/// guest OS thread runs as an ordinary Windows thread in this one shared host process (same
+/// structural fact the guest-visible `STDOUT_WRITE_LOCK`/`STDERR_WRITE_LOCK` pair already exists
+/// to handle, see `litebox_platform_windows_userland::write_to_std_handle`'s own doc comment), and
+/// the PREVIOUS version of this type called `std::io::stderr().write(buf)` then, SEPARATELY,
+/// `std::io::stderr().flush()` -- two independent lock acquire/release cycles per `Write` call, and
+/// `fmt::Layer` issues several `Write` calls per single log event. That left a real window for two
+/// different guest threads' concurrently-logged events to interleave their bytes in the shared
+/// host stderr stream. Found while investigating a suspected corruption in a reassembled xfwm4 X11
+/// wire-stream trace (70th pass, D-Bus-and-X11-decode investigation) -- **that specific suspicion
+/// was independently RULED OUT** (the same parse anomaly reproduced byte-identical on a fresh boot
+/// taken AFTER this fix landed, proving it's a real parser/protocol-understanding gap, not
+/// log-level corruption), but the underlying two-lock-acquisition race this fix closes is real and
+/// worth closing on its own merits regardless, matching the discipline the existing guest-visible
+/// fix already applies to guest `write(1)`/`write(2)`. Buffering the whole event into `self.0` and
+/// performing exactly one `write_all` + `flush` pair while holding ONE `std::io::stderr()` lock
+/// guard for both (in `Drop`, since `MakeWriter` constructs a fresh instance per event and
+/// `fmt::Layer` drops it right after) makes the interleaving structurally impossible.
+#[derive(Default)]
+struct FlushingStderr(Vec<u8>);
 
 impl std::io::Write for FlushingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = std::io::stderr().write(buf)?;
-        std::io::stderr().flush()?;
-        Ok(n)
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stderr().flush()
+        // Real I/O happens once, atomically, in `Drop` -- see the type's own doc comment for why
+        // buffering into memory here (rather than writing through immediately) is load-bearing.
+        Ok(())
+    }
+}
+
+impl Drop for FlushingStderr {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        // One lock acquisition spanning BOTH the write and the flush -- unlike the two-call
+        // version this replaces, no other thread's `std::io::stderr()` caller can interleave
+        // bytes between them, because they all contend on this same global lock.
+        use std::io::Write as _;
+        let stderr = std::io::stderr();
+        let mut lock = stderr.lock();
+        let _ = lock.write_all(&self.0);
+        let _ = lock.flush();
     }
 }
 
@@ -538,7 +580,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,litebox_platform_windows_userland::fork_v
 
 pub fn init_logging() {
     let _ = tracing_subscriber::fmt()
-        .with_writer(|| FlushingStderr)
+        .with_writer(FlushingStderr::default)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(
