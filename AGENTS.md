@@ -22,172 +22,137 @@ target/release/litebox_runner_linux_on_windows_userland.exe -Z \
 One ~81MB layer, `[cache] HIT` after the first pull, real GNU coreutils instead of busybox (coreutils
 `touch` issues the `utimensat`/futimens form busybox's never reaches, `caaac79`). Host-side gotchas:
 
-- **PowerShell, never Git Bash** — Git Bash rewrites `/absolute/guest/paths` into
-  `C:/Program Files/Git/...` before the runner sees them, giving a misleading `ENOENT`. `Start-Process
-  -RedirectStandardOutput/-RedirectStandardError` makes the runner exit almost instantly with zero guest
-  output (no crash dump, no event-log entry); use `& .\runner.exe ... *> combined.log` instead.
+- **PowerShell, never Git Bash** — Git Bash rewrites `/absolute/guest/paths` into `C:/Program
+  Files/Git/...` before the runner sees them (misleading `ENOENT`). `Start-Process
+  -RedirectStandardOutput/-RedirectStandardError` makes the runner exit almost instantly with zero
+  guest output; use `& .\runner.exe ... *> combined.log` instead.
 - **Single quotes only inside `-c`** — embedded double quotes are corrupted crossing into the
   child's Win32 command line (masqueraded as deep fork/stack-pointer corruption for a whole session).
-- **`LITEBOX_PROCESS_FORK=1` is a HOST env var, not a guest `--env`** — `spawn_cross_process_fork_child`
-  (`litebox_platform_windows_userland/src/lib.rs`) reads it via a bare `std::env::var_os` on the HOST
-  side; setting it via `--env` instead silently no-ops the whole cross-process path with ZERO log
-  output (looks identical to "not eligible", but isn't even attempted) — confirmed live, 37th pass.
-- **Boot logs launched via PowerShell redirection (`*> file.log`) are UTF-16LE, not UTF-8** — a plain
-  `grep`/`Select-String` against them silently returns zero matches even when the text is really
-  there. Always `iconv -f UTF-16LE -t UTF-8` (or PowerShell's own `Get-Content -Encoding Unicode`)
-  first — confirmed live, 53rd pass, on `.wfgy/webtop_release_boot6.log`.
-- **`*> file.log` WORD-WRAPS any single tracing line longer than ~116-119 chars across MULTIPLE
-  physical lines, with no continuation marker** — PowerShell wraps a captured native-process
-  stderr line at its host/console buffer width; data is not lost, only split (confirmed by direct
-  repro: `python -c "sys.stderr.write('A'*300)" *> f` produces 3 physical lines for 1 logical
-  write). A naive line-based `grep`/regex over any long DEBUG line (hex payload previews
-  especially) silently sees only the first ~116-119 chars (70th pass). **Fix**: rejoin first — a
-  physical line NOT starting with the `<float>s` timestamp prefix is a continuation of the
-  previous logical line, concatenate it back on before applying any other regex.
+- **`LITEBOX_PROCESS_FORK=1` is a HOST env var, not a guest `--env`** —
+  `spawn_cross_process_fork_child` (`litebox_platform_windows_userland/src/lib.rs`) reads it via a
+  bare `std::env::var_os` on the HOST side; via `--env` it silently no-ops with ZERO log output
+  (looks like "not eligible" but isn't even attempted) — 37th pass.
+- **Boot logs from PowerShell redirection (`*> file.log`) are UTF-16LE, not UTF-8** — a plain
+  `grep`/`Select-String` silently returns zero matches even when the text is there. Always `iconv
+  -f UTF-16LE -t UTF-8` (or `Get-Content -Encoding Unicode`) first — 53rd pass.
+- **`*> file.log` WORD-WRAPS any tracing line longer than ~116-119 chars across MULTIPLE physical
+  lines, no continuation marker** — data isn't lost, only split (repro: `python -c
+  "sys.stderr.write('A'*300)" *> f` → 3 physical lines for 1 logical write). A naive line-based
+  grep/regex over a long DEBUG line sees only the first ~116-119 chars (70th). **Fix**: a physical
+  line NOT starting with the `<float>s` timestamp prefix is a continuation — rejoin before regex.
 
 **Log level**: default is `warn,litebox_platform_windows_userland::fork_verify=error` (`fork_verify`
-pinned to `error` since it warns per single-stepped instruction). Do **not** add `LITEBOX_LOG=error`
-by reflex; use `fork_verify=warn` when a fork heal is the subject. A bare `LITEBOX_LOG=debug` rules
-out "which module's silent early-return ate my decision" fast but is too noisy for a full boot.
-**For a process-tree/socket-payload investigation specifically (the common case), prefer the two
-dedicated low-overhead targets over any blanket module target**: `litebox_diag::process_timeline=
-debug` (five `DIAG_TIMELINE` lines, system-wide, cheap — see Standing lessons) and
-`litebox_diag::socket_read=debug` (read()/recvfrom() payload previews; optionally narrow further
-with the `LITEBOX_DIAG_SOCKET_READ_TARGET=<comm>` env var, unset = every process, 74th pass) —
-both strictly cheaper than the old `litebox_shim_linux::syscalls::{process,net,file,unix}=debug`
-recipe, which floods ~70+ unrelated call sites per module across every concurrently-forked process
-during a desktop boot's fork storm.
+pinned to `error` since it warns per single-stepped instruction). Don't add `LITEBOX_LOG=error` by
+reflex; use `fork_verify=warn` for a fork heal. Bare `LITEBOX_LOG=debug` is useful but too noisy for
+a full boot. **Prefer the two dedicated low-overhead targets over any blanket module target**:
+`litebox_diag::process_timeline=debug` (five `DIAG_TIMELINE` lines, system-wide, cheap) and
+`litebox_diag::socket_read=debug` (read()/recvfrom() payload previews, narrow with
+`LITEBOX_DIAG_SOCKET_READ_TARGET=<comm>`, unset = every process, 74th) — both far cheaper than the
+old `litebox_shim_linux::syscalls::{process,net,file,unix}=debug` recipe (~70+ call sites/module
+flooded across every concurrently-forked process during a boot's fork storm).
 
 ## Standing lessons and hard constraints
 
-- **No WSL or hypervisor, ever** — always run under the matching runner
-  (`litebox_runner_linux_on_windows_userland.exe`/`litebox_runner_linux_userland`); cross-compiling
-  FOR Linux is fine, running the result in a VM defeats the premise.
+- **No WSL/hypervisor ever** — run under the matching runner (`litebox_runner_linux_on_windows_
+  userland.exe`/`litebox_runner_linux_userland`); cross-compiling FOR Linux is fine, running the
+  result in a VM defeats the premise.
 - **`fork_verify.rs`'s stale-pointer-healing bug class is Windows-only** (real `fork()` gives
-  identical child addresses) — never port to another platform's crate.
+  identical child addresses) — never port it to another platform's crate.
 - **Never `bcdedit /debug on`** without a kernel debugger attached — two full-host freezes so far.
-- **A process spinning inside a dead-locked allocator/spinlock resists `Stop-Process -Force`** —
-  use `Invoke-CimMethod -MethodName Terminate` (WMI) instead. `cdb -p <pid>` must use `-pv`/`qd`,
-  never a bare `q` (kills the target).
-- **Never run two full-stack verifications concurrently** — starves both, looks exactly like a real
-  hang. Kill every `litebox_runner` between runs; watch `FreePhysicalMemory`, kill on a falling trend.
-- **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check**, never
-  `PrintWindow`/`CopyFromScreen` — decode frame structure (`advisor/probes/decode_frame.py`) and
-  correlate against `DIAG_TIMELINE execve`'s real argv0.
+- **A process spinning in a dead-locked allocator/spinlock resists `Stop-Process -Force`** — use
+  `Invoke-CimMethod -MethodName Terminate` (WMI). `cdb -p <pid>` must use `-pv`/`qd`, never bare `q`
+  (kills the target).
+- **Never run two full-stack verifications concurrently** — starves both, looks like a real hang.
+  Kill every `litebox_runner` between runs; watch `FreePhysicalMemory`, kill on a falling trend.
+- **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check**, never `PrintWindow`/
+  `CopyFromScreen` — decode via `advisor/probes/decode_frame.py`, correlate against `DIAG_TIMELINE
+  execve`'s real argv0.
 - **Never time litebox with one host process per datapoint** (bare spawn costs 1.6-2.3s) — run N
-  iterations inside ONE guest process; never subtract timestamps across a parent log and a
-  fork-child log (`init_logging()` resets elapsed time to ~0 per child).
-- **Release-binary `cdb` reads are unreliable** — MSVC linker ICF folds distinct functions into one
-  symbol. Build `cargo build -p litebox_runner_linux_on_windows_userland` (no `--release`) for any
-  `cdb` session needing a trustworthy stack.
+  iterations in ONE guest process; never subtract timestamps across a parent log and a fork-child
+  log (`init_logging()` resets elapsed time to ~0 per child).
+- **Release-binary `cdb` reads are unreliable** (MSVC ICF folds distinct functions into one symbol)
+  — build `cargo build -p litebox_runner_linux_on_windows_userland` (no `--release`) for any `cdb`
+  session needing a trustworthy stack.
 - **Refusal errno choice is API contract** — EPERM lets callers degrade, EINVAL/ENOSYS fails them
-  hard; wrong choices have silently broken whole subsystems before (30th pass's AF_UNIX
+  hard; wrong choices have silently broken whole subsystems before (30th-pass AF_UNIX
   `EAGAIN`-vs-`EINPROGRESS` fix is the newest instance).
 - **Proving a run took the cross-process fork path needs `[process_fork_diag] task-resume-probe`
-  lines, never the shim's eligibility log** — the latter fires regardless of outcome (three false
-  conclusions so far, archive).
-- **An fd subsystem being "uncarriable" across a cross-process fork does not mean the fork must be
-  refused over it** — only that fd can't be carried. Pipes/regular files/eventfds ARE carried;
-  close-on-exec and pty fds are safely DROPPED and the fork proceeds (a pty, unlike a socket, is
-  RE-OPENABLE by id via `SharedPtyTable`); only genuinely un-recoverable kinds (unix-socket) still
-  refuse. Check `try_cross_process_fork`'s match arms (`litebox_shim_linux/src/syscalls/process.rs`)
-  before assuming a new kind needs old treatment. Run dbus-daemon non-forking; for XFCE use
-  `xfce4-session`, never `startxfce4`.
+  lines, never the shim's eligibility log** — the latter fires regardless of outcome (archive).
+- **An fd subsystem being "uncarriable" across a cross-process fork doesn't mean the fork must be
+  refused** — pipes/regular files/eventfds ARE carried; close-on-exec and pty fds are safely
+  DROPPED and the fork proceeds (a pty, unlike a socket, is RE-OPENABLE by id via `SharedPtyTable`);
+  only genuinely unrecoverable kinds (unix-socket) refuse. Check `try_cross_process_fork`'s match
+  arms (`litebox_shim_linux/src/syscalls/process.rs`) before assuming a new kind needs old
+  treatment. Run dbus-daemon non-forking; for XFCE use `xfce4-session`, never `startxfce4`.
 - **`wait4()`/`kill()` to a cross-process fork child are asymmetric** — `kill()` to a
-  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (documented gap, not a bug:
-  reachable via `wait4`, just not signalable yet).
+  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (documented gap: reachable
+  via `wait4`, just not signalable yet).
 - **A `socketpair(2)`-originated fd (both ends `Unnamed`) is NOT safe to drop as CLOEXEC across a
-  cross-process fork** — unlike a named-peer CLOEXEC client socket, real processes (`dbus-daemon`'s
-  babysitter) use it for pre-`exec()` bookkeeping; `raw_fd_is_addressless_unix_socket_pair`
-  (`net.rs`) now refuses (falls back to thread-based fork) rather than silently dropping it (54th).
+  cross-process fork** — real processes (`dbus-daemon`'s babysitter) use it for pre-`exec()`
+  bookkeeping; `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) refuses it (falls back to
+  thread-based fork) rather than silently dropping it (54th).
 - **A `TypedFd`'s index is only valid against the SAME `Descriptors` instance that `insert()`ed
-  it** — reading one back against a DIFFERENT process's table is out-of-bounds or resolves to an
+  it** — reading one back against a different process's table is out-of-bounds or resolves to an
   unrelated entry; every accessor in `litebox/src/fd/mod.rs` returns `None` rather than panicking
-  (`faa74c6`) — the same class as the `Network::queued_for_closure`/`Pipes.litebox`/`FutexManager`
-  bugs before it.
-- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot's RAM floor is NOT a fixed ~3.1-3.3GB plateau —
-  it depends on concurrent HOST load and can fall well below 1GB free** (73rd pass, 4/4 independent
-  `de_only_xcensus_seed2.tar` boots: consistent collapse to 500MB-1.5GB free within ~10-20s of
-  `xfce4-session`'s own fork tree starting, on a host where unrelated processes — other Claude Code
-  sessions, browser, etc. — independently held ~9 of 15GB total RAM). `taskkill /IM
-  litebox_runner…exe /F /T` reliably recovers full RAM even from a <500MB-free state; still check
-  `FreePhysicalMemory`/`Get-Counter '\Memory\Available MBytes'` throughout and kill on a FALLING
-  TREND, not a fixed number. **Confirm the release binary's mtime postdates the newest relevant
-  commit before trusting a boot result** (57th pass caught a ~1hr-stale binary this way). See Track
-  B item 1.
-- **`de_only_xcensus_seed2.tar` (NOT the plain `de_only_seed.tar`) reaches `DE_LAUNCHED_DIRECT` in
-  ~10-15s real time and does NOT hit the 71st-pass `gpg-agent`/`iceauth`/`ssh-agent` dead end** —
-  confirmed 4/4 clean runs, 73rd pass; still the preferred harness, ~10x faster to `xfwm4`-launch
-  than `webtop_stack.sh`. **`de_only_xcensus_seed3.tar`** (75th pass, disk-only, not checked in) is
-  the SAME seed with its baked-in `/tmp/xcensus.py` round trip rewritten to feed the census script
-  to `python3` via a shell variable + stdin instead of a `/tmp` file — the old seed2's census
-  always failed `rc=2` ENOENT (writable-layer-visibility gap on `/tmp`, a different instance of the
-  same class the 75th pass's own fix addressed for ordinary files); seed3's census returns real
-  data (`rc=0`). Use seed3 for any future census-dependent capture.
+  (`faa74c6`) — same class as the `Network::queued_for_closure`/`Pipes.litebox`/`FutexManager` bugs.
+- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot's RAM floor is NOT a fixed ~3.1-3.3GB plateau — it
+  depends on concurrent HOST load, can fall well below 1GB free** (73rd, 4/4 `de_only_xcensus_
+  seed2.tar` boots: collapse to 500MB-1.5GB free within ~10-20s of `xfce4-session`'s fork tree
+  starting). `taskkill /IM litebox_runner…exe /F /T` reliably recovers RAM even from <500MB-free;
+  watch `FreePhysicalMemory` throughout, kill on a FALLING TREND not a fixed number. **Confirm the
+  release binary's mtime postdates the newest relevant commit before trusting a boot result** (57th
+  caught a ~1hr-stale binary this way). See Track B item 1.
+- **`de_only_xcensus_seed2.tar` (NOT `de_only_seed.tar`) reaches `DE_LAUNCHED_DIRECT` in ~10-15s and
+  does NOT hit the 71st-pass `gpg-agent`/`iceauth`/`ssh-agent` dead end** (4/4, 73rd) — preferred
+  harness, ~10x faster to `xfwm4`-launch than `webtop_stack.sh`. **`de_only_xcensus_seed3.tar`**
+  (75th, disk-only) is the same seed with its `/tmp/xcensus.py` round trip rewritten to feed
+  `python3` via stdin instead of a `/tmp` file — seed2's census always failed `rc=2` ENOENT
+  (writable-layer-visibility gap on `/tmp`); seed3 returns real data (`rc=0`). Use seed3.
 - **A bare file redirect (`cmd > /tmp/f` + a later sibling's read) used to fail silently under
-  `LITEBOX_PROCESS_FORK=1` for the SAME root cause the 75th pass fixed (`1d449e6`) — a fork
-  child's writable-layer export was never re-imported by the parent on any `--oci-image` boot, so
-  no later sibling ever saw it.** Not yet re-verified for a literal `>` redirect specifically (only
-  `mkdir`+`cp`+`ls`/`cat` was), so still prefer a PIPE or `$( )` when in doubt: `cmd 2>&1 | sed
-  's/^/[tag] /' &` for streaming output, `VAR=$(external-cmd)` for captured output (44th-pass
-  fd-carry fix). Full mechanism: archive + 75th-pass entry above.
+  `LITEBOX_PROCESS_FORK=1`, same root cause the 75th pass fixed (`1d449e6`)** — not yet re-verified
+  for a literal `>` specifically, so prefer a PIPE or `$( )` when in doubt: `cmd 2>&1 | sed
+  's/^/[tag] /' &` for streaming, `VAR=$(external-cmd)` for captured output (44th-pass fix).
 - **`.wfgy/webtop_stack.sh` is NOT what boots — `.wfgy/webtop_seed.tar` embeds a FROZEN COPY**
-  (`--resume-from`), so editing the host script alone changes nothing. Re-tar after every edit
-  (`tar -xf` to a stage dir, overwrite, `tar -cf webtop_seed.tar webtop_stack.sh tmp config`) and
-  verify with `tar -xOf ... | grep`. Found the hard way: the 35th pass's `/dev/tcp` rewrite was
-  still absent from the tar on the 38th pass — never once ran in a guest.
-- **A boot whose log stops is usually a DEAD ROOT RUNNER, not a hang** — when the root process
-  (hosting the top-level shell) dies, `[s]` markers stop while orphaned cross-process children
-  (Xvfb, selkies) keep burning CPU, reading exactly like a stall. Diagnose via
-  `Get-CimInstance Win32_Process -Filter "Name='litebox_runner…'"` and check `CommandLine.Length`
-  — a cross-process CHILD has the bare 77-char exe-only command line
-  (`process_fork.rs:1594-1599`); if NO survivor carries the full `--oci-image …` args, the root is
+  (`--resume-from`); editing the host script alone changes nothing. Re-tar after every edit (stage,
+  overwrite, `tar -cf webtop_seed.tar webtop_stack.sh tmp config`), verify with `tar -xOf ... |
+  grep`. Found the hard way: the 35th pass's `/dev/tcp` rewrite was still absent from the tar on
+  the 38th pass — never once ran in a guest.
+- **A boot whose log stops is usually a DEAD ROOT RUNNER, not a hang** — when the root process dies,
+  `[s]` markers stop while orphaned cross-process children (Xvfb, selkies) keep burning CPU, reading
+  like a stall. Check `Get-CimInstance Win32_Process -Filter "Name='litebox_runner…'"`'s
+  `CommandLine.Length` — a cross-process CHILD has the bare 77-char exe-only command line
+  (`process_fork.rs:1594-1599`); if no survivor carries the full `--oci-image…` args, the root is
   gone (RAM pressure → OOM-kill).
 - **Before ANY `cdb` attach, set `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` and
-  `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`** — every runner spawns a watchdog child (`process_fork.rs:4391`)
-  that `TerminateProcess`es after 15s of <10ms CPU delta, killing a debugger-frozen (zero-progress)
-  target; kill the already-running target's own watchdog first if attaching mid-boot.
-- **Socket read/write tracing, condensed (69th-74th passes; full mechanism: archive)**: `sys_write`/
-  `sys_writev` log under `syscalls::file`, not `net` (`file.rs:1847`/`2990`). A socket fd's
-  `read(2)`/`readv(2)` is a SEPARATE code path from `recvmsg(2)` — `do_read`'s socket branch calls
-  `GlobalState::receive` directly, real Xlib/XCB Xtrans uses plain `read()`/`write()` — root-caused
-  (71st) as the true cause of the 70th pass's X11-reassembly desync. `run_on_raw_fd`'s dispatch
-  (`lib.rs:1702`) splits socket fds into TWO closures, `net` (generic TCP) and `unix`
-  (`UnixSocketSubsystem`, what X11/D-Bus actually use) — the 71st pass's `litebox_diag::socket_read`
-  diagnostic only instrumented `net` (fixed 73rd, `fc830d1`, mirrored onto `unix`). `sys_readv`/
-  `sys_pread64`/`sys_preadv` all delegate to `sys_read`, no separate instrumentation needed. Blanket
-  `syscalls::file=debug` is unusable on a real boot (50MB+/s of guest time, destabilized a boot
-  badly enough to break a normally-reliable `xdpyinfo` probe, 71st) — use the dedicated
-  `litebox_diag::socket_read` target instead, optionally with `LITEBOX_DIAG_SOCKET_READ_TARGET=
-  <comm>[,<comm>...]` (74th pass; unset = every process).
-- **`FlushingStderr` (`litebox_runner_linux_on_windows_userland/src/lib.rs`) buffers one whole
-  tracing EVENT and does exactly one locked `write_all`+`flush`, in `Drop`** — the prior version's
-  separate lock/write/lock/flush left a real interleaving window across concurrent guest threads
-  (= Windows threads in this one host process). Matches the guest-visible `STDOUT_WRITE_LOCK`/
-  `STDERR_WRITE_LOCK` discipline. Fixed; NOT the 70th pass's X11-reassembly desync explanation
-  (reproduced byte-identical post-fix — that gap was the `read()`/`recvmsg()` split above).
-- **All five `DIAG_TIMELINE` sites (`exit`/`exit_group`/`clone`/`execve` in `syscalls/process.rs`,
-  `exit_signal` in `syscalls/signal/mod.rs`) now log at `debug!` on their OWN dedicated
-  `litebox_diag::process_timeline` target, NOT nested under `syscalls::process`/`syscalls::signal`
-  (74th pass)** — those two modules' own implicit debug!/trace! targets carry ~70 unrelated call
-  sites each, so the historical `litebox_shim_linux::syscalls::process=debug` recipe (still below,
-  do not use it just for this) floods every syscall of every concurrently-forked desktop-boot
-  process to see five cheap lines. Use `LITEBOX_LOG=warn,litebox_platform_windows_userland::
-  fork_verify=error,litebox_diag::process_timeline=debug` instead — same five lines, for the WHOLE
-  boot, at a small fraction of the cost. (This target was briefly `error!`/always-on by original
-  design, commit `ec7427d`; demoted to `debug!` in `3042980` because `error!` + ~50 OTHER sites
-  raised the same way flooded a desktop boot with thousands of lines — a real, cited log-volume
-  hazard, not something to simply revert.) A cross-process fork child's guest pid IS its real
-  Windows PID (`runner…/lib.rs:1673`), so `DIAG_TIMELINE execve`'s `pid=` is directly `cdb -pv -p`-able.
+  `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`** — every runner spawns a watchdog (`process_fork.rs:4391`)
+  that `TerminateProcess`es after 15s of <10ms CPU delta, killing a debugger-frozen target.
+- **Socket read/write tracing (69th-74th; full mechanism: archive)**: `sys_write`/`sys_writev` log
+  under `syscalls::file`, not `net` (`file.rs:1847`/`2990`). A socket fd's `read(2)`/`readv(2)` is a
+  SEPARATE path from `recvmsg(2)` — real Xlib/XCB Xtrans uses plain `read()`/`write()` (root cause,
+  71st, of the 70th pass's X11-reassembly desync). `run_on_raw_fd` (`lib.rs:1702`) splits socket fds
+  into `net` (generic TCP) and `unix` (`UnixSocketSubsystem`, what X11/D-Bus use) — the 71st pass's
+  `litebox_diag::socket_read` diagnostic only instrumented `net` (fixed 73rd, `fc830d1`, mirrored
+  onto `unix`). Blanket `syscalls::file=debug` is unusable on a real boot (50MB+/s of guest time,
+  destabilized a boot enough to break `xdpyinfo`, 71st) — use `litebox_diag::socket_read` instead,
+  optionally `LITEBOX_DIAG_SOCKET_READ_TARGET=<comm>[,<comm>...]` (74th; unset = every process).
+- **`FlushingStderr` (`litebox_runner_linux_on_windows_userland/src/lib.rs`) does one locked
+  `write_all`+`flush` per tracing EVENT, in `Drop`** — closes a real interleaving window across
+  concurrent guest (=Windows) threads the prior separate lock/write/lock/flush had. Fixed; NOT the
+  70th pass's X11-reassembly desync explanation (that gap was the `read()`/`recvmsg()` split above).
+- **All five `DIAG_TIMELINE` sites log at `debug!` on their own `litebox_diag::process_timeline`
+  target**, not nested under `syscalls::process`/`syscalls::signal` (~70 unrelated sites each; 74th)
+  — use `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error,litebox_diag::
+  process_timeline=debug` for cheap whole-boot coverage. A cross-process fork child's guest pid IS
+  its real Windows PID (`runner…/lib.rs:1673`), so `DIAG_TIMELINE execve`'s `pid=` is `cdb -pv -p`-able.
 - **On host-side crashes, use `advisor/probes/symbolize_litebox_crash.py`, snapshotting `.exe`+`.pdb`
   next to the log** — a ring dump's `rva=` is only meaningful against the exact emitting build.
 - **Isolate the harness before blaming litebox** — launch guest probes directly as the runner's
   top-level program, never via a runtime-built `/bin/sh -c` wrapper. Never trust a container tag
   name for its WM/session contents — verify by registry manifest + blob tar-listing or a live
-  in-guest `/usr/bin` listing. Never record a test count not watched run to completion; never
-  leave a suite red for an environmental reason. **The 53rd pass's "`xfce4-session` startup depth
-  varies run to run" was itself a RAM-exhaustion artifact (fixed 56th/57th) — 58th pass's 3/3 clean
-  runs all reach the IDENTICAL depth** (`iceauth`+`ssh-agent` spawned, then hangs — see Track B item 1).
+  in-guest `/usr/bin` listing. Never record a test count not watched run to completion; never leave
+  a suite red for an environmental reason. **The 53rd pass's "`xfce4-session` startup depth varies
+  run to run" was itself a RAM-exhaustion artifact (fixed 56th/57th)** — 58th pass's 3/3 clean runs
+  all reach the identical depth (`iceauth`+`ssh-agent` spawned, then hangs — Track B item 1).
 - **Repo hygiene** — packed layer tars, frame dumps and debug logs never go in git (`.wfgy/`,
   gitignored); untrack anything `git add -A` sweeps.
 - **Guest-reachable code returns an errno, never a panic** — the host process IS the entire guest
@@ -205,99 +170,82 @@ thread-based default's 100% tcache-corruption rate (ADVISORY-001 §3N is thread-
 
 **Eligibility** — an already-borrowed fd table, a beyond-stdio fd that isn't a pipe end/path-recorded
 regular file/eventfd/close-on-exec/pty (overridable by `LITEBOX_PROCESS_FORK_IGNORE_FDS`), or an
-unsanitizable `fs_base`/context. No by-name gate exists (34th pass) — only this global opt-in env
-var plus the per-fork fd-kind scan. On a real `debian-xfce` boot the only remaining blocking kind is
+unsanitizable `fs_base`/context. No by-name gate exists (34th) — only this global opt-in env var
+plus the per-fork fd-kind scan; the only remaining blocking kind on a real `debian-xfce` boot is
 `unix-socket`. Fork-child GPR/vmem-adopt cost is small (~1.2s, down from ~3.5-5s); the rootfs
-index-merge cost the 56th pass fixed is NOT the dominant per-fork cost any more — confirmed 100%
-cache-hit (both the per-layer OCI cache and the 56th pass's own merged-index cache) with
-`LITEBOX_DIAG_FORK_TIMING=1` on a real `debian-xfce` boot, 75th pass: real per-fork rootfs-related
-cost is ~83-140ms end to end. The real per-fork-count cost is each fork being a genuinely separate
-Windows process with its own ~350MB-1.1GB peak working set (guest-memory emulation, its own
-writable-layer import, rootfs materialization — not yet decomposed) — see Track B item 1's
-"process-count accumulation" note. **`live_cross_process_fork_children`** (`GlobalState` field,
-`litebox_shim_linux/src/lib.rs`) is a 76th-pass admission-control counter capping concurrent
-cross-process-fork children at 6 (bounded non-busy wait via `Task::reserve_cross_process_fork_slot`/
-`release_cross_process_fork_slot`, `syscalls/process.rs`, fails open after ~8s) — real but only a
-PARTIAL mitigation for the RAM crater, see Track B item 1. Still open: nginx's own SSL-cert
-generation fails on its first startup attempt, not root-caused (`docs/track-b-fork-fix-progress.md:146-152`).
+index-merge cost the 56th pass fixed is NOT the dominant per-fork cost any more (confirmed 100%
+cache-hit, `LITEBOX_DIAG_FORK_TIMING=1`, 75th: real per-fork rootfs cost ~83-140ms). The real
+per-fork-count cost is each fork being a separate Windows process with its own ~350MB-1.1GB peak
+working set (guest-memory emulation, writable-layer import, rootfs materialization — not yet
+decomposed; see Track B item 1). **`live_cross_process_fork_children`** (`GlobalState` field,
+`litebox_shim_linux/src/lib.rs`, 76th) is admission control capping concurrent cross-process-fork
+children at 6 (`Task::reserve_cross_process_fork_slot`/`release_cross_process_fork_slot`,
+`syscalls/process.rs`, fails open ~8s) — real but only PARTIAL mitigation, see Track B item 1.
+Still open: nginx's own SSL-cert generation fails on its first startup attempt, not root-caused
+(`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-76th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
-map" below), including the full 70th-76th detail this section used to carry inline (now
-`docs/AGENTS_ARCHIVE_2026-09-23.md`). Condensed current-state trail:
+**Pass history (4th-78th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
+map" below). Condensed current-state trail:
 
-- **43rd-69th (FIXED/REFUTED, live-verified)**: both Xvfb SIGSEGVs; D-Bus activation's
-  dropped-CLOEXEC-fd bug; `fd/mod.rs:422` panic; per-fork rootfs-rebuild RAM cost (56th);
-  `ssh-agent`/`xfwm4` permanent-freeze class (`RawMutex::WaiterQueue::with_lock`, 60th/61st);
+- **43rd-69th (FIXED/REFUTED, live-verified; archive: `_2026-09-22.md`)**: both Xvfb SIGSEGVs;
+  D-Bus activation's dropped-CLOEXEC-fd bug; `fd/mod.rs:422` panic; per-fork rootfs-rebuild RAM
+  cost (56th); `ssh-agent`/`xfwm4` permanent freeze (`RawMutex::WaiterQueue::with_lock`, 60th/61st);
   `SharedUnixConnectQueue::cancel`'s slot leak (62nd); `DBUS_FAILED` root-caused+fixed (a byte-size
-  regression guard discarding a healthy fresher writable-layer export, 67th/68th); upstream
-  `xfwm4` pre-hint chain traced to `setNetSupportedHint`; first byte-level D-Bus decode proves
-  `initSettings()` succeeds but its final `GetAllProperties` call re-issues every ~10.7s forever
-  (69th, mechanism unconfirmed). REFUTED along the way: `/defaults/xfce/` readdir, dbus-daemon
-  babysitter SIGKILL, epoll-readiness, GLX/compositor blocker theories. `DE_FAILED` (no
-  `_NET_SUPPORTING_WM_CHECK`) survived all of it. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`.
-- **70th-74th**: independently reproduced the ~10.7s retrigger and REFUTED "`xfwm4` never writes
-  X11"; root-caused two real logging/capture gaps (`do_read`'s socket branch is separate from
-  `do_recvmsg`, real Xlib/XCB uses plain `read()`/`write()`; the `unix` closure — not just `net` —
-  needed the same `socket_read` diagnostic) that had been hiding `xfwm4`'s own traffic from every
-  earlier capture attempt; added low-overhead dedicated diagnostic targets
-  (`litebox_diag::process_timeline`/`litebox_diag::socket_read`) to replace the old
-  everything-floods-every-syscall recipe. RAM still collapsed hard on every attempt in this range
-  (host process count peaking at ~30) — logging overhead was NOT the dominant RAM driver. XKB-at-
-  retrigger question remained genuinely OPEN throughout. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-- **75th**: **`xfwm4` launches for the first time in this investigation's entire history.**
-  Root-caused+FIXED (`1d449e6`) `take_cross_process_writable_layer_export` requiring an env var
-  deliberately unset on every `--oci-image` boot — meaning a parent NEVER re-absorbed ANY
-  cross-process fork child's filesystem writes, on ANY `--oci-image` boot, ever, explaining a large
-  share of this whole investigation's "writable-layer-visibility gap" symptoms (100% reproducible
-  minimal repro, fixed by mirroring the child's own OCI-image fallback onto the parent's read side).
-  With it fixed, `xfwm4` launches (confirmed via `DIAG_TIMELINE execve`, X11 window count 0→1→11,
-  `_NET_SUPPORTING_WM_CHECK` advancing from "no such atom" to "not found", reproduced 2/2). Also
-  REFUTED the 74th pass's rootfs-cache-miss theory with direct timing measurement (`LITEBOX_DIAG_
-  FORK_TIMING=1`: both the per-layer and merged-index caches hit 100%, real per-fork rootfs-related
-  cost ~83-140ms — the 56th pass's caching fix stands, fully vindicated). **Not yet reached:
-  `DE_UP`** — two boots both hit a RAM crater (0.3-1.3GB free) around `WM_POLL n=6`, 11+ live
-  windows. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-- **76th (2026-09-23)**: first-ever DIRECT host-side capture of the RAM-crater process tree
-  (`.wfgy/pass76_crater_procsnapshot.txt`) — **33 simultaneous host processes, up to 4 fork-tree
-  generations deep, ~10.5GB combined working set on a 15.25GB host**, confirming "process-count
-  accumulation" (Track B item 1) with first-hand evidence for the first time and adding the
-  previously-undocumented TREE-DEPTH dimension (cost multiplies by branching factor AND depth, not
-  just sibling count). Landed a real admission-control fix (`live_cross_process_fork_children`, a
-  plain shared-arena `AtomicU32` field on `GlobalState`; gates both `spawn_cross_process_fork_child`
-  call sites via a bounded, non-busy `wait_cx()`-based wait, capped at 6 concurrent, fails OPEN
-  after ~8s so a missing `wait4()` can never deadlock a future fork) — **real but only a PARTIAL
-  mitigation**: live re-test showed slower process-count growth and a gentler initial RAM decline,
-  but the SAME crater magnitude eventually (28-29 processes, 0.17-0.31GB free). Refines Track B item
-  1's framing: **not primarily a scheduling problem — a real XFCE session legitimately needs more
-  than 6 long-lived daemons alive simultaneously, each paying its ~350MB-1.1GB peak working set once
-  and never releasing it (ordinary Windows behavior), so the fix rate-limits rather than truly caps.
-  The real remaining fix is reducing PEAK PER-PROCESS RESIDENT MEMORY itself** (not yet decomposed
-  into rootfs-materialization vs. litebox's own per-process guest-memory-emulation bookkeeping vs.
-  Windows loader overhead) — see Track B item 1's pickup. Confirmed NOT a lifecycle/leak bug (WMI
-  `Terminate` cleanup fully recovered RAM both times, zero stragglers). `DE_UP` NOT reached; no
-  browser/app verification attempted. Full narrative, exact commands, evidence file list:
-  `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-- **77th (2026-09-23)**: root-caused+FIXED (`621ee1a`) a real, measured 2x host-allocator commit
-  bug — `WindowsUserland::alloc` (sole `SLAB_ALLOC` top-up call site) doubled every commit instead
-  of using `VirtualAlloc2`'s own unused `MEM_ADDRESS_REQUIREMENTS::Alignment` field; `cdb -pv`
-  traced 13 such 4MiB-inflated commits in one boot to `clap`'s own CLI-parsing `Vec` growth (~108MB
-  committed before the OCI pull even begins). Verified correct (fork/pipe/exec all still work) and
-  measured: Priv committed 123.7→76.6MB / 130.2→84.5MB single-process, ~35-40% reduction across
-  every process in a forked tree. **Real, but NOT sufficient alone**: a full XFCE boot with the fix
-  still cratered at the SAME magnitude (28 processes, 0.82GB free; reproduced cleanly to `WM_POLL
-  n=4`, no regression) — confirms the dominant ~350MB-1.1GB/fork cost is elsewhere, scaling with
-  something this fix doesn't touch (arithmetic: 28×~77MB ≈ 2.15GB, nowhere near the ~7-8GB actually
-  consumed). **New candidate, found by direct code reading, NOT yet fixed**: BOTH fork paths
-  (`Vmem::duplicate`, `litebox/src/mm/linux.rs` ~1679-1719; `copy_one_group`,
-  `litebox_platform_windows_userland/src/process_fork.rs`) unconditionally byte-copy EVERY
-  non-shared VMA on every fork, including read-only shared-library CODE/rodata a real `fork()`
-  would share for free and litebox's own rootfs ALREADY shares efficiently via `mmap` before this
-  re-privatizes it. Deliberately NOT attempted this pass — implementing real COW/read-only-sharing
-  across a Windows process boundary is a large, correctness-critical redesign of exactly the
-  subsystem behind this investigation's worst historical bugs (ADVISORY-001 §3N) and needs much
-  more runway than remained this pass. `DE_UP` NOT reached; chrome-devtools MCP re-checked, still
-  `CONNECT_TIMEOUT` (moot, `DE_UP` wasn't reached). Full narrative, exact `cdb` commands, every raw
-  measurement: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
+  regression guard discarding a healthy fresher writable-layer export, 67th/68th). REFUTED:
+  `/defaults/xfce/` readdir, dbus-daemon babysitter SIGKILL, epoll-readiness, GLX/compositor
+  blocker theories. `DE_FAILED` survived all of it.
+- **70th-74th (archive: `_2026-09-23.md`)**: root-caused two logging/capture gaps hiding `xfwm4`'s
+  own X11 traffic (`do_read`'s socket branch is separate from `do_recvmsg`; the `unix` closure, not
+  just `net`, needed the `socket_read` diagnostic); added low-overhead `litebox_diag::
+  process_timeline`/`socket_read` targets. Independently reproduced a `GetAllProperties` D-Bus call
+  re-issuing every ~10.7s forever (mechanism unconfirmed, still open). RAM still collapsed (host
+  process count peaking ~30) — logging overhead not the driver.
+- **75th**: **`xfwm4` launches for the first time ever.** Root-caused+FIXED (`1d449e6`)
+  `take_cross_process_writable_layer_export` requiring an env var unset on every `--oci-image`
+  boot — the parent never re-absorbed ANY cross-process fork child's filesystem writes, on ANY
+  `--oci-image` boot, ever; fixed by mirroring the child's own OCI-image fallback onto the parent's
+  read side. Confirmed via `DIAG_TIMELINE execve`, X11 window count 0→1→11,
+  `_NET_SUPPORTING_WM_CHECK` advancing. Also REFUTED the rootfs-cache-miss theory
+  (`LITEBOX_DIAG_FORK_TIMING=1`: both caches 100% hit, real per-fork rootfs cost ~83-140ms). `DE_UP`
+  not reached — RAM crater (0.3-1.3GB free) around `WM_POLL n=6`, 11+ windows.
+- **76th**: first DIRECT host-side capture of the crater process tree
+  (`.wfgy/pass76_crater_procsnapshot.txt`) — 33 simultaneous processes, 4 fork-tree generations
+  deep, ~10.5GB combined working set/15.25GB host. Landed `live_cross_process_fork_children`
+  (shared-arena `AtomicU32` admission control, caps 6 concurrent cross-process children, fails open
+  ~8s) — real but PARTIAL: slower growth, same eventual magnitude (28-29 processes, 0.17-0.31GB
+  free). Reframed: not a scheduling problem — a real XFCE session needs >6 long-lived daemons alive
+  simultaneously, each paying ~350MB-1.1GB peak working set once (ordinary Windows behavior); fix
+  rate-limits, doesn't cap. Real fix needs lower PEAK PER-PROCESS RSS. Confirmed not a leak (WMI
+  `Terminate` fully recovers RAM).
+- **77th**: root-caused+FIXED (`621ee1a`) a real 2x host-allocator commit bug —
+  `WindowsUserland::alloc` doubled every commit instead of using `VirtualAlloc2`'s unused
+  `MEM_ADDRESS_REQUIREMENTS::Alignment` field (`cdb -pv` traced it to `clap`'s CLI-parsing `Vec`
+  growth, ~108MB committed before the OCI pull even begins). Verified correct, measured: Priv
+  committed 123.7→76.6MB / 130.2→84.5MB single-process, ~35-40% reduction per process. Real but NOT
+  sufficient alone: full XFCE boot still cratered at the same magnitude (28 processes, 0.82GB free)
+  — 28×~77MB≈2.15GB vs. ~7-8GB actually consumed. New candidate found by code reading, not fixed:
+  BOTH fork paths (`Vmem::duplicate`, `litebox/src/mm/linux.rs`~1679-1719; `copy_one_group`,
+  `litebox_platform_windows_userland/src/process_fork.rs`) unconditionally byte-copy every
+  non-shared VMA on every fork, including read-only shared-library code/rodata a real `fork()`
+  would share for free. Deliberately not attempted — flagged as needing real measurement first.
+- **78th (2026-09-23)**: **measured the 77th pass's shared-library-COW theory instead of guessing.**
+  Added a permanent `env_flag`-gated diagnostic (`LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`, off by
+  default, read-only, zero behavior change) classifying every fork's copied bytes at both call sites
+  (`litebox_shim_linux/src/syscalls/process.rs`: thread-based `do_clone` and the cross-process
+  `copy_one_group`-plan site) by reusing `is_file_backed`/`VmFlags` data already carried — no new
+  bookkeeping. **Real result, live `bash -c` fork chain (8+ forks, `ls`/`cat`/`grep`/`sort`/`wc`/
+  `sed`/`find`, both fork paths cross-validated identical): read-only file-backed bytes are ~29% of
+  copied bytes (`file_ro_bytes=3690496`/`copied_total=12406784`, 17 regions) — REAL but MODERATE,
+  not dominant; ~71% is genuinely anonymous heap/stack data no such fix could skip.** Decision: did
+  NOT implement the skip-copy fix this pass — moderate (not dominant) payoff, `VmArea` tracks only
+  an `is_file_backed` BOOL with no file/inode/offset identity (needed to safely prove "same backing
+  the rootfs already `mmap`s", itself a nontrivial addition), and this subsystem's documented
+  worst-bug history (ADVISORY-001 §3N) makes a rushed fix a bad trade here. Incidentally reproduced
+  (with the new diagnostic OFF too, so unrelated to it) a pre-existing bug: `ls | wc -l` inside
+  `bash -c` intermittently SIGSEGVs/SIGABRTs a pipeline child (`free(): invalid pointer`/signal 11),
+  consistent with the known concurrent-fork tcache-corruption class (ADVISORY-001 §3N) — not chased
+  further, out of scope. `DE_UP` not reached (no functional change made, so no new boot attempt).
+  Full repro commands/raw log lines: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -322,56 +270,47 @@ both Xvfb SIGSEGVs.
    FIXED per-process floor** (`WindowsUserland::alloc`'s 2x-commit bug, `621ee1a`; ~35-40% Priv
    reduction per process, verified) — real but confirmed insufficient alone, the crater still hits
    the same magnitude (`docs/AGENTS_ARCHIVE_2026-09-23.md`, 77th pass). **Refined pickup, in order,
-   supersedes the (a)/(b) below where they overlap**: (0) the 77th pass's own direct-code-reading
-   finding is the strongest lead now: `Vmem::duplicate` (`litebox/src/mm/linux.rs` ~1679-1719) and
-   `copy_one_group` (`litebox_platform_windows_userland/src/process_fork.rs`) both unconditionally
-   byte-copy EVERY non-shared VMA on every fork, including read-only shared-library CODE/rodata a
-   real `fork()` would share for free and litebox's own rootfs ALREADY shares efficiently via
-   `mmap` before this copy re-privatizes it — the next step is confirming this quantitatively (a
-   `cdb`/ETW heap-diff comparing a process's committed-memory total immediately pre-fork vs.
-   immediately post-fork-pre-exec on a REAL multi-generation daemon chain, e.g. `dbus-launch`→
-   `dbus-daemon`, not the `sleep`-only minimal repro the 77th pass used) before attempting any fix
-   to this correctness-critical subsystem — go in with much more runway than one pass, this exact
-   code is responsible for this whole investigation's worst historical bugs (ADVISORY-001 §3N).
-   (a) ALSO still open: decompose remaining per-fork cost between rootfs materialization staying
-   resident after its own cheap (~83-140ms) build step vs. ordinary Windows loader/image overhead
-   (both smaller candidates than (0) above, per the 77th pass's own single-fork isolation
-   measurements: a MUCH bigger `debian-xfce` merged rootfs added only ~16MB over the small
-   `debian:stable-slim` baseline, refuting rootfs-index size as a major scaling factor — the
-   dominant remaining cost is fork-content-dependent, matching theory (0), not rootfs-size-dependent).
-   (b) do not just raise the admission-control cap number, the bottleneck is per-process SIZE, not
-   concurrent-slot COUNT. (c) once `DE_UP`
-   fires (or the boot stalls again short of it), use `de_only_xcensus_seed3.tar`'s now-working
-   `/tmp/xcensus.py` ground truth (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP` — real `_NET_SUPPORTING_
-   WM_CHECK`/`WM_S0` values, not `xprop`'s heuristic text) plus `LITEBOX_DIAG_SOCKET_READ_TARGET=
-   xfwm4` to see whether the ~10.7s `GetAllProperties` retrigger (69th/70th pass, still genuinely
-   unconfirmed either way — no post-75th-fix boot has survived long enough to re-observe it) is
-   still real; if it recurs, check for `MappingNotify`(34)/XKB at the ~10.7s boundaries before
-   falling back to the 30th-pass `LD_PRELOAD getenv_probe.so` reentrancy-detection technique.
-   `ps`/`/proc` is blind to cross-process-forked siblings (65th) — re-weigh any `ps`-based
-   conclusion. `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd) is why the OLD
-   `de_only_seed.tar` (not `_xcensus_seed2/3`) dead-ends earlier, at `iceauth`+`ssh-agent`+`gpg-agent`.
-   (d) separately worth checking: this pass's `LITEBOX_LOG` (host env var) did not appear to reach
-   forked children's own stderr (`litebox_diag::process_timeline=debug` output was present in the
-   root process's log but absent from the fixed-run child processes') — if the cross-process-fork
-   env-block construction in `process_fork.rs` is dropping the parent's `LITEBOX_LOG` rather than
-   forwarding it, every prior pass's diagnostic-logging conclusions about anything past the FIRST
-   fork generation should be re-weighed; not confirmed, just flagged, see `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass (`unix.rs`); did NOT
-   resolve the `xfwm4` symptom above, so a real but insufficient fix for THIS symptom. Other AF_UNIX
-   exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256
-   overflow; a key >108 bytes; backlog ignored on cross-process accept. Abstract sockets CORRECT.
-3. `SafeZoneAllocator`'s own `spin::mutex::SpinMutex` still has no dead-holder recovery — kept as a
-   lower-urgency theoretical risk (the real, live `ssh-agent`/`xfwm4` freeze this was once blamed
-   for was `RawMutex`'s `WaiterQueue::with_lock`, CLOSED 60th/61st, see above), not tied to any live
-   symptom now.
+   supersedes (a)/(b) below where they overlap**: (0) **MEASURED, 78th pass**:
+   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` on a live `bash -c` fork chain shows read-only file-backed
+   bytes are ~29% of copied bytes/fork — real but MODERATE, not dominant (~71% is anonymous data no
+   skip-copy fix could touch). NOT fixed: `VmArea` (`litebox/src/mm/linux.rs`) tracks only an
+   `is_file_backed` BOOL, no file/inode/offset identity — needed to safely prove "same backing the
+   rootfs already `mmap`s" before `Vmem::duplicate`/`copy_one_group` could skip a copy, itself a
+   nontrivial addition in the subsystem behind this investigation's worst bugs (ADVISORY-001 §3N).
+   Next: (i) re-run the diagnostic on a HEAVIER real daemon fork (`dbus-daemon`'s own
+   double-fork-to-daemonize — it keeps running the SAME image post-fork, so the copy isn't
+   transient) to see if the skippable fraction rises enough to justify the file-identity bookkeeping
+   + narrow skip-copy fix, with real runway, never rushed; (ii) if it doesn't rise materially, look
+   at `Vmem::duplicate`/`copy_one_group` and per-process guest heap/stack SIZING instead
+   (over-sized reservations vs. real usage, not yet measured) — the likelier next lead. The
+   diagnostic (both call sites, zero cost when off) is permanent and reusable either way.
+   Lower-priority, still open: (a) decompose remaining per-fork cost between rootfs
+   materialization staying resident post its cheap (~83-140ms) build vs. Windows loader overhead
+   (77th: a much bigger `debian-xfce` rootfs added only ~16MB over the `stable-slim` baseline, so
+   cost is fork-content- not rootfs-size-dependent); (b) don't just raise the admission-control cap
+   — the bottleneck is per-process SIZE, not slot COUNT; (c) once `DE_UP` fires (or stalls again),
+   use `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/
+   `XCENSUS_ROOTPROP`, real values not `xprop` heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=
+   xfwm4` to check whether the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed)
+   recurs, checking `MappingNotify`(34)/XKB at that boundary before the 30th-pass `LD_PRELOAD
+   getenv_probe.so` technique (`ps`/`/proc` is blind to cross-process-forked siblings, 65th;
+   `gpg-agent`'s fatal `malloc.c:3846` assertion, 52nd, is why the OLD `de_only_seed.tar` dead-ends
+   earlier than `_xcensus_seed2/3`); (d) unconfirmed: `LITEBOX_LOG` may not reach forked children's
+   own stderr (`process_fork.rs`'s env-block construction possibly drops it) — if so, every prior
+   diagnostic-logging conclusion past the FIRST fork generation needs re-weighing; see `_2026-09-23.md`.
+2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
+   resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
+   `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on
+   cross-process accept. Abstract sockets CORRECT.
+3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` still has no dead-holder recovery — lower-urgency
+   theoretical risk (the live `ssh-agent`/`xfwm4` freeze once blamed on it was actually `RawMutex`'s
+   `WaiterQueue::with_lock`, CLOSED 60th/61st), not tied to any live symptom now.
 4. Debugger-root-cause `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state
-   (dozens per boot, most frequent panic historically, NOT yet debugger-confirmed — do not patch
-   blind).
+   (dozens/boot, most frequent historical panic, NOT yet debugger-confirmed — don't patch blind).
 5. `flock_registry`/`drm`/`evdev` (`GlobalState` fields) remain open, same non-POD-payload obstacle
-   `SharedPtyTable` gives a template for; `timerfd`/`signalfd` are the next-cheapest carriable fd
-   kinds before `socket`/`unix-socket`/`epoll`; the writable-layer-visibility gap for LARGE content
-   (`/tmp/de.log` etc.) needs its own chunked-publish design, NOT a widened `SharedFilePublishTable`
+   `SharedPtyTable` is a template for; `timerfd`/`signalfd` are the next-cheapest carriable fd kinds
+   before `socket`/`unix-socket`/`epoll`; the writable-layer-visibility gap for LARGE content
+   (`/tmp/de.log` etc.) needs its own chunked-publish design, not a widened `SharedFilePublishTable`
    cap. All three lower-urgency, not on the Xvfb/selkies boot path.
 
 ## Container images and OCI loading
@@ -403,28 +342,27 @@ x264, MIT-SHM) inside litebox, reverse proxy host-side only. Working config: sel
 `--addr=0.0.0.0` port **8081**, dashboard over `--publish`, `/websockets` tunnelled to 8081.
 Fourteen litebox defects got here, all landed (archive).
 
-**A stock s6-overlay image boots with no flags/stubs**: `/init` runs 16 cross-process children
-with zero uncarriable fds. The once-deterministic black XFCE desktop is fixed (runtime rewriter was
-corrupting `libLLVM.so.19.1`'s `.dynsym`, mesa `dlopen` failed forever). Rest settled in archive.
+**A stock s6-overlay image boots with no flags/stubs**: `/init` runs 16 cross-process children with
+zero uncarriable fds. The once-deterministic black XFCE desktop is fixed (runtime rewriter was
+corrupting `libLLVM.so.19.1`'s `.dynsym`, mesa `dlopen` failed forever). Rest: archive.
 
 **XFCE also renders on the THREAD-based fork path, gated by one flag** (`docker.io/linuxserver/
 webtop:debian-xfce`, `.wfgy/webtop_stack.sh`). Without it, 3/3 boots die ~7s in to ADVISORY-001
 §3N's safe-linked-tcache write. Fix: `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=
-0:glibc.malloc.mxfast=0` as a GUEST-side `--env` runner flag (workaround, not a fix, THREAD-path
-only). `LITEBOX_PROCESS_FORK=1` removes that whole crash class by construction and no longer hits
-the old "Fork-after-Xorg" freeze either (35th pass). A `de_only.sh` boot runs its whole 60s+160s
-window with ZERO crash/OOM as of the 57th pass (fixes landed: cross-process fork section above).
-`DE_FAILED` still fires — NOT "Cannot open display" (refuted, 52nd), NOT RAM exhaustion (57th) —
-see Track B item 1 for the current live blockers. Selkies also needs `--clipboard-enabled=false`
-on the thread-based path (its clipboard monitor re-triggers the same corruption every tick) —
-moot cross-process.
+0:glibc.malloc.mxfast=0` as a GUEST-side `--env` flag (workaround, THREAD-path only).
+`LITEBOX_PROCESS_FORK=1` removes that crash class by construction and no longer hits the old
+"Fork-after-Xorg" freeze either (35th). A `de_only.sh` boot runs its whole 60s+160s window with
+ZERO crash/OOM as of the 57th pass. `DE_FAILED` still fires — NOT "Cannot open display" (refuted,
+52nd), NOT RAM exhaustion (57th) — see Track B item 1 for current blockers. Selkies also needs
+`--clipboard-enabled=false` on the thread-based path (its clipboard monitor re-triggers the same
+corruption every tick) — moot cross-process.
 
 **Open here.** One client per selkies instance, no slot reclaim on reload. A second, distinct
 glibc/tcache corruption signature (`double free or corruption (out)` SIGABRT) still sporadically
-hits selkies on the THREAD-based fork path under heavy fork load — Track B territory; do not
+hits selkies on the THREAD-based fork path under heavy fork load — Track B territory; don't
 re-attempt `GLIBC_TUNABLES` without evidence of a third mechanism.
 
-**ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)**, detail: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
+**ACK-stall-kill and port-8081 watchdog — both CLOSED (2026-09-16)**: `docs/AGENTS_ARCHIVE_2026-09-16.md`.
 
 ## Host-side crash machinery
 
@@ -432,10 +370,10 @@ A fatal host fault dumps before it dies, ungated (stack walk, `RECENT_FAULTS` ri
 no env var needed); a real OS minidump comes only from the repeated-identical-fault circuit
 breaker. An unexplained `0xC0000005` may be a panic — the VEH handler enters only for the four
 codes it triages, registers FIRST in the chain (`docs/veh-exception-handler-design.md`).
-Cross-process sync on Windows is a hard platform constraint: every native address/TID-based wait
-is process-local (`WaitOnAddress`, keyed events, `NtAlertThreadByThreadId`=ACCESS_DENIED); only a
-shared kernel object crosses processes — `RawMutex` (below) is the one that matters;
-`xproc_sync.rs`'s named-event primitive is live-verified but still unwired.
+Cross-process sync on Windows: every native address/TID-based wait is process-local
+(`WaitOnAddress`, keyed events, `NtAlertThreadByThreadId`=ACCESS_DENIED); only a shared kernel
+object crosses processes — `RawMutex` (below) is the one that matters; `xproc_sync.rs`'s
+named-event primitive is live-verified but still unwired.
 
 ## Shared-memory foundations -- all DONE, live-verified 2026-09-16/17/22 (full mechanism: archive)
 
@@ -449,14 +387,13 @@ private per-process heap, meaningless to an attaching process. Of the original u
 list (`unix_addr_table`/`pty_registry`/`daemon_pty_masters`/`flock_registry`/`fifo_registry`/
 `sysv_shm`/`memfds`/`shared_files`): all but `flock_registry` are fixed (per-process-shadowed, a
 shared-arena fixed array, or — for `pty_registry`/`daemon_pty_masters` — both a shadow AND a
-live-verified cross-process companion, `syscalls::pty::SharedPtyTable`). `sysv_shm` moved from a
-shared-address-table design to per-process named-object mapping (51st pass, see above). Reusable
-pattern (`SharedUnixAddrPresenceTable`, reused by AF_UNIX/`SharedPtyTable`): fixed-slot,
-pure-atomic, lock-free `(kind, key bytes<=108, owner pid)` side-index. **A mutable-state table on
-this pattern needs every WRITE path audited for shared-side mirroring** — `SharedPtyTable`'s own
-setters originally only reached the local side (37th-pass live catch). Still open: `flock_registry`
-(pty's pattern is now a template); `SafeZoneAllocator::alloc`'s spinlock livelock (no dead-holder
-recovery unlike `RawMutex`).
+live-verified cross-process companion, `syscalls::pty::SharedPtyTable`). `sysv_shm` moved to
+per-process named-object mapping (51st). Reusable pattern (`SharedUnixAddrPresenceTable`, reused
+by AF_UNIX/`SharedPtyTable`): fixed-slot, pure-atomic, lock-free `(kind, key bytes<=108, owner
+pid)` side-index. **A mutable-state table on this pattern needs every WRITE path audited for
+shared-side mirroring** — `SharedPtyTable`'s own setters originally only reached the local side
+(37th-pass live catch). Still open: `flock_registry` (pty's pattern is a template);
+`SafeZoneAllocator::alloc`'s spinlock livelock (no dead-holder recovery unlike `RawMutex`).
 
 ## Closed — do not re-attempt without a genuinely new approach
 
