@@ -9,8 +9,11 @@ for a trail, never as a starting point.
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th and
 81st passes (pass-history section below; 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`;
-70th-81st full narrative, including each pass's own complete evidence and fix rationale:
-`docs/AGENTS_ARCHIVE_2026-09-23.md`).
+70th-82nd full narrative, including each pass's own complete evidence and fix rationale:
+`docs/AGENTS_ARCHIVE_2026-09-23.md`). Lightly re-compacted 82nd pass (merged the 43rd-69th/70th-74th
+bullets); this file is ~40KB, over its own informal compaction trigger again — due for a fuller pass
+that drains more pass-history detail to the archive, not attempted this pass (time went to live
+measurement instead; nothing here is stale or wrong, just due for a trim).
 
 ## The cheap repro — start here
 
@@ -184,22 +187,21 @@ children at 6 (`Task::reserve_cross_process_fork_slot`/`release_cross_process_fo
 Still open: nginx's own SSL-cert generation fails on its first startup attempt, not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-78th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
+**Pass history (4th-82nd, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
 map" below). Condensed current-state trail:
 
-- **43rd-69th (FIXED/REFUTED, live-verified; archive: `_2026-09-22.md`)**: both Xvfb SIGSEGVs;
-  D-Bus activation's dropped-CLOEXEC-fd bug; `fd/mod.rs:422` panic; per-fork rootfs-rebuild RAM
-  cost (56th); `ssh-agent`/`xfwm4` permanent freeze (`RawMutex::WaiterQueue::with_lock`, 60th/61st);
-  `SharedUnixConnectQueue::cancel`'s slot leak (62nd); `DBUS_FAILED` root-caused+fixed (a byte-size
-  regression guard discarding a healthy fresher writable-layer export, 67th/68th). REFUTED:
-  `/defaults/xfce/` readdir, dbus-daemon babysitter SIGKILL, epoll-readiness, GLX/compositor
-  blocker theories. `DE_FAILED` survived all of it.
-- **70th-74th (archive: `_2026-09-23.md`)**: root-caused two logging/capture gaps hiding `xfwm4`'s
-  own X11 traffic (`do_read`'s socket branch is separate from `do_recvmsg`; the `unix` closure, not
-  just `net`, needed the `socket_read` diagnostic); added low-overhead `litebox_diag::
-  process_timeline`/`socket_read` targets. Independently reproduced a `GetAllProperties` D-Bus call
-  re-issuing every ~10.7s forever (mechanism unconfirmed, still open). RAM still collapsed (host
-  process count peaking ~30) — logging overhead not the driver.
+- **43rd-74th (FIXED/REFUTED, live-verified; archives: `_2026-09-22.md`/`_2026-09-23.md`)**: both
+  Xvfb SIGSEGVs; D-Bus activation's dropped-CLOEXEC-fd bug; `fd/mod.rs:422` panic; per-fork
+  rootfs-rebuild RAM cost (56th); `ssh-agent`/`xfwm4` permanent freeze
+  (`RawMutex::WaiterQueue::with_lock`, 60th/61st); `SharedUnixConnectQueue::cancel`'s slot leak
+  (62nd); `DBUS_FAILED` root-caused+fixed (a byte-size regression guard discarding a healthy fresher
+  writable-layer export, 67th/68th). REFUTED: `/defaults/xfce/` readdir, dbus-daemon babysitter
+  SIGKILL, epoll-readiness, GLX/compositor blocker theories. 70th-74th: root-caused two
+  logging/capture gaps hiding `xfwm4`'s own X11 traffic (`do_read`'s socket branch is separate from
+  `do_recvmsg`; the `unix` closure, not just `net`, needed the `socket_read` diagnostic); added
+  low-overhead `litebox_diag::process_timeline`/`socket_read` targets; independently reproduced a
+  `GetAllProperties` D-Bus call re-issuing every ~10.7s forever (mechanism unconfirmed, still open).
+  `DE_FAILED`/RAM collapse (host process count peaking ~30) survived all of it.
 - **75th**: **`xfwm4` launches for the first time ever.** Root-caused+FIXED (`1d449e6`)
   `take_cross_process_writable_layer_export` requiring an env var unset on every `--oci-image`
   boot — the parent never re-absorbed ANY cross-process fork child's filesystem writes, on ANY
@@ -260,6 +262,51 @@ map" below). Condensed current-state trail:
   Whole-batch deferral removes the per-page performance argument only, not the correctness one — the
   only remaining viable path is genuine per-page lazy population (79th's own scoped primitive), no
   shortcut exists at either granularity. Re-confirms 79th's decision not to implement.
+- **82nd — both remaining "quick, safe" Track B levers tested; both real but genuinely exhausted,
+  narrowing the whole investigation down to one candidate.** *Angle A (skip copying provably-zero
+  bytes within an oversized VMA, e.g. the 8MB `DEFAULT_STACK_SIZE` guest stack a `bash -c`
+  external-command fork rarely touches past a few KB)*: read `insert_mapping`'s
+  `populate_pages_immediately=true` path (`litebox/src/mm/linux.rs`) and confirmed by code reading —
+  NOT implemented, no rebuild — that a write-skip-only version of this idea (detect all-zero source
+  chunks, skip the `write_slice_at_offset`/`WriteProcessMemory` for them) would save real wall-clock
+  but NOT the committed-memory (`Priv`) the crater is actually measured in: `insert_mapping` already
+  requests the FULL VMA span as one `VirtualAlloc2(MEM_COMMIT)` call regardless of what gets written
+  into it afterward, and Windows charges commit at that call, not at first touch. A genuine
+  committed-byte reduction needs the never-touched sub-range never committed at fork time at all
+  (`MEM_RESERVE`-only, promoted to `MEM_COMMIT` lazily on first real guest touch) — which is the SAME
+  page-fault-driven lazy-population primitive the 79th/81st passes already scoped as its own
+  dedicated, careful, VEH-coordinated investigation, not a smaller/safer variant of it. Angle A
+  therefore does not open a new, lower-risk path — it reduces to the one already-deferred primitive.
+  *Angle B (trim optional XFCE session-autostart components)*: read the real Failsafe session client
+  list live from the image (`/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml`, confirmed
+  never seeded into the user xfconf dir by `startwm.sh`) — `Client0=xfwm4` (alone gates this
+  project's own `_NET_SUPPORTING_WM_CHECK`/`DE_UP` criterion via `setNetSupportedHint`),
+  `Client1=xfsettingsd`, `Client2=xfce4-panel`, `Client3="Thunar --daemon"`, `Client4=xfdesktop`; plus
+  `/etc/xdg/autostart/{at-spi-dbus-bus,pulseaudio}.desktop`. Implemented a real, safe, additive,
+  reversible trim (a user-level xfconf override reducing the Failsafe list to just
+  `xfwm4`+`xfsettingsd`, plus two `Hidden=true` XDG-autostart-spec overrides) in both
+  `.wfgy/de_only.sh` and `.wfgy/webtop_stack.sh` — none of the trimmed components are load-bearing
+  for `xfwm4` itself or for the goal's own named apps (Terminal, Thunar), which are launched on
+  demand during verification rather than through the panel UI or session autostart. Live-verified: a
+  fresh boot with the trim applied reached `DE_LAUNCHED_DIRECT`, real `XCENSUS_WINDOWS=9`, and
+  `WM_POLL n=1..4` (`DBUS_XFCONF_PROBE` also succeeded, confirming the trimmed XML did not break
+  xfconfd) before the SAME crater magnitude as the untrimmed 77th/80th-pass baselines — 28 processes,
+  0.73GB free at t=105s, vs. 28-29 processes/0.17-0.82GB free at ~120-140s untrimmed — i.e. no
+  measurable improvement, if anything slightly earlier. (`ps -ef` cannot directly confirm which
+  session clients actually launched — confirmed this pass that a cross-process-forked `ps` sees only
+  itself, never sibling forks, the same `/proc`-is-per-process-blind limitation the 65th pass already
+  documented for a different tool — so this is inferred from boot-pace/crater-timing parity, not a
+  process-list diff.) Real, non-hypothetical conclusion: trimming 3-5 long-lived daemons out of the
+  boot's whole fork tree (dozens of forks over the boot's lifetime — Xvfb/dbus/xfce4-session's own
+  children, plus every `WM_POLL` iteration's `xprop`/`XCENSUS` probe fork) is too small a fraction of
+  total fork VOLUME to matter; this reconfirms 80th's own finding from a different angle — the crater
+  is CUMULATIVE per-fork cost across the whole fork history, not concentrated in a few big
+  long-lived processes, so trimming WHICH programs run cannot substitute for reducing the per-fork
+  copy cost itself. Kept (harmless, real, fully reversible by deleting the seeded xfconf/autostart
+  files) despite the null result, same standing this project gives 76th's admission-control fix.
+  **Net effect on the whole investigation: every "quick/safe" lever short of the deferred lazy-page
+  primitive is now closed** — see the Track B pickup list's own item 1 update below. `DE_UP` not
+  reached this pass either; chrome-devtools MCP not re-checked (moot, `DE_UP` never fired).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -282,16 +329,24 @@ both Xvfb SIGSEGVs.
    admission-control (76th, tuning CLOSED as a dead end 80th) and the fixed per-process alloc floor
    (77th, real ~35-40% reduction) are both landed and real but each only a partial mitigation — the
    crater is CUMULATIVE committed memory across the boot's whole fork history, not peak concurrency
-   or a fixed per-process floor. **The one lever that could plausibly still move it — eager,
+   or a fixed per-process floor. Session-autostart trimming (82nd: Failsafe client list 5→2,
+   `at-spi-dbus-bus`/`pulseaudio` disabled) is ALSO now closed as a lever — live-verified null result,
+   same crater magnitude/timing as untrimmed, because it reduces WHICH programs run, not the per-fork
+   copy volume that dominates. **The one lever that could plausibly still move it — eager,
    unconditional full-VMA-copy on every fork (~85% of a fork-exec cycle wasted the instant `execve`
-   fires, 79th) — has no safe narrow fix at either per-page or whole-batch granularity (79th, 81st):
-   it needs a genuine new per-page lazy-population primitive (real page-fault handling), explicitly
-   cross-referenced against `fork_verify.rs`'s VEH single-step healing before either touches the boot
-   path, and is deferred to its own dedicated multi-pass investigation, not attempted again without
-   that groundwork.** `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero cost when off)
-   remains the permanent tool for measuring any future fix's real payoff before landing it. `DE_UP`
-   has not been reached by any pass through the 81st; chrome-devtools MCP has been `CONNECT_TIMEOUT`
-   every time it was checked (moot until `DE_UP` fires). Lower-priority, still open: (a) decompose
+   fires, 79th) — has no safe narrow fix at either per-page or whole-batch granularity, and Angle A's
+   own "skip provably-zero bytes" variant (82nd) doesn't either: `insert_mapping`'s
+   `populate_pages_immediately=true` already commits the FULL span in one `VirtualAlloc2` call
+   regardless of what gets written into it, so a write-skip-only version saves wall-clock, not the
+   committed bytes the crater is measured in. Every variant of this lever converges on the SAME
+   single remaining primitive: genuine per-page lazy population (real page-fault/VEH-driven
+   `MEM_RESERVE`→`MEM_COMMIT`-on-touch), explicitly cross-referenced against `fork_verify.rs`'s VEH
+   single-step healing before either touches the boot path, its own dedicated multi-pass
+   investigation, not attempted again without that groundwork.** `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`
+   (both call sites, zero cost when off) remains the permanent tool for measuring any future fix's
+   real payoff before landing it. `DE_UP` has not been reached by any pass through the 82nd;
+   chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP`
+   fires). Lower-priority, still open: (a) decompose
    remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
    build vs. Windows loader overhead; (b) once `DE_UP` fires (or stalls again), use
    `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`,
