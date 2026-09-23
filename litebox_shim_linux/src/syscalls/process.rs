@@ -608,9 +608,39 @@ impl<Platform: ShimPlatform> Process<Platform> {
             return None;
         }
         let mut guard = self.pm.lock();
+        // The OLD `PageManager` is still the SAME shared, live address space the parent is
+        // blocked in the middle of using -- read what it currently tracks BEFORE swapping it out,
+        // so the fresh replacement can be seeded with those ranges as foreign/do-not-touch rather
+        // than starting blind. See `PageManager::new_for_vfork_execve_detach`'s doc comment for
+        // the full bug this closes.
+        //
+        // ONLY non-empty-flags entries -- i.e. real guest mappings the parent (or one of ITS OWN
+        // ancestors, transitively, since `tracked_regions()` already includes whatever an earlier
+        // `detach_pm_for_vfork_execve` seeded) actually owns. An empty-flags entry is the
+        // parent's own inherited `Vmem::new`/`reserved_pages()` placeholder -- foreign-but-
+        // genuinely-stealable by design (`insert_mapping`'s own `Replace`-mode comment: a real
+        // `MAP_FIXED` load, e.g. `cc1`'s classic non-PIE `0x400000` base, is legitimately allowed
+        // to land there). Carrying it forward as `VM_FOREIGN_LIVE_NEVER_REPLACE` would wrongly
+        // upgrade "stealable" to "never touch" and break exactly that case -- confirmed live: with
+        // an early, unfiltered version of this fix, `cc1` (forked transitively under `xrdb`'s own
+        // `cpp` invocation) started failing `execve` with `LoadError(Map(Errno(ENOMEM)))` because
+        // its `0x400000` load collided with a `VM_FOREIGN_LIVE_NEVER_REPLACE` entry that was really
+        // just carrying forward `Vmem::new`'s own placeholder, not real parent memory. The child's
+        // own fresh `Vmem::new` (inside `new_for_vfork_execve_detach`) already re-derives its own
+        // copy of those placeholders from `reserved_pages()` directly, so nothing is lost by
+        // excluding them here.
+        let parent_occupied: alloc::vec::Vec<core::ops::Range<usize>> = guard
+            .tracked_regions()
+            .into_iter()
+            .filter(|(_range, flags, _is_file_backed)| *flags != 0)
+            .map(|(range, _flags, _is_file_backed)| range)
+            .collect();
         let old = core::mem::replace(
             &mut *guard,
-            Arc::new(litebox::mm::PageManager::new(litebox)),
+            Arc::new(litebox::mm::PageManager::new_for_vfork_execve_detach(
+                litebox,
+                parent_occupied.into_iter(),
+            )),
         );
         Some(old)
     }
@@ -1952,8 +1982,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `vfork()`ed child exiting via the ordinary exit path, not `execve`, previously
             // released the STILL-SHARED address space out from under its live, suspended
             // parent).
-            let release =
-                |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
+            // `VM_FOREIGN_LIVE_NEVER_REPLACE` (see its own doc comment) is EXCLUDED here too, for
+            // the same reason plain `VmFlags::empty()` is: it marks memory a DIFFERENT, still-live
+            // process owns (a `CLONE_VFORK` child's own detached `Vmem`, seeded from the parent's
+            // occupied ranges at detach time) -- non-empty so `insert_mapping`'s `Replace` check
+            // refuses to place anything over it, but NOT this process's own memory to free. Without
+            // this exclusion, `!vm.is_empty()` alone swept these up as "real, mine, releasable" and
+            // issued a genuine platform `deallocate_pages`/`VirtualFree` against the PARENT's live
+            // memory (confirmed live: a vfork grandchild's own exit hit exactly this path against
+            // an entry covering Windows' own `KUSER_SHARED_DATA` page at `0x7ffe0000`, "The handle
+            // is invalid", which took down the whole real process -- including an unrelated
+            // sibling thread, e.g. `Xvfb`'s own X-server-serving main thread).
+            let release = |_r: Range<usize>, vm: VmFlags| {
+                (!vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING))
+                    && !vm.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+            };
             if let Err(err) = unsafe { self.process().pm().release_memory(release) } {
                 litebox_util_log::warn!(tid:% = self.tid.get(), err:? = err; "prepare_for_exit: release_memory failed");
             }
@@ -2806,9 +2849,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // ever reaching stderr -- so a borrow conflict would present as an unexplained fault with
         // no diagnostic at all. Falling back to the thread-based fork is always safe.
         let Ok(files) = self.files.try_borrow() else {
-            litebox_util_log::debug!(
-                tid:% = self.tid.get();
-                "clone: cross-process fork() skipped -- fd table already borrowed"
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get();
+                "clone: cross-process fork() not eligible -- fd table already borrowed"
             );
             return None;
         };
@@ -3092,6 +3135,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             litebox_util_log::warn!(
                 tid:% = self.tid.get(),
+                pid:% = self.pid.get(),
+                comm:? = self.comm.get(),
                 uncarriable:% = uncarriable,
                 uncarriable_cloexec:% = uncarriable_cloexec,
                 kinds:? = uncarriable_kinds,
@@ -3121,19 +3166,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             carried_eventfds:% = inherited_eventfds.len();
             "clone: cross-process fork() is eligible -- the child gets a real address space"
         );
-        let parent_fs_base = self
+        let Ok(parent_fs_base) = self
             .global
             .platform
             .get_arch_specific_register(&ArchSpecificRegister::FsBase)
-            .ok()?;
+        else {
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get();
+                "clone: cross-process fork() not eligible -- could not read parent fs_base register"
+            );
+            return None;
+        };
         if !litebox_common_linux::arch::is_valid_user_fs_base(parent_fs_base)
             || parent_fs_base >= Platform::TASK_ADDR_MAX
         {
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
+                fs_base:% = parent_fs_base;
+                "clone: cross-process fork() not eligible -- unsanitizable/out-of-range fs_base"
+            );
             return None;
         }
 
         let mut source_ctx = ctx.clone();
         if !source_ctx.sanitize_for_user_return() {
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get();
+                "clone: cross-process fork() not eligible -- register context failed sanitize_for_user_return"
+            );
             return None;
         }
         let full_gprs = litebox::platform::ForkFullGprSnapshot {
@@ -3954,6 +4014,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Ok(usize::try_from(child_tid).unwrap());
             }
 
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
+                child_tid:% = child_tid, vforked:% = vforked;
+                "clone: not cross-process -- falling back to same-process thread-based fork (vforked=shared-pm, else=eager-duplicate/ADVISORY-001-exposed)"
+            );
             let (dest_pm, relocations) = if vforked {
                 (
                     self.process().pm(),
@@ -6673,8 +6738,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // by `VmFlags::empty()` alone. See `VM_OWN_FORK_PADDING`'s own doc comment for the full
         // history -- this was the confirmed root cause of the long-standing fork()+execve()
         // mallocng `.meta=0` crash.
-        let release =
-            |_r: Range<usize>, vm: VmFlags| !vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING);
+        // See `prepare_for_exit`'s identical `release` closure (this function's sibling caller of
+        // `release_memory`) for why `VM_FOREIGN_LIVE_NEVER_REPLACE` must ALSO be excluded here --
+        // this call site is in fact the one that reaches it first: `detach_pm_for_vfork_execve`
+        // just above already swapped `self.process().pm()` to the fresh, placeholder-seeded
+        // `PageManager` this closure now runs against.
+        let release = |_r: Range<usize>, vm: VmFlags| {
+            (!vm.is_empty() || vm.contains(VmFlags::VM_OWN_FORK_PADDING))
+                && !vm.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+        };
         if let Err(e) = unsafe { self.process().pm().release_memory(release) } {
             // Real Linux `munmap()` failing is a recoverable per-call error, never a process
             // abort -- and by this point in `execve` teardown (CLOEXEC fds already closed, robust

@@ -113,6 +113,27 @@ bitflags::bitflags! {
         /// untouched -- see `release_memory`'s own callers for the fix built on this flag.
         const VM_OWN_FORK_PADDING = 1 << 9;
 
+        /// Marks a placeholder range as belonging to ANOTHER, still-live process sharing this
+        /// same real host address space -- memory this `Vmem` must never place anything over,
+        /// under ANY [`FixedAddressBehavior`], not even [`FixedAddressBehavior::Replace`]'s
+        /// otherwise-legitimate "a `MAP_FIXED` request unconditionally overwrites whatever is
+        /// there" semantics (see `insert_mapping`'s own doc comment on why an ordinary
+        /// empty-flags [`Vmem::new`] placeholder is deliberately allowed to be replaced, and why
+        /// that is wrong for this case specifically).
+        ///
+        /// The one and only source of this flag today is
+        /// [`Vmem::new_for_vfork_execve_detach`]: a `CLONE_VFORK` child's fresh `Vmem`, seeded
+        /// with the ranges the shared `PageManager` it is detaching from was tracking at that
+        /// moment (i.e. the PARENT's own live memory) -- a genuinely different case from every
+        /// other placeholder kind here, because there is no host-level mechanism (unlike a real
+        /// `fork()` child's `duplicate()`, which asks the platform's own allocator for fresh room)
+        /// that keeps this child's own address choices away from a foreign, concurrently-live
+        /// owner's memory. An `insert_mapping` caller that reaches this flag on ANY overlap --
+        /// partial or, unlike the empty-flags case, even a full one -- must fail loudly
+        /// (`AddressPartiallyInUse`) rather than silently decommit-then-recommit real memory a
+        /// different, merely-blocked process is going to resume using.
+        const VM_FOREIGN_LIVE_NEVER_REPLACE = 1 << 10;
+
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
             | Self::VM_EXEC.bits();
@@ -777,6 +798,85 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         vmem
     }
 
+    /// Like [`Self::new`], but ALSO records `parent_occupied` as foreign, do-not-touch address
+    /// space -- exactly the same empty-flags "reserved by someone else" placeholder
+    /// [`Self::new`]'s own loop inserts for [`PageManagementProvider::reserved_pages`], just for
+    /// ranges a CALLER supplies directly instead of ranges the platform tracks itself.
+    ///
+    /// # Why this exists: `CLONE_VFORK`'s shared-then-detach execve, not [`Self::duplicate`]'s fork
+    ///
+    /// [`Self::new`]'s own doc comment above already explains why a plain thread-based `fork()`
+    /// child does NOT need this: [`Self::duplicate`] places the child's copy at genuinely fresh
+    /// host addresses (asking the platform's real allocator for room, which inherently cannot
+    /// double-book already-committed memory), so by the time that child later `execve()`s, its own
+    /// memory occupies addresses nothing else uses -- freeing and reusing them is safe.
+    ///
+    /// A `CLONE_VFORK` child is different in exactly the way that reasoning depends on: it is
+    /// never placed anywhere, because it never gets a copy at all -- `do_clone` hands it the
+    /// SAME [`PageManager`] `Arc` the parent is still using (see that function's own doc comment
+    /// on why this is safe up to this exact point: the parent is unconditionally blocked in
+    /// `wait_for_vfork_done` for the whole window). When that child calls `execve()`,
+    /// `detach_pm_for_vfork_execve` swaps in a brand-new `PageManager` for it -- correct per
+    /// real Linux's own `execve()` semantics (always a fresh address space) -- but a brand-new
+    /// `Vmem::new` only knows about [`PageManagementProvider::reserved_pages`], which on Windows is
+    /// a snapshot frozen at process-startup time (`refresh_reserved_pages` is a documented no-op
+    /// there) and so has NO knowledge whatsoever of anything the parent allocated since starting
+    /// up -- which, for a real process like `xfce4-session`, is effectively its entire heap, stack
+    /// growth, and every library `mmap`ed after its own startup. Unlike `duplicate()`'s child, this
+    /// child's execve is NOT placing memory at fresh host addresses discovered by asking the
+    /// platform for room -- it is running in the exact same real Windows process, address space
+    /// and (per the platform's own `reserved_pages` snapshot) largely UNTRACKED memory as the
+    /// still-live, merely-blocked parent. A "blind" fresh `Vmem` can then have its ELF loader's own
+    /// hint-based placement (PIE base, stack, mmap'd libraries -- the overwhelming common case)
+    /// select an address `insert_mapping`'s free-space search believes is empty but which is real,
+    /// currently-committed memory belonging to the PARENT -- and `insert_mapping`'s own
+    /// `FixedAddressBehavior::Replace` fallback (see its doc comment above) will silently
+    /// decommit-then-recommit fresh content directly over it, destroying the parent's live memory
+    /// out from under it. The parent does not notice until it resumes (unblocked the moment this
+    /// child reaches its own `execve`/`_exit`, not when it eventually exits) and later touches the
+    /// now-corrupted region -- a DELAYED fault, often tens of milliseconds to several seconds
+    /// after the actual corruption, which is exactly the observed shape of `xfce4-session`'s own
+    /// real `STATUS_ACCESS_VIOLATION` crash shortly after forking a `CLONE_VFORK` child that this
+    /// constructor was added to fix (2026-09-23 investigation).
+    ///
+    /// `parent_occupied` should be every range the OLD, about-to-be-detached `PageManager` (the one
+    /// this child was sharing with its still-live parent) currently tracks -- see
+    /// [`super::PageManager::tracked_regions`]. Recorded with the SAME empty-flags placeholder
+    /// [`Self::new`] itself uses for foreign, platform-reserved memory: real ranges (a PIE base
+    /// search, a `brk`-extension, an ordinary `mmap` hint search) correctly skip them, exactly as
+    /// they already skip [`Self::new`]'s own `reserved_pages` placeholders -- with no change needed
+    /// to `insert_mapping`'s existing overlap logic. Malformed/unaligned input is skipped, never
+    /// panics, matching this module's established "degrade, never crash the process being
+    /// diagnosed" contract for data describing another process's memory.
+    pub(super) fn new_for_vfork_execve_detach(
+        platform: &'static Platform,
+        parent_occupied: impl Iterator<Item = Range<usize>>,
+    ) -> Self {
+        let mut vmem = Self::new(platform);
+        for each in parent_occupied {
+            if each.start >= each.end || each.start % ALIGN != 0 || each.end % ALIGN != 0 {
+                continue;
+            }
+            // `VM_FOREIGN_LIVE_NEVER_REPLACE`, not an ordinary empty-flags placeholder -- see that
+            // flag's own doc comment for why an empty-flags entry (silently stealable under
+            // `FixedAddressBehavior::Replace`, by design, for the foreign-but-genuinely-free
+            // `reserved_pages()` case `Vmem::new` itself seeds) is NOT strong enough here: this
+            // range is the PARENT's own live, in-use memory, not merely foreign-and-free space.
+            vmem.vmas.insert(
+                each,
+                VmArea {
+                    flags: VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE,
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
+        }
+        vmem
+    }
+
     /// Create a [`Vmem`] whose `vmas` bookkeeping ADOPTS memory that ALREADY EXISTS, at exactly
     /// the given addresses, in this process's address space -- performing no allocation, no
     /// reservation, no commit, and no copying of any kind.
@@ -1272,6 +1372,27 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             FixedAddressBehavior::Replace => {
                 if self.vmas.overlaps(&(start..end)) {
+                    // `VM_FOREIGN_LIVE_NEVER_REPLACE` (see that flag's own doc comment) is an
+                    // unconditional refusal, regardless of partial vs. full coverage: unlike an
+                    // ordinary empty-flags `Vmem::new` placeholder (which a real `MAP_FIXED` is
+                    // legitimately allowed to steal, see the case below), this marks memory a
+                    // DIFFERENT, still-live process owns -- there is no "legitimate ELF segment
+                    // placement" reading of overwriting that, ever.
+                    if let Some((r, _)) = self
+                        .vmas
+                        .iter()
+                        .find(|(r, vma)| {
+                            r.start < end
+                                && r.end > start
+                                && vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+                        })
+                    {
+                        litebox_util_log::warn!(
+                            target_start:% = start, target_end:% = end, overlapping:? = r;
+                            "insert_mapping: MAP_FIXED target overlaps memory a different, still-live process owns, rejecting as AddressPartiallyInUse"
+                        );
+                        return Err(AllocationError::AddressPartiallyInUse);
+                    }
                     if self.vmas.gaps(&(start..end)).next().is_some()
                         // A partial overlap is only unsafe to blindly `Replace` over when some
                         // piece of it is a REAL guest mapping (non-empty flags) this shim doesn't
@@ -1506,11 +1627,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // `Self::new` (not real guest mappings, and not necessarily even
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
-        // business.
+        // business. `VM_FOREIGN_LIVE_NEVER_REPLACE` ranges (see that flag's own doc comment) get
+        // the identical treatment despite being non-empty: they mark a DIFFERENT, still-live
+        // process's own memory (seeded into a `CLONE_VFORK` child's fresh `Vmem` by
+        // `new_for_vfork_execve_detach`), not real content belonging to `self` -- `dest` must not
+        // copy it as if it were this process's own heap/stack, only continue refusing to place
+        // anything over the same addresses (which `dest`'s own placeholder, inserted the same way,
+        // already guarantees on its own account).
         let regions: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .vmas
             .iter()
-            .filter(|(_, vma)| !vma.flags.is_empty())
+            .filter(|(_, vma)| {
+                !vma.flags.is_empty() && !vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+            })
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
 

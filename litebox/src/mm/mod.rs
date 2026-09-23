@@ -691,6 +691,29 @@ where
         Self { vmem }
     }
 
+    /// Like [`Self::new`], but for the ONE case where that is not enough: a `CLONE_VFORK` child
+    /// detaching into its own fresh address space at `execve()` time, via
+    /// `detach_pm_for_vfork_execve` in `litebox_shim_linux`. See
+    /// [`linux::Vmem::new_for_vfork_execve_detach`]'s doc comment for the full bug this closes
+    /// (a real, delayed `STATUS_ACCESS_VIOLATION` in a still-live parent whose memory a vfork
+    /// child's own `execve` silently overwrote) and why [`Self::new`] alone -- sufficient for
+    /// every OTHER caller, including a plain `fork()` child's `execve` -- is not sufficient here.
+    ///
+    /// `parent_occupied` should be `self`'s own [`Self::tracked_regions`] -- i.e. the OLD
+    /// `PageManager` this child is about to detach from -- read and passed BEFORE the swap, while
+    /// the ranges it describes are still this same shared, live address space.
+    pub fn new_for_vfork_execve_detach(
+        litebox: &LiteBox<Platform>,
+        parent_occupied: impl Iterator<Item = Range<usize>>,
+    ) -> Self {
+        litebox.x.platform.refresh_reserved_pages();
+        let vmem = RwLock::new(linux::Vmem::new_for_vfork_execve_detach(
+            litebox.x.platform,
+            parent_occupied,
+        ));
+        Self { vmem }
+    }
+
     /// Create a `PageManager` whose guest-tracked address space ADOPTS memory that already exists,
     /// at exactly these addresses, in the CURRENT process -- allocating, reserving, committing and
     /// copying nothing.

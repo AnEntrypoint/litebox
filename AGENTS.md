@@ -13,8 +13,10 @@ line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 88th pass (drained
 the 83rd-87th passes' own full bug-by-bug writeups to the archive, now that
 `lazy_fork_commit.rs`'s own module doc comment serves as the canonical detailed record for that
-mechanism; ~53.6KB→~44KB, still above the 30KB threshold — further compaction of older,
-already-CLOSED sections is the next pass's own pickup if this file crosses 30KB again).
+mechanism; ~53.6KB→~44KB). 90th pass added a real fix (`VM_FOREIGN_LIVE_NEVER_REPLACE`, see its own
+entry below) without further compaction — this file is over 30KB again; the next pass should drain
+the 90th pass's own bullet (and older CLOSED material) to the archive once its own follow-up work
+lands, rather than compacting a still-actively-being-extended entry.
 
 ## The cheap repro — start here
 
@@ -203,72 +205,29 @@ map" below). Condensed current-state trail:
   low-overhead `litebox_diag::process_timeline`/`socket_read` targets; independently reproduced a
   `GetAllProperties` D-Bus call re-issuing every ~10.7s forever (mechanism unconfirmed, still open).
   `DE_FAILED`/RAM collapse (host process count peaking ~30) survived all of it.
-- **75th**: **`xfwm4` launches for the first time ever.** Root-caused+FIXED (`1d449e6`)
-  `take_cross_process_writable_layer_export` requiring an env var unset on every `--oci-image`
-  boot — the parent never re-absorbed ANY cross-process fork child's filesystem writes, on ANY
-  `--oci-image` boot, ever; fixed by mirroring the child's own OCI-image fallback onto the parent's
-  read side. Confirmed via `DIAG_TIMELINE execve`, X11 window count 0→1→11,
-  `_NET_SUPPORTING_WM_CHECK` advancing. Also REFUTED the rootfs-cache-miss theory
-  (`LITEBOX_DIAG_FORK_TIMING=1`: both caches 100% hit, real per-fork rootfs cost ~83-140ms). `DE_UP`
-  not reached — RAM crater (0.3-1.3GB free) around `WM_POLL n=6`, 11+ windows.
-- **76th**: first DIRECT host-side capture of the crater process tree
-  (`.wfgy/pass76_crater_procsnapshot.txt`) — 33 simultaneous processes, 4 fork-tree generations
-  deep, ~10.5GB combined working set/15.25GB host. Landed `live_cross_process_fork_children`
-  (shared-arena `AtomicU32` admission control, caps 6 concurrent cross-process children, fails open
-  ~8s) — real but PARTIAL: slower growth, same eventual magnitude (28-29 processes, 0.17-0.31GB
-  free). Reframed: not a scheduling problem — a real XFCE session needs >6 long-lived daemons alive
-  simultaneously, each paying ~350MB-1.1GB peak working set once (ordinary Windows behavior); fix
-  rate-limits, doesn't cap. Real fix needs lower PEAK PER-PROCESS RSS. Confirmed not a leak (WMI
-  `Terminate` fully recovers RAM).
-- **77th**: root-caused+FIXED (`621ee1a`) a real 2x host-allocator commit bug —
-  `WindowsUserland::alloc` doubled every commit instead of using `VirtualAlloc2`'s unused
-  `MEM_ADDRESS_REQUIREMENTS::Alignment` field (`cdb -pv` traced it to `clap`'s CLI-parsing `Vec`
-  growth, ~108MB committed before the OCI pull even begins). Verified correct, measured: Priv
-  committed 123.7→76.6MB / 130.2→84.5MB single-process, ~35-40% reduction per process. Real but NOT
-  sufficient alone: full XFCE boot still cratered at the same magnitude (28 processes, 0.82GB free)
-  — 28×~77MB≈2.15GB vs. ~7-8GB actually consumed. New candidate found by code reading, not fixed:
-  BOTH fork paths (`Vmem::duplicate`, `litebox/src/mm/linux.rs`~1679-1719; `copy_one_group`,
-  `litebox_platform_windows_userland/src/process_fork.rs`) unconditionally byte-copy every
-  non-shared VMA on every fork, including read-only shared-library code/rodata a real `fork()`
-  would share for free. Deliberately not attempted — flagged as needing real measurement first.
-- **78th**: measured the 77th pass's shared-library-COW theory (`LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`,
-  permanent, off by default) instead of guessing — read-only file-backed bytes are only ~29% of
-  copied bytes per fork (real but MODERATE, not dominant); declined the skip-copy fix as a bad trade
-  against ADVISORY-001 §3N's bug history for a moderate payoff. Incidentally reconfirmed `ls | wc -l`
-  can still SIGSEGV/SIGABRT via the known tcache-corruption class.
-- **79th**: measured fork-then-immediately-`execve()` instead of guessing — with the `GLIBC_TUNABLES`
-  workaround, 20/20 real `bash -c` forks are plain `fork()` (`CLONE_VM` absent) with `execve()` as
-  the literal first syscall, ~85% of cycle wall time is eager-copy, 100% wasted at `execve`. Declined
-  to implement a skip/defer-copy fix: reaching a "first syscall" checkpoint needs the child to
-  execute real instructions first, which needs the copy already done (no COW/page-fault primitive
-  exists) — a real fix needs a new per-page lazy-population primitive, scoped but not attempted.
-  Also reconfirmed ADVISORY-001 §3N live (44% per-fork crash rate WITHOUT the tunable, 0% with it).
-- **80th**: confirmed by direct live measurement (not prediction) that tightening
-  `CROSS_PROCESS_FORK_CONCURRENCY_CAP` further is a dead end — two fresh boots at 6→3 hit the SAME
-  WM_POLL n=4 crater ceiling the unmodified cap=6 binary already hit (77th), just slower with fewer
-  procs alive at the crater instant. Confirms the crater is driven by CUMULATIVE committed memory
-  across the boot's whole fork history, not peak instantaneous concurrency — CLOSES admission-cap
-  tuning as a lever.
-- **81st**: investigated the 79th pass's declined idea in a narrower "defer the WHOLE copy batch (not
-  per-page) until the child's first non-`execve` syscall" framing, via code reading only (no code
-  changed, no live boot — nothing to verify). Confirms 79th's obstacle (the child needs real,
-  populated memory to execute even its first instruction, so there is no window to defer into) and
-  finds a SECOND, independent one: the checkpoint is a syscall event, not a memory-WRITE event, and a
-  plain `fork()`ed child may legally write memory (stack/TLS/malloc bookkeeping/`atfork` handlers)
-  with zero syscalls before `execve` — sharing pages until the checkpoint would let such a write
-  silently corrupt the PARENT. Litebox's own `CLONE_VFORK` path already does share-until-`execve`
-  safely (`do_clone`, `process.rs:3893-3925`), but only because real `vfork()` carries a POSIX UB
-  contract forbidding exactly that write, plus the parent is blocked (`wait_for_vfork_done`) —
-  neither property holds for plain `fork()`, which is what the real `bash` workload uses (79th).
-  Whole-batch deferral removes the per-page performance argument only, not the correctness one — the
-  only remaining viable path is genuine per-page lazy population (79th's own scoped primitive), no
-  shortcut exists at either granularity. Re-confirms 79th's decision not to implement.
-- **82nd** — both remaining "quick, safe" Track B levers (skip-copying-zero-bytes; trimming optional
-  XFCE session-autostart components) tested and confirmed real but genuinely exhausted — neither
-  reduces Windows' own `VirtualAlloc2(MEM_COMMIT)` charge, which is what the crater is measured in.
-  Net effect: narrowed the whole investigation down to one remaining candidate, genuine per-page
-  lazy population. Full Angle A/B evidence, exact XFCE client list, exact before/after process
-  counts: archive.
+- **75th-82nd (condensed; full narrative for each: `docs/AGENTS_ARCHIVE_2026-09-23.md`)** — 75th:
+  **`xfwm4` launches for the first time ever**, root-caused+FIXED (`1d449e6`) a writable-layer
+  export-path fallback bug that had silently broken filesystem-write visibility on EVERY
+  `--oci-image` boot, ever (RAM crater at `WM_POLL n=6`/11 windows, `DE_UP` not reached). 76th: first
+  direct host-side capture of the crater process tree (33 processes/~10.5GB), landed admission
+  control (`live_cross_process_fork_children`, caps 6 concurrent) — real but partial (slower growth,
+  same eventual 28-29-process/<1GB-free magnitude); reframed as cumulative per-process peak RSS
+  across a real XFCE session's >6 necessarily-concurrent daemons, not a scheduling problem. 77th:
+  root-caused+FIXED (`621ee1a`) a real 2x host-allocator commit-doubling bug (~35-40%
+  per-process reduction, confirmed not sufficient alone) and found, by code reading, fork's own
+  unconditional full-VMA-copy (no COW for shared-library pages) as the next candidate. 78th:
+  measured that theory instead of guessing — real but moderate (~29% of copied bytes), declined as a
+  bad trade against ADVISORY-001's bug history. 79th: measured (not guessed) that the dominant real
+  case is fork-then-immediate-`execve()` with ~85% of cycle time wasted on the eager copy; scoped a
+  genuine per-page lazy-population primitive as the real fix, correctly declined to implement it
+  without a COW/page-fault mechanism in hand. 80th: confirmed by live measurement that tightening the
+  admission cap further is a dead end (same crater ceiling, just slower) — closes cap-tuning as a
+  lever. 81st: code-reading-only investigation of a narrower deferred-copy variant, found a SECOND
+  correctness obstacle (a plain `fork()` child may legally write memory pre-`execve`, unlike
+  `vfork()`'s POSIX-guaranteed non-write contract) — re-confirms 79th's decision, no shortcut exists.
+  82nd: the two remaining "quick, safe" levers (zero-byte-skip; XFCE autostart trimming) tested and
+  confirmed genuinely exhausted — neither touches Windows' own `VirtualAlloc2(MEM_COMMIT)` charge —
+  narrowing the whole investigation to the one remaining candidate, genuine per-page lazy population.
 - **83rd-87th (compacted; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "83rd-87th pass full
   narrative" section)** — implemented lazy (reserve-then-commit-on-fault) fork memory
   (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`, `LITEBOX_LAZY_FORK_COMMIT=1`), a
@@ -432,6 +391,97 @@ map" below). Condensed current-state trail:
     **Concrete pickup**: re-verify this boot result 2-4 more times for consistency, then root-cause
     the pre-existing `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now that RAM is no longer in the way
     of reaching it — see priority item 1 below for the exact next steps on that gap.
+- **90th — pursued Angle 1 (why does `xfce4-session`'s crashing fork go thread-based, not
+  cross-process); found the exact answer with real evidence, fixed two genuine, previously-unknown
+  architectural bugs the answer led to (both live-verified), but the ORIGINAL crash survives both
+  fixes unchanged — narrower, still-open finding, not a full close.** Added permanent diagnostics
+  first rather than guessing: `pid`/`comm` on the `try_cross_process_fork` ineligibility warn (was
+  `tid`-only), and a new warn at `do_clone`'s `vforked` branch point stating which of the two
+  same-process fallbacks (`vforked=true` shared-PM vs. `vforked=false` eager-duplicate) a given
+  fork actually took. **Real evidence, not a guess**: `xfce4-session`'s own crashing fork (its
+  `/bin/sh` startup-script child) is a genuine `CLONE_VFORK` (`vforked=true`) — `do_clone`'s own
+  `if !vforked && self.try_cross_process_fork(...)` gate means `try_cross_process_fork` is never
+  even CALLED for it; this is categorically different from the 89th pass's "thread-based, not
+  cross-process" framing, which did not distinguish vfork-shared from eager-duplicate within that
+  bucket.
+  - **Bug A (FOUND+FIXED, real, live-verified): `detach_pm_for_vfork_execve`
+    (`litebox_shim_linux/src/syscalls/process.rs`) built the vfork child's fresh `PageManager` via
+    plain `PageManager::new` — blind to every range the STILL-LIVE, merely-blocked parent currently
+    occupies.** Windows has no per-guest-process page tables (unlike real Linux's `vfork`+`execve`,
+    where the child's `exec_mmap` installs a genuinely separate `mm_struct` with zero collision
+    risk against the parent's own, untouched one) — a same-process vfork child's own ELF/stack
+    placement can select a REAL address the parent is still using, and `insert_mapping`'s existing
+    `FixedAddressBehavior::Replace` path (`litebox/src/mm/linux.rs`) silently decommits-then-
+    recommits over it, corrupting the parent. Fixed: new `Vmem::new_for_vfork_execve_detach` /
+    `PageManager::new_for_vfork_execve_detach` seed the child's fresh `Vmem` with the OLD (still-
+    shared) `PageManager`'s own `tracked_regions()`, tagged with a new `VmFlags::
+    VM_FOREIGN_LIVE_NEVER_REPLACE` bit that `insert_mapping`'s `Replace` arm now rejects
+    UNCONDITIONALLY on any overlap (not just the existing partial-overlap-with-real-content case,
+    which an ordinary empty-flags `Vmem::new` placeholder is deliberately exempt from — see that
+    flag's own doc comment for why the two must stay distinct). **This mechanism is REAL and fires
+    on a genuine, previously-silent collision**: `xrdb`'s own `cpp`→`cc1` vfork chain (both classic
+    non-PIE GCC binaries loading at the SAME fixed `0x400000`) — `cc1`'s `execve` now correctly
+    fails loud (`LoadError(Map(Errno(ENOMEM)))`, `AddressPartiallyInUse`) instead of silently
+    overwriting `cpp`'s own still-live, about-to-resume image, which a prior pass's own comment
+    (the `vfork-child-execve-large-elf-enomem` investigation) had misdiagnosed as merely straddling
+    a harmless reserved placeholder — it is not, in this case it is real live parent content, a
+    genuinely new, previously-undetected instance of this whole investigation's core bug class.
+  - **Bug B (a real regression Bug A itself introduced — FOUND live, FIXED, live-verified): marking
+    those seeded ranges non-empty made `release_memory`'s existing `!vm.is_empty()`-based "this is
+    real, mine, free it" predicates (`process.rs`'s `prepare_for_exit` and `sys_execve`, both
+    already special-cased for `VM_OWN_FORK_PADDING`) sweep them up too.** A vfork grandchild's own
+    ordinary exit/exec teardown then issued a genuine platform `deallocate_pages`/`VirtualFree`
+    against the PARENT's real memory — caught live or by direct log evidence: one such attempt hit
+    an entry covering Windows' own `KUSER_SHARED_DATA` page (`0x7ffe0000`), producing a real Rust
+    panic (`WindowsUserland::deallocate_pages`: "The handle is invalid") whose unwind took down the
+    ENTIRE real Windows process — including `Xvfb`'s own unrelated main X-server-serving thread
+    (same-process vfork sharing means one thread's fail-fast kills every thread), observed as
+    `Xvfb` exiting `STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`, this codebase's own documented
+    `RaiseFailFastException` signature) ~4s after its own start, cascading into every later X
+    client seeing "unable to open display". **Fixed**: both `release` closures now also exclude
+    `VM_FOREIGN_LIVE_NEVER_REPLACE`; `Vmem::duplicate`'s own region-copy filter (a plain ordinary
+    `fork()` from an already-vfork-detached process) excludes it too, for the same reason (it is
+    not this process's own content to copy). **A second, related over-broad-protection bug found
+    and fixed in the same pass**: the FIRST version of Bug A's fix carried forward an ancestor's
+    own EMPTY-flags `Vmem::new`/`reserved_pages()` placeholders (genuinely foreign-but-legitimately-
+    stealable, e.g. the very `0x400000` band `cc1` needs) as `VM_FOREIGN_LIVE_NEVER_REPLACE`
+    (wrongly upgrading "stealable" to "never touch"), which broke `cc1` outright
+    (`LoadError(ENOMEM)` on ITS OWN legitimate, first, non-colliding load). Fixed by filtering
+    `parent_occupied` to non-empty-flags entries only (`detach_pm_for_vfork_execve`'s own updated
+    doc comment has the full before/after). **Live-verified, both fixes together, 2 full boots
+    (`de_only_xcensus_seed3.tar`, ~220s each)**: `Xvfb` no longer crashes (X server stays reachable
+    — `_NET_SUPPORTING_WM_CHECK` queries now return "no such atom on any window", not "unable to
+    open display"); `xfce4-session` reaches real GTK/ICE startup (`ConsoleKit proxy` warning,
+    `_NET_NUMBER_OF_DESKTOPS`/`_NET_WORKAREA`/`_NET_CURRENT_DESKTOP` EWMH queries, `iceauth`
+    authority file creation) — materially further than any run this pass observed before either fix
+    landed; `cc1`'s own real, first-use collision correctly rejects loud rather than corrupting
+    silently, with `xrdb`'s own failure being a narrow, non-blocking, cosmetic side effect (X
+    resource preprocessing) that does not stop `DE_LAUNCHED_DIRECT`.
+  - **The ORIGINAL target crash — `xfce4-session` itself, `STATUS_ACCESS_VIOLATION`
+    (`exit_code=3221225477`), ~16-16.7s after its own start, immediately after its own `vfork()` of
+    `/bin/sh` — is UNCHANGED by any of the above, confirmed by re-running the exact same boot with
+    both fixes landed (2/2 runs where `xfce4-session` reaches this point at all: identical signature,
+    16685ms/16691ms elapsed).** Decisive negative evidence, not a guess: the new
+    `VM_FOREIGN_LIVE_NEVER_REPLACE` rejection log line NEVER fires anywhere in `xfce4-session`'s own
+    fork chain across every run this pass captured (it fired exactly once, total, across all boots —
+    for the unrelated `cc1` case above) — ruling OUT a `Replace`-mode fixed-address placement
+    collision as this specific crash's mechanism. The vfork chain itself (`xfce4-session`→`/bin/sh`→
+    `iceauth`, all exiting/execve-ing cleanly, `status=0`) completes with no visible error; the crash
+    is DELAYED well past it, with zero corresponding `[veh]`/`diag-unrecov-av`/panic output anywhere
+    in the log for `xfce4-session`'s own winpid — meaning this specific fault is NOT being caught by
+    this codebase's own VEH machinery at all (contrast `Xvfb`'s crash above, which WAS: a real
+    Rust panic with a full backtrace). Root cause remains OPEN.
+  - **Next pickup, precise**: (1) a live `cdb -pv`/`-p` attach specifically on `xfce4-session`'s own
+    winpid, breaking EARLY (right after its `task-resume-probe` line) and single-stepping a bounded
+    window rather than a blanket `g`/`sxe` — the 89th pass's own sustained invasive attach ran the
+    whole window without ever reproducing the crash (timing-perturbation-sensitive), so bound the
+    step count and consider breaking specifically around the `vfork`-resume point (`wait_for_vfork_
+    done` returning) rather than at process start. (2) Since no VEH output at all appears for this
+    fault, check whether it is happening on a HOST-mode code path the VEH's own `is_in_guest`-keyed
+    triage doesn't classify as one of its "four codes" at all (`docs/veh-exception-handler-design.md`)
+    — i.e. confirm whether this is even a GUEST-mode fault before assuming it's a guest memory bug.
+    (3) The 89th pass's own still-unchecked `GLIBC_TUNABLES` propagation question remains open and
+    cheap to check first.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
@@ -483,22 +533,10 @@ both Xvfb SIGSEGVs.
    codes via `wait4_diag`), not a passive registration gap -- and that crash is on the OLD
    thread-based-fork path (`child_tid=`), NOT `lazy_fork_commit`/guard-cow (`winpid=`-only). See
    this section's own "89th pass" entry above for the full evidence chain.**
-   **Next pickup, in order, supersedes the old (1)-(3) below**: (1) confirm whether
-   `GLIBC_TUNABLES` genuinely reaches `xfce4-session`/`ssh-agent`/`iceauth`'s own real environment
-   at their own `clone()` point (not checked live this pass -- the single most concrete open
-   question); (2) get a live `cdb` capture of the actual fault using an EARLY breakpoint +
-   bounded single-step instead of a blanket `g` (this pass's sustained invasive attach ran the
-   whole window without ever reproducing the crash, most likely due to the attach's own timing
-   perturbation -- see the auto-attach watcher note above); (3) once root-caused, fix it as a
-   general thread-based-fork correctness bug (independent of either lazy/guard-cow flag) and
-   re-verify `DE_FAILED` stops firing on this specific cause; (4) only then does the ORIGINAL
-   `_NET_SUPPORTING_WM_CHECK`/`xfwm4`-registration angle below become reachable to investigate on
-   its own merits (a run where `xfce4-session` never crashes, like this pass's cdb-attached run3,
-   still hit `DE_FAILED` with zero `xfwm4` registration, so that gap is real too, separate from the
-   crash, and still needs its own root-cause once the crash stops obscuring it); (5) only once BOTH
-   are closed does flipping either lazy/guard-cow flag on BY DEFAULT become worth considering.
+   **Superseded by the 90th pass update below** (kept one line for the trail: this list's own item
+   (2), the early-breakpoint bounded-single-step `cdb` approach, is still the live recommendation).
    `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (zero cost when off) remains the permanent tool for measuring
-   any future fix's real payoff. `DE_UP` has not been reached by any pass through the 89th;
+   any future fix's real payoff. `DE_UP` has not been reached by any pass through the 90th;
    chrome-devtools MCP was not re-checked this pass (no boot got close enough to a real desktop to
    make it worth checking). Lower-priority, still
    open: (a) decompose remaining per-fork cost between rootfs materialization staying resident post
@@ -513,6 +551,16 @@ both Xvfb SIGSEGVs.
    (`process_fork.rs`'s env-block construction possibly drops it) — if so, every prior
    diagnostic-logging conclusion past the FIRST fork generation needs re-weighing; see
    `_2026-09-23.md`.
+   **90th pass update**: root-caused the crashing fork to a genuine `CLONE_VFORK`, fixed two real
+   architectural gaps this uncovered (a vfork child's blind fresh address space risking silent
+   parent-memory corruption on `execve`, and a regression that fix itself caused in `release_memory`/
+   `Vmem::duplicate`) — both live-verified (`Xvfb` no longer crashes; `xfce4-session` now reaches real
+   GTK/ICE startup). **The original `xfce4-session` crash itself is UNCHANGED by either fix** —
+   decisive evidence (the new collision-rejection log line never fires for its own fork chain) rules
+   out a placement collision as this specific crash's cause; see this file's own "90th" pass-history
+   entry above for the full evidence chain and precise next pickup (an early-breakpoint `cdb` attach
+   on `xfce4-session`'s own winpid, and checking whether this fault is even guest-mode at all).
+   `DE_UP` still not reached.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
    `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on
