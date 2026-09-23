@@ -7,10 +7,10 @@ detail is drained to `docs/AGENTS_ARCHIVE_*.md` and dated `docs/*.md` in the map
 for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd and 75th passes
-(pass-history section below; 26th-69th full narrative, including each pass's own complete evidence
-and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-74th narrative is condensed in-line
-below only, not yet migrated to that archive).
+line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th and 76th
+passes (pass-history section below; 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`;
+70th-76th full narrative, including each pass's own complete evidence and fix rationale:
+`docs/AGENTS_ARCHIVE_2026-09-23.md`).
 
 ## The cheap repro — start here
 
@@ -212,121 +212,71 @@ index-merge cost the 56th pass fixed is NOT the dominant per-fork cost any more 
 cache-hit (both the per-layer OCI cache and the 56th pass's own merged-index cache) with
 `LITEBOX_DIAG_FORK_TIMING=1` on a real `debian-xfce` boot, 75th pass: real per-fork rootfs-related
 cost is ~83-140ms end to end. The real per-fork-count cost is each fork being a genuinely separate
-Windows process (guest-memory emulation, its own writable-layer import) — see Track B item 1's
-"process-count accumulation" note. Still open: nginx's own SSL-cert generation fails on its first
-startup attempt, not root-caused (`docs/track-b-fork-fix-progress.md:146-152`).
+Windows process with its own ~350MB-1.1GB peak working set (guest-memory emulation, its own
+writable-layer import, rootfs materialization — not yet decomposed) — see Track B item 1's
+"process-count accumulation" note. **`live_cross_process_fork_children`** (`GlobalState` field,
+`litebox_shim_linux/src/lib.rs`) is a 76th-pass admission-control counter capping concurrent
+cross-process-fork children at 6 (bounded non-busy wait via `Task::reserve_cross_process_fork_slot`/
+`release_cross_process_fork_slot`, `syscalls/process.rs`, fails open after ~8s) — real but only a
+PARTIAL mitigation for the RAM crater, see Track B item 1. Still open: nginx's own SSL-cert
+generation fails on its first startup attempt, not root-caused (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-75th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
-map" below). Condensed current-state trail:
+**Pass history (4th-76th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
+map" below), including the full 70th-76th detail this section used to carry inline (now
+`docs/AGENTS_ARCHIVE_2026-09-23.md`). Condensed current-state trail:
 
-- **43rd-61st (FIXED, live-verified)**: both Xvfb SIGSEGVs; D-Bus activation's dropped-CLOEXEC-fd
-  bug (`66265d9`); `fd/mod.rs:422` panic (`faa74c6`); per-fork rootfs-rebuild RAM cost (`2d18a4e`);
-  the `ssh-agent`/`xfwm4` permanent-freeze class via `RawMutex::WaiterQueue::with_lock`
-  (`61c235e`). `DE_FAILED` (no `_NET_SUPPORTING_WM_CHECK`) survived all of it. **62nd-66th**:
-  narrowed `xfwm4` to an exact fd/protocol step (X11 census, guest-stderr, `cdb -pv`) — claims
-  `WM_S0`, zero stderr, never reaches `setNetSupportedHint`; fixed `SharedUnixConnectQueue::
-  cancel`'s slot leak (62nd); REFUTED `/defaults/xfce/` readdir, dbus-daemon babysitter SIGKILL,
-  epoll-readiness (pid-filtered traces miss cross-process-forked GDBus siblings), GLX/compositor
-  blocker theories. **67th-68th**: `DBUS_FAILED` root-caused+FIXED (`publish_as_container_fs_
-  snapshot`'s byte-size regression guard discarded a healthy fresher export; gated the veto on
-  THIS process's own prior-adoption failure only, `WRITABLE_LAYER_IMPORT_OK`) — 0 fires across 6
-  post-fix boots vs 17 pre-fix. Upstream `xfwm4` pre-hint chain confirmed: `initSettings()`→
-  `init_compositor_screen`(no-op)→`sn_init_display`→`myDisplayAddScreen`→`getNetCurrentDesktop`→
-  `setUTF8StringHint`→`setNetSupportedHint`. **69th**: first byte-level D-Bus decode (`sys_recvmsg`
-  payload-preview, `net.rs::do_recvmsg`) proves `initSettings()`'s call chain succeeds end-to-end,
-  but its final `GetAllProperties(.../"/xfwm4/custom")` call re-issued identically every ~10.7s
-  forever — matching upstream mechanism `cb_keys_changed`→`keymap_reload()` (GDK `keys-changed`),
-  theory not proven. Full narrative for all of this range: archive.
-- **70th**: retrigger independently reproduced (t=9.22/20.47/31.27/42.19s, deltas 10.8-11.3s);
-  "`xfwm4` never writes X11" REFUTED — `sys_writev`/`sys_read` log under `syscalls::file`, not
-  `net`. Fixed two logging-infra bugs (Standing lessons: line-wrap rejoin, `FlushingStderr` race).
-  Reassembled RECV stream parsed 155 Replies+15 PropertyNotify+2 Errors in <1s, incl. a
-  `GetKeyboardMapping`-shaped reply — but bytes after didn't parse as valid framing (real parser
-  gap, not corrupted input, explained by 71st). GDK upstream source confirms `keys-changed` fires
-  ONLY on genuine XKB `XkbNewKeyboardNotify`/`XkbMapNotify`, no internal timer. Did not reach `DE_UP`.
-- **71st**: root-caused the 70th-pass desync — `do_read`'s socket branch (`file.rs`, calls
-  `GlobalState::receive` directly) is a separate path from `do_recvmsg`; real Xlib/XCB Xtrans uses
-  plain `read()`/`write()`, so a `recvmsg`-only capture missed the whole stream including ConnSetup
-  (confirmed: captured stream's first bytes don't parse as a live ConnSetup reply). Fixed: new
-  `litebox_diag::socket_read` diagnostic on `do_read`'s socket branch, dedicated low-overhead
-  target. Three fresh-capture attempts each hit a different obstacle (blanket `file=debug`
-  destabilized the boot; `de_only.sh` hit an unrelated `gpg-agent` dead end; a `webtop_stack.sh`
-  boot was killed mid-`SELKIES_PORT_SELFTEST_FAILED` polling). XKB-at-retrigger remained OPEN.
-- **73rd**: found+fixed the REAL reason the 71st-pass diagnostic captured zero `xfwm4` traffic — the
-  `unix` closure gap above (`fc830d1`); live-confirmed (real AF_UNIX D-Bus SASL handshake traffic
-  captured for the first time). Added `litebox_shim_linux::syscalls::process=debug`
-  (`DIAG_TIMELINE execve`) to directly identify `xfwm4`'s own guest pid. 4/4 captures that pass
-  showed `xfwm4` stopping after EXACTLY 2 reads (its D-Bus SASL handshake), attributed at the time
-  to RAM/CPU starvation from the fork storm — **partially superseded by the 75th pass: `xfwm4`
-  wasn't merely starved, its own xfconf config was invisible to it at all (the writable-layer
-  export-path bug, fixed `1d449e6`); RAM/CPU pressure is real but was not the whole story.** XKB
-  question left OPEN, unchanged since.
-- **74th**: narrowed the diagnostic scope itself (assignment: cut the 73rd pass's own self-inflicted
-  capture overhead). Moved all five `DIAG_TIMELINE` sites onto a dedicated `litebox_diag::
-  process_timeline` target and added an optional `LITEBOX_DIAG_SOCKET_READ_TARGET` comm filter to
-  `litebox_diag::socket_read` — both verified live. RAM still collapsed hard that run (7.85GB free
-  at launch → 479MB at t=60s, host process count peaking at 30) — logging overhead was NOT the
-  dominant RAM driver. Read the ever-present `[process_fork_diag] globalstate-probe (child):
-  rebuilding rootfs from OCI image …` line (99 of them that boot) as evidence the 56th pass's
-  rootfs-index cache was still missing repeatedly — **REFUTED by the 75th pass below with direct
-  measurement: that line prints unconditionally on every fork regardless of downstream cache
-  status, and the cache was actually hitting 100% of the time.** Also hit the xcensus.py
-  writable-layer-visibility gap every attempt (`rc=2`, file not found) — **FIXED, 75th pass.**
-- **75th**: two real findings, in order of consequence.
-  1. **The 74th pass's rootfs-cache-miss theory is REFUTED, with direct measurement.**
-     `LITEBOX_DIAG_FORK_TIMING=1` on a real `de_only_xcensus_seed2.tar` boot (`debian-xfce`, same
-     harness) shows the per-layer OCI cache AND the 56th pass's merged-rootfs-index cache both
-     hitting 100% of the time (`[cache] HIT`/`[diag-mergedidx] HIT` on every single one of ~28-100
-     forks sampled across two boots, zero misses) — real per-fork rootfs-related cost is now
-     **~83-140ms end to end** (`rootfs layers ready`→`default_fs_multi_layer returned`), far below
-     even the 56th pass's own ~2.3-2.5s cache-hit target. The `globalstate-probe (child):
-     rebuilding rootfs from OCI image …` line the 74th pass read as a miss signal fires
-     UNCONDITIONALLY before either cache is even consulted — a high count of it is not evidence of
-     wasted work. The 56th pass's own caching fix stands, fully vindicated; do not re-investigate
-     it without new contrary measurement.
-  2. **Root-caused and FIXED a real, deterministic (not racy) writable-layer bug that plausibly
-     explains a large share of this whole investigation's "writable-layer-visibility gap"
-     symptoms.** `take_cross_process_writable_layer_export`
-     (`litebox_platform_windows_userland/src/lib.rs`, called from `sys_wait4`'s cross-process
-     branch via `import_cross_process_writable_layer` — the ONLY place a parent ever re-absorbs a
-     reaped fork child's filesystem writes) required `FORK_CHILD_TAR_PATH_ENV_VAR`, which is
-     deliberately UNSET on every `--oci-image` boot (only ever set for `--initial-files`) — so the
-     function returned `None` unconditionally on every OCI-image boot, meaning **a parent NEVER
-     imported ANY cross-process fork child's filesystem writes back into its own live state, on
-     ANY `--oci-image` boot, ever.** The child's own export-path-naming side (`diag_process_fork_
-     task_resume_probe` in the runner crate) already had the correct OCI-image fallback (a
-     placeholder `"oci-image"` stem); the parent's read side did not mirror it, so the two sides
-     silently computed different export filenames and the parent's read always missed. Confirmed
-     live with a minimal, fast repro (`-Z --oci-image ... -- /bin/bash -c 'mkdir -p /tmp/t2; ls -la
-     /tmp/t2'`, both `debian:stable-slim` and `linuxserver/webtop:debian-xfce`): before the fix,
-     `mkdir` reports exit 0 but the VERY NEXT sibling fork's `ls` deterministically reports `No
-     such file or directory` for the identical path — 100% reproducible across 6+ repeated runs,
-     not a timing race. **Fix** (`1d449e6`): mirror the child's own `.or_else(FORK_CHILD_OCI_IMAGE_
-     ENV_VAR → "oci-image")` fallback on the parent's read side too. Verified: the same minimal
-     repro now succeeds 4/4; the real `de_only.sh` harness's own `mkdir -p ~/.config/xfce4/xfconf/
-     xfce-perchannel-xml/ && cp /defaults/xfce/*` step (previously invisible to every later
-     sibling — `XFCONF_USERDIR`/`XFCONF_XFWM4XML_HEAD` both `No such file or directory`, every
-     single pass since this harness existed) now succeeds, and **`xfwm4` launches for the first
-     time in this investigation's entire history** — confirmed via `DIAG_TIMELINE execve`
-     (`argv0=/usr/bin/xfwm4`), the X11 window count growing 0→1→11 (`XCENSUS_WINDOWS`), and
-     `_NET_SUPPORTING_WM_CHECK`'s `xprop` error text advancing from "no such atom on any window"
-     to "not found" (the exact 56th-pass forward-progress marker) — reproduced 2/2. Also fixed the
-     seed tar's own `/tmp/xcensus.py` visibility gap (a DIFFERENT instance of the same
-     export/import-staleness class, still present for a plain `cat > file <<EOF` + later-sibling
-     `python3 file` round trip even after the fix above, since that round trip's SOURCE write and
-     READ are two more forks either side of the SAME gap) by feeding the census script to `python3`
-     via a shell variable + stdin instead of a `/tmp` file (`.wfgy/de_only_xcensus_seed3.tar`,
-     disk-only, not checked in) — `XCENSUS_PRE_DE` now returns `rc=0` with real census data instead
-     of `rc=2` ENOENT, giving this investigation its first-ever live X11-census ground truth.
-     **Not yet reached: `DE_UP`.** Two independent post-fix boots both reached `WM_POLL n=6`
-     (`_NET_SUPPORTING_WM_CHECK` still "not found") with 11+ real windows before a RAM crater (free
-     RAM fell to 0.3-1.3GB, forcing cleanup) cut the run short — the already-known "process-count
-     accumulation" bottleneck (Track B item 1) is now the SOLE remaining blocker on this harness,
-     not a filesystem-visibility bug. `xfwm4`'s own X11 traffic capture
-     (`LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4`) still showed only the 2-read D-Bus SASL handshake in
-     both post-fix attempts — the RAM crater cut the run before `xfwm4` reached its steady-state
-     retrigger loop, so **the XKB-event question remains genuinely open, unchanged, not newly
-     answered by this pass.**
+- **43rd-69th (FIXED/REFUTED, live-verified)**: both Xvfb SIGSEGVs; D-Bus activation's
+  dropped-CLOEXEC-fd bug; `fd/mod.rs:422` panic; per-fork rootfs-rebuild RAM cost (56th);
+  `ssh-agent`/`xfwm4` permanent-freeze class (`RawMutex::WaiterQueue::with_lock`, 60th/61st);
+  `SharedUnixConnectQueue::cancel`'s slot leak (62nd); `DBUS_FAILED` root-caused+fixed (a byte-size
+  regression guard discarding a healthy fresher writable-layer export, 67th/68th); upstream
+  `xfwm4` pre-hint chain traced to `setNetSupportedHint`; first byte-level D-Bus decode proves
+  `initSettings()` succeeds but its final `GetAllProperties` call re-issues every ~10.7s forever
+  (69th, mechanism unconfirmed). REFUTED along the way: `/defaults/xfce/` readdir, dbus-daemon
+  babysitter SIGKILL, epoll-readiness, GLX/compositor blocker theories. `DE_FAILED` (no
+  `_NET_SUPPORTING_WM_CHECK`) survived all of it. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`.
+- **70th-74th**: independently reproduced the ~10.7s retrigger and REFUTED "`xfwm4` never writes
+  X11"; root-caused two real logging/capture gaps (`do_read`'s socket branch is separate from
+  `do_recvmsg`, real Xlib/XCB uses plain `read()`/`write()`; the `unix` closure — not just `net` —
+  needed the same `socket_read` diagnostic) that had been hiding `xfwm4`'s own traffic from every
+  earlier capture attempt; added low-overhead dedicated diagnostic targets
+  (`litebox_diag::process_timeline`/`litebox_diag::socket_read`) to replace the old
+  everything-floods-every-syscall recipe. RAM still collapsed hard on every attempt in this range
+  (host process count peaking at ~30) — logging overhead was NOT the dominant RAM driver. XKB-at-
+  retrigger question remained genuinely OPEN throughout. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
+- **75th**: **`xfwm4` launches for the first time in this investigation's entire history.**
+  Root-caused+FIXED (`1d449e6`) `take_cross_process_writable_layer_export` requiring an env var
+  deliberately unset on every `--oci-image` boot — meaning a parent NEVER re-absorbed ANY
+  cross-process fork child's filesystem writes, on ANY `--oci-image` boot, ever, explaining a large
+  share of this whole investigation's "writable-layer-visibility gap" symptoms (100% reproducible
+  minimal repro, fixed by mirroring the child's own OCI-image fallback onto the parent's read side).
+  With it fixed, `xfwm4` launches (confirmed via `DIAG_TIMELINE execve`, X11 window count 0→1→11,
+  `_NET_SUPPORTING_WM_CHECK` advancing from "no such atom" to "not found", reproduced 2/2). Also
+  REFUTED the 74th pass's rootfs-cache-miss theory with direct timing measurement (`LITEBOX_DIAG_
+  FORK_TIMING=1`: both the per-layer and merged-index caches hit 100%, real per-fork rootfs-related
+  cost ~83-140ms — the 56th pass's caching fix stands, fully vindicated). **Not yet reached:
+  `DE_UP`** — two boots both hit a RAM crater (0.3-1.3GB free) around `WM_POLL n=6`, 11+ live
+  windows. Full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
+- **76th (2026-09-23)**: first-ever DIRECT host-side capture of the RAM-crater process tree
+  (`.wfgy/pass76_crater_procsnapshot.txt`) — **33 simultaneous host processes, up to 4 fork-tree
+  generations deep, ~10.5GB combined working set on a 15.25GB host**, confirming "process-count
+  accumulation" (Track B item 1) with first-hand evidence for the first time and adding the
+  previously-undocumented TREE-DEPTH dimension (cost multiplies by branching factor AND depth, not
+  just sibling count). Landed a real admission-control fix (`live_cross_process_fork_children`, a
+  plain shared-arena `AtomicU32` field on `GlobalState`; gates both `spawn_cross_process_fork_child`
+  call sites via a bounded, non-busy `wait_cx()`-based wait, capped at 6 concurrent, fails OPEN
+  after ~8s so a missing `wait4()` can never deadlock a future fork) — **real but only a PARTIAL
+  mitigation**: live re-test showed slower process-count growth and a gentler initial RAM decline,
+  but the SAME crater magnitude eventually (28-29 processes, 0.17-0.31GB free). Refines Track B item
+  1's framing: **not primarily a scheduling problem — a real XFCE session legitimately needs more
+  than 6 long-lived daemons alive simultaneously, each paying its ~350MB-1.1GB peak working set once
+  and never releasing it (ordinary Windows behavior), so the fix rate-limits rather than truly caps.
+  The real remaining fix is reducing PEAK PER-PROCESS RESIDENT MEMORY itself** (not yet decomposed
+  into rootfs-materialization vs. litebox's own per-process guest-memory-emulation bookkeeping vs.
+  Windows loader overhead) — see Track B item 1's pickup. Confirmed NOT a lifecycle/leak bug (WMI
+  `Terminate` cleanup fully recovered RAM both times, zero stragglers). `DE_UP` NOT reached; no
+  browser/app verification attempted. Full narrative, exact commands, evidence file list:
+  `docs/AGENTS_ARCHIVE_2026-09-23.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -344,29 +294,39 @@ both Xvfb SIGSEGVs.
 1. **`xfwm4` now launches (75th pass, `1d449e6`) — the blocker is no longer filesystem visibility,
    it is pure host-RAM/process-count exhaustion before `DE_UP`.** CLOSED sub-issues:
    `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th);
-   the writable-layer export-path fallback bug that silently discarded every cross-process fork
-   sibling's filesystem writes on every `--oci-image` boot (75th, see pass-history above — this is
-   almost certainly why `setNetSupportedHint` and the xfconf-config-dependent parts of `xfwm4`
-   startup never worked in any earlier pass; the 69th/70th pass's "`GetAllProperties` retriggers
-   every ~10.7s forever" symptom was captured on a boot that could never have seen `xfwm4`'s own
-   copied `xfwm4.xml` config in the first place). **Pickup, in order**: (a) get RAM/process-count
-   down or budget up enough for `de_only_xcensus_seed2/3.tar` under `LITEBOX_PROCESS_FORK=1` to
-   survive past `WM_POLL n=6` (two 75th-pass attempts both hit a RAM crater — 0.3-1.3GB free —
-   at 11+ live X11 windows, `_NET_SUPPORTING_WM_CHECK` still "not found"; a genuinely quiet host
-   with more starting headroom than the ~8GB this pass had, or a reduced-diagnostic-overhead
-   config, is the first thing to try — the 75th pass's OWN fix did not touch process-count
-   accumulation at all, that remains exactly as the 56th pass characterized it); (b) once `DE_UP`
+   the writable-layer export-path fallback bug (75th). **76th pass landed a real, evidenced-partial
+   mitigation** (`live_cross_process_fork_children` admission control, `litebox_shim_linux/src/
+   syscalls/process.rs`/`lib.rs`) but did NOT close the crater — live re-test still cratered (28-29
+   processes, 0.17-0.31GB free), just more slowly. **Refined pickup, in order**: (a) decompose the
+   ~350MB-1.1GB per-cross-process-fork-child peak working set into its real components — rootfs
+   materialization staying resident after its own cheap (~83-140ms) build step, vs. litebox's own
+   per-process guest-memory-emulation bookkeeping (`PageManager`/VMA tracking), vs. ordinary Windows
+   loader/image overhead — via a debug-build `cdb -pv` heap-diff on a MINIMAL single-fork repro (not
+   a full desktop boot, too RAM-risky to debugger-attach on); `LITEBOX_DIAG_FORK_TIMING=1` already
+   proves the TIME cost is cheap, this needs a genuinely separate MEMORY-focused measurement. (b) If
+   rootfs materialization dominates, the real fix is a genuinely SHARED (read-only, one physical
+   copy for the whole fork family) in-memory rootfs representation instead of a private per-process
+   rebuild — a bigger design change than 76th pass's admission-control fix, but the one likely to
+   actually close the gap; do not just raise the admission-control cap number, the bottleneck is
+   per-process SIZE, not concurrent-slot COUNT (76th pass's own live evidence: a real XFCE session
+   legitimately needs more than 6 long-lived daemons alive at once, so a low cap either blocks
+   legitimate concurrency or, fail-open, just rate-limits instead of truly capping). (c) once `DE_UP`
    fires (or the boot stalls again short of it), use `de_only_xcensus_seed3.tar`'s now-working
    `/tmp/xcensus.py` ground truth (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP` — real `_NET_SUPPORTING_
    WM_CHECK`/`WM_S0` values, not `xprop`'s heuristic text) plus `LITEBOX_DIAG_SOCKET_READ_TARGET=
-   xfwm4` to see whether the ~10.7s `GetAllProperties` retrigger is still real post-fix — it was
-   NOT re-observed this pass (both attempts died before `xfwm4` got past its D-Bus SASL handshake,
-   same as the 73rd/74th passes, but now for a RAM reason unrelated to the fix); if it recurs,
-   check for `MappingNotify`(34)/XKB at the ~10.7s boundaries before falling back to the
-   30th-pass `LD_PRELOAD getenv_probe.so` reentrancy-detection technique. `ps`/`/proc` is blind to
-   cross-process-forked siblings (65th) — re-weigh any `ps`-based conclusion. `gpg-agent`'s fatal
-   glibc `malloc.c:3846` assertion (52nd) is why the OLD `de_only_seed.tar` (not `_xcensus_seed2/3`)
-   dead-ends earlier, at `iceauth`+`ssh-agent`+`gpg-agent`.
+   xfwm4` to see whether the ~10.7s `GetAllProperties` retrigger (69th/70th pass, still genuinely
+   unconfirmed either way — no post-75th-fix boot has survived long enough to re-observe it) is
+   still real; if it recurs, check for `MappingNotify`(34)/XKB at the ~10.7s boundaries before
+   falling back to the 30th-pass `LD_PRELOAD getenv_probe.so` reentrancy-detection technique.
+   `ps`/`/proc` is blind to cross-process-forked siblings (65th) — re-weigh any `ps`-based
+   conclusion. `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd) is why the OLD
+   `de_only_seed.tar` (not `_xcensus_seed2/3`) dead-ends earlier, at `iceauth`+`ssh-agent`+`gpg-agent`.
+   (d) separately worth checking: this pass's `LITEBOX_LOG` (host env var) did not appear to reach
+   forked children's own stderr (`litebox_diag::process_timeline=debug` output was present in the
+   root process's log but absent from the fixed-run child processes') — if the cross-process-fork
+   env-block construction in `process_fork.rs` is dropping the parent's `LITEBOX_LOG` rather than
+   forwarding it, every prior pass's diagnostic-logging conclusions about anything past the FIRST
+   fork generation should be re-weighed; not confirmed, just flagged, see `docs/AGENTS_ARCHIVE_2026-09-23.md`.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass (`unix.rs`); did NOT
    resolve the `xfwm4` symptom above, so a real but insufficient fix for THIS symptom. Other AF_UNIX
    exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256
@@ -478,9 +438,11 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-69th passes, full narrative behind every
-  pass-history entry above through the 69th; 70th-75th are condensed in AGENTS.md itself only, not
-  yet migrated), `_2026-09-18.md` (12th-34th), `_2026-09-17.md` (shell-crash, stdio-handle bug),
+- **Archives** (newest first) — `_2026-09-23.md` (70th-76th passes, full narrative: the `xfwm4`
+  writable-layer-export fix, the live-captured RAM-crater process tree, and the 76th-pass
+  admission-control fix's honest partial-success evidence), `_2026-09-22.md` (26th-69th passes,
+  full narrative behind every pass-history entry above through the 69th), `_2026-09-18.md`
+  (12th-34th), `_2026-09-17.md` (shell-crash, stdio-handle bug),
   `_2026-09-16.md` (Track A audit), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md` (fork fd
   eligibility, OCI cache, s6-boot). Older: `_2026-09-03/05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,

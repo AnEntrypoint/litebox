@@ -633,6 +633,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+                        live_cross_process_fork_children: core::sync::atomic::AtomicU32::new(0),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
@@ -3241,6 +3242,28 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
+    /// Count of cross-process-fork children (`LITEBOX_PROCESS_FORK=1`) that have been spawned
+    /// (`CreateProcessW` succeeded) but not yet reaped by their parent's `wait4()` -- a plain
+    /// `AtomicU32` field of this same struct, free-riding on `GlobalState`'s own cross-process
+    /// sharing exactly like `unix_addr_presence` below, so every process in the fork FAMILY
+    /// (not just direct parent/child pairs) observes the same live count.
+    ///
+    /// Root-caused 76th pass: each cross-process-fork child independently rebuilds its entire
+    /// merged/rewritten OCI rootfs into its own private heap on startup (~350MB-1.1GB working
+    /// set observed live, `.wfgy/pass76_crater_procsnapshot.txt`), and nothing previously bounded
+    /// how many such children could be simultaneously alive -- a real boot's desktop-startup
+    /// scripts fork in a TREE (parent -> child -> grandchild -> great-grandchild via nested
+    /// command substitutions/subshells), not a flat sequence, so this cost multiplies by tree
+    /// depth x branching factor. A live capture at the crater moment found 33 simultaneous
+    /// `litebox_runner_linux_on_windows_userland.exe` processes, 4 generations deep, ~10.5GB
+    /// combined working set on a 15GB host (0.4GB free), one call stack after another rebuilding
+    /// the identical read-only rootfs. `try_reserve_fork_slot`/`release_fork_slot` (see
+    /// `syscalls::process`) gate `spawn_cross_process_fork_child` on this counter staying under
+    /// [`CROSS_PROCESS_FORK_CONCURRENCY_CAP`], bounding peak transient RAM without changing fork
+    /// correctness (still genuinely cross-process, just admission-controlled) -- a real, deeper
+    /// fix (share the parsed rootfs itself instead of re-deriving it per child) remains open, see
+    /// AGENTS.md.
+    live_cross_process_fork_children: core::sync::atomic::AtomicU32,
     // NOTE: this struct deliberately has NO `unix_addr_table` field -- NINTH instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment, found in the 2026-09-18 systematic audit. See `GlobalStateHandle::unix_addr_table`'s

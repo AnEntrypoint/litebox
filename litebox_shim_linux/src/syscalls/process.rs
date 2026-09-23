@@ -508,6 +508,14 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.cross_process_children
             .lock()
             .retain(|(p, _)| *p != pid);
+        // NOTE: does NOT release a `live_cross_process_fork_children` admission-control slot here
+        // -- `Process` deliberately has no `GlobalState`/`self.global` access of its own (every
+        // other field on this struct follows the same isolation; see e.g. `cross_process_children`
+        // field's own doc comment on why a cross-process child cannot share an `Arc<GlobalState>`
+        // in the first place). `Task::sys_wait4`, which alone calls this method and already has
+        // `self.global`, calls `Task::release_cross_process_fork_slot` itself right alongside each
+        // call to this function instead -- see `reserve_cross_process_fork_slot`'s doc comment
+        // (on `Task`, not here) for the full mechanism.
     }
 
     /// Returns the live child `Process` with pid `pid`, if this process has one (see
@@ -2318,6 +2326,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             self.import_cross_process_writable_layer(handle);
             process.reap_cross_process_child(pid);
+            self.release_cross_process_fork_slot();
             let encoded = decode_cross_process_wait_status(raw_exit);
             if let Some(wstatus) = wstatus {
                 let _ = wstatus.write_at_offset::<Platform>(0, encoded);
@@ -2469,6 +2478,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
+                    self.release_cross_process_fork_slot();
                     let encoded = decode_cross_process_wait_status(raw_exit);
                     if let Some(wstatus) = wstatus {
                         let _ = wstatus.write_at_offset::<Platform>(0, encoded);
@@ -2639,6 +2649,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// zero. Deciding here removes the duplicate rather than trying to tear it down more
     /// carefully, and saves a full eager address-space copy per fork on top.
     ///
+    /// Admission control for `spawn_cross_process_fork_child` -- 76th-pass fix for the real-RAM-
+    /// crater root cause: each cross-process-fork child independently rebuilds its entire merged
+    /// OCI rootfs into its own private heap (~350MB-1.1GB working set measured live), and desktop
+    /// startup scripts fork in a TREE via nested command substitutions/subshells, not a flat
+    /// sequence, so nothing previously bounded how many such rootfs-rebuilding children could be
+    /// simultaneously alive at once -- a live capture at the crater moment
+    /// (`.wfgy/pass76_crater_procsnapshot.txt`) found 33 simultaneous host processes, 4
+    /// generations deep, ~10.5GB combined working set on a 15GB host (0.4GB free).
+    ///
+    /// Blocks (bounded, never forever) until `live_cross_process_fork_children` drops below
+    /// [`CROSS_PROCESS_FORK_CONCURRENCY_CAP`], then reserves a slot by incrementing it and
+    /// returns. Always returns eventually -- fails OPEN (proceeds without a reserved slot) once
+    /// [`ADMISSION_POLL_ITERATIONS`] real waits have elapsed, so a parent that never calls
+    /// `wait4()` on a cross-process child (or a child this table otherwise loses track of) can
+    /// never permanently wedge every future fork in the whole fork family -- correctness/liveness
+    /// always wins over the RAM bound. The counter itself is a plain field of the shared-kernel-
+    /// arena `GlobalState` (see that field's own doc comment), so this bound is enforced across
+    /// the WHOLE fork family, not just this one process's direct children.
+    ///
+    /// Uses `wait_cx().with_timeout(..).sleep()` (the same real, non-busy blocking-wait primitive
+    /// `sys_clock_nanosleep` itself is built on), not a `core::hint::spin_loop` busy-wait -- unlike
+    /// `SharedUnixConnectQueue::cancel`'s bounded spin (expected wait: a handful of instructions),
+    /// this expects to wait for another OS process's rootfs rebuild-and-exit (hundreds of ms to
+    /// low seconds), and a tight spin for that long would burn a full host CPU core on an already
+    /// RAM/CPU-pressured boot -- making exactly the problem this fix targets worse.
+    fn reserve_cross_process_fork_slot(&self) {
+        const CROSS_PROCESS_FORK_CONCURRENCY_CAP: u32 = 6;
+        const ADMISSION_POLL_ITERATIONS: u32 = 80; // 80 x 100ms = 8s bound
+        let counter = &self.global.live_cross_process_fork_children;
+        for attempt in 0..=ADMISSION_POLL_ITERATIONS {
+            let current = counter.load(core::sync::atomic::Ordering::Acquire);
+            if current < CROSS_PROCESS_FORK_CONCURRENCY_CAP
+                && counter
+                    .compare_exchange(
+                        current,
+                        current + 1,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+            if attempt == ADMISSION_POLL_ITERATIONS {
+                litebox_util_log::warn!(
+                    live:% = current;
+                    "reserve_cross_process_fork_slot: admission timeout, proceeding unreserved (failing open) rather than blocking a fork forever"
+                );
+                return;
+            }
+            // `Interrupted` (a real signal delivered to this thread) and `TimedOut` are handled
+            // identically here: either way, loop back and re-check the counter -- this is an
+            // internal admission wait, not a guest-visible syscall, so there is no `EINTR` to
+            // propagate and no reason to give up early just because a signal arrived.
+            let _ = self
+                .wait_cx()
+                .with_timeout(core::time::Duration::from_millis(100))
+                .sleep();
+        }
+    }
+
+    /// Releases a slot reserved by `reserve_cross_process_fork_slot` -- called from `sys_wait4`
+    /// right alongside each of its own calls to `Process::reap_cross_process_child` (the parent-
+    /// side "this child is fully done" point; `Process` itself has no `GlobalState` access of its
+    /// own to release a slot directly, see that method's doc comment) and from the two
+    /// `spawn_cross_process_fork_child` call sites themselves when it returns `None` (reservation
+    /// was optimistic; no child was actually created, so undo it immediately). Saturating: never
+    /// go below zero even if called one extra time, since undercounting only costs a little
+    /// unnecessary admission blocking, while a stuck-negative counter (wrapping to a huge u32)
+    /// would wedge every future fork.
+    fn release_cross_process_fork_slot(&self) {
+        let counter = &self.global.live_cross_process_fork_children;
+        let _ = counter.fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |v| Some(v.saturating_sub(1)),
+        );
+    }
+
     /// Everything this needs is available before duplication and none of it comes from one:
     /// the register snapshot is the parent's own `ctx`, the FS base is the parent's own, and the
     /// child's layout is the parent's own `tracked_regions()` -- which is exactly the shape
@@ -3222,6 +3311,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
+        // Admission control (76th pass) -- bounds how many rootfs-rebuilding cross-process
+        // children can be simultaneously alive; see `reserve_cross_process_fork_slot`'s own doc
+        // comment for the full RAM-crater evidence and mechanism.
+        self.reserve_cross_process_fork_slot();
         let handle = self.global.platform.spawn_cross_process_fork_child(
             &relocations,
             full_gprs,
@@ -3229,6 +3322,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_files,
             inherited_eventfds,
         );
+        if handle.is_none() {
+            // No child was actually created -- undo the optimistic reservation immediately
+            // rather than leaving it held until some future reap that will never come.
+            self.release_cross_process_fork_slot();
+        }
 
         // Second half of the same probe: a THIRD write, strictly AFTER `spawn_cross_process_fork_
         // child` has returned (i.e. after the child process has already been created) -- matching
@@ -4521,11 +4619,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                      address space by design; nothing was duplicated to transfer)"
                 );
             }
+            // Set (inside the `&&` chain below, right before the actual spawn attempt) so the
+            // fallback path just past this `if`'s closing brace knows whether an admission-control
+            // slot was reserved and needs releasing -- see `reserve_cross_process_fork_slot`'s doc
+            // comment (76th-pass RAM-crater fix). Deliberately reserved only immediately before
+            // the real spawn attempt, not any earlier in the chain, so a fork that was never going
+            // to attempt the cross-process path at all (vfork, fd complexity, no GPR snapshot)
+            // never touches the shared counter.
+            let mut fork_slot_reserved = false;
             if !vfork_child
                 && (fd_complexity.beyond_stdio == 0 || ignore_fds)
                 && let Some(mut full_gprs) = cross_process_gprs
                 && {
                     full_gprs.fs_base = cross_process_fs_base;
+                    true
+                }
+                && {
+                    fork_slot_reserved = true;
+                    self.reserve_cross_process_fork_slot();
                     true
                 }
                 && let Some(handle) = self
@@ -4565,6 +4676,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .platform
                     .with_fork_duplicate_claim_owner(child_tid, || drop(thread));
                 return Ok(usize::try_from(child_tid).unwrap());
+            }
+            if fork_slot_reserved {
+                // The chain above reserved a slot but did not reach (or did not take) the
+                // early-return success path -- either `spawn_cross_process_fork_child` returned
+                // `None`, or it succeeded but the whole condition was `false` for a different
+                // reason evaluated after the reservation. Undo the reservation unconditionally
+                // rather than trying to distinguish those cases: `release_cross_process_fork_slot`
+                // is saturating, so releasing a slot that was never actually granted a live child
+                // just costs a slightly-early free, never a stuck-negative counter.
+                self.release_cross_process_fork_slot();
             }
 
             // Pass 141 diagnostic-only proof (`LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by
