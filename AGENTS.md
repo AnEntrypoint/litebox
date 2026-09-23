@@ -164,22 +164,18 @@ map" below). The CURRENT STATE those passes converged on:
 - **62nd-64th — `xfwm4` narrowed to an exact fd/protocol step; one real leak fixed; `DE_FAILED`
   UNCHANGED.** 3 independent live techniques (X11 ground-truth census, guest-stderr capture, `cdb
   -pv`) agree `xfwm4` genuinely claims `WM_S0`, prints zero stderr, never reaches
-  `setNetSupportedHint`. REFUTED along the way: the `/defaults/xfce/` readdir-empty-to-a-later-fork
-  theory (63rd — `layered.rs`'s merge is correct; `ls -la`'s "total 0" was its block-count header);
-  the dbus-daemon activation-babysitter `SIGKILL` (64th — real, correctly-emulated upstream
-  `dbus-spawn-unix.c` cleanup; `xfconfd` independently confirmed alive/registered via `dbus-send`
-  throughout). Fixed: `SharedUnixConnectQueue::cancel`'s claim-race slot leak (62nd, `unix.rs`).
-  64th pass then isolated `xfwm4`'s SECOND (`SOCK_NONBLOCK`) D-Bus connection: its `connect()` hits
-  the known cross-process AF_UNIX visibility gap, recovers, completes SASL through `BEGIN` — a
-  `tid=20900`-only filtered trace then showed zero further traffic on that fd, theorized as an
-  epoll-readiness gap on the connect-retry path (same defect CLASS as the 26th pass's `EpollFile`
-  `EPOLLET` fix). Flagged NOT YET CONFIRMED — see 65th pass immediately below.
+  `setNetSupportedHint` — this exact signature reconfirmed again on the 68th pass, below. REFUTED
+  along the way: the `/defaults/xfce/` readdir-empty-to-a-later-fork theory (63rd); the dbus-daemon
+  activation-babysitter `SIGKILL` (64th). Fixed: `SharedUnixConnectQueue::cancel`'s claim-race slot
+  leak (62nd, `unix.rs`). 64th pass isolated `xfwm4`'s SECOND (`SOCK_NONBLOCK`) D-Bus connection:
+  hits the known cross-process AF_UNIX visibility gap, recovers, completes SASL through `BEGIN`,
+  then a `tid`-filtered trace showed zero further traffic — theorized as an epoll-readiness gap.
+  Flagged NOT YET CONFIRMED — see 65th pass immediately below.
 - **65th** — the 64th pass's epoll-readiness theory REFUTED: a pid-filtered trace must follow the
-  WHOLE thread group (GDBus moved the fd's I/O onto a cloned sibling thread the 64th pass's filter
-  never looked at; the fd was never stuck). New standing gap found: `ps`/`/proc` cannot see ANY
-  cross-process-forked sibling (`GlobalState::proc_self_info`, `lib.rs:425`, never joined the
-  shared-arena registry set) — re-weigh any past pass's `ps`-based conclusion. Not fixed. Full
-  evidence: archive.
+  WHOLE thread group (GDBus moved the fd's I/O onto a cloned sibling thread the filter never
+  looked at; the fd was never stuck). Standing gap found: `ps`/`/proc` cannot see ANY
+  cross-process-forked sibling (`GlobalState::proc_self_info`, `lib.rs:425`) — re-weigh any past
+  `ps`-based conclusion. Not fixed. Full evidence: archive.
 - **66th** — `DBUS_FAILED` re-diagnosed: NOT the 65th pass's write-visibility theory (`/tmp/addr`
   publish verified working, twice, in isolation) — the REAL mechanism is an INPUT-side ENOENT: a
   cross-process-forked child about to exec `dbus-daemon` gets `ENOENT` on its own `< /tmp/empty`
@@ -198,25 +194,29 @@ map" below). The CURRENT STATE those passes converged on:
   snapshot. **Fix**: `WRITABLE_LAYER_IMPORT_OK` (`process_fork.rs`) — the size veto now only
   applies when THIS process's own adoption of a real prior snapshot is known to have failed (set at
   both `import_writable_layer` call sites in the runner crate), never for a healthy process
-  exporting its own current, different-but-correct view. Verified: 0 regression-guard fires across
-  2 post-fix boots vs. 17 in one pre-fix boot; `DBUS_UP` reached cleanly in all 3 runs. Did not
-  personally catch a live `DBUS_FAILED` end-symptom this pass (needs the guard to discard a
-  snapshot that specifically lacks `/tmp/empty`, not just any snapshot) — the defect is real and
-  live-confirmed firing on the exact repro scenario, matching the 66th pass's own failure shape,
-  but treat as evidenced-fixed-pending-reconfirmation, not fully closed until a run that hits
-  `DBUS_FAILED` pre-fix is reproduced clean post-fix. **New Thread-2 finding**: a debug-traced
-  `de_only.sh` run this pass showed `xfwm4` was NEVER `execve`'d at all within the 60s window
-  (`dbus-daemon`/`ssh-agent`/`gpg-agent`/`at-spi2`/`xfconfd`/`iceauth` all ran; `xfwm4` did not) —
+  exporting its own current, different-but-correct view. Verified this pass: 0 regression-guard
+  fires across 2 post-fix boots vs. 17 in one pre-fix boot. **New Thread-2 finding**: a
+  debug-traced `de_only.sh` run this pass showed `xfwm4` was NEVER `execve`'d at all within 60s —
   a DIFFERENT `DE_FAILED` depth than the 62nd-66th passes' "`xfwm4` runs, never calls
-  `setNetSupportedHint`" — meaning `DE_FAILED` has at least two distinct manifestations, and
-  `xfce4-session`'s own decision of whether/when to launch the WM may be as much the blocker as
-  `xfwm4`'s own init. Read real upstream `xfwm4` source directly (`curl`, not lossy AI-summarized
-  fetches): the exact pre-`setNetSupportedHint` call chain is `initSettings()` (calls
-  `xfconf_init`/`xfconf_channel_new`/`loadSettings`, all real synchronous D-Bus-backed libxfconf
-  calls, NEVER live-tested as the blocker) → `init_compositor_screen` (confirmed no-op, gated on
-  `use_compositing`, `main.c:444-453`) → `sn_init_display` → `myDisplayAddScreen` →
-  `getNetCurrentDesktop` → `setUTF8StringHint` → `setNetSupportedHint`. Full evidence, exact
-  repro commands, full pickup list: archive.
+  `setNetSupportedHint`". Upstream `xfwm4` source (`curl`'d directly): the pre-`setNetSupportedHint`
+  chain is `initSettings()` (`xfconf_init`/`xfconf_channel_new`/`loadSettings`, synchronous
+  D-Bus-backed libxfconf, never live-tested as the blocker) → `init_compositor_screen` (confirmed
+  no-op, `use_compositing=false`) → `sn_init_display` → `myDisplayAddScreen` →
+  `getNetCurrentDesktop` → `setUTF8StringHint` → `setNetSupportedHint`. Full evidence: archive.
+- **68th (2026-09-23) — the 67th-pass fix RE-VERIFIED stable on 4 REAL `webtop_stack.sh` full
+  boots (not just `de_only.sh`); `DE_FAILED` UNCHANGED, now with X11 ground truth on 3/4** (see
+  Track B item 1 for the full evidence — this entry covers method only). Rebuilt release binary
+  (already current at `3bdf088`, incremental, 1.4s). Inlined a ctypes/libX11 census
+  (`advisor/probes/webtop_xcensus.py`'s technique) directly into `.wfgy/webtop_stack.sh` so every
+  boot gets `XGetSelectionOwner`/`XQueryTree`/`XGetWindowProperty` ground truth, not just `xprop`
+  text (re-tarred into `webtop_seed.tar` per the standing freezing gotcha). **New writable-layer
+  finding**: a file the root process wrote before any fork was still `ENOENT` to a later `$()`
+  child (run1) — the existing visibility-gap bug class, this time parent-writes/child-reads
+  rather than the previously-documented reverse; worked around (not fixed) by holding the census
+  script in a bash VARIABLE instead of a file — variables live in the shell's own process memory,
+  which any fork copies wholesale regardless of writable-layer semantics — 100% reliable runs 2-4.
+  0 crashes/OOM/regression-guard-fires across all 5 boots this pass (4 full-stack + 1 `de_only.sh`
+  debug trace).
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -231,26 +231,27 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 
 **Open, in rough priority order:**
 
-1. **`DE_FAILED`'s real chain — the `ssh-agent`/`xfwm4` permanent-freeze class CLOSED for good**
-   (60th/61st); `DBUS_FAILED`'s real cause (`publish_as_container_fs_snapshot`'s byte-size
-   regression guard discarding healthy fresh exports) **FOUND+FIXED 67th pass**
-   (`WRITABLE_LAYER_IMPORT_OK`, `process_fork.rs`) — evidenced-fixed (0/17 regression-guard fires
-   post-fix vs. 17 pre-fix on the same repro), pending a clean pre/post A/B on a run that actually
-   hits `DBUS_FAILED`. `setNetSupportedHint` still never reached: leading NOT-yet-live-tested
-   candidate is `initSettings()`'s `xfconf_init`/`xfconf_channel_new`/`loadSettings` (real
-   synchronous D-Bus-backed libxfconf calls, `settings.c:1062-1123`) — compositor/GLX path already
-   REFUTED (66th, `use_compositing=false` in this image). **New 67th-pass finding**: at least one
-   `DE_FAILED` depth is `xfce4-session` never even `execve`-ing `xfwm4` at all within 60s (distinct
-   from the 62nd-66th passes' "`xfwm4` runs, never calls `setNetSupportedHint`") — `xfce4-session`'s
-   own decision of whether/when to launch the WM may be as much the blocker as `xfwm4`'s own init.
-   Pickup: live `cdb -pv` on `xfce4-session`'s `xfwm4` child breaking on libdbus/GDBus call entry
-   (cited as an option since the 62nd pass, never attempted), or read real upstream
-   `xfce4-session` source for its WM-launch decision. `ps`/`/proc` is blind to every
-   cross-process-forked sibling (`proc_self_info` never joined the shared-arena registry set,
-   65th) — re-weigh any past `ps`-based conclusion. PER-PROCESS RAM is the hard ceiling on any
-   attempt (~28-29 live host processes, 8.5GB→<1GB in <90s on `de_only.sh` alone) — budget for it,
-   kill fast, never run two attempts back-to-back. Secondary, lower priority: `gpg-agent`'s fatal
-   glibc `malloc.c:3846` assertion (52nd); high `VM_SHARED` fork-child region count (52nd).
+1. **`DE_FAILED`'s real chain — CLOSED sub-issues per above (`ssh-agent`/`xfwm4` freeze, 60th/61st;
+   `DBUS_FAILED`'s regression-guard cause, 67th, RE-VERIFIED stable 68th on 4 full-stack boots,
+   0 fires). `setNetSupportedHint` itself is the one still-open blocker, now with 68th-pass X11
+   ground truth confirming the exact symptom on 3/4 full boots** (`XCENSUS_SELECTION WM_S0
+   owner=0x60008e`, `XCENSUS_NETWMCHECK nitems=0`) and `xfwm4`'s own `execve` independently
+   confirmed live (run2 debug trace, `resolve_shebang: ... Ok(())`, pid=28340) — the full-stack
+   boot's `xfwm4` launch is RELIABLE, not the 67th-pass Thread-2 "never execve's" anomaly (that
+   anomaly is real but reproduces only on the separate `de_only.sh` harness, 68th pass — still
+   unexplained, possibly a stale-seed-tar artifact per the standing `webtop_seed.tar`-freezing
+   gotcha). Leading NOT-yet-live-tested candidate for the real blocker: `initSettings()`'s
+   `xfconf_init`/`xfconf_channel_new`/`loadSettings` (synchronous D-Bus-backed libxfconf,
+   `settings.c:1062-1123`) — compositor/GLX path already REFUTED (66th). Pickup: live `cdb -pv`
+   on `xfwm4` breaking on libdbus/GDBus call entry inside `initSettings()` (cited since the 62nd
+   pass, never attempted), or a live-traced `de_only.sh`-vs-`webtop_stack.sh` environment diff to
+   explain the Thread-2 anomaly's harness-specificity. `ps`/`/proc` is blind to every
+   cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion. PER-PROCESS RAM
+   is the hard ceiling on any attempt (5-8GB free at boot start → 0.15-1.2GB during the
+   WM2/selkies-concurrent window on EVERY 68th-pass full-stack run) — kill fast right after the
+   census, via WMI `Terminate`, never wait for the script's own 600s `HOLD` loop. Secondary, lower
+   priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high `VM_SHARED`
+   fork-child region count (52nd).
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass (`unix.rs`); did NOT
    resolve the `xfwm4` symptom above, so a real but insufficient fix for THIS symptom. Other AF_UNIX
    exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256
