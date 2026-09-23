@@ -11654,12 +11654,35 @@ pub fn shared_arc_probe_child_attach() {
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        let size = core::cmp::max(
-            layout.size().next_power_of_two(),
-            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
-            // can always find a required chunk within the returned memory region.
-            core::cmp::max(layout.align(), 0x1000) << 1,
-        );
+        // 77th pass (2026-09-23), real-memory-profile investigation: this function is the SOLE
+        // call site of `M::alloc` in the whole codebase (`litebox/src/mm/allocator.rs`'s
+        // `SafeZoneAllocator::new` buddy-heap rescue closure, confirmed by direct grep), and that
+        // caller ALWAYS passes a self-aligned `Layout::from_size_align(n, n)` (`n` a power of
+        // two) -- so `layout.align()` here is always exactly the block size the buddy allocator
+        // needs its returned base address aligned to. The OLD code (`size = max(next_pow2(size),
+        // max(align,0x1000) << 1)`, i.e. always commit 2x) existed because its doc comment
+        // inherited an `mmap`-based platform's constraint ("mmap provides no guarantee of
+        // alignment, so double the size and hope an aligned sub-chunk exists inside it") -- but
+        // `VirtualAlloc2` on Windows has a NATIVE alignment request
+        // (`MEM_ADDRESS_REQUIREMENTS::Alignment`, unused everywhere in this file before this
+        // fix, confirmed by grep) that gets an exactly-aligned base directly from the OS, making
+        // the 2x pad pure waste. Live-measured via `cdb -pv` on the debug build (breakpoint on
+        // `kernelbase!VirtualAlloc2`, `.wfgy/pass77_cdb_out2.log`): 13 of these calls during one
+        // ordinary `bash -c` boot's `clap` CLI-parsing phase ALONE each committed 4 MiB for a
+        // 2 MiB buddy-heap top-up (the align-doubling term dominates whenever the caller's
+        // `align == size`, which -- per the paragraph above -- is every real call), i.e. exactly
+        // 2x the structurally necessary commit, on top of similar 2x waste on every OTHER size
+        // class this allocator ever tops up (confirmed via `LITEBOX_DIAG_ALLOC=1`,
+        // `.wfgy/pass77_diagalloc.err.log`: ~20 early top-ups totalling ~108 MiB committed before
+        // the guest's own OCI image pull even begins, on a process that ultimately does nothing
+        // more than `bash -c 'sleep N'`). This 2x waste is paid on EVERY host process this
+        // runtime ever creates -- the root process AND every cross-process-fork child alike,
+        // since each is a freshly `CreateProcess`'d instance of this same binary re-running this
+        // same startup allocation burst (`AGENTS.md`'s 76th-pass RAM-crater investigation) --
+        // so halving it here directly lowers the fixed per-process RSS floor that multiplies
+        // across a real XFCE boot's 15-33 simultaneous processes.
+        let alignment = core::cmp::max(layout.align(), 0x1000);
+        let size = core::cmp::max(layout.size().next_power_of_two(), alignment);
 
         // **Reverted to private per-process `VirtualAlloc2`, 2026-09-17** (selective-routing
         // correction; exact pre-`c08182d` mechanism -- see [`SLAB_ALLOC`]'s doc comment for the
@@ -11676,7 +11699,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
             LowestStartingAddress: HOST_ALLOCATOR_REGION_MIN as *mut c_void,
             HighestEndingAddress: core::ptr::null_mut(),
-            Alignment: 0,
+            Alignment: alignment,
         };
         let mut ext_param = MEM_EXTENDED_PARAMETER {
             Anonymous1: MEM_EXTENDED_PARAMETER_0 {
@@ -11687,7 +11710,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             },
         };
 
-        let result = match unsafe {
+        let mut result = match unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 core::ptr::null_mut(),
@@ -11701,6 +11724,36 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             addr if addr.is_null() => None,
             addr => Some((addr as usize, size)),
         };
+
+        // Defensive fallback, never yet observed to trigger: if the OS ever refuses an explicit
+        // `Alignment` request (e.g. a value it considers unsupported), fall back to the old
+        // 2x-oversized/no-explicit-alignment request rather than let this `#[global_allocator]`
+        // -- every allocation in the whole process -- start failing outright.
+        if result.is_none() {
+            let fallback_size = size << 1;
+            // Read back through `ext_param`'s raw pointer inside the `VirtualAlloc2` FFI call
+            // below, not directly by name -- the compiler's `unused_assignments` lint can't see
+            // that aliasing, hence the `#[allow]`.
+            #[allow(unused_assignments)]
+            {
+                addr_req.Alignment = 0;
+            }
+            result = match unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    core::ptr::null_mut(),
+                    fallback_size,
+                    Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
+                    Win32_Memory::PAGE_READWRITE,
+                    &raw mut ext_param,
+                    1,
+                )
+            } {
+                addr if addr.is_null() => None,
+                addr => Some((addr as usize, fallback_size)),
+            };
+        }
+        let size = result.map_or(size, |(_, actual_size)| actual_size);
 
         if diag_alloc_enabled() {
             if let Some((addr, _)) = result {
