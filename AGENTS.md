@@ -357,6 +357,69 @@ map" below). Condensed current-state trail:
   fast path only for the common single-active-fork-child moment. `LITEBOX_LAZY_FORK_COMMIT` stays
   default OFF, unchanged; no runtime behavior modified this pass; `DE_UP` not attempted. Full
   writeup: `lazy_fork_commit.rs`'s own module doc comment (this pass's own section).
+- **87th** — deliberate fork-in-the-road pass (Path A vs. Path B). **Judgment call: neither pure
+  Path A (implement the full multi-generation COW protocol) nor pure Path B (abandon lazy-fork-
+  commit for a different lever) — both real Path B angles investigated this pass closed with real
+  evidence rather than opening a new lever, while Path A's own scope, worked through in full,
+  turned out smaller and more precisely buildable than "full multi-generation" once the 86th
+  pass's own single-generation Candidate 3 sketch was pushed to a real design.** Chose to spend
+  this pass refining that design to genuinely buildable (closing two real gaps the 86th pass's
+  sketch left open) rather than attempting to implement it, because a THIRD gap found while doing
+  so (interaction with `VIRTUAL_PROTECT_LOCK`/`fork_verify` VEH machinery — real, but a solved
+  precedent, not a blocker) confirmed this still needs the same live-`cdb`-verification budget
+  each of the 83rd-85th passes spent a full pass on, which this pass did not have room for
+  alongside the Path B evidence-gathering below. No runtime behavior changed this pass.
+  - **Path B angle closed with real evidence, not speculation**: re-derived whether Windows'
+    commit LIMIT (as opposed to physical RAM) is any part of the crater, live, via
+    `Get-CimInstance Win32_OperatingSystem`/`Win32_PageFileUsage`/`Get-Counter '\Memory\Commit
+    Limit'` at pass start — Commit Limit ~43.9 GB (15.25 GB physical + an automatically-managed
+    ~25.7 GB pagefile) against only ~18.1 GB Committed Bytes in use, i.e. ~25 GB of already-unused
+    commit headroom exists before any boot attempt starts. The 76th-82nd passes' own crater
+    measurements (~7-8 GB additional committed at the crater) land nowhere near this limit even
+    stacked on top of the pre-boot baseline — confirms the crater is genuine PHYSICAL working-set
+    demand (thrashing/eviction as available RAM falls, matching AGENTS.md's own standing
+    "FreePhysicalMemory falling trend" guidance), never a commit-limit rejection. **Closes the
+    "grow the pagefile" idea as a lever** — there is no commit-limit problem to fix by growing it.
+  - **Path B angle (admission-cap tuning) reconfirmed closed, not reopened**: read the 80th pass's
+    own conclusion in full before doing anything — "the crater is driven by CUMULATIVE committed
+    memory across the boot's whole fork history, not peak instantaneous concurrency" — and found
+    no new evidence this pass that would change that; not re-litigated without a genuinely new
+    angle, per this file's own standing instruction not to redo closed work.
+  - **Design refinements landed in `lazy_fork_commit.rs`'s own module doc (this pass's own new
+    section, real and substantive, not implemented as code)**: (1) the 86th pass's own Candidate 3
+    sketch scoped its guard/claim state as tree-wide/global; working the argument through shows
+    the actual correctness unit is PER-PARENT-PROCESS (two different parents' fork relationships
+    touch disjoint memory and can never race each other), which needs no shared arena/`SharedArc`/
+    new `SharedKernelStateSlot` at all — ordinary process-local statics for the claim, one new env
+    var (mirroring the existing `FORK_CHILD_PARENT_PID_ENV_VAR` pattern) carrying the parent's own
+    snapshot-table address for the child to `ReadProcessMemory` (protection state doesn't gate
+    `ReadProcessMemory`, only committed-and-not-`PAGE_NOACCESS` does), and a non-blocking
+    `WaitForSingleObject(h, 0)` liveness poll on the recorded owner pid to reclaim a stale slot —
+    no new IPC primitive needed. (2) the sketch's "child prefers a recorded snapshot over a live
+    read" step has an unstated TOCTOU of its own (the parent's snapshot-publish could land in the
+    exact window between the child's flag check and its `ReadProcessMemory` call) — closed with an
+    explicit double-checked-state protocol: read live FIRST, re-check the snapshot flag AFTER,
+    prefer the snapshot if it is now set (never the reverse); sound because the flag's 0->1
+    transition is one-shot and globally visible the instant it happens, so "still 0 after my read"
+    is a truthful witness that no write occurred during the read window. (3) a genuinely new
+    finding not in the 86th pass's writeup at all: a parent-side write-fault VEH for this mechanism
+    would need to coordinate with the EXISTING `VIRTUAL_PROTECT_LOCK` (guards every `VirtualProtect`
+    against guest-mapped memory process-wide, landed after a real live `labwc` SIGSEGV from two
+    unlocked protection flips racing) and `fork_verify`'s own AV-path healing — checked against
+    precedent (`fork_verify::write_usize_fault_tolerant`), a plain blocking `.lock()` on
+    `VIRTUAL_PROTECT_LOCK` is the codebase's own already-shipped pattern even from inside VEH
+    dispatch, so this is a solved problem to follow, not a new one to invent — but confirming that
+    is itself part of why this needs a real verification pass, not a same-day landing.
+  - **Concrete pickup, unchanged in substance from the 86th pass but now precisely scoped**:
+    implement exactly the refined design above, gated behind a new, additional, default-OFF flag
+    (`LITEBOX_LAZY_FORK_GUARD_COW=1`, on top of `LITEBOX_LAZY_FORK_COMMIT=1`) so it cannot affect
+    the already-working fork-then-`execve` path even if buggy; verify 5/5 on both existing repros
+    (regression check, flag off; fix check, flag on) PLUS a new concurrent-two-children-one-parent
+    repro (this codebase does not yet have one), both debug and release, before considering `DE_UP`
+    with either flag on. `LITEBOX_LAZY_FORK_COMMIT` stays default OFF; `DE_UP` not attempted this
+    pass (unchanged reason: the flag remains unsafe for a real boot). Host RAM ~5.9-6.1GB free
+    throughout; only `cargo check -p litebox_platform_windows_userland` was run (clean), no live
+    boot attempted (no runtime behavior to verify — doc-only change).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
@@ -397,13 +460,26 @@ both Xvfb SIGSEGVs.
    **and scoped a third: software COW via parent-side guard pages (`VirtualProtect(PAGE_READONLY)` +
    a parent-side VEH mirroring the existing child-side one), sound for ONE live fork child but a real
    multi-generation/multi-version design problem for the 6-concurrent-children case a real boot
-   needs — not implemented, needs its own live-debug pass.** **Next pickup, precise**: either scope
-   and implement candidate 3's multi-generation protocol properly (per-page generation tracking, or
-   the narrower "fall back to eager the moment a second concurrent child would share one protected
-   page" first cut), then re-verify 5/5 clean on BOTH repros, both builds, before ever attempting the
-   full `DE_UP` boot with the flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero
-   cost when off) remains the permanent tool for measuring any future fix's real payoff before
-   landing it. `DE_UP` has not been reached by any pass through the 86th;
+   needs — not implemented, needs its own live-debug pass.** **87th pass: pushed candidate 3 from a
+   sketch to a concretely buildable design (still not implemented) — found the correctness unit is
+   actually PER-PARENT-PROCESS, not tree-wide (needs only ordinary process-local statics + one new
+   env var for the snapshot-table address, no shared arena), closed a real TOCTOU gap in the
+   sketch's own "child prefers a recorded snapshot" step with an explicit double-checked-state
+   read (live-read-then-recheck, not a new lock), and flagged a genuinely new hazard (coordination
+   with the existing `VIRTUAL_PROTECT_LOCK`/`fork_verify` VEH machinery) that checked-precedent
+   confirms is solvable by following `fork_verify::write_usize_fault_tolerant`'s own established
+   locking pattern rather than inventing a new one. Also closed the pagefile-size idea as a Path B
+   lever with live evidence (`Get-Counter`: ~25GB of already-unused commit headroom exists before
+   any boot attempt — the crater is genuine physical-RAM/working-set pressure, never a commit-limit
+   rejection) and reconfirmed the 80th pass's admission-cap-is-a-dead-end finding still holds.**
+   **Next pickup, precise**: implement exactly the 87th pass's refined design (full writeup:
+   `lazy_fork_commit.rs`'s own "87th pass" doc section) gated behind a NEW, additional, default-OFF
+   flag (`LITEBOX_LAZY_FORK_GUARD_COW=1`) so it cannot affect the already-working fork-then-`execve`
+   path even if buggy, then re-verify 5/5 clean on BOTH existing repros PLUS a new
+   concurrent-two-children-one-parent repro (does not exist yet), both builds, before ever
+   attempting the full `DE_UP` boot with either flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both
+   call sites, zero cost when off) remains the permanent tool for measuring any future fix's real
+   payoff before landing it. `DE_UP` has not been reached by any pass through the 87th;
    chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP`
    fires). Lower-priority, still open: (a) decompose
    remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)

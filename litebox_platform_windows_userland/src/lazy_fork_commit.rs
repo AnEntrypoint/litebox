@@ -257,6 +257,129 @@
 //! resumes any guest execution, and never mutated again -- `OnceLock`'s own publication fence
 //! makes that one write visible to every later reader on every thread without further
 //! synchronization.
+//!
+//! # 87th pass -- Bug B/Bug 4 (TOCTOU) design refined into something concretely buildable;
+//! **NOT implemented this pass** -- judged too large a correctness surface to land and verify
+//! with confidence in one pass without a live `cdb` session, exactly the bar the 86th pass's own
+//! Candidate 3 sketch was already close to but left two real gaps in (both closed below). Flag
+//! stays default OFF; no runtime behavior changed this pass.
+//!
+//! Before any design work, re-derived (not assumed) whether the standing "increase the pagefile"
+//! idea from the task brief could be a cheaper, orthogonal fix for the RAM crater instead: live
+//! `Get-Counter`/`Get-CimInstance Win32_PageFileUsage` on the actual host at pass start showed
+//! Commit Limit ~43.9 GB (15.25 GB physical + an automatically-managed ~25.7 GB pagefile) against
+//! only ~18.1 GB Committed Bytes -- i.e. ~25 GB of UNUSED commit headroom already exists before
+//! any boot attempt even starts. The 76th-82nd passes' own crater measurements (~7-8 GB additional
+//! committed at the crater, 28-29 processes) would still land well under the existing commit
+//! limit even added on top of the 18.1 GB baseline -- so the crater is real PHYSICAL working-set
+//! demand exceeding physical RAM (causing thrashing/eviction), never a Windows commit-limit
+//! rejection; growing the pagefile further would not change this, and is a closed angle as of
+//! this pass, not merely an unexamined one. (Also re-confirmed the 80th pass's admission-cap
+//! finding and the 76th-pass per-process working-set-driven framing both still hold -- nothing in
+//! the surrounding system has changed enough since the 86th pass to revisit either without new
+//! evidence, which this pass did not find.)
+//!
+//! **Two real refinements over the 86th pass's own Candidate 3 sketch, found by working through
+//! the concurrency argument in full instead of only sketching it:**
+//!
+//! 1. **The sketch's "global" scope was wrong -- the actual correctness unit is PER-PARENT-PROCESS,
+//!    not tree-wide.** Two different parent processes' own fork-guarded relationships touch
+//!    disjoint address spaces (each process's own private memory) and can never race each other no
+//!    matter how many are concurrently outstanding -- only two overlapping generations from the
+//!    SAME parent are the actual hazard the 86th pass identified. A single system-wide "at most one
+//!    ever" gate (what the 86th pass's own writeup implied) would be needlessly conservative during
+//!    a real boot's fork storm, where many DIFFERENT parent processes (distinct daemons/shells) are
+//!    forking concurrently -- exactly the RAM-crater moment this mechanism exists to help. The gate
+//!    belongs on ordinary process-LOCAL statics (an `AtomicU32` "current guard-owner child pid, 0 =
+//!    free" plus a `Vec<Range<usize>>` of this process's own currently-guarded ranges) -- no shared
+//!    arena, no `SharedArc`, no new `SharedKernelStateSlot` variant, no cross-process attach/offset
+//!    dance needed for the claim/release decision at all, since only the parent's OWN code ever
+//!    decides whether ITS OWN next fork may take the guarded path. The one piece that genuinely
+//!    must cross the process boundary -- the captured pre-write snapshot bytes -- can ride the
+//!    SAME `PROCESS_VM_READ` handle the child already opens on the parent for [`lazy_commit_veh`]'s
+//!    existing live-read fallback (`ReadProcessMemory` doesn't care about a page's protection state,
+//!    only that it's committed and not `PAGE_NOACCESS`), reached via a plain `usize` address of the
+//!    parent's own snapshot-table static, carried across in ONE new env var at fork time --
+//!    symmetric with how [`FORK_CHILD_PARENT_PID_ENV_VAR`] already works, not a new IPC primitive.
+//!    Release: a parent, before granting its NEXT fork the guarded path, first does a bounded,
+//!    non-blocking liveness check on the recorded owner pid (`OpenProcess(SYNCHRONIZE, ...)` +
+//!    `WaitForSingleObject(h, 0)`) and reclaims the slot if that child has since died -- covers
+//!    BOTH a fork-without-execve child that eventually exits AND one that crashes, with no explicit
+//!    "I'm done" signal needed from the child at all (the tradeoff: a long-lived, successfully
+//!    `execve()`'d daemon child holds its parent's slot for the rest of its own life, since nothing
+//!    currently distinguishes "still running my own forked code" from "long since `execve()`'d and
+//!    now independent" without an active completion signal -- a real, honest limitation flagged for
+//!    a future pass to improve, not silently assumed away: it only gives up SOME of the win, never
+//!    correctness).
+//!
+//! 2. **The sketch's "child prefers a recorded snapshot over a live read, if one exists" step has
+//!    an unstated TOCTOU of its own -- closed here with an explicit double-checked-state protocol
+//!    (a bounded, single-retry seqlock-style read, not a new lock).** A naive "check a `state` flag,
+//!    then branch to either the snapshot or a live read" sequence has a gap: the parent's own
+//!    write-fault handler could publish the snapshot (flip `state` 0 -> 1) in the window BETWEEN
+//!    the child's flag check and its subsequent `ReadProcessMemory` call, in which case that RPM
+//!    would observe the parent's POST-write bytes even though the flag it just checked said "no
+//!    snapshot yet" -- reintroducing exactly Bug B/Bug 4's torn/stale read, just narrowed to one
+//!    smaller window instead of the whole child lifetime. Fix: the child performs its live
+//!    `ReadProcessMemory` FIRST (matching today's existing fallback path exactly), then re-checks
+//!    the snapshot slot's `state` a SECOND time; if it is now `1` (the parent published a snapshot
+//!    at some point during or after the child's read -- indistinguishable from "before", which is
+//!    exactly the ambiguity that makes the live read unsound), the child DISCARDS its own live read
+//!    and uses the snapshot bytes instead, never the reverse. This is sound because: the parent's
+//!    page is `PAGE_READONLY` from fork time until the FIRST write-fault flips `state` to `1` (the
+//!    snapshot is captured, published via a `Release` store, while the page is still read-only, so
+//!    a write physically cannot have landed before that publish); if the child's post-read re-check
+//!    still observes `state == 0`, that is a truthful witness that NO write-fault happened at any
+//!    point during the child's own read window (the state transition is monotonic, one-shot, and
+//!    globally visible the instant it happens -- there is no way for it to have happened and then
+//!    "un-happened" by the time of the re-check), so the live read the child just took is provably
+//!    the correct fork-time-through-now value. One retry is always enough (`state` only ever
+//!    transitions 0 -> 1, once, for the lifetime of a given guard relationship), so this needs no
+//!    loop, no backoff, no new blocking primitive -- two atomic loads and, on the rare
+//!    snapshot-wins branch, a fixed 4 KiB copy.
+//!
+//! **A third, genuinely new finding this pass, NOT present in the 86th pass's own writeup at all**:
+//! any parent-side write-fault handler for this mechanism would run as a THIRD entrant into
+//! machinery this codebase has already had to fight hard-won, `AGENTS.md`-documented battles over
+//! -- `VIRTUAL_PROTECT_LOCK` (`lib.rs`, guards every `VirtualProtect` call against guest-mapped
+//! memory process-wide, because two threads racing independent flips of the SAME page, e.g. an
+//! ordinary guest `mprotect()` on one thread against [`fork_verify`]'s own AV-path healer on
+//! another, produced a real, live `labwc` SIGSEGV before this lock existed) and `fork_verify`'s own
+//! `FORK_VERIFY_HEAL_LOCK`-serialized AV-path healing (which can ALSO write-fault-then-heal on
+//! guest memory from inside VEH dispatch). A new parent-side handler that `VirtualProtect`s guest
+//! memory on a write fault MUST take `VIRTUAL_PROTECT_LOCK` around its own query/flip/write/restore
+//! span for the exact reason that lock's own doc comment gives -- checked against precedent
+//! (`fork_verify::write_usize_fault_tolerant`, `lib.rs`), the established, ALREADY-SHIPPED pattern
+//! for this exact lock is a plain blocking `.lock()` even from inside VEH dispatch (not the
+//! try-lock-plus-bounded-spin pattern `FORK_VERIFY_HEAL_LOCK` itself uses for a much LARGER
+//! critical section) -- i.e. this is a solved problem in this codebase already, not a new one, as
+//! long as a future implementation follows that exact precedent rather than inventing a new
+//! locking discipline. Flagged explicitly because getting this wrong (e.g. reaching for `.lock()`
+//! inside a handler that can itself be re-entered on the same thread across a larger span) is
+//! exactly the class of subtle regression `AGENTS.md`'s own 84th-pass entry warns future
+//! `vectored_exception_handler`-adjacent work about.
+//!
+//! **Why this pass stops at design, not code**: even with both gaps closed and the locking
+//! precedent identified, this is a new VEH firing on ordinary, ONGOING write traffic from an
+//! ALREADY-RUNNING, potentially long-lived guest process (unlike [`lazy_commit_veh`], which only
+//! ever runs during a fresh fork child's own early startup, before most of the codebase's other
+//! fragile machinery is even relevant yet) -- a bug here risks corrupting or crashing a process the
+//! rest of the boot already depends on (e.g. `dbus-daemon` itself), not just an isolated,
+//! easily-rerun fork-child repro. Landing it needs the same live `cdb`/diagnostic-gated
+//! verification budget the 83rd-85th passes each spent a full pass on for a SMALLER mechanism, plus
+//! a genuinely new concurrent-fork repro (two children racing one mutating parent) this codebase
+//! does not yet have. Shipping it under-verified would trade today's honest, deterministic Bug
+//! B/Bug 4 crash for a silently-wrong-data risk on a live daemon -- exactly what the standing
+//! project discipline forbids. **Concrete pickup for the next pass with a live-debug budget**:
+//! implement exactly the design above (parent-local claim/release statics; one new env var
+//! carrying the parent's own snapshot-table address; the double-checked-state child read; a
+//! `VIRTUAL_PROTECT_LOCK`-guarded parent write-fault VEH modeled on
+//! `fork_verify::write_usize_fault_tolerant`'s own locking), gated behind a SEPARATE, additional,
+//! default-OFF flag (e.g. `LITEBOX_LAZY_FORK_GUARD_COW=1`, checked in addition to
+//! [`lazy_fork_commit_enabled`]) so it cannot change anything about the already-working
+//! fork-then-`execve` path even if buggy; verify 5/5 on both existing repros (regression check with
+//! the new flag OFF; the fix check with it ON) PLUS a new concurrent-two-children-one-parent repro,
+//! both debug and release, before ever considering flipping either flag on for a real boot.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
