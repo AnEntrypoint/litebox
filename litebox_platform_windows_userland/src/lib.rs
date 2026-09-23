@@ -4430,6 +4430,25 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // Restore fsbase for the guest.
     WindowsUserland::restore_thread_fs_base();
 
+    // Repair `GS_BASE` here too, immediately before EVERY guest resume (both the `sysret` fast
+    // path and the `NtContinue` slow path fall through this same choke point) -- see
+    // `WindowsUserland::restore_thread_gs_base_if_cleared`'s doc comment for why Windows can clear
+    // this thread's `GS_BASE` back to 0 under scheduling pressure. Every existing call site of
+    // this repair (`vectored_exception_handler`'s entry, `syscall_handler`'s entry,
+    // `RawMutex::block_or_maybe_timeout`'s wait loop) runs BEFORE host-side work such as
+    // `self.shim`'s syscall handling, signal delivery, or the `ctxwatch`/fork-verify bookkeeping
+    // immediately above in this same function -- none of them is the LAST thing to run before the
+    // jump back into guest code, so a re-corruption during any of that intervening host work would
+    // reach the guest unrepaired. `switch_to_guest_ntcontinue`'s 95th-pass-identified investigation
+    // (see `AGENTS.md`) found that a corrupted `GS_BASE` at fault time makes even
+    // `vectored_exception_handler_entry`'s own fast path unable to run (its TLS lookup is itself
+    // `GS_BASE`-relative) -- a structural deadlock no in-VEH repair can fix. Placing the repair
+    // here, as the narrowest point through which literally every guest resume passes, closes that
+    // gap regardless of which upstream host code path let it slip through. Cheap and safe to call
+    // unconditionally (two `rdgsbase` reads plus a conditional `wrgsbase`, no allocation, no
+    // syscall) -- already proven safe to call from host-mode contexts elsewhere in this file.
+    WindowsUserland::restore_thread_gs_base_if_cleared();
+
     // Restore the guest's xmm0-xmm5 (the caller-saved SSE registers, see `guest_xmm0_5`'s doc
     // comment) as late as possible, immediately before handing control to either resume path --
     // no host Rust code runs between this and the jump into guest code on either path, so
