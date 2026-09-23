@@ -756,3 +756,159 @@ standalone repro).
 Host RAM: ~6.2GB free at pass start, never approached exhaustion this pass (no full desktop boot
 attempted). All stray `litebox_runner*` processes terminated via
 `Invoke-CimMethod -MethodName Terminate` between every trial, per standing practice.
+
+## 84th pass (2026-09-23) -- two real cross-process-fork bugs fixed, third precisely re-scoped
+
+Investigating the 83rd pass's "unexplained `PAGE_READONLY`" on the subshell (fork-without-`execve`)
+repro. Diagnostic method: the project's own rich `eprintln!`/`litebox_util_log::debug!` gates
+(`LITEBOX_DIAG_FAULT_VQ`, `LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP`, `LITEBOX_DIAG_MM`,
+`LITEBOX_LOG=litebox_shim_linux=debug`), not `cdb` -- sufficient this pass, faster to iterate than
+a live debugger attach for a bug whose signature was fully captured by existing structured logging.
+
+**Bug 1 (FIXED, `litebox/src/mm/linux.rs`'s `Vmem::new_adopting_existing_memory`)**: the crashing
+page (`0x7feffffef000`, one page short of the group's own end) is `copy_one_group`'s 64KiB
+`VirtualAlloc2`/`MEM_ADDRESS_REQUIREMENTS` alignment padding (real Windows-committed memory,
+genuinely unmapped-in-the-guest, matches `do_clone`'s own `GRANULE`-rounding, NOT
+`VmArea::reserved_extra` -- that's 16MiB, three orders of magnitude too big). A fresh child's own
+`sys_mmap` allocator (`get_unmmaped_area`, `litebox/src/mm/linux.rs`) had no record of this padding
+at all -- it is real per-VMA guest layout (`vma_layout()`) that carries no notion of the coarser
+group rounding -- so it could hand a BRAND NEW guest mmap exactly this address, silently succeeding
+(the underlying Windows page was already committed, so `VirtualAlloc(MEM_COMMIT)` on it is a
+harmless no-op) and corrupting host memory that, on real 4KiB-granular Linux, would simply have been
+part of the SAME, single, adjacent VMA. Confirmed live via `LITEBOX_DIAG_MM=1`: `sys_mmap` returned
+exactly `0x7feffffef000`, the guest then `mprotect`'d it `PROT_READ`. Fix: `new_adopting_existing_
+memory` now takes the child's OWN real group-relocation spans (`do_clone`'s `groups`, plumbed via
+`AddressRelocations::group_relocations()` -> a new `group_spans` parameter ->
+`PageManager::new_adopting_existing_memory`) and pre-inserts a `VmFlags::VM_OWN_FORK_PADDING`
+placeholder for each FULL span before adopting real per-VMA regions on top (`RangeMap::insert`
+narrows/overwrites the placeholder for each real region's own sub-range, leaving it tracked only for
+the genuine gaps) -- `allocate_pages`'s own free-space search (`self.vmas.gaps()`/`.overlaps()`) now
+correctly treats this padding as claimed. (A parallel widening of `Vmem::duplicate`'s OWN placeholder
+sizing was ALSO tried and REVERTED this pass -- `do_clone`'s doc comment establishes `Vmem::
+duplicate`'s grouping feeds only a diagnostic/verification path, never real cross-process-fork
+placement, and live A/B testing confirmed that change was actively harmful.)
+
+**Bug 2 (FIXED, real but NOT sufficient alone)**: a cross-process-fork child's `SignalState` is
+built via `SignalState::new_process` (`adopt_forked_process`, `litebox_shim_linux/src/lib.rs`),
+which starts `sigreturn_trampoline` at `0` -- unlike `clone_for_new_task` (the thread-based path),
+which correctly preserves it. `LinuxShimEntrypoints::exception`'s own x86_64 sigreturn-trampoline
+recognition (`ctx.rip == self.task.sigreturn_trampoline_addr()`) can therefore never match in a
+forked child that inherits a parent's already-established trampoline (real memory content correctly
+copied by `copy_one_group`; the Task-level ADDRESS that lets litebox recognize a fault there is what
+was missing) -- exactly the fork-without-`execve` shape. Fix: threads the forking parent's own
+`Task::sigreturn_trampoline_addr()` through `spawn_cross_process_fork_child`'s new `sigreturn_
+trampoline` parameter -> a new `LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE` env var
+(`process_fork.rs`) -> `adopt_forked_process`'s new parameter -> `SignalState::set_sigreturn_
+trampoline_for_fork_adoption`. Confirmed live the child's own `exception()` now correctly matches
+`rip == sigreturn_trampoline_addr()` for a LATER, unrelated signal event in the same run.
+
+Both bugs are REAL, GENERAL correctness fixes, independent of `LITEBOX_LAZY_FORK_COMMIT` -- with
+both landed, `LITEBOX_PROCESS_FORK=1` alone (lazy flag unset) runs the subshell repro clean 5/5
+(this exact non-lazy case was ALSO already clean on pristine `a7e6a83` -- these two bugs were
+latent/unobserved via this specific repro, not a new regression the 83rd pass introduced).
+
+**Bug 3 (re-scoped, not yet fixed this pass)**: with `LITEBOX_LAZY_FORK_COMMIT=1`, the exact
+subshell repro STILL crashed 5/5, byte-identical signature, even with both bugs above fixed.
+Precisely characterized: the fault DOES reach `vectored_exception_handler`, which DOES redirect the
+thread context to `exception_callback` (confirmed via a temporary, since-removed trace immediately
+before the `context.Rip = exception_callback` assignment) -- but `LinuxShimEntrypoints::exception()`
+was never observably entered afterward (confirmed via a temporary, since-removed `pid`-tagged trace:
+the only `exception()` call in a full run belonged to the ORIGINAL, never-forked bootstrap process
+handling an unrelated LATER signal, never the crashing forked child).
+
+**Methodological finding, load-bearing for any future pass touching `vectored_exception_handler`**:
+adding EVEN GATED, LOW-VOLUME `eprintln!`/extra local variables to that function (tried this pass: a
+`pid`/`is_in_guest`/`veh_depth`-enriched `[veh-regs]` line and one new gated print) measurably
+REGRESSED the NON-lazy case too (broke the now-clean 5/5 back to 5/5 killed) -- reverting those
+specific diagnostic-only additions (keeping the real fixes) restored the clean non-lazy result.
+Confirmed via live A/B isolation, not assumed. This function's compiled layout is sensitive enough
+that any future instrumentation there needs an A/B test against the non-lazy repro before being
+trusted.
+
+`LITEBOX_LAZY_FORK_COMMIT` stayed default OFF; `DE_UP` not attempted this pass.
+
+## 85th pass (2026-09-23) -- Bug 3 root-caused and FIXED; a fourth, deeper bug (Bug 4) found and
+left OPEN; `LITEBOX_LAZY_FORK_COMMIT` still not safe for a real boot
+
+Picked up the 84th pass's own precise pickup (a live `cdb -pv` attach on `exception_callback`/
+`call_shim`). Before reaching for a debugger, re-derived the crash from first principles by reading
+`vectored_exception_handler_entry`/`vectored_exception_handler`/`lazy_commit_veh` side by side and
+computing exact address arithmetic against a freshly captured repro log
+(`LITEBOX_DIAG_LAZY_FORK_COMMIT=1 LITEBOX_DIAG_FATALDUMP=1`) -- this alone found the real mechanism,
+no debugger attach needed this pass.
+
+**Bug 3 root cause, precisely**: the crash's own `[lazy_fork_commit] install_if_configured:
+registering VEH for 2 range(s)` line gives the exact lazy ranges for that run; the crash's own `[veh]
+RAWREGS`/`[veh-regs] ENTRY` lines give `rsp=0x7fefffeed200` at the moment of the (unrelated) sigreturn-
+trampoline instruction-fetch fault. Arithmetic (`awk`, exact, not eyeballed) confirms `rsp` falls
+STRICTLY INSIDE the second registered range (`0x7fefff6e0000..0x7fefffef0000`, the lazily-reserved
+8 MiB+64 KiB stack group) -- i.e. the child's OWN live stack pointer, at the exact moment ANY
+exception is delivered to it, was itself sitting on a page `lazy_commit_veh` had never yet serviced
+(confirmed independently: the crash log shows ZERO `[lazy_fork_commit] fault #N serviced` lines
+across the entire run, despite `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` being set and confirmed reaching the
+child -- the mechanism never got to service its first real page fault before the process died).
+Windows delivers EVERY exception -- not only ones whose own fault address lands in a lazy range --
+with `CONTEXT.Rsp` set to whatever the CPU held at fault time; for the group anchoring a fresh
+child's very first instructions, that is guaranteed to still be a genuinely never-touched (`MEM_
+RESERVE`-only) page under this feature, a scenario the ordinary "stack-touching instruction lazily
+faults, gets serviced by `lazy_commit_veh`, retries" path (proven correct for the dominant
+fork-then-`execve` case) never exercises, because there the fault address and `CONTEXT.Rsp` are
+identical and get serviced before anything else can look at them.
+
+**Fix**: `classify_lazy_eligible_groups` (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`)
+now takes the child's fork-time `%rsp` (threaded from `spawn_process_fork_child`'s existing
+`full_gprs.rsp`, `litebox_platform_windows_userland/src/process_fork.rs`) and excludes whichever
+group contains it from lazy treatment, falling back to the ordinary eager `copy_one_group` path for
+THAT one group only -- every OTHER pure-data group (heap, etc.) stays lazy exactly as before.
+**Verified**: the exact subshell repro's ORIGINAL crash signature (0 faults serviced, `Killed`,
+`inner_var` never printed) is GONE, 5/5, both debug and release builds; the fork-then-`execve` repro
+(`bash -c 'echo hello; sleep 0.2; echo done'`) remains clean 5/5, both builds, no regression; the
+non-lazy default path is untouched (this parameter only affects groups when `LITEBOX_LAZY_FORK_
+COMMIT=1`).
+
+**Bug 4 (OPEN, found while re-verifying Bug 3's fix)**: with Bug 3 fixed, the SAME subshell repro
+now runs further -- `lazy_commit_veh` DOES service real lazy faults now (3/3 with real parent data
+via `ReadProcessMemory`, not zero-filled: `page=0x111156000`/`0x111148000`/`0x111155000`, all below
+the child's own `brk=0x111169000`, i.e. genuinely heap pages, not stack) -- but the repro still fails
+5/5, both builds, with a NEW, different, equally deterministic signature: `Fatal glibc error:
+malloc.c:2601 (sysmalloc): assertion failed: (old_top == initial_top (av) && old_size == 0) ||
+((unsigned long) (old_size) >= MINSIZE && prev_inuse (old_top) && ((unsigned long) old_end &
+(pagesize - 1)) == 0)` -- SIGABRT (`bash`'s own `Aborted`, not `Killed`), and `subshell_child` now
+prints but `inner_var` still never does.
+
+This is a genuine heap-corruption assertion (glibc's `malloc_state.top`-chunk consistency check), and
+the mechanism is structural, not incidental: `lazy_commit_veh` services a fault by `ReadProcessMemory`-
+ing the PARENT's address space at WHATEVER MOMENT the CHILD happens to touch that page -- for a
+fork-WITHOUT-`execve` child, that can be arbitrarily long after `fork()` returned control to the
+PARENT's own guest thread. The eager `copy_one_group` path captures every byte SYNCHRONOUSLY, while
+the parent's guest thread is still blocked inside the `fork()` syscall handler, so it is immune to
+this. This module's whole point is DEFERRING that capture, which only stays correct if the parent's
+memory at the same virtual address is guaranteed stable in the meantime -- true for a page the
+parent never touches again, false for one it does (its own heap, mutated by its own continued
+malloc/free activity while the forked-but-not-exec'd child is still running the same program). The
+observed corruption shape (a torn/inconsistent read of a live, concurrently-mutating heap's own
+top-chunk bookkeeping) matches this mechanism exactly.
+
+This is a genuine TOCTOU (time-of-check to time-of-use) gap in the module's own "Correctness
+argument" doc section, which only proves the CHILD's own access-based deferral is safe and never
+establishes that the PARENT's memory at the same address stays stable after `fork()` RETURNS -- a
+separate assumption, true for the eager path by construction (parent is blocked during the whole
+copy), false in general for the lazy path (parent resumes as soon as `spawn_process_fork_child`
+returns, well before any lazy fault is serviced). No fix attempted this pass -- see `lazy_fork_
+commit.rs`'s own updated module doc comment (Bug B) for the two candidate real-fix directions (a
+fork-time snapshot into a buffer instead of a live parent read, or genuine OS-level COW between the
+two separate Windows processes) -- both are real design work, not a quick patch.
+
+**Verification discipline**: both fixes verified 5/5 on BOTH the subshell and fork-then-`execve`
+repros, both debug and release builds, with the non-lazy default path reconfirmed byte-identical
+(5/5 clean, unset flag). `LITEBOX_LAZY_FORK_COMMIT` stays default OFF -- Bug 4 means it is still not
+safe to flip on for `.wfgy/webtop_stack.sh` or any real boot attempt: a real desktop boot forks many
+long-lived processes (shells, daemons, e.g. `dbus-daemon`) that do not immediately `execve()` AND
+keep running concurrently with a parent that keeps mutating its own heap -- exactly Bug 4's trigger
+shape, worse and harder to isolate than this clean, minimal, 100%-reproducible standalone repro.
+`DE_UP` not attempted this pass -- the flag remains unsafe to enable for a real boot, and attempting
+one anyway would very likely hit Bug 4's heap-corruption class inside `dbus-daemon` or another
+long-lived forked-without-exec daemon, at real RAM/wall-clock cost, for a known-bad outcome.
+
+Host RAM: ~6.6GB free at pass start. Full desktop boot NOT attempted (Bug 4 makes the flag unsafe).
+All `litebox_runner*` processes cleaned up between trials.

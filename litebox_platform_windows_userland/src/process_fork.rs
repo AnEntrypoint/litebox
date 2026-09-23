@@ -1822,8 +1822,11 @@ pub fn spawn_process_fork_child(
     // VEH, on first real access) instead of eagerly `copy_one_group`-copied. Always all-`false`
     // unless `LITEBOX_LAZY_FORK_COMMIT=1` is set -- see `lazy_fork_commit_enabled`'s doc comment
     // for why that makes this whole mechanism provably inert by default.
-    let lazy_eligible =
-        crate::lazy_fork_commit::classify_lazy_eligible_groups(group_relocations, vma_layout);
+    let lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
+        group_relocations,
+        vma_layout,
+        full_gprs.rsp,
+    );
     let lazy_group_ranges: Vec<Range<usize>> = group_relocations
         .iter()
         .zip(lazy_eligible.iter())

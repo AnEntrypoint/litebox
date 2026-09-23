@@ -10,41 +10,74 @@
 //! 5/5 clean runs, both debug and release, `bash -c 'echo hello; sleep 0.2; echo done'`
 //! (the `sleep` fork execve's almost instantly) -- correct output, exit 0, real ~3-18x
 //! parent-side group-copy speedup measured both builds (debug: 103ms eager vs 34ms mixed / 6
-//! groups, 2 lazy; release: 6ms mixed vs a proportionally larger eager baseline).
+//! groups, 2 lazy; release: 6ms mixed vs a proportionally larger eager baseline). Re-verified
+//! clean 5/5, both builds, 85th pass, after the fix below landed.
 //!
 //! **NOT yet safe for a fork that keeps running WITHOUT `execve()`ing** (e.g. a bash `(...)`
 //! subshell, which runs bash's own already-forked, already-copied code directly rather than
-//! replacing its address space): 5/5 clean, 100%-reproducible crash,
-//! `bash -c '(echo subshell_child; x=inner_var; echo $x); echo parent_after'` -- the subshell
-//! prints `subshell_child` then is killed (`/bin/bash: ... Killed`) before `inner_var` ever
-//! prints. The crash is a genuine `EXCEPTION_ACCESS_VIOLATION` (code fetch, confirmed via
-//! `LITEBOX_DIAG_FATALDUMP=1`) at an address that is NOT inside any range this module reserved
-//! lazily -- it lands ~0xff000 bytes above the lazy stack group's own end, inside a separate,
-//! small (`0x40000`-byte) group that this run's own classification left on the EAGER
-//! `copy_one_group` path, with an unexplained `PAGE_READONLY` (`0x2`) protection that neither
-//! `copy_one_group`'s blanket `PAGE_READWRITE` nor the PASS-144 exec-fixup's
-//! `PAGE_EXECUTE_READ`/`PAGE_EXECUTE_READWRITE` would ever produce. The obvious "just needs more
-//! wall-clock slack before the eager path's own ~100ms of `WriteProcessMemory` calls would have
-//! given some other startup step time to finish" theory was tested directly (an artificial
-//! `LITEBOX_DIAG_LAZY_FORK_ARTIFICIAL_DELAY_MS` re-added after group reservation, up to 80ms,
-//! i.e. matching/exceeding the eager path's own real elapsed time) and REFUTED: the crash is
-//! still 5/5 with the delay in place, so it is not a simple "the lazy path finishes too fast"
-//! race. Root cause NOT found this pass -- the leading hypothesis (untested, needs a live
-//! `cdb -pv` attach per this project's own established practice for this exact class of bug,
-//! debug binary, per `AGENTS.md`'s standing constraints on release-binary `cdb` reliability) is
-//! an interaction with `fork_verify.rs`'s own watched-code-page/exception machinery, since the
-//! crash's `[codewatch]` diagnostic explicitly logged `watched=false` for the faulting page --
-//! either a real gap in that recognition, or a hint the true cause is elsewhere entirely.
+//! replacing its address space): `bash -c '(echo subshell_child; x=inner_var; echo $x); echo
+//! parent_after'` originally crashed 5/5 (83rd/84th passes). The 85th pass found this was
+//! actually TWO SEPARATE bugs layered on top of each other:
 //!
-//! **Because of this, [`lazy_fork_commit_enabled`] stays an explicit opt-in
+//! **Bug A (FIXED, 85th pass)** -- the crash's own address (~0xff000 bytes above the lazy stack
+//! group's own end, `PAGE_READONLY`, matching the synthesized x86_64 sigreturn trampoline's own
+//! deliberately-execute-disabled page -- see `litebox_shim_linux::LinuxShimEntrypoints::exception`'s
+//! doc comment) was a red herring: that page's own memory was always correct (real, eagerly
+//! committed, correct protection) both with and without the lazy flag, and the fault there IS the
+//! trampoline mechanism working exactly as designed. The real defect was that
+//! [`classify_lazy_eligible_groups`] could make the group containing the child's OWN LIVE `%rsp`
+//! AT FORK TIME lazy -- confirmed live via `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`: the crash fired with
+//! **zero** `[lazy_fork_commit] fault #N serviced` lines ever printed, i.e. `lazy_commit_veh` never
+//! got to service a single real page fault before the process died to an unhandled
+//! `STATUS_SINGLE_STEP`/wild-jump cascade. Every exception Windows delivers -- not just ones whose
+//! own fault address lands in a lazy range -- is delivered with `CONTEXT.Rsp` set to whatever the
+//! CPU held at fault time; if that happens to be an address inside a group this module reserved
+//! but has NEVER YET serviced (guaranteed true for the group anchoring the child's very first
+//! instructions), downstream fault-handling code that assumes a live thread's own current stack is
+//! at minimum readable breaks in ways this repro's specific crash signature never disambiguated
+//! cleanly from a dozen other candidate theories the 83rd/84th passes tried and refuted. Fix:
+//! [`classify_lazy_eligible_groups`] now takes the child's fork-time `%rsp` and excludes whichever
+//! group contains it, leaving every OTHER pure-data group (heap, etc.) lazy exactly as before --
+//! confirmed live: the exact subshell repro's original crash signature (0 faults serviced,
+//! `Killed`, `inner_var` never printed) is gone, 5/5, both debug and release.
+//!
+//! **Bug B (OPEN, found by the 85th pass while verifying Bug A's fix)** -- with Bug A fixed, the
+//! SAME subshell repro now runs further (lazy faults ARE serviced, 3/3 with real parent data, not
+//! zero-filled) but still fails 5/5, both builds, with a NEW, different, equally deterministic
+//! signature: `Fatal glibc error: malloc.c:2601 (sysmalloc): assertion failed: ...` -- SIGABRT, not
+//! SIGKILL, and `subshell_child` now prints but `inner_var` still never does. This is a genuine
+//! heap-corruption assertion, and the mechanism is structural, not incidental: [`lazy_commit_veh`]
+//! services a fault by `ReadProcessMemory`-ing the PARENT's address space **at whatever moment the
+//! CHILD happens to touch that page**, which for a fork-WITHOUT-`execve` child can be arbitrarily
+//! long after `fork()` returned control to the PARENT's own guest thread. The eager `copy_one_group`
+//! path captures every byte synchronously, before the parent's guest thread ever resumes, so it is
+//! immune to this; this module's whole point is deferring that capture, which only stays correct if
+//! the parent's memory at the same virtual address is guaranteed stable in the meantime -- true for
+//! a page the parent never touches again, false for one it does (e.g. its own heap, mutated by its
+//! own continued malloc/free activity while the child is still running). The observed corruption
+//! (a `malloc_state.top`-chunk consistency check) is exactly the shape a torn/inconsistent read of a
+//! live, concurrently-mutating heap would produce. **This is a genuine TOCTOU (time-of-check to
+//! time-of-use) gap in the module's own "Correctness argument" section below, which only proves the
+//! CHILD's own access-based deferral is safe and never establishes that the PARENT's memory at the
+//! same address stays stable after `fork()` returns -- a separate assumption, true for the eager
+//! path by construction, false in general for the lazy path.** No fix attempted this pass; a real
+//! fix needs either a synchronous fork-time SNAPSHOT of lazy-eligible bytes into a buffer the lazy
+//! fault handler reads from instead of the live parent (trades away part of the eager-copy cost this
+//! module exists to avoid, but only for eligible groups, and only the bytes that are ever actually
+//! touched could still be deferred if the snapshot itself is lazy-populated on the PARENT side at
+//! reservation time... an unexplored design), or genuine OS-level COW between the two separate
+//! Windows processes (no such primitive is being used today; a real design pass, likely on the scale
+//! of `ADVISORY-002`, not a quick fix).
+//!
+//! **Because of Bug B, [`lazy_fork_commit_enabled`] stays an explicit opt-in
 //! (`LITEBOX_LAZY_FORK_COMMIT=1`), default OFF, and this module's own existence changes NOTHING
-//! about the default fork path** (confirmed live, this same pass: 3/3 clean runs of the exact
-//! subshell repro above with the env var unset, byte-identical correct output to before this
-//! module existed). Do not flip this on for `.wfgy/webtop_stack.sh` or any real boot attempt
-//! until the subshell case above is root-caused and fixed -- a real desktop boot forks many
-//! long-lived processes (shells, daemons) that do not immediately `execve()`, so this exact bug
-//! class would very likely recur on the actual boot path, worse and harder to isolate than this
-//! clean, minimal, 100%-reproducible standalone repro.
+//! about the default fork path** (confirmed live, 85th pass: 5/5 clean runs of both repros above
+//! with the env var unset, byte-identical correct output to before this module existed). Do not
+//! flip this on for `.wfgy/webtop_stack.sh` or any real boot attempt until Bug B is fixed -- a real
+//! desktop boot forks many long-lived processes (shells, daemons, e.g. `dbus-daemon`) that do not
+//! immediately `execve()` AND keep running concurrently with a parent that keeps mutating its own
+//! heap, which is exactly Bug B's trigger shape -- worse and harder to isolate than this clean,
+//! minimal, 100%-reproducible standalone repro.
 //!
 //! # Why this exists
 //!
@@ -158,10 +191,42 @@ pub const FORK_CHILD_PARENT_PID_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PAR
 /// `vma_layout` range(s) include `VM_EXEC` (see this module's own doc comment for why CODE stays
 /// on the eager path). Order matches `group_relocations`' own order; callers use this to decide,
 /// per group, whether to call [`reserve_group_lazy`] instead of `copy_one_group`.
+///
+/// Also excludes whichever group contains `active_rsp` -- the child's OWN guest `%rsp` at the
+/// exact moment of this `fork()` call, i.e. the live stack the child's very first (and every
+/// subsequent) exception will be DELIVERED with as `CONTEXT.Rsp`, regardless of what the fault is
+/// actually about. Root-caused (85th pass) as Bug 3 (`AGENTS.md`'s 84th-pass entry): the subshell
+/// (fork-without-`execve`) repro's guest `%rsp` at fork time lands inside the SAME lazily-reserved
+/// (`MEM_RESERVE`-only, zero pages ever committed) 8 MiB+64 KiB stack group `classify_lazy_eligible_
+/// groups` was already making lazy for exactly this repro -- confirmed live via
+/// `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`: the crash fires with ZERO `[lazy_fork_commit] fault #N
+/// serviced` lines ever printed, i.e. the mechanism never even got to service its first real page
+/// fault. The crash itself is an UNRELATED `EXCEPTION_ACCESS_VIOLATION` (an instruction fetch at
+/// the synthesized sigreturn trampoline, a separate, always-eagerly-committed page one page past
+/// this group's own end) -- so the fault address itself is never inside a lazy range, and
+/// `lazy_commit_veh` correctly declines it (`EXCEPTION_CONTINUE_SEARCH`). The break is that
+/// Windows delivers THIS (and every) exception using `CONTEXT.Rsp` exactly as the CPU held it at
+/// fault time -- the guest's own live, GUEST-address `%rsp` -- and with `LITEBOX_LAZY_FORK_COMMIT
+/// =1`, that value pointed into memory that had NEVER been committed by anyone: not by the eager
+/// path (this group was reserved-only), and not yet by a lazy fault either (nothing had touched
+/// this exact page since the fork). A page fully absent from the process's own working set at the
+/// moment its address becomes `CONTEXT.Rsp` for exception delivery is a scenario the ordinary
+/// "stack-touching instruction lazily faults, gets serviced, retries" path (proven correct,
+/// 83rd/84th passes, for the dominant fork-then-`execve` case) never exercises, because there the
+/// fault address and `CONTEXT.Rsp` are the SAME address, serviced by `lazy_commit_veh` before
+/// anything else can look at it. Pre-committing (eager, `copy_one_group`) the one group the
+/// child's live stack pointer sits in at fork time closes this gap while leaving every OTHER
+/// pure-data group (heap, TLS, etc.) lazy exactly as before -- a narrow, targeted fix, not a
+/// reversion of the whole feature: real measurement (85th pass, `LITEBOX_DIAG_FORK_TIMING=1`)
+/// shows the excluded group is consistently one of the smallest eligible ones per real fork (this
+/// exact repro: 2 groups total, ~8.06 MiB and ~4.19 KiB; the 8 MiB one is what gets excluded here,
+/// but real forks were already observed classifying MULTIPLE separate stack-shaped groups, and
+/// only the one actually anchoring `active_rsp` loses its lazy treatment).
 #[must_use]
 pub fn classify_lazy_eligible_groups(
     group_relocations: &[(Range<usize>, usize)],
     vma_layout: &[(Range<usize>, u32, bool)],
+    active_rsp: usize,
 ) -> Vec<bool> {
     if !lazy_fork_commit_enabled() {
         return vec![false; group_relocations.len()];
@@ -172,9 +237,13 @@ pub fn classify_lazy_eligible_groups(
             // Exclude the group the instant ANY overlapping vma_layout range carries VM_EXEC --
             // conservative by design: a group is data-only, and therefore lazy-eligible, only if
             // every vma_layout range touching it agrees.
-            !vma_layout
+            let has_exec = vma_layout
                 .iter()
-                .any(|(range, flags, _)| ranges_overlap(range, group) && flags & VM_EXEC != 0)
+                .any(|(range, flags, _)| ranges_overlap(range, group) && flags & VM_EXEC != 0);
+            // Exclude the group anchoring the child's own live stack pointer at fork time -- see
+            // this function's own doc comment for the full root-cause/correctness argument.
+            let is_active_stack = group.contains(&active_rsp);
+            !has_exec && !is_active_stack
         })
         .collect()
 }
