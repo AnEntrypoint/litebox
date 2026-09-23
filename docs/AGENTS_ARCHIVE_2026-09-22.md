@@ -1525,3 +1525,108 @@ engineering, not a quick patch; (4) once (2)/(3) narrow the real allocation site
 exact de_only.sh repro to determine for the first time whether xfwm4 genuinely reaches
 _NET_SUPPORTING_WM_CHECK given enough sustained RAM, before assuming any further xfwm4-specific
 logic bug exists at all.
+
+## 58th-60th passes (2026-09-23) — ssh-agent/xfwm4 blocker root-caused and fixed
+
+**58th pass** — fixed `ps -ef`'s `fatal library error, lookup self` (real procps needs its own
+pid's `/proc/<pid>/stat`; `Procfs` had zero numeric pid subdirectories). Fixed in
+`litebox/src/fs/procfs.rs`: one subdirectory per pid the shared `ProcSelfTable` already tracks
+(`ProcfsDirHandle::Pid`/`ProcPidEntry`/`ProcSelfTable::get`/`pids`, reusing `/proc/self`'s own
+renderers). Verified 2/2 clean. Root-caused (not yet fixed) `xfwm4`'s non-launch as now 100%
+reproducible at an identical point: `xfce4-session` spawns `iceauth`+`ssh-agent`, then goes silent
+forever, never reaching `xfwm4`. Hypothesis at the time: `ssh-agent`'s own daemonizing fork holds a
+bound AF_UNIX listening socket (uncarriable), forcing its inner fork to a THREAD-based
+(same-Windows-process) child; that long-lived agent keeps the hosting Windows process alive
+forever, so a PROCESS-handle-based `wait_for_process_exit`/`try_wait_for_cross_process_exit`
+(`process_fork.rs:4263`/`4297`) never signals (the task's own initial OS thread returns long before
+the whole process exits).
+
+**59th pass** — implemented and live-verified a task-scoped cross-process exit wait, fixing the
+general case described above: `spawn_process_fork_child` (`process_fork.rs:1695`) no longer closes
+the child's initial THREAD handle, returning it too; `CrossProcessChildHandle`
+(`litebox/platform/mod.rs:1485`) now carries it; new `wait_for_thread_exit`/
+`try_wait_for_thread_exit` (`process_fork.rs`, `GetExitCodeThread`/`GetProcessIdOfThread`) back
+`wait_for_cross_process_exit`/`try_wait_for_cross_process_exit` (`lib.rs:12135`). Confirmed correct
+by construction first (`lib.rs:3406` `run_thread_inner`, `4381` `thread_start`: every guest task
+gets its own dedicated OS thread running exactly one `run_thread_arch` call, terminating when it
+returns — 1:1 task-scoping holds structurally) and live (`.wfgy/de_only_pass59_run1.log`: fires
+correctly dozens of times, e.g. pid=23868 `sleep`, resolving the instant `run_thread` returns with
+the correct encoded status `0xc0de0000`). BUT `ssh-agent` (tid=27264, Windows pid 27264) still never
+unblocked `xfce4-session`'s `wait4`: its `exit_group`→`prepare_for_exit` ran clean through
+`close_all_fds`/`take_children` (`n_orphans=1`) then never logged again — `run_thread` genuinely
+never returned for this task. Live `cdb -p 27264 -pv` (release binary, no symbols), two snapshots
+~30s apart: byte-identical stack, no Win32 wait syscall at frame 0 — stable RSP, parked
+mid-execution, the signature of a spinlock retry loop. Named frame deferred to the next pass
+(release-binary ICF folding makes any name from that binary unreliable per this file's own standing
+warning) — tentatively associated with the standing `SafeZoneAllocator::alloc`/`dealloc` spinlock
+suspicion, NOT yet confirmed. Also ported (real, low-risk, did not alone fix this case): `sys_wait4`'s
+thread-based specific-pid branch (`process.rs:2468`) was missing the bounded-repoll/`Interrupted`-
+recheck its siblings got 21st/24th pass.
+
+**60th pass (2026-09-23) — the tentative 59th-pass suspicion (`SafeZoneAllocator`'s spinlock) was
+WRONG; the real mechanism, confirmed with a fully-named debug-build stack trace, is a DIFFERENT,
+previously-unexamined spinlock one layer up: `RawMutex`'s own internal `WaiterQueue::with_lock`.**
+
+Built the DEBUG binary (`cargo build -p litebox_runner_linux_on_windows_userland`, no `--release`)
+and repeated `.wfgy/de_only.sh` under `LITEBOX_PROCESS_FORK=1`. `cdb -pv` (non-invasive attach,
+`_NT_SYMBOL_PATH` pointed at `target/debug` so the shipped `.pdb` actually resolves symbols — the
+59th pass never did this) on the process hosting the stuck exit path, three independent snapshots
+spanning 40+ real seconds, all byte-identical `Child-SP`, only the micro-offset inside one function
+moving. The full named stack (innermost first):
+
+`core::sync::atomic::Atomic<bool>::compare_exchange_weak` <- `litebox_platform_windows_userland::
+WaiterQueue::with_lock<...block_or_maybe_timeout::Registration...>` <- `RawMutex::
+block_or_maybe_timeout` <- `impl$27::block` <- `litebox::sync::mutex::SpinEnabledRawMutex::
+lock_contended` <- `..::lock` <- `litebox::sync::mutex::Mutex<..Vec<(i32, Arc<Process>)>..>::lock`
+<- `litebox_shim_linux::syscalls::process::Process::adopt_children` <- `litebox_shim_linux::Task::
+prepare_for_exit` <- `litebox_shim_linux::impl$21::drop` (LinuxShimEntrypoints) <-
+`litebox_platform_windows_userland::run_thread_with_fork_verification`
+
+i.e. exactly the guest exit path (`Task::prepare_for_exit` -> `adopt_children`, reparenting orphans)
+that the 58th/59th passes already knew never logs again -- this thread is not blocked on a real
+Win32 wait at all, it is spinning forever trying to ACQUIRE `WaiterQueue`'s own internal
+`lock: AtomicBool` (a `compare_exchange_weak` retry loop with no OS wait), because some OTHER caller
+already set that same flag to `true` and never cleared it.
+
+**Root cause, confirmed by reading `WaiterQueue::with_lock`'s source (`litebox_platform_windows_
+userland/src/lib.rs`) before touching it**: the function acquired the spin-flag, called the
+caller-supplied closure `f`, and only THEN executed `self.lock.store(false, Release)` as a plain
+statement -- no RAII guard. `RawMutex::wake_many` (called on every unlock of every contended mutex
+in the whole process) passes a closure that calls `WaiterQueue::drain_locked`, which builds a
+`Vec<WaiterRecord>` via `Vec::new()` + `.push(..)` -- an ordinary heap allocation through this
+process's own `#[global_allocator]` (`SLAB_ALLOC`, `litebox::mm::allocator::SafeZoneAllocator`). If
+that allocation ever panicked -- and `SafeZoneAllocator::alloc`/`dealloc`'s own `OutOfMemory`/
+`InvalidLayout`/deallocate-failure branches DID panic, via `.expect(msg)`/`panic!("{layout:?}")`,
+while `self.slab_allocator.lock()`'s own guard was held -- the panic unwound straight through
+`with_lock`'s stack frame and past the un-guarded `store(false, ..)`, permanently wedging
+`WaiterQueue::lock` at `true`. The panicking OS thread itself survived (caught by the per-task
+`catch_unwind` wrapper every guest task already has, visible in literally every stack trace this
+whole investigation has captured) -- so this was never a dead holder in `RawMutex`'s own sense
+(`OpenProcess`/`GetExitCodeProcess` would report that thread's process as perfectly healthy
+forever); it is a purely structural missing-panic-safety bug, one layer below `RawMutex` itself.
+
+**Fix** (`61c235e`): `WaiterQueue::with_lock` now releases via a `litebox::utils::defer` guard (the
+same idiom this file already uses elsewhere, e.g. `ThreadHandle::interrupt`'s `_resume_guard`), so
+the release runs on every exit path, panic included. Defense in depth: every
+`SafeZoneAllocator::alloc`/`dealloc` failure panic that used to format a message is now a plain
+`&'static str`-only `panic!` (no `{}` interpolation, so it can never reach `format!` and therefore
+can never recurse into this allocator no matter which lock -- guarded or not -- happens to be held
+when it fires), mirroring the allocation-free-failure discipline `WindowsUserland::alloc`'s own
+`CreateFileMappingW` failure path already established.
+
+**Verification, honestly incomplete**: the PRE-fix hang was cleanly and unambiguously reproduced
+and root-caused (three clean cdb samples, healthy 3-4GB free RAM at the time, one single thread
+permanently frozen, zero forward motion). POST-fix, re-verification in the same session was
+confounded by this exact repro's own well-documented, SEPARATE per-process RAM cost (Track B item 1
+below) -- every debug-build attempt fell to 1-3GB free within about a minute of `DE_LAUNCHED_DIRECT`
+regardless of this fix, and under that pressure, similar-looking `WaiterQueue::with_lock` contention
+was observed on OTHER, unrelated `RawMutex` instances too (e.g. `litebox::net::Network`'s own
+mutex, via `wake_many`'s release path) -- consistent with genuine system-wide CPU/memory starvation
+making ordinary brief contention look artificially prolonged, not with the exact fixed mechanism
+recurring (a fresh binary confirmed to contain both fixes was used throughout). One clean debug-build
+sample of the ORIGINAL frozen thread, taken shortly after the fix under still-healthy RAM, showed
+its retry-loop micro-offset actively changing between samples (progress) rather than the pre-fix
+dead freeze -- suggestive but not a full `DE_UP`/`xfwm4`-launch confirmation. `_NET_SUPPORTING_WM_CHECK`
+was not observed to fire in this pass. Pickup: re-verify on a host that can sustain several minutes
+of a debug-build boot without falling below ~4GB free (or fix Track B item 1's per-process RAM cost
+first), then confirm `xfconfd`/`xfwm4` actually spawn and `_NET_SUPPORTING_WM_CHECK` gets set.
