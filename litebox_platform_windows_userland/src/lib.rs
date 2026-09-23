@@ -6669,6 +6669,23 @@ impl RawMutex {
             // SAFETY: `event` is this thread's own valid, owned-for-its-lifetime event handle.
             let rc = unsafe { Win32_Threading::WaitForSingleObject(event, chunk_ms) };
 
+            // Repair `GS_BASE` here too, same rationale as `syscall_handler`'s own call to this
+            // (see `WindowsUserland::restore_thread_gs_base_if_cleared`'s doc comment and the
+            // investigation this call site closes a gap in). `block()`'s caller (e.g. a real
+            // `vfork()`'s `wait_for_vfork_done`, which can legitimately block here for many
+            // seconds while sibling threads/processes fork/exec/exit around it -- exactly the
+            // "nested vfork() kernel-transition pressure" this codebase has twice independently
+            // observed corrupting GS_BASE, see `docs/AGENTS_ARCHIVE_2026-09-03.md`'s converged
+            // finding) never re-enters `syscall_handler` while blocked here, so that entry-point
+            // repair cannot cover this window -- but THIS loop already makes its own repeated,
+            // real kernel round-trips (`WaitForSingleObject`, chunked to `LIVENESS_CHECK_INTERVAL`
+            // even for a nominally-infinite wait), each one a legitimate place for the same
+            // Windows scheduling-pressure quirk already documented for FS_BASE/GS_BASE to strike.
+            // Checking after every chunk closes the gap for every `RawMutex::block`/`block_or_
+            // timeout` caller in the whole codebase, not just vfork, at the cost of one cheap
+            // `rdgsbase`-and-compare per wait wakeup/liveness-check tick.
+            WindowsUserland::restore_thread_gs_base_if_cleared();
+
             match rc {
                 Win32_Foundation::WAIT_OBJECT_0 => break Ok(UnblockedOrTimedOut::Unblocked),
                 Win32_Foundation::WAIT_TIMEOUT => {
