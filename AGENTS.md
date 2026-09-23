@@ -97,10 +97,22 @@ target `litebox_shim_linux::syscalls::{process,unix}=debug` on `de_only.sh` inst
   unrelated entry; every accessor in `litebox/src/fd/mod.rs` returns `None` rather than panicking
   (`faa74c6`) — the same class as the `Network::queued_for_closure`/`Pipes.litebox`/`FutexManager`
   bugs before it.
-- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot no longer crashes on RAM** — plateaus ~3.1-3.3GB
-  free; still check `FreePhysicalMemory` throughout. **Confirm the release binary's mtime postdates
-  the newest relevant commit before trusting a boot result** (57th pass caught a ~1hr-stale binary
-  this way). See Track B item 1.
+- **A `de_only.sh`/`LITEBOX_PROCESS_FORK=1` boot's RAM floor is NOT a fixed ~3.1-3.3GB plateau —
+  it depends on concurrent HOST load and can fall well below 1GB free** (73rd pass, 4/4 independent
+  `de_only_xcensus_seed2.tar` boots: consistent collapse to 500MB-1.5GB free within ~10-20s of
+  `xfce4-session`'s own fork tree starting, on a host where unrelated processes — other Claude Code
+  sessions, browser, etc. — independently held ~9 of 15GB total RAM). `taskkill /IM
+  litebox_runner…exe /F /T` reliably recovers full RAM even from a <500MB-free state; still check
+  `FreePhysicalMemory`/`Get-Counter '\Memory\Available MBytes'` throughout and kill on a FALLING
+  TREND, not a fixed number. **Confirm the release binary's mtime postdates the newest relevant
+  commit before trusting a boot result** (57th pass caught a ~1hr-stale binary this way). See Track
+  B item 1.
+- **`de_only_xcensus_seed2.tar` (NOT the plain `de_only_seed.tar`) reaches `DE_LAUNCHED_DIRECT` in
+  ~10-15s real time and does NOT hit the 71st-pass `gpg-agent`/`iceauth`/`ssh-agent` dead end** —
+  confirmed 4/4 clean runs, 73rd pass. The "never `de_only.sh`" pickup note below is stale for THIS
+  specific seed; it reaches the exact same `xfwm4`-launch state as `webtop_stack.sh` roughly 10x
+  faster and with a much smaller total RAM footprint by the time `xfwm4` execve's, making it the
+  preferred harness for any future capture attempt at this symptom.
 - **A guest diagnostic must reach the console through a PIPE or `$( )`, never a bare file redirect**
   — `cmd > /tmp/f` + parent read fails silently under `LITEBOX_PROCESS_FORK=1` (child writes its
   own writable-layer snapshot). `cmd 2>&1 | sed 's/^/[tag] /' &` is the pattern for streaming
@@ -135,6 +147,16 @@ target `litebox_shim_linux::syscalls::{process,unix}=debug` on `de_only.sh` inst
   the true cause of the 70th pass's X11-reassembly desync (full mechanism/fix: pass-history below,
   71st entry) — `do_read`'s socket branch now has its own hex-preview diagnostic on a DEDICATED
   `litebox_diag::socket_read` target (not nested under heavy `syscalls::file`).
+- **`run_on_raw_fd`'s dispatch (`lib.rs:1702`) has TWO separate socket-fd closures — `net` (generic
+  Network/TCP) and `unix` (`UnixSocketSubsystem`, real AF_UNIX) — and the 71st pass's own
+  `litebox_diag::socket_read` diagnostic only instrumented `net`.** X11's real Xtrans transport (and
+  D-Bus) is AF_UNIX, so every one of those reads dispatches through `unix` instead, which called
+  `file.recvfrom` with zero logging — a live boot captured under the 71st pass's own filter (`xfwm4`
+  alive, `WM_S0` claimed, 16 windows per XCENSUS) produced ZERO `socket_read` events, proving this
+  was the actual capture gap, not an env/filter mistake. Fixed 73rd pass (`fc830d1`,
+  `litebox_shim_linux/src/syscalls/file.rs`): mirrors the same hex-preview event onto the `unix`
+  closure. `sys_readv`/`sys_pread64`/`sys_preadv` all delegate to `sys_read` (`file.rs:2882,2062`),
+  so no other read-family syscall needs separate instrumentation.
 - **`FlushingStderr` (`litebox_runner_linux_on_windows_userland/src/lib.rs`) buffers one whole
   tracing EVENT and does exactly one locked `write_all`+`flush`, in `Drop`** — the prior version's
   separate lock/write/lock/flush left a real interleaving window across concurrent guest threads
@@ -227,6 +249,31 @@ map" below). Condensed current-state trail:
   XKB event fires at the retrigger boundary remained OPEN going into the 72nd pass.
 - **72nd**: see top of file for outcome (this pass's own findings are recorded there first, ahead
   of the archived narrative, per the "claim nobody could point at gets deleted" rule above).
+- **73rd**: found+fixed the REAL reason the 71st-pass diagnostic captured zero `xfwm4` traffic — the
+  `unix` closure gap above (`fc830d1`). Live-confirmed the fix works (real AF_UNIX D-Bus SASL
+  handshake traffic captured for the first time, 165 events on one boot). Added
+  `litebox_shim_linux::syscalls::process=debug` (`DIAG_TIMELINE execve`) to directly identify
+  `xfwm4`'s own guest pid rather than guessing from byte content — worked cleanly, 4/4 attempts.
+  **But across those same 4 independent captures (2 `webtop_stack.sh`, 2 `de_only_xcensus_seed2.tar`,
+  both under `LITEBOX_PROCESS_FORK=1`), `xfwm4` consistently made EXACTLY 2 reads total — a D-Bus
+  SASL handshake (`OK <cookie>`/`AGREE_UNIX_FD`) on its first socket fd — and never progressed
+  further within the observable window (up to ~9s post-exec in the longest attempt), including zero
+  X11 ConnSetup bytes ever captured.** Host RAM fell from a 6-8GB starting point to under 1.5GB free
+  within 10-30s of `xfce4-session`'s fork tree starting, every single attempt (see the RAM-floor
+  correction above) — most likely explanation is CPU/scheduling starvation from the fork storm
+  itself (15-22 concurrent `litebox_runner…exe` processes racing for CPU on a host already down to
+  ~6GB total free from unrelated concurrent load) stalling `xfwm4`'s own forward progress, i.e. THE
+  ACT OF CAPTURING under `LITEBOX_PROCESS_FORK=1` on a loaded host may itself be perturbing the exact
+  timing being investigated — an observer-effect risk in the same family as the already-documented
+  "`cdb` attach perturbs the Xvfb race" finding (32nd pass). A `LITEBOX_PROCESS_FORK`-free
+  (thread-based) attempt this same pass hit a DIFFERENT, unrelated failure (`XVFB_FAILED`/
+  `DBUS_FAILED` immediately, before ever reaching `xfce4-session`) despite the standing
+  `GLIBC_TUNABLES` workaround being passed — not investigated further this pass. **The XKB-event
+  question remains genuinely OPEN — no evidence either way, not a refutation.** Pickup: a genuinely
+  QUIET host (confirm via `Get-Process | Sort WorkingSet -Descending` that no other heavy process is
+  competing) is likely required before any further live-capture attempt under `LITEBOX_PROCESS_FORK
+  =1` can outrun the RAM/CPU collapse long enough to reach `xfwm4`'s steady-state retrigger loop;
+  `de_only_xcensus_seed2.tar` (see above) is the right harness once host conditions allow it.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -245,14 +292,19 @@ both Xvfb SIGSEGVs.
    `DBUS_FAILED`'s regression-guard cause, 67th, stable through 68th, 0 fires). `setNetSupportedHint`
    is the one still-open blocker, narrowed to a ~10.7s periodic `GetAllProperties(.../"/xfwm4/
    custom")` retrigger matching `xfwm4`'s only periodic-reload path (`cb_keys_changed`→
-   `keymap_reload()` via GDK's event-only `keys-changed` signal).** Pickup, per the 72nd-pass
-   outcome recorded at the top of this file: if that pass didn't reach a definitive answer, repeat
-   its method — `webtop_stack.sh` (never `de_only.sh`, gpg-agent dead end below) with
-   `litebox_diag::socket_read=debug`, patient past the known ~170s `SELKIES_PORT_SELFTEST_FAILED`
-   window (RAM stays healthy, 71st/72nd), reassemble `sys_recvmsg`+`sys_read` previews together in
-   file-line order, verify a genuine ConnSetup reply before trusting anything downstream, check for
-   `MappingNotify`(34)/XKB at t≈9.22/20.47/31.27/42.19s; if absent, `LD_PRELOAD` on
-   `g_dbus_connection_call_sync`/`g_main_context_iteration` (30th-pass `getenv_probe.so` technique).
+   `keymap_reload()` via GDK's event-only `keys-changed` signal).** Pickup, per the 73rd-pass outcome
+   above: the real diagnostic gap is now fixed and `de_only_xcensus_seed2.tar` (NOT the plain
+   `de_only_seed.tar` the old "gpg-agent dead end" note below was about) is the right harness — 10x
+   faster to `xfwm4`-launch than `webtop_stack.sh` — but the 73rd pass's 4/4 attempts all lost the
+   capture window to host RAM/CPU collapse before `xfwm4` progressed past its first D-Bus SASL
+   handshake, on a host with heavy unrelated concurrent load. **Confirm a genuinely quiet host first**
+   (`Get-Process | Sort WorkingSet -Descending`, no other heavy process competing), then repeat with
+   `litebox_diag::socket_read=debug` + `litebox_shim_linux::syscalls::process=debug` (the latter
+   gives `xfwm4`'s exact guest pid via `DIAG_TIMELINE execve`, no more guessing from byte content),
+   reassemble `sys_recvmsg`+`sys_read` previews together in file-line order, verify a genuine
+   ConnSetup reply before trusting anything downstream, check for `MappingNotify`(34)/XKB at
+   t≈9.22/20.47/31.27/42.19s; if absent, `LD_PRELOAD` on `g_dbus_connection_call_sync`/
+   `g_main_context_iteration` (30th-pass `getenv_probe.so` technique).
    `ps`/`/proc` is blind to cross-process-forked siblings (65th) — re-weigh any `ps`-based
    conclusion. Secondary: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd) is why
    `de_only.sh` specifically dead-ends at `iceauth`+`ssh-agent`+`gpg-agent` pre-`xfce4-session`
