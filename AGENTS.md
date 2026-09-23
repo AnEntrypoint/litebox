@@ -8,11 +8,13 @@ for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th,
-81st, 83rd and 85th passes (pass-history section below; 26th-69th full narrative:
-`docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-86th full narrative, including each pass's own complete
-evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 85th pass (drained
-the 83rd/84th passes' own full bug-by-bug writeups to the archive, ~50KB→~41KB, now that this file
-was well past its own 30KB threshold).
+81st, 83rd, 85th and 88th passes (pass-history section below; 26th-69th full narrative:
+`docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-87th full narrative, including each pass's own complete
+evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 88th pass (drained
+the 83rd-87th passes' own full bug-by-bug writeups to the archive, now that
+`lazy_fork_commit.rs`'s own module doc comment serves as the canonical detailed record for that
+mechanism; ~53.6KB→~44KB, still above the 30KB threshold — further compaction of older,
+already-CLOSED sections is the next pass's own pickup if this file crosses 30KB again).
 
 ## The cheap repro — start here
 
@@ -267,159 +269,90 @@ map" below). Condensed current-state trail:
   Net effect: narrowed the whole investigation down to one remaining candidate, genuine per-page
   lazy population. Full Angle A/B evidence, exact XFCE client list, exact before/after process
   counts: archive.
-- **83rd** — IMPLEMENTED the lazy (reserve-then-commit-on-first-fault) primitive
-  (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`, `LITEBOX_LAZY_FORK_COMMIT=1`,
-  default OFF) the 79th/81st/82nd passes converged on. Real, measured win for the dominant
-  fork-then-`execve` case (debug: 103ms eager vs 34ms mixed; both builds 5/5 clean). Found a
-  genuine, 100%-reproducible crash for fork-WITHOUT-`execve` (a bash `(...)` subshell) — root cause
-  not found this pass. Full design, ordering-bug fix, isolation-POC numbers: archive.
-- **84th** — root-caused the 83rd pass's crash to TWO real, general cross-process-fork bugs, both
-  FIXED and live-verified (neither is lazy-commit-specific): (1) a forked child's `sys_mmap`
-  allocator had no record of `copy_one_group`'s own 64KiB alignment padding, letting a fresh mmap
-  silently collide with it (`litebox/src/mm/linux.rs`'s `Vmem::new_adopting_existing_memory`, now
-  pre-inserts a `VM_OWN_FORK_PADDING` placeholder per group span); (2) a cross-process-fork child's
-  `SignalState` never inherited the parent's `sigreturn_trampoline` address (unlike the thread-based
-  path), so `LinuxShimEntrypoints::exception`'s trampoline recognition could never match
-  (`adopt_forked_process` now takes it via a new env var). With both landed, the subshell repro runs
-  clean 5/5 WITHOUT the lazy flag — but STILL crashed 5/5 WITH it (Bug 3, re-scoped, not fixed this
-  pass): the fault reached `vectored_exception_handler` and got redirected toward
-  `exception_callback`, but `LinuxShimEntrypoints::exception()` was never observably entered.
-  **Methodological finding**: gated, low-volume diagnostics added directly inside
-  `vectored_exception_handler` measurably regressed the (otherwise-fixed) non-lazy case too — any
-  future instrumentation there needs an A/B test against the non-lazy repro before being trusted.
-  Full bug mechanics, exact diffs: archive.
-- **85th** — root-caused and FIXED Bug 3 (no debugger needed — exact address arithmetic against a
-  `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`/`LITEBOX_DIAG_FATALDUMP=1` capture was sufficient): the child's
-  own live `%rsp` at fork time landed INSIDE the same lazily-reserved (never-yet-committed) stack
-  group `classify_lazy_eligible_groups` was already making lazy — confirmed via ZERO
-  `[lazy_fork_commit] fault #N serviced` lines ever printing before the crash. Windows delivers
-  EVERY exception with `CONTEXT.Rsp` set to whatever the CPU held at fault time, not only ones whose
-  own fault address is in a lazy range; a fresh child's very first exception is guaranteed to hit
-  this. Fix: `classify_lazy_eligible_groups` (`lazy_fork_commit.rs`) now takes the child's fork-time
-  `%rsp` (threaded from `spawn_process_fork_child`'s `full_gprs.rsp`) and excludes whichever group
-  contains it, leaving every OTHER pure-data group lazy. **Verified**: the subshell repro's ORIGINAL
-  crash signature is gone, 5/5, both debug and release; fork-then-`execve` stays clean 5/5, no
-  regression. **Bug 4 (OPEN, found while re-verifying the fix)**: the SAME subshell repro now runs
-  further (lazy faults ARE serviced, with real, non-zero-filled parent data) but still fails 5/5,
-  both builds, with a NEW signature: `Fatal glibc error: malloc.c:2601 (sysmalloc): assertion
-  failed` — real heap corruption. Root cause: `lazy_commit_veh` reads the PARENT's LIVE memory
-  (`ReadProcessMemory`) at WHATEVER MOMENT the child happens to touch a page, which for a
-  fork-without-`execve` child can be long after `fork()` returned control to the parent's own guest
-  thread — a genuine TOCTOU gap the eager `copy_one_group` path (synchronous, while the parent is
-  still blocked inside its own `fork()` syscall) never had. The parent's continued heap
-  mutation (malloc/free) after `fork()` returns can be read mid-mutation by a later lazy fault,
-  corrupting the child's heap bookkeeping — exactly the observed assertion shape. No fix attempted
-  this pass; needs either a fork-time snapshot into a buffer (not a live parent read) or genuine
-  OS-level COW between the two Windows processes — real design work, not a quick patch. Full
-  mechanics, exact repro logs, both candidate fix directions: archive and
-  `lazy_fork_commit.rs`'s own module doc comment. `LITEBOX_LAZY_FORK_COMMIT` stays default OFF —
-  Bug 4 means it is STILL not safe for a real boot (a real desktop forks many long-lived daemons
-  that don't `execve()` and run concurrently with a parent still mutating its own heap — exactly
-  Bug 4's trigger shape). `DE_UP` not attempted this pass.
-- **86th** — investigated both of Bug 4's candidate fixes in depth (source reading, no code
-  changed), concluded NEITHER is viable as a net improvement, found and scoped a THIRD candidate,
-  also not implemented. Re-verified live (debug, unmodified binary) that nothing had drifted: flag
-  unset stays clean, flag set still hits the exact documented `malloc.c:2601` signature.
-  **Candidate 2 (real section-object COW) ruled out**: every guest allocation
-  (`WindowsUserland::allocate_pages`/`deallocate_pages`/`update_permissions`) is built on private
-  `VirtualAlloc2`, never a section — retrofitting COW needs section-backing from allocation time,
-  not fork time (no "adopt existing private memory into a section" API exists; the only way is to
-  copy the bytes, which is the cost this mechanism exists to avoid). Concrete evidence this is a
-  disruptive rewrite, not a scoped fix: `deallocate_pages` (`lib.rs`:~8469) already explicitly
-  refuses to decommit a `MEM_MAPPED` view (Windows can't partially unmap a section view the way
-  Linux `munmap` can unmap a sub-range); this exact codebase's own `SHARED_KERNEL_HEAP_BASE` fight
-  (`lib.rs`:~10355) already hit `ERROR_INVALID_ADDRESS` on every `SEC_RESERVE`/placeholder variant
-  tried, ASLR placement failures, and an eager-full-commit-charge trap, for ONE fixed-size, fixed-
-  address region — the guest VMA allocator handles an open-ended number of dynamically-placed,
-  `MAP_FIXED`-capable regions, the same problem at much larger scope. **Candidate 1 (fork-time
-  snapshot) ruled out**: a race-free snapshot must be captured synchronously while the parent is
-  blocked in its own fork syscall (same window the eager path already uses) — which means reading
-  every byte of every eligible group at fork time regardless of whether the child ever touches it
-  or is about to `execve()`, since nothing distinguishes the two cases at fork time. That forfeits
-  the 83rd pass's own measured win (103ms eager vs 34ms mixed, debug) for the dominant
-  fork-then-`execve` case (~85% of forks, 79th pass) — a snapshot design would make EVERY fork pay
-  full eager-read cost unconditionally, strictly worse than just keeping such groups eager.
-  **Candidate 3 (new, found this pass): software COW via guard pages** — `VirtualProtect` an
-  eligible group `PAGE_READONLY` in the parent at fork time (O(1), not O(bytes)); a new parent-side
-  VEH catches the parent's own next write, snapshots the one page, unprotects it, lets the write
-  retry; the child's existing VEH prefers a recorded snapshot over a live `ReadProcessMemory` when
-  one exists. Correctness-sound for exactly ONE live fork child, but a real boot needs up to 6
-  concurrent children (`live_cross_process_fork_children`'s cap, 76th pass) forking from the same
-  continuously-mutating parent — a single global protect/snapshot/unprotect cycle is provably wrong
-  across 2+ overlapping fork generations (a later child can be served an earlier child's stale
-  snapshot instead of the parent's true value as of its own later fork). Closing this needs a real
-  multi-generation/multi-version COW protocol — the same complexity class as the mechanism that
-  already took three passes (83rd-85th) to get right in its simpler, single-direction form.
-  **Not implemented — this pass's own conclusion is that shipping the full multi-generation version
-  without an equivalent live-debug budget risks a silently-wrong-data bug, worse than today's honest
-  crash.** Narrower first cut identified for a future pass: fall back to eager copy the moment a
-  SECOND concurrent live fork child would otherwise need to share one protected page, keeping the
-  fast path only for the common single-active-fork-child moment. `LITEBOX_LAZY_FORK_COMMIT` stays
-  default OFF, unchanged; no runtime behavior modified this pass; `DE_UP` not attempted. Full
-  writeup: `lazy_fork_commit.rs`'s own module doc comment (this pass's own section).
-- **87th** — deliberate fork-in-the-road pass (Path A vs. Path B). **Judgment call: neither pure
-  Path A (implement the full multi-generation COW protocol) nor pure Path B (abandon lazy-fork-
-  commit for a different lever) — both real Path B angles investigated this pass closed with real
-  evidence rather than opening a new lever, while Path A's own scope, worked through in full,
-  turned out smaller and more precisely buildable than "full multi-generation" once the 86th
-  pass's own single-generation Candidate 3 sketch was pushed to a real design.** Chose to spend
-  this pass refining that design to genuinely buildable (closing two real gaps the 86th pass's
-  sketch left open) rather than attempting to implement it, because a THIRD gap found while doing
-  so (interaction with `VIRTUAL_PROTECT_LOCK`/`fork_verify` VEH machinery — real, but a solved
-  precedent, not a blocker) confirmed this still needs the same live-`cdb`-verification budget
-  each of the 83rd-85th passes spent a full pass on, which this pass did not have room for
-  alongside the Path B evidence-gathering below. No runtime behavior changed this pass.
-  - **Path B angle closed with real evidence, not speculation**: re-derived whether Windows'
-    commit LIMIT (as opposed to physical RAM) is any part of the crater, live, via
-    `Get-CimInstance Win32_OperatingSystem`/`Win32_PageFileUsage`/`Get-Counter '\Memory\Commit
-    Limit'` at pass start — Commit Limit ~43.9 GB (15.25 GB physical + an automatically-managed
-    ~25.7 GB pagefile) against only ~18.1 GB Committed Bytes in use, i.e. ~25 GB of already-unused
-    commit headroom exists before any boot attempt starts. The 76th-82nd passes' own crater
-    measurements (~7-8 GB additional committed at the crater) land nowhere near this limit even
-    stacked on top of the pre-boot baseline — confirms the crater is genuine PHYSICAL working-set
-    demand (thrashing/eviction as available RAM falls, matching AGENTS.md's own standing
-    "FreePhysicalMemory falling trend" guidance), never a commit-limit rejection. **Closes the
-    "grow the pagefile" idea as a lever** — there is no commit-limit problem to fix by growing it.
-  - **Path B angle (admission-cap tuning) reconfirmed closed, not reopened**: read the 80th pass's
-    own conclusion in full before doing anything — "the crater is driven by CUMULATIVE committed
-    memory across the boot's whole fork history, not peak instantaneous concurrency" — and found
-    no new evidence this pass that would change that; not re-litigated without a genuinely new
-    angle, per this file's own standing instruction not to redo closed work.
-  - **Design refinements landed in `lazy_fork_commit.rs`'s own module doc (this pass's own new
-    section, real and substantive, not implemented as code)**: (1) the 86th pass's own Candidate 3
-    sketch scoped its guard/claim state as tree-wide/global; working the argument through shows
-    the actual correctness unit is PER-PARENT-PROCESS (two different parents' fork relationships
-    touch disjoint memory and can never race each other), which needs no shared arena/`SharedArc`/
-    new `SharedKernelStateSlot` at all — ordinary process-local statics for the claim, one new env
-    var (mirroring the existing `FORK_CHILD_PARENT_PID_ENV_VAR` pattern) carrying the parent's own
-    snapshot-table address for the child to `ReadProcessMemory` (protection state doesn't gate
-    `ReadProcessMemory`, only committed-and-not-`PAGE_NOACCESS` does), and a non-blocking
-    `WaitForSingleObject(h, 0)` liveness poll on the recorded owner pid to reclaim a stale slot —
-    no new IPC primitive needed. (2) the sketch's "child prefers a recorded snapshot over a live
-    read" step has an unstated TOCTOU of its own (the parent's snapshot-publish could land in the
-    exact window between the child's flag check and its `ReadProcessMemory` call) — closed with an
-    explicit double-checked-state protocol: read live FIRST, re-check the snapshot flag AFTER,
-    prefer the snapshot if it is now set (never the reverse); sound because the flag's 0->1
-    transition is one-shot and globally visible the instant it happens, so "still 0 after my read"
-    is a truthful witness that no write occurred during the read window. (3) a genuinely new
-    finding not in the 86th pass's writeup at all: a parent-side write-fault VEH for this mechanism
-    would need to coordinate with the EXISTING `VIRTUAL_PROTECT_LOCK` (guards every `VirtualProtect`
-    against guest-mapped memory process-wide, landed after a real live `labwc` SIGSEGV from two
-    unlocked protection flips racing) and `fork_verify`'s own AV-path healing — checked against
-    precedent (`fork_verify::write_usize_fault_tolerant`), a plain blocking `.lock()` on
-    `VIRTUAL_PROTECT_LOCK` is the codebase's own already-shipped pattern even from inside VEH
-    dispatch, so this is a solved problem to follow, not a new one to invent — but confirming that
-    is itself part of why this needs a real verification pass, not a same-day landing.
-  - **Concrete pickup, unchanged in substance from the 86th pass but now precisely scoped**:
-    implement exactly the refined design above, gated behind a new, additional, default-OFF flag
-    (`LITEBOX_LAZY_FORK_GUARD_COW=1`, on top of `LITEBOX_LAZY_FORK_COMMIT=1`) so it cannot affect
-    the already-working fork-then-`execve` path even if buggy; verify 5/5 on both existing repros
-    (regression check, flag off; fix check, flag on) PLUS a new concurrent-two-children-one-parent
-    repro (this codebase does not yet have one), both debug and release, before considering `DE_UP`
-    with either flag on. `LITEBOX_LAZY_FORK_COMMIT` stays default OFF; `DE_UP` not attempted this
-    pass (unchanged reason: the flag remains unsafe for a real boot). Host RAM ~5.9-6.1GB free
-    throughout; only `cargo check -p litebox_platform_windows_userland` was run (clean), no live
-    boot attempted (no runtime behavior to verify — doc-only change).
+- **83rd-87th (compacted; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "83rd-87th pass full
+  narrative" section)** — implemented lazy (reserve-then-commit-on-fault) fork memory
+  (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`, `LITEBOX_LAZY_FORK_COMMIT=1`), a
+  real measured win for the dominant fork-then-`execve` case; found and fixed three real bugs
+  along the way (two general cross-process-fork bugs unrelated to laziness itself — a
+  guest-mmap/64KiB-alignment-padding collision, and forked children never inheriting the parent's
+  `sigreturn_trampoline` address — plus the lazy-specific active-`%rsp`-group bug); found, but did
+  NOT fix, Bug 4: a genuine TOCTOU — a lazily-serviced page fault reads the parent's CURRENT
+  memory, not a true point-in-time-at-fork snapshot, unsafe for fork-WITHOUT-`execve` (subshells/
+  daemons) since the parent can keep mutating its own heap after `fork()` returns. Investigated and
+  ruled out two fix candidates (real section-object COW: infeasible without a disruptive allocator
+  rewrite; fork-time snapshot: forfeits the dominant case's own win) before converging on and fully
+  designing a THIRD: single-generation software COW via guard pages, correctness-sound only for
+  exactly one outstanding (fork-time-to-fully-serviced) lazy child per parent at a time — closed
+  design gaps: per-parent-process (not tree-wide) claim scope; a double-checked-state read
+  protocol closing the design's own TOCTOU; and `VIRTUAL_PROTECT_LOCK`/`fork_verify`-VEH
+  coordination, matched against the codebase's own `write_usize_fault_tolerant` precedent. Both
+  `LITEBOX_LAZY_FORK_COMMIT` and the not-yet-existing guard-cow flag stayed default OFF throughout;
+  `DE_UP` not attempted in any of these passes.
+- **88th — IMPLEMENTED the single-generation guard-page COW design, gated behind a SEPARATE,
+  additional flag `LITEBOX_LAZY_FORK_GUARD_COW=1` (on top of `LITEBOX_LAZY_FORK_COMMIT=1`), both
+  default OFF. Found+FIXED a real, live, guard-cow-specific hang (Bug 5) via an actual boot
+  attempt, then re-ran the boot and reached further than any prior pass without cratering RAM.**
+  Full mechanism, exact code locations, correctness argument, Bug 5's own root-cause writeup:
+  `lazy_fork_commit.rs`'s own module doc comment ("88th pass" section) — this entry is the compact
+  summary. Gating: a process-local single-owner slot (`GUARD_COW_OWNER_PID`, CAS-claimed with a
+  placeholder plus a bounded `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`+`GetExitCodeProcess`
+  liveness reclaim, matching `WindowsUserland::is_process_alive`'s own existing idiom in `lib.rs`)
+  — a fork whose parent already has another live, still-outstanding guarded child gets ZERO lazy
+  groups at all (forced fully eager for every group, never a mix of guarded and unguarded lazy).
+  When the claim succeeds, the parent `VirtualProtect`s its own already-committed pages in each
+  lazy group to `PAGE_READONLY` (per-`VirtualQuery`-region) and installs (once, lazily) a
+  write-fault VEH that snapshots a page on the PARENT's own first post-fork write to it, publishes
+  `state=1` under `VIRTUAL_PROTECT_LOCK` (matching `fork_verify::write_usize_fault_tolerant`'s own
+  established locking-from-VEH precedent), and restores the page's real prior protection so the
+  write retries and succeeds. The child's lazy fault handler does the double-checked-state read
+  exactly as designed: live `ReadProcessMemory` FIRST, re-check the snapshot slot's `state` SECOND,
+  prefer the snapshot if it is now set (never the reverse).
+  - **Isolated-repro verification (all 5/5, both builds)**: `LITEBOX_PROCESS_FORK=1` alone
+    reconfirmed unchanged; fork-then-`execve` clean with real `parent write-fault captured`/
+    `snapshot preferred over live read` log lines proving genuine engagement; the subshell
+    (fork-without-`execve`) repro — 5/5 killed under `LAZY_FORK_COMMIT=1` alone with the documented
+    `malloc.c:2601` Bug 4 signature — clean under both flags; a NEW two-overlapping-forks-one-parent
+    repro confirms the exact expected `reserve_group_lazy`/`copy_one_group` call split (first child
+    guarded, second forced fully eager, a nested grandchild fork gets its own independent
+    process-local slot), correct output from every child.
+  - **Bug 5 (found via a REAL boot attempt, not an isolated repro — FIXED, live-verified)**: all
+    four isolated repros above passed clean immediately, but attempting the actual
+    `de_only_xcensus_seed3.tar` boot (per this task's own item 8) surfaced a real, guard-cow-
+    specific hang — root at 150+ CPU-seconds, process tree stuck at exactly 2, zero further
+    progress past the second fork; A/B against `LITEBOX_LAZY_FORK_COMMIT=1` alone (stayed low-CPU,
+    exited ~30s, hitting Bug 4's already-documented corruption instead — useful independent
+    confirmation Bug 4 is real on a genuine multi-fork boot too) proved it was guard-cow-specific.
+    Root cause: reclaiming a dead former owner's slot never healed that owner's guard-protected
+    regions first — if the parent had simply never gotten around to writing to a page before that
+    (short-lived, fork-then-execve) child died, it stayed `PAGE_READONLY`; the next claim's own
+    protect walk then re-`VirtualProtect`s the SAME still-protected range, and Win32's `old_protect`
+    out-param faithfully reports the CURRENT (already-read-only) state, poisoning the new claim's
+    own restore target. The parent's first real write to that page then re-faults on the exact same
+    instruction forever — real CPU burned on every exception dispatch, no crash, no progress,
+    indistinguishable from outside the process from a hang. **Fix**: reclaiming a dead owner's slot
+    now heals every region that claim ever guard-protected (restores each to its OWN recorded
+    `old_protect`) BEFORE the new claim's own protect walk can run, using the same lock order
+    `guard_cow_write_fault_veh` itself uses. **Verified**: a cheap, targeted 8-sequential-fork
+    repro exercising exactly this reclaim shape hung before the fix, completes clean after it
+    (`SEQ_DONE`, all forks' own log lines present, zero corruption), both builds; all four original
+    repros re-verified 5/5 clean, both builds, unchanged after landing the fix.
+  - **Real `de_only_xcensus_seed3.tar` boot result after Bug 5's fix**: ran the full ~195s
+    monitoring window WITHOUT cratering and WITHOUT hanging — free RAM held a stable 2.8-4.5GB band
+    (9-16 processes) the entire time, qualitatively healthier than every prior pass's own
+    documented crater (28-29 processes, <1GB free). Real forward progress reached: `DE_ONLY_START`
+    → `XSOCK_WAIT_DONE` → `DBUS_UP` → `DE_LAUNCHED_DIRECT` → `WM_POLL` n=1..12 →
+    `XCENSUS_WINDOWS total=1` (a real X window exists) → the SAME already-documented
+    `DE_FAILED after 60s` (`_NET_SUPPORTING_WM_CHECK` never appearing — a separate, pre-existing,
+    not-yet-root-caused xfwm4 registration gap, unrelated to this mechanism). **`DE_UP` NOT reached
+    this pass** — but the presenting blocker at failure was the pre-existing WM-registration gap,
+    not RAM/process exhaustion, which is itself the real positive result: for this run, the
+    RAM-crater blocker this whole 76th-88th-pass investigation exists to fix was not what stopped
+    the boot. One run, not five (each real boot costs ~3+ minutes; landing+documenting Bug 5's fix
+    and this one clean data point was judged higher value than more boot repetitions within this
+    pass's remaining budget). Both flags stay default OFF pending broader boot verification.
+    **Concrete pickup**: re-verify this boot result 2-4 more times for consistency, then root-cause
+    the pre-existing `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now that RAM is no longer in the way
+    of reaching it — see priority item 1 below for the exact next steps on that gap.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
@@ -437,62 +370,57 @@ both Xvfb SIGSEGVs.
    `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th); the
    writable-layer export-path fallback bug (75th). Admission-control (76th) and the fixed
    per-process alloc floor (77th, ~35-40% reduction) are landed, real, partial mitigations.
-   Session-autostart trimming and zero-byte-skip (82nd) are closed as dead-end levers — neither
-   touches Windows' own `VirtualAlloc2(MEM_COMMIT)` charge. **83rd-85th passes: genuine per-page
-   lazy fork-memory population (`litebox_platform_windows_userland::lazy_fork_commit`,
-   `LITEBOX_LAZY_FORK_COMMIT=1`) implemented, a real measured win for fork-then-`execve` (the
-   dominant real case), and THREE real correctness bugs found+fixed along the way (a guest-mmap/
-   64KiB-padding collision; forked children not inheriting the parent's `sigreturn_trampoline`;
-   the lazy classifier making the child's own live stack group lazy, breaking exception delivery
-   before its first fault could ever be serviced) — but a FOURTH, structural bug (Bug 4, 85th pass)
-   remains OPEN: `lazy_commit_veh` reads the parent's memory LIVE, at whatever moment the child
-   touches a page, which races the parent's own continued heap mutation for a fork-WITHOUT-`execve`
-   child — confirmed live as a deterministic `glibc malloc.c:2601` heap-corruption SIGABRT, 5/5,
-   both builds.** `LITEBOX_LAZY_FORK_COMMIT` stays default OFF — Bug 4 makes it genuinely unsafe for
-   any real boot (a real desktop forks many long-lived daemons that don't `execve()` and run
-   concurrently with a parent still mutating its own heap, exactly Bug 4's trigger shape). Full
-   mechanics of all four bugs: archive and `lazy_fork_commit.rs`'s own module doc comment. **86th
-   pass ruled out both of Bug 4's originally-proposed fixes** (real section-object COW needs a
-   disruptive full-allocator rewrite — every guest allocation is private `VirtualAlloc2`, never
-   section-backed, and this codebase's own `SHARED_KERNEL_HEAP_BASE` fight already shows how fragile
-   that retrofit is even for one fixed region; a fork-time snapshot buffer is race-free only if
-   captured synchronously, which forfeits the dominant fork-then-`execve` case's entire measured win)
-   **and scoped a third: software COW via parent-side guard pages (`VirtualProtect(PAGE_READONLY)` +
-   a parent-side VEH mirroring the existing child-side one), sound for ONE live fork child but a real
-   multi-generation/multi-version design problem for the 6-concurrent-children case a real boot
-   needs — not implemented, needs its own live-debug pass.** **87th pass: pushed candidate 3 from a
-   sketch to a concretely buildable design (still not implemented) — found the correctness unit is
-   actually PER-PARENT-PROCESS, not tree-wide (needs only ordinary process-local statics + one new
-   env var for the snapshot-table address, no shared arena), closed a real TOCTOU gap in the
-   sketch's own "child prefers a recorded snapshot" step with an explicit double-checked-state
-   read (live-read-then-recheck, not a new lock), and flagged a genuinely new hazard (coordination
-   with the existing `VIRTUAL_PROTECT_LOCK`/`fork_verify` VEH machinery) that checked-precedent
-   confirms is solvable by following `fork_verify::write_usize_fault_tolerant`'s own established
-   locking pattern rather than inventing a new one. Also closed the pagefile-size idea as a Path B
-   lever with live evidence (`Get-Counter`: ~25GB of already-unused commit headroom exists before
-   any boot attempt — the crater is genuine physical-RAM/working-set pressure, never a commit-limit
-   rejection) and reconfirmed the 80th pass's admission-cap-is-a-dead-end finding still holds.**
-   **Next pickup, precise**: implement exactly the 87th pass's refined design (full writeup:
-   `lazy_fork_commit.rs`'s own "87th pass" doc section) gated behind a NEW, additional, default-OFF
-   flag (`LITEBOX_LAZY_FORK_GUARD_COW=1`) so it cannot affect the already-working fork-then-`execve`
-   path even if buggy, then re-verify 5/5 clean on BOTH existing repros PLUS a new
-   concurrent-two-children-one-parent repro (does not exist yet), both builds, before ever
-   attempting the full `DE_UP` boot with either flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both
-   call sites, zero cost when off) remains the permanent tool for measuring any future fix's real
-   payoff before landing it. `DE_UP` has not been reached by any pass through the 87th;
-   chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP`
-   fires). Lower-priority, still open: (a) decompose
-   remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
-   build vs. Windows loader overhead; (b) once `DE_UP` fires (or stalls again), use
-   `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`,
-   real values not `xprop` heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4` to check whether
-   the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed) recurs, checking
+   Session-autostart trimming and zero-byte-skip (82nd) are closed as dead-end levers. **83rd-87th:
+   genuine per-page lazy fork-memory population (`litebox_platform_windows_userland::
+   lazy_fork_commit`, `LITEBOX_LAZY_FORK_COMMIT=1`) implemented, a real measured win for
+   fork-then-`execve` (the dominant real case); found+fixed three real correctness bugs; found, but
+   left OPEN, a fourth (Bug 4: a genuine TOCTOU unsafe for fork-WITHOUT-`execve`, e.g. long-lived
+   daemons); ruled out two fix candidates and fully designed a third (single-generation guard-page
+   software COW). Full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "83rd-87th pass" section.**
+   **88th pass IMPLEMENTED that design**, gated behind a SEPARATE, additional, default-OFF flag
+   (`LITEBOX_LAZY_FORK_GUARD_COW=1`, on top of `LITEBOX_LAZY_FORK_COMMIT=1`) restricting it to
+   exactly the case it is provably sound for: at most one outstanding (not-yet-fully-serviced)
+   guarded lazy child per parent process at a time. Isolated-repro verification (5/5, both builds,
+   4 repro shapes) passed immediately, but a REAL `de_only_xcensus_seed3.tar` boot attempt (this
+   task's own item 8) surfaced a real, guard-cow-specific hang (Bug 5: a reclaimed dead-owner slot's
+   still-guard-protected pages were never healed before the next claim re-guarded the same range,
+   poisoning `VirtualProtect`'s own `old_protect` out-param and causing an infinite same-instruction
+   re-fault loop) — root-caused and FIXED same pass, re-verified via both a cheap targeted repro and
+   all four original repros, both builds. **With the fix landed, a real boot ran the FULL ~195s
+   monitoring window WITHOUT cratering and WITHOUT hanging** (stable 2.8-4.5GB free, 9-16 processes,
+   vs. every prior pass's own documented 28-29-process/<1GB crater) and reached real forward
+   progress — `DE_LAUNCHED_DIRECT` → `WM_POLL` → `XCENSUS_WINDOWS total=1` (a real window) — before
+   hitting the SAME pre-existing, already-documented `DE_FAILED after 60s`
+   (`_NET_SUPPORTING_WM_CHECK` never appearing) this file has tracked for many passes as a SEPARATE,
+   not-yet-root-caused gap. **`DE_UP` NOT reached this pass, but for the first time the RAM-crater
+   blocker this whole 76th-88th investigation exists to fix was not what stopped the boot** — the
+   presenting blocker is now the pre-existing WM-registration gap. Full mechanism, Bug 5's own
+   root-cause writeup, and the boot's exact log excerpts: `lazy_fork_commit.rs`'s own "88th pass"
+   doc section. Both flags stay default OFF pending broader boot re-verification (one run, not
+   five, given each real boot costs several minutes).
+   **Next pickup, in order**: (1) re-run the `de_only_xcensus_seed3.tar` boot 2-4 more times with
+   both flags on to confirm the healthy-RAM result is consistent, not a one-off; (2) if confirmed,
+   root-cause the `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now that RAM headroom makes it
+   reachable repeatedly — this file's own standing notes on that gap (item (b) below,
+   `XCENSUS_ROOTPROP`/`LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4`, the ~10.7s `GetAllProperties`
+   retrigger) are the concrete starting point; (3) only once that gap is also closed does flipping
+   either flag on BY DEFAULT become worth considering, and even then only after the same 5/5
+   real-boot rigor this pass's single clean run does not yet meet. `LITEBOX_DIAG_FORK_VMA_
+   BREAKDOWN=1` (zero cost when off) remains the permanent tool for measuring any future fix's real
+   payoff. `DE_UP` has not been reached by any pass through the 88th; chrome-devtools MCP has been
+   `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP` fires). Lower-priority, still
+   open: (a) decompose remaining per-fork cost between rootfs materialization staying resident post
+   its cheap (~83-140ms) build vs. Windows loader overhead; (b) use `de_only_xcensus_seed3.tar`'s
+   working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`, real values not `xprop`
+   heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4` to check whether the ~10.7s
+   `GetAllProperties` retrigger (69th/70th, still unconfirmed) recurs, checking
    `MappingNotify`(34)/XKB at that boundary before the 30th-pass `LD_PRELOAD getenv_probe.so`
    technique (`ps`/`/proc` is blind to cross-process-forked siblings, 65th; `gpg-agent`'s fatal
    `malloc.c:3846` assertion, 52nd, is why the OLD `de_only_seed.tar` dead-ends earlier than
    `_xcensus_seed2/3`); (c) unconfirmed: `LITEBOX_LOG` may not reach forked children's own stderr
    (`process_fork.rs`'s env-block construction possibly drops it) — if so, every prior
-   diagnostic-logging conclusion past the FIRST fork generation needs re-weighing; see `_2026-09-23.md`.
+   diagnostic-logging conclusion past the FIRST fork generation needs re-weighing; see
+   `_2026-09-23.md`.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
    `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on

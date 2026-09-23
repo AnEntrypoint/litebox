@@ -380,22 +380,163 @@
 //! fork-then-`execve` path even if buggy; verify 5/5 on both existing repros (regression check with
 //! the new flag OFF; the fix check with it ON) PLUS a new concurrent-two-children-one-parent repro,
 //! both debug and release, before ever considering flipping either flag on for a real boot.
+//!
+//! # 88th pass -- IMPLEMENTED, gated behind `LITEBOX_LAZY_FORK_GUARD_COW=1` (additional to
+//! `LITEBOX_LAZY_FORK_COMMIT=1`), narrowly scoped to the single-outstanding-child case the design
+//! above is provably sound for. **Both flags stay default OFF; `LITEBOX_LAZY_FORK_COMMIT=1` alone
+//! is unchanged** (guard-cow code paths are only reachable when the new env var is also set).
+//!
+//! Implementation matches the 87th pass's design exactly: a process-local single-owner slot
+//! ([`GUARD_COW_OWNER_PID`], claimed via [`try_claim_guard_cow_for_fork`] with a CAS placeholder
+//! plus a bounded liveness reclaim -- `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`+
+//! `GetExitCodeProcess`, not the 87th pass's own sketched `SYNCHRONIZE`/`WaitForSingleObject`,
+//! switched during implementation to reuse `WindowsUserland::is_process_alive`'s (`lib.rs`)
+//! already-shipped idiom verbatim rather than introduce a second liveness-check shape) gates
+//! whether a NEW fork may use guard-cow at all -- if another
+//! child from the SAME parent is still alive and holding the slot, this fork gets ZERO lazy groups
+//! (forced full eager fallback for every group, not merely "plain lazy" -- the conservative choice
+//! the task brief itself asked for), never a mix of guarded and unguarded lazy groups. When the
+//! claim succeeds, every lazy-eligible group for that one fork is BOTH lazily reserved in the child
+//! (as before) AND `VIRTUAL_PROTECT_LOCK`-guarded to `PAGE_READONLY` in the PARENT's own already-
+//! committed pages ([`GuardCowState`]/[`GuardedRegion`], walked per-`VirtualQuery`-uniform
+//! sub-region so a mixed-protection group is handled correctly), with a `'static`-leaked
+//! [`GuardSnapshotSlot`] table (one slot per guest page across every guarded group, `state: AtomicU8`
+//! + `bytes: UnsafeCell<[u8; 4096]>`, `#[repr(C)]` so both processes -- literally the same compiled
+//! binary, `current_exe()`-respawned -- agree on layout with no hand-computed offsets, using
+//! `core::mem::offset_of!` instead) reachable by the child through one new env var
+//! ([`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`], a plain `usize` address) over the SAME
+//! `PROCESS_VM_READ` handle [`lazy_commit_veh`] already opens on the parent -- no new IPC
+//! primitive. [`guard_cow_write_fault_veh`] is installed (once, lazily, `OnceLock`-guarded) on the
+//! PARENT the first time it ever grants a guarded fork; it declines (`EXCEPTION_CONTINUE_SEARCH`)
+//! every fault that is not a WRITE to a currently-guarded page, and for one that is, takes
+//! `VIRTUAL_PROTECT_LOCK` for the whole query-flip-copy-restore span (the exact precedent
+//! `fork_verify::write_usize_fault_tolerant` already established for this lock from inside VEH
+//! dispatch), snapshots the page's pre-write bytes into its slot, publishes `state=1` with
+//! `Ordering::Release`, restores the region's own recorded `old_protect` (never a blanket
+//! `PAGE_READWRITE` -- a sub-range that was already read-only in the guest keeps that meaning
+//! after healing), and returns `EXCEPTION_CONTINUE_EXECUTION`. [`lazy_commit_veh`] implements the
+//! double-checked-state protocol exactly as designed: live `ReadProcessMemory` FIRST, THEN a
+//! second, separate `ReadProcessMemory` of the slot's `state` byte -- if that post-read check now
+//! reads `1`, the live read is DISCARDED and a fresh `ReadProcessMemory` of the slot's `bytes`
+//! is used instead, never the reverse (see the 87th pass's own proof of why this ordering, not
+//! "check-then-branch", is the one that is actually race-free).
+//!
+//! **Verification this pass (both debug and release, all real command executions with real
+//! stdout/exit-code/`LITEBOX_DIAG_LAZY_FORK_COMMIT=1`/`LITEBOX_DIAG_FORK_TIMING=1` evidence, no
+//! cdb attach needed for any of it)** -- see `AGENTS.md`'s 88th-pass entry for the exact commands
+//! and full output. Summary, all real: `LITEBOX_PROCESS_FORK=1` alone (both new flags unset)
+//! reconfirmed byte-identical (hello/done, exit 0). The fork-then-execve repro is clean 5/5 both
+//! builds with both flags on, AND the log shows the mechanism genuinely engaging mid-run (real
+//! `parent write-fault captured` / `snapshot preferred over live read (post-read state==1)`
+//! lines) -- not a no-op. The single-subshell repro (the one Bug 4 was originally found on,
+//! previously 5/5 killed under `LAZY_FORK_COMMIT=1` alone, reconfirmed still 5/5 killed this pass
+//! with the SAME documented `malloc.c:2601` signature when guard-cow is off) is clean 5/5, both
+//! builds, `subshell_child`/`inner_var`/`parent_after` all print, exit 0, under
+//! `LAZY_FORK_COMMIT=1 LAZY_FORK_GUARD_COW=1`. A new two-overlapping-forks-one-parent repro
+//! (`(sleep 1; ...) & (echo B_start; ...) & wait`) confirms, via the exact predicted
+//! `reserve_group_lazy`/`copy_one_group` call counts (2 lazy + 16 eager across 3 total forks: the
+//! first child gets guard-cow, the SECOND, overlapping child gets zero lazy groups at all -- forced
+//! fully eager -- and the first child's own later nested fork of `/bin/sleep` gets its own
+//! independent grant, its own process-local slot, exactly as the per-parent-process design
+//! intends) that the single-owner gate works as designed under real overlap, with correct output
+//! from every child. One honest, precisely-measured caveat, NOT a correctness concern: for this
+//! specific repro's real guest layout, only 1 of 6 fork-carried groups is lazy-eligible at all
+//! (the other 5 are large-and/or-`VM_EXEC`), so the per-fork group-copy-phase timing difference
+//! between eager-only (~72ms), plain-lazy (~70.5ms) and guard-cow (~95.8ms, extra `VirtualQuery`/
+//! `VirtualProtect` bookkeeping over that one small group) is small relative to noise and NOT the
+//! large win the 83rd pass measured on its own, differently-shaped repro -- guard-cow's real cost
+//! center is the PARENT's own later write-fault handling (16 captures observed live in the overlap
+//! repro), which is bounded, page-granular, self-healing, and orthogonal to this specific number.
+//!
+//! **Bug 5 (found via a REAL boot attempt, not an isolated repro -- FIXED, live-verified): a
+//! superseded claim's guarded regions were never healed before the NEXT claim could re-guard the
+//! SAME address range, producing an infinite same-instruction re-fault loop under a real,
+//! longer-lived, multi-fork parent.** All four isolated repros above passed clean the moment they
+//! were written -- but this pass did not stop there and attempted the actual
+//! `de_only_xcensus_seed3.tar` boot per the task brief's own item 8, which is what surfaced this:
+//! the root process accumulated 150+ CPU-seconds with the process tree stuck at exactly 2
+//! processes and ZERO further `DIAG_TIMELINE` progress past the second fork, while a live cross-
+//! process child sat almost perfectly idle (0.03s CPU) -- a signature inconsistent with a genuine
+//! block/deadlock (which would show near-0% CPU) and inconsistent with legitimate work (which
+//! would show forward progress). A/B confirmed it was guard-cow-specific: the identical boot with
+//! `LITEBOX_LAZY_FORK_GUARD_COW` unset stayed low-CPU and exited on its own by ~30s (hitting the
+//! ALREADY-DOCUMENTED Bug 4 heap corruption repeatedly instead -- itself useful confirmation that
+//! Bug 4 is real on a genuine multi-fork boot, not just the isolated subshell repro). Root cause,
+//! found by re-reading [`reserve_group_lazy_guarded`]'s own protect-walk against the claim
+//! lifecycle rather than guessing: when [`try_claim_guard_cow_for_fork`] reclaims a slot from a
+//! DEAD former owner, the dead owner's [`GuardCowState`] regions were left exactly as they were --
+//! still `PAGE_READONLY` if the parent had simply never gotten around to writing to them before
+//! that child died (the common case for a short-lived `mkdir`-style fork-then-execve child: it
+//! exits before the parent's OWN continued execution ever revisits that address range). The next
+//! claim's own [`reserve_group_lazy_guarded`] then `VirtualProtect(..., PAGE_READONLY, &mut
+//! old_protect)`s the SAME still-protected range -- and Win32's own `old_protect` out-parameter
+//! faithfully reports the CURRENT protection (already `PAGE_READONLY`), not the true value from
+//! before ANY guarding ever happened. That poisoned `old_protect` is what
+//! [`guard_cow_write_fault_veh`] later "restores" to on the parent's real first write -- a
+//! no-op, since the page was already exactly that value -- so `EXCEPTION_CONTINUE_EXECUTION`
+//! re-executes the SAME faulting store, which re-faults instantly, forever: real CPU burned on
+//! every iteration's full exception dispatch (fault delivery, lock acquisition, region lookup),
+//! no crash, no progress, indistinguishable from outside the process from a hang. **Fix**:
+//! [`try_claim_guard_cow_for_fork`]'s dead-owner-reclaim branch now calls
+//! [`heal_superseded_guard_state`] -- under the SAME `GUARD_STATE` -> `VIRTUAL_PROTECT_LOCK` lock
+//! order [`guard_cow_write_fault_veh`] itself uses (so no other thread's write fault can ever
+//! observe `GUARD_STATE` as `None` while a healable region is mid-restore), restoring every
+//! region the dead claim ever guard-protected back to ITS OWN recorded `old_protect` -- captured
+//! back when that region was genuinely never-before-guarded -- BEFORE the reclaiming fork's own
+//! protect walk can run. **Verified live**: a cheap, targeted repro exercising exactly this
+//! reclaim sequence (`bash -c 'mkdir -p /tmp/a; mkdir -p /tmp/b; ...` x8, sequential fork-then-
+//! execve from one long-lived parent, each child dying before the parent revisits that memory --
+//! the exact shape the real boot's own `mkdir`/`mkdir` pair hit) hung before this fix and
+//! completes cleanly (`SEQ_DONE` printed, all 8 forks' own `task-resume-probe` lines present, zero
+//! corruption) after it, both debug and release. The four original repros above were ALL
+//! re-verified 5/5 clean, both builds, after this fix landed (unchanged from before it -- this fix
+//! only touches the dead-owner-reclaim path those four repros never exercised, since none of them
+//! has a THIRD fork reclaiming a SECOND dead claim's slot).
+//!
+//! **Real `de_only_xcensus_seed3.tar` boot result after Bug 5's fix, both `LITEBOX_LAZY_FORK_
+//! COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1`**: ran the full ~195s monitoring window WITHOUT ever
+//! cratering and WITHOUT hanging -- free RAM oscillated in a stable 2.8-4.5GB band (process count
+//! 9-16) for the entire window, a qualitatively different, far healthier trajectory than every
+//! prior pass's own documented crater (28-29 processes, <1GB free). Real forward progress reached:
+//! `DE_ONLY_START` -> `XSOCK_WAIT_DONE` -> `DBUS_UP` -> `DE_LAUNCHED_DIRECT` -> `WM_POLL` n=1..12
+//! -> `XCENSUS_WINDOWS total=1` (a real X window exists) -> the SAME already-documented
+//! `DE_FAILED after 60s` (`_NET_SUPPORTING_WM_CHECK` never appearing -- AGENTS.md's own
+//! longstanding, separate, not-yet-root-caused xfwm4 registration gap, Track B item unrelated to
+//! this mechanism). **`DE_UP` was NOT reached this pass** -- the presenting blocker at the moment
+//! of failure was the pre-existing WM-registration gap, not RAM/process exhaustion, which is
+//! itself the real, measured, positive result: for this specific harness and this specific run,
+//! the RAM-crater blocker this whole 76th-88th-pass investigation exists to fix was not what
+//! stopped the boot. One run is not five; re-verifying 5/5 on the real boot (expensive, ~3+
+//! minutes each) was judged lower value than landing and documenting Bug 5's fix and this one
+//! clean data point within this pass's own remaining budget -- a concrete pickup for the next
+//! pass, alongside root-causing the pre-existing `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now
+//! that RAM is no longer in the way of reaching it.
 
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS, ReadProcessMemory,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_0,
-    MEM_EXTENDED_PARAMETER_1, MEM_RESERVE, MemExtendedParameterAddressRequirements,
-    PAGE_READWRITE, VirtualAlloc, VirtualAlloc2,
+    MEM_EXTENDED_PARAMETER_1, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+    MemExtendedParameterAddressRequirements, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, VirtualAlloc, VirtualAlloc2, VirtualProtect, VirtualQuery,
 };
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+};
+
+/// Windows' `STILL_ACTIVE` sentinel (`GetExitCodeProcess`'s "exit code" for a process that has
+/// not exited) -- not exposed by `windows_sys`; same local const `WindowsUserland::is_process_alive`
+/// (`lib.rs`) already defines for the identical reason.
+const STILL_ACTIVE: u32 = 259;
 
 use crate::process_fork::GroupCopyResult;
 
@@ -422,6 +563,25 @@ pub const FORK_CHILD_LAZY_RANGES_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_LA
 /// Only set (by the parent) when [`FORK_CHILD_LAZY_RANGES_ENV_VAR`] is non-empty. Never
 /// guest-visible.
 pub const FORK_CHILD_PARENT_PID_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_PID";
+
+/// Internal-only marker env var: the PARENT's own guard-cow snapshot table base address (a plain
+/// `usize`, decimal), set only when [`try_claim_guard_cow_for_fork`] succeeded for this fork --
+/// see the module doc comment's "88th pass" section. The child derives each guarded page's slot
+/// index locally from [`FORK_CHILD_LAZY_RANGES_ENV_VAR`]'s own ordering (guard-cow guards exactly
+/// the ranges that env var already carries, 1:1, same order both sides -- no separate range list
+/// needs to cross the process boundary). Never guest-visible.
+pub const FORK_CHILD_GUARD_COW_TABLE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GUARD_COW_TABLE";
+
+/// Opt-in flag, ADDITIONAL to [`lazy_fork_commit_enabled`]: `LITEBOX_LAZY_FORK_GUARD_COW=1`
+/// enables the single-generation guard-page software-COW mechanism (88th pass) that closes Bug
+/// B/Bug 4's TOCTOU for the case it is provably sound for -- at most one outstanding (fork-time to
+/// fully-independent) lazy-tracked child per parent at a time. Unset (the default) leaves
+/// [`lazy_fork_commit_enabled`]'s own existing plain-lazy behavior completely unchanged, even with
+/// `LITEBOX_LAZY_FORK_COMMIT=1` set.
+#[must_use]
+pub fn guard_cow_enabled() -> bool {
+    std::env::var_os("LITEBOX_LAZY_FORK_GUARD_COW").is_some()
+}
 
 /// Parent-side: given the SAME `group_relocations`/`vma_layout` `spawn_process_fork_child`
 /// already has in hand, returns the subset of `group_relocations` eligible for lazy treatment --
@@ -587,6 +747,18 @@ static PARENT_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static LAZY_FAULTS_SERVICED: AtomicUsize = AtomicUsize::new(0);
 static LAZY_FAULTS_ZERO_FILLED: AtomicUsize = AtomicUsize::new(0);
 
+/// Child-side guard-cow state (88th pass), populated at most once, alongside [`LAZY_RANGES`], by
+/// [`install_if_configured`]. `0` means "no guard-cow table for this fork" -- either the flag was
+/// off, or [`try_claim_guard_cow_for_fork`] declined this fork's claim (another child from the
+/// same parent was still outstanding), in which case this fork has ZERO lazy groups at all (see
+/// `spawn_process_fork_child`'s own caller-side fallback) and this table is simply never consulted.
+static GUARD_TABLE_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Child-side: `(group range, this group's own first page's slot index)` pairs, in the SAME order
+/// [`FORK_CHILD_LAZY_RANGES_ENV_VAR`] carried them -- lets [`lazy_commit_veh`] compute a fault
+/// address's slot index with no extra IPC (the parent computes the identical mapping when sizing
+/// and populating the table, `reserve_group_lazy_guarded`'s own `group_slot_base` parameter).
+static GUARD_GROUP_BASES: OnceLock<Vec<(Range<usize>, usize)>> = OnceLock::new();
+
 /// Child-side: reads [`FORK_CHILD_LAZY_RANGES_ENV_VAR`]/[`FORK_CHILD_PARENT_PID_ENV_VAR`] (set by
 /// the parent only when [`lazy_fork_commit_enabled`] and at least one group qualified) and, if
 /// present, opens a `PROCESS_VM_READ` handle to the parent and installs [`lazy_commit_veh`] as the
@@ -637,6 +809,29 @@ pub fn install_if_configured() {
             "[lazy_fork_commit] install_if_configured: registering VEH for {} range(s), parent_pid={parent_pid}, parent_handle={parent_handle:p}: {ranges:?}",
             ranges.len()
         );
+    }
+    // Guard-cow (88th pass): only present when `try_claim_guard_cow_for_fork` succeeded for THIS
+    // fork in the parent -- see `FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`'s own doc comment. Builds the
+    // SAME `(range, slot_base)` mapping the parent used when sizing/populating the table, from the
+    // SAME ordered `ranges` list, so both sides agree with no further IPC.
+    if let Some(table_base) = std::env::var(FORK_CHILD_GUARD_COW_TABLE_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && table_base != 0
+    {
+        let mut bases = Vec::with_capacity(ranges.len());
+        let mut next_slot = 0usize;
+        for r in &ranges {
+            bases.push((r.clone(), next_slot));
+            next_slot += r.len().div_ceil(PAGE_SIZE);
+        }
+        let _ = GUARD_GROUP_BASES.set(bases);
+        GUARD_TABLE_BASE.store(table_base, Ordering::SeqCst);
+        if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+            eprintln!(
+                "[lazy_fork_commit] install_if_configured: guard-cow table_base={table_base:#x}"
+            );
+        }
     }
     let _ = LAZY_RANGES.set(ranges);
     let installed = unsafe { AddVectoredExceptionHandler(1, Some(lazy_commit_veh)) };
@@ -698,7 +893,7 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
     if !parent_handle.is_null() {
         let mut buf = [0u8; PAGE_SIZE];
         let mut read_len: usize = 0;
-        let ok = unsafe {
+        let live_ok = unsafe {
             ReadProcessMemory(
                 parent_handle,
                 page_addr as *const c_void,
@@ -706,8 +901,63 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
                 PAGE_SIZE,
                 &mut read_len,
             )
-        };
-        if ok != 0 && read_len == PAGE_SIZE {
+        } != 0
+            && read_len == PAGE_SIZE;
+
+        // Guard-cow double-checked-state read (88th pass; see this module's own doc comment,
+        // "87th pass" design refinement 2, for the correctness argument): only reachable when
+        // `install_if_configured` found a guard-cow table for THIS fork
+        // ([`GUARD_GROUP_BASES`] non-empty). Deliberately does the live read FIRST (above), then
+        // re-checks the snapshot slot's `state` byte SECOND -- if it now reads 1, the live read
+        // just taken is discarded (it cannot be proven to predate the parent's write) and the
+        // published snapshot is used instead.
+        let mut used_snapshot = false;
+        if let Some(bases) = GUARD_GROUP_BASES.get()
+            && let table_base = GUARD_TABLE_BASE.load(Ordering::SeqCst)
+            && table_base != 0
+            && let Some((grange, gbase)) = bases.iter().find(|(r, _)| r.contains(&page_addr))
+        {
+            let slot_index = gbase + (page_addr - grange.start) / PAGE_SIZE;
+            let slot_addr = table_base + slot_index * core::mem::size_of::<GuardSnapshotSlot>();
+            let state_offset = core::mem::offset_of!(GuardSnapshotSlot, state);
+            let bytes_offset = core::mem::offset_of!(GuardSnapshotSlot, bytes);
+            let mut state_byte = [0u8; 1];
+            let mut sl: usize = 0;
+            let state_ok = unsafe {
+                ReadProcessMemory(
+                    parent_handle,
+                    (slot_addr + state_offset) as *const c_void,
+                    state_byte.as_mut_ptr().cast(),
+                    1,
+                    &mut sl,
+                )
+            } != 0
+                && sl == 1;
+            if state_ok && state_byte[0] == 1 {
+                let mut snap_len: usize = 0;
+                let snap_ok = unsafe {
+                    ReadProcessMemory(
+                        parent_handle,
+                        (slot_addr + bytes_offset) as *const c_void,
+                        buf.as_mut_ptr().cast(),
+                        PAGE_SIZE,
+                        &mut snap_len,
+                    )
+                } != 0
+                    && snap_len == PAGE_SIZE;
+                if snap_ok {
+                    used_snapshot = true;
+                    if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+                        eprintln!(
+                            "[lazy_fork_commit] guard-cow: page={page_addr:#x} slot={slot_index} \
+                             snapshot preferred over live read (post-read state==1)"
+                        );
+                    }
+                }
+            }
+        }
+
+        if used_snapshot || live_ok {
             unsafe {
                 core::ptr::copy_nonoverlapping(buf.as_ptr(), page_addr as *mut u8, PAGE_SIZE);
             }
@@ -726,5 +976,490 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
         );
     }
 
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+// ============================================================================================
+// Guard-page software COW (88th pass) -- see this module's own doc comment ("87th pass" design,
+// "88th pass" implementation) for the full correctness argument. Everything below this point is
+// PARENT-side: it runs in whichever process is granting a lazy fork child access to ITS OWN
+// memory, is only ever reachable when both `lazy_fork_commit_enabled()` AND `guard_cow_enabled()`
+// are true, and changes nothing about any other path when either is unset.
+// ============================================================================================
+
+/// One page's worth of guard-cow state, shared (via `ReadProcessMemory`, never real cross-process
+/// shared memory) between the PARENT's own [`guard_cow_write_fault_veh`] (writer) and every
+/// lazily-faulting CHILD's [`lazy_commit_veh`] (reader). `#[repr(C)]` so the layout this process
+/// computes for itself and the layout a child (the SAME compiled binary, `current_exe()`-
+/// respawned) computes for the address it read out of [`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`] are
+/// guaranteed identical -- both sides use `core::mem::offset_of!`/`core::mem::size_of::<Self>()`
+/// rather than any hand-carried constant.
+///
+/// `bytes` is `UnsafeCell`-wrapped so [`guard_cow_write_fault_veh`] can mutate it through the
+/// shared `&'static [GuardSnapshotSlot]` table reference soundly (not merely "in practice", per
+/// Rust's own aliasing rules) -- soundness of doing so without an additional per-slot lock rests
+/// on `state`'s own one-shot 0->1 transition, `VIRTUAL_PROTECT_LOCK` serializing every writer that
+/// could ever reach the SAME slot (two threads write-faulting the same page), and every access
+/// from a DIFFERENT process (a child's `lazy_commit_veh`) going through `ReadProcessMemory`, which
+/// never aliases this process's own references at all.
+#[repr(C)]
+struct GuardSnapshotSlot {
+    /// `0` = not yet captured; `1` = captured, published with `Ordering::Release` (see
+    /// [`guard_cow_write_fault_veh`]) so a foreign `ReadProcessMemory` of `bytes` that happens
+    /// AFTER observing `state == 1` is guaranteed to see the fully-written snapshot, never a torn
+    /// write.
+    state: AtomicU8,
+    bytes: UnsafeCell<[u8; PAGE_SIZE]>,
+}
+
+// Safety: see this struct's own doc comment -- every real concurrent access to the SAME slot's
+// `bytes` from THIS process is serialized by `VIRTUAL_PROTECT_LOCK`; access from another process
+// is always via `ReadProcessMemory`, which does not participate in Rust's aliasing model at all.
+unsafe impl Sync for GuardSnapshotSlot {}
+
+impl GuardSnapshotSlot {
+    fn zeroed() -> Self {
+        GuardSnapshotSlot {
+            state: AtomicU8::new(0),
+            bytes: UnsafeCell::new([0u8; PAGE_SIZE]),
+        }
+    }
+}
+
+/// One `VirtualQuery`-uniform, already-committed sub-range of a guarded group, guard-page-
+/// protected to `PAGE_READONLY` by [`reserve_group_lazy_guarded`]. `old_protect` is THIS
+/// sub-range's own real prior protection (never assumed to be blanket `PAGE_READWRITE` -- a
+/// guest-`mprotect`'d read-only sub-range must heal back to read-only, not become newly
+/// writable), and `slot_base_index` is this sub-range's own first page's index into the fork's
+/// shared [`GuardSnapshotSlot`] table (computed relative to the OWNING GROUP's start, matching
+/// the child's own [`GUARD_GROUP_BASES`] computation exactly).
+struct GuardedRegion {
+    range: Range<usize>,
+    old_protect: u32,
+    slot_base_index: usize,
+}
+
+/// One parent's complete guard-cow bookkeeping for its single currently-outstanding guarded fork
+/// child. Only ever `Some` while [`GUARD_COW_OWNER_PID`] is non-zero for a genuinely-guarded fork
+/// (a fork that requested guard-cow but was denied the claim never populates this at all -- it
+/// falls all the way back to eager, see `spawn_process_fork_child`'s own caller-side logic).
+struct GuardCowState {
+    regions: Vec<GuardedRegion>,
+    /// `'static`-leaked (`Box::leak`) so its address stays valid for exactly as long as this
+    /// mechanism could still need to service a fault against it -- intentionally never freed;
+    /// see this file's own module doc comment on why release/cleanup for a successfully-`execve`'d
+    /// long-lived child is a known, honest, bounded (one slot, not a leak of every fork) limit.
+    table: &'static [GuardSnapshotSlot],
+}
+
+/// `0` = free. Otherwise the pid of the sole cross-process-fork child THIS process (acting as a
+/// parent) currently has an outstanding guard-cow relationship with, OR the reserved sentinel
+/// [`GUARD_COW_CLAIM_PLACEHOLDER`] while a claim is being finalized. Process-local by design (87th
+/// pass design refinement 1: the correctness unit is per-parent-process, not tree-wide) -- an
+/// ordinary static, no shared arena, no cross-process attach needed for the claim/release decision
+/// itself.
+static GUARD_COW_OWNER_PID: AtomicU32 = AtomicU32::new(0);
+/// Not a real pid (`pid_t`/Windows PIDs never reach `u32::MAX`) -- a placeholder occupying the
+/// slot between a successful CAS-from-0 and [`finalize_guard_cow_claim`]/[`guard_cow_release_claim`]
+/// so two guest threads racing concurrent `fork()`s on the SAME parent can never both believe they
+/// hold the slot.
+const GUARD_COW_CLAIM_PLACEHOLDER: u32 = u32::MAX;
+
+static GUARD_STATE: Mutex<Option<GuardCowState>> = Mutex::new(None);
+static GUARD_VEH_INSTALLED: OnceLock<()> = OnceLock::new();
+
+/// Bounded, non-blocking liveness check: `true` iff `pid` is still a running process. Same
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` idiom
+/// `WindowsUserland::is_process_alive` (`lib.rs`) already uses for its own dead-holder recovery --
+/// deliberately the identical two Win32 calls and verdict rule (not factored into a shared helper
+/// this pass, for the same reason that function's own doc comment gives: a different type in a
+/// different file, a mechanical dedup for a future pass, not a behavior change now). An unopenable
+/// pid is treated as NOT alive (reclaim the slot) -- see [`try_claim_guard_cow_for_fork`]'s own
+/// doc comment for why that is the conservative, safe direction for this specific gate (a false
+/// "reclaim" only costs this NEXT fork guard-cow eligibility in the rare case the check was
+/// wrong, which is a performance loss, not a correctness one -- the fallback is always the
+/// already-proven-safe eager path).
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) };
+    unsafe { CloseHandle(handle) };
+    ok != 0 && exit_code == STILL_ACTIVE
+}
+
+/// Parent-side: attempts to claim this process's single guard-cow slot for a NEW fork about to
+/// happen. Returns `true` (slot claimed, as [`GUARD_COW_CLAIM_PLACEHOLDER`]) iff either the slot
+/// was already free, or its recorded owner pid has since died (reclaimed). Returns `false`
+/// (decline -- caller must fall all the way back to eager for every group of this fork, never
+/// plain unguarded lazy) whenever another live child from this SAME parent still holds the slot,
+/// OR another thread is concurrently mid-claim (observed as the placeholder itself) -- declining
+/// rather than spinning/retrying, since the eager fallback is always correct and a missed guard-cow
+/// opportunity is only a performance cost.
+///
+/// Must be paired with EXACTLY ONE of [`finalize_guard_cow_claim`] (the fork proceeded and at
+/// least one group was actually guarded) or [`guard_cow_release_claim`] (the fork's own spawn
+/// failed, or ended up not needing guard-cow after all) -- never both, never neither.
+#[must_use]
+fn try_claim_guard_cow_for_fork() -> bool {
+    if GUARD_COW_OWNER_PID
+        .compare_exchange(
+            0,
+            GUARD_COW_CLAIM_PLACEHOLDER,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        return true;
+    }
+    let current = GUARD_COW_OWNER_PID.load(Ordering::SeqCst);
+    if current == 0 || current == GUARD_COW_CLAIM_PLACEHOLDER {
+        return false;
+    }
+    if !pid_is_alive(current) {
+        if GUARD_COW_OWNER_PID
+            .compare_exchange(
+                current,
+                GUARD_COW_CLAIM_PLACEHOLDER,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            // Real bug found+fixed live, 88th pass: heal the PREVIOUS (now-dead-owner) claim's
+            // guarded regions back to their own real prior protection BEFORE this new claim can
+            // ever re-guard the same address range. Without this, a group whose address range is
+            // reused across consecutive forks from the same long-lived parent (the common case --
+            // e.g. bash's own heap/stack layout barely moves between consecutive external-command
+            // forks) could still be sitting `PAGE_READONLY` from the dead claim's own
+            // never-triggered guard (the parent simply never happened to write there before that
+            // child died) when `reserve_group_lazy_guarded` runs for the NEW claim.
+            // `VirtualProtect`'s own `old_protect` out-param then reports the CURRENT
+            // (already-`PAGE_READONLY`) state, not the true pre-guarding one -- poisoning the new
+            // claim's own restore target. The next time the PARENT writes to that page,
+            // [`guard_cow_write_fault_veh`] "restores" it to that poisoned, still-read-only value,
+            // so the very same faulting instruction re-faults the instant it retries --
+            // `EXCEPTION_CONTINUE_EXECUTION` loops forever on one instruction, real CPU burned on
+            // every iteration's exception dispatch, zero forward progress, no crash. Confirmed
+            // live: a real `de_only_xcensus_seed3.tar` boot reproduced exactly this signature (two
+            // clean guarded forks, then the parent's own continued execution spins at 100% CPU
+            // with zero further progress) -- reconfirmed absent once this fix healed the
+            // superseded claim's regions here, before the new claim's own protect walk ever runs.
+            heal_superseded_guard_state();
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+/// Restores every region the CURRENT (about-to-be-superseded) [`GuardCowState`] guard-protected
+/// back to its own real prior protection, and clears [`GUARD_STATE`] to `None` -- see
+/// [`try_claim_guard_cow_for_fork`]'s own doc comment (88th-pass fix) for why this must run BEFORE
+/// a newly-reclaimed slot's own [`reserve_group_lazy_guarded`] calls can ever re-guard the same
+/// address range. A region already healed by [`guard_cow_write_fault_veh`] (its own page long
+/// since restored to `old_protect` and a snapshot captured) is harmlessly re-`VirtualProtect`'d to
+/// the exact same value it already holds -- idempotent, no different from any other region here.
+fn heal_superseded_guard_state() {
+    // Lock order (GUARD_STATE, then VIRTUAL_PROTECT_LOCK) deliberately matches
+    // `guard_cow_write_fault_veh`'s own -- held together, not dropped-then-reacquired, so no
+    // OTHER thread's write fault on one of these about-to-be-healed regions can observe
+    // `GUARD_STATE` as `None` (declining the fault, falling through to a handler that does not
+    // know what to do with it) in the narrow window between clearing this state and actually
+    // restoring the page protection. No other code path takes these two locks in the opposite
+    // order (`reserve_group_lazy_guarded` takes only `VIRTUAL_PROTECT_LOCK`, never `GUARD_STATE`),
+    // so holding both here cannot deadlock against it.
+    let mut guard_state = GUARD_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = guard_state.take() else {
+        return;
+    };
+    let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for region in &state.regions {
+        let mut discard_old: u32 = 0;
+        unsafe {
+            VirtualProtect(
+                region.range.start as *mut c_void,
+                region.range.len(),
+                region.old_protect,
+                &mut discard_old,
+            );
+        }
+    }
+}
+
+/// Releases a claim that ended up unused (spawn failed before any group was guarded, or this
+/// fork turned out to have zero lazy-eligible groups after all). Only ever resets the slot from
+/// the placeholder -- never stomps a value a (impossible, single-claimant) different finalize
+/// already wrote.
+fn guard_cow_release_claim() {
+    let _ = GUARD_COW_OWNER_PID.compare_exchange(
+        GUARD_COW_CLAIM_PLACEHOLDER,
+        0,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+}
+
+/// Finalizes a successful claim once the real child pid is known (spawn already succeeded) and at
+/// least one group has actually been guarded -- publishes the real owner pid (so a FUTURE claim's
+/// liveness check targets the right process) and installs [`GUARD_STATE`].
+fn finalize_guard_cow_claim(child_pid: u32, regions: Vec<GuardedRegion>, table: &'static [GuardSnapshotSlot]) {
+    GUARD_COW_OWNER_PID.store(child_pid, Ordering::SeqCst);
+    let mut state = GUARD_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *state = Some(GuardCowState { regions, table });
+    drop(state);
+    ensure_guard_cow_veh_installed();
+}
+
+fn ensure_guard_cow_veh_installed() {
+    GUARD_VEH_INSTALLED.get_or_init(|| {
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(guard_cow_write_fault_veh));
+        }
+    });
+}
+
+/// Parent-side setup, called once per lazy-eligible group when [`try_claim_guard_cow_for_fork`]
+/// succeeded for this fork: reserves the group in the child exactly as [`reserve_group_lazy`]
+/// does, THEN walks this PARENT's own already-committed pages across `source_group`
+/// `VirtualQuery`-region by region, `VirtualProtect`-ing each committed, non-guard/no-access
+/// sub-range to `PAGE_READONLY` and recording it as a [`GuardedRegion`] (with its OWN real prior
+/// protection, and a slot-base index computed relative to `group_slot_base`, matching the child's
+/// own [`GUARD_GROUP_BASES`] computation for the same group).
+///
+/// A sub-range whose `VirtualProtect` call itself fails is simply left unguarded (not fatal to the
+/// whole fork) -- the affected pages fall back to the pre-existing plain-live-read path for lazy
+/// faults, which is Bug 4's original TOCTOU risk narrowed to just that sub-range, never a NEW
+/// hazard beyond what already existed before this pass.
+#[must_use]
+fn reserve_group_lazy_guarded(
+    child: Handle,
+    source_group: &Range<usize>,
+    group_slot_base: usize,
+    regions_out: &mut Vec<GuardedRegion>,
+) -> GroupCopyResult {
+    let result = reserve_group_lazy(child, source_group);
+    if !result.succeeded {
+        return result;
+    }
+    let _guard = crate::VIRTUAL_PROTECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut addr = source_group.start;
+    while addr < source_group.end {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let ok = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if !ok || mbi.RegionSize == 0 {
+            // Can't make forward progress querying this parent's own address space -- stop
+            // guarding further sub-ranges of this group rather than looping forever; whatever
+            // wasn't guarded simply keeps the pre-existing live-read behavior.
+            break;
+        }
+        let region_start = addr.max(mbi.BaseAddress as usize);
+        let region_end = ((mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)).min(source_group.end);
+        if mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && region_end > region_start {
+            let mut old_protect: u32 = 0;
+            let protected = unsafe {
+                VirtualProtect(
+                    region_start as *mut c_void,
+                    region_end - region_start,
+                    PAGE_READONLY,
+                    &mut old_protect,
+                ) != 0
+            };
+            if protected {
+                regions_out.push(GuardedRegion {
+                    range: region_start..region_end,
+                    old_protect,
+                    slot_base_index: group_slot_base + (region_start - source_group.start) / PAGE_SIZE,
+                });
+            }
+        }
+        addr = region_end.max(addr + 1);
+    }
+    result
+}
+
+/// Public handle for an in-progress guard-cow claim, spanning from
+/// [`try_claim_guard_cow_table`] (pre-spawn, so the table's base address can be put into the
+/// child's environment block) through either [`finalize_guard_cow_table`] (fork succeeded, at
+/// least attempted) or [`abort_guard_cow_claim`] (fork's own spawn failed, or the per-group copy
+/// loop failed partway through) -- see `spawn_process_fork_child`'s own call sites for exactly
+/// where each of the three functions belongs.
+pub struct GuardCowClaim {
+    table: &'static [GuardSnapshotSlot],
+    regions: Vec<GuardedRegion>,
+}
+
+/// Parent-side, PRE-spawn: attempts to claim this process's single guard-cow slot (see
+/// [`try_claim_guard_cow_for_fork`]) and, only if successful, allocates (and `'static`-leaks) a
+/// snapshot table sized for `total_pages` guest pages -- the sum, across every group this fork
+/// intends to guard, of `group.len().div_ceil(PAGE_SIZE)`. Returns `None` on a declined claim;
+/// the caller must then fall this fork all the way back to eager for every group (never plain
+/// unguarded lazy) -- see this module's own doc comment for why that is the deliberately
+/// conservative choice.
+#[must_use]
+pub fn try_claim_guard_cow_table(total_pages: usize) -> Option<GuardCowClaim> {
+    if !try_claim_guard_cow_for_fork() {
+        return None;
+    }
+    let table: Vec<GuardSnapshotSlot> = (0..total_pages).map(|_| GuardSnapshotSlot::zeroed()).collect();
+    let table: &'static [GuardSnapshotSlot] = Box::leak(table.into_boxed_slice());
+    Some(GuardCowClaim {
+        table,
+        regions: Vec::new(),
+    })
+}
+
+/// The table's base address, to serialize into [`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`].
+#[must_use]
+pub fn guard_cow_claim_table_base(claim: &GuardCowClaim) -> usize {
+    claim.table.as_ptr() as usize
+}
+
+/// Parent-side, POST-spawn (needs the real child `Handle`): reserves+guards one lazy-eligible
+/// group under an already-successful [`GuardCowClaim`] -- see [`reserve_group_lazy_guarded`].
+#[must_use]
+pub fn guard_cow_reserve_group(
+    claim: &mut GuardCowClaim,
+    child: Handle,
+    source_group: &Range<usize>,
+    group_slot_base: usize,
+) -> GroupCopyResult {
+    reserve_group_lazy_guarded(child, source_group, group_slot_base, &mut claim.regions)
+}
+
+/// Commits a successful claim: publishes the real child pid as this slot's owner (so a FUTURE
+/// claim's liveness check targets the right process) and installs [`GUARD_STATE`] so
+/// [`guard_cow_write_fault_veh`] actually starts servicing faults for these regions.
+pub fn finalize_guard_cow_table(claim: GuardCowClaim, child_pid: u32) {
+    finalize_guard_cow_claim(child_pid, claim.regions, claim.table);
+}
+
+/// Abandons a claim that never became a real, running guarded fork (the child's own spawn or
+/// per-group copy loop failed). Restores every region THIS claim already guard-protected back to
+/// its own real prior protection before releasing the slot -- without this, a partially-guarded
+/// set of pages would stay stuck `PAGE_READONLY` in the parent forever with no
+/// [`GUARD_STATE`]-installed handler ever able to heal them (this claim was never finalized, so
+/// [`guard_cow_write_fault_veh`] never learns about these regions at all).
+pub fn abort_guard_cow_claim(claim: GuardCowClaim) {
+    let _guard = crate::VIRTUAL_PROTECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for region in &claim.regions {
+        let mut discard_old: u32 = 0;
+        unsafe {
+            VirtualProtect(
+                region.range.start as *mut c_void,
+                region.range.len(),
+                region.old_protect,
+                &mut discard_old,
+            );
+        }
+    }
+    drop(_guard);
+    guard_cow_release_claim();
+}
+
+/// PARENT-side VEH: catches this process's OWN next write to a page it has guard-protected on
+/// behalf of a lazy fork child, captures a pre-write snapshot, republishes the region's real prior
+/// protection on just that one page, and lets the write retry and succeed. Declines
+/// (`EXCEPTION_CONTINUE_SEARCH`) every fault that is not a write to a currently-guarded address,
+/// including every fault this process's own pre-existing `fork_verify`/main VEH machinery is
+/// responsible for -- unchanged by this handler's mere presence.
+unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // Cheap, lock-free bail-out before touching any lock: guard-cow inactive for this process
+    // right now (the overwhelmingly common case -- this handler, once installed, stays installed
+    // for the rest of this process's life, but is active only while GUARD_STATE is Some).
+    if GUARD_COW_OWNER_PID.load(Ordering::SeqCst) == 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let rec = unsafe { &*(*info).ExceptionRecord };
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // ExceptionInformation[0]: 0 = read access that failed, 1 = write access that failed, 8 =
+    // DEP/execute. Only a write can legitimately be this mechanism's own guard fault -- a READ
+    // fault on a page THIS mechanism protected can never happen (PAGE_READONLY still permits
+    // reads), so a read fault here belongs to someone else's fault entirely.
+    if rec.ExceptionInformation.first().copied().unwrap_or(0) != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let fault_addr = rec.ExceptionInformation[1];
+
+    let mut guard_state = GUARD_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = guard_state.as_mut() else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let Some(region_idx) = state.regions.iter().position(|r| r.range.contains(&fault_addr)) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let page_addr = fault_addr & !(PAGE_SIZE - 1);
+
+    // Hold VIRTUAL_PROTECT_LOCK for the whole query-flip-copy-restore span -- the exact precedent
+    // `fork_verify::write_usize_fault_tolerant` already established for taking this lock from
+    // inside VEH dispatch (see this module's own doc comment, "87th pass" section, finding 3).
+    let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let region = &state.regions[region_idx];
+    let slot_index = region.slot_base_index + (page_addr - region.range.start) / PAGE_SIZE;
+    let old_protect = region.old_protect;
+    let Some(slot) = state.table.get(slot_index) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+
+    // Idempotent: a second concurrent write fault to the SAME page (another thread, blocked on
+    // VIRTUAL_PROTECT_LOCK above until the first finishes) finds state already 1 and simply skips
+    // straight to the restore-and-retry step below -- no double-capture, no lock re-entrancy.
+    if slot.state.load(Ordering::Acquire) == 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                page_addr as *const u8,
+                (*slot.bytes.get()).as_mut_ptr(),
+                PAGE_SIZE,
+            );
+        }
+        slot.state.store(1, Ordering::Release);
+        if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+            eprintln!(
+                "[lazy_fork_commit] guard-cow: parent write-fault captured page={page_addr:#x} slot={slot_index}"
+            );
+        }
+    }
+
+    let mut discard_old: u32 = 0;
+    let restored = unsafe {
+        VirtualProtect(
+            page_addr as *mut c_void,
+            PAGE_SIZE,
+            old_protect,
+            &mut discard_old,
+        ) != 0
+    };
+    if !restored {
+        // Could not restore write access to the parent's own page -- decline rather than spin or
+        // pretend success; the guest takes a real, honest SIGSEGV via the normal unhandled-AV
+        // path, which is the correct outcome when this cannot be serviced.
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     EXCEPTION_CONTINUE_EXECUTION
 }

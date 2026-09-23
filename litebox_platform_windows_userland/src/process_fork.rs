@@ -1822,17 +1822,46 @@ pub fn spawn_process_fork_child(
     // VEH, on first real access) instead of eagerly `copy_one_group`-copied. Always all-`false`
     // unless `LITEBOX_LAZY_FORK_COMMIT=1` is set -- see `lazy_fork_commit_enabled`'s doc comment
     // for why that makes this whole mechanism provably inert by default.
-    let lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
+    let mut lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
         group_relocations,
         vma_layout,
         full_gprs.rsp,
     );
-    let lazy_group_ranges: Vec<Range<usize>> = group_relocations
+    let mut lazy_group_ranges: Vec<Range<usize>> = group_relocations
         .iter()
         .zip(lazy_eligible.iter())
         .filter(|(_, eligible)| **eligible)
         .map(|((group, _dest_base), _)| group.clone())
         .collect();
+    // Guard-cow (88th pass): when requested, this fork's lazy groups may ONLY proceed as lazy at
+    // all if this process's single guard-cow slot (at most one outstanding lazy-tracked child per
+    // parent -- see `lazy_fork_commit`'s own module doc comment for why that bound is exactly what
+    // makes the mechanism correctness-sound) is currently free. A denied claim forces this fork's
+    // `lazy_eligible` all the way back to empty -- not merely "plain unguarded lazy" -- per the
+    // task's own conservative framing: never mix a guarded and an unguarded lazy child from the
+    // same parent.
+    let mut guard_cow_claim: Option<crate::lazy_fork_commit::GuardCowClaim> = None;
+    if crate::lazy_fork_commit::guard_cow_enabled() && !lazy_group_ranges.is_empty() {
+        let total_pages: usize = lazy_group_ranges
+            .iter()
+            .map(|r| r.len().div_ceil(4096))
+            .sum();
+        match crate::lazy_fork_commit::try_claim_guard_cow_table(total_pages) {
+            Some(claim) => {
+                child_env.push((
+                    crate::lazy_fork_commit::FORK_CHILD_GUARD_COW_TABLE_ENV_VAR,
+                    crate::lazy_fork_commit::guard_cow_claim_table_base(&claim).to_string(),
+                ));
+                guard_cow_claim = Some(claim);
+            }
+            None => {
+                // Another live child from this same parent still holds the slot -- fall this
+                // whole fork back to fully eager (every group), not partially lazy.
+                lazy_eligible = vec![false; lazy_eligible.len()];
+                lazy_group_ranges.clear();
+            }
+        }
+    }
     if !lazy_group_ranges.is_empty() {
         child_env.push((
             crate::lazy_fork_commit::FORK_CHILD_LAZY_RANGES_ENV_VAR,
@@ -2065,6 +2094,12 @@ pub fn spawn_process_fork_child(
         if let Some(path) = &parent_layer {
             let _ = std::fs::remove_file(path);
         }
+        // The spawn itself never happened -- no group was ever guarded under this claim (if one
+        // was made pre-spawn for the table's env-var address). Abort it now rather than leaking
+        // this process's single guard-cow slot forever.
+        if let Some(claim) = guard_cow_claim.take() {
+            crate::lazy_fork_commit::abort_guard_cow_claim(claim);
+        }
     });
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
     close_child_side();
@@ -2096,6 +2131,11 @@ pub fn spawn_process_fork_child(
 
     let diag_copy_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
     let copy_all_t0 = std::time::Instant::now();
+    // Running page-count cursor into the guard-cow table, matching the CHILD's own identical
+    // computation in `install_if_configured` -- both walk `group_relocations`/`lazy_eligible` (or
+    // `FORK_CHILD_LAZY_RANGES_ENV_VAR`, which was serialized from the SAME filtered sequence) in
+    // the same order, advancing only across LAZY groups.
+    let mut next_guard_slot: usize = 0;
     for ((source_group, dest_base), lazy) in group_relocations.iter().zip(lazy_eligible.iter()) {
         let process = core::hint::black_box(process);
         if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
@@ -2109,7 +2149,18 @@ pub fn spawn_process_fork_child(
         }
         let group_t0 = std::time::Instant::now();
         let result = if *lazy {
-            crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
+            if let Some(claim) = guard_cow_claim.as_mut() {
+                let group_slot_base = next_guard_slot;
+                next_guard_slot += source_group.len().div_ceil(4096);
+                crate::lazy_fork_commit::guard_cow_reserve_group(
+                    claim,
+                    process,
+                    source_group,
+                    group_slot_base,
+                )
+            } else {
+                crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
+            }
         } else {
             copy_one_group(process, source_group, *dest_base, &mut read_source_bytes)
         };
@@ -2121,6 +2172,9 @@ pub fn spawn_process_fork_child(
             );
         }
         if !result.succeeded {
+            if let Some(claim) = guard_cow_claim.take() {
+                crate::lazy_fork_commit::abort_guard_cow_claim(claim);
+            }
             fail_teardown!(
                 "[process_fork] spawn_process_fork_child: group {} FAILED group={:#x}..{:#x} GetLastError={}",
                 if *lazy { "reserve" } else { "copy" },
@@ -2129,6 +2183,12 @@ pub fn spawn_process_fork_child(
                 result.last_error
             );
         }
+    }
+    // Every group succeeded -- commit the guard-cow claim (if any) under the real child pid now
+    // that it is known. From this point on, `guard_cow_write_fault_veh` actively services this
+    // parent's own future writes to whatever was actually guarded above.
+    if let Some(claim) = guard_cow_claim.take() {
+        crate::lazy_fork_commit::finalize_guard_cow_table(claim, pid);
     }
     if diag_copy_timing {
         eprintln!(
