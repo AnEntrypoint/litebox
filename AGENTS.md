@@ -8,7 +8,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-23,
-60th pass (pass-history section below; 26th-60th full narrative, including this pass's own complete
+61st pass (pass-history section below; 26th-61st full narrative, including this pass's own complete
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
@@ -168,53 +168,68 @@ map" below). The CURRENT STATE those passes converged on:
   this crash family proven infeasible, `LITEBOX_DIAG_FATALDUMP=1` (VEH, no debugger) works instead
   (38th-42nd/46th); "Fork-after-Xorg PERMANENT freeze" confirmed gone (35th); cross-process pty I/O
   live-proven (36th/37th, "Shared-memory foundations" below).
-- **44th-49th passes** — `xfce4-session` first reached real pre-session setup (fixed en route: fd
-  0/1/2 at the fork boundary, an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption panic
-  `c5a8884`, a `buddy_system_allocator` corruption `8b64698`). 7/7 clean boots.
-- **52nd-56th passes** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone, REFUTED "Cannot
-  open display" for good; D-Bus activation's dropped-CLOEXEC-fd bug FIXED (54th, `66265d9`, `xfwm4`
+- **44th-49th** — `xfce4-session` first reached real pre-session setup (fd 0/1/2 at the fork
+  boundary, an AF_UNIX connect-cancel race, a `PROT_NONE`-adoption panic `c5a8884`, a
+  `buddy_system_allocator` corruption `8b64698` all fixed en route). 7/7 clean boots.
+- **52nd-56th** — full `webtop_stack.sh` confirmed both Xvfb SIGSEGVs gone, REFUTED "Cannot open
+  display" for good; D-Bus activation's dropped-CLOEXEC-fd bug FIXED (54th, `66265d9`, `xfwm4`
   genuinely `execve`d for the first time ever right after); `fd/mod.rs:422` panic FIXED (55th,
-  `faa74c6`); per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`). Each fix surfaced the next
+  `faa74c6`); per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`) — each fix surfaced the next
   newly-reachable blocker (RAM exhaustion, then process-count). `gpg-agent`'s fatal glibc
-  `malloc.c:3846` SIGABRT, reproduced once (52nd), still open. Full narrative: archive.
+  `malloc.c:3846` SIGABRT, reproduced once, still open. Full narrative: archive.
 - **57th pass** — rebuilt release binary (56th's predated its own fix), confirmed RAM no longer
   kills the boot (2/2, plateaus ~3.1-3.3GB free). Surfaced `ps -ef`'s crash and `xfwm4` never
   launching, both below.
-- **58th pass** — FIXED `ps -ef`'s `fatal library error, lookup self` crash (`Procfs` now serves a
-  real `/proc/<pid>` subdirectory per pid the shared `ProcSelfTable` tracks,
-  `litebox/src/fs/procfs.rs`). Root-caused (not yet fixed) `xfwm4`'s non-launch as 100%
-  reproducible: `xfce4-session` spawns `iceauth`+`ssh-agent`, then goes silent forever.
-- **59th pass** — implemented + live-verified a task-scoped cross-process exit wait (general fix:
-  `wait_for_thread_exit`/`try_wait_for_thread_exit`, `GetExitCodeThread` on the child's own initial
-  OS THREAD handle rather than the Windows PROCESS handle, `process_fork.rs`/`lib.rs:12135`) — fires
-  correctly dozens of times on ordinary exits. `ssh-agent` still never unblocked `xfce4-session`'s
-  `wait4`: live `cdb -pv` (release binary, no symbols) showed a byte-identical stack with no Win32
-  wait syscall at frame 0 across two snapshots — a spinlock retry loop, tentatively (WRONGLY, see
-  60th) associated with `SafeZoneAllocator`'s own spinlock.
+- **58th-59th passes** — FIXED `ps -ef`'s `fatal library error, lookup self` crash (`Procfs` now
+  serves a real `/proc/<pid>` subdirectory per pid, `litebox/src/fs/procfs.rs`); implemented a
+  task-scoped cross-process exit wait (`wait_for_thread_exit`/`try_wait_for_thread_exit`,
+  `GetExitCodeThread` on the child's initial OS THREAD handle rather than the Windows PROCESS
+  handle, `process_fork.rs`/`lib.rs:12135`) — fires correctly dozens of times on ordinary exits, but
+  root-caused `xfwm4`'s non-launch as 100% reproducible anyway: `xfce4-session` spawns
+  `iceauth`+`ssh-agent` then goes silent forever, `ssh-agent` never unblocking `xfce4-session`'s
+  `wait4`. Live `cdb -pv` (release, no symbols) showed a byte-identical stack, no Win32 wait syscall
+  at frame 0 — a spinlock retry loop, tentatively (WRONGLY, see 60th) blamed on
+  `SafeZoneAllocator`'s own spinlock.
 - **60th pass (2026-09-23) — REAL root cause found+FIXED (`61c235e`): `RawMutex`'s internal
   `WaiterQueue::with_lock` had no panic-safe release, not `SafeZoneAllocator`.** Debug build +
-  `cdb -pv` with `_NT_SYMBOL_PATH` pointed at `target/debug` (the 59th pass never did this) gave a
-  fully-named stack, three snapshots over 40+s, byte-identical: `Task::prepare_for_exit` →
-  `Process::adopt_children`'s `Mutex::lock()` → `RawMutex::block_or_maybe_timeout` →
-  `WaiterQueue::with_lock`'s `compare_exchange_weak` retry loop — spinning forever to ACQUIRE the
-  queue's own tiny `lock: AtomicBool`, not blocked on the outer mutex at all. Root cause:
-  `with_lock` released via a plain statement AFTER calling its closure, no RAII guard;
-  `wake_many`'s closure (`drain_locked`) builds a `Vec` — an ordinary allocation through
-  `SLAB_ALLOC` (`#[global_allocator]`) — and `SafeZoneAllocator::alloc`/`dealloc`'s own
-  `.expect(msg)`/`panic!("{layout:?}")` failure branches panicked WHILE holding
-  `slab_allocator.lock()`'s guard; that panic unwound straight past `with_lock`'s un-guarded
-  release, wedging it at `true` forever. The panicking thread survived (caught by the per-task
-  `catch_unwind` wrapper) — not a dead holder, so `RawMutex`'s own `holder_pid`/`OpenProcess`
-  dead-holder recovery cannot and does not apply; the fix is structural, not a liveness check.
-  Fixed: `with_lock` now releases via a `litebox::utils::defer` guard (same idiom as
-  `ThreadHandle::interrupt`'s `_resume_guard`); every `SafeZoneAllocator` failure panic is now a
-  plain `&'static str` (no `{}` interpolation, so it can never recurse into the allocator via
-  `format!`) as defense in depth. **Verification partial, honestly**: pre-fix hang cleanly
-  reproduced (clean RAM, unambiguous permanent freeze); post-fix re-check was confounded by item
-  1's own RAM cost (every attempt fell to 1-3GB free within ~1 minute, and under that pressure
-  similar `WaiterQueue` contention showed on OTHER, unrelated mutexes too — real starvation, not
-  this mechanism recurring). One clean post-fix sample showed the previously-frozen thread's
-  offset actually moving. `DE_UP`/`xfwm4` NOT yet confirmed. Full evidence: archive.
+  `cdb -pv` (`_NT_SYMBOL_PATH` → `target/debug`) gave a fully-named stack, byte-identical across
+  three 40+s-apart snapshots: `Task::prepare_for_exit` → `Process::adopt_children`'s `Mutex::lock()`
+  → `RawMutex::block_or_maybe_timeout` → `WaiterQueue::with_lock`'s `compare_exchange_weak` retry —
+  spinning to ACQUIRE the queue's own tiny `lock: AtomicBool`, not the outer mutex. Root cause:
+  `with_lock` released via a plain statement AFTER its closure, no RAII guard; `wake_many`'s closure
+  (`drain_locked`) builds a `Vec` through `SLAB_ALLOC`, and `SafeZoneAllocator::alloc`/`dealloc`'s
+  own `.expect(msg)`/`panic!("{layout:?}")` failure branches panicked WHILE holding
+  `slab_allocator.lock()`, unwinding past the un-guarded release and wedging it `true` forever — the
+  panicking thread itself survived (per-task `catch_unwind`), so this was never a dead holder;
+  `RawMutex`'s own liveness recovery cannot and does not apply. Fixed: `with_lock` now releases via
+  a `litebox::utils::defer` guard; every `SafeZoneAllocator` failure panic is now a plain
+  `&'static str` (no `format!`, so it can't recurse into the allocator) as defense in depth. That
+  pass's own debug-build re-check was confounded by its own RAM cost — see the 61st pass below for
+  the clean, unconfounded answer.
+- **61st pass (2026-09-23) — 60th pass's fix CONFIRMED on the RELEASE binary: the ssh-agent/xfwm4
+  hang is GONE, 3/3 clean.** Rebuilt release (verified newer than `61c235e`), ran `.wfgy/de_only.sh`
+  under `LITEBOX_PROCESS_FORK=1` three times (one already on disk + two fresh): every run reaches
+  `DE_LAUNCHED_DIRECT` → all 12 `WM_POLL`s → `DE_FAILED after 60s` cleanly, zero hang — vs. the
+  58th/59th passes' 100% permanent freeze at this exact point pre-fix. **`DE_FAILED` still happens,
+  but for a different, now precisely-located reason, confirmed two ways**: (1) execve tracing
+  (`litebox_shim_linux::syscalls::process=debug`) shows `xfwm4` DOES `execve` (`argv0=/usr/bin/
+  xfwm4`) and keeps doing normal `futex` WAKE/WAIT every ~10s through 74s+ — not crashed, not stuck;
+  (2) a live non-invasive `cdb -pv` attach on `xfwm4`'s own host process (release binary, real
+  symbols resolved) dumped all 10 OS threads: every one in a legitimate OS wait, no
+  `compare_exchange_weak` spin anywhere — genuinely healthy, not a litebox lock/fork defect. The
+  `xprop -root _NET_SUPPORTING_WM_CHECK` error text changes in lockstep with `xfwm4`'s own `execve`
+  (`WM_POLL` n=1-3: "no such atom"; n=4+: "not found."), meaning `xfwm4` interns the atom NAME early
+  but never calls `XChangeProperty`/`XSetSelectionOwner` to publish it — narrows the blocker to
+  something inside `xfwm4`'s own X11-registration sequence, not litebox's fork/thread/lock machinery
+  (that job is done). **Also re-confirmed, with fresh numbers, the known per-process RAM cost bug**:
+  this repro alone spawns ~28-29 live host processes within under a minute (several 500MB-1.1GB
+  each), draining ~8.5GB free RAM to under 1GB twice in a row in well under 90s each time — killed
+  both times via `Invoke-CimMethod -MethodName Terminate`, RAM fully recovered both times. **Pickup**:
+  trace `xfwm4`'s actual X11 protocol writes (`litebox_shim_linux::syscalls::unix=debug` or
+  equivalent) to find whether it's blocked on a prerequisite reply or never reaches that code path —
+  an application-level (`xfwm4`/GTK/X11) question now, not a litebox host-emulation one; budget for
+  the RAM cliff above on any attempt, kill fast, never run two attempts back-to-back without a full
+  recovery pause.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -229,32 +244,26 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 
 **Open, in rough priority order:**
 
-1. **`DE_FAILED`'s real chain — D-Bus activation FIXED (54th), `fd/mod.rs:422` panic FIXED (55th),
-   per-fork rootfs-rebuild RAM cost FIXED (56th, `2d18a4e`) — RAM no longer kills the boot outright
-   (57th pass, verified 2/2, plateaus ~3.1-3.3GB free on RELEASE). The real, STILL-open cost is
-   PER-PROCESS on the DEBUG build especially: a `de_only.sh` debug-build boot falls to 1-3GB free
-   within ~1 minute of `DE_LAUNCHED_DIRECT` (60th pass, live-measured, repeatedly) — allocation site
-   not yet found (needs `cdb`/memory-profile on an isolated Xvfb-alone repro). This is now the
-   PRIMARY thing standing between the 60th pass's fix and a clean `DE_UP` verification — fix or
-   work around this BEFORE re-attempting the xfwm4 check below.** `ps -ef`'s crash is FIXED (58th).
-   Windows-process-vs-guest-task exit-detection gap FIXED+verified (59th).
-   **`ssh-agent`/`xfwm4` blocker: ROOT-CAUSED AND FIXED, 60th pass, `61c235e`** — see the pass-history
-   entry above and Track B item 3 below; verification of `xfwm4` actually launching and setting
-   `_NET_SUPPORTING_WM_CHECK` is the immediate next step, blocked on the RAM item just above. (ii)
-   `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd), maybe the SAME mechanism — recheck
-   once `DE_UP` is confirmed. (iii) high `VM_SHARED` fork-child region count (52nd).
+1. **`DE_FAILED`'s real chain — the `ssh-agent`/`xfwm4` HANG is CLOSED for good** (60th/61st passes
+   above). Current blocker is application-level: `xfwm4` interns `_NET_SUPPORTING_WM_CHECK`'s name
+   but never publishes it via `XChangeProperty`/`XSetSelectionOwner` — needs an X11-protocol trace
+   of its own socket writes (61st pass pickup). PER-PROCESS RAM is the hard ceiling on how long any
+   such attempt can safely run (~28-29 live host processes, 8.5GB→<1GB in <90s on `de_only.sh`
+   alone, 61st pass) — budget for it, kill fast, never run two attempts back-to-back. `ps -ef`'s
+   crash is FIXED (58th); the Windows-process-vs-guest-task exit-detection gap is FIXED+verified
+   (59th). (ii) `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd), maybe the SAME
+   mechanism — recheck once `DE_UP` is confirmed. (iii) high `VM_SHARED` fork-child region count
+   (52nd).
 2. **AF_UNIX cross-process tables have FOUR silent exhaustion paths, none logging anything** (38th,
    `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256 overflow silently discarded
    (`unix.rs:275-277`); a key >108 bytes silently bails; `SharedUnixConnectQueue`/`SharedUnixConnTable`
    (capacity 64) leak a `REQ_CLAIMED` slot forever on cancel (`unix.rs:430-435`); backlog ignored on
    cross-process accept. Abstract sockets checked and CORRECT.
-3. **CLOSED, 60th pass — the `xfwm4` blocker was NOT `SafeZoneAllocator`'s spinlock** (the 59th
-   pass's tentative, unnamed-frame guess); a debug-build `cdb -pv` with real symbols named the
-   actual frame as `RawMutex`'s own internal `WaiterQueue::with_lock`, missing a panic-safe release
-   — fixed via a `litebox::utils::defer` guard, `61c235e`. `SafeZoneAllocator`'s error-path panics
-   (the plausible trigger for the above) are hardened as defense in depth (allocation-free, no
-   `format!`) but its OWN `spin::mutex::SpinMutex` still has no dead-holder recovery — kept as a
-   lower-urgency theoretical risk (unlike before, NOT tied to any live symptom now).
+3. **CLOSED, 60th/61st passes** — the `ssh-agent`/`xfwm4` hang was `RawMutex`'s internal
+   `WaiterQueue::with_lock` missing a panic-safe release (not `SafeZoneAllocator`, the 59th pass's
+   wrong guess); fixed `61c235e`, confirmed gone on the release binary 3/3 — full mechanism in the
+   pass-history entries above. `SafeZoneAllocator`'s own `spin::mutex::SpinMutex` still has no
+   dead-holder recovery — kept as a lower-urgency theoretical risk, not tied to any live symptom now.
 4. Debugger-root-cause `litebox/src/event/wait.rs:224`'s `unreachable!()` on garbage thread state
    (dozens per boot, most frequent panic historically, NOT yet debugger-confirmed — do not patch
    blind).

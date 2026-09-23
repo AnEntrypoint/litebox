@@ -1630,3 +1630,127 @@ dead freeze -- suggestive but not a full `DE_UP`/`xfwm4`-launch confirmation. `_
 was not observed to fire in this pass. Pickup: re-verify on a host that can sustain several minutes
 of a debug-build boot without falling below ~4GB free (or fix Track B item 1's per-process RAM cost
 first), then confirm `xfconfd`/`xfwm4` actually spawn and `_NET_SUPPORTING_WM_CHECK` gets set.
+
+## 61st pass (2026-09-23) -- release-binary re-verification: hang CLOSED for good, DE_FAILED narrowed to xfwm4's own X11-registration step
+
+**Task**: the 60th pass's fix (`61c235e`, `WaiterQueue::with_lock` panic-safety) was diagnosed and
+verified only on a DEBUG binary, itself confounded by that build's own well-documented per-process
+RAM cost. This pass rebuilt the RELEASE binary and re-ran the exact same repro to get an
+unconfounded answer, per the pickup note at the end of the previous entry.
+
+**Build verification**: `cargo build --release -p litebox_runner_linux_on_windows_userland` -- the
+build was already up to date (source `litebox_platform_windows_userland/src/lib.rs` mtime
+02:32:27, binary mtime 02:49:35, both before HEAD's commit timestamp 03:05:38 which is just when
+the commit object was written, not when the file was edited) -- confirmed via `git log -1 --format=
+%cI 61c235e` plus direct `stat` comparison of source vs. binary mtimes, not assumed.
+
+**Verification runs (3 total, all clean)**:
+1. `.wfgy/de_only_pass60_release_run1.log` (pre-existing on disk from immediately after the build,
+   `LITEBOX_PROCESS_FORK=1`, `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=
+   error`): `DE_ONLY_START` -> `XSOCK_WAIT_DONE` -> `DBUS_UP` -> `DE_LAUNCHED_DIRECT` -> 12/12
+   `WM_POLL`s -> `DE_FAILED after 60s` -> `HOLD` loop to at least t=280s. Zero hang.
+2. `.wfgy/de_only_release_verify_run1.log` (fresh run, same env/command): identical marker
+   sequence, `DE_FAILED after 60s`, zero hang.
+3. `.wfgy/de_only_release_verify_run2_exectrace.log` (fresh run, same env plus
+   `litebox_shim_linux::syscalls::process=debug` added): identical marker sequence, `DE_FAILED
+   after 60s`, zero hang. (This run's execve/futex trace is the source of the findings below.)
+
+All three used the exact repro (`.wfgy/de_only_seed.tar`, `docker.io/linuxserver/webtop:debian-xfce`,
+`/bin/bash /de_only.sh`) that was previously 100% reproducibly frozen forever at exactly this point
+(58th/59th passes, `ssh-agent`'s `prepare_for_exit` never returning). **3/3 clean vs. the
+pre-fix 100% freeze rate is the closing confirmation this investigation needed.**
+
+**DE_FAILED narrowed to a new, precise, different mechanism.** Two independent lines of evidence
+from run 3 (execve trace plus a live `cdb -pv` attach on a separate, later run):
+
+*Execve/futex evidence* (`.wfgy/de_only_release_verify_run2_exectrace_utf8.log`, converted from
+UTF-16LE): `xfwm4` genuinely `execve`s successfully -- `sys_execve` tries `/lsiopy/bin/xfwm4`,
+`/usr/local/sbin/xfwm4`, `/usr/local/bin/xfwm4`, `/usr/sbin/xfwm4` (all `ENOENT`, normal `$PATH`
+walk) then `/usr/bin/xfwm4` (`resolve_shebang: open result=Ok(())`), at log line ~10240 -- well
+BEFORE `WM_POLL n=4` (line 11494) and `DE_FAILED` (line 51597). Its guest tid (10136 in this run)
+then shows completely normal `futex` WAKE/WAIT activity -- a live GTK/glib main-loop idle pattern --
+at elapsed 0.1s, 3-8s (bursty, startup), then isolated single WAKEs at 8.9s, 21.1s, 32.1s, 42.9s,
+53.3s, 63.4s, 74.4s (roughly every ~10-11s, a periodic idle timer, not a crash or a stall). The full
+XFCE session fan-out is ALSO visible in the same execve trace, well past `DE_FAILED`'s 60s mark:
+`at-spi-bus-launcher`, `xfconfd`, `at-spi2-registryd`, `iceauth`, `ssh-agent`,
+`dbus-update-activation-environment`, `gpgconf`, `gpg-connect-agent`, `gpg-agent`, `xfwm4`,
+`xfsettingsd`, `dconf-service`, `xfce4-panel`, `Thunar`/`thunar-real` (desktop icons daemon),
+`xfce4-panel`'s `wrapper-2.0` plugins, `xfdesktop`, `pm-is-supported`, `start-pulseaudio-x11` plus
+`pactl` -- i.e. essentially the ENTIRE real XFCE desktop session actually launches successfully in
+the background even though the harness's own 60s `WM_POLL` window already gave up.
+
+*Live cdb evidence* (`.wfgy/xfwm4_cdb_snapshot.log`, orchestrated via `.wfgy/
+xfwm4_cdb_orchestrator.ps1`, a SEPARATE, later run purpose-built to grab a fast snapshot before the
+per-process RAM cost below forced a kill): the harness's own execve-trace log was tailed live to
+find the `winpid=` printed by `task-resume-probe (child, winpid=NNNN)` immediately preceding the
+successful `argv0=/usr/bin/xfwm4` line (winpid=8836 this run), then `cdb.exe -pv -p 8836 -c "kn;
+~*kn; qd"` attached non-invasively (no `g`, no bare `q`, per the standing cdb-safety lesson) within
+seconds of `xfwm4`'s own `execve`. All 10 of that process's OS threads dumped clean, REAL symbol
+names (this release binary's ICF folding did NOT prevent useful names here, contrary to the
+standing caution -- worth remembering release-binary `cdb` is not ALWAYS unusable, just unreliable):
+thread 0 = main, in `std::sys::thread::windows::Thread::join` (waiting for the guest thread);
+threads 1-3 = idle `TppWorkerThread`s; thread 4/7 = `detached_pipe_read`/`PollSet::wait` inside an
+epoll wait (stdout/stderr pump plumbing); thread 5 = `fault_terminate_watchdog_thread_body`
+(routine); thread 6 = `net::wait_on_tun` blocked on a `Condvar` (idle network-gateway wait); thread
+8 = `net::NatGateway::new`'s `OnceLock::call_once_force` (idle init wait); thread 9 = another
+`detached_pipe_read` epoll wait. **Not one thread shows a `compare_exchange_weak` spin or any other
+deadlock signature** -- every thread is in a completely ordinary, legitimate OS wait
+(`WaitForSingleObject`/`WaitOnAddress`/`NtWaitForWorkViaWorkerFactory`). This directly confirms
+`xfwm4`'s HOST process is genuinely healthy at the litebox/Windows level; whatever keeps it from
+registering as the window manager is happening inside the GUEST program's own logic, not in
+litebox's fork/thread/lock machinery.
+
+*The concrete, reproducible symptom*: `xprop -root _NET_SUPPORTING_WM_CHECK`'s error text itself
+changes, in BOTH independently-run boots, at essentially the exact moment `xfwm4` execve's:
+`WM_POLL n=1` through `n=3` read `"_NET_SUPPORTING_WM_CHECK:  no such atom on any window."` (the
+atom name has never been interned on the X server at all); from `WM_POLL n=4` onward it reads
+`"_NET_SUPPORTING_WM_CHECK:  not found."` (a DIFFERENT, shorter xprop message meaning the atom name
+IS now interned/known to the server, but has no value set on the queried window). This is exactly
+consistent with: some part of `xfwm4`'s own GTK/GDK/glib startup path references or caches this
+atom NAME early (interning it via `XInternAtom`), but the process never reaches the later step that
+actually calls `XChangeProperty`/`XSetSelectionOwner` to publish its VALUE on the root window,
+within the 74+ seconds this pass observed it running. This is now believed to be an
+application-level (`xfwm4`/GTK/X11) issue, not a litebox host-emulation defect -- litebox's job
+(getting a real, unmodified `xfwm4` binary to `execve`, run, and talk to a real X server without
+crashing or deadlocking) is DONE for this specific process.
+
+**Per-process RAM cost, re-measured with fresh precision** (already known, Track B item 1, 57th
+pass; this pass adds concrete numbers from direct observation): a single `de_only.sh` boot under
+`LITEBOX_PROCESS_FORK=1` spawns roughly 28-29 live Windows host processes (external commands like
+`mkdir`/`cp`/`sleep`/`xset`/`xprop`/`xdpyinfo`, dbus-daemon's activation babysitters, and every
+`xfce4-session` client, EACH a full cross-process fork with its own ~500MB-1.1GB working set on
+this build) within under a minute of `DE_LAUNCHED_DIRECT`. Directly observed twice this pass:
+free RAM fell from ~8.5GB to under 1GB (0.98GB, then separately 0.75GB) in well under 90 seconds
+each time, purely from this one repro running with no nginx/selkies on top at all. Both times,
+`Invoke-CimMethod -MethodName Terminate` against every `litebox_runner_linux_on_windows_userland`
+process cleanly recovered RAM to 7.8-8.5GB within seconds -- no host instability, no hang requiring
+`cdb`/WMI escalation. This RAM cliff is the practical reason a live cdb attach on `xfwm4` needed a
+purpose-built fast-attach orchestrator script rather than an interactive step-by-step session, and
+is why any future attempt at this investigation (an X11-protocol trace, or the full
+`webtop_stack.sh` with nginx+selkies layered on top, which will cost strictly more) must budget for
+it explicitly and never run two attempts back-to-back without a full RAM-recovery pause.
+
+**Why the browser/screenshot goal was NOT attempted this pass**: the task's own gate for the full
+`webtop_stack.sh`+browser-screenshot verification is `xfwm4` genuinely reaching
+`_NET_SUPPORTING_WM_CHECK` (i.e. `DE_UP`, not `DE_FAILED`). That gate is not met -- the atom's NAME
+is interned but its VALUE is never set within the observed window, so `_NET_SUPPORTING_WM_CHECK`
+never fires and `DE_FAILED` still occurs, just from an application-level cause instead of a
+litebox-level hang. Attempting the full nginx+selkies boot on top of this unresolved blocker would
+also incur strictly higher RAM cost than the already-dangerous `de_only.sh`-alone cost measured
+above, for no additional diagnostic value until the `xfwm4` registration gap itself is understood.
+
+**Pickup, precise**: (1) trace `xfwm4`'s actual X11 protocol writes on its own socket fd (enable
+`litebox_shim_linux::syscalls::unix=debug` or equivalent, or a host-side network/socket capture if
+one becomes available) to find its LAST successful X request before the point it should call
+`XChangeProperty`/`XSetSelectionOwner` -- determine whether it is blocked waiting on a specific X
+reply/selection it never receives, or whether it simply never reaches that code path at all (e.g.
+an early `xfwm4` internal error that leaves it running its main loop without ever creating its
+manager/check window); cross-reference against real upstream `xfwm4` source
+(`src/wm.c`/`src/settings.c`, the `xfwm4` GitHub mirror) for the exact call site once a candidate
+frame is found. (2) Budget RAM explicitly for this -- the ~28-29-process/<90s-to-<1GB cost measured
+this pass applies even to the bare `de_only.sh` repro, before any selkies/nginx overhead. (3) Once
+`_NET_SUPPORTING_WM_CHECK` genuinely fires, THEN attempt the full `webtop_stack.sh`
+browser-screenshot verification (chrome-devtools MCP failed to connect this pass --
+`CONNECT_TIMEOUT` -- re-check `claude-in-chrome`/`chrome-devtools` availability fresh at that time,
+per the task's own standing instruction that this is the single most important moment for that
+check to succeed).
