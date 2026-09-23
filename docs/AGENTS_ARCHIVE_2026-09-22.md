@@ -2094,3 +2094,187 @@ genuinely quiet host RAM per the 32nd-35th passes' own repeated documented failu
 Logs for this pass: `.wfgy/de_only_xcensus_run5.log`/`_utf8.log` (real production re-test),
 scratchpad `readdir_repro1.log` through `repro4.log` (isolated repro; repro1 is the
 thread-based-fork-crash control, repro2-4 are the cross-process-fork clean results).
+
+## 64th pass (2026-09-23) -- the dbus-daemon-babysitter `SIGKILL` lead root-caused and REFUTED as
+the `DE_FAILED` cause; one real, independent, low-severity bug found; `DE_FAILED` UNCHANGED
+
+**Task**: the 63rd pass's own precise pickup -- identify who forks the second `dbus-daemon`
+(comm-preserved babysitter) that gets `SIGKILL`ed ~0.4-0.6s after a thread-based-fork fallback, and
+determine whether it is causally upstream of `xfwm4`'s `initSettings()` hang or an unrelated
+parallel failure.
+
+### Method
+
+Rebuilt the DEBUG binary (`cargo build -p litebox_runner_linux_on_windows_userland`, no
+`--release`) and re-ran the same `de_only_xcensus` harness (`docker.io/linuxserver/webtop:
+debian-xfce`, `LITEBOX_PROCESS_FORK=1`, `--resume-from .wfgy/de_only_xcensus_seed2.tar`) with
+`LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error,litebox_shim_linux::
+syscalls::{process,signal}=trace,litebox_shim_linux::syscalls::net=debug,litebox_shim_linux::
+syscalls::unix=debug`. This produced a 65MB+, 200K+-line log
+(`.wfgy/pass64_dbus_trace_run1.log`, gitignored) growing fast enough that the boot was killed via
+`Invoke-CimMethod -MethodName Terminate` the moment the target SIGKILL events were already
+captured in the log (confirmed via a live `grep` before terminating), rather than waiting for the
+full 60s+ `WM_POLL`/`DE_FAILED` window -- this pass's question only needed the fork/exec/kill
+window, not the later census.
+
+### Interleaving hazard, confirmed live (AGENTS.md's own standing lesson, reconfirmed)
+
+A naive scan of nearby line numbers is worthless here: MULTIPLE independent cross-process children
+write to the SAME redirected log stream concurrently, each with its OWN `init_logging()`-reset
+elapsed clock, so adjacent lines can jump from `123.7s` to `28.5s` to `83.2s` with no ordering
+relationship at all. The only reliable technique is `grep`-filtering to an EXACT `tid=N`/`pid=N`
+token (never a line-number window) -- a single OS thread's own log calls remain strictly ordered
+even when interleaved with unrelated threads' output between them.
+
+### Identity, unambiguous
+
+Filtering to the exact babysitter's own tid (`39` in this run) from its `clone: request
+registered child_tid=39 parent_pid=19372` line onward: the babysitter's `comm` stays
+`dbus-daemon\0` for its ENTIRE life (never execs, matching real dbus's own babysitter protocol --
+the babysitter IS a fork of dbus-daemon itself, retaining its parent's `comm` until/unless it
+execs the real target). Its OWN fork produces `child_tid=40, parent_pid=39` at t=83.278s, and
+THAT process's own `DIAG_TIMELINE execve pid=40 ppid=39` line at t=83.334324200s gives the
+unambiguous answer: `argv0=/usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd`. This is the
+`org.xfce.Xfconf` service activation -- squarely on `xfwm4`'s own `initSettings()`/
+`xfconf_channel_new` dependency chain, not an unrelated a11y/notification bus. This alone made the
+lead worth chasing all the way through rather than stopping at "identity established."
+
+### Cause of death, unambiguous (full syscall-level sequence, tid-filtered)
+
+```
+82.866313800s  clone: request registered child_tid=39 parent_pid=19372      (real daemon forks babysitter)
+83.278215500s  clone: request registered child_tid=40 parent_pid=39        (babysitter forks grandchild)
+83.278648400s  DIAG_TIMELINE clone pid=39 -> child_tid=40
+83.322474100s  sys_wait4 entry tid=39 pid=40 options=1 (WNOHANG)             (babysitter polls grandchild)
+83.334294900s  sys_execve: entry tid=40 host_tid=3548
+83.334324200s  DIAG_TIMELINE execve pid=40 ppid=39 argv0=.../xfconfd         (grandchild becomes xfconfd)
+   [[ tid=39 goes COMPLETELY SILENT for ~1.28s -- zero syscalls, zero signal-checks logged ]]
+84.617081900s  sys_wait4 entry tid=19372 pid=39 options=1 (WNOHANG)          (real daemon polls babysitter: still alive)
+84.620133700s  sys_wait4 entry tid=39 pid=40 options=1 (WNOHANG)             (babysitter FINALLY resumes, polls grandchild again)
+84.621070100s  sys_wait4 entry tid=19372 pid=39 options=0 (BLOCKING)         (real daemon escalates to a blocking wait)
+84.621113900s  process_signals entry with ctx tid=39                        (babysitter's own next signal-check point)
+84.621202300s  process_signals dispatching signal tid=39
+84.621234600s  ERROR fatal signal: terminating task signal=Signal(9) pid=39 tid=39 comm=dbus-daemon
+84.621343300s  sys_exit_group: entry tid=39 status=Signal(Signal(9))
+```
+
+The gap between the real daemon's BLOCKING `wait4(39, 0)` entry (84.621070100s) and the babysitter
+discovering `SIGKILL` already pending (84.621113900s) is 43 MICROSECONDS -- too tight to be
+coincidence, confirmed reproducible in shape (not exact timing) across all 5 sampled kills in the
+same log (pids 39/46/57/77/96, the 77 case delivering `Signal(6)`/SIGABRT instead once).
+
+**`sys_kill`/`sys_tkill`/`sys_tgkill` (`litebox_shim_linux/src/syscalls/signal/mod.rs:852-862`)
+carry NO log statement at all** (confirmed by reading the source directly) -- so the actual `kill()`
+syscall that queued this `SIGKILL` is structurally invisible to ANY log-based trace, at any level.
+Its existence and timing can only be inferred from its effect (the pending-signal dispatch) and
+from cross-referencing real upstream behavior, which is exactly what closes this out:
+
+Fetched `dbus.freedesktop.org`'s own doxygen-rendered `dbus-spawn-unix_8c_source.html` (the
+gitlab.freedesktop.org raw source is behind an Anubis bot-block; the doxygen mirror is not) and
+read `_dbus_babysitter_kill_child`/`_dbus_babysitter_unref` directly:
+
+```c
+/* _dbus_babysitter_unref's cleanup path */
+if (sitter->sitter_pid > 0) {
+  ret = waitpid (sitter->sitter_pid, &status, WNOHANG);
+  if (ret == 0)
+    kill (sitter->sitter_pid, SIGKILL);
+  /* (a subsequent blocking waitpid reaps the now-guaranteed-fast zombie) */
+}
+```
+
+with the doc comment: "If we haven't forked other babysitters since this babysitter and socket
+were created then this close will cause the babysitter to wake up from poll with a hangup and
+then the babysitter will quit itself" -- i.e. the NORMAL, expected path is: the daemon drops its
+reference (once the activation it was tracking is considered resolved), closes its end of the
+pipe, and the babysitter -- which has nothing left to do -- notices the HUP via its own `poll()`
+and exits gracefully on its own. The explicit `kill(SIGKILL)` is upstream's OWN documented
+DEFENSIVE FALLBACK for exactly the case observed here: the babysitter too slow to reach its
+`poll()` before the daemon gives up waiting and force-reaps it. This maps EXACTLY onto the traced
+sequence (WNOHANG check finds it alive -> kill -> blocking reap) with the two `wait4` calls
+corresponding 1:1 to the two real `waitpid` calls.
+
+**Conclusion: this is real, correctly-emulated dbus-daemon behavior. Litebox does not invent or
+misfire this kill** -- it is faithfully running the guest's own C code, which itself sent a real
+`kill()` syscall litebox has no visibility into by design (upstream dbus never logs this either).
+
+### Definitively NOT the `DE_FAILED` cause
+
+`xfconfd` (`pid=40`) is a genuinely SEPARATE Linux process from its babysitter (`pid=39`) --
+real Unix process semantics: a `SIGKILL` to a parent (or, here, to a fork-sibling-in-lineage) does
+not touch an already-running child. Filtering the SAME log to `tid=40` end to end proves it never
+even notices:
+
+```
+84.352294200s  sys_recvfrom tid=40 fd=7 ... EAGAIN
+84.361052100s  sys_recvfrom tid=40 fd=7 ... preview="REJECTED ..."
+84.365383700s  sys_sendto   tid=40 fd=7 len=15  preview="AUTH EXTERNAL\r\n"
+84.376855700s  sys_recvfrom tid=40 fd=7 ... preview="DATA\r\n"
+84.377144700s  sys_sendto   tid=40 fd=7 len=6   preview="DATA\r\n"
+84.387245500s  sys_recvfrom tid=40 fd=7 ... preview="OK ..."
+84.395749800s  sys_sendto   tid=40 fd=7 len=19  preview="NEGOTIATE_UNIX_FD\r\n"
+84.402142400s  sys_recvfrom tid=40 fd=7 ... preview="AGREE_UNIX_FD\r\n"
+84.408438900s  sys_sendto   tid=40 fd=7 len=7   preview="BEGIN\r\n"
+   [[ babysitter (pid=39) dies at 84.621234600s -- xfconfd (pid=40) is already past BEGIN by then ]]
+84.473-94.427s futex WAIT/WAKE cycles, healthy glib main-loop idling, continuing 10+ more seconds
+100.086188300s DIAG_TIMELINE exit pid=40 (much later, unrelated boot-script cleanup)
+```
+
+A complete, successful D-Bus SASL handshake (`AUTH EXTERNAL` -> `OK ...` -> `NEGOTIATE_UNIX_FD` ->
+`AGREE_UNIX_FD` -> `BEGIN`) finishing at t=84.408s, fully BEFORE the babysitter's own death at
+t=84.621s, followed by 10+ seconds of healthy idle main-loop activity. `xfconfd` is a fully live,
+fully bus-registered `org.xfce.Xfconf` throughout -- matching the 62nd/63rd passes' own independent
+`dbus-send ... Introspect` confirmation exactly. The babysitter's death is cosmetic to the ACTUAL
+service's availability: whichever caller's method call the activation daemon was originally
+holding for `org.xfce.Xfconf` gets satisfied once `xfconfd` names itself on the bus, entirely
+independent of what happens to the babysitter that helped fork it.
+
+### A real, independent, low-severity bug found (not fixed this pass)
+
+The babysitter (`tid=39`) going COMPLETELY unscheduled -- zero syscalls, zero signal-checks, not
+even a `process_signals` poll -- for ~1.28 seconds immediately after successfully forking+exec'ing
+its grandchild is not itself corruption (its internal state is intact: the very first thing it
+does on resuming, a WNOHANG `wait4`, behaves correctly) but IS a genuine scheduling/latency anomaly
+specific to the thread-based-fork fallback path (this fork was forced there by `unix-socket-
+pair(addressless,pre-exec-IPC)`, the already-known-uncarriable fd class from the 54th pass). In
+real Linux, a babysitter sitting in `poll()` waiting on a HUP would be woken essentially
+instantly; a ~1.28s stall is far outside that norm and is why the daemon's rare defensive
+`SIGKILL` fallback fires on effectively every sampled babysitter this boot (5 for 5) instead of
+being the rare case upstream's own comment implies. Root cause NOT isolated this pass -- plausible
+candidates: (a) genuine host CPU contention from the many concurrent cross-process forks happening
+in this same dense boot phase (each costing ~1.2s per the "Cross-process fork" section above,
+which is suspiciously close to the observed stall), or (b) a real scheduling defect specific to
+the thread-based-fork fallback's own OS-thread handling. Zero functional impact observed (the
+activated service always still comes up fine) -- flagged as a new, low-priority Track B candidate
+rather than chased further, since it does not explain any live symptom.
+
+### Explicit non-actions this pass, and why
+
+- Did NOT modify any code -- the evidence conclusively shows correct dbus emulation, not a litebox
+  defect in the signal/kill path; patching a non-defect would violate this project's own
+  "verify before fixing" discipline.
+- Did NOT pursue the scheduling-stall finding further -- real but low-priority, zero functional
+  impact, and a distinct investigation from `DE_FAILED`.
+- Did NOT attempt `webtop_stack.sh`/browser verification -- `DE_FAILED` itself is unchanged, so a
+  full-stack attempt would cost real RAM/wall-clock for no new information.
+- Did NOT yet fetch real `xfce-mirror/xfconf` source for `xfconf_channel_new`'s exact GDBus
+  sequence, or attempt a `cdb -pv` attach on `xfwm4` -- both are the clear next steps, better
+  scoped as their own dedicated pass now that this lead is closed.
+
+### Precise pickup for the next pass
+
+Proceed to the previously-recorded pickup, now the sole remaining concrete lead: a byte-level
+trace of `xfwm4`'s own D-Bus fd specifically (`litebox_shim_linux::syscalls::net=debug`, filtered
+to `xfwm4`'s own pid once known, to avoid the whole-boot 150-300MB/minute cost), cross-referenced
+against real `xfce-mirror/xfconf` source (`xfconf/xfconf.c`'s `xfconf_init`/`xfconf_channel_new`,
+confirmed this pass via `raw.githubusercontent.com/xfce-mirror/xfconf/master/xfconf/xfconf.c` --
+NOT `libxfconf`, that repo name does not exist; and confirmed `xfconf_init()` itself does not
+force activation, only the FIRST real method call on the channel proxy does, via ordinary GDBus
+name-owning semantics) for its exact call/signal-subscribe sequence and default timeout behavior.
+Alternatively or additionally, a genuine `cdb -pv` attach on `xfwm4` itself (breaking on
+`g_dbus_proxy_call_sync`/`XOpenDisplay`-adjacent call sites), attempted only once host RAM is
+confirmed genuinely quiet per the standing RAM-budget lesson -- not attempted by any pass to date.
+
+Logs for this pass: `.wfgy/pass64_dbus_trace_run1.log` (65MB+, gitignored, debug binary,
+full `process/signal=trace,net/unix=debug` trace covering the fork/exec/kill window for pids
+39/40/19372 and 4 other same-shaped babysitter kills at pids 46/57/77/96).
