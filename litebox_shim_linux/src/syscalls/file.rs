@@ -1741,15 +1741,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .read(fd, &mut buf.borrow_mut(), offset)
                         .map_err(Errno::from)
                 },
-                |fd| {
+                |sock_fd| {
                     espipe_for_non_seekable_offset(offset)?;
-                    self.global.receive(
+                    let result = self.global.receive(
                         &self.wait_cx(),
-                        fd,
+                        sock_fd,
                         &mut buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
-                    )
+                    );
+                    // Mirrors sys_recvmsg's own hex-payload-preview diagnostic
+                    // (net.rs::do_recvmsg, 69th pass) -- plain read(2) on a socket fd is a
+                    // SEPARATE code path (GlobalState::receive here, never do_recvmsg), so a
+                    // trace that only enabled recvmsg-side logging silently missed every byte a
+                    // caller receives via read() specifically. Real X11 clients' Xtrans Unix-socket
+                    // transport calls plain read()/write(), not recvmsg()/sendmsg() -- root-caused
+                    // (71st pass) as the true cause of the 70th pass's own X11-stream-reassembly
+                    // desync: a stream built from recvmsg previews ALONE is a fragmentary, gapped
+                    // subset of the real bytes (missing every read()-delivered chunk entirely), not
+                    // evidence of a real X11 framing/protocol gap.
+                    // Uses a DEDICATED tracing target ("litebox_diag::socket_read"), deliberately
+                    // NOT nested under `litebox_shim_linux::syscalls::file` -- that parent target's
+                    // own pre-existing `sys_read` debug log fires on EVERY read() of EVERY fd kind
+                    // system-wide (regular files, pipes, ttys, ...), which is what makes a blanket
+                    // `syscalls::file=debug` filter cost 50MB+/s of guest time (AGENTS.md's own
+                    // standing note) and, live-observed this same pass, slow/destabilize a full
+                    // `webtop_stack.sh` boot badly enough to perturb its own timing (an `xdpyinfo`
+                    // pre-DE probe that normally succeeds failed with "unable to open display"
+                    // under that blanket filter). A caller only investigating a SPECIFIC socket's
+                    // read-side wire bytes (X11, D-Bus, ...) can enable just
+                    // `litebox_diag::socket_read=debug` and get complete, low-overhead coverage of
+                    // every read()/readv() delivered chunk on that fd without paying for every
+                    // other process's file I/O too.
+                    if let Ok(n) = result {
+                        litebox_util_log::__private::tracing::event!(
+                            target: "litebox_diag::socket_read",
+                            litebox_util_log::__private::tracing::Level::DEBUG,
+                            tid = %self.tid.get(),
+                            fd = %fd,
+                            preview = ?alloc::format!("{:02x?}", &buf.borrow()[..n.min(4096)]),
+                            "DIAG sys_read: payload"
+                        );
+                    }
+                    result
                 },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;

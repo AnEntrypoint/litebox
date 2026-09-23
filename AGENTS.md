@@ -7,8 +7,8 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 `docs/*.md` in the map below — read those for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. Compacted at the 65th pass and again at the
-70th (pass-history section below; 26th-70th full narrative, including each pass's own complete
+line plus its pointer, not a separate memory file. Compacted at the 65th and 70th passes, partial
+pass at the 71st (pass-history section below; 26th-71st full narrative, including each pass's own complete
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
@@ -123,11 +123,29 @@ target `litebox_shim_linux::syscalls::{process,unix}=debug` on `de_only.sh` inst
   that `TerminateProcess`es after 15s of <10ms CPU delta, killing a debugger-frozen (zero-progress)
   target; kill the already-running target's own watchdog first if attaching mid-boot.
 - **`sys_write`/`sys_writev`'s DEBUG log line is under the `syscalls::file` target, not `net`** —
-  `sys_writev` (`file.rs:2990`) delegates to `sys_write` (`file.rs:1847`). A `LITEBOX_LOG` filter
-  enabling only `syscalls::{process,net}=debug` (every pass through the 69th) makes every
-  write-side socket syscall invisible by construction — not evidence the write never happened. Add
-  `syscalls::file=debug` only narrowly/briefly: it also logs every `sys_read`, 50MB+ within under a
-  second of guest time on a real `webtop_stack.sh` boot (70th pass) — `de_only.sh`-scale only.
+  `sys_writev` (`file.rs:2990`) delegates to `sys_write` (`file.rs:1847`); same for `sys_readv`→
+  `sys_read` (`file.rs:2833`). A `LITEBOX_LOG` filter enabling only `syscalls::{process,net}=debug`
+  (every pass through the 69th) makes every write/read-side socket syscall invisible by
+  construction — not evidence the traffic never happened. Blanket `syscalls::file=debug` is
+  unusable on a real `webtop_stack.sh` boot: it logs every `sys_read` of every fd kind
+  system-wide, 50MB+/s of guest time, and live-observed (71st pass) to slow/destabilize the boot
+  badly enough that a normally-reliable `xdpyinfo` pre-DE probe failed to open the display under
+  it — do not use it on anything past `de_only.sh` scale.
+- **A socket fd's `read(2)`/`readv(2)` is a SEPARATE code path from `recvmsg(2)`, both at the
+  host-shim layer and for what real X11/D-Bus clients actually call** — `do_read`'s socket branch
+  (`file.rs`) calls `GlobalState::receive` directly, never `net.rs::do_recvmsg`; real Xlib/XCB's
+  Xtrans Unix-socket transport calls plain `read()`/`write()`, not `recvmsg()`/`sendmsg()` (`xfwm4`
+  shows a live, functioning X11 connection with ZERO `sendmsg`/`recvmsg`-visible send-side bytes,
+  confirmed 69th/70th/71st passes). Root-caused (71st pass) as the TRUE cause of the 70th pass's
+  own X11-stream-reassembly desync: a stream reassembled from `recvmsg` previews alone is missing
+  every `read()`-delivered chunk entirely, including the connection-setup reply itself, not
+  evidence of a real X11 framing/protocol gap. Fixed: `do_read`'s socket branch now has its own
+  hex-payload-preview diagnostic, mirroring `do_recvmsg`'s (69th pass) — but on a DEDICATED
+  `litebox_diag::socket_read` tracing target (not nested under `syscalls::file`) specifically so it
+  can be enabled ALONE for complete low-overhead read-side coverage of one socket's traffic
+  (X11, D-Bus, …) without paying blanket `syscalls::file=debug`'s system-wide cost. NOT yet
+  live-verified end-to-end against a clean full capture — three 71st-pass attempts each hit a
+  different obstacle before reaching `xfwm4` with the new diagnostic active (below).
 - **`FlushingStderr` (`litebox_runner_linux_on_windows_userland/src/lib.rs`) now buffers one whole
   tracing EVENT and does exactly one locked `write_all`+`flush`, in `Drop`** — the prior version
   acquired-and-released `std::io::stderr()`'s lock separately for `.write()` and `.flush()`, and
@@ -244,6 +262,29 @@ map" below). The CURRENT STATE those passes converged on:
   emulation by code search. `DE_FAILED` reproduces identically post-fix (`XCENSUS_WINDOWS
   total=16`, same as 69th). Did not reach `DE_UP`; no browser/app verification attempted. Byte
   dumps, reassembly script, exact offsets: `.wfgy/pass70_*` (gitignored).
+- **71st — the 70th pass's own X11-reassembler desync ROOT-CAUSED and FIXED (mechanism/fix: "Standing
+  lessons" above); NOT yet re-verified against a clean fresh capture; the root question (does a real
+  XKB event fire at the retrigger boundary) remains genuinely OPEN.** A correct length-aware re-parse
+  of the 70th pass's own surviving log found the captured RECV stream's FIRST bytes don't parse as a
+  real ConnSetup reply at all (`proto=1.0`, `vendor_len=0`, `num_screens=0` — all impossible for a
+  live server) — the true ConnSetup reply was itself delivered via `read()`, so a `recvmsg`-only
+  capture starts mid-stream, misaligned from byte 0 (not just at the previously-reported ~14KB mark,
+  which was a downstream symptom of this). Three attempts to get a fresh clean capture with the new
+  `litebox_diag::socket_read` diagnostic active each hit a different obstacle before reaching
+  `xfwm4`: blanket `syscalls::file=debug` on the full stack was catastrophically heavy and appears to
+  have destabilized the boot itself (a normally-reliable pre-DE `xdpyinfo` probe failed to open the
+  display — not seen in any prior pass's baseline; do not repeat this); `de_only.sh` hit its own
+  pre-existing dead end before `xfwm4` (Track B item 2, new finding this pass — `gpg-agent`'s known
+  52nd-pass fatal assertion is the likely cause, so use `webtop_stack.sh` instead of `de_only.sh`
+  until that's root-caused); a `webtop_stack.sh` boot with the new dedicated-target diagnostic (no
+  blanket `file=debug`) progressed normally and cheaply (matched the known-good 70th-pass marker
+  sequence in ~60s at ~40KB/s vs. 15MB+ under blanket `file=debug`) but was still inside the
+  pre-existing ~170s `SELKIES_PORT_SELFTEST_FAILED` polling window (35th pass) when killed — RAM
+  stayed healthy (5.9-7.6GB free) throughout, so almost certainly just needs a longer, patient
+  re-run, not a fix; the instrumentation itself is ready and cheap enough to leave on. Because of the
+  ConnSetup-corruption finding, the original recvmsg-only stream's "no `MappingNotify` in the clean
+  region" is NOT a real negative result — that region was never reliably aligned, so it's superseded,
+  not confirmed. **Did not reach `DE_UP`; no browser/app verification attempted.**
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -263,21 +304,33 @@ both Xvfb SIGSEGVs.
    itself is the one still-open blocker; 69th/70th (pass-history above) narrowed it to a ~10.7s
    periodic `GetAllProperties(.../"/xfwm4/custom")` retrigger, independently reproduced twice,
    matching `xfwm4`'s only periodic-reload path (`cb_keys_changed`→`keymap_reload()`, a GDK
-   "keys-changed" signal confirmed event-only by upstream source — no GDK timer).** Pickup, in
-   order: (a) root-cause the 70th pass's own deterministic X11-reassembler desync (~14KB in,
-   inside/after a legitimate `GetKeyboardMapping` reply, byte-identical on two boots so it's a
-   parser/protocol gap, not corrupted input — dump the exact boundary bytes against a byte-accurate
-   X11 spec, don't guess); (b) once the RECV stream parses past that point, check directly for a
+   "keys-changed" signal confirmed event-only by upstream source — no GDK timer).** The 71st
+   pass's own X11-reassembler desync is root-caused and FIXED (`litebox_diag::socket_read`
+   diagnostic, "Standing lessons" above) but NOT yet live-verified end-to-end. Pickup, in order:
+   (a) boot `webtop_stack.sh` with `LITEBOX_LOG=warn,litebox_shim_linux::syscalls::{process,
+   net}=debug,litebox_diag::socket_read=debug` (cheap — no blanket `file=debug` needed) and be
+   PATIENT past `SELKIES_BIND_WATCHDOG_STARTED` — the known ~170s `SELKIES_PORT_SELFTEST_FAILED`
+   polling window (35th pass) still precedes `XVFB_UP` on the current `.wfgy/webtop_stack.sh`, RAM
+   stays healthy (5.9-7.6GB free, 71st pass) throughout so this is normal, not a hang; (b) once
+   `xfwm4` execs, reassemble BOTH its `sys_recvmsg` and NEW `sys_read` payload previews together, in
+   file-line order (chronological — merge, don't pick one), THEN parse with correct length-aware
+   framing (71st pass's rewritten framing rules, "Standing lessons" above) — the reassembled stream
+   should now start with a genuine ConnSetup reply (`proto=11.0`, real `vendor_len`/`num_screens` —
+   verify this FIRST, before trusting anything downstream); (c) check directly for a
    `MappingNotify`(34)/XKB event at the already-timestamped ~10.7s boundaries (70th pass log:
-   t=9.22/20.47/31.27/42.19s); (c) if none exists, pivot to testing the reentrancy theory directly
-   via an `LD_PRELOAD` interposer on `g_dbus_connection_call_sync`/`g_main_context_iteration` (same
-   technique as the 30th pass's `getenv_probe.so`) rather than more passive tracing. `ps`/`/proc` is
-   blind to every cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion.
-   PER-PROCESS RAM is the hard ceiling on any attempt (5-8GB free at boot start → sub-1GB during
-   the WM2/selkies-concurrent window on most full-stack runs, 70th pass included) — kill fast via
-   WMI `Terminate` right after the census, never wait for the script's own 600s `HOLD` loop.
-   Secondary, lower priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high
-   `VM_SHARED` fork-child region count (52nd).
+   t=9.22/20.47/31.27/42.19s, reproduced twice); (d) if none exists, pivot to testing the
+   reentrancy theory directly via an `LD_PRELOAD` interposer on
+   `g_dbus_connection_call_sync`/`g_main_context_iteration` (same technique as the 30th pass's
+   `getenv_probe.so`) rather than more passive tracing. `ps`/`/proc` is blind to every
+   cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion. Kill fast via WMI
+   `Terminate` once the needed window of `xfwm4` activity is captured (2-3 retrigger cycles is
+   enough, ~45s of ITS OWN local clock past `DE_LAUNCHED`), never wait for the script's own 600s
+   `HOLD` loop. Secondary, lower priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion
+   (52nd) — ALSO now the likely reason `de_only.sh` specifically (not the full stack) dead-ends at
+   `iceauth`+`ssh-agent`+`gpg-agent` before ever launching `xfce4-session`'s WM child (71st pass,
+   live-reproduced 2/2 on `de_only.sh` — `webtop_stack.sh` does not hit this, use it instead of
+   `de_only.sh` for any `xfwm4`-reaching repro until this is root-caused); high `VM_SHARED`
+   fork-child region count (52nd).
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass (`unix.rs`); did NOT
    resolve the `xfwm4` symptom above, so a real but insufficient fix for THIS symptom. Other AF_UNIX
    exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable` capacity-256
