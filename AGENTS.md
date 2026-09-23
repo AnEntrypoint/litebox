@@ -336,6 +336,85 @@ map" below). Condensed current-state trail:
     repro exercising exactly this reclaim shape hung before the fix, completes clean after it
     (`SEQ_DONE`, all forks' own log lines present, zero corruption), both builds; all four original
     repros re-verified 5/5 clean, both builds, unchanged after landing the fix.
+  - **89th pass — RAM-fix reproducibility CONFIRMED across 2 more independent real boots (debug
+    build, both flags on); DE_FAILED's proximate cause found to be REAL, live `xfce4-session`
+    process crashes in 2 of 3 runs (not a passive "WM registration gap") -- but root-caused these
+    crashes as PRE-EXISTING, thread-based-fork-only corruption, UNRELATED to
+    `lazy_fork_commit`/guard-cow; a first-ever live `cdb` attach on a cross-process fork child was
+    achieved but did not catch the fault in the act; `DE_UP` NOT reached.** Rebuilt both debug and
+    release (`cargo build [--release] -p litebox_runner_linux_on_windows_userland`, both exactly
+    current for `96234c2`). Two fresh debug-build `de_only_xcensus_seed3.tar` boots (both flags on,
+    `LITEBOX_DIAG_FATALDUMP=1`, both watchdogs disabled) each ran their FULL monitoring window
+    (~283s and ~300s+) with a stable 2.8-4.6GB free / 4-8 processes band, zero crater -- a second and
+    third independent confirmation of the 88th pass's result, different binary (debug vs. release),
+    reproducible.
+    - **Real finding, from re-reading the 88th pass's own `pass88_boot1` logs plus two fresh debug
+      boots**: `xfce4-session`'s own real Windows process (its cross-process-fork guest pid IS its
+      real winpid, confirmed `winpid=` in `task-resume-probe`) CRASHED with a genuine unhandled
+      exception in 2 of 3 runs -- `[wait4_diag]` shows `exit_code=3221225477` (`0xC0000005`
+      `STATUS_ACCESS_VIOLATION`) for BOTH `xfce4-session` (pid 18388) and `ssh-agent` (pid 22932,
+      its child) within the 88th pass's own release-build log (`.wfgy/pass88_boot1.err.log:2092,
+      2094`), 16-31s after each process's own thread started; a fresh debug-build run showed a
+      DIFFERENT exit code, `exit_code=3221225485` (`0xC000000D` `STATUS_INVALID_PARAMETER`), for
+      `xfce4-session` itself 31.3s after a `clone()` to `/bin/sh` to `iceauth` chain (scratch log,
+      not committed). Confirmed via a count of `exit_code=3221225477` that this is RARE (3 of 82
+      `wait4_diag` exits in the 88th pass's own log), not the normal encoded-exit sentinel
+      (`0xC0DE0000`/`3235774464`, seen 160 times) -- a real distinguishing signal, not noise. **This
+      directly explains `DE_FAILED`/the empty `_NET_SUPPORTING_WM_CHECK`: the session manager that
+      would launch `xfwm4` is dead before it ever gets there**, not merely "hung" or stuck on a
+      passive registration gap as the 88th pass's own writeup guessed (reasonably, since it did not
+      check `wait4_diag` exit codes).
+    - **Root-caused (via `DIAG_TIMELINE clone`'s own `child_tid=` vs `winpid=` marker, plus
+      `classify_lazy_eligible_groups`/`try_claim_guard_cow_table`'s own call sites in
+      `process_fork.rs:1825,1849`) that EVERY crashing fork in both runs is on the OLD, PRE-EXISTING
+      THREAD-BASED fork fallback path (`child_tid=`), never cross-process (`winpid=`)** -- confirmed
+      `xfce4-session`'s own `clone()`s for `ssh-agent`/`/bin/sh` are thread-based (the same
+      ineligible-fd reason `ssh-agent`'s own daemonizing fork already logs:
+      `kinds=["unix-socket"]`, unrelated to `xfce4-session`'s OWN fork but the same mechanism).
+      `lazy_fork_commit`/guard-cow ONLY ever runs for cross-process fork children
+      (`FORK_CHILD_LAZY_RANGES_ENV_VAR`/`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR` are only set on the
+      cross-process spawn path, `process_fork.rs`) -- these specific crashes cannot be caused by the
+      83rd-88th passes' own new mechanism. The far more likely suspect is the SAME long-documented,
+      still-not-fully-solved thread-based-fork corruption class this file has flagged for months
+      (ADVISORY-001 §3N tcache-safe-linking corruption and/or `fork_verify.rs`'s own stale-pointer
+      healing) -- both logs show `fork_verify: stale CODE pointer detected` / `AV-path stale rip
+      livelock detected, falling through to deeper slot healers` dozens of times throughout, i.e.
+      this OLD healing machinery is actively, heavily engaged around the crash window, not merely
+      present. **Not yet proven which exact one -- a real, still-open gap.**
+    - **First-ever live `cdb` attach on a cross-process fork child, achieved but inconclusive**:
+      `cdb` (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`, not on `PATH`) attaches
+      fine to both the root runner and a cross-process-forked child once the PID is genuinely still
+      alive -- the FIRST `-pv` (noninvasive) attempt failed with `No runnable debuggees` on `g` not
+      because of any permission problem but because `-pv` never takes ownership of the debug loop
+      (`g` has nothing to continue) -- use a plain invasive `-p <pid>` attach (still always detach
+      with `qd`, never bare `q`, per this file's own standing rule) if the goal is to catch a live
+      in-progress fault with `sxe`/`g`. An automated log-tailing watcher script that greps for
+      `argv0=/usr/bin/xfce4-session`'s `winpid=` and attaches within ~1s was necessary -- manual
+      multi-tool-call polling is too slow to win the race against a crash that lands 16-31s after
+      thread start. Even with this, the one successful invasive attach never caught the fault: the
+      target ran its entire observed window (300s+, well past its own un-debugged 16-31s crash
+      point) without crashing OR producing its own usual early stderr (the `[de2]`-tagged
+      `libxfce4util-WARNING`/EWMH-query lines that appear within ~1s in an un-debugged run were
+      completely ABSENT the whole run) -- i.e. a sustained invasive `cdb` attach measurably changes
+      this specific heavily-multi-threaded target's own behavior/timing (consistent with, but not
+      proof of, the underlying bug being genuinely timing-sensitive; could also simply be `cdb`'s own
+      suspend/resume overhead delaying this target's very early startup). **Concrete pickup for a
+      future pass with more live-debug budget**: retry the same auto-attach approach but breaking in
+      EARLY (right after the `task-resume-probe` line, before the target has done much) and manually
+      single-stepping forward a bounded number of instructions rather than a blanket `g`, to avoid
+      the same timing perturbation; also worth directly testing whether
+      `--env GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0` (this file's own
+      documented thread-based-fork tcache-corruption workaround) is genuinely present in
+      `xfce4-session`'s/`ssh-agent`'s/`iceauth`'s own real process environment at the point of their
+      OWN `clone()` (several generations removed from the container's root entrypoint through
+      `/de_only.sh` -> `xfce4-session` -> `clone()`) -- not directly checked this pass, a real gap,
+      and the most concrete remaining hypothesis: if a real `xfce4-session`/`GLib`
+      environment-rebuild step silently drops it before spawning `ssh-agent`, the exact crash class
+      this workaround exists to prevent would recur even with the flag correctly passed at the CLI.
+    - Both `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` stay default OFF, unchanged this
+      pass -- nothing above is a regression in either flag's own mechanism; this pass's finding is
+      that a SEPARATE, older bug class is what stands between the RAM fix and `DE_UP`, not the new
+      lazy/guard-cow mechanism itself, which continues to check out clean on every re-run.
   - **Real `de_only_xcensus_seed3.tar` boot result after Bug 5's fix**: ran the full ~195s
     monitoring window WITHOUT cratering and WITHOUT hanging — free RAM held a stable 2.8-4.5GB band
     (9-16 processes) the entire time, qualitatively healthier than every prior pass's own
@@ -398,17 +477,30 @@ both Xvfb SIGSEGVs.
    root-cause writeup, and the boot's exact log excerpts: `lazy_fork_commit.rs`'s own "88th pass"
    doc section. Both flags stay default OFF pending broader boot re-verification (one run, not
    five, given each real boot costs several minutes).
-   **Next pickup, in order**: (1) re-run the `de_only_xcensus_seed3.tar` boot 2-4 more times with
-   both flags on to confirm the healthy-RAM result is consistent, not a one-off; (2) if confirmed,
-   root-cause the `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now that RAM headroom makes it
-   reachable repeatedly — this file's own standing notes on that gap (item (b) below,
-   `XCENSUS_ROOTPROP`/`LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4`, the ~10.7s `GetAllProperties`
-   retrigger) are the concrete starting point; (3) only once that gap is also closed does flipping
-   either flag on BY DEFAULT become worth considering, and even then only after the same 5/5
-   real-boot rigor this pass's single clean run does not yet meet. `LITEBOX_DIAG_FORK_VMA_
-   BREAKDOWN=1` (zero cost when off) remains the permanent tool for measuring any future fix's real
-   payoff. `DE_UP` has not been reached by any pass through the 88th; chrome-devtools MCP has been
-   `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP` fires). Lower-priority, still
+   **89th pass: RAM-fix reproducibility CONFIRMED (2 more independent clean real boots, debug
+   build) -- but `DE_FAILED`'s own root cause is now KNOWN to be, in most runs, a real
+   `xfce4-session` process CRASH (real `STATUS_ACCESS_VIOLATION`/`STATUS_INVALID_PARAMETER` exit
+   codes via `wait4_diag`), not a passive registration gap -- and that crash is on the OLD
+   thread-based-fork path (`child_tid=`), NOT `lazy_fork_commit`/guard-cow (`winpid=`-only). See
+   this section's own "89th pass" entry above for the full evidence chain.**
+   **Next pickup, in order, supersedes the old (1)-(3) below**: (1) confirm whether
+   `GLIBC_TUNABLES` genuinely reaches `xfce4-session`/`ssh-agent`/`iceauth`'s own real environment
+   at their own `clone()` point (not checked live this pass -- the single most concrete open
+   question); (2) get a live `cdb` capture of the actual fault using an EARLY breakpoint +
+   bounded single-step instead of a blanket `g` (this pass's sustained invasive attach ran the
+   whole window without ever reproducing the crash, most likely due to the attach's own timing
+   perturbation -- see the auto-attach watcher note above); (3) once root-caused, fix it as a
+   general thread-based-fork correctness bug (independent of either lazy/guard-cow flag) and
+   re-verify `DE_FAILED` stops firing on this specific cause; (4) only then does the ORIGINAL
+   `_NET_SUPPORTING_WM_CHECK`/`xfwm4`-registration angle below become reachable to investigate on
+   its own merits (a run where `xfce4-session` never crashes, like this pass's cdb-attached run3,
+   still hit `DE_FAILED` with zero `xfwm4` registration, so that gap is real too, separate from the
+   crash, and still needs its own root-cause once the crash stops obscuring it); (5) only once BOTH
+   are closed does flipping either lazy/guard-cow flag on BY DEFAULT become worth considering.
+   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (zero cost when off) remains the permanent tool for measuring
+   any future fix's real payoff. `DE_UP` has not been reached by any pass through the 89th;
+   chrome-devtools MCP was not re-checked this pass (no boot got close enough to a real desktop to
+   make it worth checking). Lower-priority, still
    open: (a) decompose remaining per-fork cost between rootfs materialization staying resident post
    its cheap (~83-140ms) build vs. Windows loader overhead; (b) use `de_only_xcensus_seed3.tar`'s
    working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`, real values not `xprop`
