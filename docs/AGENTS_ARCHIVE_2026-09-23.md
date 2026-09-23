@@ -1331,3 +1331,299 @@ inside `/de_only.sh` itself, cascading into the ROOT process's own unrecoverable
 `xfce4-session` is ever reached at all — matching the general, long-documented ADVISORY-001 §3N
 thread-based-fork tcache corruption class, not a regression from this pass's own fix. Host RAM
 4.7-5.8GB free throughout, no concurrent boots, all three runs cleanly self-terminated.
+
+## 91st-94th pass full narrative (drained from AGENTS.md by the 95th pass)
+
+- **91st — root-caused the 90th pass's "ZERO `[veh]`/panic output" mystery to a real, independently
+  doubly-documented `GS_BASE` corruption class (Windows' exception dispatcher itself needs valid
+  `GS_BASE` to even invoke a registered VEH callback) and fixed the one call site that lacked its
+  repair (`RawMutex::block_or_maybe_timeout`'s `WaitForSingleObject` loop, what `wait_for_vfork_done`
+  blocks in) — but could NOT live-verify against the real crash this pass (3/3 boots died from an
+  earlier, unrelated `bash pid=80` tcache crash first). Full mechanism, doc-comment cross-references,
+  exact fix: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "91st pass full narrative" section.
+- **92nd — the `bash pid=80` crash did not reproduce (0/5 boots), so the 91st pass's `GS_BASE` fix
+  could finally be tested against the real `xfce4-session` crash — and was DISPROVED live: a new
+  `LITEBOX_DIAG_GS_BASE_REPAIR=1` diagnostic fired zero times across 3 full boots while the
+  identical `STATUS_ACCESS_VIOLATION` crash still occurred every time. Found the exact, fully
+  deterministic faulting guest RIP via Windows' own Application Error event log
+  (`rip=0x00007fefe92bc7cb code=0xC0000005`, byte-identical across all 3 independent boots) — real,
+  reproducible, invisible to litebox's own VEH logging. Ruled out lazy-fork-commit/guard-cow as a
+  simple on/off cause (live test: removing guard-cow makes things categorically worse, not better).
+  Full evidence, exact commands and the precise next-pickup cdb target: this file's own item-1 entry
+  under "Open, in rough priority order", below.
+- **93rd — live-captured the exact deterministic crash (`rip=0x00007fefe92bc7cb`) with `cdb` for the
+  first time ever, via a hardware execute breakpoint at the 92nd pass's own known address (invasive
+  `cdb -p <winpid>`, NOT `-pv` — confirmed live that `-pv` cannot receive debug events at all,
+  "the process can be examined but debug events will not be received"; `-pv` is for read-only
+  inspection of an already-alive process, invasive `-p` + `qd` to detach is what actually catches a
+  breakpoint). Identified the code: guest glibc's `__syscall_error` (`neg eax; mov rcx,[tls-offset-
+  slot]; mov fs:[rcx],eax; or rax,-1; ret` — the Initial-Exec-model `errno = -ret` store every failed
+  syscall wrapper calls), `rcx=0xffffffffffffffa0` (a small negative TLS offset). `!address @rip`:
+  `Usage: <unknown>`, `PAGE_EXECUTE_READ`, `MEM_PRIVATE` — real guest-mapped memory, matching the
+  92nd pass's event-log `Faulting module name: unknown`. cdb's own effective-address preview for the
+  faulting `fs:[rcx]` resolved to the literal offset with NO base contribution
+  (`fs:ffffffff`ffffffa0=????????`) — i.e. `FS_BASE` reads back `0` on this thread at this exact
+  instruction, the guest-TLS-register sibling of the already-documented `GS_BASE`-clears-under-
+  scheduling-pressure class. **Fix attempted (real, safe, landed, but empirically NOT sufficient)**:
+  `RawMutex::block_or_maybe_timeout`'s own comment already flagged `FS_BASE` as equally at risk at
+  that exact call site, yet only `GS_BASE` had ever gotten a repair there (91st pass) — added the
+  mirroring `WindowsUserland::restore_thread_fs_base()` call (`litebox_platform_windows_userland/
+  src/lib.rs`, right after the existing `restore_thread_gs_base_if_cleared()` call). Builds clean
+  (debug + release). **Live-verified this does NOT fix the crash**: a fresh, fixed release-binary
+  boot (no debugger) still crashed `xfce4-session` at `elapsed_ms_since_thread_start=16993`,
+  `exit_code=3221225477`, byte-identical to every pre-fix run — the FS_BASE clearing this specific
+  crash depends on is not occurring (at least not exclusively) via that call site. A genuinely useful
+  negative result: `RawMutex::block`'s wait loop is closed as a cause for THIS crash (the fix itself
+  stays landed — it is still a real, independently-justified gap-closer per the code's own prior
+  comment, just not the explanation here). **Deeper, not-yet-conclusive finding via single-stepping
+  through the live fault** (`t` repeatedly past the breakpoint, `sxd av` NOT set so cdb stops on every
+  first-chance AV): on this same thread, in the seconds/instructions immediately before the fatal
+  write, FIVE OTHER `fs:`-relative guest READS (`fs:[0x18]`, `fs:[0x18]` again from a different call
+  site, `fs:[r12]`/`fs:[r14]` both `=-0x40`, `fs:[0x28]` — the classic glibc stack-protector canary
+  check) ALL show the identical "no FS_BASE contribution" signature and yet do NOT immediately kill
+  the process the way the final WRITE (`__syscall_error`'s `mov fs:[rcx],eax`) does — suggesting
+  `FS_BASE` may be clearing far more often on this thread than previously characterized (not one
+  isolated event near a long vfork wait, but seemingly every few guest instructions), with reads
+  perhaps surviving via the existing reactive `vectored_exception_handler` repair-and-retry
+  (`lib.rs:2509-2539`, gated on `WindowsUserland::get_thread_fs_base() != 0` — skips repair entirely,
+  falling to the fatal path, if litebox's OWN recorded value for this thread is itself `0`) while a
+  WRITE either does not get the same retry treatment or loses a race the reads happen not to. **This
+  observation needs treating with real caution, not as confirmed fact**: it was made WHILE invasively
+  attached, and the 89th pass already established that invasive attachment measurably perturbs this
+  exact bug class's own timing — the cascade-of-reads-then-one-fatal-write pattern could be an
+  artifact of debugger-added latency rather than the true undebugged sequence. **Next pickup,
+  precise**: (a) re-run the identical single-step trace 2-3 more times to see if the "5 reads then 1
+  write" shape is stable, or an artifact of this one capture; (b) read `lib.rs:2509-2539` (the
+  guest-mode FS_BASE repair) and `lib.rs:1802-1919` (the host-mode sibling) side by side against a
+  REAL write-fault case to determine definitively whether the repair-and-retry path treats a write
+  destination any differently from a read source (it should not, by inspection — `wrfsbase`+retry
+  just re-executes the same instruction regardless of read/write — so if the mechanism really is
+  identical, the "write is special" theory from this pass is likely wrong and the true answer is
+  timing/race-window-based instead, worth checking `WindowsUserland::get_thread_fs_base()`'s value
+  captured at the exact moment of the fatal fault specifically, not inferred from the debugged
+  trace); (c) a `LITEBOX_DIAG_FS_BASE_REPAIR=1`-style permanent diagnostic (mirroring the 92nd pass's
+  own `LITEBOX_DIAG_GS_BASE_REPAIR`) on the GUEST-mode repair site specifically, run WITHOUT a
+  debugger attached at all, would settle both (a) and (b) with real, unperturbed evidence — this is
+  the single most valuable next step, cheaper and less invasive than more cdb sessions. `DE_UP` not
+  reached. Two release+one debug boot this pass, all cleanly self-terminated or WMI-`Terminate`d, RAM
+  never fell below ~1.4GB free, no concurrent boots.
+- **94th — implemented the 93rd pass's own recommended `LITEBOX_DIAG_FS_BASE_REPAIR=1` diagnostic
+  (mirroring `LITEBOX_DIAG_GS_BASE_REPAIR` exactly), got real unperturbed evidence, and used it to
+  FIND+FIX two genuine, previously-unpatched GS_BASE/FS_BASE repair gaps in `RawMutex` — both real,
+  safe, independently justified, and both LIVE-VERIFIED INSUFFICIENT for this specific crash, which
+  is the pass's actual headline finding: the crash's ~16.4-16.9s timing is suspiciously IDENTICAL
+  across 4 different repair-coverage configurations, arguing against the "random scheduling-pressure
+  MSR clear" framing every fix through the 93rd pass has assumed.** `DE_UP` NOT reached.
+  - **Diagnostic added** (`litebox_platform_windows_userland/src/lib.rs`): `VehGates::fs_base_repair`
+    (`LITEBOX_DIAG_FS_BASE_REPAIR`), logging at FOUR sites: the guest-mode AV repair (both the
+    successful-repair case AND, newly, the "detected the exact reset shape but `THREAD_FS_BASE`
+    itself reads 0, cannot repair" case — the previously-unlogged half of the story), its
+    single-step-path sibling, and the host-mode AV repair's own mirrored pair, plus an unconditional
+    "host-mode AV, no FS_BASE-reset match" catch-all. A shim-side companion
+    (`litebox_shim_linux/src/syscalls/process.rs`'s `ThreadInitState::ForkedChild` handler) logs
+    every forked/vforked child's own FS_BASE establishment for cross-correlation.
+  - **First real finding (decisive negative result, confirmed twice independently)**: across two
+    full `de_only_xcensus_seed3.tar` boots with this diagnostic on, NONE of the new log lines ever
+    fired anywhere near `xfce4-session`'s own crash — not the guest-mode repair, not the host-mode
+    repair, not the "can't repair" failure case, not even the codebase's own PRE-EXISTING, totally
+    unconditional `[diag-unrecov-av]`/`[diag-veh-no-tls]` prints (`lib.rs`, no gate at all) that fire
+    for ANY unrecovered guest-mode fault reaching this codebase's own VEH. This independently
+    reconfirms, via a completely different mechanism, the 90th pass's own original "zero `[veh]`/
+    `diag-unrecov-av`/panic output anywhere in the log for `xfce4-session`'s own winpid" finding
+    (`docs/AGENTS_ARCHIVE_2026-09-23.md:1289`) and the 91st pass's independently cross-session-
+    confirmed theory (`docs/AGENTS_ARCHIVE_2026-09-03.md:5643`): this codebase's own
+    `vectored_exception_handler` is never even being INVOKED for the fault that kills
+    `xfce4-session` — consistent with Windows' own exception dispatcher itself needing a valid
+    `GS_BASE` to locate the TEB/VEH chain and reach ANY registered callback at all, so sufficiently
+    bad `GS_BASE` corruption is invisible to every diagnostic living inside the VEH (cdb's own live
+    capture, 93rd pass, bypasses this because a kernel debug port does not need the same
+    `GS_BASE`-relative TEB lookup ntdll's own userspace SEH/VEH dispatch does).
+  - **Two real fixes landed on that theory** (`RawMutex`, `litebox_platform_windows_userland/src/
+    lib.rs`): (1) `finish_real_timeout`'s own `WaitForSingleObject(event, INFINITE)` — reached only
+    via the narrow "a real timeout raced a concurrent `wake_many`" branch — had NO repair call at
+    all, unlike its sibling in `block_or_maybe_timeout`'s main loop; added both
+    `restore_thread_gs_base_if_cleared()` and `restore_thread_fs_base()` immediately after it. (2)
+    `poll_until_value_changes` (the `MAX_INLINE_WAITERS`-exhaustion fallback, entered whenever
+    `RawMutex::block_or_maybe_timeout` logs "waiter queue full, falling back to polling") is a pure
+    `std::thread::sleep`-based spin loop with NO repair call anywhere — added both calls per
+    iteration. Live-caught this path actually firing on a real boot: `max_waiters=32` reached at
+    15.24s into one run, ~1.66s before that same run's `xfce4-session` crash at 16.9s — real,
+    demonstrably-live evidence this fallback is active under real XFCE-startup lock contention, not
+    a theoretical path.
+  - **Both fixes live-verified INSUFFICIENT, twice**: post-fix-1-only boot still crashed at
+    elapsed_ms=16900/16901 (byte-identical exit code, `owning_pid=27256`=`xfce4-session`); post-both-
+    fixes boot still crashed at elapsed_ms=16754 (`owning_pid=3384`=`xfce4-session`) — and in that
+    second run "waiter queue full" never even fired, so fix 2 wasn't exercised that specific run
+    either way. Across all 4 measurements this pass and the 93rd pass combined (pre-fix 16468/16993,
+    post-93rd-fix-alone 16864, post-94th-fix-1 16900, post-both-94th-fixes 16754), the spread is
+    under 550ms regardless of which `RawMutex` repair coverage is present — real, reproducible,
+    unperturbed evidence against "this crash is a random Windows scheduling-pressure MSR clear
+    racing a `RawMutex` wait", the framing every fix attempt from the 91st through this pass has
+    shared. A genuinely random race raced against 4 different code changes affecting its own
+    contention/timing characteristics would be expected to show more than 550ms of jitter.
+  - **Sharpened pickup for the next pass**: the timing's own suspicious consistency now outweighs
+    the segment-base-MSR-clear theory as the leading explanation for THIS specific crash (the two
+    fixes landed this pass remain real, general, worth keeping regardless). Two concrete next
+    angles, neither yet attempted: (a) audit every OTHER brand-new-OS-thread-creation path (beyond
+    `ThreadInitState::ForkedChild`, already confirmed correct this pass, and `NewThread`'s
+    `tls: Some(_)` case, also confirmed correct) for one that can legitimately leave `THREAD_FS_BASE`
+    at its Rust-default `0` — a genuinely uninitialized value reads identically to a "cleared" one
+    to every existing repair site's `saved != 0` guard, and would produce this exact
+    byte-identical-every-time signature far more naturally than a race would; `NewThread`'s
+    `tls: None` case (clone() without `CLONE_SETTLS`) is unaudited and worth checking even though
+    real glibc/musl `pthread_create` should always pass `CLONE_SETTLS` in practice. (b) Search for a
+    Windows-side or litebox-side constant near 15-17s that could explain the timing being fixed
+    rather than random — `EXTERNAL_GRACE_PERIOD` (`process_fork.rs`, 15s) and
+    `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (`unix.rs`, 15s) are structurally close but unconfirmed;
+    neither has been checked against whether `xfce4-session`'s own fork tree ever actually exercises
+    them. A live `cdb -p` attach breaking on `exception_callback`'s entry (not `vectored_exception_
+    handler`, which the 84th pass separately found is instrumentation-sensitive) remains the
+    only way to see PAST this pass's own decisive "VEH is never entered" finding, if the next pass
+    has budget for the perturbation risk the 93rd pass already flagged. Three release boots this
+    pass (baseline capture, post-fix-1, post-both-fixes), all cleanly self-terminated or
+    WMI-`Terminate`d, RAM never observed below ~3.9GB free, no concurrent boots.
+
+## Item-1 tracker full narrative (75th-94th passes, drained from AGENTS.md by the 95th pass)
+
+1. **`xfwm4` now launches (75th pass, `1d449e6`) — the blocker is no longer filesystem visibility,
+   it is pure host-RAM/process-count exhaustion before `DE_UP`.** CLOSED sub-issues:
+   `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th); the
+   writable-layer export-path fallback bug (75th); the RAM crater (76th-88th, lazy fork-memory
+   population + single-generation guard-page COW, both default OFF behind `LITEBOX_LAZY_FORK_
+   COMMIT=1`/`LITEBOX_LAZY_FORK_GUARD_COW=1` — a real boot ran its full ~195s window without
+   cratering, reaching `DE_LAUNCHED_DIRECT` → `WM_POLL` → a real X window). Full narrative for
+   75th-90th: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "88th-90th pass full narrative" section and
+   this file's own compacted 88th-90th pass-history entry above.
+   **Current blocker (90th-91st pass)**: `xfce4-session` itself dies `STATUS_ACCESS_VIOLATION`
+   ~16-16.7s after start, immediately after its own genuine `CLONE_VFORK` of `/bin/sh`, with ZERO
+   `[veh]`/panic output — 90th pass fixed two real, unrelated vfork-detach architectural bugs
+   (`VM_FOREIGN_LIVE_NEVER_REPLACE`) that this crash survived unchanged. **91st pass root-caused
+   the "zero VEH output" mechanism**: independently DOUBLY-documented (`docs/
+   AGENTS_ARCHIVE_2026-09-03.md:5643`, cross-referenced this pass) `GS_BASE` corruption under
+   "nested vfork() kernel-transition pressure" — the OS's own exception dispatcher needs valid
+   `GS_BASE` to even locate/invoke a registered VEH callback, so when it breaks badly enough
+   (confirmed independently via `ntdll!mov %gs:0x60,%rcx` faulting), Windows' dispatcher faults
+   before litebox's VEH ever runs. Landed the fix that prior finding's own writeup specified: GS_BASE
+   repair now also runs after every `WaitForSingleObject` wakeup inside `RawMutex::
+   block_or_maybe_timeout` (`litebox_platform_windows_userland/src/lib.rs`), not just at VEH/
+   syscall-entry — closes the gap for `wait_for_vfork_done`'s own many-seconds-long blocking wait
+   (previously unrepaired). **NOT yet live-verified against the target crash**: 3/3 real boot
+   attempts this pass (1 pre-fix baseline, 2 post-fix) all died from a DIFFERENT, earlier,
+   already-known `bash` crash (`pid=80`, general ADVISORY-001 §3N thread-fork tcache corruption,
+   identical in the pre-fix baseline too — not a regression) before `xfce4-session` was ever
+   reached.
+
+   **92nd pass — the `bash pid=80` early crash did NOT reproduce (0/5 boots), letting the GS_BASE
+   fix finally be tested against the real target, and DISPROVED it with live evidence.** Added a
+   cheap, permanent, zero-cost-when-off diagnostic (`LITEBOX_DIAG_GS_BASE_REPAIR=1`,
+   `VehGates::gs_base_repair`, resolved once via the existing pre-resolved-gate pattern, not a
+   fresh `std::env::var_os` inside the VEH itself) that logs every time `restore_thread_gs_base_
+   if_cleared` actually observes-and-repairs a cleared `GS_BASE`, at all three call sites. **Result,
+   3 independent full boots with it on: ZERO repairs fired in any run, yet `xfce4-session` crashed
+   with the IDENTICAL `STATUS_ACCESS_VIOLATION` signature every time** (`elapsed_ms_since_thread_
+   start` 17160/16542/16402) — `GS_BASE` is never observed cleared at `vectored_exception_handler`'s
+   entry, `syscall_handler`'s entry, or `block_or_maybe_timeout`'s wait loop during this crash's
+   whole lifetime, so the 91st pass's fix, while real and harmless, does not explain or resolve
+   this specific crash. **New decisive evidence via Windows' own Application Error event log**
+   (`Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='Application Error'}`,
+   filtered to `Faulting module name: unknown` = a guest-address fault) pins down the exact faulting
+   guest RIP across THREE independent boots: **`rip=0x00007fefe92bc7cb code=0xC0000005`, byte-for-
+   byte IDENTICAL every time**, cross-checked against each run's own `task-resume-probe (child,
+   winpid=…)` line to confirm each one really is that run's own `xfce4-session` (winpids
+   0x4710/0x63B0/0x5778). A deterministic, identical crash RIP across independent boots (different
+   fork trees, different timing) rules out random heap corruption as the direct mechanism and points
+   at a specific, reproducible code path — yet litebox's own runner log has ZERO `[veh]`/
+   `[diag-unrecov-av]` output for this fault in all three runs, even with `LITEBOX_DIAG_FATALDUMP=1`
+   on throughout (confirmed still firing correctly for every OTHER real fault in the same logs) —
+   the fault reaches the OS's real unhandled-exception path (WER) while staying totally invisible to
+   litebox's own instrumentation. **Ruled out lazy-fork-commit/guard-cow as a simple on/off cause,
+   tested live**: `LITEBOX_LAZY_FORK_COMMIT=1` alone (guard-cow unset) does not fix this — it causes
+   markedly WORSE, widespread early corruption instead (114+ processes exiting via signal almost
+   immediately, zero `DIAG_TIMELINE execve` entries logged at all) and `xfce4-session` itself dies as
+   an immediate, loud, correctly-delivered GUEST `Segmentation fault` (bash's own job-control
+   message) rather than the silent host AV — matching the already-documented Bug 4 TOCTOU risk for
+   fork-without-`execve` on real long-lived daemons, and confirming guard-cow is necessary (removing
+   it makes things broadly worse), not itself simply "introducing" this narrower residual crash from
+   nothing. Both flags fully OFF cannot be tested within the RAM budget (craters to <1GB free by
+   `WM_POLL n=4`, well before `xfce4-session` could reach its own 16-17s crash window — confirmed
+   live, aborted via WMI `Terminate` on a falling-RAM trend per this file's own safety rule). Net
+   effect: falsifies the 91st pass's leading theory with real evidence, and produces the deterministic
+   RIP the 93rd pass then used as a live `cdb` breakpoint target.
+
+   **93rd pass — first-ever live `cdb` capture of this exact crash address, root cause narrowed to
+   the guest's `FS_BASE` (Linux TLS base register) reading `0` at the fault, a fix attempted and
+   landed but empirically NOT sufficient, and a real, specific next step identified.** Key correction
+   to the 92nd pass's own "next pickup": **`cdb -pv` CANNOT catch a breakpoint at all** — confirmed
+   live, `-pv`'s own output says so verbatim ("the process can be examined but debug events will not
+   be received") — invasive `cdb -p <winpid>` (detach cleanly with `qd`, never bare `q`) is required
+   to actually stop on a breakpoint; `-pv` is read-only inspection of an already-running process. With
+   invasive attach + `ba e1 0x00007fefe92bc7cb` + `g`, the breakpoint hit on the FIRST attempt against
+   a fresh, rebuilt release binary — no `exception_callback`-entry breakpoint or symbol resolution
+   needed, the raw address was enough. Disassembly: guest glibc's `__syscall_error`
+   (`mov rcx,[addr]; neg eax; mov fs:[rcx],eax; or rax,-1; ret` — the standard errno-store after any
+   failed syscall), faulting on the STORE, with `rcx=0xffffffffffffffa0`. `!address @rip`:
+   `Usage: <unknown>`/`PAGE_EXECUTE_READ`/`MEM_PRIVATE` (real guest memory, matching the 92nd pass's
+   `Faulting module name: unknown`). cdb's own `fs:` effective-address preview resolved to the bare
+   offset with no base contribution — `FS_BASE` reads `0` on this thread at the fault, the guest-side
+   sibling of the already-fixed `GS_BASE`-clears-under-scheduling-pressure class. **Fix landed** (real,
+   safe, builds clean both profiles): `RawMutex::block_or_maybe_timeout`'s own pre-existing comment
+   already named `FS_BASE` as equally at risk at that call site, but only `GS_BASE` had a repair there
+   — added `WindowsUserland::restore_thread_fs_base()` alongside it. **Live-verified NOT sufficient**:
+   a fresh post-fix release boot still crashed at the identical `elapsed_ms_since_thread_start=16993`,
+   `exit_code=3221225477` — closes `RawMutex::block` as a cause for THIS crash specifically (fix stays
+   landed as a real, independently-justified gap-closer for whatever it does cover). Single-stepping
+   live through the fault (invasive `cdb`, `t` repeatedly, first-chance AV breaking enabled) showed
+   FIVE OTHER `fs:`-relative guest READS in the same thread's immediately-preceding instructions (a
+   stack-protector `fs:[0x28]` canary check among them) with the identical zero-base signature that
+   did NOT immediately kill the process, vs. the ONE write that did — but this was observed WHILE
+   invasively attached, which the 89th pass already showed perturbs this exact bug's timing, so treat
+   this "reads survive, the write doesn't" pattern as a lead, not a conclusion (94th pass: STILL
+   unconfirmed either way, superseded as the leading theory — see below).
+
+   **94th pass — implemented the 93rd pass's own recommended `LITEBOX_DIAG_FS_BASE_REPAIR=1`
+   diagnostic, got real unperturbed evidence, found+fixed two genuine `RawMutex` GS_BASE/FS_BASE
+   repair gaps, and both were LIVE-VERIFIED INSUFFICIENT — decisive new evidence that the
+   "segment-base MSR randomly cleared under scheduling pressure" framing (91st-93rd passes'
+   shared premise) is very likely the WRONG mechanism for this specific crash.** Full mechanism,
+   exact fixes, exact numbers: this file's own 94th pass-history entry above. Summary: (1) the
+   new diagnostic independently RECONFIRMED the 90th pass's "zero VEH output" finding via a
+   completely different method — not just the targeted GS_BASE/FS_BASE repair sites but this
+   codebase's own PRE-EXISTING, totally unconditional `[diag-unrecov-av]`/`[diag-veh-no-tls]`
+   prints (no gate at all) also never fire, meaning `vectored_exception_handler` is never even
+   invoked for this fault, undebugged. (2) Found and fixed two real, previously-unpatched gaps —
+   `RawMutex::finish_real_timeout`'s own `WaitForSingleObject(event, INFINITE)` (reached via a
+   narrow real-timeout-races-`wake_many` branch) and `RawMutex::poll_until_value_changes` (the
+   `MAX_INLINE_WAITERS`-exhaustion "waiter queue full" fallback, a pure `std::thread::sleep` spin
+   loop) — both had zero GS_BASE/FS_BASE repair anywhere, unlike their sibling call sites; the
+   second was LIVE-CAUGHT actually firing 1.66s before a real crash (`max_waiters=32`), proving
+   it's a real, active path, not theoretical. (3) **Both fixes together still did not move the
+   crash at all**: pre-94th baseline 16468/16993ms, 92nd pass's own 3 boots 17160/16542/16402ms,
+   post-fix-1-only 16900ms, post-both-fixes 16754ms — **7 independent boots across 4+ distinct
+   code versions, spread under 800ms** (`owning_pid` confirmed as `xfce4-session` every time).
+   This tightness is itself the pass's real finding: a genuine scheduling-pressure RACE would be
+   expected to show more jitter across code changes that alter contention/timing characteristics;
+   this looks more like a fixed timeout or a deterministic (not probabilistic) uninitialized-value
+   bug. **Next pickup, precise, two untried angles**: (a) audit every remaining brand-new-OS-
+   thread-creation path for one that can leave `THREAD_FS_BASE` at its Rust-default `0` rather than
+   a genuine hardware clear of a previously-good value — `ThreadInitState::ForkedChild` and
+   `NewThread`'s `tls: Some(_)` case are both confirmed correct (94th pass, by code reading);
+   `NewThread`'s `tls: None` case (`process.rs:7034`, clone() without `CLONE_SETTLS`) is the one
+   remaining unaudited case, low-probability (real glibc/musl `pthread_create` always passes
+   `CLONE_SETTLS`) but unchecked. (b) `EXTERNAL_GRACE_PERIOD` (`process_fork.rs`, 15s) and
+   `SHARED_UNIX_CROSS_CONNECT_TIMEOUT` (`unix.rs`, 15s) are the only two 15-17s-range constants
+   found by a first grep pass — neither confirmed nor ruled out against whether `xfce4-session`'s
+   own fork tree exercises them; a wider search (including GLib/D-Bus/xfce4-session's OWN default
+   timeouts, guest-side, not litebox's) has not been done. A live `cdb -p` attach breaking on
+   `exception_callback`'s own entry (never `vectored_exception_handler` itself — the 84th pass
+   found that function is instrumentation-sensitive enough that new probes there need an A/B test
+   against a non-crashing repro first) remains the only way to see past this pass's "VEH never
+   entered" finding, budget/perturbation-risk permitting.
+   `GLIBC_TUNABLES` propagation to `xfce4-session`'s own environment (89th/90th) remains untested.
+   `DE_UP` has not been reached by any pass through the 94th; chrome-devtools MCP was not
+   re-checked this pass (no boot got close enough). Lower-priority, still open: (a) decompose
+   remaining per-fork cost between rootfs materialization staying resident post its cheap
+   (~83-140ms) build vs. Windows loader overhead; (b) use `de_only_xcensus_seed3.tar`'s working
+   `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`) + `LITEBOX_DIAG_SOCKET_READ_TARGET=
+   xfwm4` to check whether the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed)
+   recurs; (c) unconfirmed: `LITEBOX_LOG` may not reach forked children's own stderr — see
+   `_2026-09-23.md`.
