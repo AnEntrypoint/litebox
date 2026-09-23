@@ -1809,22 +1809,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 },
                 |_fd| Err(Errno::EINVAL),
-                |fd| {
+                |unix_fd| {
                     let handle = self
                         .global
                         .litebox
                         .descriptor_table()
-                        .entry_handle(fd)
+                        .entry_handle(unix_fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|file| {
+                    let result = handle.with_entry(|file| {
                         file.recvfrom(
                             &self.wait_cx(),
                             &mut buf.borrow_mut(),
                             litebox_common_linux::ReceiveFlags::empty(),
                             None,
                         )
-                    })
+                    });
+                    // AF_UNIX's own read() branch -- a plain read(2) on a Unix-domain socket fd
+                    // (X11's real Xtrans transport, confirmed 71st pass) dispatches HERE, through
+                    // `run_on_raw_fd`'s dedicated `unix` closure, never through the `net` closure
+                    // immediately above (that one's plain-TCP/generic-Network `sock_fd` path,
+                    // where the 71st pass's own diagnostic was actually placed). Zero
+                    // `litebox_diag::socket_read` events were ever emitted for a live X11 stream
+                    // as a direct result -- this is the missing half of that same diagnostic,
+                    // same target, same shape, covering the code path X11 actually uses.
+                    if let Ok(n) = &result {
+                        litebox_util_log::__private::tracing::event!(
+                            target: "litebox_diag::socket_read",
+                            litebox_util_log::__private::tracing::Level::DEBUG,
+                            tid = %self.tid.get(),
+                            fd = %fd,
+                            preview = ?alloc::format!("{:02x?}", &buf.borrow()[..(*n).min(4096)]),
+                            "DIAG sys_read (unix): payload"
+                        );
+                    }
+                    result
                 },
                 |fd| {
                     let handle = self
