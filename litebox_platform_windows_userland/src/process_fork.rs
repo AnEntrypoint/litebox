@@ -992,6 +992,38 @@ pub const EXEC_COLLISION_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_EXEC_COLLISION_
 /// filesystem semantics.
 pub const CONTAINER_FS_SNAPSHOT_ENV_VAR: &str = "LITEBOX_INTERNAL_CONTAINER_FS_SNAPSHOT";
 
+/// Whether THIS process's own writable-layer view is known to be a faithful continuation of the
+/// shared boot-tree snapshot it was supposed to adopt (`true`, the default) or a degraded
+/// fallback because that adoption genuinely failed (`false`, set by
+/// [`mark_writable_layer_import_degraded`]).
+///
+/// Exists so [`publish_as_container_fs_snapshot`]'s own regression guard can tell "this export is
+/// smaller because it is a legitimately different, independent branch of the boot tree" (common,
+/// harmless, must publish) apart from "this export is smaller because THIS process itself never
+/// got the real prior state and is about to clobber it with a near-empty view" (rare, the one
+/// case the guard exists for). A raw byte-size comparison alone cannot distinguish these -- see
+/// `publish_as_container_fs_snapshot`'s own fix history for the real, live-observed defect this
+/// caused: a completely healthy sibling's smaller-but-fresher export (e.g. one that legitimately
+/// has fewer bytes than an unrelated branch's own larger one) was silently discarded in favor of a
+/// stale snapshot, live-observed dropping a just-created `/tmp/empty` for several forks in a row
+/// on a real `de_only.sh` boot (66th-67th pass).
+static WRITABLE_LAYER_IMPORT_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Record that this process's own adoption of a shared writable-layer snapshot it was actually
+/// handed (a real, previously-published archive, not merely "none existed yet") failed to parse
+/// or apply -- so this process is now running from a base rootfs it should NOT trust as complete,
+/// and [`publish_as_container_fs_snapshot`] must not let this process's own future exports
+/// silently outrank a real prior snapshot on size alone; the OLD, cruder size-based guard becomes
+/// this flag's fallback behavior specifically for THIS process's own publishes from here on.
+///
+/// Never call this for the ordinary, expected "nothing to import yet" case (the very first spawn
+/// in a fresh boot, or a `--resume-from` path that legitimately does not exist) -- that process's
+/// view is NOT degraded, it simply has nothing to have missed.
+pub fn mark_writable_layer_import_degraded() {
+    WRITABLE_LAYER_IMPORT_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Publishes a freshly-written export as this boot tree's new canonical "latest" filesystem
 /// snapshot (see [`CONTAINER_FS_SNAPSHOT_ENV_VAR`]'s own doc comment), and returns the path a
 /// caller should actually hand to whatever reads it back -- the shared path on success, or
@@ -1022,29 +1054,54 @@ pub fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::
     };
     let shared = std::path::PathBuf::from(shared);
 
-    // Non-regression guard, not a real merge (seeing this module's own doc comment's honest
-    // limit on CONTAINER_FS_SNAPSHOT_ENV_VAR: this is not live, concurrent, continuous sharing).
-    // Confirmed live as a REAL, active harm without this: several independent, short-lived,
-    // rapidly-retrying processes (s6-supervise instances, one per supervised service, each
-    // re-executing and re-colliding every few seconds) each import the shared snapshot at their
-    // own spawn and export it back unchanged at their own exit -- but an import that lost the
-    // race this module's own doc comment discloses (the shared file briefly missing mid-publish)
-    // falls back to the BASE rootfs's empty upper layer, and THAT process then re-publishes ITS
-    // OWN much-smaller view, clobbering a larger, more-complete snapshot a sibling had already
-    // published. Observed: published sizes oscillating 55808 -> 7680 -> 55808 bytes across
-    // consecutive retries, a real regression, not a rare theoretical one. A byte-size comparison
-    // is a crude proxy for "more complete" -- genuinely wrong in principle (a smaller archive can
-    // legitimately be the newer, correct one, e.g. after a real `rm -rf`) -- but it is cheap,
-    // directionally right for the failure this module actually observes (an EMPTY fallback, not
-    // a deliberate deletion, losing to a populated one), and never makes a currently-missing
-    // shared file worse; a real fix needs actual merge semantics, named as separate, larger
-    // follow-on work, not approximated further here.
-    if let Ok(existing) = std::fs::metadata(&shared)
+    // Non-regression guard, not a real merge (see this module's own doc comment's honest limit on
+    // CONTAINER_FS_SNAPSHOT_ENV_VAR: this is not live, concurrent, continuous sharing).
+    //
+    // Originally a bare byte-size comparison (kept ANY existing snapshot larger than the fresh
+    // export, unconditionally) -- REAL, LIVE-OBSERVED DEFECT, 66th-67th pass: on a real
+    // `de_only.sh` boot, this fired 17 times discarding a perfectly healthy process's own
+    // genuinely fresher, smaller export (its own real writable-layer view, including a
+    // just-created `/tmp/empty`) purely because an UNRELATED sibling branch's own larger export
+    // happened to be the current "shared" value -- a smaller-but-different branch is not a
+    // "regression" at all, and raw size cannot tell the two cases apart. Gating the guard on
+    // [`WRITABLE_LAYER_IMPORT_OK`] instead: the guard's entire justification (s6-supervise
+    // instances re-publishing a near-empty view after losing the shared-file-briefly-missing
+    // import race, oscillating a real snapshot 55808 -> 7680 -> 55808 bytes) is specifically a
+    // process whose OWN import of the shared state it needed just failed. Restrict the size veto
+    // to exactly that self-reported condition; every process whose own import succeeded (or never
+    // needed one -- the boot's very first spawn) always gets to publish its own real, current
+    // view, matching this module's own already-accepted "last exporter wins" semantics for the
+    // common case instead of overriding it with a proxy that was wrong most of the time it fired.
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some();
+    let this_process_degraded = !WRITABLE_LAYER_IMPORT_OK.load(core::sync::atomic::Ordering::Relaxed);
+    if this_process_degraded
+        && let Ok(existing) = std::fs::metadata(&shared)
         && let Ok(new) = std::fs::metadata(&written_to)
         && existing.len() > new.len()
     {
+        if diag {
+            eprintln!(
+                "[diag-fork-snapshot] REGRESSION GUARD FIRED pid={} existing_len={} new_len={} \
+                 -- discarding {} (fresh export), keeping stale {} (shared)",
+                std::process::id(),
+                existing.len(),
+                new.len(),
+                written_to.display(),
+                shared.display()
+            );
+        }
         let _ = std::fs::remove_file(&written_to);
         return shared;
+    }
+    if diag {
+        eprintln!(
+            "[diag-fork-snapshot] publishing pid={} {} -> {} (new_len={:?}, prev_len={:?})",
+            std::process::id(),
+            written_to.display(),
+            shared.display(),
+            std::fs::metadata(&written_to).map(|m| m.len()).ok(),
+            std::fs::metadata(&shared).map(|m| m.len()).ok(),
+        );
     }
 
     match std::fs::rename(&written_to, &shared) {

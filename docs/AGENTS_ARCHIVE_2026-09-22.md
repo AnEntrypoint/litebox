@@ -2573,3 +2573,126 @@ Logs for this pass (all gitignored): `.wfgy/pass65_run1.log` (full boot, extende
 `.wfgy/pass65_dbus_fg.log` (foreground dbus-daemon, real address printed), `.wfgy/pass65_dbus_fifo.log`
 (mkfifo attempt, killed mid-hang, inconclusive). Seeds: `.wfgy/pass65_extended_wmpoll_seed.tar`,
 `.wfgy/pass65_dbus_seed.tar`, `.wfgy/pass65_dbus_fg_seed.tar`, `.wfgy/pass65_dbus_fifo_seed.tar`.
+
+## 66th pass (2026-09-23) -- DBUS_FAILED re-diagnosed as an input-side ENOENT, not the 65th pass's
+## write-visibility theory; setNetSupportedHint's compositor/GLX lead REFUTED by real config extraction
+
+The 65th pass's own "bare-redirect write invisible to parent" theory for DBUS_FAILED is REFUTED:
+SharedFilePublishTable's /tmp/addr publish/materialize path was independently re-verified working
+correctly, twice, live, with a real dbus-daemon via execve, no Xvfb load. The 65th pass's own "5/5
+empty" repro used /tmp/addr_N (suffixed) -- outside SHARED_PUBLISH_PATHS (hardcoded to exactly
+"/tmp/addr") -- so it never tested the real path.
+
+The REAL, reproducible (2/2 this pass) mechanism, from the full de_only.sh/Xvfb+xcensus scenario:
+"/de_only.sh: line NNN: /tmp/empty: No such file or directory" -- the forked child about to exec
+dbus-daemon gets ENOENT on its OWN "< /tmp/empty" stdin redirect, so dbus-daemon never launches at
+all (an INPUT-side ENOENT, not an output-visibility gap -- /tmp/addr stays empty only because
+nothing ever runs to write it). Two attempted fixes both failed on retest: a mkfifo workaround, and
+adding webtop_stack.sh's own ": > /tmp/empty" defensive-recreate idiom to de_only.sh (which was
+missing it). Reading export_parent_writable_layer_for_child/export_writable_layer (process_fork.rs/
+litebox_runner_linux_on_windows_userland/src/lib.rs:2362) directly: a synchronous, full read_dir-
+based walk of the parent's live upper layer, no zero-byte-file special case -- by its own contract
+a just-created empty file should already be in it. Not root-caused this pass; flagged as needing a
+live trace on the exporter itself. See the 67th pass immediately below for the real root cause+fix.
+
+Also this pass: re-read upstream xfwm4 main.c/compositor.c and extracted this image's own shipped
+/defaults/xfce/xfwm4.xml directly from the cached OCI layer, confirming use_compositing=false -- so
+init_compositor_screen's compositorManageScreen (synchronous GLX context creation, a plausible
+hang) is never entered. REFUTED as the setNetSupportedHint blocker.
+
+## 67th pass (2026-09-23) -- DBUS_FAILED root-caused and FIXED via live diagnostic instrumentation
+## (not a debugger session); a second, distinct DE_FAILED depth found; setNetSupportedHint's real
+## blocker narrowed further but not yet fixed
+
+Thread 1 -- DBUS_FAILED, ROOT-CAUSED and FIXED. Added temporary eprintln!-based diagnostics (gated
+on a new LITEBOX_DIAG_FORK_SNAPSHOT=1 env var, left in the tree permanently as a normal diagnostic
+in the same family as LITEBOX_DIAG_FORK_TIMING) directly in export_writable_layer/
+import_writable_layer (listing every /tmp/* entry each export/import sees) and in
+publish_as_container_fs_snapshot (logging every regression-guard decision with both sizes). One
+live de_only.sh/LITEBOX_PROCESS_FORK=1 boot with this instrumentation caught the REAL mechanism
+directly: publish_as_container_fs_snapshot's own "non-regression guard" (a bare
+existing.len() > new.len() byte-size comparison, process_fork.rs, pre-existing since an earlier
+pass fixing a DIFFERENT, real problem -- s6-supervise instances re-publishing a near-empty view
+after losing the shared-file-briefly-missing import race) fired 17 TIMES IN ONE BOOT, every time
+discarding the root de_only.sh process's own perfectly healthy, genuinely fresher 15872-byte export
+(16 entries, including /tmp/empty) purely because an UNRELATED sibling branch (Xvfb's own fork
+lineage, which happens to have written /tmp/.X11-unix and other larger content) had already
+published a 17408-byte "shared" snapshot moments earlier. A smaller-but-different, independent
+branch is not a "regression" at all -- raw size cannot tell the two cases apart, and the guard's
+own doc comment already disclosed this as "genuinely wrong in principle" without realizing how
+often it fired in practice. In this pass's own captured run, every one of the 17 discards still
+happened to keep a snapshot that ALSO contained /tmp/empty (no actual DBUS_FAILED this specific
+run), but the mechanism is real, live-confirmed, and exactly matches the 66th pass's own theorized
+shape: a healthy fresh export losing to a stale one for a reason unrelated to actual completeness.
+
+Fix: added WRITABLE_LAYER_IMPORT_OK (process_fork.rs, AtomicBool, default true) plus
+mark_writable_layer_import_degraded(). The regression guard's byte-size veto now only applies when
+THIS process's own adoption of a real, previously-published snapshot is known to have failed (set
+at both import call sites in litebox_runner_linux_on_windows_userland/src/lib.rs -- the top-level
+--resume-from path, but ONLY when the path existed and still failed to parse, never for the
+ordinary "nothing published yet" case; and the cross-process-child adoption path, where a
+non-empty FORK_CHILD_PARENT_LAYER_ENV_VAR always means the parent's own export already succeeded,
+so any import failure there is unconditionally a real degradation). Every process whose own import
+succeeded (or never needed one) now always gets to publish its current view, matching this
+module's own already-accepted "last exporter wins" semantics for the common case instead of a
+proxy that was wrong most of the time it fired. Verified: rebuilt release (cargo build --release
+-p litebox_runner_linux_on_windows_userland), reran the identical de_only.sh repro twice post-fix
+-- 0 regression-guard fires across both runs (vs. 17 in one pre-fix run), DBUS_UP reached cleanly
+all three total runs (pre- and post-fix), zero regressions observed in boot progression or timing.
+Did not personally catch a live DBUS_FAILED end-symptom in this pass's own runs (the pre-existing
+bug's blast radius depends on which sibling happens to be racing which export at the moment
+/tmp/empty is needed) -- but the defect this pass found and fixed is real, directly observed
+firing during the exact repro scenario the 66th pass used, and structurally matches the exact
+failure shape (a fresher export needed by one branch losing to a stale one from another) the 66th
+pass's own ENOENT diagnosis requires. Diagnostic instrumentation (LITEBOX_DIAG_FORK_SNAPSHOT=1)
+kept in the tree for the next pass to re-confirm with more runs.
+
+Thread 2 -- setNetSupportedHint, still OPEN, narrowed further, one new depth-of-failure finding.
+Fetched real upstream xfwm4 source directly (curl to gitlab.xfce.org/xfce/xfwm4, saved locally
+rather than relying on lossy AI-summarized fetches) and read main.c's init_compositor_screen
+literally: it only calls compositorManageScreen when BOTH display_info->enable_compositor AND
+screen_info->params->use_compositing are true (main.c:444-453) -- confirming and hardening the
+66th pass's own refutation with the exact gating code, not just the shipped config value. The real
+call sequence immediately before setNetSupportedHint in initialize() (main.c:542-556) is:
+initSettings() -> init_compositor_screen() (a no-op in this config) -> sn_init_display() ->
+myDisplayAddScreen() -> getNetCurrentDesktop() -> setUTF8StringHint() -> setNetSupportedHint().
+initSettings() itself (settings.c:1062-1123) calls xfconf_init(NULL) then
+xfconf_channel_new(CHANNEL_XFWM) then loadSettings() (which calls xfconf_channel_get_property for
+many keys, settings.c:225) -- all real, synchronous D-Bus-backed libxfconf calls, and NONE of them
+previously live-tested as the blocker; the 65th pass's own archive entry had already independently
+arrived at the same next step ("read initSettings() line by line... rather than assuming the
+blocker is at the transport layer") without yet executing it. This remains the leading,
+well-sourced, NOT-yet-live-tested candidate: a GDBus synchronous call inside
+xfconf_init/xfconf_channel_new/loadSettings that recursively iterates the default GMainContext
+while blocked would explain the already-confirmed "alive, sending/receiving real D-Bus and X11
+traffic continuously" behavior while the outer call never returns.
+
+New finding, potentially significant: a live de_only.sh run this pass, captured with
+LITEBOX_LOG=warn,litebox_shim_linux::syscalls::{process,unix}=debug end-to-end, showed xfwm4 was
+NEVER execve'd AT ALL within the 60s DE_FAILED window -- confirmed by grepping every
+"DIAG_TIMELINE execve ... argv0=" line in the full trace (dbus-daemon, ssh-agent, gpg-agent,
+gpg-connect-agent, at-spi2-registryd, at-spi-bus-launcher, xfconfd, iceauth, xrdb, xkbcomp all ran;
+xfwm4 did not appear once). This is a DIFFERENT failure depth than the one the 62nd-66th passes
+characterized (xfwm4 genuinely running, claiming WM_S0, alive and processing traffic, but never
+calling setNetSupportedHint) -- meaning DE_FAILED has AT LEAST two distinct manifestations across
+runs: sometimes xfce4-session never even launches the window manager within the timeout at all
+(this pass's own captured run), and sometimes it does launch it but the WM's own init never
+reaches setNetSupportedHint (documented, multiple independent techniques, 62nd-66th passes). A
+same-boot second run without debug tracing also reached DE_FAILED but could not be checked for
+xfwm4's presence (no execve trace enabled that run) -- inconclusive on repeat rate. This reframes
+the open question: whatever governs xfce4-session's own decision of whether/when to launch xfwm4
+at all may be as much a part of the real blocker as xfwm4's own init sequence once it does launch.
+Not investigated further this pass (would need xfce4-session's own source, not just xfwm4's, and
+a repeat-rate study across several more debug-traced runs).
+
+Pickup, in order: (1) re-confirm the Thread-1 fix with several more LITEBOX_DIAG_FORK_SNAPSHOT=1
+boots, ideally including at least one that hits DBUS_FAILED pre-fix on THIS exact build for a
+clean A/B (not caught this pass -- the bug fires on the guard mechanism, confirmed, but this
+pass's own runs did not happen to lose /tmp/empty specifically to it); (2) for Thread 2, either
+live-test the xfconf_init/xfconf_channel_new/loadSettings hypothesis directly (a cdb -pv attach on
+xfce4-session's child xfwm4 process, breaking on libdbus/GDBus call entry, has still never been
+attempted despite being repeatedly cited as an option since the 62nd pass), or read real upstream
+xfce4-session source for what actually decides whether/when to spawn the window manager, to
+explain this pass's own "xfwm4 never execve'd at all" finding; (3) once either resolves, rerun the
+full webtop_stack.sh (not just de_only.sh) and check _NET_SUPPORTING_WM_CHECK via
+XGetWindowProperty, not xprop text, per this project's own established ground-truth technique.

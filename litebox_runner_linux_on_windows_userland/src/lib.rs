@@ -816,12 +816,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // never having had one -- the process already starts from a correct, empty upper
                 // layer otherwise -- so this degrades to that rather than taking the whole process
                 // down over a best-effort continuity mechanism's own race.
+                // A path that simply doesn't exist yet is the expected "nothing published yet"
+                // case this whole block's own comment already covers -- not a degraded view (there
+                // is nothing this process could have missed), so only a path that DOES exist but
+                // still fails to import (mid-rename race, real corruption) marks this process's own
+                // future exports as untrustworthy for `publish_as_container_fs_snapshot`'s guard.
+                let existed_before_import = resume_from.exists();
                 if let Err(e) = import_writable_layer(fs, resume_from) {
                     eprintln!(
                         "warning: failed to import --resume-from archive {}: {e} -- starting from \
                          the base rootfs instead",
                         resume_from.display()
                     );
+                    if existed_before_import {
+                        litebox_platform_windows_userland::process_fork::mark_writable_layer_import_degraded();
+                    }
                 }
             });
         }
@@ -1411,10 +1420,19 @@ fn diag_process_fork_globalstate_probe_inner() {
                 "[process_fork_diag] globalstate-probe (child): adopted the parent's writable layer from {}",
                 parent_layer.display()
             ),
-            Err(e) => eprintln!(
-                "[process_fork_diag] globalstate-probe (child): could not adopt the parent's writable layer from {}: {e}",
-                parent_layer.display()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "[process_fork_diag] globalstate-probe (child): could not adopt the parent's writable layer from {}: {e}",
+                    parent_layer.display()
+                );
+                // The parent only ever hands over a non-empty path after ITS OWN export of it
+                // succeeded (`export_parent_writable_layer_for_child`), so unlike the top-level
+                // `--resume-from` case above, there is no legitimate "nothing existed yet" reading
+                // of a failure here -- this child's own view is now genuinely degraded, and its
+                // future exports must not be allowed to outrank a real prior snapshot on size
+                // alone. See `WRITABLE_LAYER_IMPORT_OK`'s own doc comment.
+                litebox_platform_windows_userland::process_fork::mark_writable_layer_import_degraded();
+            }
         });
         diag_elapsed!(format!(
             "writable layer imported (size={} bytes)",
@@ -2370,6 +2388,20 @@ where
     let entries = litebox::fs::export::export_all(fs.upper())
         .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
 
+    if std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some() {
+        let tmp_entries: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.path.starts_with("/tmp/"))
+            .map(|e| e.path.as_str())
+            .collect();
+        eprintln!(
+            "[diag-fork-snapshot] export_writable_layer pid={} total_entries={} tmp_entries={:?}",
+            std::process::id(),
+            entries.len(),
+            tmp_entries
+        );
+    }
+
     let file = std::fs::File::create(export_path)
         .map_err(|e| anyhow!("failed to create {}: {e}", export_path.display()))?;
     let mut builder = tar::Builder::new(file);
@@ -2449,6 +2481,10 @@ fn import_writable_layer(
         .entries()
         .map_err(|e| anyhow!("failed to read {}: {e}", resume_from.display()))?;
 
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some();
+    let mut diag_tmp_paths: Vec<String> = Vec::new();
+    let mut diag_total: usize = 0;
+
     for entry_result in entries {
         let mut entry = entry_result.map_err(|e| anyhow!("failed to read tar entry: {e}"))?;
         let header_path = entry
@@ -2459,6 +2495,13 @@ fn import_writable_layer(
         let path = alloc::format!("/{header_path}");
         let mode_bits = entry.header().mode().unwrap_or(0o644);
         let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);
+
+        if diag {
+            diag_total += 1;
+            if path.starts_with("/tmp/") {
+                diag_tmp_paths.push(path.clone());
+            }
+        }
 
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
@@ -2542,6 +2585,15 @@ fn import_writable_layer(
                     .map_err(|e| anyhow!("failed to close {path} while resuming: {e:?}"))?;
             }
         }
+    }
+    if diag {
+        eprintln!(
+            "[diag-fork-snapshot] import_writable_layer pid={} from={} total_entries={} tmp_entries={:?}",
+            std::process::id(),
+            resume_from.display(),
+            diag_total,
+            diag_tmp_paths
+        );
     }
     Ok(())
 }
