@@ -277,6 +277,27 @@ map" below), including the full 70th-76th detail this section used to carry inli
   `Terminate` cleanup fully recovered RAM both times, zero stragglers). `DE_UP` NOT reached; no
   browser/app verification attempted. Full narrative, exact commands, evidence file list:
   `docs/AGENTS_ARCHIVE_2026-09-23.md`.
+- **77th (2026-09-23)**: root-caused+FIXED (`621ee1a`) a real, measured 2x host-allocator commit
+  bug — `WindowsUserland::alloc` (sole `SLAB_ALLOC` top-up call site) doubled every commit instead
+  of using `VirtualAlloc2`'s own unused `MEM_ADDRESS_REQUIREMENTS::Alignment` field; `cdb -pv`
+  traced 13 such 4MiB-inflated commits in one boot to `clap`'s own CLI-parsing `Vec` growth (~108MB
+  committed before the OCI pull even begins). Verified correct (fork/pipe/exec all still work) and
+  measured: Priv committed 123.7→76.6MB / 130.2→84.5MB single-process, ~35-40% reduction across
+  every process in a forked tree. **Real, but NOT sufficient alone**: a full XFCE boot with the fix
+  still cratered at the SAME magnitude (28 processes, 0.82GB free; reproduced cleanly to `WM_POLL
+  n=4`, no regression) — confirms the dominant ~350MB-1.1GB/fork cost is elsewhere, scaling with
+  something this fix doesn't touch (arithmetic: 28×~77MB ≈ 2.15GB, nowhere near the ~7-8GB actually
+  consumed). **New candidate, found by direct code reading, NOT yet fixed**: BOTH fork paths
+  (`Vmem::duplicate`, `litebox/src/mm/linux.rs` ~1679-1719; `copy_one_group`,
+  `litebox_platform_windows_userland/src/process_fork.rs`) unconditionally byte-copy EVERY
+  non-shared VMA on every fork, including read-only shared-library CODE/rodata a real `fork()`
+  would share for free and litebox's own rootfs ALREADY shares efficiently via `mmap` before this
+  re-privatizes it. Deliberately NOT attempted this pass — implementing real COW/read-only-sharing
+  across a Windows process boundary is a large, correctness-critical redesign of exactly the
+  subsystem behind this investigation's worst historical bugs (ADVISORY-001 §3N) and needs much
+  more runway than remained this pass. `DE_UP` NOT reached; chrome-devtools MCP re-checked, still
+  `CONNECT_TIMEOUT` (moot, `DE_UP` wasn't reached). Full narrative, exact `cdb` commands, every raw
+  measurement: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -297,20 +318,29 @@ both Xvfb SIGSEGVs.
    the writable-layer export-path fallback bug (75th). **76th pass landed a real, evidenced-partial
    mitigation** (`live_cross_process_fork_children` admission control, `litebox_shim_linux/src/
    syscalls/process.rs`/`lib.rs`) but did NOT close the crater — live re-test still cratered (28-29
-   processes, 0.17-0.31GB free), just more slowly. **Refined pickup, in order**: (a) decompose the
-   ~350MB-1.1GB per-cross-process-fork-child peak working set into its real components — rootfs
-   materialization staying resident after its own cheap (~83-140ms) build step, vs. litebox's own
-   per-process guest-memory-emulation bookkeeping (`PageManager`/VMA tracking), vs. ordinary Windows
-   loader/image overhead — via a debug-build `cdb -pv` heap-diff on a MINIMAL single-fork repro (not
-   a full desktop boot, too RAM-risky to debugger-attach on); `LITEBOX_DIAG_FORK_TIMING=1` already
-   proves the TIME cost is cheap, this needs a genuinely separate MEMORY-focused measurement. (b) If
-   rootfs materialization dominates, the real fix is a genuinely SHARED (read-only, one physical
-   copy for the whole fork family) in-memory rootfs representation instead of a private per-process
-   rebuild — a bigger design change than 76th pass's admission-control fix, but the one likely to
-   actually close the gap; do not just raise the admission-control cap number, the bottleneck is
-   per-process SIZE, not concurrent-slot COUNT (76th pass's own live evidence: a real XFCE session
-   legitimately needs more than 6 long-lived daemons alive at once, so a low cap either blocks
-   legitimate concurrency or, fail-open, just rate-limits instead of truly capping). (c) once `DE_UP`
+   processes, 0.17-0.31GB free), just more slowly. **77th pass decomposed and partially fixed the
+   FIXED per-process floor** (`WindowsUserland::alloc`'s 2x-commit bug, `621ee1a`; ~35-40% Priv
+   reduction per process, verified) — real but confirmed insufficient alone, the crater still hits
+   the same magnitude (`docs/AGENTS_ARCHIVE_2026-09-23.md`, 77th pass). **Refined pickup, in order,
+   supersedes the (a)/(b) below where they overlap**: (0) the 77th pass's own direct-code-reading
+   finding is the strongest lead now: `Vmem::duplicate` (`litebox/src/mm/linux.rs` ~1679-1719) and
+   `copy_one_group` (`litebox_platform_windows_userland/src/process_fork.rs`) both unconditionally
+   byte-copy EVERY non-shared VMA on every fork, including read-only shared-library CODE/rodata a
+   real `fork()` would share for free and litebox's own rootfs ALREADY shares efficiently via
+   `mmap` before this copy re-privatizes it — the next step is confirming this quantitatively (a
+   `cdb`/ETW heap-diff comparing a process's committed-memory total immediately pre-fork vs.
+   immediately post-fork-pre-exec on a REAL multi-generation daemon chain, e.g. `dbus-launch`→
+   `dbus-daemon`, not the `sleep`-only minimal repro the 77th pass used) before attempting any fix
+   to this correctness-critical subsystem — go in with much more runway than one pass, this exact
+   code is responsible for this whole investigation's worst historical bugs (ADVISORY-001 §3N).
+   (a) ALSO still open: decompose remaining per-fork cost between rootfs materialization staying
+   resident after its own cheap (~83-140ms) build step vs. ordinary Windows loader/image overhead
+   (both smaller candidates than (0) above, per the 77th pass's own single-fork isolation
+   measurements: a MUCH bigger `debian-xfce` merged rootfs added only ~16MB over the small
+   `debian:stable-slim` baseline, refuting rootfs-index size as a major scaling factor — the
+   dominant remaining cost is fork-content-dependent, matching theory (0), not rootfs-size-dependent).
+   (b) do not just raise the admission-control cap number, the bottleneck is per-process SIZE, not
+   concurrent-slot COUNT. (c) once `DE_UP`
    fires (or the boot stalls again short of it), use `de_only_xcensus_seed3.tar`'s now-working
    `/tmp/xcensus.py` ground truth (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP` — real `_NET_SUPPORTING_
    WM_CHECK`/`WM_S0` values, not `xprop`'s heuristic text) plus `LITEBOX_DIAG_SOCKET_READ_TARGET=

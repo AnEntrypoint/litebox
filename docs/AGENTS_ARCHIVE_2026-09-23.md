@@ -261,3 +261,203 @@ list rather than forwarding the parent's full environment, so `LITEBOX_LOG` itse
 to forked children — not confirmed, but explains the missing `DIAG_TIMELINE`/`execve` correlation this
 pass wanted and did not get; worth checking directly in a future pass since it would affect every
 prior pass's diagnostic-logging assumptions for anything past the FIRST fork generation).
+
+## 77th pass (2026-09-23) — real memory profile of a single litebox process; a real, measured,
+## verified fix landed (2x host-allocator commit waste); confirmed insufficient alone; the
+## eager-full-fork-copy mechanism identified as the strongest remaining candidate
+
+**Assignment**: the 76th pass ended with the crater refined to "reduce PEAK PER-PROCESS RESIDENT
+MEMORY, not concurrency" but no decomposition of what that memory actually was. This pass's job
+was to get a real memory profile of a single litebox guest process and root-cause+fix the real
+driver, not guess.
+
+### Method note: `Start-Process -ArgumentList` argument-splitting trap
+
+Every early measurement in this pass was silently wrong until this was found: `Start-Process
+-ArgumentList @(...,"-c","sleep 6")` does NOT reliably quote a multi-word array element for the
+child's real Win32 command line — `Get-CimInstance Win32_Process | select CommandLine` showed the
+guest received `-c sleep 6` as THREE separate argv entries, so `bash -c` ran the script `"sleep"`
+alone (`sleep: missing operand`, guest pid 1 exits in ~1-2s instead of actually sleeping). Fix:
+explicitly wrap the risky element in literal quotes before building the array, e.g.
+`$scriptArg = '"sleep 6"'` then pass `$scriptArg` as the array element — verified via
+`Get-CimInstance Win32_Process | select CommandLine` showing `-c "sleep 6"` correctly quoted
+before trusting any measurement built on it. Any future pass measuring per-process memory via
+`Start-Process` must verify the real received command line the same way BEFORE trusting numbers
+built on it — this cost most of this pass's early measurement cycles.
+
+### Finding 1 — clean baseline measurements (`Get-Process WorkingSet64`/`PrivateMemorySize64`,
+### release binary, `LITEBOX_PROCESS_FORK=1`, single combined launch+poll PowerShell call to avoid
+### cross-turn timing gaps)
+
+| scenario | image | processes | max WS | max Priv (committed) |
+|---|---|---|---|---|
+| single guest proc, no guest fork | `debian:stable-slim` | root 68.3MB/123.7MB + small re-exec helper 5.7MB/1.3MB | | |
+| single guest proc, no guest fork | `debian-xfce` (huge merged rootfs) | root 84.1MB/130.2MB + helper 5.7MB/1.3MB | | |
+| `sleep 6 \| cat` (2 real guest forks) | `debian:stable-slim` | 6 processes: 3 "real" (78.2/125.4, 61.6/122.9, 61.6/123.1 MB) + 3 small helpers (5.7-10.3/1.3MB) | | |
+
+Two things established directly: (1) EVERY host process, root or forked, pays a roughly CONSTANT
+~120-130MB Priv-committed fixed floor, independent of image size (`debian-xfce`'s much bigger
+merged rootfs added only ~16MB over `debian:stable-slim`'s baseline — directly refuting the
+"per-process cost scales with rootfs/mergedidx size" theory the 76th pass's own pickup list
+raised as its first candidate); (2) a "two-process-per-logical-fork" host process shape is real
+and already known (76th pass) but the SMALL member (~5.7-10MB) is not the interesting one — the
+~120-130MB "large" member is.
+
+### Finding 2 — the fixed floor traced to a real, concrete bug: 2x commit waste in the host's own
+### global allocator
+
+`LITEBOX_DIAG_ALLOC=1` (existing diagnostic, `litebox_platform_windows_userland/src/lib.rs`,
+logs every `WindowsUserland::alloc` call — the `#[global_allocator]`'s own OS-backing function)
+on the `debian:stable-slim`/`sleep 3` minimal repro showed ~20 allocation events totalling
+~108MB committed, ALL before "Pulling OCI image" even prints — i.e. pure Rust-runtime-startup
+cost, unrelated to any guest workload. Sizes: 3×8KB, 13×4MiB, 1×8MiB, 3×16MiB.
+
+Live `cdb -pv` (debug build, `target/debug/litebox_runner_linux_on_windows_userland.exe`, per
+`AGENTS.md`'s own standing guidance for trustworthy stacks) with a breakpoint on
+`kernelbase!VirtualAlloc2` (`.wfgy/pass77_cdb_script.txt`/`_script2.txt`, output
+`.wfgy/pass77_cdb_out.log`/`_out2.log`) traced every one of the 13×4MiB hits to the IDENTICAL
+call chain: `alloc::raw_vec::RawVec::grow_one` → `Vec<clap_builder::builder::arg::Arg>::push` /
+`Vec<clap_builder::builder::arg_group::ArgGroup>::push` → `clap_builder::builder::command::
+Command::group` → `litebox_runner_linux_on_windows_userland::impl$13::augment_args` — i.e.
+`clap`'s own CLI-argument-definition construction, which runs once per process startup for every
+host process this runtime ever creates (root AND every cross-process-fork child, since each is a
+freshly `CreateProcess`'d re-invocation of the same binary re-running this same startup burst).
+
+Root cause: `WindowsUserland::alloc` (`litebox_platform_windows_userland/src/lib.rs`, `impl
+litebox::mm::allocator::MemoryProvider for WindowsUserland`) computed
+`size = max(layout.size().next_pow2(), max(layout.align(), 0x1000) << 1)` — an unconditional 2x
+commit inflation, justified by a doc comment inherited from an `mmap`-based platform ("`mmap`
+provides no guarantee of alignment, so double the size"). But this function ALREADY constructs a
+`MEM_ADDRESS_REQUIREMENTS` extended parameter for `VirtualAlloc2` (for `LowestStartingAddress`/
+`HighestEndingAddress`) and that same struct has a native `Alignment: usize` field
+(`windows-sys 0.60.2`, confirmed via the vendored crate source) that was set to `0` (unused)
+at EVERY ONE of the 4 call sites in this file that construct this struct (confirmed by grep) —
+Windows has a direct way to request a correctly-aligned base address and this code was silently
+falling back to "commit 2x and hope", never a deliberate choice (no doc comment anywhere claims
+`Alignment` was tried and rejected). Grepped and confirmed: `M::alloc`
+(`litebox::mm::allocator::MemoryProvider::alloc`) has exactly ONE call site in the whole
+codebase — `SafeZoneAllocator::new()`'s buddy-heap rescue closure
+(`litebox/src/mm/allocator.rs`) — which ALWAYS passes a self-aligned
+`Layout::from_size_align(page_aligned_size, page_aligned_size)`, so `layout.align() ==
+layout.size()` on every real call, making `Alignment: layout.align()` both safe and exactly
+sufficient.
+
+**Fix** (`621ee1a`, `litebox_platform_windows_userland/src/lib.rs`'s `WindowsUserland::alloc`):
+request `size = max(layout.size().next_pow2(), max(layout.align(), 0x1000))` (no `<< 1`) with
+`Alignment: max(layout.align(), 0x1000)` set on the `MEM_ADDRESS_REQUIREMENTS`. Kept a defensive
+fallback (never observed to trigger) that retries with the old oversized/`Alignment: 0` request
+if the OS ever refuses the explicit alignment, so this `#[global_allocator]` — every allocation
+in the whole process — cannot start failing outright from this change.
+
+**Verification**:
+- Correctness: debug build, `debian:stable-slim`, a script exercising echo/sleep/pipe(fork+exec)/
+  `ls | wc -l` (a second real fork+exec chain) — exit 0, all output correct
+  (`.wfgy/pass77_correctness.out.log`: `CORRECTNESS_OK_10`, `pipeline_test` round-tripped through
+  `cat`, `ls / | wc -l` returned a real count `13`).
+- Memory, release build, same measurement methodology as Finding 1:
+
+| scenario | before (Priv) | after (Priv) | reduction |
+|---|---|---|---|
+| single proc, `debian:stable-slim` | 123.7MB | 76.6MB | -38% |
+| single proc, `debian-xfce` | 130.2MB | 84.5MB | -35% |
+| forked pipeline root, `debian:stable-slim` | 125.4MB | 77.0MB | -39% |
+| forked pipeline child ×2, `debian:stable-slim` | 122.9-123.1MB | 74.5-74.7MB | -39% |
+
+Consistent ~35-40% Priv-committed reduction across every process shape tested, root and forked
+alike, as expected (this fix touches the FIXED per-process floor every host process pays, not a
+guest-workload-dependent cost).
+
+### Finding 3 — the fix is real but NOT sufficient alone: the full XFCE boot still craters at the
+### same magnitude
+
+Same exact 76th-pass repro (`LITEBOX_PROCESS_FORK=1`, `GLIBC_TUNABLES=...`, `--oci-image
+docker.io/linuxserver/webtop:debian-xfce --resume-from .wfgy/de_only_xcensus_seed3.tar --
+/bin/bash /de_only.sh`, `Start-Process -RedirectStandardOutput/-RedirectStandardError` + a
+parallel polling loop with an automatic `Invoke-CimMethod -MethodName Terminate` kill switch at
+<1.3GB free), release binary with the 77th-pass fix applied
+(`.wfgy/pass77_boot1.out.log`/`.err.log`):
+
+Reached (cleanly reproduced, matching the 75th/76th passes, confirming NO regression from the
+fix): `DE_ONLY_START` → `XSOCK_WAIT_DONE` → `DBUS_UP` → `DIAG_ENV` (correct `DISPLAY=:1`) →
+`DE_LAUNCHED_DIRECT` → `WM_POLL n=1..4` (`_NET_SUPPORTING_WM_CHECK` "not found", same
+forward-progress marker as the 75th pass) → `XCENSUS_ROOTPROP` real census data. Free RAM fell
+from 6.98GB to 0.82GB over ~28 polls (~2 minutes) as process count climbed 5→28, at which point
+the operator kill fired; `Invoke-CimMethod -MethodName Terminate` fully recovered RAM to 8.17GB
+free within 2 seconds, zero stragglers (same "not a leak" conclusion the 76th pass already
+established, reconfirmed).
+
+**28 processes at ~0.82GB free is the SAME crater magnitude the 76th pass's own admission-control
+fix alone produced (28-29 processes, 0.17-0.31GB free)** — i.e. this pass's real, verified,
+~35-40%-per-process fix did NOT meaningfully change the crater's ultimate process-count ceiling
+or severity. Arithmetic check: if the crater were driven purely by the FIXED per-process floor
+this pass fixed, 28 processes at the OLD ~125MB/process would be ~3.5GB, and at the NEW
+~77MB/process would be ~2.15GB — both far short of accounting for the ~7-8GB actually consumed
+by the time the crater hits. This confirms Finding 1's own single-fork isolation measurement
+(constant ~120-130MB regardless of rootfs size) was measuring only a SMALL, now-partially-fixed
+slice of the real per-process cost — the dominant driver is something that scales with what a
+REAL running guest program (Xvfb, dbus-daemon once it has real connections, xfwm4, etc.)
+actually accumulates, not a fixed startup constant.
+
+### Finding 4 — the eager-full-fork-copy mechanism: the strongest remaining candidate, found by
+### direct code reading, NOT yet fixed
+
+Both of litebox's two fork implementations copy a forking process's ENTIRE non-shared memory
+footprint into the child, unconditionally, on EVERY single fork call, with no copy-on-write and
+no read-only fast path:
+
+- **Thread-based path** — `Vmem::duplicate` (`litebox/src/mm/linux.rs`, ~lines 1679-1719): for
+  every VMA that is neither `VM_SHARED` (remapped, not copied) nor `PROT_NONE` (empty, nothing to
+  copy), it reads the FULL source region's live bytes (`source_ptr.to_owned_slice`), inserts a
+  fresh destination mapping with `populate_pages_immediately = true`, and writes the full byte
+  copy in — regardless of whether the region is writable, read-only, or executable-only.
+- **Cross-process path** — `copy_one_group` (`litebox_platform_windows_userland/src/
+  process_fork.rs`, called from the per-group copy loop around line 2065; that same file's own
+  doc comment at lines 2089-2109, "PASS 144", explicitly confirms "`copy_one_group` above commits
+  every reservation-group span as blanket `PAGE_READWRITE`... after every group's bytes are
+  copied") — copies EVERY reservation group (the coarse span the ELF loader originally reserved
+  together, typically covering a whole binary's or shared library's PT_LOAD segments including
+  its `.text`/`.rodata`) via `WriteProcessMemory`, unconditionally, then fixes up per-region
+  permissions afterward. No distinction is made between a group that is entirely read-only/
+  never-written since it was mapped and one that has genuinely diverged.
+
+Why this is the strongest remaining candidate: real Linux `fork()` makes this near-free via COW
+— read-only pages (and even writable pages, until actually written) are SHARED between parent and
+child, so forking a process that has loaded, say, 40-80MB of shared-library code (glibc, libX11,
+libdbus, and — once XFCE's real desktop components run — GTK/cairo/pango/glib) costs almost
+nothing per fork. litebox pays the FULL byte-copy cost of that same library code on EVERY fork,
+and — worse — litebox's own rootfs backend is ALREADY sharing those exact bytes efficiently
+across processes via a cross-process `mmap`'d view (`litebox_packager::oci::read_cached_layer`,
+`Cow::Borrowed` over a `Box::leak`'d `memmap2::Mmap`, confirmed by direct code reading,
+`litebox_packager/src/oci.rs` ~lines 300-641) — so the ELF loader's INITIAL load of a binary's
+segments may well already be reading from an efficiently-shared source, and this fork-copy step
+needlessly re-privatizes a private, redundant copy of it into every single forked descendant.
+This mechanism scales with what a process has ACTUALLY LOADED (unlike the fixed host-allocator
+floor this pass fixed), matching Finding 3's own arithmetic gap, and matches the 76th pass's own
+qualitative observation that later-generation/deeper fork-tree processes are the expensive ones.
+
+**Deliberately NOT attempted this pass**: implementing real COW or read-only-region sharing
+across a Windows process boundary is a large, correctness-critical redesign of precisely the
+subsystem responsible for this whole investigation's worst historical bugs (`ADVISORY-001`
+§3N's tcache corruption, the whole Track B fork-fix saga) — attempting it without much more
+runway for verification than remained in this pass would risk exactly the kind of regression
+this project's own standing discipline exists to prevent. Quantitatively confirming Finding 4
+(not just the qualitative code-reading argument above) needs a `cdb`/ETW heap-diff comparing a
+REAL daemon's committed-memory total immediately pre-fork vs. immediately post-fork-pre-exec
+(e.g. `dbus-launch`→`dbus-daemon`, which really does load real shared libraries before forking)
+— the `sleep`-only minimal repro this pass used never loads enough library content for the
+effect to show clearly in a single-fork isolation test, which is why Findings 1-2's own
+measurements (correctly) showed a roughly constant, small per-process floor.
+
+**`DE_UP` was NOT reached this pass.** chrome-devtools MCP was re-checked (this pass's own tool
+listing) and remains `CONNECT_TIMEOUT` — moot this pass since `DE_UP` was never reached, so no
+browser/app verification was attempted.
+
+**Pickup, precise**: see `AGENTS.md`'s own Track B item 1 pickup list, item (0), for the exact
+next step (quantitative pre/post-fork heap-diff on a real daemon chain) before any fix attempt on
+the eager-copy mechanism.
+
+Evidence files (`.wfgy/`, gitignored, disk-only): `pass77_cdb_script.txt`/`_script2.txt` (cdb
+breakpoint scripts), `pass77_cdb_out.log`/`_out2.log` (full VirtualAlloc2 call-stack captures),
+`pass77_diagalloc.err.log` (`LITEBOX_DIAG_ALLOC=1` startup allocation trace),
+`pass77_correctness.out.log` (post-fix correctness verification), `pass77_boot1.out.log`/
+`.err.log` (post-fix full XFCE boot attempt, reached `WM_POLL n=4` before the RAM-crater kill).
