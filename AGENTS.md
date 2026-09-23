@@ -8,7 +8,7 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-23,
-64th pass (pass-history section below; 26th-64th full narrative, including this pass's own complete
+65th pass (pass-history section below; 26th-65th full narrative, including each pass's own complete
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
 
 ## The cheap repro — start here
@@ -153,113 +153,60 @@ per-fork cost on an `--oci-image` boot is the rootfs rebuild, not this (56th pas
 open: nginx's own SSL-cert generation fails on its first startup attempt, not root-caused
 (`docs/track-b-fork-fix-progress.md:146-152`).
 
-**Pass history (4th-64th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
+**Pass history (4th-65th, 2026-09-17/23)**: full narrative in the dated archives ("Docs and tooling
 map" below). The CURRENT STATE those passes converged on:
 
-- **Both Xvfb SIGSEGVs FIXED** (43rd `01f8532` top-down-search library-crowding; 51st `c2112bc`
-  `sys_shmat` addr-only-valid-in-creator, now a NAMED `CreateFileMappingW`), confirmed gone on a
-  full `webtop_stack.sh` boot (52nd). Do NOT reopen DISPLAY/`getenv()`/loader-stack (proven correct,
-  30th). Also DONE: Xvfb backtrace corruption (38th/39th `7d66935`); `LITEBOX_DIAG_FATALDUMP=1`
-  (VEH, no debugger) is the only viable capture for this crash family, `cdb` proven infeasible;
-  "Fork-after-Xorg PERMANENT freeze" gone (35th); cross-process pty I/O proven (36th/37th).
-- **44th-59th** — `xfce4-session` reached real pre-session setup (fd/allocator bugs fixed en
-  route); D-Bus activation's dropped-CLOEXEC-fd bug FIXED (`66265d9`, `xfwm4` genuinely `execve`d
-  for the first time ever); `fd/mod.rs:422` panic FIXED (`faa74c6`); per-fork rootfs-rebuild RAM
-  cost FIXED (`2d18a4e`); `ps -ef` crash FIXED; task-scoped cross-process exit wait added.
-  Root-caused `xfwm4`'s non-launch as 100% reproducible: `xfce4-session` spawns `iceauth`+
-  `ssh-agent` then goes silent, `cdb -pv` showing a spinlock retry loop (tentatively, WRONGLY,
-  blamed on `SafeZoneAllocator`, see 60th). `gpg-agent`'s fatal glibc `malloc.c:3846` SIGABRT,
-  reproduced once, still open. Full narrative: archive.
-- **60th-61st — the ssh-agent/xfwm4 permanent-freeze class CLOSED for good.** Root cause:
-  `RawMutex`'s `WaiterQueue::with_lock` released via a plain statement, not a RAII guard, so a panic
-  inside `SafeZoneAllocator` mid-`wake_many` wedged the queue's lock `true` forever. Fixed
-  `61c235e` (RAII release via `litebox::utils::defer`). Confirmed on RELEASE, 3/3 clean, zero hang
-  (vs. 100% pre-fix). `DE_FAILED` still happens.
-- **62nd — independently re-verified; narrowed further; one real leak found+fixed, symptom NOT
-  resolved.** Fetched real upstream `xfwm4` source; 3 independent live techniques (X11 ground-truth
-  census via `XGetSelectionOwner`/`XQueryTree`, guest-stderr capture, mid-hang `cdb -pv`) agree:
-  `xfwm4` genuinely claims `WM_S0` and finishes `myScreenInit`, prints ZERO stderr, never reaches
-  `setNetSupportedHint` — stuck inside `initSettings()`'s `xfconf_init`/`xfconf_channel_new` D-Bus
-  call chain. `xfconfd` independently verified alive via `dbus-send ... Introspect` — refutes
-  "xfconfd never starts." Found+fixed a real leak: `SharedUnixConnectQueue::cancel` (`unix.rs`)
-  permanently leaked a slot on a claim-race against the listener's `accept()`; fixed via the same
-  Drop-based release path a normal closed connection uses. Verified building/running; did NOT
-  resolve the `xfwm4` symptom.
-- **63rd — `/defaults/xfce/` readdir hypothesis REFUTED; `DE_FAILED` reconfirmed; new lead
-  surfaced.** Isolated repro + full production-log re-read: `layered.rs`'s upper/lower `read_dir`
-  merge is CORRECT under cross-process fork (the 62nd pass's "total 0" was `ls -la`'s block-count
-  header, not an entry count). `DE_FAILED` reconfirmed byte-for-byte: 25 real windows exist, `WM_S0`
-  genuinely owned by `xfwm4`, `_NET_SUPPORTING_WM_CHECK` stays empty through 12 `WM_POLL`s (60s).
-  New lead surfaced (not yet chased): a second `dbus-daemon` child `SIGKILL`ed ~0.4s after a
-  thread-based-fork fallback.
-- **64th — the dbus-daemon `SIGKILL` lead REFUTED as the `DE_FAILED` cause; one real, independent,
-  low-severity bug found instead; `DE_FAILED` UNCHANGED.** Rebuilt the debug binary,
-  `syscalls::{process,signal}=trace,net=debug,unix=debug`, pid-level execve/wait4 trace across the
-  exact kill window. **Identity**: the killed pid is dbus-daemon's own activation "babysitter"
-  (`comm` stays `dbus-daemon\0`, never execs) — its own fork's `argv0` is
-  `/usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd`, the `org.xfce.Xfconf` activation `xfwm4`'s
-  `initSettings()` depends on. **Cause of death** (`pid=39` babysitter/`pid=40` xfconfd/`pid=19372`
-  real daemon): babysitter forks+execs xfconfd cleanly (t=83.334s), then goes completely silent for
-  ~1.28s — a real thread-based-fork-fallback scheduling stall, not corruption. The real daemon does
-  `wait4(babysitter,WNOHANG)` then `wait4(babysitter,0)` BLOCKING ~4ms later; 43 microseconds after
-  that the babysitter's own signal check finds `SIGKILL` already queued and dies. `sys_kill`/
-  `sys_tgkill` (`signal/mod.rs:852-862`) log nothing, so the kill itself is invisible in any trace —
-  but this exact WNOHANG-then-kill-then-blocking-reap sequence is upstream `dbus-spawn-unix.c`'s OWN
-  documented `_dbus_babysitter_unref()` cleanup fallback (fetched and read live this pass): normal
-  successful-activation cleanup expects the babysitter to self-exit via a pipe-close `poll()` HUP,
-  and explicitly `kill(sitter_pid, SIGKILL)`s it if too slow to notice — exactly what's observed.
-  **Real, correctly-emulated dbus behavior, not a litebox signal-delivery bug.** **Definitively NOT
-  the `DE_FAILED` cause**: xfconfd (`pid=40`) is a SEPARATE OS process, unaffected by the
-  babysitter's SIGKILL — its own trace shows a complete D-Bus SASL handshake finishing at t=84.41s
-  BEFORE the babysitter's own death at t=84.621s, then idles healthily 10+ more seconds — a fully
-  live, fully-registered `org.xfce.Xfconf` throughout, matching the
-  62nd/63rd passes' own `dbus-send` confirmation. **Real independent low-severity bug found, not
-  fixed** (cosmetic, zero functional impact, lower priority than `DE_FAILED`): a
-  thread-based-fork-fallback child can go fully unscheduled for over a second right after its own
-  fork+exec, missing a real upstream fast-shutdown window and hitting a defensive-kill path instead
-  — flagged as a new Track B candidate (root cause — genuine host CPU contention vs. a real
-  fallback-path scheduling defect — not isolated). **Same pass, second half — pursued the fallback
-  pickup (this lead being a dead end) and found the single most concrete `xfwm4` lead of the whole
-  investigation**: a fresh release-binary boot with `syscalls::{process,net}=debug`, filtered to
-  `xfwm4`'s own pid (`20900` this run, identified via its `DIAG_TIMELINE execve` line), shows
-  `xfwm4` opens TWO separate D-Bus connections in sequence — `fd=5` (blocking socket,
-  `type_and_flags=0x80001`, no `SOCK_NONBLOCK`) completes SASL `AUTH EXTERNAL`/`BEGIN` and goes on
-  to send multiple real method calls successfully (binary `sendmsg`s at t=1.92-3.16s, all getting
-  replies) — and `fd=8` (NON-blocking socket, `type_and_flags=0x80801`, `SOCK_NONBLOCK` set),
-  opened later (t=3.314s), whose `connect()` immediately hits `[unix_addr_presence] ECONNREFUSED
-  but address IS bound, by a DIFFERENT guest pid` (`self_pid=20900 owner_pid=18636` — the already-
-  documented cross-process AF_UNIX data-plane visibility gap, "Shared-memory foundations" section
-  above) before the `SharedUnixAddrPresenceTable` retry path recovers it. `fd=8` THEN completes its
-  own SASL handshake fine (`AUTH`→`REJECTED ...`→`AUTH EXTERNAL`→`DATA`→`OK ...`→
-  `NEGOTIATE_UNIX_FD`→`AGREE_UNIX_FD`→`BEGIN`, finishing at t=3.421077s) — **and then NEVER sends
-  or receives ANYTHING ELSE on that fd, ever, for the rest of the boot** (confirmed: zero
-  `sendto`/`sendmsg`/`recvfrom`/`recvmsg` on `fd=8` for `tid=20900` anywhere after that line). From
-  t=9s onward `xfwm4`'s own activity drops to a single sparse `futex WAKE` roughly every 10-20s
-  (a GLib timeout heartbeat, not real work) — matching "silently parked forever" exactly. This is
-  the FIRST time any pass has isolated the exact fd and exact protocol step (`BEGIN`, i.e. right
-  where GDBus would issue its own internal `Hello` call before any xfconf traffic could begin) —
-  more precise than the 62nd pass's own "somewhere inside `initSettings()`" framing. **Working,
-  NOT YET PROVEN theory for the next pass**: `fd=8`'s `connect()` took the non-standard
-  ECONNREFUSED-then-retry path (unlike `fd=5`'s presumably clean first-attempt connect) — if that
-  retry path leaves the connection's readiness/epoll-interest state subtly incomplete (this fd is
-  `SOCK_NONBLOCK`, so GDBus MUST rely on an epoll/poll wakeup to notice it can write its `Hello`
-  call or read a reply, unlike the blocking `fd=5`), `xfwm4` would legitimately, silently, block
-  forever in `epoll_wait`/`poll()` waiting for an event litebox never delivers — with NO error, NO
-  timeout, and NO stderr, matching every observed symptom exactly, and squarely in the same
-  edge-triggered-epoll defect class the 26th pass already found+fixed once elsewhere
-  (`EpollFile::repoll_stdin_and_timerfd_interests` reading the wrong flag for `EPOLLET`). NOT yet
-  confirmed this pass (would need `syscalls::epoll=debug`/`syscalls::unix=debug` layered onto the
-  SAME filtered trace, not attempted this pass to avoid the log-volume blowup, plus checking
-  `SharedUnixConnectQueue`/`unix_addr_table`'s exact post-retry state for this connection). **This
-  is now the single most concrete, mechanistic, actionable `DE_FAILED` lead the whole 64-pass
-  investigation has produced** — pickup: re-run with `syscalls::{process,net,unix,epoll}=debug`
-  filtered to `xfwm4`'s pid specifically (identify it fresh via its own `DIAG_TIMELINE execve`
-  line each run, it is not stable across boots), confirm whether `fd=8` ever gets an `epoll_ctl`
-  registration and whether that registration's `is_still_ready` (or equivalent) ever flips true;
-  if confirmed, the fix is either in the AF_UNIX connect-recovery path's readiness-state handoff or
-  in the same `EpollFile` interest-tracking class the 26th pass already fixed once. Full trace
-  (`.wfgy/pass64_dbus_trace_run1.log`, `.wfgy/pass64_xfwm4_trace_run1.log`, both gitignored) and
-  exact line numbers: archive.
+- **Both Xvfb SIGSEGVs FIXED** (43rd/51st, confirmed on a full boot 52nd); D-Bus activation's
+  dropped-CLOEXEC-fd bug FIXED (`66265d9`); `fd/mod.rs:422` panic FIXED (`faa74c6`); per-fork
+  rootfs-rebuild RAM cost FIXED (`2d18a4e`); the `ssh-agent`/`xfwm4` permanent-freeze class (a
+  `RawMutex::WaiterQueue::with_lock` release-via-plain-statement bug) CLOSED for good, 60th/61st
+  (`61c235e`, confirmed 3/3 clean on RELEASE vs. 100% pre-fix). `DE_FAILED` (no
+  `_NET_SUPPORTING_WM_CHECK`) survived all of this. Full narrative: archive.
+- **62nd-64th — `xfwm4` narrowed to an exact fd/protocol step; one real leak fixed; `DE_FAILED`
+  UNCHANGED.** 3 independent live techniques (X11 ground-truth census, guest-stderr capture, `cdb
+  -pv`) agree `xfwm4` genuinely claims `WM_S0`, prints zero stderr, never reaches
+  `setNetSupportedHint`. REFUTED along the way: the `/defaults/xfce/` readdir-empty-to-a-later-fork
+  theory (63rd — `layered.rs`'s merge is correct; `ls -la`'s "total 0" was its block-count header);
+  the dbus-daemon activation-babysitter `SIGKILL` (64th — real, correctly-emulated upstream
+  `dbus-spawn-unix.c` cleanup; `xfconfd` independently confirmed alive/registered via `dbus-send`
+  throughout). Fixed: `SharedUnixConnectQueue::cancel`'s claim-race slot leak (62nd, `unix.rs`).
+  64th pass then isolated `xfwm4`'s SECOND (`SOCK_NONBLOCK`) D-Bus connection: its `connect()` hits
+  the known cross-process AF_UNIX visibility gap, recovers, completes SASL through `BEGIN` — a
+  `tid=20900`-only filtered trace then showed zero further traffic on that fd, theorized as an
+  epoll-readiness gap on the connect-retry path (same defect CLASS as the 26th pass's `EpollFile`
+  `EPOLLET` fix). Flagged NOT YET CONFIRMED — see 65th pass immediately below.
+- **65th — the 64th pass's epoll-readiness theory REFUTED (methodology bug, not litebox); two new,
+  more foundational leads surfaced.** (1) Re-grepping the 64th pass's OWN trace for every `tid=`
+  (not just `20900`) shows GDBus moved that fd's I/O onto a cloned sibling thread (`tid=83`,
+  `clone: ... parent_tid=20900 child_tid=83` at t=3.42s) the moment it connected — that thread sends
+  a real request and gets two real replies (`2032`+`1805` bytes) every ~10-11s continuously through
+  at least t=121s in the SAME log the 64th pass called "silently parked forever." `tid=20900` itself
+  is also alive throughout, reading real X11 events off `fd=3` every ~30ms. The fd was never stuck;
+  the 64th pass's trace filter simply never looked at the thread GDBus handed it to. **Lesson: a
+  pid-filtered trace must follow the whole thread group (every `clone: ... parent_tid=<X>` line
+  recursively), never a single tid — "goes quiet" can mean "handed the fd to a sibling," not "hung."**
+  (2) New finding: `ps`/`/proc` cannot see ANY cross-process-forked sibling process at all —
+  confirmed via a full boot's `ps -ef` showing NOTHING (not even `Xvfb`, independently verified
+  alive via `xset q`) but itself. Root cause: `GlobalState::proc_self_info` (`lib.rs:425`, backing
+  `/proc`/`ps`) is a plain per-process `Arc<RwLock<...>>`, never added to the actual cross-process
+  shared-arena registry set (`unix_addr_table`/`fifo_registry`/`memfds`/`shared_files`/`sysv_shm`) —
+  meaning every past pass's `ps`/`PS_DUMP`-based evidence has been blind to forked siblings the
+  whole investigation. Not fixed this pass. (3) New, unresolved lead: `DBUS_FAILED` is real and
+  reproducible — a fresh boot with the IDENTICAL script/flags the 62nd-64th passes used got
+  `DBUS_FAILED` instead of `DBUS_UP` (a SEPARATE, more foundational failure mode from the
+  62nd-64th passes' "dbus up, xfwm4 running" scenario). Isolated to `dbus-daemon --print-address >
+  /tmp/addr &` (used verbatim by both `de_only.sh` and `webtop_stack.sh:373`): backgrounded, 5/5
+  reproductions leave `/tmp/addr` empty; the IDENTICAL command run in the FOREGROUND (no `&`)
+  prints a correct real address immediately — `dbus-daemon` itself is not broken, something about
+  backgrounding it is, consistent with (not yet proven to BE) the already-documented "bare file
+  redirect across a forked child is invisible to the parent" mechanism, just never before applied
+  to dbus-daemon's OWN startup line. An `mkfifo`-based fix attempt did not complete within this
+  pass's wait budget — inconclusive. **This pass's refutation also leaves the ORIGINAL 62nd-64th
+  question (dbus genuinely up, xfwm4 genuinely running, never calls `setNetSupportedHint`) fully
+  open again** — the blocker is neither a dead connection nor a missed epoll wakeup (both fds stay
+  healthy 120+s), so it is most likely a synchronous condition inside `initSettings()` itself; next
+  pass should read real upstream `xfwm4` source line-by-line for that function rather than assume
+  a transport-layer cause. Full evidence, exact log lines, all four repro scripts: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -275,23 +222,25 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
 **Open, in rough priority order:**
 
 1. **`DE_FAILED`'s real chain — the `ssh-agent`/`xfwm4` permanent-freeze class is CLOSED for good**
-   (60th/61st). Current blocker, now isolated to an EXACT fd and protocol step (64th pass, see pass
-   history above): `xfwm4` opens a SECOND, `SOCK_NONBLOCK` D-Bus connection whose `connect()` hits
-   the already-known cross-process AF_UNIX visibility gap, recovers, completes its own SASL
-   handshake through `BEGIN`, then NEVER sends or receives anything else on that fd for the rest of
-   the boot — `xfconfd` itself independently confirmed alive and fully registered throughout (64th's
-   own SASL trace), so this is NOT "xfconfd never starts" and NOT the 63rd/64th passes'
-   dbus-daemon-babysitter `SIGKILL` (both REFUTED). Leading theory: the non-standard connect-retry
-   path leaves this `SOCK_NONBLOCK` connection's epoll/poll readiness state incomplete, so `xfwm4`
-   blocks forever in `epoll_wait`/`poll()` for an event litebox never delivers — same defect CLASS
-   the 26th pass already fixed once (`EpollFile`'s `EPOLLET` interest-tracking). NOT yet confirmed —
-   needs `syscalls::{unix,epoll}=debug` layered onto the same pid-filtered trace to check whether
-   `fd=8`'s (or that run's equivalent fd) `epoll_ctl` registration's readiness ever flips true. PER-
-   PROCESS RAM is the hard ceiling on any attempt (~28-29 live host processes, 8.5GB→<1GB in <90s on
-   `de_only.sh` alone) — budget for it, kill fast, never run two attempts back-to-back. Secondary,
-   lower priority: `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high `VM_SHARED`
-   fork-child region count (52nd); the 64th pass's own thread-based-fork-fallback scheduling-stall
-   finding (new Track B candidate, zero functional impact so far).
+   (60th/61st). The 64th pass's "`fd=8` epoll-readiness gap" theory is **REFUTED** (65th pass,
+   see pass history above: the fd's traffic simply moved to a cloned sibling thread the 64th pass's
+   trace filter never looked at; it never stopped). This reopens the ORIGINAL question with no
+   current theory: in a run where dbus is genuinely up and `xfwm4` is genuinely running (sends/
+   receives real D-Bus and X11 traffic continuously for 120+s, zero errors), it still never calls
+   `setNetSupportedHint`. Likeliest remaining shape: a synchronous condition inside `initSettings()`
+   itself that never becomes true — pickup is reading real upstream `xfwm4` source for that function
+   line-by-line, not another transport-layer trace. **New, higher-priority blocker found the SAME
+   pass, not yet fixed**: `DBUS_FAILED` (dbus-daemon never produces its address) is real,
+   reproducible, and independent of the above — isolated to `dbus-daemon --print-address > /tmp/addr
+   &`'s file redirect being invisible to the parent when backgrounded (works fine in the foreground);
+   an `mkfifo`-based fix is drafted but unverified (65th pass). Also newly found: `ps`/`/proc` is
+   blind to every cross-process-forked sibling (`proc_self_info` never joined the shared-arena
+   registry set) — re-weigh any past pass's `ps`-based conclusion. PER-PROCESS RAM is the hard
+   ceiling on any attempt (~28-29 live host processes, 8.5GB→<1GB in <90s on `de_only.sh` alone) —
+   budget for it, kill fast, never run two attempts back-to-back. Secondary, lower priority:
+   `gpg-agent`'s fatal glibc `malloc.c:3846` assertion (52nd); high `VM_SHARED` fork-child region
+   count (52nd); the 64th pass's own thread-based-fork-fallback scheduling-stall finding (new Track
+   B candidate, zero functional impact so far).
 2. **`SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED, 62nd pass** (`unix.rs`,
    `cancel()` now drains an abandoned `REQ_ACCEPTED` slot via the same Drop-based release path a
    normal closed connection uses, rather than leaking it until the whole fork family exits); a
@@ -301,13 +250,6 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
    AF_UNIX exhaustion paths still silent (38th, `unix.rs`): `SharedUnixAddrPresenceTable`
    capacity-256 overflow (`unix.rs:275-277`); a key >108 bytes; backlog ignored on cross-process
    accept. Abstract sockets checked and CORRECT.
-2b. **REFUTED, 63rd/64th passes**: the 62nd pass's `/defaults/xfce/`-appears-empty-to-a-later-fork
-   hypothesis (63rd — `layered.rs` merge is correct, `ls -la`'s "total 0" was its block-count
-   header) AND the dbus-daemon-babysitter-`SIGKILL` hypothesis (64th — real, correctly-emulated
-   upstream dbus cleanup behavior; xfconfd itself fully registers on the bus independent of its
-   babysitter's fate, see 64th pass entry above). Neither is the `DE_FAILED` mechanism. The 64th
-   pass's own real-but-cosmetic side finding (a thread-based-fork-fallback child going unscheduled
-   for ~1.3s) is a new, lower-priority Track B candidate, not yet root-caused.
 3. `SafeZoneAllocator`'s own `spin::mutex::SpinMutex` still has no dead-holder recovery — kept as a
    lower-urgency theoretical risk (the real, live `ssh-agent`/`xfwm4` freeze this was once blamed
    for was `RawMutex`'s `WaiterQueue::with_lock`, CLOSED 60th/61st, see above), not tied to any live
@@ -417,15 +359,11 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-22.md` (26th-64th passes, full narrative for everything
-  this file's own entries summarize: the 62nd pass's xfwm4/xfconf X11-census+stderr-capture+cdb
-  evidence, the `SharedUnixConnectQueue::cancel` leak fix, the 63rd pass's readdir-hypothesis
-  refutation, and the 64th pass's dbus-daemon-babysitter-SIGKILL root cause+refutation),
-  `_2026-09-18.md` (12th-34th,
-  shared AF_UNIX plane, ldconfig static-PIE fix), `_2026-09-17.md` (shell-crash, stdio-handle bug,
-  writable-layer-race fix), `_2026-09-16.md` (Track A audit, RawMutex/presenter), `_2026-09-15.md`
-  (ACK-stall-kill), `_2026-09-10.md` (fork fd eligibility, OCI cache, s6-boot, crash-dump/VEH). Older:
-  `_2026-09-03.md`, `_2026-09-05.md`.
+- **Archives** (newest first) — `_2026-09-22.md` (26th-65th passes, full narrative behind every
+  pass-history entry above), `_2026-09-18.md` (12th-34th, shared AF_UNIX plane, ldconfig static-PIE
+  fix), `_2026-09-17.md` (shell-crash, stdio-handle bug, writable-layer-race fix), `_2026-09-16.md`
+  (Track A audit, RawMutex/presenter), `_2026-09-15.md` (ACK-stall-kill), `_2026-09-10.md` (fork fd
+  eligibility, OCI cache, s6-boot, crash-dump/VEH). Older: `_2026-09-03.md`, `_2026-09-05.md`.
 - Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
   `advisor/ADVISORY-001-fundamentals.md` (§3N tcache). `docs/veh-exception-handler-design.md` —
   read before touching VEH.

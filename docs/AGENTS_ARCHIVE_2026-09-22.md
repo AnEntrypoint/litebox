@@ -2422,3 +2422,154 @@ sequence) instead.
 
 Logs for this pass: `.wfgy/pass64_xfwm4_trace_run1.log` (release binary, `process/net=debug`, full
 boot to `DE_FAILED`, gitignored).
+
+## 65th pass (2026-09-23) -- the 64th pass's epoll-readiness theory REFUTED; two new, deeper leads
+
+**Directive**: confirm the 64th pass's "fd=8 stuck after BEGIN, epoll readiness gap" theory with
+real syscall-level evidence before touching any code (this session's own standing discipline).
+
+**(1) Theory REFUTED -- root cause was the 64th pass's own trace-filtering methodology, not litebox.**
+Re-read `.wfgy/pass64_xfwm4_trace_run1.log` (already on disk, 22MB, `process/net=debug`, pid-filtered
+to xfwm4's `20900`) but this time grepped for EVERY `tid=`, not just `tid=20900`. Found:
+
+```
+20426:   3.421445300s clone: request registered child_tid=83 parent_pid=20900
+20427:   3.421531700s clone: spawned new task parent_tid=20900 child_tid=83
+20435:   3.425397900s sys_sendmsg tid=83 fd=8 preview=Some("[6c, 01, 00, 01, 00, ...
+```
+
+GDBus moved `fd=8`'s actual I/O onto a freshly cloned SIBLING THREAD (`tid=83`) the moment the
+connection came up -- a completely normal glib/GIO pattern (a private worker thread owns the
+socket). `tid=83` immediately does the real `Hello`-plus-setup burst (five `sendmsg`s within 30ms,
+serials `9f`/`14`/`a1`/`5f`/`18`) and then settles into a genuine, healthy periodic heartbeat:
+
+```
+167458:  54.191520300s sys_sendmsg tid=83 fd=8 preview=Some("[6c, 01, 00, 01, 32, ...
+167770:  54.221811100s DIAG sys_recvmsg: returning tid=83 fd=8 result=Ok(16)
+167773:  54.221856500s DIAG sys_recvmsg: returning tid=83 fd=8 result=Ok(2032)
+167778:  54.237353200s DIAG sys_recvmsg: returning tid=83 fd=8 result=Ok(1805)
+```
+
+...repeating at 65.55s, 77.36s, 89.00s, 99.69s, 110.84s, 121.28s -- a clean send-then-two-real-reply
+round trip every ~10-11s, continuing for the entire captured window (log ends ~125s, not because
+xfwm4 died). `fd=8` was never stuck for even one cycle. The 64th pass's own claim ("zero sendto/
+sendmsg/recvfrom/recvmsg on fd=8 for tid=20900 anywhere after BEGIN") is TRUE as literally stated but
+answers the wrong question -- it only ever looked at `tid=20900`, and GDBus had already handed that
+fd's I/O to `tid=83` three seconds in. `tid=20900` itself (the real xfwm4 main thread) is ALSO alive
+and healthy the whole time, independently: `fd=3` (the X11 connection) gets a real 32-byte event read
+every ~30ms continuously through the same window, with the expected two-EAGAIN drain pattern after
+each. Neither fd shows any sign of a missed wakeup, an incomplete epoll registration, or a permanent
+block. Lesson for every future pid-filtered trace in this codebase: filter by the whole THREAD GROUP
+(recursively follow every `clone: ... parent_tid=<X> child_tid=<Y>` line), never a single tid in
+isolation -- a thread that "goes quiet" may simply have handed its fd to a sibling, not hung.
+
+**(2) New foundational finding: `ps`/`/proc` cannot see ANY cross-process-forked sibling process.**
+While re-verifying with a longer `WM_POLL` window (`.wfgy/pass65_extended_wmpoll_seed.tar`, `n<48`
+i.e. 240s instead of the original 60s, plus periodic `xcensus.py`/`ps -eLf | grep xfwm4` snapshots),
+a full boot's own `ps -ef` (run inside the guest, well after `Xvfb` is independently confirmed alive
+via a successful `xset q`) printed:
+
+```
+[s] PS_DUMP >>>UID        PID  PPID  C STIME TTY          TIME CMD
+root      2636     0  0  1970 ?        00:00:00 ps -ef<<<
+```
+
+Literally nothing but `ps -ef` itself, with `PPID=0`. Every `PS_XFWM4 n=<N>` snapshot the extended
+poll took (n=2,4,8,...,48) was also empty, and `XCENSUS_WINDOWS total=0` at every one of those same
+checkpoints (this particular run's `xfwm4` apparently never got far enough to map any window at all
+-- see finding (3) below for why: `DBUS_FAILED` fired in this run, so `xfce4-session` never got a
+working bus). Root cause, read directly from source: `GlobalState::proc_self_info`
+(`litebox_shim_linux/src/lib.rs:425`, `Arc<litebox::sync::RwLock<Platform, ProcSelfTable>>`) backs
+every `/proc/[pid]` read and hence `ps`. Its own doc comment (`lib.rs:2968`) documents a fix for the
+WITHIN-one-process multi-`GlobalStateHandle`-clone stale-pointer bug (each clone must reference the
+SAME cell, not its own fresh one) -- but that fix only guarantees every `GlobalStateHandle` inside
+ONE real OS process sees the same table. `proc_self_info` was never added to the actual
+cross-process shared-arena registry set the "Shared-memory foundations" section names
+(`unix_addr_table`/`fifo_registry`/`memfds`/`shared_files`/`sysv_shm`) -- it is a plain per-process
+heap-allocated `Arc`, invisible across a real Windows-process boundary by construction, exactly the
+same root-cause class (`SharedArc::new` only shares `T`'s literal inline bytes; a registry's nodes
+live on the private per-process heap) already characterized for the other seven fields. This means
+every previous pass in this investigation that used a `ps -ef`/`PS_DUMP` snapshot as evidence about
+which processes were alive was reading a table that can ONLY ever show that one guest task's own
+child tree, never any cross-process-forked sibling -- worth re-weighing any past pass's conclusion
+that leaned on an empty or sparse `ps` output. Not fixed this pass (scoped, not chased further); the
+fix shape would mirror `sysv_shm`'s (a shared-arena-native fixed array) or `pty_registry`'s (shadow +
+`SharedPtyTable`-style companion), whichever a future pass has time for.
+
+**(3) New, unresolved lead: `DBUS_FAILED` is real, reproducible, and NOT the same thing the 62nd-64th
+passes were chasing.** The SAME `de_only.sh`-family script that produced the 62nd-64th passes'
+"`xfwm4` claims `WM_S0`, 25 windows exist" result produced, on a fresh boot this pass (identical
+image, identical flags, `LITEBOX_PROCESS_FORK=1`, `--env GLIBC_TUNABLES=...`), a flat
+`[s] DBUS_FAILED` a few seconds in -- `dbus-daemon`'s own `--print-address` line never produced an
+address within its 20 x 1s poll, so `xfce4-session`/`xfwm4` never got a working session bus at all,
+never even execve'd (`ps`-blindness above means this can't be confirmed via `ps`, but zero D-Bus/
+X11-window activity for the entire 240s extended `WM_POLL` window is consistent with it). This is a
+DIFFERENT failure mode from the 62nd-64th passes' scenario (where dbus WAS up and xfwm4 genuinely
+ran) -- i.e. `DE_FAILED`/boot failure in this codebase currently has AT LEAST TWO independent causes,
+and this one is the more foundational of the two since it prevents the desktop from starting at all.
+Isolated further with two minimal repros (both `--resume-from` a tiny custom seed tar, no Xvfb/xfce
+involved at all):
+
+- `.wfgy/pass65_dbus_seed.tar`: `dbus-daemon --session --nofork --print-address < /tmp/empty >
+  /tmp/addr_N 2>/tmp/dbuserr_N &` (the EXACT idiom both `de_only.sh` and `.wfgy/webtop_stack.sh:373`
+  use), 5 iterations, 3s sleep each, then `cat`s the address file. Result: 5/5 iterations, `/tmp/
+  addr_N` AND `/tmp/dbuserr_N` both come back completely EMPTY, and `ps -ef | grep dbus` shows
+  nothing (expected now, see finding (2)).
+- `.wfgy/pass65_dbus_fg_seed.tar`: the IDENTICAL `dbus-daemon --session --nofork --print-address`
+  invocation, but in the FOREGROUND this time (`timeout 3 ... 2>&1` via command substitution, no
+  `&`). Result: `[s] FG_RESULT rc=137 out=[unix:path=/tmp/dbus-0rpxq5fSDY,guid=
+  651d9481cbc6800180d61b526ab34c7a]` -- a real, correct, well-formed D-Bus address, printed
+  immediately. `dbus-daemon` itself is provably NOT broken; something specific to BACKGROUNDING it
+  (`&`) is.
+
+This is consistent with (not yet proven to literally BE) the exact mechanism the "Standing lessons"
+section already documents under "A guest diagnostic must reach the console through a PIPE or `$( )`,
+never a bare file redirect" -- but that lesson has, until now, only ever been applied to DIAGNOSTIC
+output a script's author added for visibility (`de.log`, `de2.log`, `wm1`/`wm2`). Nobody had
+previously recognized that `dbus-daemon`'s OWN production startup line, in BOTH `de_only.sh` and the
+real `webtop_stack.sh:373`, uses the exact same vulnerable `cmd > file &` shape for its address
+handoff. If a cross-process-forked `dbus-daemon` child's write to `/tmp/addr` lands in that child's
+own private writable-layer snapshot (taken at fork time) rather than the parent's, the parent's `read
+-r A < /tmp/addr` would see nothing -- an intermittent failure (it would only happen on runs where
+that particular `&` background job actually took the cross-process-fork path rather than the
+thread-based fallback, which shares the writable layer directly with no snapshot) that would exactly
+explain why some runs (62nd-64th) get `DBUS_UP` and others (this pass) get `DBUS_FAILED` with an
+otherwise byte-identical script and flags.
+
+**Attempted fix, INCONCLUSIVE this pass**: rewrote the address handoff to use a `mkfifo`'d named pipe
+instead of a plain file (`/tmp/dbusfifo_N`, relying on `fifo_registry`'s already-fixed cross-process
+sharing, "Shared-memory foundations" section), so the reader (`cat`) blocks on a real pipe rather than
+racing a file write. `.wfgy/pass65_dbus_fifo_seed.tar`, 3 iterations. Did NOT complete within this
+pass's wait budget (the FIRST iteration's `cat /tmp/dbusfifo_1` never returned even after several
+minutes of wall-clock time -- killed via `Invoke-CimMethod -MethodName Terminate` rather than left
+running). Inconclusive whether this is (a) the fix genuinely deadlocking on a real
+`fifo_registry`/pipe-semantics gap under cross-process fork, (b) coincidental severe host slowness
+this pass already saw elsewhere (a trivial `timeout 3 dbus-daemon` foreground command, see above,
+took several minutes of real wall-clock time to complete despite the guest-visible timeout being
+3 seconds -- not yet explained, possibly just this specific large multi-GB image's cold decompress
+cost on this host at this RAM level, not necessarily a new bug), or (c) a genuine new litebox bug in
+`mkfifo`+background-writer+foreground-reader interaction specifically. Not root-caused. Next pass
+should re-attempt with `syscalls::{process,unix,file}=debug` tracing and a generous (5+ minute)
+timeout budget before concluding either way, then, if the fifo fix DOES work, port it into the real
+`.wfgy/webtop_stack.sh:373` (remembering to re-tar `webtop_seed.tar`, per the standing lesson that
+editing the host script alone changes nothing) and re-run a full boot.
+
+**Where this leaves the ORIGINAL `DE_FAILED` question (62nd-64th passes' scenario, dbus genuinely
+up, xfwm4 genuinely running)**: still completely open. This pass's finding (1) only removes one
+specific (wrong) theory; it does not identify what actually blocks `setNetSupportedHint`. The
+`xfwm4`/`xfce4-session` process, in a run where dbus IS up, demonstrably sends and receives real
+D-Bus and X11 traffic continuously for 120+ real seconds with zero errors and zero missed wakeups on
+either of its two D-Bus fds or its X11 fd -- so the blocker is neither an epoll/poll readiness gap
+nor a dead connection. The likeliest remaining shape (not yet investigated) is a synchronous
+condition somewhere INSIDE `initSettings()`'s own control flow that never becomes true (e.g. waiting
+on a specific property value, a specific `xfconf` channel's specific key, a compositor-manager
+selection check, or a GTK settings-portal round trip on a THIRD bus/fd this pass never looked for) --
+next pass should go back to real upstream `xfwm4` source (already fetched once, 62nd pass) and read
+`initSettings()` literally line by line for every blocking condition between `xfconf_channel_new`
+succeeding and `setNetSupportedHint()`, rather than assuming the blocker is at the transport layer.
+
+Logs for this pass (all gitignored): `.wfgy/pass65_run1.log` (full boot, extended `WM_POLL`,
+`DBUS_FAILED`), `.wfgy/pass65_dbus_only.log` (5x background-dbus-daemon repro, all empty),
+`.wfgy/pass65_dbus_fg.log` (foreground dbus-daemon, real address printed), `.wfgy/pass65_dbus_fifo.log`
+(mkfifo attempt, killed mid-hang, inconclusive). Seeds: `.wfgy/pass65_extended_wmpoll_seed.tar`,
+`.wfgy/pass65_dbus_seed.tar`, `.wfgy/pass65_dbus_fg_seed.tar`, `.wfgy/pass65_dbus_fifo_seed.tar`.
