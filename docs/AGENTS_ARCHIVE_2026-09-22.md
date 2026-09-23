@@ -1754,3 +1754,158 @@ browser-screenshot verification (chrome-devtools MCP failed to connect this pass
 `CONNECT_TIMEOUT` -- re-check `claude-in-chrome`/`chrome-devtools` availability fresh at that time,
 per the task's own standing instruction that this is the single most important moment for that
 check to succeed).
+
+## 62nd pass (2026-09-23) -- independent re-verification of the 61st pass's "app-level, not litebox" framing: NARROWED, one real litebox leak found+fixed, symptom NOT resolved
+
+**Task**: verify (not assume) the 61st pass's conclusion that `xfwm4`'s failure to publish
+`_NET_SUPPORTING_WM_CHECK` is application-level, per the standing project lesson that "looked like
+an app bug, was actually a litebox emulation gap" has happened before (`libLLVM.so.19.1` `.dynsym`
+corruption). Fetched real upstream `xfwm4` source (`github.com/xfce-mirror/xfwm4`, shallow clone to
+the scratchpad) and read its actual startup sequence (`src/main.c`, `src/screen.c`, `src/hints.c`,
+`src/settings.c`) to know exactly what to look for.
+
+**Real upstream xfwm4 sequence, precisely**: `main()` -> `initialize(replace_wm)` ->
+`myScreenInit()` (creates `screen_info->gtk_win`/`xfwm4_win`, calls `myScreenSetWMAtom()` which does
+`XGetSelectionOwner(WM_S<screen>)` then `setXAtomManagerOwner()`/`XSetSelectionOwner` to CLAIM the
+selection, then creates 4 "sidewalk" edge-detection windows, THEN returns) -> back in `initialize()`,
+`initSettings(screen_info)` (`settings.c:1063`: `xfconf_init(NULL)` -> `xfconf_channel_new
+(CHANNEL_XFWM)` -> `loadSettings()`, a loop of `xfconf_channel_get_property` calls -> `placeSidewalks
+()`) -> ONLY IF THAT SUCCEEDS: `setUTF8StringHint(NET_WM_NAME)` then **`setNetSupportedHint()`**
+(`hints.c:433-438`, the ONLY place `XChangeProperty(..., NET_SUPPORTING_WM_CHECK, ...)` is called, on
+both the check window and root) -> `setNetDesktopInfo`/`workspaceUpdateArea`/`clientFrameAll` ->
+`gtk_main()`. If `initSettings` fails, `initialize()` returns `-2` and the process `exit(1)`s
+immediately (`main.c:714-717`) -- it does NOT reach `gtk_main()`.
+
+**New live evidence, 3 independent techniques, none requiring guessing**:
+
+1. **X11 ground-truth census** (`advisor/probes/webtop_xcensus.py`'s exact ctypes/libX11 technique,
+   inlined as a heredoc into a `de_only.sh` variant, `.wfgy/de_only_xcensus_seed.tar`) run at
+   `WM_POLL` n=2/4/8/12 via `XGetSelectionOwner`/`XQueryTree`/`XGetWindowProperty` -- far stronger
+   ground truth than `xprop`'s atom-existence heuristic the 61st pass relied on. Two independent
+   boots (`.wfgy/de_only_xcensus_run1_utf8.log`, `_run3_utf8.log`) agree exactly: at n=2, only
+   `xfce4-session`'s own window exists, `WM_S0` owner=0x0 (myScreenInit not yet run). By n=4, windows
+   `0x400001`/`0x40008c`/`0x40008e` (matching `xfwm4`'s `gtk_win`/`xfwm4_win`/its check window
+   exactly, class `xfwm4.Xfwm4`) exist AND **`WM_S0` owner=`0x40008e`** -- `myScreenSetWMAtom`
+   genuinely succeeded, `xfwm4` genuinely claimed the window-manager selection. By n=8, four more
+   windows (`0x400092`-`0x400095`, sizes/positions matching the 4 sidewalk windows exactly) appear,
+   under the SAME XID range (`0x400xxx`, i.e. the SAME client connection, never respawned) -- proving
+   `myScreenInit` ran to completion and RETURNED. Yet at every poll through n=12 (60s+),
+   `_NET_SUPPORTING_WM_CHECK`/`_NET_WM_NAME`/`_NET_CLIENT_LIST`/`SM_CLIENT_ID` root properties are ALL
+   still empty. **Conclusion: `xfwm4` is demonstrably past `myScreenSetWMAtom` and past the end of
+   `myScreenInit`, meaning it is inside (or has failed inside) `initSettings` -- the ONLY code between
+   the confirmed-successful point and the confirmed-never-reached `setNetSupportedHint` call.**
+
+2. **Direct guest stderr capture** (`litebox_diag::stderr_capture=debug`, `litebox_shim_linux/src/
+   syscalls/file.rs:1877-1889` -- fires on every `fd==2` write host-side, independent of the guest's
+   own pipe/fd plumbing, so it sidesteps the separate, still-open "`[de]`/`[de2]`-tagged pipe output
+   never appears" writable-layer-visibility gap entirely). A full boot's 87 `stderr_write` events
+   (`.wfgy/de_only_stderr_run1_utf8.log`) show real, correctly-attributed text from `dbus-daemon`
+   (`Cannot initialize inotify: Function not implemented`), `gpg-agent`, `iceauth`, `pactl`,
+   `xfce4-panel`, `xfce4-session`, `xfdesktop`, even `Xvfb` -- proving the capture mechanism itself
+   works and catches real warnings from real processes. **`comm="xfwm4"` appears ZERO times.** Real
+   upstream `xfwm4` prints an explicit `g_warning`/`g_print`/`g_critical` on EVERY one of its own
+   failure paths (`"Another Window Manager (%s) is already running"`, `"Cannot acquire window manager
+   selection"`, `"Missing data from default files"`, `"Could not find a screen to manage"`) -- zero
+   output means NONE of xfwm4's own explicit, self-diagnosed failure paths fired. It is not failing
+   loudly; it is silently, indefinitely pending inside a call that itself never errors or times out.
+
+3. **Live `cdb -pv` mid-hang attach** (NOT immediately after `execve` like the 61st pass -- 35s into
+   `xfwm4`'s own lifetime, deliberately timed to land mid-`initSettings` via a fixed orchestrator
+   script, `.wfgy/xfwm4_cdb_midhang.ps1`; the first 3 attempts failed for a mundane reason worth
+   recording -- ANSI color escape codes embedded in `LITEBOX_LOG` output split literal substrings like
+   `argv0=` and `path=` across escape sequences, so a naive `Select-String -Pattern "argv0=..."`
+   never matches; fixed by stripping `[char]27 + "\[[0-9;]*m"` before matching, and PowerShell 5.1's
+   lack of a backtick-e escape for ESC was the actual root cause of the first fix attempt also
+   failing). The snapshot (`.wfgy/xfwm4_midhang_snapshot_utf8.log`) shows the real guest-execution OS
+   thread blocked inside `litebox_shim_linux::syscalls::epoll::PollSet::wait` -> `WaitContext::
+   wait_until` -> `ThreadHandle::interrupt` -> a genuine `WaitForSingleObjectEx`/`NtWaitForSingleObject`
+   -- a legitimate poll()-style wait, no spin/deadlock signature, matching a normal idle GLib main-loop
+   iteration. This is CONSISTENT WITH BOTH remaining hypotheses (idling correctly post-init, or
+   perpetually polling inside a stuck `initSettings`) and does not itself discriminate them --
+   recorded so a future pass does not re-attempt an identical single-snapshot cdb capture expecting a
+   different answer; the discriminating signal has to come from (1)/(2) above or a byte-level D-Bus
+   trace, not another generic thread dump.
+
+**A directly relevant, already-landed fix's own doc comment, re-examined and found INSUFFICIENT**:
+`litebox_shim_linux/src/syscalls/unix.rs`'s `UnixConnectingStream` (commit `aa0b085`, 2026-09-22,
+already in the binary this pass tested) explicitly documents itself as the fix for "the reason a
+real `xfce4-session` boot never reaches `_NET_SUPPORTING_WM_CHECK`: its own (GDBus/GIO-driven) D-Bus
+connect hits [the old unconditional-cancel] arm and then never forks a single child process again."
+That description matches a DIFFERENT, EARLIER, already-CLOSED failure mode (a total, permanent
+fork-starvation) -- this pass's boots fork dozens of children successfully (`xfsettingsd`,
+`xfce4-panel`, `Thunar`, `xfdesktop` all launch) and never freeze, so that catastrophic case is
+confirmed still fixed. The CURRENT, narrower symptom (only `xfwm4`'s own `initSettings` never
+finishing) is a residual instance of the same general subsystem, not proof the whole class is closed.
+
+**Real, verified, additional fix landed this pass** (still open whether it's sufficient):
+`SharedUnixConnectQueue::cancel` (`unix.rs`) had one more real leak in the SAME rendezvous the
+`aa0b085` fix touched: if a connect's caller cancels (on timeout, or losing a state race) at the
+EXACT moment the listener's `try_claim()` has already moved a request `REQ_PENDING` -> `REQ_CLAIMED`
+(and shortly after, `REQ_ACCEPTED`), the old `cancel()` did one `compare_exchange(PENDING, EMPTY)`,
+saw it fail, and walked away -- leaking that request slot AND the `SharedUnixConnTable` connection
+slot the listener had just allocated, forever (own comment: "reclaimed when the whole fork family
+exits"). `SHARED_UNIX_CONNECT_QUEUE_CAPACITY` is 64; a real desktop boot's ~28+ processes each making
+several D-Bus/X11 connect attempts under real host-RAM pressure is exactly the shape that could
+exhaust it well before the fork family ever exits, permanently `EAGAIN`-ing every later connect to an
+otherwise-healthy listener. **Fixed**: `cancel()` now, on losing the race, bounded-spins
+(non-blocking, matching this queue's existing no-real-wakeup design) for the listener's own
+`complete()`, then constructs this side's own `UnixConnectedStream` for the abandoned slot and
+immediately drops it -- deferring to `ConnTransport`'s existing Drop-based both-sides-shut-down
+bookkeeping (the same path a synchronously-completed connect immediately closed by its caller already
+uses) rather than calling `SharedUnixConnTable::free` directly, which would race a listener still
+genuinely using the slot. Also added a `WARN` on `SharedUnixConnectQueue::post`'s queue-full return
+(previously silent) so a future trace can directly confirm or refute real exhaustion instead of
+inferring it. **Verified**: `cargo build -p litebox_runner_linux_on_windows_userland --release`
+clean; re-ran the exact `de_only.sh` repro post-fix (`.wfgy/de_only_verify62_run1.log`) --
+**identical symptom, byte-for-byte the same marker sequence and timing as every pre-fix run**
+(`WM_POLL` n=1-3 "no such atom", n=4+ "not found", `DE_FAILED after 60s`). The fix is real, safe, and
+plausibly still load-bearing for a DIFFERENT, higher-load scenario (the full `webtop_stack.sh` with
+nginx+selkies layered on top costs strictly more per AGENTS.md's own measurements), but it is
+**NOT, by itself, the mechanism blocking `xfwm4` in `de_only.sh`'s simpler repro**.
+
+**A second, separate, real litebox bug found live, unrelated to `xfwm4`**: `/defaults/xfce/` (a
+`linuxserver/webtop` image path baked into an immutable OCI layer, confirmed present via `tar -tf`
+on the cached layer tars in `.litebox-cache/`) is read correctly (3 real files, correct byte counts)
+by `de_only.sh`'s own `cp /defaults/xfce/* ...` early in the script, but a LATER `ls -la
+/defaults/xfce/` (a separate forked child, later in the same boot) sees it as EMPTY (only `.`/`..`).
+Read `litebox/src/fs/layered.rs`'s `read_dir`/`migrate_entry_up_for_metadata`/`open` logic: a path not
+yet cached in `root.entries` tries `self.upper.open()` FIRST unconditionally (`layered.rs:670`); if
+SOME earlier operation (a `chmod`/`chown`/`utimensat`/`touch`-style metadata op via
+`migrate_entry_up_for_metadata`, `layered.rs:423-470`) ever creates an EMPTY upper-layer directory
+shadow for this exact path, `read_dir`'s `EntryX::Upper` branch is SUPPOSED to still union it with
+`self.lower`'s real content (`layered.rs:1704-1728`) -- the exact point of failure (whether the
+`self.lower.open`/`read_dir` merge itself fails for this path, or whether the upper-shadow gets
+created some OTHER way this pass didn't fully trace) is NOT yet root-caused; not on `xfwm4`'s own
+boot path (it never touches `/defaults/xfce`) so lower urgency, but real, reproducible, and worth a
+dedicated pass given this project's own history of filesystem-layering bugs (`libLLVM.so.19.1`,
+`Pipes.litebox`, `FutexManager`, all "raw-pointer/cache-frozen-into-shared-bytes" variants of the
+same root pattern per the Shared-memory foundations section).
+
+**Refined conclusion on the 61st pass's framing**: NEITHER confirmed nor refuted outright --
+narrowed. The specific claim "an application-level (xfwm4/GTK/X11) issue, not a litebox host-emulation
+defect" is NOT well-supported by this pass's own evidence (zero explicit-failure stderr from xfwm4
+argues against a genuine upstream xfwm4 bug specifically; xfconfd independently verified reachable
+via a bare `dbus-send --session --dest=org.xfce.Xfconf ... Introspect` call succeeding with a real
+method-return in the SAME boot argues against "xfconfd never starts" too) -- but this pass's own
+fix attempt (a real, verified, already-known-incomplete leak in the exact rendezvous machinery this
+class of symptom lives in) did not resolve it either. The most likely remaining shape: something in
+`libxfconf`'s/GDBus's OWN persistent/cached bus-connection or signal-subscription (`AddMatch`) pattern
+-- distinct from `dbus-send`'s one-shot synchronous call, which this pass proved works -- hits a gap
+in the shared AF_UNIX transport (or in xfconfd's own handling of that specific pattern) that a plain
+method-call round-trip never exercises.
+
+**Pickup, precise**: (1) get a BYTE-LEVEL trace of xfwm4's own D-Bus socket specifically (not the
+whole boot's `unix=debug`, which produced 150-300MB logs in under a minute this pass and is
+impractical past the first ~15s) -- narrow to ONE fd/sock_id by first correlating xfwm4's own guest
+pid via `syscalls::process=debug`'s `winpid=`/execve lines, then either add a temporary,
+pid-filtered trace, or decode the existing `diag-unix-stream-write`/`-read`'s `sock_id`s against
+`unix_connect`'s own logged `sock_id` for that same pid's D-Bus fd. (2) Cross-reference against
+`libxfconf`'s real source (`git clone https://github.com/xfce-mirror/xfconf`, not yet fetched this
+pass) for exactly what `xfconf_channel_new`+first `xfconf_channel_get_property` call sequence does at
+the GDBus level (method calls issued, signals subscribed, in what order) -- this pass fetched
+`xfwm4`'s own source but not `libxfconf`'s. (3) Root-cause the `/defaults/xfce/` empty-readdir bug
+found above as its own dedicated investigation (add a one-off diagnostic print of `root.entries`'
+state for a specific path right before/after the suspect `migrate_entry_up_for_metadata` call, on a
+minimal non-desktop repro, to avoid the 28-process RAM cost of a full boot). (4) Budget RAM exactly as
+the 61st pass documented (~8.5GB -> under 1GB within 90s on `de_only.sh` alone) -- this pass hit the
+same cliff 4 times and killed cleanly each time via `Invoke-CimMethod -MethodName Terminate`.
