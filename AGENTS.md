@@ -246,6 +246,35 @@ map" below). Condensed current-state trail:
   consistent with the known concurrent-fork tcache-corruption class (ADVISORY-001 §3N) — not chased
   further, out of scope. `DE_UP` not reached (no functional change made, so no new boot attempt).
   Full repro commands/raw log lines: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
+- **79th (2026-09-23)**: **measured fork-then-immediately-`execve()` before touching the copy loop**
+  (debug build, `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug`, thread-based path,
+  `bash -c` loop of `/bin/true`/`/bin/echo`). With the documented `GLIBC_TUNABLES` workaround: 20/20
+  forks were plain `fork()` (`CloneFlags(18874368)`, `CLONE_VM` absent — bash never uses `vfork`/
+  `posix_spawn`'s VM-sharing path for external commands); 20/20 had `execve()` as the literal FIRST
+  syscall, zero intervening syscalls; fork→`execve` gap averaged 127ms (60-205ms, nothing else
+  happening in that window) vs. actual post-exec runtime (`execve`→`exit_group`) averaging 23ms —
+  **~85% of every cycle's wall time is eager-copy, 100% wasted the instant `execve` fires.**
+  Incidental finding, SAME repro WITHOUT the tunable: 44% (7/16) per-fork crash rate
+  (SIGABRT/SIGSEGV before `execve`) — a new, precise live reconfirmation ADVISORY-001 §3N's
+  tcache-corruption class is still fully live on `main`, not just historical (0/20 with the
+  tunable). Cross-process fork (`LITEBOX_PROCESS_FORK=1`), same repro: 20/20 clean but ~830-930ms/
+  cycle (~6x thread-based), dominated by the already-documented per-child rootfs rebuild (76th
+  pass) not VM-copy — a skip-copy fix's payoff is thread-based-path-only.
+  **Decision: did NOT implement a skip/defer-copy fix.** The "peek next syscall, skip copy if
+  `execve`" shape isn't a static check: the child must execute real instructions (fork-return
+  trampoline, the `execve` stub itself) before it CAN call `execve`, needing those pages valid at
+  its relocated address first — real Linux gets this free from hardware page tables, litebox's
+  thread-based path has no native COW/section-object primitive wired into `VmArea`. A real fix
+  needs genuine per-page LAZY population via a fault handler (reusing `fork_verify.rs`'s own
+  `AddressRelocations` map) — a new primitive, not a narrow patch, that must coexist with
+  `fork_verify.rs`'s VEH single-step healing on the SAME faulting instruction stream. Given this
+  pass's own fresh 44%-per-fork live-corruption finding in this exact subsystem, layering a second
+  invasive change into the same path in one sitting was judged unsafe — deferred to its own
+  multi-pass investigation (mirrors 78th pass declining a smaller-scoped version for the same
+  reason). **`DE_UP` not attempted**: mid-session host RAM was additionally consumed by unrelated
+  processes (chrome ~5.7GB WS, `rustc` ~1.36GB WS — neither litebox), free RAM fell from the
+  session's initial 5.56GB to under 300MB with ZERO litebox processes running — environmental, not
+  a regression. All litebox processes cleanly terminated, confirmed none left running.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -277,13 +306,19 @@ both Xvfb SIGSEGVs.
    `is_file_backed` BOOL, no file/inode/offset identity — needed to safely prove "same backing the
    rootfs already `mmap`s" before `Vmem::duplicate`/`copy_one_group` could skip a copy, itself a
    nontrivial addition in the subsystem behind this investigation's worst bugs (ADVISORY-001 §3N).
-   Next: (i) re-run the diagnostic on a HEAVIER real daemon fork (`dbus-daemon`'s own
-   double-fork-to-daemonize — it keeps running the SAME image post-fork, so the copy isn't
-   transient) to see if the skippable fraction rises enough to justify the file-identity bookkeeping
-   + narrow skip-copy fix, with real runway, never rushed; (ii) if it doesn't rise materially, look
-   at `Vmem::duplicate`/`copy_one_group` and per-process guest heap/stack SIZING instead
-   (over-sized reservations vs. real usage, not yet measured) — the likelier next lead. The
-   diagnostic (both call sites, zero cost when off) is permanent and reusable either way.
+   **79th pass measured the bigger fork-then-`execve` theory instead (real numbers: ~85% of every
+   thread-based fork-exec-run cycle is eager-copy time, 100% wasted at `execve` — see that pass's own
+   entry above) and confirmed a real fix needs genuine per-page LAZY population (a new fault-handler
+   primitive reusing `fork_verify.rs`'s own `AddressRelocations` map), not a narrow patch — declined
+   to implement it this pass given a freshly-reconfirmed LIVE 44%-per-fork tcache-corruption rate in
+   this exact subsystem without the `GLIBC_TUNABLES` workaround (0% with it).** Next, in order: (i)
+   scope the lazy-page-fault primitive as its own dedicated multi-pass investigation, explicitly
+   cross-referenced against `fork_verify.rs`'s single-step healing so the two mechanisms are proven
+   to coexist correctly on the same faulting instruction stream before either touches the boot path;
+   (ii) only once (i) is live-verified safe on the cheap `bash -c` repro (not the full desktop boot)
+   should it be tried against a heavier real daemon fork (`dbus-daemon`'s double-fork-to-daemonize)
+   or the full boot. The `LITEBOX_DIAG_FORK_VMA_BREAKDOWN` diagnostic (both call sites, zero cost
+   when off) remains permanent and reusable for measuring either fix's real payoff before landing it.
    Lower-priority, still open: (a) decompose remaining per-fork cost between rootfs
    materialization staying resident post its cheap (~83-140ms) build vs. Windows loader overhead
    (77th: a much bigger `debian-xfce` rootfs added only ~16MB over the `stable-slim` baseline, so
