@@ -7,9 +7,9 @@ detail is drained to `docs/AGENTS_ARCHIVE_*.md` and dated `docs/*.md` in the map
 for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th and 76th
-passes (pass-history section below; 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`;
-70th-76th full narrative, including each pass's own complete evidence and fix rationale:
+line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th and
+81st passes (pass-history section below; 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`;
+70th-81st full narrative, including each pass's own complete evidence and fix rationale:
 `docs/AGENTS_ARCHIVE_2026-09-23.md`).
 
 ## The cheap repro — start here
@@ -228,53 +228,38 @@ map" below). Condensed current-state trail:
   `litebox_platform_windows_userland/src/process_fork.rs`) unconditionally byte-copy every
   non-shared VMA on every fork, including read-only shared-library code/rodata a real `fork()`
   would share for free. Deliberately not attempted — flagged as needing real measurement first.
-- **78th (2026-09-23)**: **measured the 77th pass's shared-library-COW theory instead of guessing.**
-  Added a permanent `env_flag`-gated diagnostic (`LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`, off by
-  default, read-only, zero behavior change) classifying every fork's copied bytes at both call sites
-  (`litebox_shim_linux/src/syscalls/process.rs`: thread-based `do_clone` and the cross-process
-  `copy_one_group`-plan site) by reusing `is_file_backed`/`VmFlags` data already carried — no new
-  bookkeeping. **Real result, live `bash -c` fork chain (8+ forks, `ls`/`cat`/`grep`/`sort`/`wc`/
-  `sed`/`find`, both fork paths cross-validated identical): read-only file-backed bytes are ~29% of
-  copied bytes (`file_ro_bytes=3690496`/`copied_total=12406784`, 17 regions) — REAL but MODERATE,
-  not dominant; ~71% is genuinely anonymous heap/stack data no such fix could skip.** Decision: did
-  NOT implement the skip-copy fix this pass — moderate (not dominant) payoff, `VmArea` tracks only
-  an `is_file_backed` BOOL with no file/inode/offset identity (needed to safely prove "same backing
-  the rootfs already `mmap`s", itself a nontrivial addition), and this subsystem's documented
-  worst-bug history (ADVISORY-001 §3N) makes a rushed fix a bad trade here. Incidentally reproduced
-  (with the new diagnostic OFF too, so unrelated to it) a pre-existing bug: `ls | wc -l` inside
-  `bash -c` intermittently SIGSEGVs/SIGABRTs a pipeline child (`free(): invalid pointer`/signal 11),
-  consistent with the known concurrent-fork tcache-corruption class (ADVISORY-001 §3N) — not chased
-  further, out of scope. `DE_UP` not reached (no functional change made, so no new boot attempt).
-  Full repro commands/raw log lines: `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-- **79th (2026-09-23)**: **measured fork-then-immediately-`execve()` before touching the copy loop**
-  (debug build, `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug`, thread-based path,
-  `bash -c` loop of `/bin/true`/`/bin/echo`). With the documented `GLIBC_TUNABLES` workaround: 20/20
-  forks were plain `fork()` (`CloneFlags(18874368)`, `CLONE_VM` absent — bash never uses `vfork`/
-  `posix_spawn`'s VM-sharing path for external commands); 20/20 had `execve()` as the literal FIRST
-  syscall, zero intervening syscalls; fork→`execve` gap averaged 127ms (60-205ms, nothing else
-  happening in that window) vs. actual post-exec runtime (`execve`→`exit_group`) averaging 23ms —
-  **~85% of every cycle's wall time is eager-copy, 100% wasted the instant `execve` fires.**
-  Incidental finding, SAME repro WITHOUT the tunable: 44% (7/16) per-fork crash rate
-  (SIGABRT/SIGSEGV before `execve`) — a new, precise live reconfirmation ADVISORY-001 §3N's
-  tcache-corruption class is still fully live on `main`, not just historical (0/20 with the
-  tunable). Cross-process fork (`LITEBOX_PROCESS_FORK=1`), same repro: 20/20 clean but ~830-930ms/
-  cycle (~6x thread-based), dominated by the already-documented per-child rootfs rebuild (76th
-  pass) not VM-copy — a skip-copy fix's payoff is thread-based-path-only.
-  **Decision: did NOT implement a skip/defer-copy fix.** The "peek next syscall, skip copy if
-  `execve`" shape isn't a static check: the child must execute real instructions (fork-return
-  trampoline, the `execve` stub itself) before it CAN call `execve`, needing those pages valid at
-  its relocated address first — real Linux gets this free from hardware page tables, litebox's
-  thread-based path has no native COW/section-object primitive wired into `VmArea`. A real fix
-  needs genuine per-page LAZY population via a fault handler (reusing `fork_verify.rs`'s own
-  `AddressRelocations` map) — a new primitive, not a narrow patch, that must coexist with
-  `fork_verify.rs`'s VEH single-step healing on the SAME faulting instruction stream. Given this
-  pass's own fresh 44%-per-fork live-corruption finding in this exact subsystem, layering a second
-  invasive change into the same path in one sitting was judged unsafe — deferred to its own
-  multi-pass investigation (mirrors 78th pass declining a smaller-scoped version for the same
-  reason). **`DE_UP` not attempted**: mid-session host RAM was additionally consumed by unrelated
-  processes (chrome ~5.7GB WS, `rustc` ~1.36GB WS — neither litebox), free RAM fell from the
-  session's initial 5.56GB to under 300MB with ZERO litebox processes running — environmental, not
-  a regression. All litebox processes cleanly terminated, confirmed none left running.
+- **78th**: measured the 77th pass's shared-library-COW theory (`LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`,
+  permanent, off by default) instead of guessing — read-only file-backed bytes are only ~29% of
+  copied bytes per fork (real but MODERATE, not dominant); declined the skip-copy fix as a bad trade
+  against ADVISORY-001 §3N's bug history for a moderate payoff. Incidentally reconfirmed `ls | wc -l`
+  can still SIGSEGV/SIGABRT via the known tcache-corruption class.
+- **79th**: measured fork-then-immediately-`execve()` instead of guessing — with the `GLIBC_TUNABLES`
+  workaround, 20/20 real `bash -c` forks are plain `fork()` (`CLONE_VM` absent) with `execve()` as
+  the literal first syscall, ~85% of cycle wall time is eager-copy, 100% wasted at `execve`. Declined
+  to implement a skip/defer-copy fix: reaching a "first syscall" checkpoint needs the child to
+  execute real instructions first, which needs the copy already done (no COW/page-fault primitive
+  exists) — a real fix needs a new per-page lazy-population primitive, scoped but not attempted.
+  Also reconfirmed ADVISORY-001 §3N live (44% per-fork crash rate WITHOUT the tunable, 0% with it).
+- **80th**: confirmed by direct live measurement (not prediction) that tightening
+  `CROSS_PROCESS_FORK_CONCURRENCY_CAP` further is a dead end — two fresh boots at 6→3 hit the SAME
+  WM_POLL n=4 crater ceiling the unmodified cap=6 binary already hit (77th), just slower with fewer
+  procs alive at the crater instant. Confirms the crater is driven by CUMULATIVE committed memory
+  across the boot's whole fork history, not peak instantaneous concurrency — CLOSES admission-cap
+  tuning as a lever.
+- **81st**: investigated the 79th pass's declined idea in a narrower "defer the WHOLE copy batch (not
+  per-page) until the child's first non-`execve` syscall" framing, via code reading only (no code
+  changed, no live boot — nothing to verify). Confirms 79th's obstacle (the child needs real,
+  populated memory to execute even its first instruction, so there is no window to defer into) and
+  finds a SECOND, independent one: the checkpoint is a syscall event, not a memory-WRITE event, and a
+  plain `fork()`ed child may legally write memory (stack/TLS/malloc bookkeeping/`atfork` handlers)
+  with zero syscalls before `execve` — sharing pages until the checkpoint would let such a write
+  silently corrupt the PARENT. Litebox's own `CLONE_VFORK` path already does share-until-`execve`
+  safely (`do_clone`, `process.rs:3893-3925`), but only because real `vfork()` carries a POSIX UB
+  contract forbidding exactly that write, plus the parent is blocked (`wait_for_vfork_done`) —
+  neither property holds for plain `fork()`, which is what the real `bash` workload uses (79th).
+  Whole-batch deferral removes the per-page performance argument only, not the correctness one — the
+  only remaining viable path is genuine per-page lazy population (79th's own scoped primitive), no
+  shortcut exists at either granularity. Re-confirms 79th's decision not to implement.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -291,69 +276,32 @@ both Xvfb SIGSEGVs.
 
 1. **`xfwm4` now launches (75th pass, `1d449e6`) — the blocker is no longer filesystem visibility,
    it is pure host-RAM/process-count exhaustion before `DE_UP`.** CLOSED sub-issues:
-   `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th);
-   the writable-layer export-path fallback bug (75th). **76th pass landed a real, evidenced-partial
-   mitigation** (`live_cross_process_fork_children` admission control, `litebox_shim_linux/src/
-   syscalls/process.rs`/`lib.rs`) but did NOT close the crater — live re-test still cratered (28-29
-   processes, 0.17-0.31GB free), just more slowly. **77th pass decomposed and partially fixed the
-   FIXED per-process floor** (`WindowsUserland::alloc`'s 2x-commit bug, `621ee1a`; ~35-40% Priv
-   reduction per process, verified) — real but confirmed insufficient alone, the crater still hits
-   the same magnitude (`docs/AGENTS_ARCHIVE_2026-09-23.md`, 77th pass). **Refined pickup, in order,
-   supersedes (a)/(b) below where they overlap**: (0) **MEASURED, 78th pass**:
-   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` on a live `bash -c` fork chain shows read-only file-backed
-   bytes are ~29% of copied bytes/fork — real but MODERATE, not dominant (~71% is anonymous data no
-   skip-copy fix could touch). NOT fixed: `VmArea` (`litebox/src/mm/linux.rs`) tracks only an
-   `is_file_backed` BOOL, no file/inode/offset identity — needed to safely prove "same backing the
-   rootfs already `mmap`s" before `Vmem::duplicate`/`copy_one_group` could skip a copy, itself a
-   nontrivial addition in the subsystem behind this investigation's worst bugs (ADVISORY-001 §3N).
-   **79th pass measured the bigger fork-then-`execve` theory instead (real numbers: ~85% of every
-   thread-based fork-exec-run cycle is eager-copy time, 100% wasted at `execve` — see that pass's own
-   entry above) and confirmed a real fix needs genuine per-page LAZY population (a new fault-handler
-   primitive reusing `fork_verify.rs`'s own `AddressRelocations` map), not a narrow patch — declined
-   to implement it this pass given a freshly-reconfirmed LIVE 44%-per-fork tcache-corruption rate in
-   this exact subsystem without the `GLIBC_TUNABLES` workaround (0% with it).** Next, in order: (i)
-   scope the lazy-page-fault primitive as its own dedicated multi-pass investigation, explicitly
-   cross-referenced against `fork_verify.rs`'s single-step healing so the two mechanisms are proven
-   to coexist correctly on the same faulting instruction stream before either touches the boot path;
-   (ii) only once (i) is live-verified safe on the cheap `bash -c` repro (not the full desktop boot)
-   should it be tried against a heavier real daemon fork (`dbus-daemon`'s double-fork-to-daemonize)
-   or the full boot. The `LITEBOX_DIAG_FORK_VMA_BREAKDOWN` diagnostic (both call sites, zero cost
-   when off) remains permanent and reusable for measuring either fix's real payoff before landing it.
-   **80th pass CONFIRMED item (b) below by direct measurement, not just prediction**: fresh
-   release rebuild with 76th+77th both compiled in (correctness re-verified,
-   `.wfgy/pass80_correctness*.out.log`), then tried tightening `CROSS_PROCESS_FORK_CONCURRENCY_CAP`
-   6->3 (`litebox_shim_linux/src/syscalls/process.rs`) and ran two fresh `de_only.sh` boots on that
-   binary (`Start-Process` + parallel RAM-trajectory polling + an automatic `Invoke-CimMethod
-   Terminate` kill switch, `.wfgy/pass80_ram_trajectory{,2}.csv`/`pass80_boot{1,2}.out.log`): a
-   lower-headroom start (5.78GB free) craterd at WM_POLL n=1/t=92s/18 procs/1.14GB free; a
-   higher-headroom start (~6.8-7GB free) reached WM_POLL n=4/t=140s/25 procs/0.79GB free before the
-   kill switch fired — **the exact same WM_POLL n=4 ceiling the unmodified cap=6 binary already
-   reached in the 77th pass's own Finding 3** (28-29 procs/0.82GB free, ~120s), just ~20s slower and
-   with fewer procs alive at the crater instant (18-25 vs 28-33). Tightening the cap bounds peak
-   INSTANTANEOUS concurrency but not how far the boot gets — REVERTED to 6 (net diff: a doc comment
-   only) since 3 added latency for zero depth benefit. This directly confirms the crater is driven
-   by CUMULATIVE committed memory across the boot's whole fork history (WM_POLL's own loop re-forks
-   `xprop` every 5s regardless of the cap) — i.e. the SAME underlying cost Finding 4's eager-fork-copy
-   theory already identified, just observed from the concurrency angle instead of the per-fork-size
-   angle. **Practical effect: admission-control tuning (item (b)) is now CLOSED as a dead end** —
-   the only lever left that could plausibly change the outcome is Finding 4's lazy-page-fault
-   primitive (already scoped above as its own dedicated multi-pass investigation, not attempted
-   again this pass given the same live tcache-corruption risk without `GLIBC_TUNABLES`). `DE_UP` was
-   NOT reached this pass; chrome-devtools MCP remained `CONNECT_TIMEOUT` (moot, `DE_UP` never fired).
-   Lower-priority, still open: (a) decompose remaining per-fork cost between rootfs
-   materialization staying resident post its cheap (~83-140ms) build vs. Windows loader overhead
-   (77th: a much bigger `debian-xfce` rootfs added only ~16MB over the `stable-slim` baseline, so
-   cost is fork-content- not rootfs-size-dependent); (b) CLOSED, 80th pass, confirmed by live
-   measurement (see above) — admission-control cap tuning is a dead end, don't re-attempt without a
-   genuinely new angle; (c) once `DE_UP` fires (or stalls again),
-   use `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/
-   `XCENSUS_ROOTPROP`, real values not `xprop` heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=
-   xfwm4` to check whether the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed)
-   recurs, checking `MappingNotify`(34)/XKB at that boundary before the 30th-pass `LD_PRELOAD
-   getenv_probe.so` technique (`ps`/`/proc` is blind to cross-process-forked siblings, 65th;
-   `gpg-agent`'s fatal `malloc.c:3846` assertion, 52nd, is why the OLD `de_only_seed.tar` dead-ends
-   earlier than `_xcensus_seed2/3`); (d) unconfirmed: `LITEBOX_LOG` may not reach forked children's
-   own stderr (`process_fork.rs`'s env-block construction possibly drops it) — if so, every prior
+   `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th); the
+   writable-layer export-path fallback bug (75th). Full 76th-81st evidence/numbers: the pass-history
+   section above (this file) and `docs/AGENTS_ARCHIVE_2026-09-23.md`. **Net state after 76th-81st**:
+   admission-control (76th, tuning CLOSED as a dead end 80th) and the fixed per-process alloc floor
+   (77th, real ~35-40% reduction) are both landed and real but each only a partial mitigation — the
+   crater is CUMULATIVE committed memory across the boot's whole fork history, not peak concurrency
+   or a fixed per-process floor. **The one lever that could plausibly still move it — eager,
+   unconditional full-VMA-copy on every fork (~85% of a fork-exec cycle wasted the instant `execve`
+   fires, 79th) — has no safe narrow fix at either per-page or whole-batch granularity (79th, 81st):
+   it needs a genuine new per-page lazy-population primitive (real page-fault handling), explicitly
+   cross-referenced against `fork_verify.rs`'s VEH single-step healing before either touches the boot
+   path, and is deferred to its own dedicated multi-pass investigation, not attempted again without
+   that groundwork.** `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero cost when off)
+   remains the permanent tool for measuring any future fix's real payoff before landing it. `DE_UP`
+   has not been reached by any pass through the 81st; chrome-devtools MCP has been `CONNECT_TIMEOUT`
+   every time it was checked (moot until `DE_UP` fires). Lower-priority, still open: (a) decompose
+   remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
+   build vs. Windows loader overhead; (b) once `DE_UP` fires (or stalls again), use
+   `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`,
+   real values not `xprop` heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4` to check whether
+   the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed) recurs, checking
+   `MappingNotify`(34)/XKB at that boundary before the 30th-pass `LD_PRELOAD getenv_probe.so`
+   technique (`ps`/`/proc` is blind to cross-process-forked siblings, 65th; `gpg-agent`'s fatal
+   `malloc.c:3846` assertion, 52nd, is why the OLD `de_only_seed.tar` dead-ends earlier than
+   `_xcensus_seed2/3`); (c) unconfirmed: `LITEBOX_LOG` may not reach forked children's own stderr
+   (`process_fork.rs`'s env-block construction possibly drops it) — if so, every prior
    diagnostic-logging conclusion past the FIRST fork generation needs re-weighing; see `_2026-09-23.md`.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):

@@ -461,3 +461,149 @@ breakpoint scripts), `pass77_cdb_out.log`/`_out2.log` (full VirtualAlloc2 call-s
 `pass77_diagalloc.err.log` (`LITEBOX_DIAG_ALLOC=1` startup allocation trace),
 `pass77_correctness.out.log` (post-fix correctness verification), `pass77_boot1.out.log`/
 `.err.log` (post-fix full XFCE boot attempt, reached `WM_POLL n=4` before the RAM-crater kill).
+
+## 78th pass (2026-09-23) — measured the 77th pass's shared-library-COW theory instead of guessing
+
+Added a permanent `env_flag`-gated diagnostic (`LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`, off by default,
+read-only, zero behavior change) classifying every fork's copied bytes at both call sites
+(`litebox_shim_linux/src/syscalls/process.rs`: thread-based `do_clone` and the cross-process
+`copy_one_group`-plan site) by reusing `is_file_backed`/`VmFlags` data already carried — no new
+bookkeeping. Real result, live `bash -c` fork chain (8+ forks, `ls`/`cat`/`grep`/`sort`/`wc`/`sed`/
+`find`, both fork paths cross-validated identical): read-only file-backed bytes are ~29% of copied
+bytes (`file_ro_bytes=3690496`/`copied_total=12406784`, 17 regions) — real but MODERATE, not
+dominant; ~71% is genuinely anonymous heap/stack data no such fix could skip.
+
+Decision: did NOT implement the skip-copy fix this pass — moderate (not dominant) payoff, `VmArea`
+tracks only an `is_file_backed` BOOL with no file/inode/offset identity (needed to safely prove
+"same backing the rootfs already `mmap`s", itself a nontrivial addition), and this subsystem's
+documented worst-bug history (ADVISORY-001 §3N) makes a rushed fix a bad trade here. Incidentally
+reproduced (with the new diagnostic OFF too, so unrelated to it) a pre-existing bug: `ls | wc -l`
+inside `bash -c` intermittently SIGSEGVs/SIGABRTs a pipeline child (`free(): invalid pointer`/
+signal 11), consistent with the known concurrent-fork tcache-corruption class (ADVISORY-001 §3N) —
+not chased further, out of scope. `DE_UP` not reached (no functional change made, so no new boot
+attempt).
+
+## 79th pass (2026-09-23) — measured fork-then-immediately-`execve()` before touching the copy loop
+
+Debug build, `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug`, thread-based path, `bash -c`
+loop of `/bin/true`/`/bin/echo`. With the documented `GLIBC_TUNABLES` workaround: 20/20 forks were
+plain `fork()` (`CloneFlags(18874368)`, `CLONE_VM` absent — bash never uses `vfork`/`posix_spawn`'s
+VM-sharing path for external commands); 20/20 had `execve()` as the literal FIRST syscall, zero
+intervening syscalls; fork→`execve` gap averaged 127ms (60-205ms, nothing else happening in that
+window) vs. actual post-exec runtime (`execve`→`exit_group`) averaging 23ms — ~85% of every cycle's
+wall time is eager-copy, 100% wasted the instant `execve` fires. Incidental finding, SAME repro
+WITHOUT the tunable: 44% (7/16) per-fork crash rate (SIGABRT/SIGSEGV before `execve`) — a new,
+precise live reconfirmation ADVISORY-001 §3N's tcache-corruption class is still fully live on
+`main`, not just historical (0/20 with the tunable). Cross-process fork (`LITEBOX_PROCESS_FORK=1`),
+same repro: 20/20 clean but ~830-930ms/cycle (~6x thread-based), dominated by the already-documented
+per-child rootfs rebuild (76th pass) not VM-copy — a skip-copy fix's payoff is thread-based-path-only.
+
+Decision: did NOT implement a skip/defer-copy fix. The "peek next syscall, skip copy if `execve`"
+shape isn't a static check: the child must execute real instructions (fork-return trampoline, the
+`execve` stub itself) before it CAN call `execve`, needing those pages valid at its relocated
+address first — real Linux gets this free from hardware page tables, litebox's thread-based path
+has no native COW/section-object primitive wired into `VmArea`. A real fix needs genuine per-page
+LAZY population via a fault handler (reusing `fork_verify.rs`'s own `AddressRelocations` map) — a
+new primitive, not a narrow patch, that must coexist with `fork_verify.rs`'s VEH single-step
+healing on the SAME faulting instruction stream. Given this pass's own fresh 44%-per-fork
+live-corruption finding in this exact subsystem, layering a second invasive change into the same
+path in one sitting was judged unsafe — deferred to its own multi-pass investigation (mirrors 78th
+pass declining a smaller-scoped version for the same reason).
+
+`DE_UP` not attempted: mid-session host RAM was additionally consumed by unrelated processes
+(chrome ~5.7GB WS, `rustc` ~1.36GB WS — neither litebox), free RAM fell from the session's initial
+5.56GB to under 300MB with ZERO litebox processes running — environmental, not a regression. All
+litebox processes cleanly terminated, confirmed none left running.
+
+## 80th pass (2026-09-23) — confirmed admission-cap tuning is a dead end for the RAM crater, by direct measurement
+
+Fresh release rebuild with 76th+77th both compiled in (correctness re-verified,
+`.wfgy/pass80_correctness*.out.log`), then tried tightening `CROSS_PROCESS_FORK_CONCURRENCY_CAP`
+6->3 (`litebox_shim_linux/src/syscalls/process.rs`) and ran two fresh `de_only.sh` boots on that
+binary (`Start-Process` + parallel RAM-trajectory polling + an automatic `Invoke-CimMethod Terminate`
+kill switch, `.wfgy/pass80_ram_trajectory{,2}.csv`/`pass80_boot{1,2}.out.log`): a lower-headroom
+start (5.78GB free) craterd at WM_POLL n=1/t=92s/18 procs/1.14GB free; a higher-headroom start
+(~6.8-7GB free) reached WM_POLL n=4/t=140s/25 procs/0.79GB free before the kill switch fired — the
+exact same WM_POLL n=4 ceiling the unmodified cap=6 binary already reached in the 77th pass's own
+Finding 3 (28-29 procs/0.82GB free, ~120s), just ~20s slower and with fewer procs alive at the
+crater instant (18-25 vs 28-33).
+
+Tightening the cap bounds peak INSTANTANEOUS concurrency but not how far the boot gets — REVERTED
+to 6 (net diff: a doc comment only) since 3 added latency for zero depth benefit. This directly
+confirms the crater is driven by CUMULATIVE committed memory across the boot's whole fork history
+(WM_POLL's own loop re-forks `xprop` every 5s regardless of the cap) — i.e. the SAME underlying
+cost the 79th pass's eager-fork-copy theory already identified, just observed from the concurrency
+angle instead of the per-fork-size angle. Practical effect: admission-control tuning is now CLOSED
+as a dead end — the only lever left that could plausibly change the outcome is genuine per-page
+lazy population (already scoped as its own dedicated multi-pass investigation, not attempted again
+this pass given the same live tcache-corruption risk without `GLIBC_TUNABLES`). `DE_UP` was NOT
+reached this pass; chrome-devtools MCP remained `CONNECT_TIMEOUT` (moot, `DE_UP` never fired).
+
+## 81st pass (2026-09-23) — the "whole-batch-deferred" shortcut is not viable either; a second, independent correctness obstacle found, on top of the 79th pass's memory-must-exist-to-execute one
+
+Task: re-examine the 79th pass's declined "peek next syscall, skip copy if `execve`" idea in a
+narrower framing — defer the ENTIRE per-fork VMA-copy batch (not per-page) from fork time to
+"immediately before the child's first non-`execve` syscall is dispatched", skipping it entirely
+when that first syscall IS `execve`. Investigation only, via full code reading — no code changed,
+so no rebuild and no live boot were performed (nothing to verify).
+
+Read in full: `Vmem::duplicate` (`litebox/src/mm/linux.rs:1441-1719+`, the thread-based path's
+eager-copy loop); the cross-process fork-plan execution (`copy_one_group`,
+`litebox_platform_windows_userland/src/process_fork.rs`); `Task::do_clone`'s address-space-decision
+and `CLONE_VFORK` branch in full (`litebox_shim_linux/src/syscalls/process.rs:3672-3930`); and
+`Process::wait_for_vfork_done`/`signal_vfork_done` (`process.rs:547-573`).
+
+**Finding 1 (reconfirms 79th):** the child must execute real guest instructions — the fork-return
+trampoline, then whatever code leads up to the `execve` syscall stub itself — before it can ever
+reach a syscall-dispatch checkpoint, and those instructions need valid, populated memory (at least
+code + stack) at their relocated addresses to execute at all. There is no hardware/OS page-fault
+trap wired into `VmArea` on the thread-based path (confirmed again by direct reading of
+`Vmem::duplicate`, unchanged since 79th) and no window in which the child can run before the copy
+completes. The "whole-batch" framing does not remove this: it just changes WHEN the (still
+mandatory, still full) copy has to happen relative to a checkpoint that itself cannot be reached
+without the copy already having happened.
+
+**Finding 2 (new this pass, independent of Finding 1):** even granting a hypothetical mechanism
+that could reach a "first syscall dispatch" checkpoint without a completed copy (e.g. by trapping
+the very first guest instruction some other way), that checkpoint is a SYSCALL event, not a
+MEMORY-WRITE event. A plain `fork()`ed child is fully entitled by POSIX to WRITE its own memory —
+stack locals, TLS, glibc's post-fork malloc-arena/PID-cache bookkeeping, `pthread_atfork` handlers
+— with ZERO intervening syscalls before it ever reaches `execve`. Sharing the parent's live pages
+until the checkpoint (the only way the deferral could actually save the copy) would let such a
+write silently corrupt the PARENT's real, live memory, undetected, since there is no syscall for
+the checkpoint to intercept at that moment.
+
+This is not hypothetical inside this codebase: litebox already implements exactly this
+share-instead-of-copy, materialize-only-at-`execve` pattern for real `vfork()`
+(`do_clone`'s `is_process_clone`/`vforked` branch, `process.rs:3893-3925` — the child genuinely
+shares the parent's `Arc<PageManager>`, gets a brand-new one only at `execve` via `ElfLoader::
+load`'s vfork-detach step, and the parent is unconditionally blocked in `wait_for_vfork_done` for
+the entire window). It is safe ONLY because of two properties plain `fork()` does not have: (1)
+real `vfork()` carries a POSIX-mandated UB contract forbidding the child from touching any memory
+but the return-value variable before `execve`/`_exit` — a contract the GUEST voluntarily accepts by
+calling `vfork()` instead of `fork()`; (2) litebox additionally blocks the parent for the whole
+window, removing any concurrent-access hazard on top. The 79th pass's own measurement already
+established the actual workload (bash's external-command fork) uses plain `fork()`
+(`CloneFlags(18874368)`, `CLONE_VM` absent) — specifically because bash does real bookkeeping in
+the child (job-control state, signal-mask restoration, fd-redirection setup) that a
+vfork-shared-address-space child is not allowed to do. Retrofitting vfork's sharing semantics onto
+plain `fork()` would silently violate `fork()`'s own POSIX contract (an independent address space,
+immediately) for any guest program that writes memory in the fork-to-exec gap, with no way to
+detect the violation short of the same hardware/OS-level COW+page-fault trapping Finding 1 already
+established litebox does not have.
+
+**Conclusion:** the narrower "whole-batch, not per-page" framing does not remove the correctness
+obstacle the 79th pass found — it only removes the performance argument for doing it per-page
+(syscall-granularity is cheaper to check than page-granularity), while leaving the underlying
+hazard (a write can happen before any syscall at all) completely unaddressed, on top of Finding 1's
+already-confirmed "child needs valid memory to execute even its first instruction" obstacle. This
+independently re-confirms the 79th pass's decision not to implement a defer/skip-copy fix, and adds
+a second, independent, arguably more fundamental reason on top of the first. The only remaining
+viable path for this whole line of investigation is genuine per-page lazy population via a real
+page-fault handler (real hardware/OS-level COW), exactly as the 79th pass scoped it — no shortcut
+around that requirement exists at either per-page or whole-batch granularity.
+
+No code changed this pass. No live boot attempted (nothing to verify — this was a design-safety
+investigation, not an implementation pass). Host RAM checked at session start: 6.18GB free
+(`FreePhysicalMemory=6330168`/`TotalVisibleMemorySize=15987768` KB), zero litebox processes
+running — clean baseline, unused this pass since no boot was attempted.
