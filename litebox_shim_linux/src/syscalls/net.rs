@@ -2326,6 +2326,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Scatter the received data across iovecs sequentially.
         let data_to_copy = size.min(total_iov_capacity);
+
+        // Mirrors sys_sendmsg's own full-length (bounded 4096B) hex-dump preview -- recvmsg had
+        // none before this (69th pass, xfwm4/xfconf D-Bus-payload investigation), so a caller's
+        // OWN outgoing method calls were visible in a debug trace but never the peer's replies,
+        // making it impossible to tell "sent a request, got a real reply" apart from "sent a
+        // request, reply never arrived" from logs alone. Dumped BEFORE the TRUNC/scatter logic
+        // above so this always reflects the real bytes read off the wire even when the caller's
+        // iovec is smaller than `size`.
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = sockfd,
+            preview:? = alloc::format!("{:02x?}", &recv_buf[..data_to_copy.min(4096)]);
+            "DIAG sys_recvmsg: payload"
+        );
         let mut offset = 0usize;
         for iov in &iovs {
             if offset >= data_to_copy {

@@ -2696,3 +2696,163 @@ xfce4-session source for what actually decides whether/when to spawn the window 
 explain this pass's own "xfwm4 never execve'd at all" finding; (3) once either resolves, rerun the
 full webtop_stack.sh (not just de_only.sh) and check _NET_SUPPORTING_WM_CHECK via
 XGetWindowProperty, not xprop text, per this project's own established ground-truth technique.
+
+## 69th pass (2026-09-23) -- first-ever byte-level decode of xfwm4's real D-Bus traffic;
+## initSettings()'s blocker re-characterized with hard evidence; a genuinely new, unexplained
+## periodic trigger found; root cause NOT yet closed
+
+**Task**: the 62nd-68th passes all cited "a live cdb -pv attach on xfwm4 breaking on libdbus/GDBus
+call entry inside initSettings()" as the next step, but no pass had ever actually executed it. This
+pass did, plus went one step further: decoded the ACTUAL D-Bus wire bytes xfwm4 sends and receives,
+not just syscall-level metadata.
+
+**New standing diagnostic, verified working**: `sys_recvmsg` had NO payload preview before this pass
+-- `sys_sendmsg` already dumps up to 4096B as hex (a prior pass's own fix for a truncated-preview
+bug), but a caller's own outgoing requests were visible while the peer's REPLIES were invisible,
+making "sent a request, got a reply" indistinguishable from "sent a request, reply never arrived"
+from logs alone. Added the mirror-image fix in `litebox_shim_linux/src/syscalls/net.rs`'s
+`do_recvmsg` (dumps `recv_buf[..data_to_copy.min(4096)]` as hex under a new `"DIAG sys_recvmsg:
+payload"` event, BEFORE the TRUNC/scatter logic so it reflects the real wire bytes even when the
+caller's own iovec is smaller). Rebuilt clean; kept in the tree permanently, matching the existing
+`LITEBOX_DIAG_FORK_SNAPSHOT`/sendmsg-preview precedent of leaving real diagnostics in place rather
+than reverting them.
+
+**Method**: booted `.wfgy/webtop_stack.sh` (release binary, `LITEBOX_PROCESS_FORK=1` host env var,
+`--env GLIBC_TUNABLES=...`) with `LITEBOX_LOG=warn,litebox_shim_linux::syscalls::{process,net}=debug`
+to a fresh `DE_FAILED` (byte-for-byte the same signature as every prior pass: `WM_S0` owned, 16 real
+windows, `XCENSUS_NETWMCHECK nitems=0`), then let the script's own `HOLD` loop keep the process alive
+indefinitely rather than killing it -- this gave unlimited, unhurried time for the live debugger work
+that every prior pass's own RAM-pressure time limit cut short.
+
+**xfwm4's own host PID is directly derivable, no probing needed**: `sys_execve: entry tid=21588
+host_tid=5000` (i.e. `DIAG_TIMELINE execve pid=21588`) IS `cdb -pv -p 21588`-able directly, confirming
+AGENTS.md's own standing note that a cross-process-fork child's guest pid equals its real Windows
+PID. `clone: spawned new task parent_tid=21588 child_tid={121,122,123,124}` gives the whole thread
+group; `futex: WAKE tid=124 host_tid=22752` gives that worker thread's own real OS TID.
+
+**cdb -pv, symbolized (`-y <target/release>`, the release PDB IS present and matched this build)**:
+BOTH the main GTK thread (host_tid 5000) and the D-Bus I/O worker thread (host_tid 22752) sit in a
+clean `litebox_shim_linux::syscalls::epoll::PollSet::wait` -> `litebox::event::wait` ->
+`WaitContext::wait_until` -> `ThreadHandle::interrupt` -> real `WaitForSingleObjectEx` -- no spin, no
+deadlock signature, matching the 62nd pass's own single-snapshot finding exactly. Confirms (again)
+that a bare thread-dump snapshot cannot by itself distinguish "idling correctly post-init" from
+"parked forever pre-init" -- the discriminating signal has to come from the wire content, which this
+pass is the first to actually decode.
+
+**The wire content, reassembled properly (D-Bus messages split across multiple `recvmsg` calls
+were NOT decodable as isolated 16-byte previews -- concatenated all SEND/RECV chunks per
+tid+fd into one continuous byte stream first, then parsed real D-Bus framing: 16-byte fixed header,
+padded field array, body, using the wire `body_len`/`field_len`, not guesswork)**:
+
+`xfwm4` opens its keybindings/settings D-Bus connection (`fd=8`, tid 21588 for the handshake,
+handed to worker thread `tid=124`/host_tid=22752 immediately after `BEGIN`, matching the 65th
+pass's own "GDBus moves fd I/O to a cloned sibling" finding). The FULL, real call sequence:
+
+```
+Hello -> AddMatch x3 (NameOwnerChanged/org.xfce.Xfconf, PropertiesChanged/org.xfce.Xfconf,
+         org.xfce.Xfconf's own signals) -> StartServiceByName(org.xfce.Xfconf) -> GetNameOwner
+-> GetAll (proxy's own property cache, interface org.freedesktop.DBus.Properties)
+-> GetAllProperties("xfwm4")                                    [CHANNEL_XFWM -- real reply, fast]
+-> GetAllProperties("xfce4-keyboard-shortcuts")                 [xfce_shortcuts_provider_clone_
+                                                                   defaults(), base "/xfwm4/default"]
+-> ~100x { GetProperty(.../custom/<key>) ; SetProperty(.../custom/<key>, ...) }
+     each answered by a real METHOD_RETURN AND a real org.xfce.Xfconf.PropertyChanged SIGNAL
+     echoed back within ~30ms -- clone-defaults migration, real, correct, complete (t=4.0s-9.5s
+     on xfwm4's own local clock)
+-> GetAllProperties("xfce4-keyboard-shortcuts", "/xfwm4/custom")   [xfce_shortcuts_provider_
+                                                                      get_shortcuts() -- the LAST
+                                                                      step of loadKeyBindings()]
+     -- gets a real, correct METHOD_RETURN in ~30ms (t=9.654s)
+-> THE SAME CALL, byte-identical, re-sent AGAIN: t=20.814s, 31.187s, 42.0s (approx), ... every
+   ~10.3-11.3s (mean ~10.7s), 17+ times through t=189.6s (the latest this pass captured before
+   the D-Bus fd went completely silent for the rest of the 439s+ session observed) -- EVERY one of
+   these re-sends ALSO gets a real, correct, fast METHOD_RETURN.
+```
+
+**This decisively REFUTES every transport/xfconfd-side theory any prior pass proposed** (62nd-68th:
+a stuck epoll registration, a dead D-Bus connection, xfconfd unreachable, a missed wakeup) -- the
+connection is alive, correct, and getting real replies for its ENTIRE observed life, including the
+one call (`GetAllProperties("xfce4-keyboard-shortcuts", "/xfwm4/custom")`) that sits at the exact
+boundary of `initSettings()` returning. `xfconfd` is not at fault; the AF_UNIX transport is not at
+fault.
+
+**New finding, not explained by any prior theory**: real upstream `xfwm4` source
+(`src/settings.c`, fetched fresh this pass, cross-referenced against `libxfce4ui`'s
+`libxfce4kbd-private/xfce-shortcuts-provider.c`, also fetched fresh) has exactly ONE mechanism that
+re-invokes `loadKeyBindings()` (and hence `xfce_shortcuts_provider_get_shortcuts()`) after startup:
+`cb_keys_changed()` (a `GdkKeymap` "keys-changed" GObject signal handler) arms a 250ms-debounced
+`g_timeout_add_full(KEYMAP_UPDATE_TIMEOUT=250, keymap_reload, ...)`; `keymap_reload()` itself sets
+`keymap_timeout = 0` and does NOT self-rearm -- only a FRESH "keys-changed" signal rearms it. No
+other periodic timer, retry loop, or self-rearming mechanism exists anywhere in `settings.c` or
+`xfce-shortcuts-provider.c` (confirmed by direct source read, not inference). This means something
+is causing GDK to believe the X11 keyboard mapping changes roughly every 10.7 seconds, continuously,
+for the whole session -- confirmed NOT explainable as request pile-up/recursion artifacts, since
+each cycle is a single clean call+reply with no overlap, no growing latency, no serial-number
+anomalies.
+
+**Working theory, evidence-consistent but NOT proven**: `g_dbus_connection_call_sync()` (what
+`xfconf_channel_get_properties()` uses under the hood) does not simply block in `recv()` -- it
+nested-iterates the calling thread's default `GMainContext` while waiting for its own reply, which
+means OTHER GSources on that same context (including GDK's own X11 event-processing source) can
+still dispatch DURING a still-pending synchronous call. If something is spuriously/repeatedly
+signalling a keyboard-mapping change (an X11 `MappingNotify` or an XKB extension event) roughly every
+10.7s, the VERY FIRST `initSettings()`-triggered call to `xfce_shortcuts_provider_get_shortcuts()`
+could still be nested-pending when `cb_keys_changed`/`keymap_reload()` fires from within that nested
+iteration, RECURSIVELY re-entering `loadKeyBindings()` and issuing a fresh, independent, correctly-
+answered `GetAllProperties` call of its own -- while the ORIGINAL, OUTERMOST call (the one
+`initSettings()` is actually blocked on, which is what would let it return and proceed to
+`setNetSupportedHint()`) never gets ITS OWN specific reply recognized/processed, stranding
+`initSettings()` forever even though the connection keeps working perfectly for every NEW call issued
+from inside the recursion. This would be a genuine reentrancy weakness in real
+`xfwm4`/`GLib`/`GDBus` code (triggered by, but not necessarily rooted in, litebox), NOT a
+transport-level litebox bug -- but it is NOT proven; the observed wire traffic (one clean call+reply
+per cycle, no visible overlap) is equally consistent with this theory and with "gtk_main() genuinely
+started successfully and this is unrelated background noise", which would point the REAL bug
+elsewhere (at the X11-property-visibility layer instead) -- considered and judged unlikely this pass
+(Xvfb is a single, unpartitioned real process; X11 protocol semantics guarantee any connected
+client's `XGetWindowProperty` reflects the server's actual live state, so a cross-process
+visibility gap of the kind AGENTS.md documents for the GUEST FILESYSTEM's writable layer has no
+plausible analogue for X server-side window-property state) but not conclusively ruled out.
+
+**Explicit non-result this pass**: attempted to identify the actual X11 event arriving every
+~10.7s by reassembling `xfwm4`'s own X11 protocol stream (`fd=3`, tid 21588) the same way the D-Bus
+stream was reassembled. Two blockers, both real, neither resolved this pass: (1) `xfwm4` shows
+ZERO `sendto`/`sendmsg`/`write`/`writev` syscalls on `fd=3` for its ENTIRE life in this trace, despite
+demonstrably having a live, functioning X11 connection (54438 total `recvmsg` events) -- Xlib almost
+certainly writes via a syscall this pass's log filter did not capture (bare `write()` IS
+instrumented with a 64B preview per `file.rs`, but zero such lines appeared either, so the true
+write path is still unidentified); (2) a first attempt at reply-length-aware X11 stream reassembly
+(distinct from the simpler D-Bus case: X11 replies carry a variable length field at a DIFFERENT byte
+offset than events, and the initial connection-setup reply has its own distinct format) desynced
+almost immediately after the connection-setup reply, producing obvious garbage (an ascending run of
+"event type" bytes 233-255 that is really misread reply-body content, not real events) -- the parser
+in `.wfgy`/scratch this pass is NOT trustworthy and needs a rewrite before reuse, not a patch.
+
+**Pickup, precise, in order**: (1) identify xfwm4's real X11 write-side syscall (grep
+`litebox_shim_linux` for every `sys_write*`/`sys_send*`/`sys_pwrite*` implementation and confirm
+which one(s) a real libX11/xcb client actually calls -- likely `writev`, or `write` with a `len` this
+pass's grep pattern missed due to log-line wrapping) and get a byte-accurate X11 SEND-side trace, not
+just RECV; (2) write a CORRECT length-aware X11 protocol-stream reassembler (Reply: byte0=1, extra
+length in 4-byte units at bytes 4-7 beyond the fixed 32; Error/Event: fixed 32 bytes except
+GenericEvent byte0=35 which has its own extra-length field; the initial ConnSetup reply is a
+DIFFERENT, one-off format -- get this right before trusting any event-type histogram) to find (or
+rule out) a real `MappingNotify` (event code 34) or XKB extension event recurring every ~10.7s; (3)
+if no such X11 event is found, pivot to the reentrancy theory directly: a `cdb -pv` attach
+specifically TIMED to interrupt mid-call (not a generic snapshot) combined with counting
+`g_main_context_iteration` nesting depth (via a guest-side `LD_PRELOAD` interposer on
+`g_dbus_connection_call_sync`/`g_main_context_iteration`, matching this project's own already-proven
+`getenv_probe.so` LD_PRELOAD technique from the 30th pass) would directly confirm or refute
+recursion without needing perfect X11 decode at all -- likely the higher-leverage next step given
+this pass's own X11-reassembly difficulty. (4) Only once the periodic-retrigger mechanism is
+identified does it become possible to say with confidence whether the actual fix belongs in litebox
+(an X11/XKB emulation gap generating spurious events) or is an app-level `GLIBC_TUNABLES`-style
+workaround (suppressing the specific reentrancy) -- do not guess at a fix before that.
+
+Logs for this pass (all gitignored): `.wfgy/pass69_full_run1.combined.log` (full boot to `DE_FAILED`
+plus 400s+ of extended `HOLD`-loop idle observation, `process,net=debug`),
+`.wfgy/pass69_cdb_snapshot2.log` (symbolized `cdb -pv` thread dump, all 11 host threads),
+`.wfgy/pass69_stream_decoded.log` (reassembled D-Bus SEND/RECV streams for `xfwm4`'s xfconf
+connection, 860 lines, full method-call/signal/reply sequence). Code change: `litebox_shim_linux/src/
+syscalls/net.rs`'s `do_recvmsg` payload-preview addition (committed, real, verified, no regressions
+-- a clean `cargo build --release -p litebox_runner_linux_on_windows_userland` and 3 full boot
+cycles this pass all completed normally with the new diagnostic enabled).

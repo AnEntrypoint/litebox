@@ -7,9 +7,10 @@ detail is drained to the `docs/AGENTS_ARCHIVE_*.md` files and per-investigation 
 `docs/*.md` in the map below — read those for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. **Compacted past ~30KB** — newest: 2026-09-23,
-67th pass (pass-history section below; 26th-67th full narrative, including each pass's own complete
-evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`).
+line plus its pointer, not a separate memory file. Last compacted under 30KB at the 65th pass;
+back over it again as of the 69th (pass-history section below; 26th-69th full narrative, including
+each pass's own complete evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-22.md`) — due
+another compaction pass soon, not done this pass to keep focus on the live investigation.
 
 ## The cheap repro — start here
 
@@ -217,6 +218,33 @@ map" below). The CURRENT STATE those passes converged on:
   which any fork copies wholesale regardless of writable-layer semantics — 100% reliable runs 2-4.
   0 crashes/OOM/regression-guard-fires across all 5 boots this pass (4 full-stack + 1 `de_only.sh`
   debug trace).
+- **69th (2026-09-23) — first-ever byte-level decode of `xfwm4`'s real D-Bus wire traffic; every
+  transport/`xfconfd`-side theory REFUTED; a genuinely new, still-unexplained periodic trigger
+  found.** Added a standing `sys_recvmsg` payload-preview diagnostic (`litebox_shim_linux/src/
+  syscalls/net.rs::do_recvmsg`, mirrors `sys_sendmsg`'s existing 4096B hex dump — recvmsg had none
+  before, so a trace saw a caller's own requests but never the peer's replies). Live `cdb -pv`
+  attach on `xfwm4`'s own host process (guest pid == host PID, both its GTK thread and its GDBus
+  worker thread) shows a clean, non-pathological `PollSet::wait` — same inconclusive-alone result
+  every prior single-snapshot attempt found. The real advance: reassembling the byte stream (not
+  single-line previews) proves `initSettings()`'s ENTIRE D-Bus call chain succeeds end-to-end —
+  `GetAllProperties("xfwm4")`, then `loadKeyBindings()`'s clone-defaults migration (~100 real
+  `GetProperty`/`SetProperty`/`PropertyChanged` round trips, all correct, all fast) — and even the
+  LAST step, `xfce_shortcuts_provider_get_shortcuts()`'s `GetAllProperties(.../"/xfwm4/custom")`,
+  gets a real, correct, ~30ms reply. But that exact same call is then RE-ISSUED, identically,
+  every ~10.7s, 17+ times over 180s+, `_NET_SUPPORTING_WM_CHECK` still empty throughout. Real
+  upstream `xfwm4` source (`settings.c`, fetched fresh) has exactly ONE mechanism that could cause
+  this: `cb_keys_changed`→`keymap_reload()`, driven by GDK's own "keys-changed" signal — meaning
+  something signals a keyboard-mapping change roughly every 10.7s, forever, and (working theory,
+  NOT proven) `g_dbus_connection_call_sync`'s own nested-main-loop iteration may let this
+  recursively re-enter `loadKeyBindings()` from inside the STILL-PENDING original `initSettings()`
+  call, stranding it forever even though every individual D-Bus round trip keeps succeeding. A
+  first attempt at reassembling `xfwm4`'s X11 stream to find the actual triggering event did NOT
+  converge (fd=3's write-side syscall is still unidentified — zero `sendto`/`sendmsg`/`write`
+  events captured despite a demonstrably live connection; the reply-length-aware X11 parser
+  desynced after the connection-setup reply and needs a rewrite, not a patch). Full evidence,
+  exact call sequence, and precise next-step pickup (X11 write-side syscall ID, a correct X11
+  reassembler, or an `LD_PRELOAD` interposer on `g_dbus_connection_call_sync`/
+  `g_main_context_iteration` to test the reentrancy theory directly): archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -240,12 +268,19 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
    boot's `xfwm4` launch is RELIABLE, not the 67th-pass Thread-2 "never execve's" anomaly (that
    anomaly is real but reproduces only on the separate `de_only.sh` harness, 68th pass — still
    unexplained, possibly a stale-seed-tar artifact per the standing `webtop_seed.tar`-freezing
-   gotcha). Leading NOT-yet-live-tested candidate for the real blocker: `initSettings()`'s
-   `xfconf_init`/`xfconf_channel_new`/`loadSettings` (synchronous D-Bus-backed libxfconf,
-   `settings.c:1062-1123`) — compositor/GLX path already REFUTED (66th). Pickup: live `cdb -pv`
-   on `xfwm4` breaking on libdbus/GDBus call entry inside `initSettings()` (cited since the 62nd
-   pass, never attempted), or a live-traced `de_only.sh`-vs-`webtop_stack.sh` environment diff to
-   explain the Thread-2 anomaly's harness-specificity. `ps`/`/proc` is blind to every
+   gotcha). **69th pass, byte-level D-Bus decode: `initSettings()`'s whole D-Bus chain (including
+   `loadKeyBindings()`'s ~100-property clone-defaults migration AND the final
+   `xfce_shortcuts_provider_get_shortcuts()` call) is CONFIRMED succeeding — `xfconfd`/the AF_UNIX
+   transport are REFUTED as the blocker for good.** The real, still-open mystery: that final
+   `GetAllProperties(.../"/xfwm4/custom")` call gets re-issued, cleanly, every ~10.7s forever
+   (matches real `xfwm4` source's ONLY periodic-reload path, `cb_keys_changed`→`keymap_reload()`,
+   itself driven by a GDK "keys-changed" signal whose own real trigger is unidentified) without
+   `initSettings()` ever returning. Pickup: identify `xfwm4`'s X11 write-side syscall (zero
+   `sendto`/`sendmsg`/`write` ever captured on its X fd despite a live connection) and build a
+   correct, reply-length-aware X11 stream reassembler to find the ~10.7s event (a first attempt
+   desynced after the connection-setup reply); or test the `g_dbus_connection_call_sync`
+   nested-main-loop reentrancy theory directly via an `LD_PRELOAD` interposer (same technique as
+   the 30th pass's `getenv_probe.so`). `ps`/`/proc` is blind to every
    cross-process-forked sibling (65th) — re-weigh any past `ps`-based conclusion. PER-PROCESS RAM
    is the hard ceiling on any attempt (5-8GB free at boot start → 0.15-1.2GB during the
    WM2/selkies-concurrent window on EVERY 68th-pass full-stack run) — kill fast right after the
