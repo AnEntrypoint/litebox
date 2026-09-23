@@ -1912,6 +1912,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // about exactly one desktop. `SystemInfoProvider::env_value` now exists and this reads it;
         // see `diag::init_syscall_timeline` for why the bound is unchanged by that.
         crate::diag::init_syscall_timeline(|| self.global.platform.env_value("LITEBOX_DIAG_SYSCALL_TIMELINE"));
+        // 74th pass: same lazy-latch shape, for the `litebox_diag::socket_read` payload-preview
+        // diagnostic's own optional comm filter -- see `diag::init_socket_read_filter`'s doc
+        // comment for what problem this solves (blanket-on-every-process cost once that
+        // tracing target is enabled) and why unset is a no-op, not a behavior change.
+        crate::diag::init_socket_read_filter(|| {
+            self.global.platform.env_value("LITEBOX_DIAG_SOCKET_READ_TARGET")
+        });
         let comm_bytes = self.comm.get();
         let is_target = crate::diag::syscall_timeline_enabled()
             && crate::diag::is_syscall_timeline_target_comm(&comm_bytes);

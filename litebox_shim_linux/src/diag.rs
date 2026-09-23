@@ -265,6 +265,70 @@ pub fn is_syscall_timeline_target_comm(comm: &[u8]) -> bool {
         .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
 }
 
+/// Optional narrowing filter for the `litebox_diag::socket_read` payload-preview diagnostic
+/// (`syscalls/file.rs`'s two `read()`/AF_UNIX `recvfrom` DIAG sites, 73rd pass). That
+/// diagnostic already lives on its own dedicated tracing target (cheap when the target is not
+/// enabled at all), but once a caller DOES enable it via `LITEBOX_LOG` -- which is what a real
+/// X11/D-Bus wire-capture investigation needs for the whole boot -- it fires for every process
+/// that reads a socket fd, not just the one process under investigation. During the
+/// desktop-boot fork storm (15-22 concurrent processes, several of them touching X11/D-Bus
+/// sockets) that is real, avoidable cost: each firing hex-formats up to 4096 bytes (a
+/// multi-KB allocation) and pushes it through the tracing dispatcher, repeated per read, per
+/// process.
+///
+/// 74th pass: same fix shape as [`init_syscall_timeline`]/[`is_syscall_timeline_target_comm`]
+/// above (same module, same lazy-latch, same explicit-enumeration-never-wildcard safety
+/// property) -- checked BEFORE the hex-formatting work happens, not after, so a caller who
+/// only cares about e.g. `xfwm4`'s own reads pays nothing for every other process's socket
+/// traffic. Unset (the default) leaves the diagnostic exactly as it was: gated solely by
+/// whether `LITEBOX_LOG` enables the `litebox_diag::socket_read` target, for every fd on every
+/// process -- this is purely an opt-in narrowing, never a behavior change for an existing
+/// capture that does not set the new variable.
+static SOCKET_READ_FILTER_ENABLED: AtomicBool = AtomicBool::new(false);
+static SOCKET_READ_FILTER_INIT: AtomicBool = AtomicBool::new(false);
+static SOCKET_READ_FILTER_COMMS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// Call once, early, with a closure performing the platform's `env_value` lookup for
+/// `LITEBOX_DIAG_SOCKET_READ_TARGET`.
+///
+/// - unset or empty -> no filter: every process's socket reads are eligible (matches the
+///   diagnostic's pre-74th-pass behavior exactly).
+/// - anything set -> a comma-separated list of `comm` names (e.g. `xfwm4` or
+///   `xfwm4,dbus-daemon`); only a matching process's socket reads emit the payload preview.
+pub fn init_socket_read_filter(value: impl FnOnce() -> Option<String>) {
+    if SOCKET_READ_FILTER_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let comms: Vec<String> = match value() {
+        None => Vec::new(),
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    };
+    SOCKET_READ_FILTER_ENABLED.store(!comms.is_empty(), Ordering::Release);
+    *SOCKET_READ_FILTER_COMMS.lock() = comms;
+    SOCKET_READ_FILTER_INIT.store(true, Ordering::Release);
+}
+
+/// Whether `comm` should have its socket-read payload preview emitted. `true` whenever no
+/// filter was ever configured (the default, backward-compatible "log everyone" behavior);
+/// once a filter IS configured, only a listed `comm` (same prefix-match rule as
+/// [`is_syscall_timeline_target_comm`], same reason) passes.
+pub fn is_socket_read_target_comm(comm: &[u8]) -> bool {
+    if !SOCKET_READ_FILTER_ENABLED.load(Ordering::Acquire) {
+        return true;
+    }
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    SOCKET_READ_FILTER_COMMS
+        .lock()
+        .iter()
+        .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
+}
+
 /// Public wrapper around [`syscall_name`] for `lib.rs`'s per-syscall timeline trace (the
 /// original is private since it was only ever used inside this module's own summary printer
 /// before now).

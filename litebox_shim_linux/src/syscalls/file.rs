@@ -1773,7 +1773,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `litebox_diag::socket_read=debug` and get complete, low-overhead coverage of
                     // every read()/readv() delivered chunk on that fd without paying for every
                     // other process's file I/O too.
-                    if let Ok(n) = result {
+                    //
+                    // 74th pass: `is_socket_read_target_comm` is an additional, OPTIONAL gate
+                    // (via `LITEBOX_DIAG_SOCKET_READ_TARGET`) checked before the hex-format
+                    // below runs at all -- unset, it is a single relaxed atomic load that
+                    // always returns true (no behavior change); set (e.g. to `xfwm4` for this
+                    // investigation), every other process's socket reads skip the format!/
+                    // event! work entirely instead of relying on the tracing target's own
+                    // enabled-check, which still costs a per-event interest lookup across
+                    // every process once the target itself is on.
+                    if let Ok(n) = result
+                        && crate::diag::is_socket_read_target_comm(&self.comm.get())
+                    {
                         litebox_util_log::__private::tracing::event!(
                             target: "litebox_diag::socket_read",
                             litebox_util_log::__private::tracing::Level::DEBUG,
@@ -1833,7 +1844,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `litebox_diag::socket_read` events were ever emitted for a live X11 stream
                     // as a direct result -- this is the missing half of that same diagnostic,
                     // same target, same shape, covering the code path X11 actually uses.
-                    if let Ok(n) = &result {
+                    //
+                    // 74th pass: same optional comm-scoped gate as the plain-socket branch
+                    // above -- see that branch's own comment.
+                    if let Ok(n) = &result
+                        && crate::diag::is_socket_read_target_comm(&self.comm.get())
+                    {
                         litebox_util_log::__private::tracing::event!(
                             target: "litebox_diag::socket_read",
                             litebox_util_log::__private::tracing::Level::DEBUG,

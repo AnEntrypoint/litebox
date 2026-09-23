@@ -1954,9 +1954,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
-        // Always-on process-timeline diagnostic (advisor-db spec item 3).
-        litebox_util_log::debug!(
-            pid:% = self.pid.get(), comm:? = self.comm.get(), status:% = status;
+        // Process-timeline diagnostic (advisor-db spec item 3), on its OWN dedicated
+        // `litebox_diag::process_timeline` tracing target rather than nested under this
+        // module's `debug!`/implicit-module-target sites -- see the 74th-pass note by
+        // `sys_execve`'s own DIAG_TIMELINE emit below for why (that one call site is the
+        // canonical explanation; all five DIAG_TIMELINE sites share the fix).
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::process_timeline",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            pid = %self.pid.get(),
+            comm = ?self.comm.get(),
+            status = %status,
             "DIAG_TIMELINE exit"
         );
         self.print_diag_reports_if_bootstrap_process();
@@ -1967,9 +1975,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
-        // Always-on process-timeline diagnostic (advisor-db spec item 3).
-        litebox_util_log::debug!(
-            pid:% = self.pid.get(), comm:? = self.comm.get(), status:% = status;
+        // Process-timeline diagnostic -- see `sys_exit`'s own comment just above.
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::process_timeline",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            pid = %self.pid.get(),
+            comm = ?self.comm.get(),
+            status = %status,
             "DIAG_TIMELINE exit_group"
         );
         self.print_diag_reports_if_bootstrap_process();
@@ -4740,18 +4752,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         //      the old name => it died inside `load_program`, never becoming the new program (a
         //      loader/relocation bug, a different class entirely from a post-exec runtime bug).
         //
-        // Always-on process-timeline diagnostic, the fork-side counterpart to `DIAG_TIMELINE
+        // Process-timeline diagnostic, the fork-side counterpart to `DIAG_TIMELINE
         // execve`/`exit`/`exit_signal`. Without it, a child that dies in the window BETWEEN
         // `clone()` and `execve()` -- exactly the window `Vmem::duplicate`'s region-relocation
         // grouping governs -- is invisible except as a pid missing from the execve list, which
         // has to be inferred by hand. Emitting the clone side makes "every forked child reached
-        // execve" a direct count comparison instead of an inference. `error` level for the same
-        // reason as its siblings: always visible regardless of the configured log filter.
+        // execve" a direct count comparison instead of an inference.
+        //
+        // 74th-pass fix: this and all four sibling DIAG_TIMELINE sites used to be plain
+        // `litebox_util_log::debug!` calls, which put them on this module's own implicit
+        // target (`litebox_shim_linux::syscalls::process`) alongside ~70 unrelated debug!/
+        // trace! call sites in the same file. A caller who only wanted the five cheap
+        // DIAG_TIMELINE lines (e.g. to find one process's guest pid from its own `execve`
+        // line, the established 73rd-pass technique) had no way to enable just those --
+        // `LITEBOX_LOG=litebox_shim_linux::syscalls::process=debug` floods every syscall in
+        // every one of the 15-22 concurrently-forked desktop-boot processes, which is the
+        // exact self-inflicted overhead the 73rd/74th passes root-caused as the thing
+        // starving host RAM during the fork storm, not external contention. These five sites
+        // now emit on their own dedicated `litebox_diag::process_timeline` target (mirroring
+        // the same fix already applied to `litebox_diag::socket_read` in `file.rs`), so
+        // `LITEBOX_LOG=litebox_diag::process_timeline=debug,litebox_diag::socket_read=debug`
+        // gets exactly the two diagnostics this investigation needs, system-wide, for the
+        // WHOLE boot, without ever paying for the other ~70 call sites per module. (This was
+        // itself once `error!`/always-on by design -- see commit `3042980` -- but that was
+        // correctly reverted: `error!`+the default `warn` filter made these visible
+        // unconditionally, and combined with ~50 OTHER call sites raised the same way, a
+        // single desktop boot could emit thousands of unwanted lines, the exact log-volume
+        // hazard `MAX_CLAIMS`'s own doc comment records breaking a live session's timing. A
+        // dedicated LOW-CARDINALITY target that must still be explicitly opted into is the
+        // fix that gets both properties: cheap to target, and never on by accident.)
         if is_process_clone {
-            litebox_util_log::debug!(
-                pid:% = self.pid.get(),
-                comm:? = self.comm.get(),
-                child_tid:% = child_tid;
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::process_timeline",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                pid = %self.pid.get(),
+                comm = ?self.comm.get(),
+                child_tid = %child_tid,
                 "DIAG_TIMELINE clone"
             );
         }
@@ -6309,13 +6345,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "sys_execve: entry"
         );
 
-        // Always-on process-timeline diagnostic (advisor-db spec item 3): one line per guest
-        // `execve`, at `error` level so it is always visible regardless of the configured log
-        // filter. Deliberately logged here (path resolved, before the point-of-no-return teardown
-        // below) rather than after `load_program` succeeds, so a process that dies mid-exec still
-        // leaves a timeline entry showing what it was trying to become.
-        litebox_util_log::debug!(
-            pid:% = self.pid.get(), ppid:% = self.ppid.get(), comm:? = self.comm.get(), argv0:% = path;
+        // Process-timeline diagnostic (advisor-db spec item 3): one line per guest `execve`.
+        // Deliberately logged here (path resolved, before the point-of-no-return teardown
+        // below) rather than after `load_program` succeeds, so a process that dies mid-exec
+        // still leaves a timeline entry showing what it was trying to become.
+        //
+        // 74th pass: moved off plain `debug!` (this module's own implicit target,
+        // `litebox_shim_linux::syscalls::process`, shared with ~70 unrelated debug!/trace!
+        // sites in this file) onto its own dedicated `litebox_diag::process_timeline`
+        // target -- see `sys_exit`'s sibling comment near the top of this file (clone site)
+        // for the full 73rd/74th-pass rationale and the commit-`3042980` history of why this
+        // was demoted from `error!` in the first place and must not simply go back to it.
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::process_timeline",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            pid = %self.pid.get(),
+            ppid = %self.ppid.get(),
+            comm = ?self.comm.get(),
+            argv0 = %path,
             "DIAG_TIMELINE execve"
         );
         crate::diag::record_process(
