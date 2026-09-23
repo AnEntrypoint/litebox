@@ -12,9 +12,11 @@ line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 
 `docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-90th full narrative, including each pass's own complete
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 91st pass (drained
 the 88th-90th passes' own full bug-by-bug writeups to the archive, same pattern as the 88th pass's
-own prior compaction of 83rd-87th). Still over the 30KB target after this pass (~46KB) — this
-file's own "Docs and tooling map"/"Closed" sections and older CLOSED pass-history entries are the
-next drain candidates for a future pass, once no actively-being-extended entry would be disturbed.
+own prior compaction of 83rd-87th). Still over the 30KB target after the 92nd pass's own addition
+(~46KB) — this file's own "Docs and tooling map"/"Closed" sections and older CLOSED pass-history
+entries are the next drain candidates for a future pass, once no actively-being-extended entry
+would be disturbed (the 92nd pass's own item-1 entry is exactly such an actively-extended entry —
+do not drain it until its own `cdb` pickup is resolved one way or the other).
 
 ## The cheap repro — start here
 
@@ -317,6 +319,16 @@ map" below). Condensed current-state trail:
   vfork window and confirm/deny whether this pass's `GS_BASE` fix resolves the original crash;
   the `GLIBC_TUNABLES`-propagation question (89th/90th) remains untested too. Host RAM 4.7-5.8GB
   free throughout, no concurrent boots, all three runs cleanly self-terminated (no WMI kill needed).
+- **92nd — the `bash pid=80` crash did not reproduce (0/5 boots), so the 91st pass's `GS_BASE` fix
+  could finally be tested against the real `xfce4-session` crash — and was DISPROVED live: a new
+  `LITEBOX_DIAG_GS_BASE_REPAIR=1` diagnostic fired zero times across 3 full boots while the
+  identical `STATUS_ACCESS_VIOLATION` crash still occurred every time. Found the exact, fully
+  deterministic faulting guest RIP via Windows' own Application Error event log
+  (`rip=0x00007fefe92bc7cb code=0xC0000005`, byte-identical across all 3 independent boots) — real,
+  reproducible, invisible to litebox's own VEH logging. Ruled out lazy-fork-commit/guard-cow as a
+  simple on/off cause (live test: removing guard-cow makes things categorically worse, not better).
+  Full evidence, exact commands and the precise next-pickup cdb target: this file's own item-1 entry
+  under "Open, in rough priority order", below.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
@@ -354,14 +366,59 @@ both Xvfb SIGSEGVs.
    attempts this pass (1 pre-fix baseline, 2 post-fix) all died from a DIFFERENT, earlier,
    already-known `bash` crash (`pid=80`, general ADVISORY-001 §3N thread-fork tcache corruption,
    identical in the pre-fix baseline too — not a regression) before `xfce4-session` was ever
-   reached. **Next pickup**: get a boot past this earlier flakiness (retry; each real boot costs
-   ~2-3 minutes and this project's own documented per-boot failure rate is ~33-66%) to reach
-   `xfce4-session`'s own vfork window and confirm/deny the fix; `GLIBC_TUNABLES` propagation to
-   `xfce4-session`'s own environment (89th/90th) remains untested too.
-   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (zero cost when off) remains the permanent tool for measuring
-   any future fix's real payoff. `DE_UP` has not been reached by any pass through the 91st;
-   chrome-devtools MCP was `CONNECT_TIMEOUT` when checked this pass (moot, no boot got close enough
-   to a real desktop). Lower-priority, still open: (a) decompose remaining per-fork cost between
+   reached.
+
+   **92nd pass — the `bash pid=80` early crash did NOT reproduce (0/5 boots), letting the GS_BASE
+   fix finally be tested against the real target, and DISPROVED it with live evidence.** Added a
+   cheap, permanent, zero-cost-when-off diagnostic (`LITEBOX_DIAG_GS_BASE_REPAIR=1`,
+   `VehGates::gs_base_repair`, resolved once via the existing pre-resolved-gate pattern, not a
+   fresh `std::env::var_os` inside the VEH itself) that logs every time `restore_thread_gs_base_
+   if_cleared` actually observes-and-repairs a cleared `GS_BASE`, at all three call sites. **Result,
+   3 independent full boots with it on: ZERO repairs fired in any run, yet `xfce4-session` crashed
+   with the IDENTICAL `STATUS_ACCESS_VIOLATION` signature every time** (`elapsed_ms_since_thread_
+   start` 17160/16542/16402) — `GS_BASE` is never observed cleared at `vectored_exception_handler`'s
+   entry, `syscall_handler`'s entry, or `block_or_maybe_timeout`'s wait loop during this crash's
+   whole lifetime, so the 91st pass's fix, while real and harmless, does not explain or resolve
+   this specific crash. **New decisive evidence via Windows' own Application Error event log**
+   (`Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='Application Error'}`,
+   filtered to `Faulting module name: unknown` = a guest-address fault) pins down the exact faulting
+   guest RIP across THREE independent boots: **`rip=0x00007fefe92bc7cb code=0xC0000005`, byte-for-
+   byte IDENTICAL every time**, cross-checked against each run's own `task-resume-probe (child,
+   winpid=…)` line to confirm each one really is that run's own `xfce4-session` (winpids
+   0x4710/0x63B0/0x5778). A deterministic, identical crash RIP across independent boots (different
+   fork trees, different timing) rules out random heap corruption as the direct mechanism and points
+   at a specific, reproducible code path — yet litebox's own runner log has ZERO `[veh]`/
+   `[diag-unrecov-av]` output for this fault in all three runs, even with `LITEBOX_DIAG_FATALDUMP=1`
+   on throughout (confirmed still firing correctly for every OTHER real fault in the same logs) —
+   the fault reaches the OS's real unhandled-exception path (WER) while staying totally invisible to
+   litebox's own instrumentation. **Ruled out lazy-fork-commit/guard-cow as a simple on/off cause,
+   tested live**: `LITEBOX_LAZY_FORK_COMMIT=1` alone (guard-cow unset) does not fix this — it causes
+   markedly WORSE, widespread early corruption instead (114+ processes exiting via signal almost
+   immediately, zero `DIAG_TIMELINE execve` entries logged at all) and `xfce4-session` itself dies as
+   an immediate, loud, correctly-delivered GUEST `Segmentation fault` (bash's own job-control
+   message) rather than the silent host AV — matching the already-documented Bug 4 TOCTOU risk for
+   fork-without-`execve` on real long-lived daemons, and confirming guard-cow is necessary (removing
+   it makes things broadly worse), not itself simply "introducing" this narrower residual crash from
+   nothing. Both flags fully OFF cannot be tested within the RAM budget (craters to <1GB free by
+   `WM_POLL n=4`, well before `xfce4-session` could reach its own 16-17s crash window — confirmed
+   live, aborted via WMI `Terminate` on a falling-RAM trend per this file's own safety rule). **Net
+   effect**: falsifies the 91st pass's leading theory with real evidence (not just "unverified"),
+   and produces a new, deterministic, reproducible data point the *next* pass should use as its cdb
+   breakpoint target directly. **Next pickup, precise**: a live `cdb -pv` attach (debug binary; set
+   both `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` and `LITEBOX_DIAG_NO_FAULT_WATCHDOG=1` first) on
+   a fresh cross-process `xfce4-session` child, breaking on `exception_callback`'s own entry (NOT
+   `vectored_exception_handler` generally — the 84th pass found that function's compiled layout is
+   sensitive enough to extra instrumentation to regress unrelated repros) and single-stepping toward
+   guest `rip=0x7fefe92bc7cb` to identify what code is actually there (which shared library/glibc/
+   gtk/dbus function — Windows' own event log cannot symbolize a guest address) and what it was
+   doing when it faulted; none of the existing `[lazy_fork_commit]` diagnostic lines carry a pid/tid
+   today, so this pass could not cheaply correlate a specific fault-servicing event to this crash
+   beyond the on/off test above — adding that tag would help narrow whether this exact page was ever
+   lazily serviced. `GLIBC_TUNABLES` propagation to `xfce4-session`'s own environment (89th/90th)
+   remains untested too. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (zero cost when off) remains the
+   permanent tool for measuring any future fix's real payoff. `DE_UP` has not been reached by any
+   pass through the 92nd; chrome-devtools MCP was `CONNECT_TIMEOUT` when checked this pass (moot, no
+   boot got close enough to a real desktop). Lower-priority, still open: (a) decompose remaining per-fork cost between
    rootfs materialization staying resident post its cheap (~83-140ms) build vs. Windows loader
    overhead; (b) use `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py`
    (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`) + `LITEBOX_DIAG_SOCKET_READ_TARGET=xfwm4` to check

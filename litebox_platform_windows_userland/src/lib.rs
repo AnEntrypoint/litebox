@@ -218,6 +218,28 @@ impl WindowsUserland {
         let saved = THREAD_GS_BASE.get();
         if saved != 0 && unsafe { litebox_common_linux::rdgsbase() } == 0 {
             unsafe { litebox_common_linux::wrgsbase(saved) };
+            // `LITEBOX_DIAG_GS_BASE_REPAIR=1` (92nd pass): logs every time this function
+            // actually observes and repairs a cleared `GS_BASE`, across all three call sites
+            // (`vectored_exception_handler`, `syscall_handler`'s entry,
+            // `RawMutex::block_or_maybe_timeout`'s wait loop -- see this fn's own doc comment
+            // and the 91st pass's fix there). Existence of THIS specific line firing (or not)
+            // anywhere near a real xfce4-session-class crash is the decisive test the 91st pass
+            // left open: did the fix actually engage for that crash, or is the real corruption
+            // event happening somewhere this function is never called at all. Reads `veh_gates()`
+            // (resolved once, before any guest thread exists -- see its own doc comment) rather
+            // than a fresh/lazy env lookup: this function runs from inside
+            // `vectored_exception_handler` itself at one call site, where a first-ever
+            // `std::env::var_os` lookup is exactly the `RtlQueryEnvironmentVariable`-reentrancy
+            // hazard that doc comment documents a real prior hang from. GS_BASE is already
+            // repaired (the `wrgsbase` above already ran) before this check, so even if it were
+            // unsafe it would at least run with a valid `GS_BASE` -- but reusing the pre-resolved
+            // gate avoids the whole question.
+            if veh_gates().gs_base_repair {
+                eprintln!(
+                    "[diag-gs-base-repair] tid={:?} repaired cleared GS_BASE back to {saved:#x}",
+                    std::thread::current().id()
+                );
+            }
         }
     }
 }
@@ -281,6 +303,8 @@ pub(crate) struct VehGates {
     pub(crate) watchaddr: Option<usize>,
     /// `LITEBOX_FORKVERIFY_OFF`
     pub(crate) forkverify_off: bool,
+    /// `LITEBOX_DIAG_GS_BASE_REPAIR`
+    pub(crate) gs_base_repair: bool,
 }
 
 impl VehGates {
@@ -303,6 +327,7 @@ impl VehGates {
                 .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .filter(|&a| a != 0),
             forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
+            gs_base_repair: std::env::var_os("LITEBOX_DIAG_GS_BASE_REPAIR").is_some(),
         }
     }
 }
