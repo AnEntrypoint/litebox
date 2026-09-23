@@ -607,3 +607,152 @@ No code changed this pass. No live boot attempted (nothing to verify — this wa
 investigation, not an implementation pass). Host RAM checked at session start: 6.18GB free
 (`FreePhysicalMemory=6330168`/`TotalVisibleMemorySize=15987768` KB), zero litebox processes
 running — clean baseline, unused this pass since no boot was attempted.
+
+## 83rd pass (2026-09-23) — implemented the lazy reserve-then-commit-on-fault primitive; real win for fork-then-execve, a genuine unresolved bug for fork-without-execve
+
+Full detail behind AGENTS.md's own condensed 83rd-pass bullet.
+
+### Design implemented
+
+New module `litebox_platform_windows_userland/src/lazy_fork_commit.rs`, wired into the real
+production cross-process fork path (`litebox_platform_windows_userland::process_fork::
+spawn_process_fork_child`, parent side; `litebox_runner_linux_on_windows_userland::
+diag_process_fork_globalstate_probe_inner`, child side -- despite its "diag" name this is the
+actual production entry point, per the existing three `LITEBOX_DIAG_PROCESS_FORK_*` gates the
+parent already sets unconditionally for every real cross-process fork).
+
+Parent side: `classify_lazy_eligible_groups(group_relocations, vma_layout)` returns, per group, a
+bool -- `true` only when `LITEBOX_LAZY_FORK_COMMIT=1` is set AND no `vma_layout` range overlapping
+that group carries `VM_EXEC` (CODE groups stay on the existing eager `copy_one_group` path
+unconditionally, sidestepping PASS-144's exec-fixup entirely). Eligible groups get
+`reserve_group_lazy(child_handle, source_group)` instead of `copy_one_group`: the same
+`MEM_ADDRESS_REQUIREMENTS`-forced `VirtualAlloc2` call `copy_one_group` uses for its own step 1,
+but with `MEM_RESERVE` only (no `MEM_COMMIT`, no `WriteProcessMemory` loop at all). The group's own
+span is serialized (`start-end` hex pairs, comma-separated) into a new internal env var
+(`FORK_CHILD_LAZY_RANGES_ENV_VAR`, plus the parent's own PID via
+`FORK_CHILD_PARENT_PID_ENV_VAR`), the same environment-block bootstrap channel
+`FORK_CHILD_VMA_LAYOUT_ENV_VAR`/`FORK_CHILD_GPRS_ENV_VAR` already use.
+
+Child side: `lazy_fork_commit::install_if_configured()` parses those two env vars; if non-empty, it
+`OpenProcess(PROCESS_VM_READ)`s the parent and `AddVectoredExceptionHandler(1, Some(lazy_commit_
+veh))`s a new handler. `lazy_commit_veh` checks `ExceptionCode == EXCEPTION_ACCESS_VIOLATION` and
+the faulting address against the registered ranges; a miss returns `EXCEPTION_CONTINUE_SEARCH`
+immediately (falling through unchanged). A hit: `VirtualAlloc(page_addr, PAGE_SIZE, MEM_COMMIT,
+PAGE_READWRITE)` on the CURRENT (child) process, `ReadProcessMemory(parent_handle, page_addr, ...)`
+pulls the real bytes from the SAME address in the parent (identity-mapped, cross-process fork's own
+existing guarantee), copies them in, returns `EXCEPTION_CONTINUE_EXECUTION` -- the CPU retries the
+original faulting instruction, which now succeeds. Deliberately lock-free: no "already populated"
+tracking, since a redundant commit+copy on a concurrent same-page fault from another guest thread is
+harmless and idempotent.
+
+### Platform-feasibility proof, isolated from litebox entirely (done FIRST, before touching production code)
+
+A standalone ~350-line Rust program (`poc.rs`, compiled directly with `rustc -O`, raw kernel32 FFI
+declarations, no windows-sys/litebox dependency, session scratchpad only, never committed)
+validated the exact mechanism end-to-end: a "parent" process writes two known 4KB patterns into an
+8MB `VirtualAlloc(MEM_COMMIT)` region, spawns itself as a "child" with the region's address+len on
+its command line, the child `VirtualAlloc2`s that SAME address `MEM_RESERVE`-only, installs the
+same lazy-commit VEH shape, then touches page A (read) and page B (write). Result, 5/5 clean runs:
+reserve-only took 8.2-8.9us vs 2.23-2.37ms for an eager commit+copy of the same region; page A read
+back the parent's real `0xab` pattern; page B read back its real pre-write `0xcd` pattern THEN the
+child's own write (`0xef`) landed correctly; the parent's own copy of page B stayed `0xcd`; and,
+decisively, `VirtualQueryEx` from the parent against the CHILD's still-live process (queried via a
+`Sleep(2000)` in the child before exit, to avoid `ERROR_ACCESS_DENIED` on a torn-down process)
+confirmed the untouched padding region 4MB into the reservation stayed genuinely `MEM_STATE_
+RESERVE`, never `MEM_COMMIT` -- the actual resource-savings claim, not just a wall-clock one.
+`VirtualAlloc2` is exported by `kernelbase.dll` but this toolchain's `kernel32.lib` import stub has
+no forwarder for it (`LNK2019` at link time) -- resolved via `LoadLibraryA`+`GetProcAddress` instead
+of a static import.
+
+### Ordering bug found and fixed live
+
+First integration attempt called `install_if_configured()` at the very top of
+`diag_process_fork_globalstate_probe_inner`, before `Platform::new()`. Result: the subshell repro
+(below) killed outright with ZERO `[lazy_fork_commit]` VEH-entry diagnostic output (a per-entry
+counter was added, gated `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`, capped at 40 entries -- printed
+nothing). Root cause: `Platform::new()` (`WindowsUserland::new()`, `lib.rs:2966`) is what registers
+this process's own main `vectored_exception_handler_entry` via `AddVectoredExceptionHandler(1,
+..)` -- and that call's own doc comment (`lib.rs:3053-3068`) says "Nothing else loaded into the
+process has any business seeing a guest fault first". `AddVectoredExceptionHandler(1, ..)` always
+PREPENDS (last-registered runs first) -- calling `install_if_configured()` before `Platform::new()`
+meant the main handler, registered afterward, became the new head, claimed every lazy-range fault
+FIRST, recognized none of this mechanism's patterns, and delivered a genuine guest `SIGSEGV` (bash:
+"Killed"). Fixed by moving the call to immediately after `Platform::new()` returns
+(`litebox_runner_linux_on_windows_userland/src/lib.rs`,
+`diag_process_fork_globalstate_probe_inner`) -- confirmed via the VEH-entry counter that
+`install_if_configured` now runs and registers successfully, though (see below) this did NOT fully
+fix the subshell case.
+
+### Measured win, both builds
+
+`bash -c 'echo hello; sleep 0.2; echo done'` (a real fork-then-immediate-execve -- the dominant real
+case per the 79th pass's own 20/20 measurement), `LITEBOX_DIAG_FORK_TIMING=1`:
+
+- Debug, eager baseline (flag unset): 6 groups, `ALL group copies done ... took 102.9946ms total`.
+- Debug, lazy (flag set): same 6 groups, 2 marked lazy (`0x111140000..0x111170000` len `0x30000`,
+  `0x7fefff6e0000..0x7fefffef0000` len `0x810000` -- the ~8MB guest stack region, exactly the
+  canonical "mostly untouched" case this investigation predicted) -- `ALL group copies done ...
+  took 33.5315ms total`, ~69% less parent-side time for this one fork. Correct output (`hello`,
+  `done`), exit 0, 5/5.
+- Release, lazy: `ALL group copies done, 6 group(s), took 5.6691ms total`. Correct output, exit 0.
+- Default path (flag unset), both builds: unaffected, confirmed by direct rerun -- 3/3 clean,
+  byte-identical output to pre-this-pass behavior.
+
+### The unresolved bug: fork without execve
+
+`bash -c '(echo subshell_child; x=inner_var; echo $x) ; echo parent_after'` -- a bash `(...)`
+subshell forks and, since `echo`/variable assignment are bash builtins, the CHILD keeps running
+bash's own already-forked, already-copied code directly rather than replacing its address space via
+`execve()`. This is exactly the case the lazy mechanism's own correctness argument says should
+still work, and the isolated POC proved the underlying platform primitive sound for exactly this
+shape of access. In the real integration it is NOT sound yet:
+
+- 5/5 with the flag OFF: clean, `subshell_child`/`inner_var`/`parent_after` all print, exit 0.
+- 5/5 with the flag ON (post ordering-fix): `subshell_child` prints, then `/bin/bash: line 1: 2
+  Killed ( echo subshell_child; x=inner_var; echo $x )` -- `inner_var` never prints. `parent_after`
+  still prints (the OUTER bash's own script continues past the killed job), so a naive
+  process-exit-code check reads 0 and would MISS this entirely -- the bug is only visible by
+  checking actual expected STDOUT content, not exit codes.
+- `LITEBOX_DIAG_FATALDUMP=1` capture: a real `EXCEPTION_ACCESS_VIOLATION` (`code=c0000005`), code
+  fetch (`addr==rip`), at `rip=0x7feffffef000`. Precise arithmetic against the two registered lazy
+  ranges for that same run (`0x111140000..0x111170000` and `0x7fefff6e0000..0x7fefffef0000`,
+  from the `[lazy_fork_commit] install_if_configured` log line) confirms the crash address is
+  OUTSIDE both -- `0xff000` bytes above the second (stack) range's own end. `[codewatch]`
+  diagnostic for that same fault: `alloc_base=0x7feffffb0000 type=0x20000 (MEM_PRIVATE) protect=0x2
+  (PAGE_READONLY) watched=false`. `PAGE_READONLY` does not match anything `copy_one_group` (blanket
+  `PAGE_READWRITE`, `0x04`) or the PASS-144 exec-fixup (`PAGE_EXECUTE_READ`/`PAGE_EXECUTE_READWRITE`,
+  `0x20`/`0x40`) would ever produce for a group on the EAGER path -- and this address's own
+  `alloc_base` matches a group that in an earlier (non-crashing) timing-enabled run was confirmed to
+  be on the eager `copy_one_group` path (`0x7feffffb0000..0x7fefffff0000 len=0x40000`), i.e. NOT one
+  this pass's own code marked lazy. The mechanism this pass added does not appear to touch this
+  memory directly -- the bug's real mechanism is not yet understood.
+- Timing-race hypothesis tested directly and REFUTED: added a diagnostic-only
+  `LITEBOX_DIAG_LAZY_FORK_ARTIFICIAL_DELAY_MS` env var (`process_fork.rs`, gated, no-op unless set)
+  to test whether the lazy path's own dramatic speedup (103ms to 33ms, above) removed timing slack
+  some OTHER startup step depended on. Reintroduced 80ms (exceeding the eager path's own real
+  ~103ms elapsed time): still 5/5 killed, byte-identical failure signature. Not a simple
+  "finishes too fast" race.
+- Leading untested hypothesis: an interaction with `fork_verify.rs`'s own watched-code-page
+  mechanism -- the crash's own `[codewatch]` diagnostic explicitly logged `watched=false` for the
+  faulting page, meaning that mechanism does NOT currently recognize this page as one of its own,
+  either a real gap in that recognition or a hint the true cause lies elsewhere. NOT investigated
+  further this pass -- needs a live `cdb -pv` attach (debug binary) breaking on this exact
+  `EXCEPTION_ACCESS_VIOLATION` class to find what sets `PAGE_READONLY` on this page and why only
+  the lazy path exposes it.
+
+### Current state left by this pass
+
+`LITEBOX_LAZY_FORK_COMMIT` defaults OFF (unset). With it unset, this pass's entire new module is
+inert -- `classify_lazy_eligible_groups` returns all-`false`, `install_if_configured` returns
+immediately on an absent env var, `AddVectoredExceptionHandler` is never called by this module at
+all. Confirmed live: 3/3 clean runs of the exact subshell repro above with the flag unset,
+byte-identical correct output to what this whole investigation has relied on through the 82nd pass.
+Both debug and release builds compile clean. Real desktop boot NOT attempted this pass with the
+flag on (would need the subshell-class bug fixed first -- a real XFCE session forks many long-lived
+daemons that do not immediately `execve()`, so this exact bug class would very likely recur on the
+real boot path, and be far harder to isolate there than in this clean, minimal, 100%-reproducible
+standalone repro).
+
+Host RAM: ~6.2GB free at pass start, never approached exhaustion this pass (no full desktop boot
+attempted). All stray `litebox_runner*` processes terminated via
+`Invoke-CimMethod -MethodName Terminate` between every trial, per standing practice.

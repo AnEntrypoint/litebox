@@ -1423,6 +1423,24 @@ fn diag_process_fork_globalstate_probe_inner() {
 
     let platform = Platform::new();
     diag_elapsed!("Platform::new() returned");
+    // Lazy (reserve-then-commit-on-first-fault) fork memory population -- see
+    // `litebox_platform_windows_userland::lazy_fork_commit`'s own module doc comment for the full
+    // design. MUST run AFTER `Platform::new()` (this line), never before: `Platform::new()`
+    // (`WindowsUserland::new()`) is what registers this process's own main
+    // `vectored_exception_handler_entry` via `AddVectoredExceptionHandler(1, ..)`, and THAT
+    // call's own doc comment is explicit that it must own every guest-context fault FIRST
+    // ("Nothing else loaded into the process has any business seeing a guest fault first").
+    // `AddVectoredExceptionHandler(1, ..)` always PREPENDS -- the most recently registered
+    // handler runs first -- so calling this here, after `Platform::new()` already registered its
+    // own handler, makes this module's handler the new head of the chain, in front of (not
+    // behind) the main handler. Registering this earlier (originally tried at this function's
+    // very top) was LIVE-CAUGHT this same pass to invert that ordering: the main handler then
+    // claimed every lazy-reserved-page fault FIRST, found no pattern it recognized, and delivered
+    // a genuine guest SIGSEGV instead of ever reaching this module's handler -- a real forked
+    // child running actual copied code (a bash subshell that does not immediately `execve`) was
+    // observed killed outright. Moving this call to after `Platform::new()` fixed it; see
+    // `AGENTS.md`'s entry for this pass for the full repro and fix.
+    litebox_platform_windows_userland::lazy_fork_commit::install_if_configured();
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 

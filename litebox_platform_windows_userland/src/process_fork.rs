@@ -1797,6 +1797,31 @@ pub fn spawn_process_fork_child(
         // because omission means inherit here.
         ("LITEBOX_PUBLISH", String::new()),
     ];
+    // Lazy (reserve-then-commit-on-first-fault) group classification -- see
+    // `crate::lazy_fork_commit`'s own module doc comment for the full design and correctness
+    // argument. `lazy_eligible[i]` tells the group-copy loop below whether
+    // `group_relocations[i]` should be RESERVED ONLY here (population deferred to the child's own
+    // VEH, on first real access) instead of eagerly `copy_one_group`-copied. Always all-`false`
+    // unless `LITEBOX_LAZY_FORK_COMMIT=1` is set -- see `lazy_fork_commit_enabled`'s doc comment
+    // for why that makes this whole mechanism provably inert by default.
+    let lazy_eligible =
+        crate::lazy_fork_commit::classify_lazy_eligible_groups(group_relocations, vma_layout);
+    let lazy_group_ranges: Vec<Range<usize>> = group_relocations
+        .iter()
+        .zip(lazy_eligible.iter())
+        .filter(|(_, eligible)| **eligible)
+        .map(|((group, _dest_base), _)| group.clone())
+        .collect();
+    if !lazy_group_ranges.is_empty() {
+        child_env.push((
+            crate::lazy_fork_commit::FORK_CHILD_LAZY_RANGES_ENV_VAR,
+            crate::lazy_fork_commit::serialize_lazy_ranges(&lazy_group_ranges),
+        ));
+        child_env.push((
+            crate::lazy_fork_commit::FORK_CHILD_PARENT_PID_ENV_VAR,
+            std::process::id().to_string(),
+        ));
+    }
     // Exported BEFORE the spawn: the path has to be in the child's environment block, and the
     // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets
     // around to reading it.
@@ -2050,28 +2075,34 @@ pub fn spawn_process_fork_child(
 
     let diag_copy_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
     let copy_all_t0 = std::time::Instant::now();
-    for (source_group, dest_base) in group_relocations {
+    for ((source_group, dest_base), lazy) in group_relocations.iter().zip(lazy_eligible.iter()) {
         let process = core::hint::black_box(process);
         if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
             let process_addr = &process as *const _ as usize;
             let dummy = 0u8;
             let stack_addr = &dummy as *const _ as usize;
             eprintln!(
-                "[diag_alloc_vec] pre-call process={:p} process_slot_addr={:#x} current_stack_addr={:#x} group={:#x}..{:#x}",
+                "[diag_alloc_vec] pre-call process={:p} process_slot_addr={:#x} current_stack_addr={:#x} group={:#x}..{:#x} lazy={lazy}",
                 process, process_addr, stack_addr, source_group.start, source_group.end
             );
         }
         let group_t0 = std::time::Instant::now();
-        let result = copy_one_group(process, source_group, *dest_base, &mut read_source_bytes);
+        let result = if *lazy {
+            crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
+        } else {
+            copy_one_group(process, source_group, *dest_base, &mut read_source_bytes)
+        };
         if diag_copy_timing {
             eprintln!(
-                "[diag-fork-timing] (parent) copy_one_group group={:#x}..{:#x} len={:#x} succeeded={} took {:?}",
+                "[diag-fork-timing] (parent) {}group={:#x}..{:#x} len={:#x} succeeded={} took {:?}",
+                if *lazy { "reserve_group_lazy " } else { "copy_one_group " },
                 source_group.start, source_group.end, source_group.len(), result.succeeded, group_t0.elapsed()
             );
         }
         if !result.succeeded {
             fail_teardown!(
-                "[process_fork] spawn_process_fork_child: group copy FAILED group={:#x}..{:#x} GetLastError={}",
+                "[process_fork] spawn_process_fork_child: group {} FAILED group={:#x}..{:#x} GetLastError={}",
+                if *lazy { "reserve" } else { "copy" },
                 result.source_group.start,
                 result.source_group.end,
                 result.last_error
@@ -2084,6 +2115,19 @@ pub fn spawn_process_fork_child(
             group_relocations.len(),
             copy_all_t0.elapsed()
         );
+    }
+    // DIAGNOSTIC ONLY, this pass's own investigation (never leave enabled by default): artificial
+    // delay to test whether the lazy-commit crash (a 100%-reproducible "Killed" on a bash subshell
+    // fork, in an address range OUTSIDE every lazy-reserved group, only when
+    // LITEBOX_LAZY_FORK_COMMIT=1) is a genuine logic bug in the lazy mechanism itself, or a
+    // PRE-EXISTING race elsewhere in child startup that the eager path's own ~100ms of
+    // WriteProcessMemory calls happened to mask simply by taking that long. If reintroducing this
+    // delay (which does no useful work) makes the crash disappear, that is strong evidence for the
+    // latter.
+    if let Ok(ms) = std::env::var("LITEBOX_DIAG_LAZY_FORK_ARTIFICIAL_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 
     // PASS 144: `copy_one_group` above commits every reservation-group span as blanket

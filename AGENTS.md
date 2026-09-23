@@ -7,13 +7,12 @@ detail is drained to `docs/AGENTS_ARCHIVE_*.md` and dated `docs/*.md` in the map
 for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
-line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th and
-81st passes (pass-history section below; 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`;
-70th-82nd full narrative, including each pass's own complete evidence and fix rationale:
-`docs/AGENTS_ARCHIVE_2026-09-23.md`). Lightly re-compacted 82nd pass (merged the 43rd-69th/70th-74th
-bullets); this file is ~40KB, over its own informal compaction trigger again — due for a fuller pass
-that drains more pass-history detail to the archive, not attempted this pass (time went to live
-measurement instead; nothing here is stale or wrong, just due for a trim).
+line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th,
+81st and 83rd passes (pass-history section below; 26th-69th full narrative:
+`docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-83rd full narrative, including each pass's own complete
+evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 83rd pass (drained
+the 82nd pass's own Angle A/B blow-by-blow to the archive, now that its conclusion is superseded by
+real code rather than just being confirmed as the next step).
 
 ## The cheap repro — start here
 
@@ -262,51 +261,66 @@ map" below). Condensed current-state trail:
   Whole-batch deferral removes the per-page performance argument only, not the correctness one — the
   only remaining viable path is genuine per-page lazy population (79th's own scoped primitive), no
   shortcut exists at either granularity. Re-confirms 79th's decision not to implement.
-- **82nd — both remaining "quick, safe" Track B levers tested; both real but genuinely exhausted,
-  narrowing the whole investigation down to one candidate.** *Angle A (skip copying provably-zero
-  bytes within an oversized VMA, e.g. the 8MB `DEFAULT_STACK_SIZE` guest stack a `bash -c`
-  external-command fork rarely touches past a few KB)*: read `insert_mapping`'s
-  `populate_pages_immediately=true` path (`litebox/src/mm/linux.rs`) and confirmed by code reading —
-  NOT implemented, no rebuild — that a write-skip-only version of this idea (detect all-zero source
-  chunks, skip the `write_slice_at_offset`/`WriteProcessMemory` for them) would save real wall-clock
-  but NOT the committed-memory (`Priv`) the crater is actually measured in: `insert_mapping` already
-  requests the FULL VMA span as one `VirtualAlloc2(MEM_COMMIT)` call regardless of what gets written
-  into it afterward, and Windows charges commit at that call, not at first touch. A genuine
-  committed-byte reduction needs the never-touched sub-range never committed at fork time at all
-  (`MEM_RESERVE`-only, promoted to `MEM_COMMIT` lazily on first real guest touch) — which is the SAME
-  page-fault-driven lazy-population primitive the 79th/81st passes already scoped as its own
-  dedicated, careful, VEH-coordinated investigation, not a smaller/safer variant of it. Angle A
-  therefore does not open a new, lower-risk path — it reduces to the one already-deferred primitive.
-  *Angle B (trim optional XFCE session-autostart components)*: read the real Failsafe session client
-  list live from the image (`/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml`, confirmed
-  never seeded into the user xfconf dir by `startwm.sh`) — `Client0=xfwm4` (alone gates this
-  project's own `_NET_SUPPORTING_WM_CHECK`/`DE_UP` criterion via `setNetSupportedHint`),
-  `Client1=xfsettingsd`, `Client2=xfce4-panel`, `Client3="Thunar --daemon"`, `Client4=xfdesktop`; plus
-  `/etc/xdg/autostart/{at-spi-dbus-bus,pulseaudio}.desktop`. Implemented a real, safe, additive,
-  reversible trim (a user-level xfconf override reducing the Failsafe list to just
-  `xfwm4`+`xfsettingsd`, plus two `Hidden=true` XDG-autostart-spec overrides) in both
-  `.wfgy/de_only.sh` and `.wfgy/webtop_stack.sh` — none of the trimmed components are load-bearing
-  for `xfwm4` itself or for the goal's own named apps (Terminal, Thunar), which are launched on
-  demand during verification rather than through the panel UI or session autostart. Live-verified: a
-  fresh boot with the trim applied reached `DE_LAUNCHED_DIRECT`, real `XCENSUS_WINDOWS=9`, and
-  `WM_POLL n=1..4` (`DBUS_XFCONF_PROBE` also succeeded, confirming the trimmed XML did not break
-  xfconfd) before the SAME crater magnitude as the untrimmed 77th/80th-pass baselines — 28 processes,
-  0.73GB free at t=105s, vs. 28-29 processes/0.17-0.82GB free at ~120-140s untrimmed — i.e. no
-  measurable improvement, if anything slightly earlier. (`ps -ef` cannot directly confirm which
-  session clients actually launched — confirmed this pass that a cross-process-forked `ps` sees only
-  itself, never sibling forks, the same `/proc`-is-per-process-blind limitation the 65th pass already
-  documented for a different tool — so this is inferred from boot-pace/crater-timing parity, not a
-  process-list diff.) Real, non-hypothetical conclusion: trimming 3-5 long-lived daemons out of the
-  boot's whole fork tree (dozens of forks over the boot's lifetime — Xvfb/dbus/xfce4-session's own
-  children, plus every `WM_POLL` iteration's `xprop`/`XCENSUS` probe fork) is too small a fraction of
-  total fork VOLUME to matter; this reconfirms 80th's own finding from a different angle — the crater
-  is CUMULATIVE per-fork cost across the whole fork history, not concentrated in a few big
-  long-lived processes, so trimming WHICH programs run cannot substitute for reducing the per-fork
-  copy cost itself. Kept (harmless, real, fully reversible by deleting the seeded xfconf/autostart
-  files) despite the null result, same standing this project gives 76th's admission-control fix.
-  **Net effect on the whole investigation: every "quick/safe" lever short of the deferred lazy-page
-  primitive is now closed** — see the Track B pickup list's own item 1 update below. `DE_UP` not
-  reached this pass either; chrome-devtools MCP not re-checked (moot, `DE_UP` never fired).
+- **82nd** — both remaining "quick, safe" Track B levers (skip-copying-zero-bytes; trimming optional
+  XFCE session-autostart components) tested and confirmed real but genuinely exhausted — neither
+  reduces Windows' own `VirtualAlloc2(MEM_COMMIT)` charge, which is what the crater is measured in.
+  Net effect: narrowed the whole investigation down to one remaining candidate, genuine per-page
+  lazy population. Full Angle A/B evidence, exact XFCE client list, exact before/after process
+  counts: archive.
+- **83rd — IMPLEMENTED the lazy (reserve-then-commit-on-first-fault) primitive the 79th/81st/82nd
+  passes converged on. Real, measured win for the dominant fork-then-execve case; a genuine,
+  100%-reproducible correctness bug found for fork-without-execve, root cause NOT yet found, feature
+  left OFF by default.** New module `litebox_platform_windows_userland/src/lazy_fork_commit.rs`
+  (own doc comment carries the full design/correctness argument and the KNOWN UNSAFE CASE in
+  precise detail — read it before touching this). Design: parent-side `classify_lazy_eligible_groups`
+  marks a fork-carried VMA group lazy iff `LITEBOX_LAZY_FORK_COMMIT=1` is set AND no overlapping
+  `vma_layout` range carries `VM_EXEC` (CODE groups stay on the existing eager `copy_one_group`
+  path unconditionally, sidestepping PASS-144's exec-fixup entirely); `reserve_group_lazy`
+  `VirtualAlloc2`s the group `MEM_RESERVE`-only (no commit, no byte copied) at fork time; the
+  child's own startup (`litebox_runner_linux_on_windows_userland::lib.rs`, right after
+  `Platform::new()` returns — ORDERING IS LOAD-BEARING, see below) calls
+  `lazy_fork_commit::install_if_configured()`, which `OpenProcess(PROCESS_VM_READ)`s the parent and
+  `AddVectoredExceptionHandler(1, ..)`-prepends a handler that, on an `EXCEPTION_ACCESS_VIOLATION`
+  whose address falls in a tracked lazy range, `VirtualAlloc(MEM_COMMIT)`s just that page,
+  `ReadProcessMemory`s the real bytes from the parent at the same address (identity-mapped, cross-
+  process fork's own existing guarantee) and returns `EXCEPTION_CONTINUE_EXECUTION` — lock-free by
+  design (concurrent same-page faults are idempotent, no "already populated" bit needed). **Platform
+  mechanism proved correct in complete isolation first** (`.wfgy`-style standalone POC, raw
+  kernel32 FFI, no litebox dependency): reserve-only took 8-9µs vs 2.2-2.4ms for an eager
+  commit+copy of the same 8MB region (5/5 clean), correct lazy-fault population on both read and
+  write access, untouched pages verified via `VirtualQueryEx` to stay genuinely `MEM_RESERVE`
+  (never `MEM_COMMIT` — the real resource-savings claim), parent's own memory unaffected by the
+  child's write. **Ordering bug found+fixed live**: registering the lazy-commit VEH BEFORE
+  `Platform::new()` (which is what registers this process's own main
+  `vectored_exception_handler_entry`) put the mechanism's handler at the chain's back, not front —
+  `AddVectoredExceptionHandler(1, ..)` always PREPENDS, so the LAST registration wins the front
+  seat; the main handler then claimed every lazy-page fault first and delivered a genuine guest
+  SIGSEGV instead of ever reaching this module's handler. Fixed by moving the call to after
+  `Platform::new()` returns. **Real measured win (both debug and release, `LITEBOX_DIAG_FORK_TIMING
+  =1`)**: `bash -c 'echo hello; sleep 0.2; echo done'` (a real fork-then-execve — the dominant real
+  case) — debug: 103ms eager (6 groups) vs 34ms mixed (2 lazily reserved, in single-digit µs each);
+  release: proportionally larger eager baseline vs 5.7ms mixed. 5/5 clean, correct output, exit 0,
+  both builds. **A genuine, 100%-reproducible correctness bug for fork-WITHOUT-execve** (e.g. a
+  bash `(...)` subshell, which runs already-forked code directly rather than replacing its address
+  space): `bash -c '(echo subshell_child; x=inner_var; echo $x); echo parent_after'` — 5/5 killed
+  after printing `subshell_child`, before `inner_var`, a real `EXCEPTION_ACCESS_VIOLATION` (code
+  fetch, confirmed `LITEBOX_DIAG_FATALDUMP=1`) at an address OUTSIDE every lazy-reserved range —
+  ~0xff000 bytes above the lazy stack group's own end, inside a separate small EAGER group, with an
+  unexplained `PAGE_READONLY` protection neither `copy_one_group` nor the exec-fixup would ever
+  produce. The obvious "lazy just finishes too fast, some other startup step loses its race window"
+  theory was tested directly (re-added up to 80ms of artificial delay after reservation, matching/
+  exceeding the eager path's own real elapsed time) and REFUTED — still 5/5 killed. Root cause not
+  found this pass; leading untested hypothesis is an interaction with `fork_verify.rs`'s own
+  watched-code-page machinery (the crash's own `[codewatch]` diagnostic logged `watched=false` for
+  the faulting page), needs a live `cdb -pv` attach, debug binary, per this project's own standing
+  practice for this bug class. **Because of this, `LITEBOX_LAZY_FORK_COMMIT` stays default OFF and
+  changes NOTHING about the default fork path** — confirmed live, 3/3 clean runs of the exact
+  subshell repro with the env var unset, byte-identical to pre-83rd-pass behavior. **Not yet safe to
+  flip on for a real desktop boot**: a real XFCE session forks many long-lived daemons that do not
+  immediately `execve()`, so this exact bug class would very likely recur, worse and harder to
+  isolate than this clean minimal repro. `DE_UP` not attempted this pass (would have needed the flag
+  on, which is not yet safe). Full repro commands, hex addresses, refuted-delay-theory numbers: this
+  file's own git history for this pass plus `docs/AGENTS_ARCHIVE_2026-09-23.md`.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -324,29 +338,31 @@ both Xvfb SIGSEGVs.
 1. **`xfwm4` now launches (75th pass, `1d449e6`) — the blocker is no longer filesystem visibility,
    it is pure host-RAM/process-count exhaustion before `DE_UP`.** CLOSED sub-issues:
    `ssh-agent`/`xfwm4` freeze (60th/61st); `DBUS_FAILED`'s regression-guard cause (67th/68th); the
-   writable-layer export-path fallback bug (75th). Full 76th-81st evidence/numbers: the pass-history
-   section above (this file) and `docs/AGENTS_ARCHIVE_2026-09-23.md`. **Net state after 76th-81st**:
-   admission-control (76th, tuning CLOSED as a dead end 80th) and the fixed per-process alloc floor
-   (77th, real ~35-40% reduction) are both landed and real but each only a partial mitigation — the
-   crater is CUMULATIVE committed memory across the boot's whole fork history, not peak concurrency
-   or a fixed per-process floor. Session-autostart trimming (82nd: Failsafe client list 5→2,
-   `at-spi-dbus-bus`/`pulseaudio` disabled) is ALSO now closed as a lever — live-verified null result,
-   same crater magnitude/timing as untrimmed, because it reduces WHICH programs run, not the per-fork
-   copy volume that dominates. **The one lever that could plausibly still move it — eager,
-   unconditional full-VMA-copy on every fork (~85% of a fork-exec cycle wasted the instant `execve`
-   fires, 79th) — has no safe narrow fix at either per-page or whole-batch granularity, and Angle A's
-   own "skip provably-zero bytes" variant (82nd) doesn't either: `insert_mapping`'s
-   `populate_pages_immediately=true` already commits the FULL span in one `VirtualAlloc2` call
-   regardless of what gets written into it, so a write-skip-only version saves wall-clock, not the
-   committed bytes the crater is measured in. Every variant of this lever converges on the SAME
-   single remaining primitive: genuine per-page lazy population (real page-fault/VEH-driven
-   `MEM_RESERVE`→`MEM_COMMIT`-on-touch), explicitly cross-referenced against `fork_verify.rs`'s VEH
-   single-step healing before either touches the boot path, its own dedicated multi-pass
-   investigation, not attempted again without that groundwork.** `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`
-   (both call sites, zero cost when off) remains the permanent tool for measuring any future fix's
-   real payoff before landing it. `DE_UP` has not been reached by any pass through the 82nd;
-   chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP`
-   fires). Lower-priority, still open: (a) decompose
+   writable-layer export-path fallback bug (75th). Admission-control (76th) and the fixed
+   per-process alloc floor (77th, ~35-40% reduction) are landed, real, partial mitigations.
+   Session-autostart trimming and zero-byte-skip (82nd) are closed as dead-end levers — neither
+   touches Windows' own `VirtualAlloc2(MEM_COMMIT)` charge. **83rd pass IMPLEMENTED the one
+   remaining lever, genuine per-page lazy population (`litebox_platform_windows_userland::
+   lazy_fork_commit`, `LITEBOX_LAZY_FORK_COMMIT=1`)** — real, measured win for fork-then-execve
+   (the dominant real case), but found a genuine, 100%-reproducible, NOT-yet-root-caused correctness
+   bug for fork-without-execve (a bash subshell killed by a real AV in a region outside every lazy
+   range, unexplained `PAGE_READONLY` protection, timing-delay theory refuted). **Feature stays
+   default OFF pending that bug's root cause — do not flip it on for a real boot attempt** until
+   fixed; see this module's own doc comment (KNOWN UNSAFE CASE section) and the 83rd pass's own
+   pass-history entry above for the full repro/evidence. **Next pickup, precise**: a live `cdb -pv`
+   attach (debug binary) on the subshell repro
+   (`bash -c '(echo subshell_child; x=inner_var; echo $x); echo parent_after'` under
+   `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1`), breaking on the crash's own faulting address
+   class (an `EXCEPTION_ACCESS_VIOLATION` code-fetch, `PAGE_READONLY` protection, outside every
+   registered lazy range) to find what sets that protection and why only the lazy path exposes it;
+   the leading untested hypothesis is an interaction with `fork_verify.rs`'s own watched-code-page
+   machinery (its own `[codewatch]` diagnostic logged `watched=false` for the exact faulting page
+   this pass's repro produced). Once fixed and re-verified 5/5 clean on BOTH the fork-then-execve
+   AND fork-without-execve repros, the next step is the full `DE_UP` boot attempt with the flag on.
+   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero cost when off) remains the permanent
+   tool for measuring any future fix's real payoff before landing it. `DE_UP` has not been reached
+   by any pass through the 83rd; chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was
+   checked (moot until `DE_UP` fires). Lower-priority, still open: (a) decompose
    remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
    build vs. Windows loader overhead; (b) once `DE_UP` fires (or stalls again), use
    `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`,

@@ -9,6 +9,7 @@
 
 mod ctxwatch;
 mod fork_verify;
+pub mod lazy_fork_commit;
 mod net;
 pub mod presentation;
 pub mod process_fork;
