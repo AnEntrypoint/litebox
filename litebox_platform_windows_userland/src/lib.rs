@@ -6246,6 +6246,39 @@ impl WaiterQueue {
     /// make "check `inner`'s value, then register/pop a waiter" one atomic critical section, exactly
     /// as the earlier `Mutex<Vec<_>>` design did -- see `block_or_maybe_timeout`'s and `wake_many`'s
     /// own doc comments for the lost-wakeup argument this preserves.
+    ///
+    /// # Panic safety -- live-caught, 60th pass (2026-09-23)
+    ///
+    /// The release used to be a plain statement AFTER calling `f(self)`, with no guard: if `f`
+    /// ever panicked, unwinding left this exactly like this queue's own doc comment already
+    /// warns against ("`lock` is held only across a handful of atomic slot reads/writes, never
+    /// across a syscall or a wait") -- except the real gap was a panic, not a syscall. `wake_many`
+    /// calls `f = drain_locked`, which builds a `Vec<WaiterRecord>` via `Vec::new()` +
+    /// `.push(..)` -- an ordinary heap allocation through this process's `#[global_allocator]`
+    /// (`SLAB_ALLOC`, `litebox::mm::allocator::SafeZoneAllocator`). If that allocation ever
+    /// panics (`SafeZoneAllocator::alloc`'s own `.expect("Could not refill?")`/
+    /// `panic!("Invalid layout: ..")`/`.expect("Failed to deallocate")` paths, `litebox/src/mm/
+    /// allocator.rs`), the panic unwound straight through this function's stack frame and past
+    /// the `store(false, ..)` below without ever running it -- permanently wedging `self.lock` at
+    /// `true`. A guest task's own per-task `catch_unwind` wrapper (`std::thread::lifecycle::
+    /// spawn_unchecked`'s `JoinInner::join`, visible in every one of this codebase's task
+    /// stacks) then caught the panic further up and let that OS thread carry on -- so the
+    /// panicking thread itself never died or blocked, but every LATER caller of `with_lock` on
+    /// this exact `RawMutex` instance (any thread contending the SAME mutex this `WaiterQueue`
+    /// backs) span forever in the `compare_exchange_weak` loop above, with no wait syscall ever
+    /// appearing on its stack -- live-confirmed via `cdb -pv`, three non-invasive snapshots
+    /// spanning 40+ real seconds, byte-identical `Child-SP` each time, only the offset inside
+    /// this loop moving: `Process::adopt_children`'s `Mutex<Vec<(i32, Arc<Process>)>>::lock()`
+    /// (itself reached from `Task::prepare_for_exit`, i.e. exactly the guest exit path that never
+    /// logs again downstream of it) contending this same wedged `RawMutex`. Neither `RawMutex`'s
+    /// own `holder_pid`/dead-holder recovery (its doc comment, above) nor any process-liveness
+    /// check applies here: the thread that leaked this lock is still alive and still running --
+    /// nothing about it is dead, so `OpenProcess`/`GetExitCodeProcess` would report it as
+    /// perfectly healthy forever. The actual defect is structural (no RAII release), so the fix
+    /// is structural too: `litebox::utils::defer` (already used elsewhere in this same file, e.g.
+    /// [`ThreadHandle::interrupt`]'s `_resume_guard`) guarantees the release runs on every exit
+    /// path out of this function, panic included, exactly like a real lock guard's `Drop` always
+    /// has for every OTHER lock in this codebase.
     fn with_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
         while self
             .lock
@@ -6259,10 +6292,11 @@ impl WaiterQueue {
         {
             core::hint::spin_loop();
         }
-        let result = f(self);
-        self.lock
-            .store(false, core::sync::atomic::Ordering::Release);
-        result
+        let _release_guard = litebox::utils::defer(|| {
+            self.lock
+                .store(false, core::sync::atomic::Ordering::Release);
+        });
+        f(self)
     }
 
     /// Registers `record` in the first free slot. Returns `false` (never panics -- this is

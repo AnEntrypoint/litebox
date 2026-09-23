@@ -245,6 +245,29 @@ pub fn buddy_allocator_code_addrs<const ORDER: usize>() -> [usize; 4] {
     ]
 }
 
+/// # Every internal failure panic below is deliberately allocation-free (60th pass, 2026-09-23)
+///
+/// `alloc`'s `OutOfMemory`/`InvalidLayout` branches and `dealloc`'s failure branch used to call
+/// `.expect(msg)`/`panic!("{layout:?}")` while `slab_allocator.lock()`'s guard (`zone_allocator`)
+/// was still held. `Result::expect` unconditionally formats `"{msg}: {error:?}"` -- and
+/// interpolating any value at all (`{layout:?}` included) forces the same `format!` path -- which
+/// allocates through this very type's own `#[global_allocator]` registration (`SLAB_ALLOC`,
+/// `litebox_platform_windows_userland/src/lib.rs`). That reentrant allocation cannot be a
+/// same-thread self-deadlock on `slab_allocator` itself (`spin::mutex::SpinMutex`'s guard still
+/// runs its `Drop` during the unwind that formatting the panic message kicks off, releasing this
+/// lock correctly) -- but a wholly UNRELATED spinlock that happened to be held by whatever code
+/// path triggered that reentrant allocation has no such protection unless it was written with one.
+/// Live-caught exactly this way: `litebox_platform_windows_userland::WaiterQueue::with_lock`
+/// (`RawMutex`'s own internal waiter-registration spinlock) had no panic guard, and one of its
+/// callers (`wake_many`'s `drain_locked`) allocates a `Vec` -- so a panic reaching this allocator
+/// from inside that specific call wedged `WaiterQueue::lock` at `true` forever, live-confirmed via
+/// `cdb -pv` (three snapshots, 40+ seconds apart, byte-identical `Child-SP`, `ssh-agent`'s exit
+/// path stuck forever contending the wedged `RawMutex`). `WaiterQueue::with_lock` itself is now
+/// fixed (a `litebox::utils::defer`-based release guard), but every panic site here is ALSO made
+/// allocation-free as defense in depth: a plain `&'static str`-only `panic!` (no `{}`
+/// placeholders) never reaches `format!`, so it can never recurse into this allocator no matter
+/// which lock -- guarded or not, in this codebase or a future one -- happens to be held when it
+/// fires.
 unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
     for SafeZoneAllocator<'static, ORDER, M>
 {
@@ -269,33 +292,51 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     Err(AllocationError::OutOfMemory) => {
                         if layout.size() <= ZoneAllocator::MAX_BASE_ALLOC_SIZE {
                             self.alloc_page().map_or(core::ptr::null_mut(), |page| {
-                                unsafe {
-                                    zone_allocator
-                                        .refill(layout, page)
-                                        .expect("Could not refill?");
+                                // Deliberately a plain `match` + a `&'static str`-only `panic!`,
+                                // never `.expect(msg)` -- see this impl block's own doc comment
+                                // (60th pass) for why: `Result::expect` unconditionally formats
+                                // `"{msg}: {error:?}"`, which allocates through this very
+                                // `#[global_allocator]` (`SLAB_ALLOC`) while `zone_allocator`
+                                // (this `slab_allocator.lock()` call's guard) is still held --
+                                // live-caught wedging a DIFFERENT, unrelated spinlock
+                                // (`WaiterQueue::with_lock`, `litebox_platform_windows_userland`)
+                                // forever when a `Vec::push` inside it happened to be the
+                                // allocation that panicked here. A plain string literal (no `{}`
+                                // placeholders) never reaches `format!`, so it can never recurse
+                                // into this allocator no matter which lock is held when it fires.
+                                if unsafe { zone_allocator.refill(layout, page) }.is_err() {
+                                    panic!("SafeZoneAllocator: refill failed");
                                 }
-                                zone_allocator
-                                    .allocate(layout)
-                                    .expect("Should succeed after refill")
-                                    .as_ptr()
+                                let Ok(ptr) = zone_allocator.allocate(layout) else {
+                                    panic!("SafeZoneAllocator: allocate failed right after refill");
+                                };
+                                ptr.as_ptr()
                             })
                         } else {
                             self.alloc_large_page()
                                 .map_or(core::ptr::null_mut(), |large_page| {
-                                    unsafe {
-                                        zone_allocator
-                                            .refill_large(layout, large_page)
-                                            .expect("Could not refill?");
+                                    // See the sibling branch above for why this is a `match` +
+                                    // static-only `panic!`, not `.expect(msg)`.
+                                    if unsafe { zone_allocator.refill_large(layout, large_page) }
+                                        .is_err()
+                                    {
+                                        panic!("SafeZoneAllocator: refill_large failed");
                                     }
-                                    zone_allocator
-                                        .allocate(layout)
-                                        .expect("Should succeed after refill")
-                                        .as_ptr()
+                                    let Ok(ptr) = zone_allocator.allocate(layout) else {
+                                        panic!(
+                                            "SafeZoneAllocator: allocate failed right after refill_large"
+                                        );
+                                    };
+                                    ptr.as_ptr()
                                 })
                         }
                     }
                     Err(AllocationError::InvalidLayout) => {
-                        panic!("Invalid layout: {layout:?}");
+                        // Static-only, deliberately not `panic!("Invalid layout: {layout:?}")`
+                        // -- see this impl block's own doc comment: formatting `layout` would
+                        // allocate while `zone_allocator` (this `slab_allocator.lock()` call's
+                        // guard) is still held.
+                        panic!("SafeZoneAllocator: invalid layout");
                     }
                 }
             }
@@ -310,10 +351,14 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
             },
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 if let Some(ptr) = NonNull::new(ptr) {
-                    self.slab_allocator
-                        .lock()
-                        .deallocate(ptr, layout)
-                        .expect("Failed to deallocate");
+                    // Static-only `panic!`, not `.expect("Failed to deallocate")` -- see this
+                    // impl block's `alloc`'s own doc comment: `.expect(msg)` always formats
+                    // `"{msg}: {error:?}"`, which would allocate through this very
+                    // `#[global_allocator]` while `slab_allocator.lock()`'s guard (the temporary
+                    // this whole chained call holds) is still alive.
+                    if self.slab_allocator.lock().deallocate(ptr, layout).is_err() {
+                        panic!("SafeZoneAllocator: failed to deallocate");
+                    }
                 }
 
                 // TODO: An proper reclamation strategy could be implemented here
