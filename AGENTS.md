@@ -191,22 +191,34 @@ map" below). The CURRENT STATE those passes converged on:
   `/proc`/`ps`) is a plain per-process `Arc<RwLock<...>>`, never added to the actual cross-process
   shared-arena registry set (`unix_addr_table`/`fifo_registry`/`memfds`/`shared_files`/`sysv_shm`) —
   meaning every past pass's `ps`/`PS_DUMP`-based evidence has been blind to forked siblings the
-  whole investigation. Not fixed this pass. (3) New, unresolved lead: `DBUS_FAILED` is real and
-  reproducible — a fresh boot with the IDENTICAL script/flags the 62nd-64th passes used got
-  `DBUS_FAILED` instead of `DBUS_UP` (a SEPARATE, more foundational failure mode from the
-  62nd-64th passes' "dbus up, xfwm4 running" scenario). Isolated to `dbus-daemon --print-address >
-  /tmp/addr &` (used verbatim by both `de_only.sh` and `webtop_stack.sh:373`): backgrounded, 5/5
-  reproductions leave `/tmp/addr` empty; the IDENTICAL command run in the FOREGROUND (no `&`)
-  prints a correct real address immediately — `dbus-daemon` itself is not broken, something about
-  backgrounding it is, consistent with (not yet proven to BE) the already-documented "bare file
-  redirect across a forked child is invisible to the parent" mechanism, just never before applied
-  to dbus-daemon's OWN startup line. An `mkfifo`-based fix attempt did not complete within this
-  pass's wait budget — inconclusive. **This pass's refutation also leaves the ORIGINAL 62nd-64th
-  question (dbus genuinely up, xfwm4 genuinely running, never calls `setNetSupportedHint`) fully
-  open again** — the blocker is neither a dead connection nor a missed epoll wakeup (both fds stay
-  healthy 120+s), so it is most likely a synchronous condition inside `initSettings()` itself; next
-  pass should read real upstream `xfwm4` source line-by-line for that function rather than assume
-  a transport-layer cause. Full evidence, exact log lines, all four repro scripts: archive.
+  whole investigation. Not fixed this pass.
+
+  **66th pass (2026-09-23) re-diagnosed `DBUS_FAILED` — the 65th pass's "bare-redirect write
+  invisible to parent" theory is REFUTED.** `SharedFilePublishTable`'s `/tmp/addr` path works
+  correctly (2/2 isolated repros, real `dbus-daemon` via `execve`, no Xvfb load: publish +
+  materialize both fire, address copies byte-for-byte). The 65th pass's own "5/5 empty" repro used
+  `/tmp/addr_N` (suffixed) — outside `SHARED_PUBLISH_PATHS` (hardcoded to exactly `"/tmp/addr"`) —
+  so it never actually tested the real path; REFUTED as a lead. The REAL, reproducible (2/2)
+  failure, from the full `de_only.sh`/Xvfb+xcensus scenario: `/de_only.sh: line NNN: /tmp/empty: No
+  such file or directory` — the forked child about to exec `dbus-daemon` gets ENOENT on its OWN
+  `< /tmp/empty` stdin redirect, so `dbus-daemon` never launches at all (an INPUT-side ENOENT, not
+  an output-visibility gap — `/tmp/addr` is empty only because nothing ever runs to write it).
+  `webtop_stack.sh` already re-creates `/tmp/empty` right before ITS dbus-daemon/selkies lines;
+  `de_only.sh` was missing that same guard before ITS dbus-daemon line — applying it did **NOT**
+  fix the repro on retest, REFUTING "staleness relative to this one fork" too. Read
+  `export_parent_writable_layer_for_child`/`export_writable_layer` (`process_fork.rs`/
+  `litebox_runner_linux_on_windows_userland/src/lib.rs:2362`) directly: a synchronous, full
+  `read_dir`-based walk of the parent's live upper layer, called right before every spawn, no
+  zero-byte-file special case — by its own contract a just-created empty file should already be
+  in it. **Not root-caused**: needs a live debugger/trace on the exporter call itself, not another
+  boot repro. Do not re-attempt the `mkfifo` fix or a defensive-recreate script fix — both tried,
+  neither closes this. This also reopens the 62nd-64th `setNetSupportedHint` question with one
+  concrete lead REFUTED: upstream `xfwm4` `main.c` calls `init_compositor_screen`→
+  `compositorManageScreen`→`init_glx` (synchronous GLX-over-Xvfb, a plausible hang) right before
+  `setNetSupportedHint`, but this image's own shipped `/defaults/xfce/xfwm4.xml` sets
+  `use_compositing=false` (extracted directly from the cached OCI layer), so that path is never
+  entered. Next pass: keep reading upstream `xfwm4`/`libxfconf` past that point, or the
+  still-never-attempted live `cdb -pv` on `xfce4-session` itself. Full evidence: archive.
 
 ### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
 
@@ -227,13 +239,16 @@ both Xvfb SIGSEGVs (43rd/51st, confirmed on the full stack by the 52nd).
    trace filter never looked at; it never stopped). This reopens the ORIGINAL question with no
    current theory: in a run where dbus is genuinely up and `xfwm4` is genuinely running (sends/
    receives real D-Bus and X11 traffic continuously for 120+s, zero errors), it still never calls
-   `setNetSupportedHint`. Likeliest remaining shape: a synchronous condition inside `initSettings()`
-   itself that never becomes true — pickup is reading real upstream `xfwm4` source for that function
-   line-by-line, not another transport-layer trace. **New, higher-priority blocker found the SAME
-   pass, not yet fixed**: `DBUS_FAILED` (dbus-daemon never produces its address) is real,
-   reproducible, and independent of the above — isolated to `dbus-daemon --print-address > /tmp/addr
-   &`'s file redirect being invisible to the parent when backgrounded (works fine in the foreground);
-   an `mkfifo`-based fix is drafted but unverified (65th pass). Also newly found: `ps`/`/proc` is
+   `setNetSupportedHint`. Pickup: read real upstream `xfwm4` source line-by-line for that function
+   (66th pass REFUTED the compositor/GLX path specifically — `use_compositing=false` in this
+   image's own shipped defaults, so `init_glx` is never reached). **Higher-priority blocker, real,
+   reproducible (2/2), NOT fixed**: `DBUS_FAILED` — 66th pass re-diagnosis: an ENOENT on
+   `/tmp/empty` (the forked child's own `< /tmp/empty` stdin redirect) kills `dbus-daemon` before
+   it launches; NOT a `/tmp/addr` write-visibility gap (verified working in isolation). Neither
+   `mkfifo` nor a defensive-recreate script fix closes it (both tried) — root cause is inside
+   whatever makes the cross-process-fork export omit a file the parent's own `read_dir` would show
+   at that instant; needs a live debugger session on the exporter, not another boot repro. Also
+   newly found: `ps`/`/proc` is
    blind to every cross-process-forked sibling (`proc_self_info` never joined the shared-arena
    registry set) — re-weigh any past pass's `ps`-based conclusion. PER-PROCESS RAM is the hard
    ceiling on any attempt (~28-29 live host processes, 8.5GB→<1GB in <90s on `de_only.sh` alone) —
