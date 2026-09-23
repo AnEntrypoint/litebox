@@ -1290,3 +1290,44 @@ Full detail for AGENTS.md's condensed 88th-90th summary.
   for `xfce4-session`'s own winpid — meaning this fault was not caught by this codebase's own VEH
   machinery at all (contrast `Xvfb`'s crash above, which was: a real Rust panic with a full
   backtrace). Root cause remained OPEN going into the 91st pass.
+
+## 91st pass full narrative (drained from AGENTS.md, 93rd pass compaction)
+
+Full detail for AGENTS.md's condensed 91st pass-history summary.
+
+Root-caused the 90th pass's "ZERO `[veh]`/panic output" mystery to a real, independently
+DOUBLY-documented (two prior sessions, `docs/AGENTS_ARCHIVE_2026-09-03.md`'s converged finding,
+cross-referenced this pass) `GS_BASE` corruption class, and landed the exact fix that finding's
+own writeup specified as the concrete next step — but could NOT live-verify it against the
+specific `xfce4-session` crash this session, because 3/3 real boot attempts (1 pre-fix, 2
+post-fix) all died from a DIFFERENT, earlier, already-known crash before `xfce4-session` even
+launched. `WindowsUserland::init_thread_gs_base`/`restore_thread_gs_base_if_cleared`'s own doc
+comment (`litebox_platform_windows_userland/src/lib.rs:185-222`) already documents: "Investigated
+live while chasing a reliably reproducible `EXCEPTION_ACCESS_VIOLATION` INSIDE `ntdll.dll` itself
+(`is_in_guest=false`, a NULL-pointer read, looping forever at the identical instruction under
+nested `vfork()`'s added kernel-transition pressure) -- this repair alone did not resolve that
+specific crash". Cross-checked `docs/AGENTS_ARCHIVE_2026-09-03.md:5643`, an INDEPENDENT prior
+session that hit the identical mechanism via a cleaner path (Windows' own Application Error event
+log): `0xc000000d` in `ntdll.dll` at a fixed offset, disassembled to `mov %gs:0x60, %rcx` — the
+single most fundamental TEB/PEB access in the OS — meaning `GS_BASE` itself is invalid at the
+moment of fault. Why litebox's own repair can't catch this: `restore_thread_gs_base_if_cleared`
+only runs from INSIDE `vectored_exception_handler` (`lib.rs:865`) or `syscall_handler`'s own entry
+(`lib.rs:11834`) — but Windows' exception dispatcher must ITSELF read `GS_BASE`-relative TEB/PEB
+state to even locate and invoke a registered VEH callback, so when `GS_BASE` breaks badly enough,
+the OS's OWN dispatcher faults before litebox's VEH ever gets control. The residual gap:
+`syscall_handler`'s entry-point repair only runs ONCE, before a syscall's own handling begins —
+but `RawMutex::block_or_maybe_timeout` (`lib.rs:6585`, what `Process::wait_for_vfork_done` —
+`syscalls/process.rs:551` — calls to implement vfork's POSIX-mandated parent-suspension) can
+legitimately block for many real seconds (matching the 16-16.7s observed crash timing) INSIDE that
+single syscall dispatch, via a loop of repeated, chunked `WaitForSingleObject` calls, each one a
+real kernel round-trip, with NO repair anywhere in this specific loop before this pass. Fix
+(`litebox_platform_windows_userland/src/lib.rs`, `block_or_maybe_timeout`): call
+`WindowsUserland::restore_thread_gs_base_if_cleared()` immediately after every
+`WaitForSingleObject` return in this loop, before matching on the result. Builds clean (debug), no
+regression in reachability to `DE_LAUNCHED_DIRECT` across 2 post-fix boots. Not live-verified
+against the target crash: all 3 real `de_only_xcensus_seed3.tar` attempts this pass died from an
+EARLIER, already-known, unrelated crash — a `bash` task (`pid=80 tid=80`) taking a fatal `SIGSEGV`
+inside `/de_only.sh` itself, cascading into the ROOT process's own unrecoverable AV, before
+`xfce4-session` is ever reached at all — matching the general, long-documented ADVISORY-001 §3N
+thread-based-fork tcache corruption class, not a regression from this pass's own fix. Host RAM
+4.7-5.8GB free throughout, no concurrent boots, all three runs cleanly self-terminated.

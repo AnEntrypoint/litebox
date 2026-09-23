@@ -6711,6 +6711,33 @@ impl RawMutex {
             // `rdgsbase`-and-compare per wait wakeup/liveness-check tick.
             WindowsUserland::restore_thread_gs_base_if_cleared();
 
+            // 93rd pass: this call site's own comment above already documented FS_BASE as
+            // equally at risk from the identical "Windows clears a segment-base MSR under
+            // kernel-transition/scheduling pressure" mechanism as GS_BASE -- but only GS_BASE
+            // ever got a repair here (91st pass). Live `cdb` capture (hardware breakpoint at the
+            // exact deterministic address the 92nd pass found via the Application Error event
+            // log, `0x00007fefe92bc7cb`) caught the real xfce4-session crash pre-fault: guest
+            // glibc's `__syscall_error` (`neg eax; mov fs:[rcx], eax; or rax,-1; ret` -- the
+            // standard Initial-Exec-model `errno = -ret` store after any failed syscall) with
+            // `rcx` a small negative TLS offset, and cdb's own effective-address preview
+            // (`fs:ffffffff`ffffffa0=????????`) resolving to the literal offset with NO base
+            // contribution -- i.e. `FS_BASE` reads back `0` on this thread at exactly this
+            // instruction, the identical "cleared segment base" signature already established
+            // for `GS_BASE`. Unlike `GS_BASE` (which Windows also legitimately owns and uses for
+            // its own TEB, hence the "only repair if cleared" caution), `FS_BASE` is *entirely*
+            // litebox's own to manage (set only via the guest's own `arch_prctl`, restored
+            // unconditionally from `THREAD_FS_BASE` on every `switch_to_guest` resume) -- so
+            // unconditionally re-applying the last value the guest itself established is always
+            // correct here, no "if cleared" check needed, mirroring `restore_thread_fs_base`'s
+            // own existing unconditional-write discipline at its other call site
+            // (`switch_to_guest`). This call site is reached from arbitrary host Rust code deep
+            // inside a blocked syscall implementation (e.g. a vforked child's own thread
+            // contending on some internal `RawMutex` while handling a guest syscall) -- NOT
+            // exclusively via `switch_to_guest`'s own resume path -- so `switch_to_guest`'s
+            // existing restore does not, by itself, cover every window in which this specific
+            // clearing mechanism can strike between here and the next guest FS-relative access.
+            WindowsUserland::restore_thread_fs_base();
+
             match rc {
                 Win32_Foundation::WAIT_OBJECT_0 => break Ok(UnblockedOrTimedOut::Unblocked),
                 Win32_Foundation::WAIT_TIMEOUT => {
