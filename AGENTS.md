@@ -319,11 +319,33 @@ both Xvfb SIGSEGVs.
    should it be tried against a heavier real daemon fork (`dbus-daemon`'s double-fork-to-daemonize)
    or the full boot. The `LITEBOX_DIAG_FORK_VMA_BREAKDOWN` diagnostic (both call sites, zero cost
    when off) remains permanent and reusable for measuring either fix's real payoff before landing it.
+   **80th pass CONFIRMED item (b) below by direct measurement, not just prediction**: fresh
+   release rebuild with 76th+77th both compiled in (correctness re-verified,
+   `.wfgy/pass80_correctness*.out.log`), then tried tightening `CROSS_PROCESS_FORK_CONCURRENCY_CAP`
+   6->3 (`litebox_shim_linux/src/syscalls/process.rs`) and ran two fresh `de_only.sh` boots on that
+   binary (`Start-Process` + parallel RAM-trajectory polling + an automatic `Invoke-CimMethod
+   Terminate` kill switch, `.wfgy/pass80_ram_trajectory{,2}.csv`/`pass80_boot{1,2}.out.log`): a
+   lower-headroom start (5.78GB free) craterd at WM_POLL n=1/t=92s/18 procs/1.14GB free; a
+   higher-headroom start (~6.8-7GB free) reached WM_POLL n=4/t=140s/25 procs/0.79GB free before the
+   kill switch fired — **the exact same WM_POLL n=4 ceiling the unmodified cap=6 binary already
+   reached in the 77th pass's own Finding 3** (28-29 procs/0.82GB free, ~120s), just ~20s slower and
+   with fewer procs alive at the crater instant (18-25 vs 28-33). Tightening the cap bounds peak
+   INSTANTANEOUS concurrency but not how far the boot gets — REVERTED to 6 (net diff: a doc comment
+   only) since 3 added latency for zero depth benefit. This directly confirms the crater is driven
+   by CUMULATIVE committed memory across the boot's whole fork history (WM_POLL's own loop re-forks
+   `xprop` every 5s regardless of the cap) — i.e. the SAME underlying cost Finding 4's eager-fork-copy
+   theory already identified, just observed from the concurrency angle instead of the per-fork-size
+   angle. **Practical effect: admission-control tuning (item (b)) is now CLOSED as a dead end** —
+   the only lever left that could plausibly change the outcome is Finding 4's lazy-page-fault
+   primitive (already scoped above as its own dedicated multi-pass investigation, not attempted
+   again this pass given the same live tcache-corruption risk without `GLIBC_TUNABLES`). `DE_UP` was
+   NOT reached this pass; chrome-devtools MCP remained `CONNECT_TIMEOUT` (moot, `DE_UP` never fired).
    Lower-priority, still open: (a) decompose remaining per-fork cost between rootfs
    materialization staying resident post its cheap (~83-140ms) build vs. Windows loader overhead
    (77th: a much bigger `debian-xfce` rootfs added only ~16MB over the `stable-slim` baseline, so
-   cost is fork-content- not rootfs-size-dependent); (b) don't just raise the admission-control cap
-   — the bottleneck is per-process SIZE, not slot COUNT; (c) once `DE_UP` fires (or stalls again),
+   cost is fork-content- not rootfs-size-dependent); (b) CLOSED, 80th pass, confirmed by live
+   measurement (see above) — admission-control cap tuning is a dead end, don't re-attempt without a
+   genuinely new angle; (c) once `DE_UP` fires (or stalls again),
    use `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/
    `XCENSUS_ROOTPROP`, real values not `xprop` heuristic text) + `LITEBOX_DIAG_SOCKET_READ_TARGET=
    xfwm4` to check whether the ~10.7s `GetAllProperties` retrigger (69th/70th, still unconfirmed)

@@ -2675,6 +2675,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// low seconds), and a tight spin for that long would burn a full host CPU core on an already
     /// RAM/CPU-pressured boot -- making exactly the problem this fix targets worse.
     fn reserve_cross_process_fork_slot(&self) {
+        // 80th pass (2026-09-23): TRIED tightening 6 -> 3, REVERTED after live measurement.
+        // Two fresh `de_only.sh` boots on this same cap=3 binary (both with 76th+77th's fixes
+        // already landed) converged on the SAME WM_POLL n=4 ceiling the cap=6 binary already
+        // reached (77th pass Finding 3) -- a lower-headroom start (5.78GB free) craterd at
+        // WM_POLL n=1/t=92s/18 procs/1.14GB free, a higher-headroom start (~6.8-7GB free)
+        // reached WM_POLL n=4/t=140s/25 procs/0.79GB free before the kill switch, matching
+        // cap=6's own n=4 ceiling exactly, just ~20s slower. Conclusion: the cap value controls
+        // peak INSTANTANEOUS concurrency (18-25 procs vs cap=6's 28-33) but not how far the boot
+        // ultimately gets -- the crater is driven by CUMULATIVE committed memory across the
+        // whole fork history of the boot (WM_POLL's own 12-iteration retry loop keeps forking
+        // `xprop` every 5s regardless of the cap), not by how many fork children are alive at
+        // once. Tightening the cap further only adds latency for no depth benefit, so left at
+        // the original 6 -- see `docs/AGENTS_ARCHIVE_2026-09-23.md`'s 80th-pass entry for the
+        // full trajectory data (`.wfgy/pass80_ram_trajectory{,2}.csv`). This REFUTES "peak
+        // concurrency" as an independent lever from Finding 4's eager-fork-copy theory: they are
+        // the same underlying cost, just observed from two angles.
         const CROSS_PROCESS_FORK_CONCURRENCY_CAP: u32 = 6;
         const ADMISSION_POLL_ITERATIONS: u32 = 80; // 80 x 100ms = 8s bound
         let counter = &self.global.live_cross_process_fork_children;
