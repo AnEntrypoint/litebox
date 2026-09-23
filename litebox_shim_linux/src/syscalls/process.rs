@@ -3384,6 +3384,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_pipes,
             inherited_files,
             inherited_eventfds,
+            self.sigreturn_trampoline_addr(),
         );
         if handle.is_none() {
             // No child was actually created -- undo the optimistic reservation immediately
@@ -3569,10 +3570,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let old_pm = old_process.pm();
         let regions = old_pm.tracked_regions();
         let (_, brk) = old_pm.tracked_region_summary();
+        // A real, native `fork()` (COW) adoption has no Windows-only 64KiB reservation-group
+        // rounding to account for -- see `PageManager::new_adopting_existing_memory`'s own doc
+        // comment on `group_spans` for why the Windows cross-process-fork caller passes a
+        // non-empty set here and this one correctly passes none.
         let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_existing_memory(
             &self.global.litebox,
             regions.into_iter(),
             brk,
+            core::iter::empty(),
         );
 
         let shared_pending = Arc::new(Mutex::new(super::signal::PendingSignals::new()));
@@ -4768,6 +4774,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
+                        self.sigreturn_trampoline_addr(),
                     )
             {
                 self.process()

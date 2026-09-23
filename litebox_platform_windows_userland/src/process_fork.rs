@@ -885,6 +885,19 @@ pub fn diag_process_fork_task_resume_enabled() -> bool {
 /// guest-visible.
 pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 
+/// Carries the PARENT's own already-established `Task::ensure_sigreturn_trampoline` address (hex,
+/// `0` if never established) across the `CreateProcessW`-spawned child boundary -- see
+/// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s own doc comment on
+/// its `sigreturn_trampoline` parameter for the full bug this closes (found live investigating the
+/// `LITEBOX_LAZY_FORK_COMMIT=1` subshell crash: a fork-without-`execve()` child's own freshly-built
+/// `SignalState` starts this at `0`, even though the real trampoline PAGE CONTENT at that address
+/// is already correctly present via the ordinary group-copy mechanism -- the host's own
+/// sigreturn-recognition logic needs the ADDRESS, not just the bytes, so a signal return the child
+/// needs to service crashes as a genuine, unhandled `SIGSEGV` instead of being recognized and
+/// serviced). Never guest-visible.
+pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
+    "LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE";
+
 /// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
 /// `fd:handle:direction` triples separated by commas (e.g. `3:1a4:w,0:1b0:r`), where `handle` is
 /// the hex value of an inheritable Windows pipe handle already present in the child by virtue of
@@ -1758,6 +1771,7 @@ pub fn spawn_process_fork_child(
     child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
     inherited_files: &[litebox::platform::ForkInheritedFile],
     inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
+    sigreturn_trampoline: usize,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1783,6 +1797,10 @@ pub fn spawn_process_fork_child(
         ("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1".to_string()),
         (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
         (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
+        (
+            FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR,
+            format!("{sigreturn_trampoline:x}"),
+        ),
         // A fork child must never publish host ports.
         //
         // `LITEBOX_PUBLISH` would otherwise be inherited (the block below copies this process's
@@ -2225,7 +2243,6 @@ pub fn spawn_process_fork_child(
             );
         }
     }
-
     // PASS 144 (external-observer diagnostic, kept alongside the fix above): pass 143 found the cross-process child crashing with a genuine
     // `STATUS_ACCESS_VIOLATION` (raw=0xc0000005) AFTER `fork_verify` correctly arms and the FS base
     // is correctly propagated, yet with ZERO corresponding VEH trace output -- not even under

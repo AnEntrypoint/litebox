@@ -73,6 +73,21 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
+    /// Overrides [`Self::new_process`]'s default `0` `sigreturn_trampoline` with the PARENT's own
+    /// already-established value, for a cross-process `fork()` child built via
+    /// `LinuxShim::adopt_forked_process` -- see that function's own doc comment on its
+    /// `sigreturn_trampoline` parameter for the full bug this closes. A real, same-process
+    /// `fork()`/`clone()` child never needs this (`Self::clone_for_new_task` already preserves the
+    /// value directly, since it starts from the parent's own live `SignalState`); this exists only
+    /// because a cross-process child is built from raw `TaskParams` instead, with no parent
+    /// `SignalState` to clone from. `sigreturn_trampoline == 0` is always a safe, correct no-op
+    /// (an address of literally `0` is never a real allocation `sys_mmap`'s own `addr == 0` return
+    /// convention could produce -- see `Task::ensure_sigreturn_trampoline`'s own use of `0` as its
+    /// "not yet allocated"/"allocation failed" sentinel).
+    pub(crate) fn set_sigreturn_trampoline_for_fork_adoption(&self, sigreturn_trampoline: usize) {
+        self.sigreturn_trampoline.set(sigreturn_trampoline);
+    }
+
     /// Build the signal state for a new task from this one, via either `clone()` (a new
     /// *thread* of the same process, `new_process_shared_pending = None`) or `fork()`/`vfork()`
     /// (a genuine new *process*, `new_process_shared_pending = Some(the new Process's

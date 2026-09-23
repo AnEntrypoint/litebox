@@ -1559,7 +1559,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid.get(), addr:% = addr.as_usize(), len:% = len, prot:? = prot;
+            pid:% = self.pid.get(), tid:% = self.tid.get(), addr:% = addr.as_usize(), len:% = len, prot:? = prot;
             "sys_mprotect: entry"
         );
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.

@@ -8563,6 +8563,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 } != 0;
                 if diag_mm_enabled() {
                     litebox_util_log::debug!(
+                        pid:% = std::process::id(),
                         tid:? = std::thread::current().id(),
                         start:% = r.start,
                         end:% = r.end,
@@ -12345,6 +12346,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         inherited_pipes: std::vec::Vec<(i32, litebox::platform::ForkPipeBridge)>,
         inherited_files: std::vec::Vec<litebox::platform::ForkInheritedFile>,
         inherited_eventfds: std::vec::Vec<litebox::platform::ForkInheritedEventfd>,
+        sigreturn_trampoline: usize,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
@@ -12471,6 +12473,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             &child_pipe_handles,
             &inherited_files,
             &inherited_eventfds,
+            sigreturn_trampoline,
         ) {
             Ok(Some((pid, process_handle, thread_handle))) => {
                 litebox_util_log::debug!(

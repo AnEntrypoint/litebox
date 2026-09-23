@@ -1033,11 +1033,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// initial register state to report (the caller already has the forked child's own translated
     /// `PtRegs`, captured at the parent's `fork()` call site) and no argv/envp/entry point to
     /// resolve.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (`0` if the parent never established one) --
+    /// see `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s doc comment
+    /// on its own `sigreturn_trampoline` parameter for why this must be threaded all the way from
+    /// the parent through to here rather than left at `SignalState::new_process`'s own default of
+    /// `0` (found live investigating the `LITEBOX_LAZY_FORK_COMMIT=1` subshell crash: a real,
+    /// 100%-reproducible `SIGSEGV` on a fork-without-`execve()` child needing to return from a
+    /// signal via the trampoline its own already-copied guest memory correctly still has the real
+    /// bytes for, but whose ADDRESS this process's own fresh `SignalState` no longer recognizes).
     pub fn adopt_forked_process(
         &self,
         fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         pm: PageManager<Platform, PAGE_SIZE>,
+        sigreturn_trampoline: usize,
     ) -> LinuxShimEntrypoints<Platform, FS> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -1063,6 +1074,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             shared_pending.clone(),
             None,
         );
+        let signals = syscalls::signal::SignalState::new_process(shared_pending);
+        // See this function's own doc comment on `sigreturn_trampoline` -- `new_process` above
+        // always starts this at `0`; override it with the parent's real, already-established
+        // value (a no-op when the parent never established one, matching a fresh process' own
+        // starting state exactly).
+        signals.set_sigreturn_trampoline_for_fork_adoption(sigreturn_trampoline);
 
         LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -1084,7 +1101,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: RefCell::new(syscalls::signal::SignalState::new_process(shared_pending)),
+                signals: RefCell::new(signals),
                 attached_pty_id: Cell::new(None),
             },
         }

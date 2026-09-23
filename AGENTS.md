@@ -321,8 +321,85 @@ map" below). Condensed current-state trail:
   isolate than this clean minimal repro. `DE_UP` not attempted this pass (would have needed the flag
   on, which is not yet safe). Full repro commands, hex addresses, refuted-delay-theory numbers: this
   file's own git history for this pass plus `docs/AGENTS_ARCHIVE_2026-09-23.md`.
-
-### Track B — current pickup list, precise (full pass-by-pass evidence: archive)
+- **84th — root-caused the 83rd pass's "unexplained `PAGE_READONLY`" to TWO real, independent bugs
+  (both FIXED, both live-verified, neither is lazy-commit-specific), then found the subshell crash
+  is caused by a THIRD, deeper bug in the exception-redirect dispatch that is genuinely
+  lazy-commit-specific and remains OPEN.** Diagnostic method: the project's own rich `eprintln!`/
+  `litebox_util_log::debug!` gates (`LITEBOX_DIAG_FAULT_VQ`, `LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP`,
+  `LITEBOX_DIAG_MM`, `LITEBOX_LOG=litebox_shim_linux=debug`), not `cdb` — sufficient this pass, and
+  much faster to iterate than a live debugger attach for a bug whose signature is fully captured by
+  existing structured logging.
+  - **Bug 1 (FIXED, `litebox/src/mm/linux.rs`'s `Vmem::new_adopting_existing_memory`)**: the
+    crashing page (`0x7feffffef000`, one page short of the group's own end) is `copy_one_group`'s
+    64KiB `VirtualAlloc2`/`MEM_ADDRESS_REQUIREMENTS` alignment padding (real Windows-committed
+    memory, genuinely unmapped-in-the-guest, matches `do_clone`'s own `GRANULE`-rounding, NOT
+    `VmArea::reserved_extra` — that's 16MiB, three orders of magnitude too big). A fresh child's own
+    `sys_mmap` allocator (`get_unmmaped_area`, `litebox/src/mm/linux.rs`) had no record of this
+    padding at all — it is real per-VMA guest layout (`vma_layout()`) that carries no notion of the
+    coarser group rounding — so it could hand a BRAND NEW guest mmap exactly this address, silently
+    succeeding (the underlying Windows page was already committed, so `VirtualAlloc(MEM_COMMIT)` on
+    it is a harmless no-op) and corrupting host memory that, on real 4KiB-granular Linux, would
+    simply have been part of the SAME, single, adjacent VMA. Confirmed live via `LITEBOX_DIAG_MM=1`:
+    `sys_mmap` returned exactly `0x7feffffef000`, the guest then `mprotect`'d it `PROT_READ`. Fix:
+    `new_adopting_existing_memory` now takes the child's OWN real group-relocation spans (`do_clone`'s
+    `groups`, plumbed via `AddressRelocations::group_relocations()` → a new `group_spans` parameter →
+    `PageManager::new_adopting_existing_memory`) and pre-inserts a `VmFlags::VM_OWN_FORK_PADDING`
+    placeholder for each FULL span before adopting real per-VMA regions on top (`RangeMap::insert`
+    narrows/overwrites the placeholder for each real region's own sub-range, leaving it tracked only
+    for the genuine gaps) — `allocate_pages`'s own free-space search (`self.vmas.gaps()`/`.overlaps()`)
+    now correctly treats this padding as claimed. (A parallel widening of `Vmem::duplicate`'s OWN
+    placeholder sizing was ALSO tried and then REVERTED this pass — `do_clone`'s doc comment
+    establishes `Vmem::duplicate`'s grouping feeds only a diagnostic/verification path, never real
+    cross-process-fork placement, and live A/B testing confirmed that change was actively harmful,
+    see Bug 3's own isolation testing below.)
+  - **Bug 2 (FIXED, real but NOT sufficient alone)**: a cross-process-fork child's `SignalState` is
+    built via `SignalState::new_process` (`adopt_forked_process`, `litebox_shim_linux/src/lib.rs`),
+    which starts `sigreturn_trampoline` at `0` — unlike `clone_for_new_task` (the thread-based path),
+    which correctly preserves it. `LinuxShimEntrypoints::exception`'s own x86_64 sigreturn-trampoline
+    recognition (`ctx.rip == self.task.sigreturn_trampoline_addr()`, `litebox_shim_linux/src/lib.rs`)
+    can therefore never match in a forked child that inherits a parent's already-established
+    trampoline (real memory content correctly copied by `copy_one_group`; the Task-level ADDRESS
+    that lets litebox recognize a fault there is what was missing) — exactly the fork-without-execve
+    shape (a subshell keeps running the parent's already-initialized glibc/signal state). Fix: threads
+    the forking parent's own `Task::sigreturn_trampoline_addr()` through
+    `ForkChildVerificationProvider::spawn_cross_process_fork_child`'s new `sigreturn_trampoline`
+    parameter → a new `LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE` env var
+    (`process_fork.rs`) → `adopt_forked_process`'s new parameter →
+    `SignalState::set_sigreturn_trampoline_for_fork_adoption`. Confirmed live (`LITEBOX_LOG=
+    litebox_shim_linux=debug`) the child's own `exception()` now correctly matches `rip ==
+    sigreturn_trampoline_addr()` for a LATER, unrelated signal event in the same run.
+  - **Both bugs are REAL, GENERAL correctness fixes, independent of `LITEBOX_LAZY_FORK_COMMIT`** —
+    live-verified: with BOTH landed, `LITEBOX_PROCESS_FORK=1` alone (flag unset) now runs the exact
+    subshell repro clean 5/5 (previously, on pristine `a7e6a83`, this exact non-lazy case was ALSO
+    already clean — these two bugs were latent/unobserved via this specific repro, not a new
+    regression the 83rd pass introduced; they are real gaps in the general cross-process-fork
+    mechanism this pass's own deeper instrumentation surfaced).
+  - **Bug 3 (OPEN, lazy-commit-specific): with `LITEBOX_LAZY_FORK_COMMIT=1`, the exact subshell repro
+    STILL crashes 5/5, byte-identical signature, even with both bugs above fixed.** Precisely
+    characterized this pass, narrower than the 83rd pass's own framing: the fault DOES reach
+    `vectored_exception_handler`, which DOES redirect the thread context to `exception_callback`
+    (confirmed via a temporary, since-removed trace immediately before the `context.Rip =
+    exception_callback` assignment) — but `LinuxShimEntrypoints::exception()` is never observably
+    entered afterward (confirmed via a temporary, since-removed `pid`-tagged trace: the only
+    `exception()` call in a full run belonged to the ORIGINAL, never-forked bootstrap process
+    handling an unrelated LATER signal, never the crashing forked child). The bug is therefore
+    somewhere between the VEH's redirect and the shim's `exception()` being invoked — inside
+    `exception_callback` itself (`litebox_platform_windows_userland/src/lib.rs`, hand-written
+    assembly) or `thread_ctx.call_shim`'s own bridging — not in trampoline-address recognition, which
+    Bug 2's fix already makes correct. **Methodological finding, load-bearing for any future pass
+    touching `vectored_exception_handler`**: adding EVEN GATED, LOW-VOLUME `eprintln!`/extra local
+    variables to that function (tried this pass: a `pid`/`is_in_guest`/`veh_depth`-enriched
+    `[veh-regs]` line and one new gated print) measurably REGRESSED the NON-lazy case too (broke the
+    now-clean 5/5 above back to 5/5 killed) — reverting those specific diagnostic-only additions
+    (keeping the real fixes) restored the clean non-lazy result. Confirmed via live A/B isolation,
+    not assumed. Matches this file's own standing caution about `VEH_FRAME_STRIDE`/exact stack-frame
+    sizing in this function; any future instrumentation of `vectored_exception_handler` MUST be
+    A/B-tested against the non-lazy repro before being trusted. **Pickup**: a live `cdb -pv` attach on
+    `exception_callback`/`call_shim` themselves (not `vectored_exception_handler`, which is now known
+    diagnostic-instrumentation-sensitive) is the next concrete step — breakpoint on
+    `exception_callback`'s own entry and single-step into `call_shim` to find exactly where control
+    diverges before reaching `LinuxShimEntrypoints::exception`. `LITEBOX_LAZY_FORK_COMMIT` stays
+    default OFF; `DE_UP` not attempted this pass (the flag is not yet safe to enable for a real boot).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
@@ -344,25 +421,30 @@ both Xvfb SIGSEGVs.
    touches Windows' own `VirtualAlloc2(MEM_COMMIT)` charge. **83rd pass IMPLEMENTED the one
    remaining lever, genuine per-page lazy population (`litebox_platform_windows_userland::
    lazy_fork_commit`, `LITEBOX_LAZY_FORK_COMMIT=1`)** — real, measured win for fork-then-execve
-   (the dominant real case), but found a genuine, 100%-reproducible, NOT-yet-root-caused correctness
-   bug for fork-without-execve (a bash subshell killed by a real AV in a region outside every lazy
-   range, unexplained `PAGE_READONLY` protection, timing-delay theory refuted). **Feature stays
-   default OFF pending that bug's root cause — do not flip it on for a real boot attempt** until
-   fixed; see this module's own doc comment (KNOWN UNSAFE CASE section) and the 83rd pass's own
-   pass-history entry above for the full repro/evidence. **Next pickup, precise**: a live `cdb -pv`
-   attach (debug binary) on the subshell repro
+   (the dominant real case). **84th pass fixed TWO real, general (non-lazy-specific) cross-process-
+   fork bugs the subshell repro's deeper instrumentation surfaced** (guest-mmap-into-64KiB-rounding-
+   -padding collision, and forked children never inheriting the parent's `sigreturn_trampoline`
+   address — see that pass's own pass-history entry above for both fixes' full mechanism) **and
+   precisely re-scoped the remaining, still-OPEN bug**: with both fixes landed, the subshell repro is
+   clean 5/5 WITHOUT the lazy flag, but STILL crashes 5/5 WITH it — the fault reaches
+   `vectored_exception_handler` and gets redirected toward `exception_callback`, but
+   `LinuxShimEntrypoints::exception()` is never observably entered, meaning the remaining bug lives
+   inside `exception_callback`'s own hand-written-assembly trampoline or `call_shim`'s bridging, not
+   in permission/trampoline-recognition logic. **Feature stays default OFF** pending that bug's root
+   cause — do not flip it on for a real boot attempt until fixed. **Next pickup, precise**: a live
+   `cdb -pv` attach (debug binary) breaking on `exception_callback`'s own entry (NOT on
+   `vectored_exception_handler` generally — the 84th pass found that function's compiled layout is
+   sensitive enough to EXTRA instrumentation that adding a few gated diagnostic lines there measurably
+   regressed the non-lazy case; any new probe there needs an A/B test against the non-lazy repro
+   before being trusted) and single-stepping into `call_shim` to find exactly where control diverges
+   before reaching `LinuxShimEntrypoints::exception`, using the subshell repro
    (`bash -c '(echo subshell_child; x=inner_var; echo $x); echo parent_after'` under
-   `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1`), breaking on the crash's own faulting address
-   class (an `EXCEPTION_ACCESS_VIOLATION` code-fetch, `PAGE_READONLY` protection, outside every
-   registered lazy range) to find what sets that protection and why only the lazy path exposes it;
-   the leading untested hypothesis is an interaction with `fork_verify.rs`'s own watched-code-page
-   machinery (its own `[codewatch]` diagnostic logged `watched=false` for the exact faulting page
-   this pass's repro produced). Once fixed and re-verified 5/5 clean on BOTH the fork-then-execve
-   AND fork-without-execve repros, the next step is the full `DE_UP` boot attempt with the flag on.
-   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero cost when off) remains the permanent
-   tool for measuring any future fix's real payoff before landing it. `DE_UP` has not been reached
-   by any pass through the 83rd; chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was
-   checked (moot until `DE_UP` fires). Lower-priority, still open: (a) decompose
+   `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1`). Once fixed and re-verified 5/5 clean on BOTH
+   the fork-then-execve AND fork-without-execve repros, the next step is the full `DE_UP` boot attempt
+   with the flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero cost when off) remains
+   the permanent tool for measuring any future fix's real payoff before landing it. `DE_UP` has not
+   been reached by any pass through the 84th; chrome-devtools MCP has been `CONNECT_TIMEOUT` every
+   time it was checked (moot until `DE_UP` fires). Lower-priority, still open: (a) decompose
    remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
    build vs. Windows loader overhead; (b) once `DE_UP` fires (or stalls again), use
    `de_only_xcensus_seed3.tar`'s working `/tmp/xcensus.py` (`XCENSUS_SELECTION`/`XCENSUS_ROOTPROP`,

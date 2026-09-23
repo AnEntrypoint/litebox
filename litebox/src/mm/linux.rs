@@ -876,12 +876,58 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         platform: &'static Platform,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
         brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
     ) -> (Self, usize, usize) {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk,
             platform,
         };
+        // Cross-process-fork guest-mmap-into-rounding-padding bug (subshell-crash investigation,
+        // `lazy_fork_commit.rs`'s own doc comment has the full repro/evidence): the REAL,
+        // production group-relocation spans this child's own `copy_one_group`/
+        // `reserve_group_lazy` (`litebox_platform_windows_userland::process_fork`) actually
+        // reserved+committed on the Windows side (`litebox_shim_linux::syscalls::process::do_clone`'s
+        // own 64KiB-`GRANULE`-widened `groups` computation, NOT `Vmem::duplicate`'s -- that one
+        // feeds only a diagnostic/verification path) can extend up to 65535 bytes past this
+        // group's own real, page-granular guest VMAs on either side (`GRANULE` alignment padding
+        // for `VirtualAlloc2`'s `MEM_ADDRESS_REQUIREMENTS`, which needs 64KiB-aligned bounds).
+        // `regions` below (== `AddressRelocations::vma_layout()`) has NO entry for that padding --
+        // it is real, per-VMA guest layout, at page granularity, with no notion of the coarser
+        // group rounding at all. Without recording the padding here too, this child's own
+        // `allocate_pages`/guest-`mmap()` bookkeeping believes that padding is ordinary free
+        // address space and can hand it out for a fresh mapping -- corrupting host memory that, on
+        // real (4KiB-granular) Linux, would simply have been part of the SAME, single, adjacent
+        // VMA. Confirmed live: a forked child's own guest `mmap()` was handed exactly such a
+        // padding range immediately following a real executable VMA, `mprotect`'d it `PROT_READ`,
+        // and a later genuine control-flow transfer into that same address (needing the real code
+        // that belongs there) code-fetch-faulted on a now-non-executable page.
+        //
+        // Insert a `VM_OWN_FORK_PADDING` placeholder for each group's FULL span FIRST, before the
+        // real per-region adoption loop below -- `RangeMap::insert` overwrites/narrows whatever was
+        // there for the inserted sub-range, so every real VMA's own `insert` below correctly
+        // replaces this placeholder across its own extent, leaving the placeholder in place only
+        // for the genuine gaps (rounding padding, and any other group-internal hole `do_clone`'s
+        // own widen-and-merge already tolerates -- see that function's own doc comment on why
+        // `read_source_bytes` reads a group page at a time rather than assuming the whole span is
+        // readable). Malformed/unaligned input is skipped, never panics, matching this function's
+        // own existing "degrade, never crash the process being diagnosed" contract for `regions`.
+        for group in group_spans {
+            if group.start >= group.end || group.start % ALIGN != 0 || group.end % ALIGN != 0 {
+                continue;
+            }
+            vmem.vmas.insert(
+                group,
+                VmArea {
+                    flags: VmFlags::VM_OWN_FORK_PADDING,
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
+        }
         let mut adopted = 0usize;
         let mut shared = 0usize;
         for (range, flag_bits, is_file_backed) in regions {

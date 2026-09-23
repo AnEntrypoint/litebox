@@ -1670,11 +1670,20 @@ fn diag_process_fork_vmem_adopt_probe(
     // The SAME `ALIGN` the shim's own `PageManager` uses (`LinuxShim::page_manager`'s
     // `PageManager<Platform, PAGE_SIZE>`), so this reconstruction is directly comparable to the
     // real one a future pass would install in its place.
+    // The group-relocation spans this child's OWN `copy_one_group`/`reserve_group_lazy` calls
+    // (in the PARENT, at spawn time) actually reserved+committed real host memory for -- see
+    // `PageManager::new_adopting_existing_memory`'s own doc comment for why these must be
+    // recorded here too, not just `expected`/`vma_layout()`.
+    let group_spans: Vec<core::ops::Range<usize>> = relocations
+        .group_relocations()
+        .iter()
+        .map(|(span, _dest_base)| span.clone())
+        .collect();
     let (page_manager, adopted, shared) = litebox::mm::PageManager::<
         Platform,
         { litebox::mm::linux::PAGE_SIZE },
     >::new_adopting_existing_memory(
-        litebox, expected.iter().cloned(), heap_top
+        litebox, expected.iter().cloned(), heap_top, group_spans.into_iter()
     );
     diag_elapsed!("PageManager::new_adopting_existing_memory returned");
 
@@ -1826,7 +1835,16 @@ fn diag_process_fork_task_resume_probe(
         egid: 0,
     };
     let fs_for_export = fs.clone();
-    let entrypoints = shim.adopt_forked_process(fs, task_params, page_manager);
+    // See `LinuxShim::adopt_forked_process`'s own doc comment on `sigreturn_trampoline`: the
+    // parent's own already-established trampoline address (0 if it never established one),
+    // carried across the `CreateProcessW` boundary by `spawn_process_fork_child`'s own export --
+    // see `litebox_platform_windows_userland::process_fork::FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR`.
+    let sigreturn_trampoline = std::env::var(pf::FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR)
+        .ok()
+        .and_then(|s| usize::from_str_radix(&s, 16).ok())
+        .unwrap_or(0);
+    let entrypoints =
+        shim.adopt_forked_process(fs, task_params, page_manager, sigreturn_trampoline);
 
     // Reopen the regular-file fds the parent held.
     //

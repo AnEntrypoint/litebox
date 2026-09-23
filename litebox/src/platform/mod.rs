@@ -1181,6 +1181,19 @@ pub trait ForkChildVerificationProvider {
     /// Takes `&'static self` because those pump threads outlive this call and need the platform to
     /// build their own per-thread wait state -- every caller already holds the platform as
     /// `&'static` (`GlobalState::platform`), so this costs nothing.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (0 if never established) -- real guest memory
+    /// at that address is already correctly carried over by the ordinary group-copy mechanism,
+    /// but the CHILD's own freshly-built `Task`/`SignalState` (`adopt_forked_process`, never
+    /// `clone_for_new_task`) starts this at `0` unless the caller threads it through explicitly.
+    /// Without this, a forked child that never re-establishes its OWN trampoline (the common case
+    /// for a `fork()`-without-`execve()` child, e.g. a shell subshell, which keeps running the
+    /// SAME already-initialized glibc/signal state its parent set up) can be delivered a signal
+    /// whose real ABI-correct, deliberately-non-executable trampoline page the host's own
+    /// sigreturn-recognition logic no longer recognizes as such -- see
+    /// `Task::ensure_sigreturn_trampoline`'s x86_64 doc comment for why that page is never meant
+    /// to be actually executed, only recognized.
     fn spawn_cross_process_fork_child(
         &'static self,
         relocations: &crate::mm::AddressRelocations,
@@ -1188,12 +1201,14 @@ pub trait ForkChildVerificationProvider {
         inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
         inherited_files: alloc::vec::Vec<ForkInheritedFile>,
         inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
+        sigreturn_trampoline: usize,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
         let _ = inherited_pipes;
         let _ = inherited_files;
         let _ = inherited_eventfds;
+        let _ = sigreturn_trampoline;
         None
     }
 

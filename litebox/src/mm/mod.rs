@@ -713,13 +713,31 @@ where
     /// region is adopted with its flags but WITHOUT a usable platform shared-memory handle (the
     /// parent's handle is meaningless in this process), so a caller should surface a non-zero
     /// second count rather than treat such a region as fully reconstructed.
+    ///
+    /// `group_spans` is the set of coarser, 64KiB-rounded reservation-group spans the CALLER
+    /// actually reserved+committed real host memory for (Windows cross-process fork only --
+    /// `litebox_platform_windows_userland::process_fork`'s `copy_one_group`/`reserve_group_lazy`;
+    /// empty for a real, native-`fork()`-COW adoption, which has no such rounding at all). Each
+    /// span may extend up to 65535 bytes past its own real, page-granular guest VMAs on either
+    /// side -- alignment padding `regions` has no entry for at all, since `regions` is real,
+    /// per-VMA guest layout with no notion of the coarser group rounding. Recorded here as
+    /// `VmFlags::VM_OWN_FORK_PADDING` placeholders so this process's own later guest `mmap()`
+    /// bookkeeping never mistakes that real, already-committed host memory for free address
+    /// space -- see `linux::Vmem::new_adopting_existing_memory`'s own doc comment for the full
+    /// bug this closes (found live investigating the `LITEBOX_LAZY_FORK_COMMIT=1` subshell
+    /// crash).
     pub fn new_adopting_existing_memory(
         litebox: &LiteBox<Platform>,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
         brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
     ) -> (Self, usize, usize) {
-        let (vmem, adopted, shared) =
-            linux::Vmem::new_adopting_existing_memory(litebox.x.platform, regions, brk);
+        let (vmem, adopted, shared) = linux::Vmem::new_adopting_existing_memory(
+            litebox.x.platform,
+            regions,
+            brk,
+            group_spans,
+        );
         (
             Self {
                 vmem: RwLock::new(vmem),
