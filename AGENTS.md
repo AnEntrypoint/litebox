@@ -9,7 +9,7 @@ for a trail, never as a starting point.
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th,
 81st, 83rd and 85th passes (pass-history section below; 26th-69th full narrative:
-`docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-85th full narrative, including each pass's own complete
+`docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-86th full narrative, including each pass's own complete
 evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). Re-compacted 85th pass (drained
 the 83rd/84th passes' own full bug-by-bug writeups to the archive, ~50KB→~41KB, now that this file
 was well past its own 30KB threshold).
@@ -316,6 +316,47 @@ map" below). Condensed current-state trail:
   Bug 4 means it is STILL not safe for a real boot (a real desktop forks many long-lived daemons
   that don't `execve()` and run concurrently with a parent still mutating its own heap — exactly
   Bug 4's trigger shape). `DE_UP` not attempted this pass.
+- **86th** — investigated both of Bug 4's candidate fixes in depth (source reading, no code
+  changed), concluded NEITHER is viable as a net improvement, found and scoped a THIRD candidate,
+  also not implemented. Re-verified live (debug, unmodified binary) that nothing had drifted: flag
+  unset stays clean, flag set still hits the exact documented `malloc.c:2601` signature.
+  **Candidate 2 (real section-object COW) ruled out**: every guest allocation
+  (`WindowsUserland::allocate_pages`/`deallocate_pages`/`update_permissions`) is built on private
+  `VirtualAlloc2`, never a section — retrofitting COW needs section-backing from allocation time,
+  not fork time (no "adopt existing private memory into a section" API exists; the only way is to
+  copy the bytes, which is the cost this mechanism exists to avoid). Concrete evidence this is a
+  disruptive rewrite, not a scoped fix: `deallocate_pages` (`lib.rs`:~8469) already explicitly
+  refuses to decommit a `MEM_MAPPED` view (Windows can't partially unmap a section view the way
+  Linux `munmap` can unmap a sub-range); this exact codebase's own `SHARED_KERNEL_HEAP_BASE` fight
+  (`lib.rs`:~10355) already hit `ERROR_INVALID_ADDRESS` on every `SEC_RESERVE`/placeholder variant
+  tried, ASLR placement failures, and an eager-full-commit-charge trap, for ONE fixed-size, fixed-
+  address region — the guest VMA allocator handles an open-ended number of dynamically-placed,
+  `MAP_FIXED`-capable regions, the same problem at much larger scope. **Candidate 1 (fork-time
+  snapshot) ruled out**: a race-free snapshot must be captured synchronously while the parent is
+  blocked in its own fork syscall (same window the eager path already uses) — which means reading
+  every byte of every eligible group at fork time regardless of whether the child ever touches it
+  or is about to `execve()`, since nothing distinguishes the two cases at fork time. That forfeits
+  the 83rd pass's own measured win (103ms eager vs 34ms mixed, debug) for the dominant
+  fork-then-`execve` case (~85% of forks, 79th pass) — a snapshot design would make EVERY fork pay
+  full eager-read cost unconditionally, strictly worse than just keeping such groups eager.
+  **Candidate 3 (new, found this pass): software COW via guard pages** — `VirtualProtect` an
+  eligible group `PAGE_READONLY` in the parent at fork time (O(1), not O(bytes)); a new parent-side
+  VEH catches the parent's own next write, snapshots the one page, unprotects it, lets the write
+  retry; the child's existing VEH prefers a recorded snapshot over a live `ReadProcessMemory` when
+  one exists. Correctness-sound for exactly ONE live fork child, but a real boot needs up to 6
+  concurrent children (`live_cross_process_fork_children`'s cap, 76th pass) forking from the same
+  continuously-mutating parent — a single global protect/snapshot/unprotect cycle is provably wrong
+  across 2+ overlapping fork generations (a later child can be served an earlier child's stale
+  snapshot instead of the parent's true value as of its own later fork). Closing this needs a real
+  multi-generation/multi-version COW protocol — the same complexity class as the mechanism that
+  already took three passes (83rd-85th) to get right in its simpler, single-direction form.
+  **Not implemented — this pass's own conclusion is that shipping the full multi-generation version
+  without an equivalent live-debug budget risks a silently-wrong-data bug, worse than today's honest
+  crash.** Narrower first cut identified for a future pass: fall back to eager copy the moment a
+  SECOND concurrent live fork child would otherwise need to share one protected page, keeping the
+  fast path only for the common single-active-fork-child moment. `LITEBOX_LAZY_FORK_COMMIT` stays
+  default OFF, unchanged; no runtime behavior modified this pass; `DE_UP` not attempted. Full
+  writeup: `lazy_fork_commit.rs`'s own module doc comment (this pass's own section).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
@@ -347,13 +388,22 @@ both Xvfb SIGSEGVs.
    both builds.** `LITEBOX_LAZY_FORK_COMMIT` stays default OFF — Bug 4 makes it genuinely unsafe for
    any real boot (a real desktop forks many long-lived daemons that don't `execve()` and run
    concurrently with a parent still mutating its own heap, exactly Bug 4's trigger shape). Full
-   mechanics of all four bugs: archive and `lazy_fork_commit.rs`'s own module doc comment. **Next
-   pickup, precise**: fix Bug 4 (needs either a fork-time snapshot of lazy-eligible bytes into a
-   buffer instead of a live parent read, or genuine OS-level COW between the two Windows processes —
-   real design work, not a quick patch), then re-verify 5/5 clean on BOTH repros, both builds, before
-   ever attempting the full `DE_UP` boot with the flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both
-   call sites, zero cost when off) remains the permanent tool for measuring any future fix's real
-   payoff before landing it. `DE_UP` has not been reached by any pass through the 85th;
+   mechanics of all four bugs: archive and `lazy_fork_commit.rs`'s own module doc comment. **86th
+   pass ruled out both of Bug 4's originally-proposed fixes** (real section-object COW needs a
+   disruptive full-allocator rewrite — every guest allocation is private `VirtualAlloc2`, never
+   section-backed, and this codebase's own `SHARED_KERNEL_HEAP_BASE` fight already shows how fragile
+   that retrofit is even for one fixed region; a fork-time snapshot buffer is race-free only if
+   captured synchronously, which forfeits the dominant fork-then-`execve` case's entire measured win)
+   **and scoped a third: software COW via parent-side guard pages (`VirtualProtect(PAGE_READONLY)` +
+   a parent-side VEH mirroring the existing child-side one), sound for ONE live fork child but a real
+   multi-generation/multi-version design problem for the 6-concurrent-children case a real boot
+   needs — not implemented, needs its own live-debug pass.** **Next pickup, precise**: either scope
+   and implement candidate 3's multi-generation protocol properly (per-page generation tracking, or
+   the narrower "fall back to eager the moment a second concurrent child would share one protected
+   page" first cut), then re-verify 5/5 clean on BOTH repros, both builds, before ever attempting the
+   full `DE_UP` boot with the flag on. `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` (both call sites, zero
+   cost when off) remains the permanent tool for measuring any future fix's real payoff before
+   landing it. `DE_UP` has not been reached by any pass through the 86th;
    chrome-devtools MCP has been `CONNECT_TIMEOUT` every time it was checked (moot until `DE_UP`
    fires). Lower-priority, still open: (a) decompose
    remaining per-fork cost between rootfs materialization staying resident post its cheap (~83-140ms)
@@ -474,7 +524,7 @@ clobbered `STARTF_USESTDHANDLES`), presenter-process split (`docs/presenter-proc
 
 ## Docs and tooling map
 
-- **Archives** (newest first) — `_2026-09-23.md` (70th-85th passes, full narrative: the `xfwm4`
+- **Archives** (newest first) — `_2026-09-23.md` (70th-86th passes, full narrative: the `xfwm4`
   writable-layer-export fix, the live-captured RAM-crater process tree, the 76th-pass
   admission-control fix's honest partial-success evidence, and the full 83rd-85th lazy-fork-commit
   bug-by-bug writeup — all four bugs, exact repro logs, both candidate real fixes for the still-open

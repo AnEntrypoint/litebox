@@ -79,6 +79,121 @@
 //! heap, which is exactly Bug B's trigger shape -- worse and harder to isolate than this clean,
 //! minimal, 100%-reproducible standalone repro.
 //!
+//! # 86th pass -- both proposed real fixes for Bug B investigated in depth, NEITHER implemented;
+//! a THIRD candidate found and scoped, also not implemented this pass. Flag stays default OFF.
+//!
+//! Re-verified live (debug build, unmodified binary) before starting: flag unset, subshell repro
+//! 100% clean (`subshell_child`/`inner_var`/`parent_after` all print); flag set, subshell repro
+//! still hits the exact documented Bug B signature (`Fatal glibc error: malloc.c:2601 (sysmalloc):
+//! assertion failed`). Both match this file's own prior claims byte-for-byte -- nothing had
+//! drifted since the 85th pass.
+//!
+//! **Candidate 2 (genuine OS-level section-object COW) -- investigated via source reading,
+//! concluded structurally infeasible without a disruptive full-allocator rewrite, NOT attempted.**
+//! Every guest memory allocation in this crate -- [`WindowsUserland`]'s `allocate_pages`/
+//! `deallocate_pages`/`update_permissions`/`unmap_shared_memory` (the entire `PageManagementProvider`
+//! impl backing guest `mmap`/`munmap`/`mprotect`/heap/stack) -- is built exclusively on PRIVATE
+//! `VirtualAlloc2(MEM_RESERVE|MEM_COMMIT)` regions, never a section object; retrofitting real
+//! `MapViewOfFile3`/`PAGE_WRITECOPY` COW at fork time requires the memory to have been
+//! SECTION-BACKED from the point of allocation, not converted after the fact (Windows has no
+//! "adopt this already-populated private VirtualAlloc range into a section" primitive -- the only
+//! way to move existing bytes into a section is to copy them, which is the exact per-byte cost
+//! this whole mechanism exists to avoid, and would have to be paid once per allocation rather than
+//! once per fork if done "from the start"). Two concrete, code-level reasons this is a disruptive
+//! rewrite, not a scoped fix:
+//!   1. `deallocate_pages` (`lib.rs`, ~line 8469-8496) EXPLICITLY REFUSES to decommit a `MEM_MAPPED`
+//!      section view, logging an error and leaving it alone, because `VirtualFree(MEM_DECOMMIT)` is
+//!      only valid on privately-committed memory. A real Linux `munmap()` can unmap an arbitrary
+//!      sub-range of a larger mapping; a Windows section view can only be unmapped WHOLE (partial
+//!      "unmap" needs the `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` split/coalesce dance).
+//!      Every guest `munmap`/`mprotect` sub-range call on a section-backed group would need this
+//!      placeholder machinery, not a `VirtualFree` one-liner.
+//!   2. This exact codebase already fought this exact battle, for ONE fixed-size, fixed-address,
+//!      narrowly-scoped region (`SHARED_KERNEL_HEAP_BASE`/`SHARED_KERNEL_HEAP_SIZE`, `lib.rs`
+//!      ~line 10355-10394's own doc comment) and the trail is a live record of how fragile it is:
+//!      plain `SEC_RESERVE` sections, `MEM_RESERVE`-type views, and the documented
+//!      `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` pair ALL failed `ERROR_INVALID_ADDRESS`
+//!      at that fixed address (only a genuinely `SEC_COMMIT` section succeeded there, which then had
+//!      to be immediately `VirtualFree(MEM_DECOMMIT)`-ed to avoid charging the FULL size against
+//!      system commit at creation time -- a section is not lazily committed by default, another trap
+//!      this design would have to reopen); a fixed placement at a high canonical address is also not
+//!      collision-guaranteed against ASLR (`SHARED_KERNEL_HEAP_ACTUAL_BASE`'s own fallback path,
+//!      confirmed live via `cdb`, `STATUS_CONFLICTING_ADDRESSES`). Reproducing this fight for a
+//!      SINGLE bounded region already needed several iterations; the guest VMA allocator handles an
+//!      open-ended number of dynamically-sized, dynamically-placed, `MAP_FIXED`-capable regions
+//!      across a real boot's whole process tree -- the same class of problem at much larger, less
+//!      bounded scope. This is exactly the "too large/risky for one pass" case the task's own
+//!      fallback anticipates -- not attempted.
+//!
+//! **Candidate 1 (fork-time snapshot buffer) -- investigated rigorously, concluded it cannot
+//! preserve the dominant fork-then-execve case's own measured win, so it is not a net improvement,
+//! NOT attempted.** Any snapshot that is actually race-free must be captured SYNCHRONOUSLY while
+//! the parent's guest thread is still blocked inside the fork syscall handler -- exactly the window
+//! [`reserve_group_lazy`] currently does nothing in, and exactly the window the EAGER
+//! `copy_one_group` path already exploits for its own immunity to Bug B (see this file's own
+//! "Correctness argument" section, and the 81st pass's `AGENTS.md` entry, which already proved
+//! there is no way to defer POPULATION past this point without reopening a `fork()`-without-
+//! `execve()` write race -- the same argument applies unchanged to deferring the READ/CAPTURE side
+//! for a snapshot). Capturing a stable snapshot synchronously means touching (reading) every byte
+//! of every eligible group at fork time, REGARDLESS of whether the child ever touches that memory
+//! -- because at fork time nothing yet distinguishes a fork that is about to `execve()` (the
+//! dominant, ~85% case, 79th pass) from one that is not. That read is the same order of cost as
+//! the eager path's own `ReadProcessMemory` loop this mechanism exists to avoid paying for the
+//! dominant case; storing the captured bytes somewhere other than the child's own committed guest
+//! memory (e.g. a scratch file) avoids re-adding the CHILD's `VirtualAlloc(MEM_COMMIT)` charge for
+//! untouched pages, but does nothing for the TIME cost, which is what the 83rd pass's own measured
+//! win (103ms eager vs 34ms mixed, debug; proportionally larger release win) was actually about --
+//! net effect, a "safe" snapshot design would make EVERY fork pay full eager-equivalent read cost
+//! unconditionally, which is strictly worse than simply keeping such groups on the existing eager
+//! `copy_one_group` path (same read cost, but writes directly into place with no extra buffer hop
+//! or later re-fault indirection). Not a net improvement -- not attempted.
+//!
+//! **Candidate 3 (found this pass, not part of the original two): software COW via guard pages,
+//! symmetric with this module's own existing child-side VEH.** Sketch: at fork time, instead of
+//! doing nothing (today's [`reserve_group_lazy`]) for an eligible group's ALREADY-COMMITTED pages
+//! in the PARENT, `VirtualProtect` them to `PAGE_READONLY` (an O(1) call per contiguous committed
+//! sub-range, not O(bytes) -- cheap, same performance class as the rest of this mechanism). Install
+//! a SECOND VEH, on the PARENT side, that catches the parent's own next WRITE fault to such a page:
+//! on that fault, snapshot the page's CURRENT (pre-write) bytes into a small side buffer, restore
+//! `PAGE_READWRITE` on just that one page so the write can retry and succeed, and record that a
+//! snapshot now exists for that address. The CHILD's existing [`lazy_commit_veh`] would then, on
+//! its own first fault, prefer a recorded snapshot over a live `ReadProcessMemory` if one exists
+//! (closing Bug B for the single-fork-child case: the child's data is now genuinely stable, either
+//! because the parent has not yet raced ahead of it, protected by `PAGE_READONLY`, or because a
+//! stable pre-write snapshot was captured at the exact moment the parent tried to). **This is
+//! correctness-sound for exactly one live fork child at a time, but a real desktop boot needs up
+//! to `litebox_shim_linux::GlobalState`'s `live_cross_process_fork_children` admission control's
+//! own cap of 6 CONCURRENT long-lived children forking from the same continuously-mutating parent
+//! (`AGENTS.md`'s 76th-pass finding) -- and a
+//! single global "protect once, snapshot once, unprotect" cycle is provably wrong for 2+ overlapping
+//! generations: if child A forks, the parent later write-faults and captures+unprotects a page, and
+//! child B THEN forks (after that write), B's own fault handler must NOT reuse A's stale pre-write
+//! snapshot -- it needs the parent's CURRENT (post-write) value as of B's own later fork moment,
+//! which requires either re-protecting on every new fork (itself fine, cheap) or a real
+//! multi-generation/multi-version scheme so a later child's read cannot be served A's earlier
+//! snapshot. Getting this fully correct is a genuine concurrent multi-version-COW design problem
+//! (per-page generation tracking, fan-out to N potentially-still-behind children on a single parent
+//! write, race-free coordination between the parent's own write-fault handler and every live
+//! child's independent read-fault handler touching the same physical page) -- the same order of
+//! design complexity as this module's OWN existing single-generation, single-direction mechanism,
+//! which took three consecutive full passes (83rd-85th) of live `cdb`/diagnostic-gated iteration to
+//! get right even in its simpler form. Attempting the full multi-generation version without an
+//! equivalent live-debug budget in one pass risks shipping an unverified, silently-wrong-data
+//! mechanism (not merely a crash) -- worse than the current honest crash, and exactly what the
+//! standing goal forbids. **Not implemented this pass.** Most promising narrower first cut, left
+//! for a future pass to scope further: force any group affected by a SECOND concurrent live
+//! fork-child (i.e. only take the fast single-generation guard-page path when at most one
+//! outstanding, not-yet-`execve()`'d/not-yet-exited child could still be depending on that parent's
+//! memory; fall back to eager copy the moment a second overlapping fork would otherwise need to
+//! share the same protected page) -- trades away laziness only under real multi-child contention,
+//! which live 76th-pass evidence suggests is common during a real boot's fork storm but not
+//! universal, while keeping the fast path for the common single-active-fork-child moment. Needs its
+//! own live-verification pass before being trusted, exactly as this module's other two bugs did.
+//!
+//! **Conclusion: [`lazy_fork_commit_enabled`] stays default OFF, unchanged this pass. No runtime
+//! behavior was modified.** `DE_UP` was not attempted (the flag remains unsafe to enable for a real
+//! boot). See `AGENTS.md`'s 86th-pass entry for the compact version of this writeup.
+//!
 //! # Why this exists
 //!
 //! `copy_one_group` (this crate's `process_fork` module) reserves AND fully commits AND
