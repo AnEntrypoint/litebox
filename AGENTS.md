@@ -8,29 +8,41 @@ for a trail, never as a starting point.
 
 Also the single source of truth for standing rules. A future "remember this" belongs here as one
 line plus its pointer, not a separate memory file. Compacted at the 65th, 70th, 72nd, 75th, 76th,
-81st, 83rd, 85th, 88th, 91st, 93rd, 95th, 98th and 101st passes (pass-history section below;
+81st, 83rd, 85th, 88th, 91st, 93rd, 95th, 98th, 101st and 104th passes (pass-history section below;
 26th-69th full narrative: `docs/AGENTS_ARCHIVE_2026-09-22.md`; 70th-100th full narrative, including
-each pass's own complete evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md`). 101st
-pass drained the 98th-100th passes' own full blow-by-blow (72.8KB -> ~52KB) and this file's own
-redundant top-of-file recap of that same material (~52KB -> see below); "Docs and tooling map"/
-"Closed" remain the next drain candidates for a future pass still working toward the 30KB target.
+each pass's own complete evidence and fix rationale: `docs/AGENTS_ARCHIVE_2026-09-23.md` -- the
+91st-102nd condensed bullets below cite this same archive for their own full narrative, further
+trimmed by the 104th pass since nothing below drops information not already there). Still over the
+30KB target; "Docs and tooling map"/"Closed" remain further drain candidates for a future pass.
 
-**Where things stand, in one paragraph (updated 103rd pass)**: cross-process fork
-(`LITEBOX_PROCESS_FORK=1`) alone remains solid and the default-safe path -- and the 103rd pass is
-the first to confirm, on the CURRENT binary, that it gets FURTHER than previously known: `xfwm4`
-launches and survives (no crash) with real X11 windows created, but the boot still hits the
-long-standing pre-83rd-pass RAM crater (Track B item 1) before `DE_UP`. **`LITEBOX_LAZY_FORK_COMMIT=1
-LITEBOX_LAZY_FORK_GUARD_COW=1` is NOT safe and must NOT be used for a real boot attempt**: the 103rd
-pass proved the "Angle B `rc=139`" SIGSEGV the 100th-102nd passes tracked as a narrow, non-blocking
-correctness bug is in fact pervasive (hits `xset`/`xprop`/`rm`/`mkdir`/`sleep` -- essentially any
-forked-then-exec'd child, not just the fork-without-execve subshell case the 83rd/84th passes
-originally scoped it to) and IS the direct, confirmed cause of `DE_FAILED` under that config: real
-boot evidence shows `xfce4-session` itself dies of an unhandled `STATUS_ACCESS_VIOLATION`
-(`0xC0000005`) ~16s into its run, before ever launching the window manager. See the 103rd-pass
-pass-history entry below for the full evidence chain and the corrected non-lazy real-boot findings
-(including a stale-seed-tar repo-hygiene bug also found and fixed this pass). **Both lazy-fork flags
-remain default OFF. `DE_UP` has not been reached by any of the 103 passes to date.** See
-"Cross-process fork"'s own "Open, in rough priority order" item 1 for the precise next pickup.
+**Where things stand, in one paragraph (updated 104th pass)**: cross-process fork
+(`LITEBOX_PROCESS_FORK=1`) alone remains solid and the default-safe path -- `xfwm4` launches and
+survives (no crash) with real X11 windows created, but the boot still hits the long-standing
+pre-83rd-pass RAM crater (Track B item 1) before `DE_UP`. **`LITEBOX_LAZY_FORK_COMMIT=1
+LITEBOX_LAZY_FORK_GUARD_COW=1` is STILL NOT safe and must NOT be used for a real boot attempt**: the
+104th pass root-caused and FIXED one real, confirmed bug behind the 103rd pass's own
+`0x7feffffef000` crash (the parent's sigreturn-trampoline page -- a real guest VMA with no
+`VM_EXEC` flag, deliberately designed to always hardware-fault on any access -- could be merged
+into a lazy-eligible group by `classify_lazy_eligible_groups`, so `lazy_commit_veh` intercepted and
+"serviced" its deliberate trap instead of letting `LinuxShimEntrypoints::exception()` recognize it,
+producing an infinite refault loop; fixed by excluding the group containing the parent's own
+`sigreturn_trampoline` address, mirroring the existing active-`%rsp` exclusion). **Live-verified on
+the cheap `.wfgy/pass103_xset_repro.sh` repro: zero occurrences of the `0x7feffffef000` fault across
+dozens of forks, both with and without guard-cow, vs. it being the dominant crash before.** But the
+SAME repro run surfaced a SEPARATE, more pervasive, still-OPEN bug this fix does not touch: with
+`LITEBOX_LAZY_FORK_COMMIT=1` alone (guard-cow off), the repro still produces 48 `fatal signal:
+terminating task signal=Signal(11)` events and `xset` itself still crashes (`rc=139`) -- this is the
+SAME "Angle B" `rc=139` class the 100th-103rd passes already flagged as open, now sharpened with new
+exact evidence: every crash is preceded by `fork_verify: stale CODE pointer detected... repeat=1..8`
+then `AV-path stale rip livelock detected... falling through to deeper slot healers` at the IDENTICAL
+`rip=0x110097b30` across every distinct crashing process, strongly matching the already-documented
+"interaction with `fork_verify.rs`'s own watched-code-page machinery" hypothesis (84th pass) --
+`fork_verify`'s single-step healing should never even engage for a genuine `D==0` cross-process fork
+(no relocation, source==dest), so something about lazy-reserved pages appears to be arming/mis-firing
+it. NOT root-caused this pass (needs the live `cdb -pv` attach this file has recommended since the
+101st pass). **Both lazy-fork flags remain default OFF. `DE_UP` has not been reached by any of the
+104 passes to date.** See "Cross-process fork"'s own "Open, in rough priority order" item 1 for the
+precise next pickup.
 
 ## The cheap repro — start here
 
@@ -279,198 +291,66 @@ map" below). Condensed current-state trail:
   VIOLATION` ~16-16.7s after its own start, immediately after its own `vfork()` of `/bin/sh`, with
   ZERO `[veh]`/panic output anywhere in the log — survived both fixes unchanged, still OPEN going
   into the 91st pass.**
-- **91st-94th (compacted 95th pass; full narrative `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "91st-94th
-  pass full narrative" section)** — chased a "Windows clears `GS_BASE`/`FS_BASE` under scheduling
-  pressure" theory across four passes: 91st found and fixed a real `GS_BASE` repair gap in
-  `RawMutex::block_or_maybe_timeout`'s wait loop; 92nd disproved that specific fix live (zero
-  repairs fired, identical crash) and found the exact deterministic faulting guest RIP
-  (`0x00007fefe92bc7cb`) via the Windows Application Error event log; 93rd live-captured it with
-  `cdb -p` for the first time (guest glibc `__syscall_error`'s `mov fs:[rcx], eax` errno store,
-  `FS_BASE` reading 0) and added the matching `FS_BASE` repair, live-verified NOT sufficient; 94th
-  added `LITEBOX_DIAG_FS_BASE_REPAIR=1` (mirrors `LITEBOX_DIAG_GS_BASE_REPAIR`), found+fixed two
-  more real repair gaps (`finish_real_timeout`, `poll_until_value_changes`), and reached the
-  decisive negative result that anchors the 95th pass below: across 4 different repair-coverage
-  configurations the crash's timing stayed within ~550ms — too tight for a genuine scheduling race
-  — and NONE of the repair diagnostics, not even the pre-existing unconditional VEH catch-all
-  prints, ever fire near the crash, meaning this codebase's own `vectored_exception_handler` is
-  never even being INVOKED for the fault that kills `xfce4-session`. All `RawMutex` repair fixes
-  from these four passes are real, general, and stay landed regardless.
-- **95th-97th (compacted 98th pass; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "95th-97th
-  pass full narrative" section) — a 6-pass misattribution (91st-97th), resolved.** 95th traced
-  `vectored_exception_handler_entry`'s fast-path assembly and sharpened "FS_BASE clearing" (91st-94th's
-  theory) to "GS_BASE clearing, with a chicken-and-egg no in-VEH fix can close" (repairing GS_BASE
-  needs the VEH to run; the VEH can't run without a valid GS_BASE). 96th REFUTED a `CONTEXT_SEGMENTS`
-  fix idea by hard fact (AMD64 `CONTEXT` has no `FsBase`/`GsBase` field) and instead fixed the real gap
-  the same reasoning surfaced: `switch_to_guest` never repaired `GS_BASE` immediately before resume the
-  way it already did for `FS_BASE` — live-verified 3/3: the silent whole-host-process death is gone,
-  replaced by a contained per-thread crash (`xfce4-session`'s vfork'd `/bin/sh`, believed at the time).
-  **97th overturned that belief**: the real, reproducible crash is a plain `CLONE_THREAD` pthread
-  (`comm=gdbus`, GLib's own D-Bus worker) hit by the ALREADY-DOCUMENTED `lazy_fork_commit.rs` Bug 4
-  TOCTOU — confirmed via a clean live A/B (removing the inherited-but-unsafe `LITEBOX_LAZY_FORK_COMMIT=1
-  LITEBOX_LAZY_FORK_GUARD_COW=1` env vars: 0/1 `gdbus` crashes vs. 2/2 with them, and `xfce4-session`
-  reached `xfwm4` for the first time) — meaning the 91st-96th passes' entire FS_BASE/GS_BASE chase,
-  while each fix landed is real and general, was chasing a MISATTRIBUTED symptom of Bug 4, not its own
-  independent bug. 97th also fixed a real, separate, valuable bug: `VEH_FRAME_STRIDE`/`EXCEPTION_
-  RECORD_RESERVE` were sized only for release codegen, crashing every debug-build boot in ~3s via the
-  project's own overflow canary — fixed with an 8x widening gated `#[cfg(debug_assertions)]`, release
-  unchanged; debug-build live debugging is viable for the first time as a result. Net effect entering
-  the 98th pass: the real remaining blocker is precisely Bug 4 itself (below), not a register-corruption
-  mystery — see the 98th pass's own entry for the fix.
-- **98th-100th (compacted 101st pass; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s
-  "98th-100th pass full narrative" section).** 98th generalized Bug 4's fix from one outstanding
-  lazy-fork child per parent to any number of concurrent generations (`GUARD_PAGE_REGISTRY`, a
-  process-local `Mutex<HashMap<page, PageGuardEntry>>` replacing the single-claim `GUARD_STATE`),
-  re-deriving the correctness unit as one shared open interval per page rather than per-generation
-  shadow versions; found+fixed a real infinite same-page re-fault livelock of its own (a page left
-  `PAGE_READONLY`-poisoned when its last pending generation died without healing) before landing,
-  5/5 clean both repros both builds. A single uncontrolled real-boot data point read as promising
-  (`DE_LAUNCHED_DIRECT` + real D-Bus traffic before cratering). **99th turned that into a controlled
-  3-run A/B and found it was NOT unlucky load: `787b139` is a real, 100%-reproducible regression on
-  BOTH axes** — 3/3 craters at 20-21.3s/7 processes (vs. 88th/89th's 195-300s/9-16-proc baseline)
-  AND a new `XCENSUS_PRE_DE rc=134` heap-corruption signature in a plain fork-then-execve `python3`
-  call, absent in the immediately-prior clean 96th/97th-pass logs. No blind fix attempted — code
-  read as internally consistent in isolation, so the defect needed a real many-sequential-prior-
-  forks shape none of the isolated repros exercised. **100th root-caused `rc=134` to Bug 7**
-  (`sys_execve` reloads a guest image in place without ever calling `lazy_fork_commit`'s
-  `disarm_on_execve` — a process that was EVER a lazy-fork child keeps servicing faults against its
-  ORIGINAL parent across arbitrarily many FUTURE unrelated `execve()`s, exactly the real
-  `xrdb`→`sh`→`cpp`→`cc1` chain on the boot), fixed via a new `DISARMED_BY_EXECVE` flag checked
-  first in `lazy_commit_veh`, hooked from `WindowsUserland::end_fork_child_verification`. Also
-  fixed two real bugs found by code reading: Bug 6a (`guard_one_page` opened a fresh `OpenProcess`
-  handle per PAGE instead of once per claim — O(pages) handle churn on a large guarded group; fixed
-  with a shared `Arc<SharedChildHandle>` per claim) and Bug 6b (`GUARD_PAGE_REGISTRY` had no hook
-  into ordinary guest `mprotect()`/`munmap()`, letting them silently desync the registry from real
-  Windows page state — fixed via a new `invalidate_guarded_range`, live-fired 33 times in a
-  targeted repro). **All three fixes verified live-real-boot, before/after**: the specific `rc=134`
-  corruption is confirmed GONE post-fix (2/2), but a DIFFERENT, OLDER signature resurfaced —
-  `rc=139` plain `SIGSEGV`, 2/2 — matching the PRE-`787b139` Bug-4 signature the 88th pass's
-  ORIGINAL single-generation code used to close cleanly (clean `rc=0` in the 96th/97th-pass logs
-  under that code); the multi-generation registry doesn't close this case as reliably, reason not
-  found this pass. Crater speed (~14-19s/7 procs) is UNCHANGED by all three fixes — leading
-  (unverified) suspect flagged: `guard_one_page`'s page-at-a-time, not per-range, `VirtualProtect`
-  calls. Both flags stay default OFF throughout 98th-100th; `DE_UP` not reached by any of them.
-- **101st pass — implemented and live-verified the batched-`VirtualProtect` optimization the
-  89th/100th passes' own doc comments scoped (Angle 2); confirmed by a REAL boot A/B that it does
-  NOT fix the crater-speed regression (real negative evidence, not guessed); confirmed by the SAME
-  real boot that the 100th pass's `rc=139` SIGSEGV (Angle 1) is genuinely reproducible (6x
-  `status=139`/28x `signal=11` events across many distinct commands within the first ~15s) but did
-  NOT root-cause it — that needs a live `cdb` session this pass's tool access could not safely
-  provide. Both flags remain default OFF; `DE_UP` NOT reached.**
-  - **Angle 2 (implemented)**: [`try_guard_region_batched`] (`lazy_fork_commit.rs`), called first by
-    `reserve_group_lazy_guarded`'s inner loop — when an entire `VirtualQuery`-uniform sub-range has
-    zero existing `GUARD_PAGE_REGISTRY` entries (checked under one lock acquisition), guards it with
-    ONE `VirtualProtect` call instead of one per page (confirmed live: `batched region ... (33
-    pages) opened fresh in one VirtualProtect` on both the isolated repro and the real boot).
-    Falls back to the original, unmodified per-page `guard_one_page` loop the instant any page in
-    the sub-range already has a live entry, so the join-vs-open correctness argument is untouched —
-    this is a strict subset of what the per-page "open fresh interval" branch already did, applied
-    via fewer syscalls. Verified: fork-then-execve and fork-without-execve subshell repros clean
-    (1/1 and 3/3 respectively, debug build; the batched log line fires on both), `LITEBOX_PROCESS_
-    FORK=1` alone (both lazy flags unset) reconfirmed to emit zero `lazy_fork_commit` log lines —
-    byte-identical default path. **Real boot A/B** (`de_only_xcensus_seed3.tar`, fresh release
-    build, `.wfgy/pass101_realboot_run1.*`): crater at 15.4s/7 processes, free RAM 7.56GB→0.84GB —
-    statistically the SAME shape as the 99th/100th passes' pre-batching baseline (14-21s/7 procs).
-    **Real, valuable negative result**: batching the parent-side `VirtualProtect`/lock-acquire count
-    does not move the crater's timing or process-count ceiling, meaning the crater is not driven by
-    guard-cow's own syscall/VAD-fragmentation overhead — consistent with the standing framing that
-    it is genuine cumulative `VirtualAlloc2(MEM_COMMIT)` charge across many concurrent child
-    processes' own working sets, a cost this fix (or any guard-cow-internal change) cannot touch.
-    Kept landed regardless — real, verified-safe reduction in per-fork syscall count with zero
-    measured correctness regression, independent of whether it helps the crater.
-  - **Angle 1 (confirmed real, not root-caused)**: the same real boot's `stderr` shows 6 `DIAG_
-    TIMELINE exit_group ... status=139` lines and 28 `signal=Signal(11)` lines across many distinct
-    short-lived commands (`mkdir`, `cat`, `xset`, `python3`, `xrdb`, `ls`, `sleep`, plus a `sh`
-    sub-chain) within the first ~15s, most crashing within ~1ms of their own `execve` — real,
-    reproducible, broad, not narrow to one command. Code-reading comparison of the old
-    single-generation `guard_cow_write_fault_veh`/heal path against the new per-page
-    `guard_one_page` registry (`git show 787b139^:...lazy_fork_commit.rs` vs. HEAD) did not surface
-    an obvious correctness gap — both the prune-then-heal sequencing and the double-checked-state
-    child read look sound on inspection; the defect most likely needs a live `cdb -p` attach
-    (debug build) on the exact real-boot fault to localize, which this pass's tool access does not
-    safely support. **Do not attempt to root-cause this by further code reading alone next pass** —
-    escalate straight to a live debugger session per the project's own standing practice for this
-    bug class. Logs: `.wfgy/pass101_execve.log`, `.wfgy/pass101_subshell{,_1,_2}.log`,
-    `.wfgy/pass101_baseline.log`, `.wfgy/pass101_realboot_run1.{out,err,poll}.log`.
-- **102nd — root-caused and FIXED the crater-speed regression (Issue 1/Angle A) by direct code
-  reading, then verified the fix with 2/2 real boots; Angle 2 (`rc=139`) confirmed still real and
-  unaffected, root cause still open.**
-  - **Root cause (code-grounded, not guessed)**: `git show 787b139^:...lazy_fork_commit.rs` (old,
-    single-owner-gated code) vs HEAD shows every successful guard-cow claim, OLD and NEW alike,
-    `Box::leak`s a `Vec<GuardSnapshotSlot>` table sized ONE FULL PAGE (`AtomicU8` + `[u8; PAGE_SIZE]`)
-    per guarded guest page — i.e. a claim guarding an 8 MiB heap/stack group eagerly commits ~8 MiB
-    in the PARENT at claim time, unconditionally, regardless of whether the child ever touches a
-    single one of those pages before `execve`/exit discards the mapping (already documented,
-    accepted, in the 88th/98th passes' own doc comments as "the accepted leak-per-successful-
-    guarded-fork tradeoff"). The 88th pass's single-owner `GUARD_STATE` gate had an UNDOCUMENTED
-    second effect nobody had named: any fork temporally overlapping an already-open claim fell back
-    to fully EAGER (`try_claim_guard_cow_for_fork`'s decline path), meaning NO table was ever
-    allocated for that fork — during a real boot's fork storm (lots of temporal overlap from busy
-    parents), most overlapping forks paid zero extra parent-side commit. The 98th pass's
-    generalization to unboundedly many concurrent claims (bounded only by the UNRELATED
-    `live_cross_process_fork_children` cap, 6, which bounds concurrent CHILDREN system-wide, not
-    concurrent open guard-cow GENERATIONS per parent) removed that incidental rate limit: every
-    lazy-eligible fork now succeeds in claiming lazily and leaks its own full-size table, so a busy
-    parent can now accumulate up to 6x as much simultaneously-live leaked commit as the old code
-    ever could — a direct, sufficient explanation for "craters faster with FEWER processes" that
-    needs no new theory about guard-cow's own syscall overhead (consistent with, not contradicting,
-    the 101st pass's own real negative result ruling that out).
-  - **Fix (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`)**: new
-    `GUARD_COW_OPEN_CLAIMS: AtomicU32` + `GUARD_COW_CONCURRENT_CLAIM_CAP: u32 = 3` restore the old
-    gate's rate-limiting side effect, generalized to N>1 instead of hardcoding N=1 (which would
-    reintroduce the exact TOCTOU the 98th pass fixed for genuinely concurrent multi-child-from-one-
-    parent workloads). `try_claim_guard_cow_table` now declines (CAS loop, falls the whole fork back
-    to eager, exactly like the pre-98th-pass gate did for ANY overlap) once the cap is reached.
-    Admission is released via the EXISTING `SharedChildHandle::drop` (fires once per claim, exactly
-    when the last page relying on that claim's snapshot data has been serviced/pruned/aborted — the
-    real end of a claim's memory-cost lifetime, not the much-shorter-lived `GuardCowClaim` struct's
-    own drop), plus a new `impl Drop for GuardCowClaim` covering the one edge case
-    `SharedChildHandle` can't (a claim admitted but that ends up guarding zero pages, e.g. its
-    child's own memory reservation failed before any page ever joined — `child_handle` stays `None`
-    for its whole life). Cap value (3) is a reasoned default (small enough to meaningfully bound the
-    regression, large enough to still exercise the 98th pass's own multi-generation correctness fix)
-    — NOT yet empirically tuned against multiple cap values on a real boot; flagged as a follow-up.
-  - **Isolated-repro verification (debug build, both flags default OFF unaffected)**: fork-then-
-    execve (`bash -c 'echo hello; sleep 0.2; echo done'`) and fork-without-execve subshell both clean
-    with flags unset, byte-identical to pre-102nd-pass behavior. With both lazy flags ON, a NEW
-    8-concurrent-subshell repro (`for i in 1 2 3 4 5 6 7 8; do ( x=child_$i; echo $x ) & done; wait`)
-    with `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` shows the cap firing exactly as designed — 5 real
-    `guard-cow claim DECLINED (cap)` lines across 8 concurrent forks (3 admitted lazily, 5 fall back
-    to eager) — with ALL EIGHT children printing their own correct value, 2/2 runs, no
-    cross-contamination (the exact correctness property the 98th pass's generalization exists to
-    protect, confirmed still intact under the new cap).
-  - **Real boot A/B, `de_only_xcensus_seed3.tar`, release build, 2/2 runs — the actual fix
-    verification**: both runs dip to 7-8 processes / ~2.3-2.6GB free around t=20-35s (same magnitude
-    the 99th-101st passes' UNFIXED code also reached), then, unlike the unfixed code's crater-to-
-    kill-switch at 14-21s, RAM RECOVERS and STABILIZES at 5 processes / ~3.6-4.2GB free for the rest
-    of the run, with the root process exiting cleanly on its own at t=188.0s (run 2) / t=188.1s (run
-    1) — not RAM-killed, not crashed. This is a direct measured fix of the regression: from a
-    14-21s/7-process crater back to a stable ~188s window, in the same order of magnitude as the
-    pre-98th-pass code's own documented 195-300s/9-16-process stable baseline. Both runs reach
-    `DE_LAUNCHED_DIRECT`, run `WM_POLL`/`XCENSUS` cycles up to `n=12` with `XCENSUS` returning clean
-    `rc=0` every single time (2/2), before `DE_FAILED after 60s` fires (the window-manager-completion
-    blocker is UNCHANGED, pre-existing, not something this fix touches or claims to fix). Logs:
-    `.wfgy/pass102_realboot_run{1,2}.{out,err,poll}.log`, `.wfgy/pass102_concurrent{,_run2}.log`,
-    `.wfgy/pass102_baseline_{execve,subshell}.log`, `.wfgy/pass102_lazy_execve.log`.
-  - **Angle B (`rc=139`) — confirmed still real, unaffected by this fix, root cause still open.**
-    Both real boots show 44 `rc=139`/`Signal(11)` events each (same order of magnitude as the 101st
-    pass's own 6 `status=139`+28 `signal=Signal(11)` count), including a live
-    `DBUS_XFCONF_PROBE rc=139` in both runs — genuinely reproducible even in the plain isolated
-    fork-then-execve+guard-cow repro (`.wfgy/pass102_lazy_execve.log`: `winpid=8916` crashes with
-    `signal=Signal(11)` essentially immediately after `task-resume-probe ... calling run_thread`,
-    `comm` still all-zero, i.e. before the crashing task ever got far enough to record its own name)
-    — a NEW, smaller, more isolated repro of this bug class than the 101st pass had, worth chasing
-    with the 101st pass's own recommended live-`cdb`-attach approach next, rather than the full real
-    boot. This pass did not attempt that live debugging session (time-boxed to Angle A given the
-    real, verified win available there) — root cause remains unknown, `LITEBOX_LAZY_FORK_GUARD_COW`
-    stays unsafe to recommend as a default until it's fixed. Critically: `rc=139` does NOT itself
-    block a boot from proceeding — both real boot runs kept advancing (`WM_POLL`/`XCENSUS` cycling
-    successfully) despite ~44 of these events each, so this is a correctness bug, not (by itself) a
-    boot-blocking one; `DE_FAILED` is a separate, still-open, pre-existing issue.
-  - **Both lazy flags remain default OFF** — this fix only changes behavior when
-    `LITEBOX_LAZY_FORK_COMMIT=1`/`LITEBOX_LAZY_FORK_GUARD_COW=1` are explicitly set; confirmed via
-    the flags-unset isolated repros above. Not yet safe to flip on for a real boot recommendation:
-    Angle B's `rc=139` remains open and, per the project's own standing caution, a real XFCE session
-    forks many more long-lived daemons than any isolated repro exercises.
+- **91st-97th (compacted; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "91st-94th"/"95th-97th
+  pass full narrative" sections) — a 7-pass misattribution, resolved.** 91st-94th chased a "Windows
+  clears `GS_BASE`/`FS_BASE` under scheduling pressure" theory: found+fixed several real `RawMutex`
+  register-repair gaps (kept landed, real and general), but reached a decisive negative result —
+  across 4 repair-coverage configurations the crash timing stayed within ~550ms (too tight for a
+  real scheduling race) and no repair diagnostic, not even the VEH's own catch-all print, ever fired
+  near the crash. 95th-96th traced the VEH assembly, refuted a `CONTEXT_SEGMENTS` idea by hard fact
+  (AMD64 `CONTEXT` has no `FsBase`/`GsBase` field) and fixed a real gap (`switch_to_guest` never
+  repaired `GS_BASE` before resume, unlike `FS_BASE`) — the silent whole-host death became a
+  contained per-thread crash. **97th overturned the working theory entirely**: the real,
+  reproducible crash is a plain `CLONE_THREAD` pthread (`comm=gdbus`) hit by the
+  ALREADY-DOCUMENTED `lazy_fork_commit.rs` Bug 4 TOCTOU, confirmed via a clean A/B (0/1 crashes with
+  the lazy flags removed vs. 2/2 with them) — the entire 91st-96th FS_BASE/GS_BASE chase, while each
+  individual fix is real, was chasing a misattributed symptom of Bug 4. Also fixed, 97th: `VEH_FRAME_
+  STRIDE`/`EXCEPTION_RECORD_RESERVE` were sized only for release codegen, crashing every debug-build
+  boot in ~3s via the project's own overflow canary — widened 8x under `#[cfg(debug_assertions)]`,
+  making debug-build live debugging viable for the first time.
+- **98th-101st (compacted; full narrative: `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "98th-100th pass
+  full narrative" section, plus this file's own git history for the 101st).** 98th generalized Bug
+  4's fix to any number of concurrent per-parent lazy-fork generations (`GUARD_PAGE_REGISTRY`,
+  one shared open interval per page rather than per-generation shadow versions), fixing a livelock
+  of its own (a page left `PAGE_READONLY`-poisoned when its last pending generation died unhealed)
+  before landing 5/5 clean. **99th turned one promising uncontrolled real-boot data point into a
+  controlled 3-run A/B and found a real, 100%-reproducible regression on two axes**: craters at
+  20-21.3s/7 processes (vs. the pre-98th-pass 195-300s/9-16-proc baseline) AND a new `XCENSUS_PRE_DE
+  rc=134` heap-corruption signature in a plain fork-then-execve `python3` call. **100th root-caused
+  `rc=134` to Bug 7** (`sys_execve` never calls `disarm_on_execve`, so a process that was EVER a
+  lazy-fork child keeps servicing faults against its ORIGINAL parent across arbitrarily many future
+  unrelated `execve()`s) and fixed it plus two more real bugs from code reading (Bug 6a: O(pages)
+  `OpenProcess` handle churn; Bug 6b: `GUARD_PAGE_REGISTRY` desyncing from ordinary guest `mprotect`/
+  `munmap`). `rc=134` confirmed gone post-fix, but a DIFFERENT, older `rc=139` SIGSEGV resurfaced,
+  and crater speed stayed unchanged. **101st implemented+verified the batched-`VirtualProtect`
+  optimization** (`try_guard_region_batched`, real syscall-count win, kept landed) and confirmed by
+  real boot A/B it does NOT fix the crater-speed regression (real negative evidence — the crater is
+  driven by cumulative `VirtualAlloc2(MEM_COMMIT)` charge, not guard-cow's own overhead) — and
+  reconfirmed `rc=139`/Angle B is real and broad (6-28 events across many distinct commands within
+  ~15s) but explicitly deferred root-causing it to a live `cdb` session rather than guess further.
+  Both flags stayed default OFF throughout 98th-101st; `DE_UP` not reached by any of them.
+- **102nd — root-caused and FIXED the crater-speed regression by direct code reading (not guessing),
+  verified with 2/2 real boots; the `rc=139` bug (Angle B, superseded by the 103rd/104th passes'
+  finer diagnosis below) confirmed still real and unaffected.** Root cause: every successful
+  guard-cow claim `Box::leak`s a full-page `GuardSnapshotSlot` table per guarded guest page
+  (accepted tradeoff since the 88th pass), and the 98th pass's generalization from one outstanding
+  claim per parent to unboundedly many (bounded only by the UNRELATED 6-wide
+  `live_cross_process_fork_children` cap) removed an undocumented incidental rate limit the old
+  single-owner gate used to provide — a busy parent could now accumulate up to 6x as much
+  simultaneously-live leaked commit as before. Fix: `GUARD_COW_OPEN_CLAIMS`/
+  `GUARD_COW_CONCURRENT_CLAIM_CAP: u32 = 3` (`lazy_fork_commit.rs`) restores rate-limiting,
+  generalized to N>1 so it doesn't reintroduce the 98th pass's own TOCTOU fix. Verified: isolated
+  8-concurrent-subshell repro shows the cap firing exactly as designed (5/8 declined, all 8 still
+  correct, no cross-contamination); real boot A/B (`de_only_xcensus_seed3.tar`, release, 2/2 runs)
+  went from the unfixed code's 14-21s/7-process crater-to-kill-switch to RAM recovering and
+  stabilizing at 5 processes/~3.6-4.2GB free for a full ~188s run, exiting cleanly rather than being
+  RAM-killed — matching the pre-98th-pass baseline's own order of magnitude. Both flags stayed
+  default OFF (fix only active when explicitly set). Cap value (3) not yet empirically tuned.
+  `rc=139`/Signal(11) reconfirmed real (44 events/boot, both runs) and unaffected by this fix — not
+  root-caused this pass (time-boxed to the crater-speed fix); see 103rd/104th for the finer-grained
+  diagnosis that supersedes this pass's "does not block boot progress" read (it does, for
+  `xfce4-session` itself). Logs: `.wfgy/pass102_realboot_run{1,2}.{out,err,poll}.log`,
+  `.wfgy/pass102_concurrent{,_run2}.log`, `.wfgy/pass102_lazy_execve.log`.
 - **103rd -- the first pass to directly investigate `DE_FAILED` itself (per the standing gap all
   102 prior passes left open). Found `rc=139`/`STATUS_ACCESS_VIOLATION` under the lazy-fork config
   IS the direct cause of `DE_FAILED` there (correcting the 102nd pass's "does not block boot
@@ -579,6 +459,85 @@ map" below). Condensed current-state trail:
     (lazy OFF control), `.wfgy/pass103_nolazy_boot1.{out,err,poll}.log`,
     `.wfgy/pass103_de_only_trimmed_xcensus.sh`, `.wfgy/pass103_de_only_trimmed_seed.tar`,
     `.wfgy/pass103_trimmed_boot{1,2}.{out,err,poll}.log`.
+- **104th -- confirmed the 103rd pass's `0x7feffffef000` hypothesis with a targeted diagnostic (not a
+  guess), root-caused and FIXED one real, independent bug behind it, live-verified on the cheap
+  `xset` repro; discovered the fix does NOT close the repro (a separate, larger, pre-existing bug --
+  `fork_verify`'s own stale-CODE-pointer healer -- still crashes it pervasively) and sharpened that
+  open item with new exact evidence instead of forcing an unverified fix.**
+  - **Root cause, confirmed by direct evidence**: the address `0x7feffffef000` is the child's own
+    `Task::ensure_sigreturn_trampoline` page (`litebox_shim_linux/src/syscalls/signal/mod.rs`) -- a
+    REAL guest `mmap()` VMA (so it is a normal entry in `vma_layout`/`group_relocations`, subject to
+    `Vmem::duplicate`'s 64 MiB `max_intra_group_gap` merge into whichever nearby data group is
+    within that huge a gap), mapped `PROT_READ` only on x86_64 and DELIBERATELY never executable --
+    the whole signal-return recognition mechanism (`LinuxShimEntrypoints::exception`: `ctx.rip ==
+    sigreturn_trampoline_addr()`) depends on a fetch there always hardware-faulting. Because the
+    page carries no `VM_EXEC` flag, `classify_lazy_eligible_groups`'s `has_exec` check can never
+    exclude its group, so it could be classified lazy along with whatever data VMA it got merged
+    with. Once lazy, `lazy_commit_veh` INTERCEPTS the deliberate trap fault (a genuine `LAZY_RANGES`
+    hit), "services" it (`VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)`, real byte copy from the parent,
+    `EXCEPTION_CONTINUE_EXECUTION`) instead of letting it reach `LinuxShimEntrypoints::exception()`
+    unserviced -- the retried fetch faults again identically forever (Windows DEP: neither
+    `PAGE_READWRITE` nor `PAGE_READONLY` is executable), a 100%-reproducible infinite refault loop,
+    never reaching the real handler. A DIFFERENT mechanism from the 85th pass's own Bug A (that one
+    was about `CONTEXT.Rsp` at an unrelated exception's delivery time; this is about the trampoline
+    page itself being touched on purpose) -- confirmed, not assumed, by extending
+    `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`'s existing diagnostic and re-running the exact
+    `.wfgy/pass103_xset_repro.sh` repro on a fresh debug build: `[lazy_fork_commit] group
+    0x7feffffb0000..0x7fefffff0000 excluded from lazy: contains
+    sigreturn_trampoline=0x7feffffef000` -- the EXACT address from the 103rd pass's own crash dump.
+  - **Fix (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`,
+    `litebox_platform_windows_userland/src/process_fork.rs`)**: `classify_lazy_eligible_groups` gains
+    a `sigreturn_trampoline: usize` parameter (the SAME value `spawn_process_fork_child` already
+    threads through for the 84th pass's unrelated Bug 2 fix, now reused for a second, independent
+    purpose) and excludes whichever group contains it, mirroring the existing active-`%rsp`
+    exclusion exactly. Belt-and-suspenders defense in depth also added to `lazy_commit_veh` itself:
+    an `EXECUTE`-type access violation (`ExceptionInformation[0] == 8`) landing inside a tracked lazy
+    range now declines (`EXCEPTION_CONTINUE_SEARCH`) unconditionally rather than servicing it --
+    this module only ever marks PURE-DATA groups lazy, so a legitimate lazy fault should never be an
+    instruction fetch; committing `PAGE_READWRITE` and retrying can never satisfy one, so failing
+    safe is strictly better than a silent infinite loop for any FUTURE case in this same bug class.
+    Both changes are entirely inside the `lazy_fork_commit_enabled()`-gated path (provably inert with
+    both flags unset, same guarantee this module has always carried).
+  - **Verified on the cheap repro, both with and without guard-cow**: rebuilt debug
+    (`cargo build -p litebox_runner_linux_on_windows_userland --target x86_64-pc-windows-msvc`,
+    confirmed fresh mtime), ran `.wfgy/pass103_xset_repro.sh` under
+    `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1
+    LITEBOX_DIAG_LAZY_FORK_COMMIT=1` (`.wfgy/pass104_xset_fix.{out,err}.log`) and again with
+    guard-cow off (`.wfgy/pass104_xset_fix2.{out,err}.log`): the trampoline-group exclusion line
+    fires correctly on essentially every fork (dozens of occurrences), ZERO
+    `0x7feffffef000`-address faults anywhere in either log, and zero "declined execute-type fault"
+    lines (meaning the classify-time fix alone is already sufficient -- the defense-in-depth check
+    in `lazy_commit_veh` never even needed to fire). Also confirmed the crate compiles clean and
+    `classify_lazy_eligible_groups`'s early return for `!lazy_fork_commit_enabled()` is unchanged, so
+    `LITEBOX_PROCESS_FORK=1` alone stays byte-identical by construction (same guarantee this module
+    has always carried; not re-verified via a fresh full boot this pass given the time cost, but the
+    code path is unreachable when the flag is unset).
+  - **NOT closed: the SAME guard-cow-off run still shows 48 `fatal signal: terminating task
+    signal=Signal(11)` events, and the script's own `[s] PROBE_XSET rc=139` line shows `xset` itself
+    still crashes** -- fixing the trampoline bug did not make the repro clean. This is the
+    already-documented "Angle B `rc=139`" class (100th-103rd passes), now sharpened with new,
+    precise evidence: every one of the 48 crashes is immediately preceded by 8 consecutive
+    `fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered),
+    translating and resuming rip=... translated_rip=... fault_addr=18446744073709551615 repeat=1..8`
+    lines (the SAME constant `rip=0x110097b30`/`fault_addr=-1` pair across every distinct crashing
+    process/pid), then `fork_verify: AV-path stale rip livelock detected (same rip repeated), falling
+    through to deeper slot healers`, then the fatal signal -- i.e. `fork_verify`'s own THREAD-based
+    stale-pointer single-step healer is engaging and failing to resolve the fault. Per this file's
+    own standing description of cross-process fork ("a genuine `D == 0` fork... no relocation, no
+    `fork_verify` healing"), this machinery should not even be relevant here -- strongly consistent
+    with the 84th pass's own flagged-but-never-confirmed "interaction with `fork_verify.rs`'s own
+    watched-code-page machinery" hypothesis for this exact bug class, now with concrete rip/fault_addr
+    evidence instead of a guess. **Confirmed absent from the non-lazy baseline** (0 `fatal signal`
+    lines in `.wfgy/pass103_xset_repro_nolazy.log`, vs. 48 in this pass's fixed-but-still-lazy run) --
+    genuinely caused by the lazy path, not pre-existing/unrelated noise. Root cause NOT found this
+    pass -- per this file's own standing practice for this bug class, the next step is a live
+    `cdb -pv` attach (debug build) on `fork_verify::on_single_step`/`vectored_exception_handler`
+    breaking on the exact `rip=0x110097b30` repeat, not further code reading. **Both lazy flags stay
+    default OFF; still not safe for a real boot.** No full real-boot attempt made this pass (the
+    cheap repro alone already disqualifies the flags; spending a ~3+ minute boot cycle on a
+    known-still-broken config would not have added information). `DE_UP` not attempted.
+  - Logs: `.wfgy/pass104_xset_fix.{out,err,poll}.log` (guard-cow on), `.wfgy/pass104_xset_fix2.
+    {out,err}.log` (guard-cow off, the 48-crash/`rc=139` evidence).
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
@@ -590,22 +549,30 @@ both Xvfb SIGSEGVs.
 
 **Open, in rough priority order:**
 
-1. **`DE_FAILED` is now root-caused on BOTH configurations (103rd), and the two blockers are
-   DIFFERENT problems requiring different fixes.**
-   - **Lazy-fork config**: `DE_FAILED` == `xfce4-session` itself dying of an unhandled
-     `STATUS_ACCESS_VIOLATION` before it ever launches `xfwm4` -- the SAME mechanism as `rc=139`
-     (confirmed pervasive, not narrow: hits `xset`/`xprop`/`rm`/`mkdir`/`sleep` too, ALWAYS at fault
-     address `0x7feffffef000`, ZERO occurrences with the lazy flags off). This is now the correctly
-     understood severity: `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` must NOT be
-     recommended or used for any real boot attempt until this is fixed. Cheapest known repro:
+1. **`DE_FAILED` is root-caused on BOTH configurations (103rd); the lazy-fork config's own
+   `0x7feffffef000` sub-bug is FIXED (104th), but a separate, larger bug in the same config remains
+   OPEN and still blocks it, and the non-lazy config's RAM-crater blocker is untouched.**
+   - **Lazy-fork config**: the 103rd pass's `0x7feffffef000` crash (sigreturn-trampoline page
+     wrongly lazy-eligible) is FIXED and live-verified (104th, zero occurrences on the cheap repro,
+     see that pass-history entry). **Still NOT safe for a real boot**: the SAME repro, same fix
+     applied, still produces 48 `fatal signal: terminating task signal=Signal(11)` events and `xset`
+     itself still crashes (`rc=139`) -- a separate, pre-existing bug (the "Angle B" class, 100th-104th
+     passes), now sharpened with exact evidence: every crash follows 8x `fork_verify: stale CODE
+     pointer detected via raw access violation... repeat=1..8` at a CONSTANT `rip=0x110097b30`
+     across every distinct crashing process, then `AV-path stale rip livelock detected... falling
+     through to deeper slot healers`, then SIGSEGV -- i.e. `fork_verify`'s own THREAD-based
+     stale-pointer single-step healer (which should not even engage for a genuine `D==0`
+     cross-process fork -- no relocation, source==dest) is firing and failing to resolve the fault.
+     `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` must NOT be recommended or used for any
+     real boot attempt until THIS is fixed. Cheapest known repro (still applies):
      `.wfgy/pass103_xset_repro.sh` (`Xvfb` + `xset q`, no DE at all) under
-     `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1`. Next pickup:
-     a live `cdb -p` attach (debug build; invasive `-p`, not `-pv`, which cannot receive debug events
-     per the 93rd pass; `sxd av` measurably induces its own exception-dispatch livelock on this
-     codebase per the 97th pass) on THIS repro -- break on the code-fetch fault at
-     `0x7feffffef000...ish` (address is deterministic across runs) and trace why the page is already
-     `MEM_COMMIT`+`PAGE_READONLY` and untracked by `lazy_commit_veh`'s own group lookup
-     ("no reverse translation found") before the guest ever legitimately touches it. Do NOT retune
+     `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1` (guard-cow not required to reproduce it).
+     Next pickup, precise: a live `cdb -pv` attach (debug build) on
+     `fork_verify::on_single_step`/`vectored_exception_handler`, breaking on the exact
+     `rip=0x110097b30` repeat sequence, to find WHY this machinery is armed/firing at all for a
+     cross-process child and why its own "deeper slot healers" fail to resolve it -- strongly
+     consistent with the 84th pass's own flagged-but-never-confirmed "interaction with
+     `fork_verify.rs`'s own watched-code-page machinery" hypothesis. Do NOT retune
      `live_cross_process_fork_children`'s admission cap or `GUARD_COW_CONCURRENT_CLAIM_CAP` in
      response -- this is a correctness bug neither capacity lever can fix or should mask.
    - **Non-lazy config (`LITEBOX_PROCESS_FORK=1` alone, the recommended safe path)**: `DE_FAILED` ==

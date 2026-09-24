@@ -749,15 +749,51 @@ pub fn guard_cow_enabled() -> bool {
 /// exact repro: 2 groups total, ~8.06 MiB and ~4.19 KiB; the 8 MiB one is what gets excluded here,
 /// but real forks were already observed classifying MULTIPLE separate stack-shaped groups, and
 /// only the one actually anchoring `active_rsp` loses its lazy treatment).
+/// **104th pass -- new required parameter `sigreturn_trampoline`, real bug found+fixed (see
+/// `AGENTS.md`'s 104th-pass entry for the full evidence).** The parent's own already-established
+/// `Task::ensure_sigreturn_trampoline` address (`0` if the parent never established one, e.g. a
+/// child that has never yet handled a signal) -- same value already threaded through to
+/// `FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR`/`adopt_forked_process` for a completely different
+/// reason (84th pass, Bug 2: making the CHILD's own `SignalState` recognize this address again).
+/// This is a SEPARATE, independent use of the same value: the trampoline page is a REAL guest
+/// `mmap()` mapping (`ensure_sigreturn_trampoline`, `litebox_shim_linux/src/syscalls/signal/
+/// mod.rs`), so it is a real entry in `vma_layout`/`group_relocations` like any other guest
+/// mapping -- and on x86_64 it is mapped `PROT_READ` only, deliberately NEVER executable (the
+/// function's own doc comment: "the page stays non-exec" -- the real ABI-matching trampoline
+/// bytes are present as DATA only, so `litebox_syscall_rewriter`/unwind tools that read them as
+/// data see the right thing; the page is never really *executed*). Its own `vma_layout` entry
+/// therefore never carries `VM_EXEC`, so the `has_exec` check below can never exclude it, and
+/// `Vmem::duplicate`'s 64 MiB `max_intra_group_gap` merges it into whatever nearby data group
+/// (heap, TLS, etc.) happens to be within that huge a gap -- ordinary, common. Deliberately
+/// setting `%rip` to this address is how this project's OWN signal-return mechanism recognizes
+/// "the guest just tried to return from a signal handler" (`LinuxShimEntrypoints::exception`,
+/// `litebox_shim_linux/src/lib.rs`: `ctx.rip == self.task.sigreturn_trampoline_addr()`) -- it
+/// works BECAUSE the fetch always, unconditionally, hardware-faults there (the page is
+/// permanently non-executable), and that specific fault must reach the shim's own `exception()`
+/// UNSERVICED so it can recognize the address and run the real sigreturn logic instead of
+/// delivering a guest `SIGSEGV`. If this group is lazy-eligible, `lazy_commit_veh` intercepts
+/// that EXACT deliberate fault instead: it is a genuine `LAZY_RANGES`-tracked address (`fault_addr`
+/// falls inside the merged group's span), so it gets "serviced" -- `VirtualAlloc(MEM_COMMIT,
+/// PAGE_READWRITE)` (still non-executable under Windows DEP either way) plus a real byte copy from
+/// the parent -- and `EXCEPTION_CONTINUE_EXECUTION` retries the SAME instruction fetch, which
+/// faults again, identically, forever (`lazy_commit_veh`'s own `VirtualAlloc(MEM_COMMIT)`-on-an-
+/// already-committed-page path is an idempotent no-op, so nothing about the second, third, ...
+/// Nth fault differs from the first) -- a live, 100%-reproducible infinite same-address refault
+/// loop, never reaching `LinuxShimEntrypoints::exception()` at all. This is a DIFFERENT root cause
+/// from the 85th pass's own Bug A (the active-`%rsp` exclusion below, which is about `CONTEXT.Rsp`
+/// at an UNRELATED exception's delivery time, not about this specific page ever being touched
+/// on purpose) -- both are real, both need their own exclusion, kept as two separate checks.
 #[must_use]
 pub fn classify_lazy_eligible_groups(
     group_relocations: &[(Range<usize>, usize)],
     vma_layout: &[(Range<usize>, u32, bool)],
     active_rsp: usize,
+    sigreturn_trampoline: usize,
 ) -> Vec<bool> {
     if !lazy_fork_commit_enabled() {
         return vec![false; group_relocations.len()];
     }
+    let diag = std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some();
     group_relocations
         .iter()
         .map(|(group, _dest_base)| {
@@ -770,7 +806,18 @@ pub fn classify_lazy_eligible_groups(
             // Exclude the group anchoring the child's own live stack pointer at fork time -- see
             // this function's own doc comment for the full root-cause/correctness argument.
             let is_active_stack = group.contains(&active_rsp);
-            !has_exec && !is_active_stack
+            // Exclude the group containing the parent's own sigreturn trampoline page -- see this
+            // function's own doc comment ("104th pass") for the full root-cause/correctness
+            // argument. `0` means the parent never established one; never excludes anything then.
+            let has_trampoline = sigreturn_trampoline != 0 && group.contains(&sigreturn_trampoline);
+            if diag && has_trampoline {
+                eprintln!(
+                    "[lazy_fork_commit] group {:#x}..{:#x} excluded from lazy: contains \
+                     sigreturn_trampoline={:#x}",
+                    group.start, group.end, sigreturn_trampoline
+                );
+            }
+            !has_exec && !is_active_stack && !has_trampoline
         })
         .collect()
 }
@@ -1074,6 +1121,25 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
     let Some(_matched) = ranges.iter().find(|r| r.contains(&fault_addr)) else {
         return EXCEPTION_CONTINUE_SEARCH;
     };
+    // Defense in depth, on top of `classify_lazy_eligible_groups`'s own trampoline exclusion
+    // (104th pass): this module only ever marks PURE-DATA groups lazy (see the module doc
+    // comment's "Scope of this first landing" section), so a legitimate lazy fault should never
+    // be an instruction fetch (`ExceptionInformation[0] == 8`, the DEP/execute-violation code).
+    // Committing `PAGE_READWRITE` (never executable under Windows DEP either way) and retrying
+    // cannot ever satisfy such a fault -- it would refault identically forever. Decline instead,
+    // so any address that lands inside a tracked lazy range for a reason this classification
+    // couldn't foresee (a future case in the same class as the 104th pass's sigreturn-trampoline
+    // bug) fails safe -- an honest crash/real-handler dispatch, never a silent infinite loop.
+    const EXECUTE_ACCESS: usize = 8;
+    if rec.ExceptionInformation.first().copied() == Some(EXECUTE_ACCESS) {
+        if diag {
+            eprintln!(
+                "[lazy_fork_commit] declined execute-type fault inside a tracked lazy range: \
+                 addr={fault_addr:#x} (would have refaulted forever -- see 104th-pass doc comment)"
+            );
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     let page_addr = fault_addr & !(PAGE_SIZE - 1);
 
     let committed =

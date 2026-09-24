@@ -1826,6 +1826,7 @@ pub fn spawn_process_fork_child(
         group_relocations,
         vma_layout,
         full_gprs.rsp,
+        sigreturn_trampoline,
     );
     let mut lazy_group_ranges: Vec<Range<usize>> = group_relocations
         .iter()
