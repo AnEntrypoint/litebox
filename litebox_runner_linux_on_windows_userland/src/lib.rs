@@ -2193,6 +2193,7 @@ fn diag_process_fork_task_resume_probe(
             entrypoints,
             &mut ctx,
             std::sync::Arc::new(relocations),
+            sigreturn_trampoline,
         );
     }
     eprintln!(

@@ -883,11 +883,25 @@ pub trait ForkChildVerificationProvider {
     /// Verification ends automatically when the child reaches `execve`/`exit`/`exit_group` (at
     /// which point the stale parent addresses are no longer reachable), or when
     /// [`end_fork_child_verification`](Self::end_fork_child_verification) is called.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (`0` if never established) -- see
+    /// [`Self::spawn_cross_process_fork_child`]'s own `sigreturn_trampoline` parameter doc comment
+    /// for the full mechanism this page exists for. A `relocations` map whose `is_identity()` is
+    /// true (real for a cross-process/lazy fork child, which gets literally the same addresses as
+    /// its parent) makes `is_in_source(addr)` true for essentially every address the child
+    /// touches inside its own mapped ranges, including this deliberately-always-faulting page --
+    /// an implementor that "heals" ANY `is_in_source` hit by translating and resuming must exclude
+    /// this exact address, or it silently converts the page's designed-to-fault signal-return
+    /// recognition mechanism into an infinite same-address refault loop instead of ever letting
+    /// the real signal-return handler see the fault.
     fn begin_fork_child_verification(
         &self,
         relocations: alloc::sync::Arc<crate::mm::AddressRelocations>,
+        sigreturn_trampoline: usize,
     ) {
         let _ = relocations;
+        let _ = sigreturn_trampoline;
     }
 
     /// Stop verifying the current thread's guest execution, if it was being verified.

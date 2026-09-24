@@ -164,6 +164,43 @@ std::thread_local! {
     /// that survives a skipped clear is refused the instant this thread's own next `begin`/`end`
     /// cycle would have invalidated it, rather than being trusted indefinitely.
     static FORK_VERIFY_EPOCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+
+    /// The PARENT's own `sigreturn_trampoline` address (`0` = none established), stamped by
+    /// [`begin`] alongside [`FORK_VERIFY_EPOCH`] and consulted by every `is_in_source(rip)`-gated
+    /// healer below (case (1) in [`on_single_step`], and its AV-path counterpart
+    /// [`translate_stale_source_rip`]).
+    ///
+    /// # Why this exists (105th pass)
+    ///
+    /// This page is a REAL guest mapping (`Task::ensure_sigreturn_trampoline`), always non-`VM_EXEC`,
+    /// deliberately unmapped/non-executable so an attempted fetch from it always hardware-faults --
+    /// that permanent, unconditional fault is exactly how `LinuxShimEntrypoints::exception`
+    /// recognizes "the guest just tried to return from a signal handler" (`litebox_shim_linux/
+    /// src/lib.rs`: `ctx.rip == self.task.sigreturn_trampoline_addr()`). For a cross-process fork
+    /// child verified with an IDENTITY relocation map (`AddressRelocations::is_identity`, real for
+    /// every `LITEBOX_PROCESS_FORK=1` child -- see `run_thread_with_fork_verification`'s own
+    /// pass-143 doc comment), `is_in_source(addr)` is true for essentially every address the child
+    /// legitimately owns (source and destination ranges are literally the same by construction), so
+    /// without this exclusion the trampoline's own deliberate fault gets "healed" -- `translate()`
+    /// on an identity map returns the SAME address, so the healer's translate-and-resume retries
+    /// the identical instruction fetch, which faults again, identically, forever, and
+    /// `LinuxShimEntrypoints::exception()` never gets a chance to see it. This is the exact same
+    /// root cause `lazy_fork_commit::classify_lazy_eligible_groups`'s own "104th pass" trampoline
+    /// exclusion fixed for the SEPARATE `lazy_commit_veh` mechanism -- this module has its own,
+    /// independent `is_in_source`/AV-path healing that needed the identical exclusion, live-
+    /// confirmed still crashing (`rip=translated_rip=0x7feffffef000`, "AV-path stale rip livelock
+    /// detected") on a fresh build that already carried the 104th-pass lazy-commit fix, proving the
+    /// two mechanisms are independent and both needed their own fix.
+    static FORK_VERIFY_SIGRETURN_TRAMPOLINE: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// Whether `addr` is this thread's currently-armed sigreturn trampoline address (never `0`, which
+/// is the "none established" sentinel and must never match). See
+/// [`FORK_VERIFY_SIGRETURN_TRAMPOLINE`]'s own doc comment for the full root-cause argument this
+/// exists to guard against.
+fn is_sigreturn_trampoline(addr: usize) -> bool {
+    addr != 0 && FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(core::cell::Cell::get) == addr
 }
 
 /// Returns `true` iff `tls.fork_verify`'s currently-armed map (if any) was stamped with THIS
@@ -572,6 +609,15 @@ pub(crate) fn translate_stale_source_rip(
         return None;
     }
     if !relocations.is_in_source(rip) {
+        return None;
+    }
+    // 105th pass: never "heal" the sigreturn trampoline's own deliberate, permanent fault -- see
+    // `FORK_VERIFY_SIGRETURN_TRAMPOLINE`'s doc comment for the full root-cause argument (real,
+    // live-confirmed via this exact function's own "translating and resuming" log message
+    // repeating forever at `rip=translated_rip=0x7feffffef000` on a cross-process/identity fork
+    // child). Declining here (returning `None`) lets the caller's normal, unhandled-AV dispatch
+    // run instead, which is what lets `LinuxShimEntrypoints::exception()` ever see this fault.
+    if is_sigreturn_trampoline(rip) {
         return None;
     }
     let translated = relocations.translate(rip)?;
@@ -1045,7 +1091,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // not a value read back out of arbitrary memory, `rbp`) translated via the exact same
     // relocation map already proven correct for CPU registers, landing on byte-identical
     // relocated code.
-    if relocations.is_in_source(rip) {
+    if relocations.is_in_source(rip) && !is_sigreturn_trampoline(rip) {
         if crate::veh_trace_enabled() {
             eprintln!(
                 "[fork_verify] tid={:?} on_single_step: rip={rip:#x} is_in_source=true",
@@ -2682,7 +2728,10 @@ fn arm_watchaddr_data() {
 
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
-pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+pub(crate) fn begin(
+    relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>,
+    sigreturn_trampoline: usize,
+) {
     // AGENTS.md pass 242: this whole diagnostic block (added passes 199-203) used to run
     // UNCONDITIONALLY on every single `begin()` call -- i.e. every `fork()`, not just while
     // actively debugging -- including a `CLAIMED_RANGES.try_lock()` (plus `ACTIVE_THREADS`/
@@ -2766,6 +2815,7 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
             // task termination -- see `FORK_VERIFY_GENERATION`'s doc comment) without needing to
             // track per-map validity any other way. Deliberately per-thread, not global.
             FORK_VERIFY_EPOCH.with(|e| e.set(FORK_VERIFY_GENERATION.with(core::cell::Cell::get)));
+            FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(|t| t.set(sigreturn_trampoline));
             *tls.fork_verify.borrow_mut() = Some(relocations);
         }
     }
@@ -2790,6 +2840,7 @@ pub(crate) fn end() {
     // per-thread (see `FORK_VERIFY_GENERATION`'s doc comment) so it never invalidates a different,
     // still-verifying thread's own live map.
     FORK_VERIFY_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(|t| t.set(0));
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} end", std::thread::current().id());
     }

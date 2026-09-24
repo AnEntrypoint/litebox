@@ -3505,15 +3505,16 @@ pub unsafe fn run_thread_with_fork_verification(
     shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
     relocations: Arc<litebox::mm::AddressRelocations>,
+    sigreturn_trampoline: usize,
 ) {
     ensure_tls_index();
-    run_thread_inner(&shim, ctx, Some(relocations));
+    run_thread_inner(&shim, ctx, Some((relocations, sigreturn_trampoline)));
 }
 
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
-    fork_verify_relocations: Option<Arc<litebox::mm::AddressRelocations>>,
+    fork_verify_relocations: Option<(Arc<litebox::mm::AddressRelocations>, usize)>,
 ) {
     let tls_state = TlsState::new();
     tls_state
@@ -3544,8 +3545,8 @@ fn run_thread_inner(
         // (already done by the time this closure body runs) and strictly BEFORE `run_thread_arch`
         // ever resumes guest code -- see this function's caller, `run_thread_with_fork_verification`,
         // for why the timing matters.
-        if let Some(relocations) = fork_verify_relocations {
-            fork_verify::begin(relocations);
+        if let Some((relocations, sigreturn_trampoline)) = fork_verify_relocations {
+            fork_verify::begin(relocations, sigreturn_trampoline);
         }
         run_thread_arch(&mut thread_ctx, &tls_state);
     });
@@ -12352,8 +12353,12 @@ impl ThreadContext<'_> {
 }
 
 impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
-    fn begin_fork_child_verification(&self, relocations: Arc<litebox::mm::AddressRelocations>) {
-        fork_verify::begin(relocations);
+    fn begin_fork_child_verification(
+        &self,
+        relocations: Arc<litebox::mm::AddressRelocations>,
+        sigreturn_trampoline: usize,
+    ) {
+        fork_verify::begin(relocations, sigreturn_trampoline);
     }
 
     fn end_fork_child_verification(&self) {

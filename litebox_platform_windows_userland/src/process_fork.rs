@@ -293,7 +293,11 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
                                  with {} range(s), arming fork_verify",
                                 relocations.ranges().len()
                             );
-                            crate::fork_verify::begin(alloc::sync::Arc::new(relocations));
+                            // Diagnostic-only probe: no real sigreturn trampoline address is
+                            // transmitted over this channel, so `0` (the documented "none
+                            // established" sentinel `is_sigreturn_trampoline` always rejects) is
+                            // the honest value -- never a real trampoline page to protect here.
+                            crate::fork_verify::begin(alloc::sync::Arc::new(relocations), 0);
                         }
                         None => {
                             eprintln!(

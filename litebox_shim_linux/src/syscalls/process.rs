@@ -7156,10 +7156,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // This runs on the child's own (brand-new) host thread, immediately before it
                 // first resumes into guest code -- ask the platform to verify that the child
                 // never executes at, nor writes through, a stale pointer into the parent's
-                // pre-`fork()` address space. See `ForkChildVerificationProvider`.
+                // pre-`fork()` address space. See `ForkChildVerificationProvider`. Also hands over
+                // this (parent, pre-fork) thread's own sigreturn trampoline address so an
+                // implementor can exclude it from stale-pointer healing -- see that parameter's
+                // own doc comment.
                 self.global
                     .platform
-                    .begin_fork_child_verification(relocations);
+                    .begin_fork_child_verification(relocations, self.sigreturn_trampoline_addr());
             }
         }
     }
