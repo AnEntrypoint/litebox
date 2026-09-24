@@ -2124,3 +2124,283 @@ thread-based-fork tcache corruption class, not a regression from this pass's own
     300s window, confirming the page-at-a-time diagnostic volume itself is prohibitively expensive at
     real-boot scale, consistent with the crater-speed hypothesis above), `.wfgy/pass100_ctrl_timing1.
     {out,err,poll}.log`, `.wfgy/pass100_seq20_diag.log` (the Bug 6b live-fire evidence).
+
+## 103rd-105th pass full narrative (drained from AGENTS.md by the 106th pass's own compaction, verbatim)
+
+- **103rd -- the first pass to directly investigate `DE_FAILED` itself (per the standing gap all
+  102 prior passes left open). Found `rc=139`/`STATUS_ACCESS_VIOLATION` under the lazy-fork config
+  IS the direct cause of `DE_FAILED` there (correcting the 102nd pass's "does not block boot
+  progress" read); separately, re-verified the plain non-lazy path against the CURRENT binary and
+  found it gets genuinely further (`xfwm4` launches and survives) but still hits the pre-83rd-pass
+  RAM crater before `DE_UP`; found+fixed a stale-seed-tar repo-hygiene bug. No source code changed
+  this pass -- `LITEBOX_PROCESS_FORK=1` alone stays byte-identical by construction.**
+  - **`DE_FAILED`'s own definition, confirmed by direct reading (not assumed)**: `.wfgy/de_only.sh`'s
+    own poll loop (`WM=$(xprop -root _NET_SUPPORTING_WM_CHECK ...)`, 12x5s=60s) declares
+    `DE_FAILED after 60s` unless `$WM` ever contains the literal substring `"window id"` -- i.e.
+    exactly the `_NET_SUPPORTING_WM_CHECK` atom existing on the root window with a real value, set
+    by `xfwm4` alone (confirmed by the 82nd pass's own source reading of `setNetSupportedHint`).
+    This pass's own new evidence (below) directly answers, for the first time, WHY that atom never
+    gets set within the window, under both configurations.
+  - **Lazy-fork config (`LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1
+    LITEBOX_LAZY_FORK_GUARD_COW=1`) -- `DE_FAILED` root-caused: `xfce4-session` itself crashes before
+    ever launching `xfwm4`.** Re-examined the 102nd pass's own "stable" real-boot logs
+    (`.wfgy/pass102_realboot_run{1,2}.err.log`, reused unmodified) with a finer-grained read than
+    that pass attempted: `[wait4_diag] wait_for_thread_exit(...) owning_pid=23636 ...
+    exit_code=3221225477(real_exit_code)` -- `3221225477 == 0xC0000005 ==
+    STATUS_ACCESS_VIOLATION` -- fired at `elapsed_ms_since_thread_start=16169`, i.e.
+    `xfce4-session`'s OWN cross-process-fork child process died of an UNHANDLED HOST-LEVEL fault
+    (not a guest-translated `SIGSEGV` -- no `[unix_addr_presence]`/`fatal signal: terminating task`
+    line exists for this pid at all, unlike every OTHER crashing process in the same log, which DOES
+    get gracefully translated to a reported guest signal). The piped `[de2]`-prefixed
+    `xfce4-session` stderr (`pass102_realboot_run2.out.log:18-26`) shows it reaches exactly:
+    `ConsoleKit proxy` warning, three `_NET_*`-property "assuming" messages, `iceauth: error in
+    locking authority file`, `Failed to setup the ICE authentication data` -- and NOTHING further.
+    `argv0=/usr/bin/xfwm4` (or any other Failsafe client) never appears ANYWHERE in either run's
+    `DIAG_TIMELINE execve` log. **`xfce4-session` dies of a real, silent, unhandled host crash
+    between its own ICE-auth warning and its first session-client launch, in BOTH of the 102nd
+    pass's own "stable" runs, 2/2.**
+  - **Isolated, much cheaper reproduction of the SAME crash class, unrelated to `xfce4-session`
+    entirely**: `.wfgy/pass103_xset_repro.sh` (+ `.wfgy/pass103_xset_seed.tar`) -- just `Xvfb` +
+    `xset q`, no `dbus`/`xfce4-session` at all. With both lazy flags ON, this is NOT a rare/narrow
+    bug: `xset`, `xprop`, `rm`, `mkdir`, and `sleep` ALL crash across repeated runs (real guest
+    `SIGSEGV`, litebox's own `syscalls::signal` correctly reports "fatal signal: terminating task"
+    for these, unlike `xfce4-session`'s silent host-level death above) -- essentially any
+    forked-then-exec'd child is at risk, not only the fork-without-execve subshell case the 83rd/84th
+    passes originally scoped this bug to. 17 of 25 captured fault events (`LITEBOX_DIAG_FATALDUMP=1
+    LITEBOX_DIAG_FAULT_VQ=1 LITEBOX_DIAG_FAULT_MODULE=1`, `.wfgy/pass103_xset_repro1.log`) share the
+    IDENTICAL fault address `0x7feffffef000` -- a CODE-FETCH fault (`rip==cr2`), on a page
+    `VirtualQuery` reports as already `MEM_COMMIT`+`PAGE_READONLY` (not the `MEM_RESERVE` state an
+    unfaulted lazy range should show), with `lazy_commit_veh`'s own group lookup logging "meta-slot
+    parent-side: no reverse translation found" -- the address isn't tracked as a lazy-reserved range
+    at all, yet real Windows memory state shows something already touched and mis-protected it.
+    **Decisive control**: the IDENTICAL script with ONLY `LITEBOX_PROCESS_FORK=1` set (lazy flags
+    unset) shows ZERO crashes across the same commands, `xset q` returns real output rc=0
+    (`.wfgy/pass103_xset_repro_nolazy.log`) -- proving the crash is caused BY the lazy flags, not
+    pre-existing. This IS the SAME mechanism as the 100th-102nd passes' "Angle B `rc=139`"
+    (previously found via `winpid=8916` crashing "essentially immediately after task-resume-probe",
+    `.wfgy/pass102_lazy_execve.log`) -- this pass shows it is NOT narrow/non-blocking: it killed the
+    actual session manager in the real boot. **Correction to the 102nd pass's own assessment**
+    ("`rc=139` does NOT itself block a boot from proceeding"): that was true only in the sense that
+    OTHER processes crashing didn't visibly stop `WM_POLL`/`XCENSUS` from cycling -- but the SAME bug
+    hitting `xfce4-session` itself is fatal to reaching `DE_UP`. Root cause of the fault itself
+    (why this address ends up committed+`PAGE_READONLY` and untracked) is NOT found this pass --
+    needs the live `cdb` attach the 101st/102nd passes already recommended, now using this pass's
+    much cheaper `xset`-under-`Xvfb` repro instead of a full real boot or even a subshell.
+  - **Non-lazy path (`LITEBOX_PROCESS_FORK=1` alone) re-verified against the CURRENT binary --
+    genuinely further progress than any lazy-flag run, but still RAM-craters before `DE_UP`.** No
+    pass since the 76th/77th/82nd passes' RAM fixes had re-tested this exact combination on a real
+    boot. `.wfgy/pass103_nolazy_boot1.{out,err,poll}.log`: `xfce4-session` does NOT crash (no
+    `exit_group`/`exit_signal` for its pid anywhere in the log), and `argv0=/usr/bin/xfwm4` DOES
+    `execve` (pid 22036) and stays alive with no exit event for the rest of the run -- real,
+    confirmed progress no lazy-flag run reaches. `XCENSUS_WINDOWS total=9` by `WM_POLL n=2`
+    (real X11 windows exist). The boot still hits the pre-83rd-pass RAM crater: 16 processes /
+    0.17GB free at t=123.9s, killed by the harness's own kill switch, before
+    `_NET_SUPPORTING_WM_CHECK` is ever observed set. **So under the safe, non-lazy path, `DE_FAILED`
+    is NOT a WM crash or hang -- it's the same still-open RAM-crater problem (Track B item 1) cutting
+    the boot off mid-initialization**, now reconfirmed on the current binary rather than assumed
+    unchanged since the 82nd pass.
+  - **Repo-hygiene bug found+fixed**: `.wfgy/de_only_xcensus_seed3.tar`'s embedded `de_only.sh`
+    predates the 82nd pass's RAM-saving session trim (Failsafe cut to `xfwm4`+`xfsettingsd`,
+    `at-spi-dbus-bus`/`pulseaudio` autostart hidden) -- per this file's own standing lesson
+    ("`.wfgy/webtop_seed.tar` embeds a FROZEN COPY... re-tar after every edit"), it was never
+    re-tarred after that pass landed the trim in the host-side `.wfgy/de_only.sh`. **Every
+    `de_only_xcensus_seed3.tar` boot since the 82nd pass -- including BOTH of the 102nd pass's own
+    "stable" verification runs -- has actually been running the FULL untrimmed 5-client Failsafe
+    session** (confirmed via `DIAG_TIMELINE execve`: `iceauth`, `ssh-agent`, `at-spi-bus-launcher`,
+    `dbus-update-activation-environment`, `gpgconf` all appear, none of which the trim should allow).
+    Fixed: `.wfgy/pass103_de_only_trimmed_seed.tar` merges the current (trimmed) `de_only.sh` with
+    the working xcensus-via-stdin probe and a lighter `WM_POLL` loop (10s interval, census only at
+    the end -- the loop's own `sleep`+`xprop`+`python3` forks were competing with `xfce4-session`'s
+    tree for the same RAM/admission-slot budget during exactly the window under test). Re-tested with
+    the trim genuinely applied + lazy flags off: the crater still occurs (~90-111s, 10-13 processes)
+    -- consistent with, not contradicting, the 82nd pass's own "tested, confirmed real but
+    exhausted... neither reduces Windows' own `VirtualAlloc2(MEM_COMMIT)` charge" conclusion; the
+    trim reduces window/client count but doesn't move the crater's RAM math. **Open note for next
+    pass, not yet root-caused**: even with the corrected seed, one trimmed run's `DIAG_TIMELINE`
+    still showed `xfce4-panel`/`Thunar`/`gpgconf` PATH-search `execve` attempts -- the trimmed
+    `xfce4-session.xml` override may not be taking effect as designed; don't assume the trim is
+    100% effective without checking this directly first.
+  - **New lead for the RAM-crater problem itself, not yet investigated**: in both non-lazy runs,
+    `xfwm4` spent its entire observed lifetime repeatedly hitting `[unix_addr_presence] ECONNREFUSED
+    but address IS bound, by a DIFFERENT guest pid` (the ALREADY-DOCUMENTED "Open" item 2
+    cross-process AF_UNIX data-plane sharing gap) roughly once every 1-10s, with no other visible
+    progress before the crater killed it. Plausible, unconfirmed: this retry loop is why `xfwm4`
+    is slow enough to lose the race against the RAM crater -- if so, fixing the item-2 AF_UNIX gap
+    could matter more for reaching `DE_UP` than continuing to chase the lazy-fork-commit bug above.
+    Check directly next pass: does `xfwm4` ever get PAST this retry loop given enough time (e.g. a
+    boot with `live_cross_process_fork_children`'s cap temporarily lowered to slow the crater,
+    purely as a diagnostic, not a fix), or is it stuck retrying forever?
+  - Logs: `.wfgy/pass103_xset_repro.sh`, `.wfgy/pass103_xset_seed.tar`,
+    `.wfgy/pass103_xset_repro1.log` (lazy ON, fault diagnostics), `.wfgy/pass103_xset_repro_nolazy.log`
+    (lazy OFF control), `.wfgy/pass103_nolazy_boot1.{out,err,poll}.log`,
+    `.wfgy/pass103_de_only_trimmed_xcensus.sh`, `.wfgy/pass103_de_only_trimmed_seed.tar`,
+    `.wfgy/pass103_trimmed_boot{1,2}.{out,err,poll}.log`.
+- **104th -- confirmed the 103rd pass's `0x7feffffef000` hypothesis with a targeted diagnostic (not a
+  guess), root-caused and FIXED one real, independent bug behind it, live-verified on the cheap
+  `xset` repro; discovered the fix does NOT close the repro (a separate, larger, pre-existing bug --
+  `fork_verify`'s own stale-CODE-pointer healer -- still crashes it pervasively) and sharpened that
+  open item with new exact evidence instead of forcing an unverified fix.**
+  - **Root cause, confirmed by direct evidence**: the address `0x7feffffef000` is the child's own
+    `Task::ensure_sigreturn_trampoline` page (`litebox_shim_linux/src/syscalls/signal/mod.rs`) -- a
+    REAL guest `mmap()` VMA (so it is a normal entry in `vma_layout`/`group_relocations`, subject to
+    `Vmem::duplicate`'s 64 MiB `max_intra_group_gap` merge into whichever nearby data group is
+    within that huge a gap), mapped `PROT_READ` only on x86_64 and DELIBERATELY never executable --
+    the whole signal-return recognition mechanism (`LinuxShimEntrypoints::exception`: `ctx.rip ==
+    sigreturn_trampoline_addr()`) depends on a fetch there always hardware-faulting. Because the
+    page carries no `VM_EXEC` flag, `classify_lazy_eligible_groups`'s `has_exec` check can never
+    exclude its group, so it could be classified lazy along with whatever data VMA it got merged
+    with. Once lazy, `lazy_commit_veh` INTERCEPTS the deliberate trap fault (a genuine `LAZY_RANGES`
+    hit), "services" it (`VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)`, real byte copy from the parent,
+    `EXCEPTION_CONTINUE_EXECUTION`) instead of letting it reach `LinuxShimEntrypoints::exception()`
+    unserviced -- the retried fetch faults again identically forever (Windows DEP: neither
+    `PAGE_READWRITE` nor `PAGE_READONLY` is executable), a 100%-reproducible infinite refault loop,
+    never reaching the real handler. A DIFFERENT mechanism from the 85th pass's own Bug A (that one
+    was about `CONTEXT.Rsp` at an unrelated exception's delivery time; this is about the trampoline
+    page itself being touched on purpose) -- confirmed, not assumed, by extending
+    `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`'s existing diagnostic and re-running the exact
+    `.wfgy/pass103_xset_repro.sh` repro on a fresh debug build: `[lazy_fork_commit] group
+    0x7feffffb0000..0x7fefffff0000 excluded from lazy: contains
+    sigreturn_trampoline=0x7feffffef000` -- the EXACT address from the 103rd pass's own crash dump.
+  - **Fix (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`,
+    `litebox_platform_windows_userland/src/process_fork.rs`)**: `classify_lazy_eligible_groups` gains
+    a `sigreturn_trampoline: usize` parameter (the SAME value `spawn_process_fork_child` already
+    threads through for the 84th pass's unrelated Bug 2 fix, now reused for a second, independent
+    purpose) and excludes whichever group contains it, mirroring the existing active-`%rsp`
+    exclusion exactly. Belt-and-suspenders defense in depth also added to `lazy_commit_veh` itself:
+    an `EXECUTE`-type access violation (`ExceptionInformation[0] == 8`) landing inside a tracked lazy
+    range now declines (`EXCEPTION_CONTINUE_SEARCH`) unconditionally rather than servicing it --
+    this module only ever marks PURE-DATA groups lazy, so a legitimate lazy fault should never be an
+    instruction fetch; committing `PAGE_READWRITE` and retrying can never satisfy one, so failing
+    safe is strictly better than a silent infinite loop for any FUTURE case in this same bug class.
+    Both changes are entirely inside the `lazy_fork_commit_enabled()`-gated path (provably inert with
+    both flags unset, same guarantee this module has always carried).
+  - **Verified on the cheap repro, both with and without guard-cow**: rebuilt debug
+    (`cargo build -p litebox_runner_linux_on_windows_userland --target x86_64-pc-windows-msvc`,
+    confirmed fresh mtime), ran `.wfgy/pass103_xset_repro.sh` under
+    `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1
+    LITEBOX_DIAG_LAZY_FORK_COMMIT=1` (`.wfgy/pass104_xset_fix.{out,err}.log`) and again with
+    guard-cow off (`.wfgy/pass104_xset_fix2.{out,err}.log`): the trampoline-group exclusion line
+    fires correctly on essentially every fork (dozens of occurrences), ZERO
+    `0x7feffffef000`-address faults anywhere in either log, and zero "declined execute-type fault"
+    lines (meaning the classify-time fix alone is already sufficient -- the defense-in-depth check
+    in `lazy_commit_veh` never even needed to fire). Also confirmed the crate compiles clean and
+    `classify_lazy_eligible_groups`'s early return for `!lazy_fork_commit_enabled()` is unchanged, so
+    `LITEBOX_PROCESS_FORK=1` alone stays byte-identical by construction (same guarantee this module
+    has always carried; not re-verified via a fresh full boot this pass given the time cost, but the
+    code path is unreachable when the flag is unset).
+  - **NOT closed: the SAME guard-cow-off run still shows 48 `fatal signal: terminating task
+    signal=Signal(11)` events, and the script's own `[s] PROBE_XSET rc=139` line shows `xset` itself
+    still crashes** -- fixing the trampoline bug did not make the repro clean. This is the
+    already-documented "Angle B `rc=139`" class (100th-103rd passes), now sharpened with new,
+    precise evidence: every one of the 48 crashes is immediately preceded by 8 consecutive
+    `fork_verify: stale CODE pointer detected via raw access violation (no #DB delivered),
+    translating and resuming rip=... translated_rip=... fault_addr=18446744073709551615 repeat=1..8`
+    lines (the SAME constant `rip=0x110097b30`/`fault_addr=-1` pair across every distinct crashing
+    process/pid), then `fork_verify: AV-path stale rip livelock detected (same rip repeated), falling
+    through to deeper slot healers`, then the fatal signal -- i.e. `fork_verify`'s own THREAD-based
+    stale-pointer single-step healer is engaging and failing to resolve the fault. Per this file's
+    own standing description of cross-process fork ("a genuine `D == 0` fork... no relocation, no
+    `fork_verify` healing"), this machinery should not even be relevant here -- strongly consistent
+    with the 84th pass's own flagged-but-never-confirmed "interaction with `fork_verify.rs`'s own
+    watched-code-page machinery" hypothesis for this exact bug class, now with concrete rip/fault_addr
+    evidence instead of a guess. **Confirmed absent from the non-lazy baseline** (0 `fatal signal`
+    lines in `.wfgy/pass103_xset_repro_nolazy.log`, vs. 48 in this pass's fixed-but-still-lazy run) --
+    genuinely caused by the lazy path, not pre-existing/unrelated noise. Root cause NOT found this
+    pass -- per this file's own standing practice for this bug class, the next step is a live
+    `cdb -pv` attach (debug build) on `fork_verify::on_single_step`/`vectored_exception_handler`
+    breaking on the exact `rip=0x110097b30` repeat, not further code reading. **Both lazy flags stay
+    default OFF; still not safe for a real boot.** No full real-boot attempt made this pass (the
+    cheap repro alone already disqualifies the flags; spending a ~3+ minute boot cycle on a
+    known-still-broken config would not have added information). `DE_UP` not attempted.
+  - Logs: `.wfgy/pass104_xset_fix.{out,err,poll}.log` (guard-cow on), `.wfgy/pass104_xset_fix2.
+    {out,err}.log` (guard-cow off, the 48-crash/`rc=139` evidence).
+- **105th -- root-caused+FIXED a SECOND, independent sigreturn-trampoline livelock, this time in
+  `fork_verify.rs` itself (not `lazy_commit_veh`); corrects the 104th pass's own "constant
+  `rip=0x110097b30`" characterization -- that address was specific to that pass's own run and is NOT
+  a fixed/meaningful constant across builds. Found via log evidence + call-graph reading (not a live
+  `cdb` attach), verified via real rebuild-and-rerun A/B, not fabricated. Still does not close the
+  repro: a THIRD, distinct, uncharacterized crash remains.**
+  - **Root cause**: `run_thread_with_fork_verification` (`litebox_platform_windows_userland/src/lib.rs`,
+    pass 142/143) arms `fork_verify::begin` for EVERY real `LITEBOX_PROCESS_FORK=1` cross-process fork
+    child, not just the old thread-based fallback path -- a deliberate, general safety net "for
+    whatever the group-relocations copy doesn't cover" per that function's own doc comment. It is
+    handed an IDENTITY `AddressRelocations` (`relocations.is_identity()` true, source == destination
+    by construction for a cross-process child). Under an identity map, `relocations.is_in_source(rip)`
+    is true for essentially every address the child legitimately executes -- including the sigreturn
+    trampoline's own deliberately-permanent-fault page. `fork_verify.rs` had ZERO references to
+    "sigreturn" anywhere in its ~2850 lines before this pass, so both `on_single_step`'s case (1) and
+    its AV-path counterpart `translate_stale_source_rip` "healed" this fault too: `relocations.
+    translate(rip)` on an identity map returns the SAME address, so the retried fetch faults again
+    identically forever -- confirmed live via `.wfgy/pass105_xset_repro_lazy.err.log` (built from
+    HEAD `67345a4`, which already carries the 104th pass's `lazy_commit_veh` fix):
+    `rip=translated_rip=140668768808960` (`0x7feffffef000`, the exact same trampoline address the
+    104th pass fixed in the OTHER module) repeating via `fork_verify: stale CODE pointer detected via
+    raw access violation`, then `fork_verify: AV-path stale rip livelock detected (same rip
+    repeated), falling through to deeper slot healers`, then `fatal signal: terminating task
+    signal=Signal(11)`. This also corrects the 104th pass's own framing: the 84th pass's flagged
+    "interaction with `fork_verify.rs`'s own watched-code-page machinery" hypothesis referred to the
+    `codewatch` diagnostic module (gated `LITEBOX_CODEWATCH=1`, off by default, unrelated to any
+    default run) -- not what is actually happening here. The real mechanism is simpler: pass 142/143's
+    deliberate, correct wiring of `fork_verify` into the cross-process path just never got the same
+    trampoline exclusion `lazy_commit_veh` got in the 104th pass, because the two healers are fully
+    independent modules that happen to share the identical failure shape against the identical
+    address.
+  - **Fix** (`litebox/src/platform/mod.rs`, `litebox_shim_linux/src/syscalls/process.rs`,
+    `litebox_platform_windows_userland/src/{lib.rs,fork_verify.rs,process_fork.rs}`,
+    `litebox_runner_linux_on_windows_userland/src/lib.rs`): `ForkChildVerificationProvider::
+    begin_fork_child_verification` gains a `sigreturn_trampoline: usize` parameter (mirroring
+    `spawn_cross_process_fork_child`'s own parameter of the same name/purpose); its one caller
+    (`litebox_shim_linux`'s thread-based-fork dispatch) passes `self.sigreturn_trampoline_addr()`;
+    `run_thread_with_fork_verification`/`run_thread_inner` thread the SAME value the runner's
+    cross-process fork-child bootstrap already parses (`FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR`,
+    the 84th pass's own Bug 2 plumbing, reused a third time) into `fork_verify::begin`. `fork_verify.rs`
+    gained a new per-thread `FORK_VERIFY_SIGRETURN_TRAMPOLINE` cell (stamped by `begin()`, cleared by
+    `end()`, mirroring the existing `FORK_VERIFY_EPOCH` pattern) and an `is_sigreturn_trampoline()`
+    guard applied at both `is_in_source(rip)` gates that can heal a code pointer -- `on_single_step`
+    case (1) and the AV-path `translate_stale_source_rip` -- declining (falling through / returning
+    `None`) instead of healing, letting the fault reach the normal unhandled-AV dispatch so
+    `LinuxShimEntrypoints::exception()` gets the chance to recognize it, exactly mirroring
+    `lazy_commit_veh`'s own `EXCEPTION_CONTINUE_SEARCH` decline. The diagnostic-only cross-process
+    resume probe (`process_fork.rs:296`) passes a literal `0` (no real trampoline is ever transmitted
+    over that synthetic channel).
+  - **Verified live, real A/B, on a rebuilt release binary** (`cargo build -p
+    litebox_runner_linux_on_windows_userland --release`, confirmed fresh mtime), same
+    `.wfgy/pass105_xset_repro.sh` (a byte-for-byte copy of the 103rd pass's `Xvfb`+`xset q` script, fed
+    via stdin -- NOT via a `-ArgumentList` inline string, which corrupts on embedded double quotes per
+    this file's own PowerShell-quoting caution; see `.wfgy/pass105_xset_repro_lazy.ps1`):
+    - Before fix: 20 occurrences of `rip=translated_rip=140668768808960`, "AV-path stale rip livelock
+      detected", 6 fatal `Signal(11)` events, `xset rc=139`.
+    - After fix: 0 occurrences of that address or livelock message anywhere in the log.
+    - `LITEBOX_PROCESS_FORK=1` alone (both lazy flags unset, `.wfgy/pass105_xset_repro_nolazy.*.log`):
+      0 fatal signals, `xset rc=0` -- confirms the new plumbing is a genuine no-op on the thread-based
+      path (its destination ranges are disjoint from source ranges by construction, so
+      `is_in_source(sigreturn_trampoline_dest_addr)` was never true there to begin with).
+    - `cargo check --workspace` and `cargo test -p litebox_platform_windows_userland --lib` each have
+      one pre-existing, unrelated failure (seccompiler libc symbols in `litebox_platform_linux_userland`;
+      a `RawMutex` test-fixture missing-fields error) -- confirmed via `git stash` to be identical on
+      pristine `67345a4`, not introduced by this pass.
+  - **NOT closed: the SAME repro, same fix applied, STILL shows 6 fatal SIGSEGVs and `xset rc=139`
+    with both lazy flags on (0 with `LITEBOX_PROCESS_FORK=1` alone) -- a genuinely THIRD, distinct,
+    still-uncharacterized bug.** Zero `0x7feffffef000` hits anywhere in the post-fix run, so this is
+    not another instance of the trampoline pattern. New evidence this pass: the clearest instance
+    (pid=12020) crashes with `Signal(11)` immediately after `DIAG_TIMELINE execve pid=12020
+    ppid=12020 ... argv0=/usr/bin/rm`, preceded by a lone `[diag-recover-fsbase] recover_rip=0x...
+    fsbase=0x7feffffb1740` line -- an FS_BASE-recovery event firing right at the guest's post-`execve`
+    resume, not another `is_in_source`/livelock signature. Leading untested hypotheses for the next
+    pass: (a) an interaction between the very-high-volume, near-every-instruction single-step tracing
+    `fork_verify`'s identity-map safety net imposes during the whole fork-to-execve window (tens of
+    thousands of "stale CODE pointer... rip==translated_rip" no-op heals observed per fork in this
+    pass's own logs) and guard-cow's own PARENT-side write-fault VEH; (b) a genuine FS_BASE-recovery
+    race specific to a lazily-committed (not-yet-faulted-in) group being touched for the first time
+    right around `execve`. Root cause NOT found this pass. Per this file's own standing practice for
+    this bug class, the next concrete step is a live `cdb -p` attach (debug build; invasive `-p`, not
+    `-pv`, per the 93rd pass's own correction) breaking on the FS_BASE-recovery path and on
+    `execve`'s own guest-resume point for `/usr/bin/rm`, not further log-based diagnosis alone --
+    this pass deliberately used log evidence + code reading (faster to land a real, verified fix for
+    the FIRST bug it found) rather than a debugger session, and that method has now run out of new
+    signal for this THIRD bug's own root cause.
+  - Logs: `.wfgy/pass105_xset_repro.sh` (the repro script, byte-identical to the 103rd pass's),
+    `.wfgy/pass105_xset_repro_lazy.ps1`/`.err.log`/`.out.log`/`.poll.log` (before-fix evidence),
+    `.wfgy/pass105_xset_repro_lazy_fixed.{err,out,poll}.log` (after-fix, 0 `0x7feffffef000` hits),
+    `.wfgy/pass105_xset_repro_nolazy.ps1`/`.{err,out,poll}.log` (control, `LITEBOX_PROCESS_FORK=1`
+    alone, 0 fatal signals both before and after this pass's fix).
