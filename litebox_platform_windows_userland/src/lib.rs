@@ -8694,6 +8694,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // can only be unmapped whole), so releasing here left exactly those ranges claimed
         // forever. It now hangs off `release_mapping_claim`, which `Vmem::remove_mapping` calls
         // unconditionally.
+        // Bug 6b (100th pass, `lazy_fork_commit`'s own doc comment on `invalidate_guarded_range`
+        // has the full correctness argument): this GUEST-initiated deallocation may be about to
+        // `VirtualFree` a page this process currently guard-cow-protects on behalf of one or more
+        // pending fork children -- evict it from the registry (servicing any pending generation
+        // with its current bytes first) BEFORE the real decommit below, so no stale entry survives
+        // to mis-heal a later, unrelated re-use of the same host virtual address. A cheap no-op
+        // when guard-cow was never enabled or nothing is currently guarded. MUST run BEFORE
+        // `ALLOCATE_PAGES_FIXED_ADDR_LOCK` is taken just below -- that lock IS `VIRTUAL_PROTECT_
+        // LOCK` (see its own doc comment, a `const` alias, not a second mutex), and `guard_one_
+        // page`/`guard_cow_write_fault_veh` always take `GUARD_PAGE_REGISTRY`'s lock OUTSIDE
+        // `VIRTUAL_PROTECT_LOCK` (registry, then virtual-protect) -- calling this INSIDE that lock
+        // would invert the order and risk a real AB-BA deadlock against those paths.
+        crate::lazy_fork_commit::invalidate_guarded_range(&range);
         // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across this entire query-then-decommit walk, for
         // the same reason `allocate_pages`'s fixed-address path holds it (see that call site's own
         // doc comment): `process_memory_range_by_regions`'s `VirtualQuery`-then-act loop has no
@@ -8791,6 +8804,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(new_permissions);
+        // Bug 6b (100th pass, `lazy_fork_commit::invalidate_guarded_range`'s own doc comment has
+        // the full correctness argument): this GUEST-initiated `mprotect()` may be about to
+        // `VirtualProtect` a page this process currently guard-cow-protects on behalf of one or
+        // more pending fork children with NO fault at all (an ordinary `VirtualProtect` call never
+        // faults), silently bypassing this mechanism's own write-fault capture and reopening the
+        // exact torn-read TOCTOU it exists to close. Evict any such page from the registry first
+        // (servicing pending generations with current bytes) so the real call below is free to set
+        // whatever protection the guest actually asked for. MUST run BEFORE `VIRTUAL_PROTECT_LOCK`
+        // is taken below, never after or nested inside it: `guard_one_page`/`guard_cow_write_fault_
+        // veh` always take `GUARD_PAGE_REGISTRY`'s lock OUTSIDE `VIRTUAL_PROTECT_LOCK` (registry,
+        // then virtual-protect) -- taking them in the opposite order here would be a real,
+        // classic AB-BA deadlock risk against those paths. A cheap no-op when guard-cow was never
+        // enabled or nothing is currently guarded.
+        crate::lazy_fork_commit::invalidate_guarded_range(&range);
         // Hold `VIRTUAL_PROTECT_LOCK` for the whole region walk: see its doc comment for why an
         // unsynchronized `VirtualProtect` here can race `fork_verify`'s own temporary
         // protection-flip-and-restore on a page shared with an unrelated thread.
@@ -12331,6 +12358,13 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
 
     fn end_fork_child_verification(&self) {
         fork_verify::end();
+        // Bug 7 (100th pass, `lazy_fork_commit::DISARMED_BY_EXECVE`'s own doc comment has the full
+        // root-cause argument): `sys_execve` calls this exact method at exactly "the old program is
+        // torn down" -- the same point this process's own `lazy_fork_commit` child-side state (if
+        // this process was ever a lazy fork child) must be permanently disarmed, since `execve`
+        // reloads the guest image IN PLACE (same Windows process) and the old fork-time ranges
+        // otherwise stay armed against whatever unrelated program runs here next.
+        lazy_fork_commit::disarm_on_execve();
     }
 
     fn lock_fork_verify_heal(&self) -> impl Sized {

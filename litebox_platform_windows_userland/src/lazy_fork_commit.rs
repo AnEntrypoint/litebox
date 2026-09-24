@@ -865,6 +865,67 @@ static PARENT_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static LAZY_FAULTS_SERVICED: AtomicUsize = AtomicUsize::new(0);
 static LAZY_FAULTS_ZERO_FILLED: AtomicUsize = AtomicUsize::new(0);
 
+/// **Bug 7 (found 100th pass, FIXED here) -- the real root cause of the 787b139/99th-pass
+/// regression's `XCENSUS_PRE_DE rc=134 corrupted size vs. prev_size` heap corruption.**
+///
+/// [`install_if_configured`]'s own doc comment already states the design invariant: [`LAZY_RANGES`]/
+/// [`PARENT_HANDLE`] are "written exactly ONCE... before the child resumes any guest execution, and
+/// never mutated again". That was always true for a fork child that never calls `execve` again --
+/// but `sys_execve` (`litebox_shim_linux::syscalls::process`) does NOT spawn a new Windows process;
+/// it tears down and reloads the CURRENT process's own guest image IN PLACE (`release_memory` then
+/// `load_program`, same PID, same host process, see that function's own "After this point, the old
+/// program is torn down" comment). [`lazy_commit_veh`] is installed once via
+/// `AddVectoredExceptionHandler` and is NEVER removed by `execve` -- nothing about reloading the
+/// guest image touches the VEH chain. So a process that was EVER a lazy-fork child (even one whose
+/// own group ranges were only ever `MEM_RESERVE`d, never actually touched/committed before it
+/// `execve`'d) keeps this handler armed, with the SAME stale [`LAZY_RANGES`] addresses and the SAME
+/// stale [`PARENT_HANDLE`], for the rest of that Windows process's ENTIRE remaining lifetime --
+/// including across arbitrarily many FUTURE `execve()` calls into completely unrelated programs
+/// (`sh` -> `cpp` -> `cc1`, the exact real-boot chain that surfaced this: `xrdb` forks a lazy child,
+/// which `execve`s `/bin/sh`, which forks its OWN lazy child which `execve`s `cpp`, etc. -- every
+/// one of those `execve`s left the ORIGINAL fork's `lazy_commit_veh`/`LAZY_RANGES` fully armed).
+///
+/// A freshly `execve`'d program's own allocator is highly likely to reuse the SAME address range
+/// its predecessor's memory just occupied (Windows' free-region search naturally prefers a range
+/// just freed/reserved by this same process's own immediately-preceding `release_memory`/
+/// `deallocate_pages` calls) -- so the NEW program's own heap/stack can genuinely fault inside an
+/// OLD, stale [`LAZY_RANGES`] entry. When that happens, [`lazy_commit_veh`] "helpfully" services the
+/// fault by `ReadProcessMemory`-ing the ORIGINAL parent (a process the new program has zero logical
+/// relationship to) and copying THAT unrelated data into the new program's fresh page -- silently
+/// seeding the new program's heap/stack with garbage instead of a clean/zero page, exactly the shape
+/// a `malloc_state`/chunk-header consistency assertion (`corrupted size vs. prev_size`) would catch.
+/// This is a different, independent bug from Bug 6a/6b above (those are about the PARENT-side
+/// `GUARD_PAGE_REGISTRY` desyncing from ordinary guest `mprotect`/`munmap` -- this is about the
+/// CHILD-side lazy-population VEH surviving past the point its own tracked ranges stop meaning
+/// anything at all).
+///
+/// **Fix**: this flag, checked FIRST in [`lazy_commit_veh`] before even consulting [`LAZY_RANGES`].
+/// [`disarm_on_execve`] sets it and closes [`PARENT_HANDLE`] -- called from `sys_execve`'s own
+/// existing `end_fork_child_verification()` hook (`litebox_shim_linux::syscalls::process`, already
+/// called at exactly "the old program is torn down" point for the UNRELATED thread-based
+/// `fork_verify` mechanism's own teardown; `WindowsUserland::end_fork_child_verification`,
+/// `lib.rs`, now also calls this). `OnceLock`s ([`LAZY_RANGES`]/[`GUARD_GROUP_BASES`]) cannot
+/// themselves be reset on stable Rust, so this flag is the gate instead -- functionally equivalent
+/// (every reader of those statics goes through [`lazy_commit_veh`], which now refuses to reach them
+/// at all once disarmed) without needing to change their storage type. A no-op, one relaxed atomic
+/// load, for the overwhelming majority of VEH invocations that belong to an entirely unrelated fault
+/// class (this process's own main `vectored_exception_handler_entry`/`fork_verify` machinery).
+static DISARMED_BY_EXECVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called from `sys_execve`'s teardown (via `WindowsUserland::end_fork_child_verification`) to
+/// permanently disarm this process's own lazy-fork-commit child-side machinery -- see
+/// [`DISARMED_BY_EXECVE`]'s own doc comment (Bug 7, 100th pass) for why this is necessary and safe.
+/// Idempotent and cheap to call even when this process was never a lazy fork child at all (the
+/// common case for most `execve`s): [`PARENT_HANDLE`] is simply `0` already, so the `CloseHandle`
+/// branch is skipped.
+pub fn disarm_on_execve() {
+    DISARMED_BY_EXECVE.store(true, Ordering::SeqCst);
+    let old = PARENT_HANDLE.swap(0, Ordering::SeqCst) as Handle;
+    if !old.is_null() {
+        unsafe { CloseHandle(old) };
+    }
+}
+
 /// Child-side guard-cow state (88th pass), populated at most once, alongside [`LAZY_RANGES`], by
 /// [`install_if_configured`]. `0` means "no guard-cow table for this fork" -- either the flag was
 /// off, or [`try_claim_guard_cow_for_fork`] declined this fork's claim (another child from the
@@ -971,6 +1032,12 @@ pub fn install_if_configured() {
 static VEH_ENTRY_COUNT_DIAG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // Bug 7 (100th pass) -- see [`DISARMED_BY_EXECVE`]'s own doc comment. Checked FIRST, before
+    // even `LAZY_RANGES`: once this process has `execve`'d, its old fork-time ranges no longer
+    // mean anything about the CURRENT guest image, and must never be used to service a fault.
+    if DISARMED_BY_EXECVE.load(Ordering::SeqCst) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     let diag = std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some();
     if diag {
         let n = VEH_ENTRY_COUNT_DIAG.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1144,40 +1211,64 @@ impl GuardSnapshotSlot {
     }
 }
 
-/// One live generation's stake in a single guarded page -- see this module's own "89th pass" doc
-/// section for the derivation. `live_handle` is a `PROCESS_QUERY_LIMITED_INFORMATION`-only handle
-/// THIS entry itself opened (in [`guard_one_page`]) and owns for as long as the entry exists;
-/// checking liveness through a handle an entry keeps open, rather than re-resolving a bare pid, is
-/// immune to PID reuse for as long as the entry is outstanding -- a real risk once a page can stay
-/// pending for the lifetime of an arbitrarily long-lived generation, not just a single claim/
-/// reclaim decision.
-struct PendingGeneration {
-    live_handle: Handle,
-    slot: &'static GuardSnapshotSlot,
-}
+/// A `PROCESS_QUERY_LIMITED_INFORMATION`-only handle to one fork child, shared (via [`Arc`])
+/// across every [`PendingGeneration`] this SAME claim ever registers -- see [`GuardCowClaim`]'s
+/// own `child_handle` field doc comment for why one handle per CLAIM (not per page) is what
+/// [`guard_one_page`] actually needs. Closed exactly once, when the last `Arc` referencing it
+/// drops (the last page this claim was pending on either gets serviced/pruned, or the claim
+/// itself is torn down).
+struct SharedChildHandle(Handle);
 
-// Safety: `live_handle` is an opaque Win32 kernel-object handle (`*mut c_void`-shaped, not a real
-// pointer into this process's own memory) -- safe to read/close from any thread, exactly as
-// `windows_sys`' own raw `HANDLE` type is used everywhere else in this codebase across thread
-// boundaries. `slot: &'static GuardSnapshotSlot` is `Sync` already (see that struct's own doc
-// comment) and therefore both `Send` and `Sync` to share.
-unsafe impl Send for PendingGeneration {}
-unsafe impl Sync for PendingGeneration {}
+// Safety: an opaque Win32 kernel-object handle (`*mut c_void`-shaped, not a real pointer into
+// this process's own memory) -- safe to read/close from any thread, exactly as `windows_sys`' own
+// raw `HANDLE` type is used everywhere else in this codebase across thread boundaries.
+unsafe impl Send for SharedChildHandle {}
+unsafe impl Sync for SharedChildHandle {}
 
-impl Drop for PendingGeneration {
+impl Drop for SharedChildHandle {
     fn drop(&mut self) {
-        if !self.live_handle.is_null() {
-            unsafe { CloseHandle(self.live_handle) };
+        if !self.0.is_null() {
+            unsafe { CloseHandle(self.0) };
         }
     }
 }
 
+/// One live generation's stake in a single guarded page -- see this module's own "89th pass" doc
+/// section for the derivation. `live_handle` is a `PROCESS_QUERY_LIMITED_INFORMATION`-only handle,
+/// SHARED (via [`Arc`]) with every other page this SAME claim/generation is pending on -- see
+/// [`SharedChildHandle`]'s own doc comment. Checking liveness through a handle an entry keeps a
+/// reference to, rather than re-resolving a bare pid, is immune to PID reuse for as long as the
+/// entry is outstanding -- a real risk once a page can stay pending for the lifetime of an
+/// arbitrarily long-lived generation, not just a single claim/reclaim decision.
+///
+/// **Bug 6a (found 100th pass, FIXED here)**: this used to be a PER-PAGE `Handle`, opened via a
+/// fresh `OpenProcess` call inside [`guard_one_page`] for every single page it guarded -- even
+/// though every page a single claim ever guards shares the exact same `child_pid` by construction
+/// (one claim == one fork == one child). A multi-MB lazy-eligible group (a guest heap group is the
+/// common real-world case) is hundreds to thousands of 4 KiB pages, so a SINGLE guarded fork used
+/// to open one handle PER PAGE to the very same child process -- real, measurable kernel
+/// handle-table and syscall pressure that grows with GROUP SIZE, not fork count, and stacks on top
+/// of every other still-open claim from a long-lived, repeatedly-forking parent (the 99th pass's
+/// own "many sequential forks" regression shape). Sharing one handle per claim turns this into
+/// O(claims) instead of O(pages) with no change in liveness semantics (a single shared handle is
+/// just as immune to PID reuse as one-per-page was, since it is still opened once and kept alive
+/// for exactly as long as any page it backs is still pending).
+struct PendingGeneration {
+    live_handle: std::sync::Arc<SharedChildHandle>,
+    slot: &'static GuardSnapshotSlot,
+}
+
+// Safety: `slot: &'static GuardSnapshotSlot` is `Sync` already (see that struct's own doc
+// comment); `Arc<SharedChildHandle>` is `Send`/`Sync` because `SharedChildHandle` is.
+unsafe impl Send for PendingGeneration {}
+unsafe impl Sync for PendingGeneration {}
+
 /// `true` iff the generation's own owning process is still running, checked through the entry's
-/// OWN kept-open handle (see [`PendingGeneration`]'s own doc comment for why this, not a
+/// OWN kept (shared) handle (see [`PendingGeneration`]'s own doc comment for why this, not a
 /// re-resolved pid).
 fn pending_generation_alive(p: &PendingGeneration) -> bool {
     let mut exit_code: u32 = 0;
-    let ok = unsafe { GetExitCodeProcess(p.live_handle, &raw mut exit_code) };
+    let ok = unsafe { GetExitCodeProcess(p.live_handle.0, &raw mut exit_code) };
     ok != 0 && exit_code == STILL_ACTIVE
 }
 
@@ -1298,7 +1389,7 @@ fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_i
     }
 
     if map.get(&page).is_some_and(|e| !e.pending.is_empty()) {
-        let Some(handle) = open_liveness_handle(child_pid) else {
+        let Some(handle) = get_or_open_child_handle(claim, child_pid) else {
             return;
         };
         let entry = map.get_mut(&page).expect("checked non-empty just above");
@@ -1328,7 +1419,7 @@ fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_i
         map.remove(&page);
         return;
     }
-    match open_liveness_handle(child_pid) {
+    match get_or_open_child_handle(claim, child_pid) {
         Some(handle) => {
             map.insert(
                 page,
@@ -1426,6 +1517,32 @@ pub struct GuardCowClaim {
     /// PRECISELY what this claim did and nothing belonging to any other, independently-pending
     /// generation this claim happened to share a page's open interval with.
     joined_pages: Vec<(usize, &'static GuardSnapshotSlot)>,
+    /// This claim's own single, shared liveness handle to its one child pid -- see
+    /// [`SharedChildHandle`]'s own doc comment (Bug 6a, 100th pass). Opened lazily, on the first
+    /// page this claim ever successfully guards/joins (via [`get_or_open_child_handle`]), and
+    /// cloned (cheap `Arc` refcount bump, no new `OpenProcess` syscall) into every subsequent
+    /// [`PendingGeneration`] this same claim registers, however many thousands of pages that ends
+    /// up being.
+    child_handle: Option<std::sync::Arc<SharedChildHandle>>,
+}
+
+/// Returns this claim's own shared liveness handle (see [`SharedChildHandle`]/[`GuardCowClaim::
+/// child_handle`]'s doc comments), opening it via a single `OpenProcess` call the first time this
+/// claim needs one and reusing that same handle (cheap `Arc` clone) for every later page -- Bug 6a
+/// (100th pass): this used to be a fresh `OpenProcess` per PAGE, which for a large lazy-eligible
+/// group (a guest heap group routinely spans hundreds-to-thousands of pages) meant one claim could
+/// open thousands of redundant handles to the very same child process.
+fn get_or_open_child_handle(
+    claim: &mut GuardCowClaim,
+    child_pid: u32,
+) -> Option<std::sync::Arc<SharedChildHandle>> {
+    if let Some(h) = &claim.child_handle {
+        return Some(std::sync::Arc::clone(h));
+    }
+    let handle = open_liveness_handle(child_pid)?;
+    let arc = std::sync::Arc::new(SharedChildHandle(handle));
+    claim.child_handle = Some(std::sync::Arc::clone(&arc));
+    Some(arc)
 }
 
 /// Parent-side, PRE-spawn: allocates (and `'static`-leaks) a snapshot table sized for
@@ -1446,6 +1563,7 @@ pub fn try_claim_guard_cow_table(total_pages: usize) -> Option<GuardCowClaim> {
     Some(GuardCowClaim {
         table,
         joined_pages: Vec::new(),
+        child_handle: None,
     })
 }
 
@@ -1484,8 +1602,9 @@ pub fn finalize_guard_cow_table(claim: GuardCowClaim, _child_pid: u32) {
 
 /// Abandons a claim that never became a real, running guarded fork (the child's own spawn or
 /// per-group copy loop failed). Removes precisely this claim's OWN pending entry from every page
-/// it joined (closing that entry's kept-open handle via [`PendingGeneration`]'s own `Drop`), and,
-/// for any page this claim was the LAST live generation on, restores that page to its real prior
+/// it joined (dropping that entry's `Arc<SharedChildHandle>` reference, which closes the shared
+/// liveness handle once every page this claim registered it for has released it), and, for any
+/// page this claim was the LAST live generation on, restores that page to its real prior
 /// protection -- without this, a partially-guarded set of pages this claim was the sole owner of
 /// would stay stuck `PAGE_READONLY` forever.
 pub fn abort_guard_cow_claim(claim: GuardCowClaim) {
@@ -1514,6 +1633,103 @@ pub fn abort_guard_cow_claim(claim: GuardCowClaim) {
                 );
             }
         }
+    }
+}
+
+/// **Bug 6b (found 100th pass, FIXED here)**: [`GUARD_PAGE_REGISTRY`] previously had no hook into
+/// this process's own `PageManagementProvider` impl (`WindowsUserland::update_permissions`/
+/// `deallocate_pages`, `lib.rs`) -- so an entirely ordinary, unrelated GUEST syscall
+/// (`mprotect()`/`munmap()`) landing on a page this process currently guard-cow-protects on behalf
+/// of one or more pending fork children could silently desync the registry from the REAL Windows
+/// page state, in either direction:
+///
+/// - `update_permissions` calls `VirtualProtect` directly and DISCARDS the `old_protect` it gets
+///   back (only ever used for a diagnostic log) -- so a guest `mprotect()` that happens to target a
+///   currently-guarded (`PAGE_READONLY`) page can silently flip the REAL protection to whatever the
+///   guest asked for (commonly back to read-write) with **no fault at all**, since `VirtualProtect`
+///   does not itself fault. [`guard_cow_write_fault_veh`] only ever runs from an
+///   `EXCEPTION_ACCESS_VIOLATION` -- an ordinary `VirtualProtect` call is not one, so this
+///   mechanism's own write-fault capture is silently bypassed entirely. Any pending generation
+///   still relying on that page's staying stable (the entire point of guard-cow) now gets nothing:
+///   the guest is free to write to it before ever taking a captured snapshot, and a lazily-faulting
+///   child that races that write (the double-checked-state protocol only guards against the
+///   PARENT's own write-FAULT path, not an mprotect-then-plain-write sequence that never faults)
+///   can observe a torn value -- reopening the exact TOCTOU class (Bug B/Bug 4) this whole
+///   mechanism exists to close, this time via a perfectly ordinary guest syscall rather than a
+///   same-page write race between two processes.
+/// - Symmetrically, `deallocate_pages` can `VirtualFree(MEM_DECOMMIT)` a currently-guarded page
+///   out from under the registry -- a later, unrelated re-mmap of the SAME host virtual address
+///   (routine on Windows, which readily reuses a freed VA range) could then have its own, entirely
+///   different real protection silently STOMPED by a stale [`guard_one_page`]/[`abort_guard_cow_
+///   claim`] "heal" (`VirtualProtect(..., true_original_protect, ...)`) applied to what the
+///   registry still thinks is the SAME allocation it originally guarded, potentially corrupting or
+///   mis-protecting completely unrelated, later memory.
+///
+/// This is exactly the kind of "accumulated stale state across many sequential forks" class the
+/// 99th pass's regression pointed at: the more pages a long-lived, repeatedly-forking parent has
+/// EVER guarded over its lifetime, the more of its own later, entirely ordinary heap/mmap activity
+/// has a chance to land on one of them.
+///
+/// **Fix**: [`WindowsUserland::update_permissions`]/`deallocate_pages` (`lib.rs`) now call this
+/// function on `range` BEFORE performing their own real `VirtualProtect`/`VirtualFree` call. For
+/// every currently-guarded page inside `range`, this immediately services every still-alive
+/// pending generation with the page's CURRENT bytes (the same capture step
+/// [`guard_cow_write_fault_veh`] itself performs on a genuine write fault) and evicts the page from
+/// the registry entirely -- the caller's own real, guest-intended operation then proceeds
+/// unimpeded, and no stale entry is left behind to mis-heal a future, unrelated re-use of the same
+/// address. A cheap no-op (one `guard_cow_enabled()` check, no lock taken) when guard-cow was never
+/// enabled or this process has never guarded anything.
+pub fn invalidate_guarded_range(range: &Range<usize>) {
+    if !guard_cow_enabled() {
+        return;
+    }
+    let mut registry = GUARD_PAGE_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(map) = registry.as_mut() else {
+        return;
+    };
+    if map.is_empty() || range.start >= range.end {
+        return;
+    }
+    let diag = std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some();
+    let mut page = range.start & !(PAGE_SIZE - 1);
+    while page < range.end {
+        if let Some(entry) = map.remove(&page) {
+            let pending_count = entry.pending.len();
+            if pending_count > 0 {
+                // Best-effort snapshot of whatever is currently there -- read BEFORE the caller's
+                // own real VirtualProtect/VirtualFree call runs (this function is always called
+                // first), so this is still a coherent "value as of right before the guest's own
+                // mprotect/munmap", exactly matching what an eager copy taken at this same instant
+                // would have captured.
+                let mut buf = [0u8; PAGE_SIZE];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(page as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+                }
+                for p in entry.pending {
+                    if pending_generation_alive(&p) {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                buf.as_ptr(),
+                                (*p.slot.bytes.get()).as_mut_ptr(),
+                                PAGE_SIZE,
+                            );
+                        }
+                        p.slot.state.store(1, Ordering::Release);
+                    }
+                }
+            }
+            if diag {
+                eprintln!(
+                    "[lazy_fork_commit] guard-cow: page={page:#x} INVALIDATED by guest-initiated \
+                     protection/lifetime change (evicted from registry, {pending_count} pending \
+                     generation(s) serviced) -- NOT restoring true_original_protect, the caller's \
+                     own real operation decides this page's next protection"
+                );
+            }
+        }
+        page += PAGE_SIZE;
     }
 }
 
