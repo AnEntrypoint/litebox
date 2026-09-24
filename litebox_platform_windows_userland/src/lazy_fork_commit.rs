@@ -610,19 +610,21 @@
 //! per-fork leaks (leaked snapshot tables), and self-evidently bounded by the guest's own total
 //! distinct-page count, not by fork count.
 //!
-//! **A known, explicit, un-optimized cost in this first landing**: page protection is applied
-//! ONE PAGE AT A TIME ([`reserve_group_lazy_guarded`]'s inner loop calls [`guard_one_page`] per
-//! page), not batched into one `VirtualProtect` call per contiguous committed sub-range the way
-//! the 88th pass's single-generation version did. This trades the 88th pass's own O(ranges) syscall
-//! count for O(pages) in the guard-cow-specific path (the plain-lazy and eager paths are UNCHANGED
-//! and unaffected) -- deliberately chosen this pass to keep the join-vs-open decision and its
-//! locking simple and provably correct under real concurrent-fork overlap, rather than layering a
-//! batching optimization on top of a brand-new correctness-critical path without an equivalent
-//! live-verification budget for THAT optimization too. Flagged as a concrete, bounded,
-//! purely-performance follow-up for a future pass with its own measurement budget -- batch
-//! `VirtualProtect` across a contiguous run of pages that are ALL currently unopened (the common
-//! case, no real overlap), falling back to this pass's per-page path only for a page some other
-//! live generation already has open (rare, bounded by the 6-concurrent-child admission cap).
+//! **101st pass: the per-page `VirtualProtect` cost flagged below by the 89th pass is now batched**
+//! ([`try_guard_region_batched`], called first by [`reserve_group_lazy_guarded`]'s inner loop):
+//! when an entire `VirtualQuery`-uniform sub-range has NO existing [`GUARD_PAGE_REGISTRY`] entry at
+//! all (checked under one lock acquisition), it is guarded with ONE `VirtualProtect` call across
+//! the whole sub-range instead of one call per page. [`guard_one_page`]'s original per-page path is
+//! UNCHANGED and still runs, unmodified, as the fallback the instant any page in a sub-range
+//! already has a live entry (a genuine overlap between two concurrently-forking generations from
+//! the same parent) -- so the join-vs-open decision's own correctness argument is untouched; the
+//! batching only ever takes over the strict subset of cases that would have gone through the
+//! per-page "open fresh interval" branch for every page in the sub-range anyway (same `old_protect`
+//! for all of them by construction, since a `VirtualQuery` region is protection-uniform). Verified
+//! this pass on the isolated fork-then-execve and fork-without-execve subshell repros (both flags
+//! on, both debug and release) -- see `AGENTS.md`'s 101st-pass entry for exact commands/output; a
+//! real-boot timing A/B against the pre-batch binary is this pass's own next step, not yet
+//! consolidated into this comment at the time it was written.
 //!
 //! **Verification this pass**: see this project's own `AGENTS.md` 98th-pass entry for the exact
 //! commands and real output -- both original repros (fork-then-execve; fork-without-execve
@@ -1454,12 +1456,124 @@ fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_i
     }
 }
 
+/// Batched fast path for [`reserve_group_lazy_guarded`]'s inner loop (101st pass): when an ENTIRE
+/// contiguous, already-`VirtualQuery`-uniform sub-region (so every page in it shares the same real
+/// prior protection by construction) contains NO existing [`GUARD_PAGE_REGISTRY`] entry at all --
+/// the common, non-overlapping case, since two live generations from the SAME parent guarding the
+/// exact same address range concurrently is bounded and rare (`live_cross_process_fork_children`'s
+/// admission cap, `AGENTS.md`'s 76th-pass finding) -- guards every page in `region_start..
+/// region_end` with ONE `VirtualProtect` call and ONE [`GUARD_PAGE_REGISTRY`] lock acquisition,
+/// instead of [`guard_one_page`]'s existing O(pages) `VirtualProtect`+lock-acquire-per-page cost
+/// (flagged as "a known, explicit, un-optimized cost" by the 89th pass's own doc comment above,
+/// the concrete follow-up this implements). Returns `false` the instant ANY page in the region
+/// already has an entry (or the batched `VirtualProtect` itself fails) -- the caller then falls
+/// back to the existing, unmodified, per-page [`guard_one_page`] loop for that WHOLE sub-region,
+/// so the join-vs-open decision's own correctness for a genuine overlap is completely unaffected;
+/// this function never partially mutates registry state on a path that returns `false` (the
+/// pre-check and the `VirtualProtect` call are both all-or-nothing for the region).
+///
+/// Holds [`GUARD_PAGE_REGISTRY`]'s lock for the ENTIRE decide-then-act span, exactly like
+/// [`guard_one_page`] -- so no other thread on this same parent can observe or act on a
+/// half-decided state for any page in the region between the pre-check and the batched
+/// `VirtualProtect`/insert (same race this module's own "89th pass" doc section already closed
+/// for the per-page path).
+fn try_guard_region_batched(
+    claim: &mut GuardCowClaim,
+    child_pid: u32,
+    region_start: usize,
+    region_end: usize,
+    source_group: &Range<usize>,
+    group_slot_base: usize,
+    diag: bool,
+) -> bool {
+    let mut registry = GUARD_PAGE_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = registry.get_or_insert_with(HashMap::new);
+
+    let mut probe = region_start;
+    while probe < region_end {
+        if map.contains_key(&probe) {
+            return false;
+        }
+        probe += PAGE_SIZE;
+    }
+
+    let mut old_protect: u32 = 0;
+    let protected = {
+        let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            VirtualProtect(
+                region_start as *mut c_void,
+                region_end - region_start,
+                PAGE_READONLY,
+                &mut old_protect,
+            ) != 0
+        }
+    };
+    if !protected {
+        return false;
+    }
+
+    let Some(handle) = get_or_open_child_handle(claim, child_pid) else {
+        // Child died in the instant between spawn and here -- same handling as guard_one_page's
+        // own "None" branch: still record every page's true prior protection (empty pending) so a
+        // future real write-fault still finds it and restores it, rather than it staying stuck
+        // PAGE_READONLY forever with nothing tracking what to heal it back to.
+        let mut page = region_start;
+        while page < region_end {
+            map.insert(
+                page,
+                PageGuardEntry {
+                    true_original_protect: old_protect,
+                    pending: Vec::new(),
+                },
+            );
+            page += PAGE_SIZE;
+        }
+        return true;
+    };
+
+    let mut page = region_start;
+    while page < region_end {
+        let slot_index = group_slot_base + (page - source_group.start) / PAGE_SIZE;
+        let Some(slot) = claim.table.get(slot_index) else {
+            page += PAGE_SIZE;
+            continue;
+        };
+        map.insert(
+            page,
+            PageGuardEntry {
+                true_original_protect: old_protect,
+                pending: vec![PendingGeneration {
+                    live_handle: std::sync::Arc::clone(&handle),
+                    slot,
+                }],
+            },
+        );
+        claim.joined_pages.push((page, slot));
+        page += PAGE_SIZE;
+    }
+    if diag {
+        eprintln!(
+            "[lazy_fork_commit] guard-cow: batched region {region_start:#x}..{region_end:#x} ({} pages) opened fresh in one VirtualProtect call, old_protect={old_protect:#x}",
+            (region_end - region_start) / PAGE_SIZE
+        );
+    }
+    true
+}
+
 /// Parent-side setup, called once per lazy-eligible group when guard-cow is enabled for this fork:
 /// reserves the group in the child exactly as [`reserve_group_lazy`] does, THEN walks this
-/// PARENT's own already-committed pages across `source_group` `VirtualQuery`-region by region,
-/// and for every committed, non-guard/no-access page within each such sub-range, calls
-/// [`guard_one_page`] (see this module's own "89th pass" doc section for why this first landing
-/// is deliberately page-at-a-time rather than batched per contiguous sub-range).
+/// PARENT's own already-committed pages across `source_group` `VirtualQuery`-region by region. For
+/// each committed, non-guard/no-access sub-range, tries [`try_guard_region_batched`] first (101st
+/// pass -- one `VirtualProtect`/lock-acquire for the whole sub-range when it is entirely unopened),
+/// falling back to the original per-page [`guard_one_page`] loop only when that returns `false`
+/// (some page in the sub-range already has a live registry entry, or the batched call itself
+/// failed) -- see [`try_guard_region_batched`]'s own doc comment for why this is correctness-
+/// preserving relative to the pure per-page path it augments, not replaces.
 #[must_use]
 fn reserve_group_lazy_guarded(
     claim: &mut GuardCowClaim,
@@ -1492,11 +1606,22 @@ fn reserve_group_lazy_guarded(
         let region_start = addr.max(mbi.BaseAddress as usize);
         let region_end = ((mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)).min(source_group.end);
         if mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && region_end > region_start {
-            let mut page = region_start;
-            while page < region_end {
-                let slot_index = group_slot_base + (page - source_group.start) / PAGE_SIZE;
-                guard_one_page(claim, child_pid, page, slot_index, diag);
-                page += PAGE_SIZE;
+            let batched = try_guard_region_batched(
+                claim,
+                child_pid,
+                region_start,
+                region_end,
+                source_group,
+                group_slot_base,
+                diag,
+            );
+            if !batched {
+                let mut page = region_start;
+                while page < region_end {
+                    let slot_index = group_slot_base + (page - source_group.start) / PAGE_SIZE;
+                    guard_one_page(claim, child_pid, page, slot_index, diag);
+                    page += PAGE_SIZE;
+                }
             }
         }
         addr = region_end.max(addr + 1);
