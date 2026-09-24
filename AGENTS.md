@@ -15,18 +15,21 @@ pass drained the 98th-100th passes' own full blow-by-blow (72.8KB -> ~52KB) and 
 redundant top-of-file recap of that same material (~52KB -> see below); "Docs and tooling map"/
 "Closed" remain the next drain candidates for a future pass still working toward the 30KB target.
 
-**Where things stand, in one paragraph**: cross-process fork (`LITEBOX_PROCESS_FORK=1`) alone is
-solid and the default-safe path. The RAM-crater blocker on top of it (`LITEBOX_LAZY_FORK_COMMIT=1
-LITEBOX_LAZY_FORK_GUARD_COW=1`) has had six real, independent, live-verified correctness bugs found
-and fixed across the 83rd-100th passes (Bugs A/B/3/4/5/6a/6b/7 -- see the "Cross-process fork"
-section's pass-history below and the archive for each one's full mechanism); the 101st pass added a
-real, verified-safe batched-`VirtualProtect` optimization and, via a real boot, confirmed two things
-with hard evidence rather than guesses: (1) that optimization does NOT fix the RAM-crater timing
-(real negative result -- the crater is genuine cumulative Windows commit charge across many
-concurrent child processes, not guard-cow's own syscall overhead), and (2) a real, still-open
-`rc=139` SIGSEGV (matching the OLDER pre-`787b139` Bug-4 signature) is confirmed live on a real
-boot, not yet root-caused -- needs a live `cdb` session, not more code reading. **Both lazy-fork
-flags remain default OFF. `DE_UP` has not been reached by any of the 101 passes to date.** See
+**Where things stand, in one paragraph (updated 103rd pass)**: cross-process fork
+(`LITEBOX_PROCESS_FORK=1`) alone remains solid and the default-safe path -- and the 103rd pass is
+the first to confirm, on the CURRENT binary, that it gets FURTHER than previously known: `xfwm4`
+launches and survives (no crash) with real X11 windows created, but the boot still hits the
+long-standing pre-83rd-pass RAM crater (Track B item 1) before `DE_UP`. **`LITEBOX_LAZY_FORK_COMMIT=1
+LITEBOX_LAZY_FORK_GUARD_COW=1` is NOT safe and must NOT be used for a real boot attempt**: the 103rd
+pass proved the "Angle B `rc=139`" SIGSEGV the 100th-102nd passes tracked as a narrow, non-blocking
+correctness bug is in fact pervasive (hits `xset`/`xprop`/`rm`/`mkdir`/`sleep` -- essentially any
+forked-then-exec'd child, not just the fork-without-execve subshell case the 83rd/84th passes
+originally scoped it to) and IS the direct, confirmed cause of `DE_FAILED` under that config: real
+boot evidence shows `xfce4-session` itself dies of an unhandled `STATUS_ACCESS_VIOLATION`
+(`0xC0000005`) ~16s into its run, before ever launching the window manager. See the 103rd-pass
+pass-history entry below for the full evidence chain and the corrected non-lazy real-boot findings
+(including a stale-seed-tar repo-hygiene bug also found and fixed this pass). **Both lazy-fork flags
+remain default OFF. `DE_UP` has not been reached by any of the 103 passes to date.** See
 "Cross-process fork"'s own "Open, in rough priority order" item 1 for the precise next pickup.
 
 ## The cheap repro — start here
@@ -468,6 +471,114 @@ map" below). Condensed current-state trail:
     the flags-unset isolated repros above. Not yet safe to flip on for a real boot recommendation:
     Angle B's `rc=139` remains open and, per the project's own standing caution, a real XFCE session
     forks many more long-lived daemons than any isolated repro exercises.
+- **103rd -- the first pass to directly investigate `DE_FAILED` itself (per the standing gap all
+  102 prior passes left open). Found `rc=139`/`STATUS_ACCESS_VIOLATION` under the lazy-fork config
+  IS the direct cause of `DE_FAILED` there (correcting the 102nd pass's "does not block boot
+  progress" read); separately, re-verified the plain non-lazy path against the CURRENT binary and
+  found it gets genuinely further (`xfwm4` launches and survives) but still hits the pre-83rd-pass
+  RAM crater before `DE_UP`; found+fixed a stale-seed-tar repo-hygiene bug. No source code changed
+  this pass -- `LITEBOX_PROCESS_FORK=1` alone stays byte-identical by construction.**
+  - **`DE_FAILED`'s own definition, confirmed by direct reading (not assumed)**: `.wfgy/de_only.sh`'s
+    own poll loop (`WM=$(xprop -root _NET_SUPPORTING_WM_CHECK ...)`, 12x5s=60s) declares
+    `DE_FAILED after 60s` unless `$WM` ever contains the literal substring `"window id"` -- i.e.
+    exactly the `_NET_SUPPORTING_WM_CHECK` atom existing on the root window with a real value, set
+    by `xfwm4` alone (confirmed by the 82nd pass's own source reading of `setNetSupportedHint`).
+    This pass's own new evidence (below) directly answers, for the first time, WHY that atom never
+    gets set within the window, under both configurations.
+  - **Lazy-fork config (`LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1
+    LITEBOX_LAZY_FORK_GUARD_COW=1`) -- `DE_FAILED` root-caused: `xfce4-session` itself crashes before
+    ever launching `xfwm4`.** Re-examined the 102nd pass's own "stable" real-boot logs
+    (`.wfgy/pass102_realboot_run{1,2}.err.log`, reused unmodified) with a finer-grained read than
+    that pass attempted: `[wait4_diag] wait_for_thread_exit(...) owning_pid=23636 ...
+    exit_code=3221225477(real_exit_code)` -- `3221225477 == 0xC0000005 ==
+    STATUS_ACCESS_VIOLATION` -- fired at `elapsed_ms_since_thread_start=16169`, i.e.
+    `xfce4-session`'s OWN cross-process-fork child process died of an UNHANDLED HOST-LEVEL fault
+    (not a guest-translated `SIGSEGV` -- no `[unix_addr_presence]`/`fatal signal: terminating task`
+    line exists for this pid at all, unlike every OTHER crashing process in the same log, which DOES
+    get gracefully translated to a reported guest signal). The piped `[de2]`-prefixed
+    `xfce4-session` stderr (`pass102_realboot_run2.out.log:18-26`) shows it reaches exactly:
+    `ConsoleKit proxy` warning, three `_NET_*`-property "assuming" messages, `iceauth: error in
+    locking authority file`, `Failed to setup the ICE authentication data` -- and NOTHING further.
+    `argv0=/usr/bin/xfwm4` (or any other Failsafe client) never appears ANYWHERE in either run's
+    `DIAG_TIMELINE execve` log. **`xfce4-session` dies of a real, silent, unhandled host crash
+    between its own ICE-auth warning and its first session-client launch, in BOTH of the 102nd
+    pass's own "stable" runs, 2/2.**
+  - **Isolated, much cheaper reproduction of the SAME crash class, unrelated to `xfce4-session`
+    entirely**: `.wfgy/pass103_xset_repro.sh` (+ `.wfgy/pass103_xset_seed.tar`) -- just `Xvfb` +
+    `xset q`, no `dbus`/`xfce4-session` at all. With both lazy flags ON, this is NOT a rare/narrow
+    bug: `xset`, `xprop`, `rm`, `mkdir`, and `sleep` ALL crash across repeated runs (real guest
+    `SIGSEGV`, litebox's own `syscalls::signal` correctly reports "fatal signal: terminating task"
+    for these, unlike `xfce4-session`'s silent host-level death above) -- essentially any
+    forked-then-exec'd child is at risk, not only the fork-without-execve subshell case the 83rd/84th
+    passes originally scoped this bug to. 17 of 25 captured fault events (`LITEBOX_DIAG_FATALDUMP=1
+    LITEBOX_DIAG_FAULT_VQ=1 LITEBOX_DIAG_FAULT_MODULE=1`, `.wfgy/pass103_xset_repro1.log`) share the
+    IDENTICAL fault address `0x7feffffef000` -- a CODE-FETCH fault (`rip==cr2`), on a page
+    `VirtualQuery` reports as already `MEM_COMMIT`+`PAGE_READONLY` (not the `MEM_RESERVE` state an
+    unfaulted lazy range should show), with `lazy_commit_veh`'s own group lookup logging "meta-slot
+    parent-side: no reverse translation found" -- the address isn't tracked as a lazy-reserved range
+    at all, yet real Windows memory state shows something already touched and mis-protected it.
+    **Decisive control**: the IDENTICAL script with ONLY `LITEBOX_PROCESS_FORK=1` set (lazy flags
+    unset) shows ZERO crashes across the same commands, `xset q` returns real output rc=0
+    (`.wfgy/pass103_xset_repro_nolazy.log`) -- proving the crash is caused BY the lazy flags, not
+    pre-existing. This IS the SAME mechanism as the 100th-102nd passes' "Angle B `rc=139`"
+    (previously found via `winpid=8916` crashing "essentially immediately after task-resume-probe",
+    `.wfgy/pass102_lazy_execve.log`) -- this pass shows it is NOT narrow/non-blocking: it killed the
+    actual session manager in the real boot. **Correction to the 102nd pass's own assessment**
+    ("`rc=139` does NOT itself block a boot from proceeding"): that was true only in the sense that
+    OTHER processes crashing didn't visibly stop `WM_POLL`/`XCENSUS` from cycling -- but the SAME bug
+    hitting `xfce4-session` itself is fatal to reaching `DE_UP`. Root cause of the fault itself
+    (why this address ends up committed+`PAGE_READONLY` and untracked) is NOT found this pass --
+    needs the live `cdb` attach the 101st/102nd passes already recommended, now using this pass's
+    much cheaper `xset`-under-`Xvfb` repro instead of a full real boot or even a subshell.
+  - **Non-lazy path (`LITEBOX_PROCESS_FORK=1` alone) re-verified against the CURRENT binary --
+    genuinely further progress than any lazy-flag run, but still RAM-craters before `DE_UP`.** No
+    pass since the 76th/77th/82nd passes' RAM fixes had re-tested this exact combination on a real
+    boot. `.wfgy/pass103_nolazy_boot1.{out,err,poll}.log`: `xfce4-session` does NOT crash (no
+    `exit_group`/`exit_signal` for its pid anywhere in the log), and `argv0=/usr/bin/xfwm4` DOES
+    `execve` (pid 22036) and stays alive with no exit event for the rest of the run -- real,
+    confirmed progress no lazy-flag run reaches. `XCENSUS_WINDOWS total=9` by `WM_POLL n=2`
+    (real X11 windows exist). The boot still hits the pre-83rd-pass RAM crater: 16 processes /
+    0.17GB free at t=123.9s, killed by the harness's own kill switch, before
+    `_NET_SUPPORTING_WM_CHECK` is ever observed set. **So under the safe, non-lazy path, `DE_FAILED`
+    is NOT a WM crash or hang -- it's the same still-open RAM-crater problem (Track B item 1) cutting
+    the boot off mid-initialization**, now reconfirmed on the current binary rather than assumed
+    unchanged since the 82nd pass.
+  - **Repo-hygiene bug found+fixed**: `.wfgy/de_only_xcensus_seed3.tar`'s embedded `de_only.sh`
+    predates the 82nd pass's RAM-saving session trim (Failsafe cut to `xfwm4`+`xfsettingsd`,
+    `at-spi-dbus-bus`/`pulseaudio` autostart hidden) -- per this file's own standing lesson
+    ("`.wfgy/webtop_seed.tar` embeds a FROZEN COPY... re-tar after every edit"), it was never
+    re-tarred after that pass landed the trim in the host-side `.wfgy/de_only.sh`. **Every
+    `de_only_xcensus_seed3.tar` boot since the 82nd pass -- including BOTH of the 102nd pass's own
+    "stable" verification runs -- has actually been running the FULL untrimmed 5-client Failsafe
+    session** (confirmed via `DIAG_TIMELINE execve`: `iceauth`, `ssh-agent`, `at-spi-bus-launcher`,
+    `dbus-update-activation-environment`, `gpgconf` all appear, none of which the trim should allow).
+    Fixed: `.wfgy/pass103_de_only_trimmed_seed.tar` merges the current (trimmed) `de_only.sh` with
+    the working xcensus-via-stdin probe and a lighter `WM_POLL` loop (10s interval, census only at
+    the end -- the loop's own `sleep`+`xprop`+`python3` forks were competing with `xfce4-session`'s
+    tree for the same RAM/admission-slot budget during exactly the window under test). Re-tested with
+    the trim genuinely applied + lazy flags off: the crater still occurs (~90-111s, 10-13 processes)
+    -- consistent with, not contradicting, the 82nd pass's own "tested, confirmed real but
+    exhausted... neither reduces Windows' own `VirtualAlloc2(MEM_COMMIT)` charge" conclusion; the
+    trim reduces window/client count but doesn't move the crater's RAM math. **Open note for next
+    pass, not yet root-caused**: even with the corrected seed, one trimmed run's `DIAG_TIMELINE`
+    still showed `xfce4-panel`/`Thunar`/`gpgconf` PATH-search `execve` attempts -- the trimmed
+    `xfce4-session.xml` override may not be taking effect as designed; don't assume the trim is
+    100% effective without checking this directly first.
+  - **New lead for the RAM-crater problem itself, not yet investigated**: in both non-lazy runs,
+    `xfwm4` spent its entire observed lifetime repeatedly hitting `[unix_addr_presence] ECONNREFUSED
+    but address IS bound, by a DIFFERENT guest pid` (the ALREADY-DOCUMENTED "Open" item 2
+    cross-process AF_UNIX data-plane sharing gap) roughly once every 1-10s, with no other visible
+    progress before the crater killed it. Plausible, unconfirmed: this retry loop is why `xfwm4`
+    is slow enough to lose the race against the RAM crater -- if so, fixing the item-2 AF_UNIX gap
+    could matter more for reaching `DE_UP` than continuing to chase the lazy-fork-commit bug above.
+    Check directly next pass: does `xfwm4` ever get PAST this retry loop given enough time (e.g. a
+    boot with `live_cross_process_fork_children`'s cap temporarily lowered to slow the crater,
+    purely as a diagnostic, not a fix), or is it stuck retrying forever?
+  - Logs: `.wfgy/pass103_xset_repro.sh`, `.wfgy/pass103_xset_seed.tar`,
+    `.wfgy/pass103_xset_repro1.log` (lazy ON, fault diagnostics), `.wfgy/pass103_xset_repro_nolazy.log`
+    (lazy OFF control), `.wfgy/pass103_nolazy_boot1.{out,err,poll}.log`,
+    `.wfgy/pass103_de_only_trimmed_xcensus.sh`, `.wfgy/pass103_de_only_trimmed_seed.tar`,
+    `.wfgy/pass103_trimmed_boot{1,2}.{out,err,poll}.log`.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
@@ -479,35 +590,46 @@ both Xvfb SIGSEGVs.
 
 **Open, in rough priority order:**
 
-1. **`xfwm4` launches and survives (75th, confirmed 97th); Bug 4's TOCTOU has a general
-   multi-generation fix landed (98th); that fix's own `rc=134` regression is root-caused+FIXED
-   (100th, Bug 7) alongside two other real bugs (Bug 6a/6b); the crater-speed regression is
-   root-caused+FIXED (102nd, `GUARD_COW_CONCURRENT_CLAIM_CAP`) and verified 2/2 on a real boot —
-   stable ~188s runs at 5 processes / ~3.6-4.2GB free instead of the 99th-101st passes' 14-21s
-   crater at 7 processes; `rc=139` SIGSEGV is confirmed still live (both the real boot, 44
-   events/run 2/2, AND now a NEW minimal isolated repro, 102nd) but STILL not root-caused — it does
-   NOT block boot progress by itself. `DE_UP` has not been reached by any pass; both real boots
-   reach `DE_LAUNCHED_DIRECT` and cycle `WM_POLL`/`XCENSUS` (clean `rc=0` every time) before
-   `DE_FAILED after 60s`, a separate, pre-existing, still-open blocker this pass did not
-   investigate.** Full evidence for 98th-102nd: pass-history section above (102nd entry) and
-   `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "98th-100th pass full narrative". **Next pickup, precise**:
-   (a) empirically tune `GUARD_COW_CONCURRENT_CLAIM_CAP` (currently 3, a reasoned but unmeasured
-   default) against real boot A/B at a few different values, extending
-   `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1` to report `GUARD_COW_OPEN_CLAIMS`'s own high-water mark if
-   useful; (b) a live `cdb -p` attach (debug build; invasive `-p`, not `-pv`, which cannot receive
-   debug events per the 93rd pass; `sxd av` measurably induces its own exception-dispatch livelock
-   on this codebase per the 97th pass -- prefer the existing `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`
-   diagnostics first) on `rc=139`, now reproducible via the much smaller/cheaper 102nd-pass isolated
-   repro (`.wfgy/pass102_lazy_execve.log`'s `winpid=8916` crash) instead of only the full real boot;
-   (c) once `rc=139` is fixed and re-verified, attempt the actual `DE_UP`/`DE_FAILED` blocker itself,
-   which no pass through the 102nd has yet investigated in its own right. Do NOT retune
-   `live_cross_process_fork_children`'s admission cap in response to `rc=139` -- that signature is a
-   correctness bug a capacity lever cannot fix and could mask (`GUARD_COW_CONCURRENT_CLAIM_CAP` is a
-   DIFFERENT, new, narrowly-scoped cap that only bounds guard-cow's own parent-side commit cost).
+1. **`DE_FAILED` is now root-caused on BOTH configurations (103rd), and the two blockers are
+   DIFFERENT problems requiring different fixes.**
+   - **Lazy-fork config**: `DE_FAILED` == `xfce4-session` itself dying of an unhandled
+     `STATUS_ACCESS_VIOLATION` before it ever launches `xfwm4` -- the SAME mechanism as `rc=139`
+     (confirmed pervasive, not narrow: hits `xset`/`xprop`/`rm`/`mkdir`/`sleep` too, ALWAYS at fault
+     address `0x7feffffef000`, ZERO occurrences with the lazy flags off). This is now the correctly
+     understood severity: `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` must NOT be
+     recommended or used for any real boot attempt until this is fixed. Cheapest known repro:
+     `.wfgy/pass103_xset_repro.sh` (`Xvfb` + `xset q`, no DE at all) under
+     `LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1`. Next pickup:
+     a live `cdb -p` attach (debug build; invasive `-p`, not `-pv`, which cannot receive debug events
+     per the 93rd pass; `sxd av` measurably induces its own exception-dispatch livelock on this
+     codebase per the 97th pass) on THIS repro -- break on the code-fetch fault at
+     `0x7feffffef000...ish` (address is deterministic across runs) and trace why the page is already
+     `MEM_COMMIT`+`PAGE_READONLY` and untracked by `lazy_commit_veh`'s own group lookup
+     ("no reverse translation found") before the guest ever legitimately touches it. Do NOT retune
+     `live_cross_process_fork_children`'s admission cap or `GUARD_COW_CONCURRENT_CLAIM_CAP` in
+     response -- this is a correctness bug neither capacity lever can fix or should mask.
+   - **Non-lazy config (`LITEBOX_PROCESS_FORK=1` alone, the recommended safe path)**: `DE_FAILED` ==
+     the pre-83rd-pass RAM crater (Track B item 1) cutting the boot off before `xfwm4` (which DOES
+     launch and survive, confirmed 103rd on the current binary) finishes initializing --
+     `_NET_SUPPORTING_WM_CHECK` is never set because the whole process tree dies first, not because
+     `xfwm4` crashes or is logically stuck. **New, unconfirmed lead**: `xfwm4` spent its entire
+     observed lifetime in both 103rd-pass runs repeatedly hitting the item-2 cross-process AF_UNIX
+     `ECONNREFUSED` gap below -- possibly why it's too slow to beat the crater. Next pickup: confirm
+     directly whether `xfwm4` ever gets past this retry loop, then decide whether fixing item 2 or
+     continuing the original RAM-crater angle (empirically tuning the admission caps, or the still-
+     unexplored genuine per-page lazy population once the config above is actually safe) is the
+     better lever for THIS blocker specifically.
+   - Full evidence for both: 103rd-pass entry above. Full evidence for 98th-102nd (the
+     `GUARD_COW_CONCURRENT_CLAIM_CAP` crater-speed fix, Bugs 6a/6b/7): pass-history section above and
+     `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "98th-100th pass full narrative".
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
    `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on
-   cross-process accept. Abstract sockets CORRECT.
+   cross-process accept. Abstract sockets CORRECT. **Possibly directly relevant to item 1's non-lazy
+   `DE_FAILED` blocker now (103rd)**: `unix_addr_table`'s Backlog/Channel values not being
+   shared-memory-native is what produces the `[unix_addr_presence] ECONNREFUSED but address IS
+   bound, by a DIFFERENT guest pid` warning `xfwm4` hit repeatedly, with no other visible progress,
+   in both of the 103rd pass's own real non-lazy boots -- see item 1's own new-lead note.
 3. `SafeZoneAllocator`'s `spin::mutex::SpinMutex` still has no dead-holder recovery — lower-urgency
    theoretical risk (the live `ssh-agent`/`xfwm4` freeze once blamed on it was actually `RawMutex`'s
    `WaiterQueue::with_lock`, CLOSED 60th/61st), not tied to any live symptom now.
