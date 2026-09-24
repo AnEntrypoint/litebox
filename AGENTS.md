@@ -27,10 +27,25 @@ own during verification** (a page left `PAGE_READONLY`-poisoned when its last pe
 died without ever restoring it — the same shape as the 88th pass's own Bug 5, reintroduced via a
 different trigger) — caught by a purpose-built repro and a targeted diagnostic, not shipped blind.
 A real boot attempt (both flags on) reached `DE_LAUNCHED_DIRECT` and real D-Bus traffic before the
-PRE-EXISTING, UNRELATED RAM crater (Track B item 1) hit hard within 5 seconds — `DE_UP` still not
-reached, but the correctness trade-off the 97th pass characterized no longer applies as stated; see
-the 98th pass-history entry and item 1 for full evidence and the precise next pickup (this is now
-purely the original RAM-crater problem again, not a correctness one).
+RAM crater hit hard within 5 seconds — `DE_UP` still not reached, and the 98th pass read this as
+"purely the original RAM-crater problem again, not a correctness one" since it was a single,
+uncontrolled data point.
+
+**99th pass turned that one data point into a controlled 3-run comparison and found the 98th
+pass's own optimistic reading does NOT hold — the multi-generation guard-cow rewrite (`787b139`) is
+itself a real, 100%-reproducible correctness regression, not just unlucky host load.** 3/3 identical
+`de_only_xcensus_seed3.tar` boots (rebuilt release binary confirmed current with `787b139`, same
+harness/env as the 96th-97th passes' own scripts) crater to <1GB free in **~20-21s**, at only
+**7 processes** — a severe regression from the 88th/89th passes' own measured 2.8-4.6GB free /
+9-16 processes sustained for 195-300s under the PRE-98th (single-generation) guard-cow code. All
+3 runs also show a NEW, identically-reproducible heap corruption: `XCENSUS_PRE_DE rc=134
+corrupted size vs. prev_size` (a glibc SIGABRT in `python3 /tmp/xcensus.py`, a plain
+fork-then-execve — exactly the "dominant, verified-safe" case the 98th pass's own isolated repros
+claimed 5/5 clean) — absent (`rc=0`, clean) in the immediately-prior `pass96_boot{1,2,3}`/
+`pass97_releaseboot1` logs, which ran the SAME env-var configuration against the PRE-98th code.
+See the 99th pass-history entry and item 1 for the full numbers, the isolation attempt, and the
+precise next pickup — this is a real correctness bug in `787b139`, not a RAM-crater capacity
+question, so admission-cap retuning is explicitly NOT the right lever here.
 
 ## The cheap repro — start here
 
@@ -374,6 +389,30 @@ map" below). Condensed current-state trail:
     own measured syscall-count win for correctness-first simplicity in a brand-new concurrent path.
     Batch `VirtualProtect` across contiguous never-yet-open pages (the common case), falling back to
     per-page joins only under genuine multi-generation overlap on the same page.
+- **99th pass — ran the controlled 3-run A/B the 98th pass explicitly flagged as missing, and found
+  its single uncontrolled data point was NOT just unlucky host load: `787b139`'s multi-generation
+  guard-cow rewrite is a real, 100%-reproducible regression on both axes the task asked about (RAM
+  trajectory AND a brand-new correctness bug).** No code changed this pass — see item 1 above for
+  the full numbers (3/3 identical 20-21.3s craters at 7 processes, vs. 88th/89th's 195-300s/9-16-proc
+  stable baseline; 3/3 identical NEW `XCENSUS_PRE_DE rc=134` heap corruption in a plain
+  fork-then-execve `python3` call, absent in the immediately-prior `pass96`/`pass97` logs under the
+  same env). Deliberately did not attempt a blind fix: `lazy_fork_commit.rs`'s own addressing
+  (`total_pages`/`group_slot_base`/`slot_index`), heal-then-reopen sequencing, and lock ordering
+  (`GUARD_PAGE_REGISTRY` before `VIRTUAL_PROTECT_LOCK`, matched on both the fork-time
+  `guard_one_page` and write-fault-time `guard_cow_write_fault_veh` paths) all read as internally
+  consistent on inspection alone — the defect only manifests after MANY real, sequential (not
+  concurrently-overlapping) prior fork claims have already cycled through the same parent's
+  `GUARD_PAGE_REGISTRY`, a shape none of the 98th pass's own 3 isolated repros exercises, so it
+  needs a live `cdb`/`LITEBOX_DIAG_LAZY_FORK_COMMIT=1` session against that specific shape rather
+  than a guess. Also ran one exploratory `LITEBOX_LAZY_FORK_COMMIT=1`-alone (guard-cow off)
+  isolation boot: inconclusive (a DIFFERENT anomaly — Xvfb/`XSOCK_WAIT_DONE` timeout, then `SIGSEGV`
+  not `SIGABRT` — and no crater at all in its own ~30s self-terminating run), one data point, not
+  re-run this pass. Explicitly did NOT retune `live_cross_process_fork_children`'s admission cap —
+  the regression's own signature (heap corruption, not merely faster exhaustion) means a
+  capacity/concurrency lever cannot fix it and could hide it; this is a `787b139` correctness bug,
+  not a Track-B capacity question. `DE_UP` not attempted (both flags remain default OFF and this
+  pass found new reasons not to flip them on for a real boot yet). Host RAM confirmed fully
+  recovered (>7.4GB free, zero stray `litebox_runner...exe`) after every run via WMI `Terminate`.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
@@ -386,28 +425,85 @@ both Xvfb SIGSEGVs.
 **Open, in rough priority order:**
 
 1. **`xfwm4` now launches AND SURVIVES (75th, then genuinely confirmed 97th), the RAM crater is
-   closed only when lazy-fork-commit is ON (76th-88th), the silent-whole-host-death bug class is
-   FIXED (96th), and Bug 4 (the guard-cow TOCTOU that was the 91st-97th passes' real, misattributed
-   blocker) is now FIXED in general form (98th pass — see that pass's own entry above for the full
-   design and the real livelock bug found+fixed during its own verification).** `DE_UP` still not
-   reached, but the trade-off the 97th pass characterized (lazy-fork-commit ON avoids the RAM crater
-   but hits Bug 4; OFF avoids Bug 4 but hits the crater) no longer applies AS STATED, since Bug 4
-   itself is fixed — a fresh real-boot attempt this same (98th) pass with both flags ON reached
-   `DE_LAUNCHED_DIRECT` and real D-Bus traffic before the PRE-EXISTING RAM crater (Track B, unrelated
-   to Bug 4) hit hard within 5 seconds, requiring an emergency WMI-terminate (host recovered fully,
-   no instability). **Next pickup, precise**: this is now purely a RAM-crater problem again (Track B
-   item 1's own original, still-unsolved shape — 76th-82nd passes' own per-process working-set cost),
-   not a correctness one — re-attempt `DE_UP` with a tighter RAM-monitoring loop (sub-5-second
-   polling, given how fast this pass's own attempt collapsed) and consider whether the 98th pass's
-   own deferred page-batching optimization (see its entry above) reduces guard-cow's own overhead
-   enough to matter, though the crater's dominant cost was always per-process Windows working set
-   (77th pass), not this mechanism's own bookkeeping. A genuine, controlled A/B (98th pass's new
-   multi-generation code vs. the 88th pass's old single-generation code, same host load, same image)
-   has NOT been run — this pass's one real-boot data point is suggestive, not conclusive, about
-   whether the crater's timing/severity changed at all. **`cdb -p` invasive attach with `sxd av`
-   measurably induces its own severe exception-dispatch livelock** on this exact codebase (250,000+
-   repeated AVs in ~20s, absent undebugged, 97th pass) — prefer the existing `exception()` `debug!`
-   diagnostics over a live attach for this bug class where possible.
+   closed only when lazy-fork-commit is ON (76th-88th) UNDER THE PRE-98TH single-generation
+   guard-cow code, the silent-whole-host-death bug class is FIXED (96th), and Bug 4 (the guard-cow
+   TOCTOU that was the 91st-97th passes' real, misattributed blocker) has a general-case fix landed
+   (98th pass) -- but the 99th pass's controlled follow-up found that general fix (`787b139`) is
+   ITSELF a new, real, 100%-reproducible correctness regression, not a net win yet.** `DE_UP` still
+   not reached.
+   - **99th pass — the controlled A/B the 98th pass flagged as missing.** Rebuilt the release binary
+     (confirmed mtime postdates `787b139`), ran the identical `de_only_xcensus_seed3.tar` harness/env
+     the 96th-97th passes used (`LITEBOX_PROCESS_FORK=1 LITEBOX_LAZY_FORK_COMMIT=1
+     LITEBOX_LAZY_FORK_GUARD_COW=1`, same `--env GLIBC_TUNABLES=...`, same 1s-granularity RAM/process
+     poll) 3 times sequentially, host RAM 7.1-7.2GB free before each run, never more than one boot
+     live at once. **Result, 3/3 IDENTICAL**: free RAM falls from ~7.1GB to the <1.0GB kill-switch
+     threshold in **20-21.3s** (t=20.0s/0.60GB, t=21.2s/0.61GB, t=21.3s/0.59GB across the 3 runs),
+     at exactly **7 `litebox_runner...exe` processes** each time — a severe regression from the
+     88th/89th passes' own measured 2.8-4.6GB free / 9-16 processes sustained for a FULL 195-300s
+     window under the pre-98th single-generation code, same harness. All 3 runs reached
+     `DE_LAUNCHED_DIRECT` (past `DBUS_UP`) before the kill-switch fired; no `STATUS_ACCESS_VIOLATION`
+     exit code was observed for any process (all "exit" codes were litebox's own `0xC0DE`-prefixed
+     synthetic wrapper for clean exits/`SIGABRT`, decoded: `0xC0DE0000`=exit 0, `0xC0DE0086`=exit 134
+     i.e. `SIGABRT`) — meaning `xfce4-session`/`gdbus` were never observed to independently crash;
+     they were killed by our own RAM-crater WMI-terminate before any such crash could occur either
+     way, so this run cannot say whether Bug 4's ORIGINAL target (the `xfce4-session` crash) is fixed
+     under real boot conditions, only that the crater now arrives far too fast to find out.
+   - **A NEW, 100%-reproducible correctness regression, found (not guessed) by comparing markers
+     against the immediately-prior `pass96_boot{1,2,3}.out.log`/`pass97_releaseboot1.out.log`**: all
+     3 of THIS pass's runs show `[s] XCENSUS_PRE_DE rc=134 >>>corrupted size vs. prev_size<<<` -- a
+     real glibc heap-corruption `SIGABRT` inside `python3 /tmp/xcensus.py`, invoked via plain
+     `$(python3 /tmp/xcensus.py)` command substitution, i.e. an ordinary fork-then-execve — exactly
+     the case the 98th pass's own isolated repros claimed 5/5 clean on both builds. The 96th/97th
+     passes' logs (same env-var configuration, pre-`787b139` code) all show `XCENSUS_PRE_DE rc=0`,
+     clean, at the identical script line. Nothing else in the harness, env, or host changed between
+     those runs and this pass's own -- the only variable is `787b139`'s multi-generation guard-cow
+     rewrite. This is a genuine gap in the 98th pass's own verification: none of its 3 isolated
+     repros (fork-then-execve `bash -c`, fork-without-execve subshell, 3-concurrent-subshell) happen
+     to exercise a long-lived parent that has ALREADY serviced many earlier, unrelated, sequential
+     (not concurrently-overlapping) guard-cow claims before the corrupting fork happens -- a real
+     `/de_only.sh` boot forks `mkdir`/`rm`/`xset`/etc. many times before reaching `python3`, each a
+     separate claim/release cycle through the SAME `GUARD_PAGE_REGISTRY` this file's own code reads
+     in detail (`litebox_platform_windows_userland/src/lazy_fork_commit.rs`'s `guard_one_page`,
+     `guard_cow_write_fault_veh`) without finding an obvious logic error on inspection alone --
+     `total_pages`/`group_slot_base`/`slot_index` addressing, the heal-then-reopen sequence, and the
+     lock ordering (`GUARD_PAGE_REGISTRY` then `VIRTUAL_PROTECT_LOCK`, matched on both the fork-time
+     and write-fault-time paths) all look self-consistent by code reading; the actual defect is
+     REAL (3/3, precisely marker-comparable against a clean baseline) but not yet isolated to a
+     specific line without a live `cdb`/`LITEBOX_DIAG_LAZY_FORK_COMMIT=1` session against this exact
+     sequential-many-prior-forks shape, which the 83rd-85th/88th passes' own precedent says this
+     bug class typically needs.
+   - **One exploratory isolation run** (`LITEBOX_LAZY_FORK_COMMIT=1` alone, `GUARD_COW` unset, same
+     harness) is INCONCLUSIVE, not exonerating: it hit a DIFFERENT-looking anomaly first (`XSOCK_WAIT
+     _DONE i=40 exists=no` -- Xvfb never became ready inside the 40s wait -- then `PROBE_XSET rc=139`/
+     `XCENSUS_PRE_DE rc=139`, both `SIGSEGV` not `SIGABRT`) and never cratered at all (stable
+     6.3-7.2GB free / 0-4 processes for its whole ~30s self-terminating run, reaching `DE_FAILED
+     after 60s` on its own). One run is not enough to conclude plain lazy-commit-without-guard-cow is
+     either safe or unsafe here — the Xvfb-startup anomaly may be unrelated host-load noise. Not
+     re-run this pass (budget went to nailing down the guard-cow-on comparison, which had a clear
+     controlled 3/3 baseline to compare against; this isolation angle does not).
+   - **Next pickup, precise**: (a) a live `cdb`/`LITEBOX_DIAG_LAZY_FORK_COMMIT=1` session on the
+     `python3 /tmp/xcensus.py` fork specifically, inside a real `/de_only.sh` boot (not an isolated
+     repro), to find exactly which guarded page's snapshot/protection state is wrong by the time this
+     fork happens — the isolated repros' own clean 5/5 results mean the bug needs REAL accumulated
+     prior-fork state to reproduce, so a fresh minimal repro should explicitly chain several
+     sequential, non-overlapping fork-then-execve children from one long-lived parent before the
+     corrupting one, mirroring `/de_only.sh`'s own real shape, rather than testing forks in isolation
+     again; (b) do NOT retune `live_cross_process_fork_children`'s admission cap in response to this
+     — the regression's signature (heap corruption, not merely faster resource exhaustion) points at
+     a correctness bug in `787b139`'s own per-page registry/snapshot logic, which a capacity/
+     concurrency-cap change cannot fix and could mask; (c) re-run the 3-run controlled comparison
+     with `LITEBOX_LAZY_FORK_COMMIT=1` alone (3 clean runs, not 1) once a repro exists, to properly
+     settle whether Bug 4's TOCTOU (documented pre-98th) or `787b139`'s own new registry logic is the
+     actual source, since this pass's single lazy-only run was inconclusive; (d) once fixed and
+     re-verified 3/3 clean on the real boot (not just isolated repros — this pass's own finding is
+     that isolated-repro-clean is no longer sufficient evidence for this mechanism), redo this exact
+     controlled 3-run RAM-trajectory comparison to see whether the ORIGINAL question (did the crater
+     get faster/slower/same from the multi-generation generalization, independent of the new
+     corruption bug) can finally be answered. **`cdb -p` invasive attach with `sxd av` measurably
+     induces its own severe exception-dispatch livelock** on this exact codebase (250,000+ repeated
+     AVs in ~20s, absent undebugged, 97th pass) — prefer the existing `exception()`/
+     `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` `debug!`/`eprintln!` diagnostics over a live attach where
+     possible, per that same precedent.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
    `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on
