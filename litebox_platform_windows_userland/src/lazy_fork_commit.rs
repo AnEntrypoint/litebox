@@ -561,15 +561,24 @@
 //! page) pair for the life of that pairing (closed via `PendingGeneration`'s own `Drop`, run
 //! whenever an entry is pruned, serviced, or a claim aborts).
 //!
-//! **The single global one-at-a-time gate is gone.** There is no longer a reason to force a whole
-//! fork back to eager just because another sibling is outstanding -- [`try_claim_guard_cow_table`]
-//! now only ever declines for the degenerate `total_pages == 0` case (never reachable from its
-//! real call site, kept for interface/defensive symmetry). Per-fork admission is bounded upstream,
-//! for free, by `litebox_shim_linux::GlobalState`'s own existing `live_cross_process_fork_children`
-//! cap (6 concurrent cross-process-fork children system-wide, 76th pass) -- since exactly one
-//! guard-cow claim exists per live cross-process-fork child, this generalization cannot create
-//! unbounded concurrent state without that separate, already-shipped admission control also being
-//! exceeded.
+//! **The single global one-at-a-time gate is gone, but a bounded N-at-a-time gate replaced it
+//! (102nd pass).** Originally this comment claimed there was "no longer a reason to force a whole
+//! fork back to eager just because another sibling is outstanding" -- the 99th-101st passes' own
+//! real-boot A/B evidence (a crater-speed regression, craters in ~14-21s at 7 processes vs. the
+//! pre-98th-pass code's documented stable 195-300s window at 9-16 processes, NOT explained by the
+//! 101st pass's own ruled-out per-page `VirtualProtect` theory) refutes that: the `6`-wide
+//! `live_cross_process_fork_children` cap bounds concurrent CHILDREN, but each concurrent child now
+//! ALSO leaks its own full-group-sized [`GuardSnapshotSlot`] table (unconditional, unchanged since
+//! the 88th pass), so removing the old 1-at-a-time gate let a busy parent accumulate up to 6x as
+//! much simultaneously-live leaked parent-side commit as the old code ever could -- see
+//! [`GUARD_COW_OPEN_CLAIMS`]'s own doc comment for the full derivation. [`try_claim_guard_cow_table`]
+//! now declines (falls the whole fork back to eager, exactly like the 88th pass's gate did for ANY
+//! overlap) once [`GUARD_COW_CONCURRENT_CLAIM_CAP`] claims are simultaneously open, not just for the
+//! degenerate `total_pages == 0` case. Per-fork admission is ALSO still bounded upstream, for free,
+//! by `litebox_shim_linux::GlobalState`'s own existing `live_cross_process_fork_children` cap (6
+//! concurrent cross-process-fork children system-wide, 76th pass) -- the two caps are independent
+//! and both apply; this module's own cap is the tighter, more targeted one for the specific
+//! leaked-table-commit cost this doc comment describes.
 //!
 //! **Per-page join/open logic ([`guard_one_page`]) holds [`GUARD_PAGE_REGISTRY`]'s lock for its
 //! ENTIRE decide-then-act body**, including the nested [`crate::VIRTUAL_PROTECT_LOCK`] acquisition
@@ -633,7 +642,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
@@ -1232,6 +1241,17 @@ impl Drop for SharedChildHandle {
         if !self.0.is_null() {
             unsafe { CloseHandle(self.0) };
         }
+        // 102nd pass (see `GUARD_COW_OPEN_CLAIMS`'s own doc comment): exactly one
+        // `SharedChildHandle` is ever constructed per successful `GuardCowClaim` (the single
+        // construction site is `get_or_open_child_handle`, called at most once per claim). Its
+        // `Arc` is cloned into the claim's own `child_handle` field and into every
+        // `PendingGeneration` the claim registers, so this `Drop` runs exactly once per claim,
+        // exactly when the LAST page still relying on this claim's snapshot data has been
+        // serviced, pruned-dead, or aborted -- i.e. exactly when this claim's leaked snapshot
+        // table can no longer be read by anything, parent or child. That is the real end of this
+        // claim's lifetime for admission-control purposes, not the much-shorter-lived
+        // `GuardCowClaim` struct itself (see `try_claim_guard_cow_table`).
+        GUARD_COW_OPEN_CLAIMS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1301,6 +1321,57 @@ struct PageGuardEntry {
 /// is correct without a shared-arena structure): every guarded page currently open across every
 /// live guard-cow claim THIS process has ever granted as a parent.
 static GUARD_PAGE_REGISTRY: Mutex<Option<HashMap<usize, PageGuardEntry>>> = Mutex::new(None);
+
+/// 102nd pass -- count of guard-cow claims currently open (admitted by [`try_claim_guard_cow_table`],
+/// not yet fully retired -- see [`SharedChildHandle`]'s `Drop` and [`GuardCowClaim`]'s `Drop`).
+///
+/// **Why this exists.** Each successful claim `Box::leak`s a [`GuardSnapshotSlot`] table sized ONE
+/// FULL PAGE per guarded guest page (`size_of::<GuardSnapshotSlot>() == PAGE_SIZE + 1`, rounded) --
+/// i.e. a claim guarding an 8 MiB heap/stack group eagerly commits ~8 MiB in the PARENT process, at
+/// claim time, unconditionally, regardless of whether the child ever touches a single one of those
+/// pages before `execve`/exit discards the whole mapping. This is a real, already-documented,
+/// accepted per-claim cost (this module's own "88th pass"/"98th pass" doc sections) -- but the 98th
+/// pass's generalization from "one outstanding claim per parent, ever" (the 88th pass's
+/// `GUARD_STATE` single-owner gate) to "unboundedly many concurrent claims, limited only by the
+/// UNRELATED `live_cross_process_fork_children` cap (6, system-wide across every parent process)"
+/// removed the OLD gate's incidental side effect of also rate-limiting how many of these
+/// full-group-sized tables could be simultaneously alive+leaked. Under the old gate, any fork that
+/// temporally overlapped an already-open claim fell back to fully EAGER (no table allocated, no
+/// leak, only the ordinary child-side copy cost) -- so during a real boot's fork storm, most
+/// overlapping forks from a busy parent paid zero extra parent-side commit. Under the new code,
+/// EVERY lazy-eligible fork succeeds in claiming lazily and EVERY one leaks its own full-size table,
+/// so a busy parent now accumulates up to 6x (the `live_cross_process_fork_children` cap) as many
+/// simultaneously-live leaked tables as before, on top of the pre-existing unconditional per-claim
+/// leak (never freed, by design, once opened) -- a plausible, code-grounded explanation for the
+/// 99th-101st passes' observed crater-speed regression (craters in ~14-21s at 7 processes, vs. the
+/// pre-98th-pass code's documented stable 195-300s window at 9-16 processes) that does not require
+/// disputing the 101st pass's own real negative result ruling out per-page `VirtualProtect`
+/// overhead as the cause.
+///
+/// **The fix**: restore the old gate's rate-limiting side effect, generalized to N>1 instead of
+/// hardcoding N=1 (which would reintroduce the exact TOCTOU the 98th pass fixed for a genuinely
+/// concurrent multi-child-from-one-parent workload) -- [`GUARD_COW_CONCURRENT_CLAIM_CAP`] concurrent
+/// open claims are allowed per parent process; a fork attempted beyond the cap declines the claim
+/// (`try_claim_guard_cow_table` returns `None`) and the caller falls all the way back to eager for
+/// every group, exactly as the pre-98th-pass code did for ANY overlap. This bounds worst-case
+/// simultaneous parent-side leaked-table commit to `CAP * (largest concurrently-open group size)`
+/// instead of `6 * (...)`, while still allowing the 98th pass's own motivating case (a small number
+/// of genuinely concurrent children from the same parent, e.g. two XFCE session daemons forking
+/// close together) to go lazy correctly rather than falling back to the single-owner gate's
+/// pessimistic eager-always-on-overlap behavior.
+///
+/// **Not yet empirically tuned against a real boot** -- [`GUARD_COW_CONCURRENT_CLAIM_CAP`]'s value
+/// is a reasoned starting point (small enough to meaningfully bound the regression this doc comment
+/// describes, large enough to still exercise the 98th pass's own multi-generation correctness fix
+/// in the isolated concurrent-multi-fork repro), not a value chosen from real boot A/B timing data.
+/// A future pass with real boot time should retune it using `LITEBOX_DIAG_FORK_VMA_BREAKDOWN=1`
+/// (extended, if needed, to report `GUARD_COW_OPEN_CLAIMS`'s own high-water mark) against
+/// `de_only_xcensus_seed3.tar` A/B runs at a few different cap values.
+static GUARD_COW_OPEN_CLAIMS: AtomicU32 = AtomicU32::new(0);
+
+/// See [`GUARD_COW_OPEN_CLAIMS`]'s own doc comment for the full derivation of why this cap exists
+/// and why its exact value is a reasoned default, not yet an empirically-tuned one.
+const GUARD_COW_CONCURRENT_CLAIM_CAP: u32 = 3;
 static GUARD_VEH_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn ensure_guard_cow_veh_installed() {
@@ -1651,6 +1722,25 @@ pub struct GuardCowClaim {
     child_handle: Option<std::sync::Arc<SharedChildHandle>>,
 }
 
+/// 102nd pass: releases this claim's [`GUARD_COW_OPEN_CLAIMS`] admission slot for the ONE real edge
+/// case [`SharedChildHandle`]'s own `Drop` can never cover -- a claim that was admitted (successful
+/// `try_claim_guard_cow_table`) but ended up never guarding a single page (e.g. the fork's own
+/// per-group reservation failed before `guard_one_page`/`get_or_open_child_handle` was ever called
+/// for any group), so `child_handle` stays `None` for this claim's entire lifetime and no
+/// `SharedChildHandle` is ever constructed to decrement on. When `child_handle` IS `Some`, this is
+/// deliberately a no-op: responsibility for the decrement belongs solely to `SharedChildHandle`'s
+/// own `Drop`, which fires once, whenever the LAST `Arc` reference (this claim's own field, plus one
+/// clone per `PendingGeneration` the claim registered) drops -- not when this much shorter-lived
+/// `GuardCowClaim` struct itself goes out of scope (`finalize_guard_cow_table` drops it immediately
+/// after installing the VEH, while the pages it guarded keep being serviced far longer).
+impl Drop for GuardCowClaim {
+    fn drop(&mut self) {
+        if self.child_handle.is_none() {
+            GUARD_COW_OPEN_CLAIMS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Returns this claim's own shared liveness handle (see [`SharedChildHandle`]/[`GuardCowClaim::
 /// child_handle`]'s doc comments), opening it via a single `OpenProcess` call the first time this
 /// claim needs one and reusing that same handle (cheap `Arc` clone) for every later page -- Bug 6a
@@ -1682,6 +1772,29 @@ fn get_or_open_child_handle(
 pub fn try_claim_guard_cow_table(total_pages: usize) -> Option<GuardCowClaim> {
     if total_pages == 0 {
         return None;
+    }
+    // 102nd pass: admission control on CONCURRENT open claims -- see `GUARD_COW_OPEN_CLAIMS`'s own
+    // doc comment. A CAS loop (not a bare `fetch_add` then check-and-revert) so a decline never
+    // transiently bumps the counter above the cap for another thread's own concurrent check to see.
+    let mut current = GUARD_COW_OPEN_CLAIMS.load(Ordering::Acquire);
+    loop {
+        if current >= GUARD_COW_CONCURRENT_CLAIM_CAP {
+            if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+                eprintln!(
+                    "[lazy_fork_commit] guard-cow claim DECLINED (cap): {current} open claims >= cap {GUARD_COW_CONCURRENT_CLAIM_CAP}, falling this fork back to eager"
+                );
+            }
+            return None;
+        }
+        match GUARD_COW_OPEN_CLAIMS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
     let table: Vec<GuardSnapshotSlot> = (0..total_pages).map(|_| GuardSnapshotSlot::zeroed()).collect();
     let table: &'static [GuardSnapshotSlot] = Box::leak(table.into_boxed_slice());
