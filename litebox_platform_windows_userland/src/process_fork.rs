@@ -1833,13 +1833,12 @@ pub fn spawn_process_fork_child(
         .filter(|(_, eligible)| **eligible)
         .map(|((group, _dest_base), _)| group.clone())
         .collect();
-    // Guard-cow (88th pass): when requested, this fork's lazy groups may ONLY proceed as lazy at
-    // all if this process's single guard-cow slot (at most one outstanding lazy-tracked child per
-    // parent -- see `lazy_fork_commit`'s own module doc comment for why that bound is exactly what
-    // makes the mechanism correctness-sound) is currently free. A denied claim forces this fork's
-    // `lazy_eligible` all the way back to empty -- not merely "plain unguarded lazy" -- per the
-    // task's own conservative framing: never mix a guarded and an unguarded lazy child from the
-    // same parent.
+    // Guard-cow (88th pass single-generation; 89th pass generalized to any number of concurrent
+    // generations per parent -- see `lazy_fork_commit`'s own module doc comment, "89th pass"
+    // section, for the derivation). `try_claim_guard_cow_table` no longer gates on a single
+    // outstanding-child slot; it only ever declines for the degenerate zero-page case (never
+    // reachable here, since `lazy_group_ranges` is checked non-empty just above). Kept as an
+    // `Option`/`match` for interface stability and as a defensive hook for a future resource cap.
     let mut guard_cow_claim: Option<crate::lazy_fork_commit::GuardCowClaim> = None;
     if crate::lazy_fork_commit::guard_cow_enabled() && !lazy_group_ranges.is_empty() {
         let total_pages: usize = lazy_group_ranges
@@ -2154,6 +2153,7 @@ pub fn spawn_process_fork_child(
                 next_guard_slot += source_group.len().div_ceil(4096);
                 crate::lazy_fork_commit::guard_cow_reserve_group(
                     claim,
+                    pid,
                     process,
                     source_group,
                     group_slot_base,

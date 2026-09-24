@@ -511,10 +511,128 @@
 //! clean data point within this pass's own remaining budget -- a concrete pickup for the next
 //! pass, alongside root-causing the pre-existing `DE_FAILED`/`_NET_SUPPORTING_WM_CHECK` gap now
 //! that RAM is no longer in the way of reaching it.
+//!
+//! # 89th pass -- generalized guard-cow from one outstanding child per parent to ANY number of
+//! concurrent generations, by re-deriving the correctness unit from first principles rather than
+//! literally implementing the 87th/88th passes' own "N shadow slots" sketch.
+//!
+//! **The key simplification, found by working the proof through rather than assuming the sketch's
+//! own framing**: the 87th/88th passes' own writeup imagined needing per-page MULTIPLE VERSIONED
+//! snapshots (one per generation, tagged by fork time, so a later child doesn't get served an
+//! earlier one's stale pre-write copy). That framing is unnecessarily conservative. The real
+//! invariant a page's `PAGE_READONLY` protection provides is much stronger: for as long as a page
+//! stays guarded, NO write has landed on it by construction (a write would have hardware-faulted
+//! and been serviced) -- so EVERY generation that forks while a page is ALREADY open (guarded, at
+//! least one other live generation already pending on it) is, by definition, forking during the
+//! exact same unbroken no-write span as whichever generation opened it. There is therefore only
+//! ONE live value in play for the whole span, not one per generation: when the eventual write
+//! finally comes, a SINGLE captured snapshot correctly serves every currently-pending generation
+//! at once, because none of them could possibly have a different "correct as of my fork" answer.
+//! This means the real per-page state needed is not "N tagged shadow versions" but "one open
+//! interval, with a growing/shrinking SET of generations currently relying on it" -- closed
+//! (snapshot distributed to everyone pending, page reopened for writing) the instant a write
+//! occurs, and reopened fresh (empty set, real current `VirtualQuery`d protection recorded) the
+//! next time any generation wants to guard that address again. No versioning, no generation
+//! timestamps, no multi-slot-per-page table needed at all.
+//!
+//! **Architecture**: [`GUARD_PAGE_REGISTRY`] (`Mutex<Option<HashMap<usize, PageGuardEntry>>>`),
+//! keyed by page-aligned address, replaces the 88th pass's single owner-pid gate + one-claim-at-a-
+//! time `GUARD_STATE`. Deliberately an ordinary process-local `Mutex`, NOT a shared-arena/
+//! `SharedArc` structure -- re-derived, not assumed, from the 87th pass's own finding 1 (still
+//! true, unaffected by this generalization): every reader and writer of this state is a thread of
+//! the SAME parent process (the guest thread(s) issuing `fork()`, and this process's own
+//! `guard_cow_write_fault_veh` reacting to ITS OWN write faults). A lazy CHILD never touches this
+//! map directly -- it only ever `ReadProcessMemory`s a specific [`GuardSnapshotSlot`]'s
+//! bytes/state, exactly as the 88th pass already had it, over the SAME `PROCESS_VM_READ` handle.
+//! Each fork's own [`GuardCowClaim`] still gets its own freshly `Box::leak`ed snapshot table
+//! (unchanged, same accepted leak-per-successful-guarded-fork tradeoff the 88th pass already
+//! documented) -- what is NEW is that a single physical page's [`PageGuardEntry`] `pending` list
+//! can hold [`PendingGeneration`] entries whose `slot` pointers point into DIFFERENT claims'
+//! DIFFERENT tables, one per currently-interested fork.
+//!
+//! **Liveness is now tracked by a kept-open `HANDLE`, not a re-resolved `u32` pid.** The 88th
+//! pass's liveness check re-opened the pid fresh on every check -- sound for a single, short-lived
+//! claim/reclaim decision, but this generalization can leave a generation "pending" for
+//! arbitrarily long (as long as the page stays unwritten), during which its owning pid could exit
+//! AND be reused by an unrelated later process. [`PendingGeneration`] instead keeps its own
+//! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` handle, taken at the moment it joins a page,
+//! and checks liveness through THAT handle ([`pending_generation_alive`]) -- immune to pid reuse
+//! for as long as the entry exists, at the cost of one extra open handle per (generation, guarded
+//! page) pair for the life of that pairing (closed via `PendingGeneration`'s own `Drop`, run
+//! whenever an entry is pruned, serviced, or a claim aborts).
+//!
+//! **The single global one-at-a-time gate is gone.** There is no longer a reason to force a whole
+//! fork back to eager just because another sibling is outstanding -- [`try_claim_guard_cow_table`]
+//! now only ever declines for the degenerate `total_pages == 0` case (never reachable from its
+//! real call site, kept for interface/defensive symmetry). Per-fork admission is bounded upstream,
+//! for free, by `litebox_shim_linux::GlobalState`'s own existing `live_cross_process_fork_children`
+//! cap (6 concurrent cross-process-fork children system-wide, 76th pass) -- since exactly one
+//! guard-cow claim exists per live cross-process-fork child, this generalization cannot create
+//! unbounded concurrent state without that separate, already-shipped admission control also being
+//! exceeded.
+//!
+//! **Per-page join/open logic ([`guard_one_page`]) holds [`GUARD_PAGE_REGISTRY`]'s lock for its
+//! ENTIRE decide-then-act body**, including the nested [`crate::VIRTUAL_PROTECT_LOCK`] acquisition
+//! for a fresh guard's own `VirtualProtect` call (lock order: registry, then virtual-protect,
+//! matching [`guard_cow_write_fault_veh`]'s own order, so the two paths can never deadlock against
+//! each other) -- closes a race an earlier draft of this design had (drop the registry lock between
+//! "decide fresh vs join" and "act on that decision", during which a second concurrently-forking
+//! guest thread on the same parent could open or close the SAME page's interval and have its own
+//! bookkeeping silently overwritten). Caught by re-deriving the concurrency argument in full before
+//! writing the fault-handler code, not found live -- the discipline this project's own 84th-pass
+//! entry asks future `vectored_exception_handler`-adjacent work to apply.
+//!
+//! **Dead-generation pruning is now per-PAGE, checked on every join attempt** ([`guard_one_page`]'s
+//! own `entry.pending.retain(pending_generation_alive)` step) -- the direct generalization of the
+//! 88th pass's Bug 5 fix (which pruned per-CLAIM, only on a single-slot reclaim). A page whose only
+//! pending generations have since died is, for a NEW joiner, exactly as fresh as a page with no
+//! entry at all; pruning (rather than tearing the whole entry down) preserves the recorded
+//! `true_original_protect` so the newcomer does not need to pay a redundant `VirtualQuery`.
+//!
+//! **The write-fault handler ([`guard_cow_write_fault_veh`]) services every still-alive pending
+//! generation for the faulting page in one pass** (`entry.pending.drain(..)`, one live
+//! `copy_nonoverlapping` of the page's current bytes shared across all of them, since -- per the
+//! key simplification above -- they all want the identical value), then restores the page's real
+//! prior protection and leaves the map entry present but empty (never removed outright). Leaving
+//! an emptied entry in place, rather than deleting it, is deliberate: it is what makes a genuinely
+//! concurrent SECOND write fault on the very same page (both threads faulted before either one's
+//! restore took effect -- physically rare but not impossible on real multi-core hardware) resolve
+//! correctly. The second thread's own VEH invocation, arriving after the first has already
+//! serviced-and-restored under the same lock, finds the entry still there with an already-empty
+//! `pending` list -- skips capture (nothing left to distribute) and simply re-asserts the same
+//! `VirtualProtect` restore (idempotent, already at that value) before returning
+//! `EXCEPTION_CONTINUE_EXECUTION` for ITS OWN retry too. Deleting the entry instead would have left
+//! that second thread's fault matching nothing, falling through to `EXCEPTION_CONTINUE_SEARCH`
+//! with no other handler able to resolve it -- a latent crash this design closes by construction
+//! rather than by observed failure. The cost is a bounded, harmless leak of empty
+//! `PageGuardEntry` records for every distinct page ever guarded over a process's whole lifetime
+//! (tens of bytes each) -- accepted, consistent with this module's other already-documented
+//! per-fork leaks (leaked snapshot tables), and self-evidently bounded by the guest's own total
+//! distinct-page count, not by fork count.
+//!
+//! **A known, explicit, un-optimized cost in this first landing**: page protection is applied
+//! ONE PAGE AT A TIME ([`reserve_group_lazy_guarded`]'s inner loop calls [`guard_one_page`] per
+//! page), not batched into one `VirtualProtect` call per contiguous committed sub-range the way
+//! the 88th pass's single-generation version did. This trades the 88th pass's own O(ranges) syscall
+//! count for O(pages) in the guard-cow-specific path (the plain-lazy and eager paths are UNCHANGED
+//! and unaffected) -- deliberately chosen this pass to keep the join-vs-open decision and its
+//! locking simple and provably correct under real concurrent-fork overlap, rather than layering a
+//! batching optimization on top of a brand-new correctness-critical path without an equivalent
+//! live-verification budget for THAT optimization too. Flagged as a concrete, bounded,
+//! purely-performance follow-up for a future pass with its own measurement budget -- batch
+//! `VirtualProtect` across a contiguous run of pages that are ALL currently unopened (the common
+//! case, no real overlap), falling back to this pass's per-page path only for a page some other
+//! live generation already has open (rare, bounded by the 6-concurrent-child admission cap).
+//!
+//! **Verification this pass**: see this project's own `AGENTS.md` 98th-pass entry for the exact
+//! commands and real output -- both original repros (fork-then-execve; fork-without-execve
+//! subshell), a NEW concurrent-multi-child repro this generalization exists to cover, and the real
+//! `de_only_xcensus_seed3.tar` boot, all re-verified against this design before it is trusted.
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 
@@ -1026,200 +1144,71 @@ impl GuardSnapshotSlot {
     }
 }
 
-/// One `VirtualQuery`-uniform, already-committed sub-range of a guarded group, guard-page-
-/// protected to `PAGE_READONLY` by [`reserve_group_lazy_guarded`]. `old_protect` is THIS
-/// sub-range's own real prior protection (never assumed to be blanket `PAGE_READWRITE` -- a
-/// guest-`mprotect`'d read-only sub-range must heal back to read-only, not become newly
-/// writable), and `slot_base_index` is this sub-range's own first page's index into the fork's
-/// shared [`GuardSnapshotSlot`] table (computed relative to the OWNING GROUP's start, matching
-/// the child's own [`GUARD_GROUP_BASES`] computation exactly).
-struct GuardedRegion {
-    range: Range<usize>,
-    old_protect: u32,
-    slot_base_index: usize,
+/// One live generation's stake in a single guarded page -- see this module's own "89th pass" doc
+/// section for the derivation. `live_handle` is a `PROCESS_QUERY_LIMITED_INFORMATION`-only handle
+/// THIS entry itself opened (in [`guard_one_page`]) and owns for as long as the entry exists;
+/// checking liveness through a handle an entry keeps open, rather than re-resolving a bare pid, is
+/// immune to PID reuse for as long as the entry is outstanding -- a real risk once a page can stay
+/// pending for the lifetime of an arbitrarily long-lived generation, not just a single claim/
+/// reclaim decision.
+struct PendingGeneration {
+    live_handle: Handle,
+    slot: &'static GuardSnapshotSlot,
 }
 
-/// One parent's complete guard-cow bookkeeping for its single currently-outstanding guarded fork
-/// child. Only ever `Some` while [`GUARD_COW_OWNER_PID`] is non-zero for a genuinely-guarded fork
-/// (a fork that requested guard-cow but was denied the claim never populates this at all -- it
-/// falls all the way back to eager, see `spawn_process_fork_child`'s own caller-side logic).
-struct GuardCowState {
-    regions: Vec<GuardedRegion>,
-    /// `'static`-leaked (`Box::leak`) so its address stays valid for exactly as long as this
-    /// mechanism could still need to service a fault against it -- intentionally never freed;
-    /// see this file's own module doc comment on why release/cleanup for a successfully-`execve`'d
-    /// long-lived child is a known, honest, bounded (one slot, not a leak of every fork) limit.
-    table: &'static [GuardSnapshotSlot],
+// Safety: `live_handle` is an opaque Win32 kernel-object handle (`*mut c_void`-shaped, not a real
+// pointer into this process's own memory) -- safe to read/close from any thread, exactly as
+// `windows_sys`' own raw `HANDLE` type is used everywhere else in this codebase across thread
+// boundaries. `slot: &'static GuardSnapshotSlot` is `Sync` already (see that struct's own doc
+// comment) and therefore both `Send` and `Sync` to share.
+unsafe impl Send for PendingGeneration {}
+unsafe impl Sync for PendingGeneration {}
+
+impl Drop for PendingGeneration {
+    fn drop(&mut self) {
+        if !self.live_handle.is_null() {
+            unsafe { CloseHandle(self.live_handle) };
+        }
+    }
 }
 
-/// `0` = free. Otherwise the pid of the sole cross-process-fork child THIS process (acting as a
-/// parent) currently has an outstanding guard-cow relationship with, OR the reserved sentinel
-/// [`GUARD_COW_CLAIM_PLACEHOLDER`] while a claim is being finalized. Process-local by design (87th
-/// pass design refinement 1: the correctness unit is per-parent-process, not tree-wide) -- an
-/// ordinary static, no shared arena, no cross-process attach needed for the claim/release decision
-/// itself.
-static GUARD_COW_OWNER_PID: AtomicU32 = AtomicU32::new(0);
-/// Not a real pid (`pid_t`/Windows PIDs never reach `u32::MAX`) -- a placeholder occupying the
-/// slot between a successful CAS-from-0 and [`finalize_guard_cow_claim`]/[`guard_cow_release_claim`]
-/// so two guest threads racing concurrent `fork()`s on the SAME parent can never both believe they
-/// hold the slot.
-const GUARD_COW_CLAIM_PLACEHOLDER: u32 = u32::MAX;
-
-static GUARD_STATE: Mutex<Option<GuardCowState>> = Mutex::new(None);
-static GUARD_VEH_INSTALLED: OnceLock<()> = OnceLock::new();
-
-/// Bounded, non-blocking liveness check: `true` iff `pid` is still a running process. Same
-/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess` idiom
-/// `WindowsUserland::is_process_alive` (`lib.rs`) already uses for its own dead-holder recovery --
-/// deliberately the identical two Win32 calls and verdict rule (not factored into a shared helper
-/// this pass, for the same reason that function's own doc comment gives: a different type in a
-/// different file, a mechanical dedup for a future pass, not a behavior change now). An unopenable
-/// pid is treated as NOT alive (reclaim the slot) -- see [`try_claim_guard_cow_for_fork`]'s own
-/// doc comment for why that is the conservative, safe direction for this specific gate (a false
-/// "reclaim" only costs this NEXT fork guard-cow eligibility in the rare case the check was
-/// wrong, which is a performance loss, not a correctness one -- the fallback is always the
-/// already-proven-safe eager path).
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
+/// `true` iff the generation's own owning process is still running, checked through the entry's
+/// OWN kept-open handle (see [`PendingGeneration`]'s own doc comment for why this, not a
+/// re-resolved pid).
+fn pending_generation_alive(p: &PendingGeneration) -> bool {
     let mut exit_code: u32 = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) };
-    unsafe { CloseHandle(handle) };
+    let ok = unsafe { GetExitCodeProcess(p.live_handle, &raw mut exit_code) };
     ok != 0 && exit_code == STILL_ACTIVE
 }
 
-/// Parent-side: attempts to claim this process's single guard-cow slot for a NEW fork about to
-/// happen. Returns `true` (slot claimed, as [`GUARD_COW_CLAIM_PLACEHOLDER`]) iff either the slot
-/// was already free, or its recorded owner pid has since died (reclaimed). Returns `false`
-/// (decline -- caller must fall all the way back to eager for every group of this fork, never
-/// plain unguarded lazy) whenever another live child from this SAME parent still holds the slot,
-/// OR another thread is concurrently mid-claim (observed as the placeholder itself) -- declining
-/// rather than spinning/retrying, since the eager fallback is always correct and a missed guard-cow
-/// opportunity is only a performance cost.
-///
-/// Must be paired with EXACTLY ONE of [`finalize_guard_cow_claim`] (the fork proceeded and at
-/// least one group was actually guarded) or [`guard_cow_release_claim`] (the fork's own spawn
-/// failed, or ended up not needing guard-cow after all) -- never both, never neither.
-#[must_use]
-fn try_claim_guard_cow_for_fork() -> bool {
-    if GUARD_COW_OWNER_PID
-        .compare_exchange(
-            0,
-            GUARD_COW_CLAIM_PLACEHOLDER,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
-    {
-        return true;
-    }
-    let current = GUARD_COW_OWNER_PID.load(Ordering::SeqCst);
-    if current == 0 || current == GUARD_COW_CLAIM_PLACEHOLDER {
-        return false;
-    }
-    if !pid_is_alive(current) {
-        if GUARD_COW_OWNER_PID
-            .compare_exchange(
-                current,
-                GUARD_COW_CLAIM_PLACEHOLDER,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            // Real bug found+fixed live, 88th pass: heal the PREVIOUS (now-dead-owner) claim's
-            // guarded regions back to their own real prior protection BEFORE this new claim can
-            // ever re-guard the same address range. Without this, a group whose address range is
-            // reused across consecutive forks from the same long-lived parent (the common case --
-            // e.g. bash's own heap/stack layout barely moves between consecutive external-command
-            // forks) could still be sitting `PAGE_READONLY` from the dead claim's own
-            // never-triggered guard (the parent simply never happened to write there before that
-            // child died) when `reserve_group_lazy_guarded` runs for the NEW claim.
-            // `VirtualProtect`'s own `old_protect` out-param then reports the CURRENT
-            // (already-`PAGE_READONLY`) state, not the true pre-guarding one -- poisoning the new
-            // claim's own restore target. The next time the PARENT writes to that page,
-            // [`guard_cow_write_fault_veh`] "restores" it to that poisoned, still-read-only value,
-            // so the very same faulting instruction re-faults the instant it retries --
-            // `EXCEPTION_CONTINUE_EXECUTION` loops forever on one instruction, real CPU burned on
-            // every iteration's exception dispatch, zero forward progress, no crash. Confirmed
-            // live: a real `de_only_xcensus_seed3.tar` boot reproduced exactly this signature (two
-            // clean guarded forks, then the parent's own continued execution spins at 100% CPU
-            // with zero further progress) -- reconfirmed absent once this fix healed the
-            // superseded claim's regions here, before the new claim's own protect walk ever runs.
-            heal_superseded_guard_state();
-            return true;
-        }
-        return false;
-    }
-    false
+fn open_liveness_handle(pid: u32) -> Option<Handle> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() { None } else { Some(handle) }
 }
 
-/// Restores every region the CURRENT (about-to-be-superseded) [`GuardCowState`] guard-protected
-/// back to its own real prior protection, and clears [`GUARD_STATE`] to `None` -- see
-/// [`try_claim_guard_cow_for_fork`]'s own doc comment (88th-pass fix) for why this must run BEFORE
-/// a newly-reclaimed slot's own [`reserve_group_lazy_guarded`] calls can ever re-guard the same
-/// address range. A region already healed by [`guard_cow_write_fault_veh`] (its own page long
-/// since restored to `old_protect` and a snapshot captured) is harmlessly re-`VirtualProtect`'d to
-/// the exact same value it already holds -- idempotent, no different from any other region here.
-fn heal_superseded_guard_state() {
-    // Lock order (GUARD_STATE, then VIRTUAL_PROTECT_LOCK) deliberately matches
-    // `guard_cow_write_fault_veh`'s own -- held together, not dropped-then-reacquired, so no
-    // OTHER thread's write fault on one of these about-to-be-healed regions can observe
-    // `GUARD_STATE` as `None` (declining the fault, falling through to a handler that does not
-    // know what to do with it) in the narrow window between clearing this state and actually
-    // restoring the page protection. No other code path takes these two locks in the opposite
-    // order (`reserve_group_lazy_guarded` takes only `VIRTUAL_PROTECT_LOCK`, never `GUARD_STATE`),
-    // so holding both here cannot deadlock against it.
-    let mut guard_state = GUARD_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(state) = guard_state.take() else {
-        return;
-    };
-    let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for region in &state.regions {
-        let mut discard_old: u32 = 0;
-        unsafe {
-            VirtualProtect(
-                region.range.start as *mut c_void,
-                region.range.len(),
-                region.old_protect,
-                &mut discard_old,
-            );
-        }
-    }
+/// One page's shared guard-cow bookkeeping, keyed by page-aligned address in THIS (parent)
+/// process's own address space -- see this module's own "89th pass" doc section for the full
+/// derivation of why a single entry, shared by however many generations are currently pending,
+/// is correct (not merely convenient) in place of one-shadow-per-generation versioning.
+struct PageGuardEntry {
+    /// This page's real protection from before ANY generation in the CURRENT interval touched it.
+    /// Captured once, by whichever generation is first to guard this page after the previous
+    /// interval (if any) closed; restored verbatim when this interval closes. Kept (not removed)
+    /// once `pending` empties -- see [`guard_cow_write_fault_veh`]'s own doc comment for why an
+    /// emptied-but-present entry, not a deleted one, is what makes a genuinely concurrent second
+    /// write fault on the same page resolve correctly.
+    true_original_protect: u32,
+    /// Every live generation currently relying on this page staying stable since it joined.
+    /// Pruned lazily (dead entries dropped, closing their handles) whenever a new generation wants
+    /// to join this same page -- the direct generalization of the 88th pass's own Bug 5 fix.
+    pending: Vec<PendingGeneration>,
 }
 
-/// Releases a claim that ended up unused (spawn failed before any group was guarded, or this
-/// fork turned out to have zero lazy-eligible groups after all). Only ever resets the slot from
-/// the placeholder -- never stomps a value a (impossible, single-claimant) different finalize
-/// already wrote.
-fn guard_cow_release_claim() {
-    let _ = GUARD_COW_OWNER_PID.compare_exchange(
-        GUARD_COW_CLAIM_PLACEHOLDER,
-        0,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
-}
-
-/// Finalizes a successful claim once the real child pid is known (spawn already succeeded) and at
-/// least one group has actually been guarded -- publishes the real owner pid (so a FUTURE claim's
-/// liveness check targets the right process) and installs [`GUARD_STATE`].
-fn finalize_guard_cow_claim(child_pid: u32, regions: Vec<GuardedRegion>, table: &'static [GuardSnapshotSlot]) {
-    GUARD_COW_OWNER_PID.store(child_pid, Ordering::SeqCst);
-    let mut state = GUARD_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    *state = Some(GuardCowState { regions, table });
-    drop(state);
-    ensure_guard_cow_veh_installed();
-}
+/// Process-local (see this module's own "89th pass"/87th-pass-finding-1 doc section for why this
+/// is correct without a shared-arena structure): every guarded page currently open across every
+/// live guard-cow claim THIS process has ever granted as a parent.
+static GUARD_PAGE_REGISTRY: Mutex<Option<HashMap<usize, PageGuardEntry>>> = Mutex::new(None);
+static GUARD_VEH_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn ensure_guard_cow_veh_installed() {
     GUARD_VEH_INSTALLED.get_or_init(|| {
@@ -1229,32 +1218,170 @@ fn ensure_guard_cow_veh_installed() {
     });
 }
 
-/// Parent-side setup, called once per lazy-eligible group when [`try_claim_guard_cow_for_fork`]
-/// succeeded for this fork: reserves the group in the child exactly as [`reserve_group_lazy`]
-/// does, THEN walks this PARENT's own already-committed pages across `source_group`
-/// `VirtualQuery`-region by region, `VirtualProtect`-ing each committed, non-guard/no-access
-/// sub-range to `PAGE_READONLY` and recording it as a [`GuardedRegion`] (with its OWN real prior
-/// protection, and a slot-base index computed relative to `group_slot_base`, matching the child's
-/// own [`GUARD_GROUP_BASES`] computation for the same group).
+/// Registers exactly one page as guarded on behalf of `claim`: either joins an already-open
+/// interval (page already `PAGE_READONLY`, some other still-live generation from this SAME parent
+/// forked during the same unbroken no-write span -- see the module doc's own correctness
+/// derivation for why sharing is sound here), or, if none is open (no entry, or every previously
+/// pending generation has since died), opens a brand new one: `VirtualProtect`s this page to
+/// `PAGE_READONLY` and records its real prior protection.
 ///
-/// A sub-range whose `VirtualProtect` call itself fails is simply left unguarded (not fatal to the
-/// whole fork) -- the affected pages fall back to the pre-existing plain-live-read path for lazy
-/// faults, which is Bug 4's original TOCTOU risk narrowed to just that sub-range, never a NEW
-/// hazard beyond what already existed before this pass.
+/// Holds [`GUARD_PAGE_REGISTRY`]'s lock for this whole decide-then-act body, with
+/// [`crate::VIRTUAL_PROTECT_LOCK`] nested inside it for the actual syscall (same lock order
+/// [`guard_cow_write_fault_veh`] uses) -- so no other thread on this same parent, concurrently
+/// forking and touching the SAME page, can observe or act on a half-decided state between "decide
+/// fresh vs join" and "act on that decision".
+///
+/// A page whose `VirtualProtect` call itself fails is simply left unguarded (not fatal to the
+/// group) -- narrows Bug 4's original TOCTOU risk to just that one page, never a NEW hazard beyond
+/// what already existed before this mechanism did.
+fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_index: usize, diag: bool) {
+    let Some(slot) = claim.table.get(slot_index) else {
+        return;
+    };
+    let mut registry = GUARD_PAGE_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = registry.get_or_insert_with(HashMap::new);
+
+    // Prune dead pending generations from any existing entry first -- the direct generalization
+    // of the 88th pass's own Bug 5 fix (there: per-claim, on a single-slot reclaim; here: per
+    // page, on every join attempt).
+    if let Some(entry) = map.get_mut(&page) {
+        let before = entry.pending.len();
+        entry.pending.retain(pending_generation_alive);
+        if diag && before > 0 && entry.pending.len() < before {
+            eprintln!(
+                "[lazy_fork_commit] guard-cow DIAG: page={page:#x} pruned {} dead pending (had {before}, now {})",
+                before - entry.pending.len(),
+                entry.pending.len()
+            );
+        }
+    }
+
+    // Heal-then-remove ANY entry now found with an EMPTY pending list, whatever the cause --
+    // pruning just above just emptied it, OR it was born empty already (the "child died between
+    // spawn and guard" branch below inserts exactly such an entry). Both are a CLOSED interval:
+    // the real Windows page protection is still whatever the LAST successful `VirtualProtect`
+    // call in this function set it to (`PAGE_READONLY`), which is NOT this entry's own recorded
+    // `true_original_protect` -- nobody has restored it, because restoration only ever happens
+    // via a genuine parent WRITE fault, which by definition never came (that is exactly what
+    // "zero live pending generations" means: nobody is left who could ever cause one to matter,
+    // but the page itself was never told). Leaving a closed-but-unhealed entry in place is the
+    // generalized form of the 88th pass's own Bug 5: the FRESH-GUARD branch below would then
+    // `VirtualProtect` an ALREADY-`PAGE_READONLY` page and capture the CURRENT (poisoned,
+    // still-`PAGE_READONLY`) value as if it were the true original -- confirmed live this pass
+    // (`LITEBOX_DIAG_LAZY_FORK_COMMIT=1`, a 3-concurrent-subshell repro with real interleaved
+    // parent heap writes): `true_original_protect=0x2` (`PAGE_READONLY`) recorded for a page,
+    // followed by an unbounded same-instruction re-fault loop (`guard_cow_write_fault_veh`
+    // "restoring" to the same already-`PAGE_READONLY` value forever) burning 100+ CPU-seconds
+    // with zero forward progress -- a real, reproducible hang, not a theoretical concern. Healing
+    // HERE, eagerly, the moment an entry is found closed (rather than only reactively inside the
+    // write-fault handler, which by definition never fires again for a page nobody ever writes to
+    // again) is what closes this for good.
+    if let Some(entry) = map.get(&page)
+        && entry.pending.is_empty()
+    {
+        let true_original_protect = entry.true_original_protect;
+        map.remove(&page);
+        let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut discard_old: u32 = 0;
+        unsafe {
+            VirtualProtect(page as *mut c_void, PAGE_SIZE, true_original_protect, &mut discard_old);
+        }
+        if diag {
+            eprintln!(
+                "[lazy_fork_commit] guard-cow: page={page:#x} healed to true_original_protect={true_original_protect:#x} (closed interval, no live pending generations)"
+            );
+        }
+    }
+
+    if map.get(&page).is_some_and(|e| !e.pending.is_empty()) {
+        let Some(handle) = open_liveness_handle(child_pid) else {
+            return;
+        };
+        let entry = map.get_mut(&page).expect("checked non-empty just above");
+        entry.pending.push(PendingGeneration {
+            live_handle: handle,
+            slot,
+        });
+        claim.joined_pages.push((page, slot));
+        if diag {
+            eprintln!(
+                "[lazy_fork_commit] guard-cow: page={page:#x} joined open interval ({} pending)",
+                entry.pending.len()
+            );
+        }
+        return;
+    }
+
+    // Not currently open (no entry, or pruned to empty) -- open a fresh interval.
+    let mut old_protect: u32 = 0;
+    let protected = {
+        let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { VirtualProtect(page as *mut c_void, PAGE_SIZE, PAGE_READONLY, &mut old_protect) != 0 }
+    };
+    if !protected {
+        map.remove(&page);
+        return;
+    }
+    match open_liveness_handle(child_pid) {
+        Some(handle) => {
+            map.insert(
+                page,
+                PageGuardEntry {
+                    true_original_protect: old_protect,
+                    pending: vec![PendingGeneration {
+                        live_handle: handle,
+                        slot,
+                    }],
+                },
+            );
+            claim.joined_pages.push((page, slot));
+            if diag {
+                eprintln!(
+                    "[lazy_fork_commit] guard-cow: page={page:#x} opened fresh interval old_protect={old_protect:#x}"
+                );
+            }
+        }
+        None => {
+            // The child died in the instant between spawn and here -- still record the entry
+            // (empty pending) so this page's TRUE prior protection is not lost: a real future
+            // write-fault must still find it and restore it, rather than leaving it stuck
+            // PAGE_READONLY forever with nothing tracking what to heal it back to.
+            map.insert(
+                page,
+                PageGuardEntry {
+                    true_original_protect: old_protect,
+                    pending: Vec::new(),
+                },
+            );
+        }
+    }
+}
+
+/// Parent-side setup, called once per lazy-eligible group when guard-cow is enabled for this fork:
+/// reserves the group in the child exactly as [`reserve_group_lazy`] does, THEN walks this
+/// PARENT's own already-committed pages across `source_group` `VirtualQuery`-region by region,
+/// and for every committed, non-guard/no-access page within each such sub-range, calls
+/// [`guard_one_page`] (see this module's own "89th pass" doc section for why this first landing
+/// is deliberately page-at-a-time rather than batched per contiguous sub-range).
 #[must_use]
 fn reserve_group_lazy_guarded(
+    claim: &mut GuardCowClaim,
+    child_pid: u32,
     child: Handle,
     source_group: &Range<usize>,
     group_slot_base: usize,
-    regions_out: &mut Vec<GuardedRegion>,
 ) -> GroupCopyResult {
     let result = reserve_group_lazy(child, source_group);
     if !result.succeeded {
         return result;
     }
-    let _guard = crate::VIRTUAL_PROTECT_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let diag = std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some();
     let mut addr = source_group.start;
     while addr < source_group.end {
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
@@ -1274,21 +1401,11 @@ fn reserve_group_lazy_guarded(
         let region_start = addr.max(mbi.BaseAddress as usize);
         let region_end = ((mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)).min(source_group.end);
         if mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && region_end > region_start {
-            let mut old_protect: u32 = 0;
-            let protected = unsafe {
-                VirtualProtect(
-                    region_start as *mut c_void,
-                    region_end - region_start,
-                    PAGE_READONLY,
-                    &mut old_protect,
-                ) != 0
-            };
-            if protected {
-                regions_out.push(GuardedRegion {
-                    range: region_start..region_end,
-                    old_protect,
-                    slot_base_index: group_slot_base + (region_start - source_group.start) / PAGE_SIZE,
-                });
+            let mut page = region_start;
+            while page < region_end {
+                let slot_index = group_slot_base + (page - source_group.start) / PAGE_SIZE;
+                guard_one_page(claim, child_pid, page, slot_index, diag);
+                page += PAGE_SIZE;
             }
         }
         addr = region_end.max(addr + 1);
@@ -1304,26 +1421,31 @@ fn reserve_group_lazy_guarded(
 /// where each of the three functions belongs.
 pub struct GuardCowClaim {
     table: &'static [GuardSnapshotSlot],
-    regions: Vec<GuardedRegion>,
+    /// (page address, this claim's own slot for that page) pairs this claim has successfully
+    /// registered itself as a pending generation for -- lets [`abort_guard_cow_claim`] undo
+    /// PRECISELY what this claim did and nothing belonging to any other, independently-pending
+    /// generation this claim happened to share a page's open interval with.
+    joined_pages: Vec<(usize, &'static GuardSnapshotSlot)>,
 }
 
-/// Parent-side, PRE-spawn: attempts to claim this process's single guard-cow slot (see
-/// [`try_claim_guard_cow_for_fork`]) and, only if successful, allocates (and `'static`-leaks) a
-/// snapshot table sized for `total_pages` guest pages -- the sum, across every group this fork
-/// intends to guard, of `group.len().div_ceil(PAGE_SIZE)`. Returns `None` on a declined claim;
-/// the caller must then fall this fork all the way back to eager for every group (never plain
-/// unguarded lazy) -- see this module's own doc comment for why that is the deliberately
-/// conservative choice.
+/// Parent-side, PRE-spawn: allocates (and `'static`-leaks) a snapshot table sized for
+/// `total_pages` guest pages -- the sum, across every group this fork intends to guard, of
+/// `group.len().div_ceil(PAGE_SIZE)`. Unlike the 88th pass's single-outstanding-child version,
+/// this always succeeds for any real caller (`total_pages > 0` always holds at the real call
+/// site) -- kept as `Option` for interface stability and as a defensive hook for a future
+/// resource cap, not because there is a live contention path today: per-fork admission is already
+/// bounded upstream by `litebox_shim_linux::GlobalState`'s own `live_cross_process_fork_children`
+/// cap (see this module's own "89th pass" doc section).
 #[must_use]
 pub fn try_claim_guard_cow_table(total_pages: usize) -> Option<GuardCowClaim> {
-    if !try_claim_guard_cow_for_fork() {
+    if total_pages == 0 {
         return None;
     }
     let table: Vec<GuardSnapshotSlot> = (0..total_pages).map(|_| GuardSnapshotSlot::zeroed()).collect();
     let table: &'static [GuardSnapshotSlot] = Box::leak(table.into_boxed_slice());
     Some(GuardCowClaim {
         table,
-        regions: Vec::new(),
+        joined_pages: Vec::new(),
     })
 }
 
@@ -1333,63 +1455,77 @@ pub fn guard_cow_claim_table_base(claim: &GuardCowClaim) -> usize {
     claim.table.as_ptr() as usize
 }
 
-/// Parent-side, POST-spawn (needs the real child `Handle`): reserves+guards one lazy-eligible
+/// Parent-side, POST-spawn (needs the real child `Handle`/pid): reserves+guards one lazy-eligible
 /// group under an already-successful [`GuardCowClaim`] -- see [`reserve_group_lazy_guarded`].
 #[must_use]
 pub fn guard_cow_reserve_group(
     claim: &mut GuardCowClaim,
+    child_pid: u32,
     child: Handle,
     source_group: &Range<usize>,
     group_slot_base: usize,
 ) -> GroupCopyResult {
-    reserve_group_lazy_guarded(child, source_group, group_slot_base, &mut claim.regions)
+    reserve_group_lazy_guarded(claim, child_pid, child, source_group, group_slot_base)
 }
 
-/// Commits a successful claim: publishes the real child pid as this slot's owner (so a FUTURE
-/// claim's liveness check targets the right process) and installs [`GUARD_STATE`] so
-/// [`guard_cow_write_fault_veh`] actually starts servicing faults for these regions.
-pub fn finalize_guard_cow_table(claim: GuardCowClaim, child_pid: u32) {
-    finalize_guard_cow_claim(child_pid, claim.regions, claim.table);
+/// Commits a successful claim. Every page this claim guarded was already registered live, under
+/// [`GUARD_PAGE_REGISTRY`]'s own lock, at the exact moment [`guard_one_page`] protected or joined
+/// it (unlike the 88th pass's single `GUARD_STATE`, which was only populated HERE, at finalize
+/// time -- closing a narrow pre-existing race where a page already made `PAGE_READONLY` mid-loop,
+/// but not yet described to `guard_cow_write_fault_veh`, could be written by a DIFFERENT guest
+/// thread of the same multi-threaded parent before finalize ever ran). This function therefore
+/// installs the VEH (idempotent past the first call, harmless if it was never needed) and lets
+/// `claim` drop -- which intentionally does NOT release anything: the whole point is for these
+/// pages to keep being serviced for as long as their pending generations stay alive.
+pub fn finalize_guard_cow_table(claim: GuardCowClaim, _child_pid: u32) {
+    ensure_guard_cow_veh_installed();
+    drop(claim);
 }
 
 /// Abandons a claim that never became a real, running guarded fork (the child's own spawn or
-/// per-group copy loop failed). Restores every region THIS claim already guard-protected back to
-/// its own real prior protection before releasing the slot -- without this, a partially-guarded
-/// set of pages would stay stuck `PAGE_READONLY` in the parent forever with no
-/// [`GUARD_STATE`]-installed handler ever able to heal them (this claim was never finalized, so
-/// [`guard_cow_write_fault_veh`] never learns about these regions at all).
+/// per-group copy loop failed). Removes precisely this claim's OWN pending entry from every page
+/// it joined (closing that entry's kept-open handle via [`PendingGeneration`]'s own `Drop`), and,
+/// for any page this claim was the LAST live generation on, restores that page to its real prior
+/// protection -- without this, a partially-guarded set of pages this claim was the sole owner of
+/// would stay stuck `PAGE_READONLY` forever.
 pub fn abort_guard_cow_claim(claim: GuardCowClaim) {
-    let _guard = crate::VIRTUAL_PROTECT_LOCK
+    let mut registry = GUARD_PAGE_REGISTRY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for region in &claim.regions {
-        let mut discard_old: u32 = 0;
-        unsafe {
-            VirtualProtect(
-                region.range.start as *mut c_void,
-                region.range.len(),
-                region.old_protect,
-                &mut discard_old,
-            );
+    let Some(map) = registry.as_mut() else {
+        return;
+    };
+    for (page_addr, slot) in &claim.joined_pages {
+        let Some(entry) = map.get_mut(page_addr) else {
+            continue;
+        };
+        entry.pending.retain(|p| !core::ptr::eq(p.slot, *slot));
+        if entry.pending.is_empty() {
+            let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut discard_old: u32 = 0;
+            unsafe {
+                VirtualProtect(
+                    *page_addr as *mut c_void,
+                    PAGE_SIZE,
+                    entry.true_original_protect,
+                    &mut discard_old,
+                );
+            }
         }
     }
-    drop(_guard);
-    guard_cow_release_claim();
 }
 
 /// PARENT-side VEH: catches this process's OWN next write to a page it has guard-protected on
-/// behalf of a lazy fork child, captures a pre-write snapshot, republishes the region's real prior
-/// protection on just that one page, and lets the write retry and succeed. Declines
-/// (`EXCEPTION_CONTINUE_SEARCH`) every fault that is not a write to a currently-guarded address,
-/// including every fault this process's own pre-existing `fork_verify`/main VEH machinery is
-/// responsible for -- unchanged by this handler's mere presence.
+/// behalf of one or more lazy fork children, captures a pre-write snapshot into EVERY still-alive
+/// pending generation's own slot (see this module's own "89th pass" doc section for why one
+/// capture correctly serves all of them at once), restores the page's real prior protection, and
+/// lets the write retry and succeed. Declines (`EXCEPTION_CONTINUE_SEARCH`) every fault that is
+/// not a write to a currently-tracked address, including every fault this process's own
+/// pre-existing `fork_verify`/main VEH machinery is responsible for -- unchanged by this handler's
+/// mere presence.
 unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // Cheap, lock-free bail-out before touching any lock: guard-cow inactive for this process
-    // right now (the overwhelmingly common case -- this handler, once installed, stays installed
-    // for the rest of this process's life, but is active only while GUARD_STATE is Some).
-    if GUARD_COW_OWNER_PID.load(Ordering::SeqCst) == 0 {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
     let rec = unsafe { &*(*info).ExceptionRecord };
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {
@@ -1403,45 +1539,78 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let fault_addr = rec.ExceptionInformation[1];
-
-    let mut guard_state = GUARD_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(state) = guard_state.as_mut() else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let Some(region_idx) = state.regions.iter().position(|r| r.range.contains(&fault_addr)) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
     let page_addr = fault_addr & !(PAGE_SIZE - 1);
 
-    // Hold VIRTUAL_PROTECT_LOCK for the whole query-flip-copy-restore span -- the exact precedent
-    // `fork_verify::write_usize_fault_tolerant` already established for taking this lock from
-    // inside VEH dispatch (see this module's own doc comment, "87th pass" section, finding 3).
+    let mut registry = GUARD_PAGE_REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(map) = registry.as_mut() else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let Some(entry) = map.get_mut(&page_addr) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+
+    let diag = std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some();
+    if diag {
+        static LAST_FAULT_PAGE: AtomicUsize = AtomicUsize::new(0);
+        static LAST_FAULT_REPEAT: AtomicUsize = AtomicUsize::new(0);
+        let prev = LAST_FAULT_PAGE.swap(page_addr, Ordering::Relaxed);
+        let repeat = if prev == page_addr {
+            LAST_FAULT_REPEAT.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            LAST_FAULT_REPEAT.store(0, Ordering::Relaxed);
+            0
+        };
+        eprintln!(
+            "[lazy_fork_commit] guard-cow DIAG: write-fault entry page={page_addr:#x} \
+             true_original_protect={:#x} pending_before={} same_page_repeat={repeat}",
+            entry.true_original_protect,
+            entry.pending.len()
+        );
+        if repeat > 3 {
+            eprintln!(
+                "[lazy_fork_commit] guard-cow DIAG: *** SAME-PAGE RE-FAULT LOOP SUSPECTED *** \
+                 page={page_addr:#x} true_original_protect={:#x} (0x2=READONLY would mean a \
+                 POISONED restore target)",
+                entry.true_original_protect
+            );
+        }
+    }
+
+    // Hold VIRTUAL_PROTECT_LOCK for the whole capture-distribute-restore span -- the exact
+    // precedent `fork_verify::write_usize_fault_tolerant` already established for taking this
+    // lock from inside VEH dispatch (see this module's own doc comment, "87th pass" section,
+    // finding 3), nested inside GUARD_PAGE_REGISTRY's own lock (same order [`guard_one_page`]
+    // uses, so the two paths can never deadlock against each other).
     let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let region = &state.regions[region_idx];
-    let slot_index = region.slot_base_index + (page_addr - region.range.start) / PAGE_SIZE;
-    let old_protect = region.old_protect;
-    let Some(slot) = state.table.get(slot_index) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-
-    // Idempotent: a second concurrent write fault to the SAME page (another thread, blocked on
-    // VIRTUAL_PROTECT_LOCK above until the first finishes) finds state already 1 and simply skips
-    // straight to the restore-and-retry step below -- no double-capture, no lock re-entrancy.
-    if slot.state.load(Ordering::Acquire) == 0 {
+    // Leaving `entry` present but with an emptied `pending` (never removing it outright) is what
+    // makes a genuinely concurrent SECOND write fault on this SAME page -- another thread, which
+    // faulted before either one's restore took effect, now blocked on the lock above until this
+    // one finishes -- resolve correctly: it will find `entry` still here with nothing left to
+    // capture, skip straight to the idempotent restore-and-continue below, and get its own valid
+    // `EXCEPTION_CONTINUE_EXECUTION` too. Deleting the entry instead would leave that second
+    // thread's fault matching nothing, with no other handler able to resolve it.
+    if !entry.pending.is_empty() {
+        let mut buf = [0u8; PAGE_SIZE];
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                page_addr as *const u8,
-                (*slot.bytes.get()).as_mut_ptr(),
-                PAGE_SIZE,
-            );
+            core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
         }
-        slot.state.store(1, Ordering::Release);
-        if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+        let n = entry.pending.len();
+        for p in entry.pending.drain(..) {
+            if pending_generation_alive(&p) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf.as_ptr(), (*p.slot.bytes.get()).as_mut_ptr(), PAGE_SIZE);
+                }
+                p.slot.state.store(1, Ordering::Release);
+            }
+        }
+        if diag {
             eprintln!(
-                "[lazy_fork_commit] guard-cow: parent write-fault captured page={page_addr:#x} slot={slot_index}"
+                "[lazy_fork_commit] guard-cow: parent write-fault captured page={page_addr:#x} generations={n}"
             );
         }
     }
@@ -1451,7 +1620,7 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
         VirtualProtect(
             page_addr as *mut c_void,
             PAGE_SIZE,
-            old_protect,
+            entry.true_original_protect,
             &mut discard_old,
         ) != 0
     };
