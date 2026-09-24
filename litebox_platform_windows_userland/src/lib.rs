@@ -3714,6 +3714,24 @@ unsafe impl Send for TlsState {}
 /// allocating here risks reentering a possibly-already-locked allocator. A fixed, generously-
 /// sized stack-relative reserve avoids that risk entirely; `exception_handler`'s frame is a
 /// fraction of 64KiB even accounting for every diagnostic branch's locals.
+///
+/// 97th pass: widened AGAIN, 8x, but ONLY for `cfg(debug_assertions)` builds -- the very first
+/// full-desktop boot ever attempted under a debug binary (previous debug-build sessions only ran
+/// small, targeted repros, never a real multi-fork XFCE boot) hit `[diag-veh-frame-stride-
+/// overflow]` within 3 seconds, on the FIRST cross-process-forked child's very first guest
+/// instruction (`fork_verify`'s single-step healing of that child's first code page). This is
+/// exactly the same "debug-build (unoptimized, larger-than-release) exception_handler frame"
+/// class this constant's own history already names above (the 4096->65536 widening) -- it simply
+/// hadn't been exercised against `VEH_FRAME_STRIDE`'s OWN separate budget (a different region of
+/// the same reserve, see that constant's doc comment) until a real desktop boot's fork storm
+/// finally forced deep-enough nesting under an unoptimized build. Gated on `debug_assertions`
+/// (not a separate feature flag) so the release path -- proven correct over dozens of live
+/// boots -- is byte-for-byte unchanged; only a `cargo build` (no `--release`) binary, which
+/// AGENTS.md already establishes as reserved for `cdb`-attach sessions rather than measured
+/// timing, pays the larger reserve.
+#[cfg(debug_assertions)]
+const EXCEPTION_RECORD_RESERVE: usize = 65536 * 8;
+#[cfg(not(debug_assertions))]
 const EXCEPTION_RECORD_RESERVE: usize = 65536;
 
 /// Bytes of host stack `vectored_exception_handler_entry` reserves for EACH nesting level before
@@ -3781,6 +3799,22 @@ const EXCEPTION_RECORD_RESERVE: usize = 65536;
 /// Redistributing the same 32 KiB ceiling from an unused-in-practice third nesting level to the
 /// one depth this workload actually uses fixes the crash without increasing how far this
 /// mechanism reaches below `host_sp`.
+///
+/// 97th pass: for `cfg(debug_assertions)` builds ONLY, widened 8x (matching the paired 8x
+/// widening of [`EXCEPTION_RECORD_RESERVE`] for the same build config, same pass -- see that
+/// constant's own doc comment for the live crash this pairing fixes). This DOES increase how far
+/// the mechanism reaches below `host_sp` for a debug build specifically, unlike every prior change
+/// to this constant -- safe here only because `EXCEPTION_RECORD_RESERVE` was widened in the same
+/// change to comfortably exceed the new `(VEH_DEPTH_CAP + 1) * VEH_FRAME_STRIDE` (enforced by the
+/// existing `const _: () = assert!(...)` at `exception_record_ptr`'s definition, which would fail
+/// to compile if the two ever drifted out of the required relationship again) and because
+/// `init_handler`'s own explicit pre-commit loop walks pages up to `EXCEPTION_RECORD_RESERVE`
+/// below `host_sp` unconditionally, so the deeper reach stays inside real, already-committed
+/// memory rather than relying on guard-page growth. The release build's value, proven correct
+/// over dozens of live boots, is untouched.
+#[cfg(debug_assertions)]
+const VEH_FRAME_STRIDE: u32 = 16384 * 8;
+#[cfg(not(debug_assertions))]
 const VEH_FRAME_STRIDE: u32 = 16384;
 
 /// Maximum nesting depth `vectored_exception_handler_entry`'s per-depth frame (see

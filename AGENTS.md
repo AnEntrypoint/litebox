@@ -1,4 +1,4 @@
-# litebox — current state (2026-09-23)
+# litebox — current state (2026-09-24)
 
 The authoritative CURRENT-STATE picture of what works, what is broken, and what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -17,12 +17,18 @@ actively-being-extended entry would be disturbed (the 96th pass's own item-1 ent
 surfaced vfork+`/bin/sh` `STATUS_ACCESS_VIOLATION`, is exactly such an entry — do not drain it
 until it is resolved).
 
-**96th pass, the headline result: the `GS_BASE`/`NtContinue` lead the 95th pass left open is
-RESOLVED — the exact hypothesis it proposed (missing `CONTEXT_SEGMENTS`) is REFUTED by hard fact,
-but the same reasoning led to a real fix, live-verified 3/3, that ends the silent-whole-host-death
-class of this bug.** See the 96th pass-history entry below for full evidence; `DE_UP` still not
-reached — a real but now-CONTAINED `xfce4-session`-vfork-child crash is the new, precisely
-characterized item 1.
+**97th pass, the headline result: the 91st-96th passes' "`xfce4-session`'s vfork'd `/bin/sh` child
+crashes" framing was WRONG.** That chain completes cleanly on every boot (live-verified via targeted
+`exception()` logging, not `cdb`). The real, now precisely root-caused fault is a plain `gdbus`
+pthread (GLib's internal D-Bus worker thread) hit by `lazy_fork_commit.rs`'s already-documented,
+still-open Bug 4 TOCTOU race — confirmed via a clean live A/B test (flags on: crash every time;
+flags off: zero crashes, `xfwm4` finally launches and survives). `DE_UP` still not reached: turning
+those flags off to dodge Bug 4 reintroduces the RAM crater instead — a genuine, doubly-confirmed
+trade-off between two already-scoped issues, not a new bug. Also fixed this pass, real and safe: a
+debug-build-only stack-budget bug (`VEH_FRAME_STRIDE`/`EXCEPTION_RECORD_RESERVE`) that made every
+debug binary crash within 3 seconds of any real multi-fork boot, blocking all `cdb` work until now.
+See the 97th pass-history entry below and item 1 for full evidence and the precise next pickup
+(Bug 4's own real fix, already scoped in the 86th pass as "Candidate 3", a multi-pass undertaking).
 
 ## The cheap repro — start here
 
@@ -466,6 +472,95 @@ map" below). Condensed current-state trail:
     confirmed post-fix before every boot. No concurrent boots; RAM watched every 2s with a 1.3GB-
     free kill switch (never triggered); all 3 runs cleanly terminated via WMI `Terminate` at
     loop-end. Logs: `.wfgy/pass96_boot{1,2,3}.{out,err}.log`.
+- **97th pass — the 91st-96th passes' "`xfce4-session`'s vfork'd `/bin/sh` child crashes" framing is
+  WRONG; the real crash is a plain pthread (`comm=gdbus`, GLib's internal D-Bus worker thread) hit by
+  the ALREADY-DOCUMENTED `lazy_fork_commit.rs` Bug 4 TOCTOU race — root-caused and confirmed via a
+  clean live A/B test, not cdb.** Two independent, verified results:
+  - **Fixed (real, safe, debug-build-only): `VEH_FRAME_STRIDE`/`EXCEPTION_RECORD_RESERVE` were too
+    small for DEBUG-BUILD codegen.** This pass is the FIRST time any pass ever attempted a full
+    multi-fork desktop boot under a debug binary (every prior debug-build session ran only small,
+    targeted repros) — it crashed in under 3 seconds, on the very first cross-process-forked child's
+    first guest instruction, via the project's own `[diag-veh-frame-stride-overflow]` canary guard
+    correctly detecting that `fork_verify`'s single-step-healing call chain, compiled unoptimized,
+    genuinely overflows the RELEASE-tuned 16 KiB-per-nesting-level budget (`VEH_FRAME_STRIDE=16384`,
+    `EXCEPTION_RECORD_RESERVE=65536`, `litebox_platform_windows_userland/src/lib.rs`) — the exact same
+    "debug-build frame is larger than release" class this file's own history already names (the prior
+    4096→65536 `EXCEPTION_RECORD_RESERVE` widening), just never previously hit for `VEH_FRAME_STRIDE`'s
+    own separate budget because no debug boot had gone this deep before. Fixed by widening BOTH
+    constants 8x, gated behind `#[cfg(debug_assertions)]` only — the release path (proven over dozens
+    of live boots) is byte-for-byte unchanged; the existing `const _: () = assert!(...)` at
+    `exception_record_ptr`'s definition (enforcing the two regions never overlap) still passes,
+    verified by a clean `cargo build` (debug) and `cargo build --release`. This unblocks every future
+    debug-build full-boot/`cdb`-attach session — previously impossible past the first fork.
+  - **Root-caused (not yet fixed — genuinely out of scope for one pass, see below): the "silent"/
+    "contained" crash the 91st-96th passes chased is `lazy_fork_commit.rs`'s own already-documented,
+    still-open Bug 4 (85th/86th pass), not the vfork'd `/bin/sh` chain.** Method: rebuilt the debug
+    binary with the fix above, then re-ran `de_only_xcensus_seed3.tar` with a NARROWLY targeted
+    `LITEBOX_LOG` (`litebox_shim_linux=debug,litebox_shim_linux::syscalls=warn`, isolating the
+    crate-root `exception()` function's own existing `diag-guest-exception` diagnostics — added in an
+    earlier pass, never before enabled this specifically — from the ~70-site-per-module noise every
+    prior pass's blanket-module attempts warned against) instead of `cdb` (see methodology note
+    below for why). Findings, live-verified: (1) `xfce4-session`'s vfork of `/bin/sh` running
+    `iceauth` — the exact chain the 91st-96th passes blamed — completes with clean `exit_group`
+    `status=0` on EVERY boot; it was never the crash. (2) The real fault is a `SIGSEGV` in a
+    DIFFERENT, plain `CLONE_THREAD` pthread inside the SAME process, `comm=gdbus` (glib's own
+    internal GDBus worker thread name, present in every process that uses `GDBusConnection` — not an
+    external `gdbus` CLI invocation), doing `lock cmpxchg [rdi], edx` (an atomic refcount/lock op) on
+    an address (`cr2`) that is IDENTICAL to `rdi`, `error_code=0x7` (present+write+user — a real
+    Windows-level PROTECTION fault, not a not-present one) against a range litebox's OWN VMA tracking
+    reports as ordinary committed `VM_READ|VM_WRITE` memory. This is neither a fork nor a vfork
+    address-relocation bug (`ADVISORY-001` §3N requires a relocation delta that neither the cross-
+    process fork that created `xfce4-session` itself, D==0 by design, nor its own `vforked=true`
+    shared-pm `/bin/sh` clone, which duplicates nothing, ever has — the `else=eager-duplicate/
+    ADVISORY-001-exposed` half of that WARN log's own message is a red herring for THIS crash
+    specifically, since every clone observed here took the `vforked=shared-pm` branch instead).
+    (3) **Live A/B, decisive**: `pass96_boot1.ps1`'s own launch command (inherited unchanged into
+    this pass's own harness) explicitly sets `LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1`
+    — exactly the configuration the 85th/86th pass's own Bug 4 writeup concludes "is still not safe to
+    enable for a real boot" and "`DE_UP` not attempted... the flag remains unsafe" — yet every boot
+    script from the 88th pass onward (including 96th's) carries it anyway, apparently drifted from
+    that caution during the GS_BASE-chase passes. Removing BOTH env vars (nothing else changed): 0/1
+    `gdbus` crashes across a full clean boot (vs. 2/2 debug-build crashes WITH them, byte-identical
+    signature both times), AND — for the first time this pass has directly observed —
+    `xfce4-session` survives long enough to actually `execve` `/usr/bin/xfwm4` (PATH-searched through
+    `/lsiopy/bin`→`/usr/local/sbin`→`/usr/local/bin`→`/usr/sbin`→`/usr/bin`), which then ran and made
+    real X11/D-Bus calls for 9+ seconds with no crash before the run ended (RAM, see below). This
+    single flag removal is almost certainly what the 91st-96th passes' whole `GS_BASE` fix was
+    prerequisite FOR, not a fix in itself — `GS_BASE` being wrong made this SAME Bug-4 SIGSEGV kill
+    the whole host process silently (96th pass's own fix); with `GS_BASE` correct, it became a clean
+    per-thread `SIGSEGV` (91st-96th's "contained crash"); with the unsafe lazy-fork flags OFF, it
+    stops happening at all.
+  - **Genuine, still-open tension found (not resolved this pass): on this host's RAM budget, neither
+    lazy-fork-commit setting reaches `DE_UP`.** With the flags OFF, a RELEASE-build boot (otherwise
+    identical harness) hit the RAM crater HARD — free RAM fell from ~3GB to 0.67GB in the same ~55s
+    window pass 96's OWN boot (flags ON) held a stable ~3.2-4GB-free plateau for 190+ seconds — and
+    was killed by the monitoring script's kill switch shortly after `xfwm4` launched, before the
+    `_NET_SUPPORTING_WM_CHECK` atom could be confirmed either way. This is not a new bug: it is the
+    SAME RAM crater Track B item 1 has chased since the 76th pass, and `LITEBOX_LAZY_FORK_COMMIT`'s
+    whole point (83rd pass) is the measured RAM win that makes it survivable — turning it off to dodge
+    Bug 4 trades a correctness bug for a resource-exhaustion one. Bug 4's own real fix (a per-page,
+    generation-tracked software-COW scheme, "Candidate 3" in the 86th pass's own writeup) is
+    explicitly scoped there as its own multi-pass undertaking (the simpler single-generation version
+    alone took three full passes, 83rd-85th, of live `cdb` iteration) — not attempted this pass,
+    consistent with that pass's own conclusion and the standing "don't patch over deeper bugs"
+    instruction: a rushed, unverified generational-COW change risks silently-wrong guest memory,
+    strictly worse than today's honest, deterministic crash.
+  - **Methodology finding for future passes: invasive `cdb -p` attachment, even with `sxd av` set to
+    skip `fork_verify`'s own benign healing access violations, measurably INDUCES a severe,
+    unbounded exception-dispatch livelock** — a single thread produced 250,000+ repeated first-chance
+    AVs within ~20 seconds under `cdb`, a signature never observed in any undebugged run of the same
+    binary/harness. The debugger's own per-exception IPC round trip (even for an exception configured
+    NOT to stop) appears to slow `fork_verify`'s single-step healing enough to prevent it from ever
+    converging, on top of this file's already-documented perturbation risks. Two smaller, real `cdb`
+    mistakes also made and fixed live: `$$>a<file` is not reliable for a multi-command script (use a
+    single semicolon-joined `-c` string instead); ending a `-c` string without an explicit `qd`
+    lets the session hit `stdin` EOF and silently take the DEFAULT (kill-the-target) quit action —
+    always end with `qd`, never rely on EOF. Given these costs, this pass pivoted to (and the real
+    fault evidence above came entirely from) the project's own existing `exception()` diagnostic
+    `debug!` logging, enabled via a precisely-scoped `LITEBOX_LOG` filter — cheaper and, this time,
+    sufficient, matching the 84th pass's own "existing logging beats a live attach" precedent.
+  - Logs: `.wfgy/pass97_debugboot1.err.log` (flags-on and flags-off runs, overwritten between each —
+    re-run to reproduce, not preserved as separate files this pass), `.wfgy/pass97_releaseboot1.*`.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
@@ -477,30 +572,37 @@ both Xvfb SIGSEGVs.
 
 **Open, in rough priority order:**
 
-1. **`xfwm4` now launches (75th pass), the RAM crater is closed (76th-88th), and the silent-whole-
-   host-death bug class is FIXED and live-verified 3/3 (96th pass, `switch_to_guest`'s missing
-   `GS_BASE` repair — see pass-history entry above for full evidence).** Full 75th-95th narrative
-   (RAM crater fix, `cdb`-captured faulting RIP `0x00007fefe92bc7cb`, the `GS_BASE`/`FS_BASE` repair
-   chase across 5 passes): `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "Item-1 tracker full narrative"
-   section — do not re-read this as a starting point, it is superseded by the pass-history entries
-   above. **Current state (96th pass)**: the `CONTEXT_SEGMENTS` hypothesis the 95th pass left open
-   is REFUTED (AMD64 `CONTEXT` has no `FS_BASE`/`GS_BASE` field at all — see 96th pass-history entry
-   for the exact struct evidence); the real gap was `switch_to_guest` never repairing `GS_BASE`
-   immediately before resume the way it already did for `FS_BASE` — FIXED, one line, live-verified
-   3/3 clean (no more `[diag-unrecov-av-terminate]`/host death). `DE_UP` still not reached: a real,
-   now-CONTAINED `STATUS_ACCESS_VIOLATION` in `xfce4-session`'s own `vfork()`ed `/bin/sh` child
-   (same ~17-18.7s timing band as the old "silent crash", `clone: ... eager-duplicate/ADVISORY-001-
-   exposed` at the vfork site) is the new, precisely characterized blocker — very plausibly the step
-   that would otherwise launch `xfwm4` (no `xfwm4` window/process ever appears in any `XCENSUS`
-   snapshot; `de_only.sh`'s own `DE_FAILED` gate is specifically the missing `_NET_SUPPORTING_WM_
-   CHECK` atom that only `xfwm4` sets). **Next pickup, precise**: because `GS_BASE` is now valid at
-   the fault instant, this crash is for the first time actually `cdb`-observable (the 91st-95th
-   passes' whole obstacle — zero VEH invocation — is gone) — attach `cdb -p` (debug build,
-   `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1 LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`) to the `/bin/sh`
-   child thread around `t=12.6-18.5s`, or add argv/script-content logging for this specific
-   `execve`, to find out what it actually runs and why it crashes; check whether it is a new
-   ADVISORY-001 §3N shape the existing `GLIBC_TUNABLES` workaround doesn't cover for a vfork'd
-   `/bin/sh` specifically.
+1. **`xfwm4` now launches AND SURVIVES (75th, then genuinely confirmed 97th), the RAM crater is
+   closed only when lazy-fork-commit is ON (76th-88th), and the silent-whole-host-death bug class is
+   FIXED (96th, `switch_to_guest`'s missing `GS_BASE` repair). The 91st-96th passes' own "vfork'd
+   `/bin/sh` crashes" framing was WRONG — 97th pass root-caused the real fault to a plain `gdbus`
+   pthread hitting `lazy_fork_commit.rs`'s already-documented Bug 4 TOCTOU race, confirmed via a
+   clean live A/B (see 97th pass-history entry above for full evidence).** `DE_UP` still not
+   reached — not because of one remaining bug, but a genuine, now doubly-confirmed TRADE-OFF between
+   two already-scoped, still-open issues: `LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW` ON avoids the RAM
+   crater but hits Bug 4 (a real `SIGSEGV` in any long-lived forked-without-`execve` child whose
+   parent keeps mutating its own heap concurrently — `xfce4-session`'s internal `gdbus` worker thread
+   is a newly-confirmed instance, on top of the 85th pass's own synthetic subshell repro); OFF avoids
+   Bug 4 but the RAM crater returns (a 97th-pass release-build A/B run collapsed from ~3GB to 0.67GB
+   free in ~55s and was killed before `xfwm4`'s own `_NET_SUPPORTING_WM_CHECK` could be confirmed
+   either way). **Next pickup, precise**: Bug 4's real fix is `lazy_fork_commit.rs`'s own "Candidate
+   3" (86th pass) — a per-page, fork-generation-tracked software-COW scheme (parent-side guard pages
+   snapshotted on first post-fork write, composed across up to `live_cross_process_fork_children`'s
+   cap of 6 concurrent live children) — explicitly scoped there as its own multi-pass undertaking
+   (the simpler single-generation lazy-commit mechanism alone took three full passes, 83rd-85th, of
+   live `cdb`/diagnostic iteration to get right); that pass's own "narrower first cut" (fall back to
+   eager `copy_one_group` the moment a SECOND concurrent live fork child would otherwise need to
+   share one guard-paged group, keeping the lazy path only for the common single-active-fork-child
+   moment) is the most tractable starting point. Do not re-attempt a quick/partial version blind — a
+   silently-wrong-memory outcome is strictly worse than today's honest, deterministic crash. Once
+   fixed, re-verify `DE_UP` with lazy-fork-commit safely ON. **Do not re-open the "vfork'd `/bin/sh`"
+   theory** — 97th pass live-verified (debug build, targeted `exception()` logging, not `cdb`) that
+   chain completes with a clean `exit_group status=0` on every boot; it was never the crash. Also
+   noted: `cdb -p` invasive attach with `sxd av` measurably induces its own severe exception-dispatch
+   livelock on this exact codebase (250,000+ repeated AVs in ~20s, absent undebugged) — prefer the
+   existing `exception()` `debug!` diagnostics (scoped `LITEBOX_LOG=litebox_shim_linux=debug,
+   litebox_shim_linux::syscalls=warn`) over a live attach for this bug class, per the 84th pass's own
+   precedent.
 2. `SharedUnixConnectQueue`'s cancel-on-claim-race slot leak — FIXED 62nd (`unix.rs`); didn't
    resolve item 1's symptom. Other AF_UNIX exhaustion paths still silent (38th, `unix.rs`):
    `SharedUnixAddrPresenceTable` capacity-256 overflow; a key >108 bytes; backlog ignored on
