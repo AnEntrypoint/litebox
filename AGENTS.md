@@ -486,50 +486,83 @@ opening paragraph warns about).
     different exception code and a different observed timing shape, found by a genuinely different
     repro, and conflating them without evidence would repeat the 91st-96th passes' own
     misattribution mistake.
-  - **A real, plausible, NOT-yet-implemented-or-tested candidate mechanism found by reading
-    `guard_one_page`/`try_guard_region_batched` (`lazy_fork_commit.rs`) in full, prompted directly
-    by designing the pre-fork-writer-threads repro above**: guard-page installation for a fork is
-    done PER PAGE (or per-uniform-sub-region since the 101st pass's batching, but still NOT as one
-    atomic operation across the WHOLE lazy-eligible set) -- each `VirtualProtect` call is a real
-    syscall, and nothing SUSPENDS the parent's OTHER already-running threads for the duration of
-    this loop. On real Linux, `fork()`'s own `copy_page_range` walk has the SAME per-PTE structure,
-    but is in-kernel and cache-resident, so the equivalent window is minute; litebox's
-    multi-syscall version is measured (89th/101st passes) as "a known, explicit, un-optimized cost"
-    precisely because it is orders of magnitude slower. During that window, ANY other parent
-    thread's write to a page NOT YET reached by the loop lands with NO fault at all (the page is
-    still fully writable) -- so the "fork-time" content this mechanism eventually captures for that
-    page is not truly fork-time, but whatever it happened to be whenever the loop's OWN
-    `VirtualProtect` finally reached it. This is not a NEW hazard class in the abstract (multi-
-    threaded `fork()` gives no cross-thread ordering guarantee on real POSIX systems either -- this
-    is exactly why it's discouraged there too), but litebox's implementation turns an inherently
-    microsecond-scale, almost-never-hit race into a much wider, practically-reachable one -- a
-    strong candidate explanation for why a real multi-threaded target (`xfce4-session`'s own
-    glib-main-loop-plus-worker-threads shape, or the 97th pass's `CLONE_THREAD` `gdbus` finding)
-    hits this on litebox when it essentially never would on real Linux. **A real fix exists and
-    uses infrastructure this codebase already has**: `ThreadHandle::interrupt`
-    (`litebox_platform_windows_userland/src/lib.rs`) already does `SuspendThread`/
-    `SetThreadContext`/`ResumeThread` on an arbitrary OTHER thread of the SAME process for signal
-    delivery, with its own doc comments already reasoning carefully about `SuspendThread`'s real
-    hazard (`lib.rs:5789-5797`, `:5964-5976`: "gives no atomicity guarantee... unrecoverable inside
-    the suspend window... a suspending thread that then blocks on one can never reach its own
-    ResumeThread") -- suspending every OTHER guest thread of the forking process for the (already
-    batching-shortened) guard-installation window, then resuming them once installation completes,
-    would close this race for good rather than merely narrowing it further. **NOT implemented this
-    pass** -- this is exactly the kind of invasive, deadlock-risking change (a suspended thread
-    could be holding a lock, e.g. the global allocator's own, that the suspending thread's own
-    guard-installation code needs indirectly, mirroring `interrupt`'s own documented hazard) that
-    must not be shipped without live testing, and no host RAM was available this pass to test it
-    (see the RAM-crater note two paragraphs up). **Next pickup, precise**: once RAM allows, (a)
-    first confirm this theory predicts something testable -- e.g., a version of the
-    `pass114_torn_read_probe.sh` repro with the pre-fork writer threads AND a LONGER, ARTIFICIALLY
-    SLOWED guard-installation loop (a temporary `std::thread::sleep` inserted per page, env-var
-    gated) should make torn/stale reads trivially reproducible if this theory is right, which
-    would be strong confirmation before touching the real fix; (b) if confirmed, implement the
-    suspend-other-threads bracket around `reserve_group_lazy_guarded`'s whole per-fork guard-install
-    loop, reusing `ThreadHandle::interrupt`'s existing suspend/resume pattern and its own
-    already-documented deadlock precautions, and re-run both this pass's torn-read probe and the
-    103rd-pass-style `Xvfb`+`xset` cheap repro to confirm no regression before ever trying a real
-    boot with it.
+  - **CONFIRMED, BISECTED, real bug (RAM recovered mid-pass; live-tested, not just theorized) --
+    guard-cow has its OWN, DIFFERENT, HOST-LEVEL memory-safety bug under a genuinely multi-threaded
+    parent, distinct from (and not a fix for, in this exact shape) the pre-existing Bug 4 TOCTOU it
+    was built to close.** Full bisection matrix, same `pass114_torn_read_probe.sh` (pre-fork
+    writer-threads) repro, three configs:
+    - `LITEBOX_PROCESS_FORK=1` alone (eager copy, no lazy anything) --
+      `.wfgy/pass114_bisect_nolazy_run.err.log`: **clean**. `CHILD_DONE scans=25408 torn=0`,
+      `PARENT_DONE child_exit=0 total_writes=101233536`, all four forks (bash's own for `which`/
+      `cat`/`python3`, plus the nested `os.fork()` python3 itself issues) exit with litebox's clean
+      `0xc0de0000` encoding.
+    - `LITEBOX_LAZY_FORK_COMMIT=1` alone, guard-cow UNSET --
+      `.wfgy/pass114_bisect_lazyonly_run.err.log`: crashes, but with a **GUEST-level `SIGSEGV`**
+      (`exit_code=0xc0de800b`, decodes to litebox's signal-exit encoding for signal 11; shell-visible
+      as `RC=139`) -- this is the ALREADY-DOCUMENTED Bug 4 TOCTOU (a lazily-serviced fault reading
+      the parent's CURRENT, not fork-time, memory), expected and unsurprising for a fork-without-
+      `execve` child under heavy concurrent parent writes with no snapshot protection at all.
+    - `LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1` (the combination meant to CLOSE Bug
+      4) -- `.wfgy/pass114_delay_confirm_run.err.log`/`run2.err.log`: crashes with a **HOST-level
+      `STATUS_ACCESS_VIOLATION`** (`exit_code=3221225477`=`0xC0000005`) instead -- three independent
+      occurrences across this pass, elapsed_ms_since_thread_start clustering at 1732/1766/1834ms.
+      **This is a real memory-safety bug in guard-cow's OWN implementation** (a genuine Windows
+      exception in litebox's own host-side Rust/Windows-API code, not a guest-level signal at all),
+      triggered specifically when the forking parent has OTHER real, concurrently-running guest
+      threads at fork time -- guard-cow does not just fail to close Bug 4 for this shape, it
+      introduces a WORSE, host-level crash of its own.
+    - **What immediately precedes the crash** (`.wfgy/pass114_delay_confirm_run2.err.log`, with
+      `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` for full visibility): the crashing process is python3's OWN
+      NESTED `os.fork()` (the SECOND cross-process fork in this one script -- bash's own fork-to-
+      exec-`python3` is the first, already running before this) guarding roughly two dozen distinct
+      batched regions covering the WHOLE address space, including one spanning **44310 pages
+      (~173MB)** -- confirms real installation work, not a trivial single-page operation, and
+      confirms the earlier per-page-`guard_one_page` delay theory (below) does not even apply to
+      MOST of this: `try_guard_region_batched`'s single-`VirtualProtect`-per-region fast path
+      handled every region shown, `guard_one_page` was never reached for any of them. The crash
+      report follows immediately after the LAST region's batched install line, while this
+      process's other real threads (this pass's own pre-fork writer threads, still alive and
+      running in the PARENT of this nested fork -- remember, only the calling thread survives INTO
+      the child, but the PARENT's other threads keep running throughout) are actively writing.
+    - **The original per-page-installation-window theory (this entry's earlier draft, kept below
+      for the record) is NOT confirmed as the actual mechanism** -- the crash timing did not shift
+      meaningfully when an artificial per-page delay (`LITEBOX_DIAG_GUARD_INSTALL_DELAY_US=2000`)
+      was added, exactly because the batched fast path bypasses the per-page code entirely for a
+      contention-free region (the common case, confirmed live here). The REAL mechanism is still
+      unknown -- candidates not yet checked: a bug in `try_guard_region_batched`'s OWN batched
+      bookkeeping specifically when it runs MANY times in one fork (each of ~20+ regions getting
+      its own `HashMap` entry and `Box::leak`'d snapshot table) while OTHER guest threads are
+      concurrently executing arbitrary host-side code (their own `ctypes.memmove` calls, which are
+      themselves going through litebox's OWN syscall/memory-access shimming) that could contend
+      for the SAME global state (`GUARD_PAGE_REGISTRY`'s mutex, the global allocator, or the
+      per-thread scheduling/GIL-equivalent mechanism litebox uses to let multiple guest OS threads
+      run real concurrent host code); or a bug specific to the 44310-page region's sheer size
+      (an overflow, an allocation failure treated as success, or similar) that the earlier
+      `allocate_pages`-focused 106th/107th passes' own investigation never considered because it
+      predates guard-cow's batched path (101st pass) entirely.
+    - **Next pickup, precise**: (a) get a real Windows crash dump/stack walk for this exact crash --
+      none appeared in any of this pass's logs despite "Host-side crash machinery"'s claim that a
+      fatal host fault always dumps one ungated; find out why (wrong output stream? outside VEH's
+      registered scope? crashing in a thread the recovery machinery doesn't cover?) as step one,
+      since a real stack trace would very likely settle this outright. (b) If no dump is available,
+      a live `cdb -p` attach on THIS exact repro (now proven cheap, reliable, and NOT needing a full
+      DE boot -- `.wfgy/pass114_torn_read_probe.sh` + `.wfgy/pass114_delay_confirm_run.ps1`) is a
+      much better target than the original `xfce4-session` SIGABRT ever was, since it reproduces in
+      under 2 seconds with `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG`/`_NO_FAULT_WATCHDOG` already
+      set. (c) Once root-caused, re-run the ORIGINAL `xfce4-session` SIGABRT repro (comm-based
+      tracing now works, see above) to check whether the SAME fix closes it too -- plausible given
+      both involve a genuinely multi-threaded parent forking under guard-cow, but NOT yet confirmed,
+      and must not be assumed.
+  - **Superseded draft (kept for the record, not re-derive)**: the ORIGINAL theory here proposed
+    that `guard_one_page`'s per-page `VirtualProtect` loop (no thread-suspension during it) was the
+    mechanism, and designed `LITEBOX_DIAG_GUARD_INSTALL_DELAY_US` (`lazy_fork_commit.rs`, committed
+    `401c6c6`) to confirm it by artificially widening that specific window. The bisection above shows
+    the crash recurs with statistically the same timing regardless of that delay, and the crashing
+    region went through the BATCHED path (`try_guard_region_batched`) which never calls
+    `guard_one_page` at all when contention-free -- so this specific mechanism is not what's
+    happening here, though the diagnostic itself (still default-off, zero-effect-when-unset) remains
+    in the tree and could matter for a genuinely CONTENDED join (two live generations on the same
+    page), which is a real but much narrower case than what this pass's repro exercises.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
