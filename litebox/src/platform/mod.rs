@@ -1216,6 +1216,7 @@ pub trait ForkChildVerificationProvider {
         inherited_files: alloc::vec::Vec<ForkInheritedFile>,
         inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
         sigreturn_trampoline: usize,
+        identity: ForkChildIdentity,
     ) -> Option<CrossProcessChildHandle> {
         let _ = relocations;
         let _ = full_gprs;
@@ -1223,7 +1224,47 @@ pub trait ForkChildVerificationProvider {
         let _ = inherited_files;
         let _ = inherited_eventfds;
         let _ = sigreturn_trampoline;
+        let _ = identity;
         None
+    }
+
+    /// The host OS's id for the process this code runs in, or `0` when the platform has no
+    /// cross-process signal delivery. `0` disables `litebox_shim_linux`'s cross-process process
+    /// registry (`syscalls::signal::xproc`) entirely, leaving signal delivery in-process only.
+    fn current_host_pid(&self) -> u32 {
+        0
+    }
+
+    /// The host process id of the cross-process fork child behind `handle`, if recoverable.
+    fn cross_process_child_host_pid(&self, handle: CrossProcessChildHandle) -> Option<u32> {
+        let _ = handle;
+        None
+    }
+
+    /// Starts this host process's cross-process signal wake listener: a platform thread that
+    /// runs `on_wake` once right away and then every time another host process calls
+    /// [`Self::wake_signal_listener`] with this process's host pid. Idempotent per host process;
+    /// returns whether a listener is running.
+    fn start_signal_wake_listener(
+        &'static self,
+        on_wake: alloc::boxed::Box<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        drop(on_wake);
+        false
+    }
+
+    /// Wakes the signal listener of host process `host_pid`. `false` when it has none (not yet
+    /// started, or already exited).
+    fn wake_signal_listener(&self, host_pid: u32) -> bool {
+        let _ = host_pid;
+        false
+    }
+
+    /// Terminates host process `host_pid` with `exit_code` (guest `SIGKILL` to a process that
+    /// owns its own host process). `false` if it could not be terminated.
+    fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {
+        let _ = (host_pid, exit_code);
+        false
     }
 
     /// Whether this platform has a REAL `fork()` -- a single syscall that gives a cross-process
@@ -1515,6 +1556,16 @@ impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>
 /// outlives the specific task a parent's `wait4()` actually asked about).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossProcessChildHandle(pub usize);
+
+/// The guest identity a cross-process fork child must come up with: the pid the parent's
+/// `fork()` returned (so `getpid()` in the child equals `$!` in the parent), its parent's pid,
+/// and the process group it inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkChildIdentity {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+}
 
 /// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process
 /// register-injection probe (pass 118) needs: where the child's translated instruction pointer,

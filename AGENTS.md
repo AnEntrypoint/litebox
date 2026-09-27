@@ -107,9 +107,12 @@ flooded across every concurrently-forked process during a boot's fork storm).
   only genuinely unrecoverable kinds (unix-socket) refuse. Check `try_cross_process_fork`'s match
   arms (`litebox_shim_linux/src/syscalls/process.rs`) before assuming a new kind needs old
   treatment. Run dbus-daemon non-forking; for XFCE use `xfce4-session`, never `startxfce4`.
-- **`wait4()`/`kill()` to a cross-process fork child are asymmetric** — `kill()` to a
-  `cross_process_children`-tracked pid returns `ESRCH` unconditionally (documented gap: reachable
-  via `wait4`, just not signalable yet).
+- **Cross-process `kill()` goes through `GlobalState::process_table`** (`syscalls/signal/xproc.rs`,
+  110th) — every guest process is registered by guest pid -> host pid/pgid/pending-bitmask; a
+  remote target gets its bit set + its host's named event (`Local\litebox-sigwake-<hostpid>`) set,
+  and that host's listener thread drains into `shared_pending` + `interrupt_all_threads()`.
+  `SIGKILL` to a process that owns its host process = `TerminateProcess` with the encoded
+  `WIFSIGNALED(9)` exit code. Stop/continue get no special cross-process semantics.
 - **A `socketpair(2)`-originated fd (both ends `Unnamed`) is NOT safe to drop as CLOEXEC across a
   cross-process fork** — real processes (`dbus-daemon`'s babysitter) use it for pre-`exec()`
   bookkeeping; `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) refuses it (falls back to
@@ -165,8 +168,10 @@ flooded across every concurrently-forked process during a boot's fork storm).
 - **All five `DIAG_TIMELINE` sites log at `debug!` on their own `litebox_diag::process_timeline`
   target**, not nested under `syscalls::process`/`syscalls::signal` (~70 unrelated sites each; 74th)
   — use `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=error,litebox_diag::
-  process_timeline=debug` for cheap whole-boot coverage. A cross-process fork child's guest pid IS
-  its real Windows PID (`runner…/lib.rs:1673`), so `DIAG_TIMELINE execve`'s `pid=` is `cdb -pv -p`-able.
+  process_timeline=debug` for cheap whole-boot coverage. A cross-process fork child's guest pid is
+  the parent-allocated `child_tid` (== the parent's `fork()` return/`$!`, 110th; it used to be the
+  child's Windows PID, disagreeing with the parent) — the Windows PID is `winpid=` on the child's
+  `[process_fork_diag] task-resume-probe` line, and `host_pid` in its `process_table` slot.
 - **On host-side crashes, use `advisor/probes/symbolize_litebox_crash.py`, snapshotting `.exe`+`.pdb`
   next to the log** — a ring dump's `rva=` is only meaningful against the exact emitting build.
 - **Isolate the harness before blaming litebox** — launch guest probes directly as the runner's
@@ -552,6 +557,50 @@ map" below). Condensed current-state trail:
     session" style before their respective fixes landed.
   - No new logs this pass (reused `.wfgy/pass106_rm_diag2.err.log` unmodified) -- no boot run, no
     build, no RAM used beyond static analysis.
+- **110th -- cross-process signal delivery (`LITEBOX_PROCESS_FORK=1`) implemented and verified;
+  pty `ISIG` (Ctrl-C/\/Z) and pty-slave carrying across a cross-process fork added.**
+  - **Guest pid bug found and fixed**: the parent's `fork()` returned `child_tid` (e.g. `2`) while
+    the child called itself by its Windows PID (`std::process::id()`, `ppid` = itself). The child
+    now gets `pid:ppid:pgid` via `LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY`
+    (`litebox::platform::ForkChildIdentity`, new `spawn_cross_process_fork_child` parameter), so
+    `$BASHPID` in the child == `$!` in the parent. Forked children (both paths) now inherit the
+    parent's pgid instead of leading their own group.
+  - **Registry**: `SharedProcessTable` (512 pointer-free slots in `GlobalState`) + per-host-process
+    `GlobalStateHandle::xproc_local` (pid -> `Weak<Process>`). Registered: bootstrap, every
+    thread-based fork child, every cross-process child (pre-registered by the parent before the
+    spawn with the parent's host pid, repointed to the child's host pid after it, re-found by the
+    child's own `adopt_forked_process`). Released at `wait4` reap; a slot whose own host process is
+    dead is released on the next send to it (orphans) or when the table is full. `getpgid`/
+    `setpgid`/`setsid` go through it, so `kill(-pgid)`/`kill(0)`/`kill(-1)` reach every host
+    process. New platform hooks (`litebox/src/platform/mod.rs`): `current_host_pid` (0 = registry
+    off, the default for non-Windows platforms), `cross_process_child_host_pid`,
+    `start_signal_wake_listener`, `wake_signal_listener`, `terminate_host_process`.
+  - **Verified** (`debian:stable-slim`, release, `LITEBOX_PROCESS_FORK=1`, logs `.wfgy/pass110_*.log`):
+    `sleep 30 & kill -0/-TERM; wait` → `kill0_rc=0 term_rc=0 wait_status=143` (was ESRCH + a full
+    30s wait with status 0); subshell `trap ... TERM` → `got_term`, status 3; `kill -9` → 137;
+    `set -m` group kill of a job and of a job whose own children inherited its pgid → all members
+    143, a job in another group untouched; a grandchild (not the caller's child) found via `$( )`
+    killed by pid, then `kill -0` → ESRCH; `for /bin/true` loop → `ok`. Thread path (flag unset):
+    identical to the pre-change binary (test 1 passes; subshell/`sleep` children still `Aborted`
+    134 with `A NULL argv[0] was passed through an exec system call` on BOTH binaries — the
+    thread-based fork's own pre-existing corruption, not this change).
+  - **pty**: `PtyEnd::write` on a master with `ISIG` consumes `VINTR`/`VQUIT`/`VSUSP` and signals
+    the pty's foreground group (`xproc_signal_group`); a fresh pty now reports Linux's default
+    `ISIG` + `c_cc`. `PtyStateRef::Local` getters now prefer the published shared slot (another
+    process's `TIOCSCTTY`/`TCSETS` was invisible to the allocating process). A pty SLAVE fd is now
+    carried across a cross-process fork by reopening `/dev/pts/<id>`
+    (`carriable_pty_slave_for_raw_fd`) instead of being dropped — the child of `forkpty()`/`script`
+    and every command a shell in a pty runs used to lose its stdio. Verified with a `perl` forkpty
+    harness: `^C` written to the master → child `bash` trap exits 5 / plain `sleep` dies
+    `WIFSIGNALED(2)`.
+  - **Open**: output a cross-process child writes to a carried slave never reaches a LOCAL master
+    in the allocating process (its reads use only the local channel, the shared ring is only
+    mirrored into) — `script` shows nothing and hangs; the pty data plane needs the shared rings to
+    be the one transport once published. No SIGSTOP/SIGCONT job-control semantics across hosts; no
+    `si_pid` in the cross-process `siginfo`; SIGKILL-by-`TerminateProcess` also kills any
+    thread-based descendants living in that host process; no input-queue flush/`^C` echo on
+    `ISIG`; tkill/tgkill to a thread in another host process still `ESRCH`.
+
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the

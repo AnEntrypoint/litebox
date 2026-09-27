@@ -2043,7 +2043,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.write(&self.wait_cx(), buf, &self.global.shared_pty))
+                    handle.with_entry(|end| {
+                        end.write(&self.wait_cx(), buf, &self.global.shared_pty, &|pgid, sig| {
+                            self.global.xproc_signal_group(pgid, sig)
+                        })
+                    })
                 },
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -6611,6 +6615,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .ok()
             .flatten()
+    }
+
+    /// The `/dev/pts/<id>` path and open flags of a pty SLAVE fd whose pty is published in
+    /// `SharedPtyTable`, or `None` for anything else (including a master, which has no path to
+    /// reopen that would not allocate a new pty).
+    ///
+    /// Lets a cross-process `fork()` child come up with the slave at the same fd -- the child of
+    /// `forkpty()`/`script`/a terminal emulator, and every command a shell inside a pty runs,
+    /// has its stdio on the slave. Reopening by path lands on `GlobalStateHandle::pts_open`'s
+    /// shared-slave fallback, which reaches the same byte rings and control state.
+    pub(crate) fn carriable_pty_slave_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, u32)> {
+        let files = self.files.borrow();
+        let id = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::pty::PtySubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    handle.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                        (!end.is_master()).then(|| end.pty_state(&self.global.shared_pty).id())
+                    })
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        self.global.shared_pty.exists(id).then(|| {
+            (
+                alloc::format!("/dev/pts/{id}"),
+                (OFlags::RDWR | OFlags::NOCTTY).bits(),
+            )
+        })
     }
 
     /// Recreate an eventfd at exactly `target_fd` with `count` and `flags`.

@@ -243,8 +243,9 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// falling back to `children`; `wait4(pid == -1)` ("any child") also consults this registry
     /// (pass 156) whenever `children` is empty, covering the shell `A && B`/pipeline wait pattern
     /// (busybox ash included) that calls `wait(-1)` rather than `waitpid(known_pid)` after a
-    /// cross-process `fork()`. `do_kill`'s remote-child signal-delivery path still does NOT check
-    /// this registry (a separate, still-open gap, out of scope for this pass).
+    /// cross-process `fork()`. Signal delivery (`do_kill`) does not use this list: it goes through
+    /// the cross-process process registry (`syscalls::signal::xproc`), which reaches every
+    /// registered process, child or not.
     cross_process_children:
         Mutex<Platform, alloc::vec::Vec<(i32, litebox::platform::CrossProcessChildHandle)>>,
     /// `1` from process creation until this (vforked) process's initial thread either calls
@@ -253,13 +254,14 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// anyone. `vfork()`'s POSIX contract requires the calling (parent) thread to be suspended
     /// for exactly this window -- see `do_clone`'s use of this field.
     vfork_done: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
-    /// This process's process group ID, as last set via `setpgid()`. Defaults to the process's
-    /// own pid at creation, matching real Linux's default (a freshly created process is the
-    /// leader of its own, freshly created group). We have no global pid registry (see
-    /// `do_kill`'s doc comment on remote pid/tid being unsupported), so `setpgid`/`getpgid` only
-    /// ever target the calling process itself -- there is nowhere to look up another process by
-    /// pid to move it into a different group.
-    pgid: core::sync::atomic::AtomicI32,
+    /// This process's process group ID, as last set via `setpgid()`. Starts as the process's own
+    /// pid; `do_clone` overwrites it with the parent's group, since a forked child inherits its
+    /// parent's process group. When the process is in the cross-process registry
+    /// (`syscalls::signal::xproc`), the registry slot is the authoritative copy (another host
+    /// process may `setpgid()` it) and this mirrors it.
+    pub(crate) pgid: core::sync::atomic::AtomicI32,
+    /// Index of this process's slot in `GlobalState::process_table`, or `xproc::NO_SLOT`.
+    pub(crate) xproc_slot: core::sync::atomic::AtomicU32,
     /// This process's process-directed pending-signal queue -- the exact same `Arc` as this
     /// process's own live `Task`'s `SignalState::shared_pending` (see that field's doc comment
     /// on why they must be identical). Reachable from a `Process` handle alone (e.g. via
@@ -353,20 +355,10 @@ const CROSS_PROCESS_EXIT_SIGNAL_FLAG: u32 = 0x0000_8000;
 /// from an arbitrary unrelated Windows exit code); bit 15 is set for `Signal`, clear for `Exit`;
 /// the low 8 bits hold the exit code (`Exit`) or signal number (`Signal`).
 ///
-/// Not yet called from production code: the actual encode-side call site is a cross-process
-/// child's own `sys_exit`/`sys_exit_group` path, which does not exist yet -- `do_clone` still
-/// only ever spawns a same-process, thread-based child (see PASS 141 of
-/// `scratchpad/jqrepro/FINDINGS.txt`: production wiring is blocked on a second, not-yet-built
-/// subsystem, a non-torn-down `CreateProcess` spawn+resume path). This function and
-/// [`decode_cross_process_wait_status`] are the proven, ready-to-call codec half of the bridge;
-/// `litebox_platform_windows_userland::process_fork::diagnostic_cross_process_wait4_probe`
-/// exercises the SAME encoding (duplicated there, not called directly, due to crate layering --
-/// `litebox_platform_windows_userland` sits below this crate) against a real child process,
-/// live-verified end to end.
-#[allow(
-    dead_code,
-    reason = "encode-side production call site (a real spawned child's own exit path) does not exist yet -- see doc comment"
-)]
+/// A child's own exit encodes through `LinuxShimProcess::wait_for_encoded_cross_process_exit_status`
+/// (same layout); this function is used when ANOTHER process terminates the child's host process
+/// for a guest `SIGKILL` (`syscalls::signal::xproc`), so the parent's `wait4()` still decodes
+/// `WIFSIGNALED(SIGKILL)`.
 pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
     match status {
         ExitStatus::Exit(code) => {
@@ -444,6 +436,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             cross_process_children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
+            xproc_slot: core::sync::atomic::AtomicU32::new(super::signal::xproc::NO_SLOT),
             shared_pending,
             exit_signal,
         }
@@ -464,12 +457,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// have been moved into the caller's process group (e.g. via `setpgid()`, the standard
     /// shell-job-control/process-supervisor pattern of putting a whole spawned pipeline into one
     /// group), not just the caller itself.
-    pub(crate) fn children_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
+    pub(crate) fn children_in_group(
+        &self,
+        group: i32,
+    ) -> alloc::vec::Vec<(i32, Arc<Process<Platform>>)> {
         self.children
             .lock()
             .iter()
             .filter(|(_, child)| child.pgid.load(Ordering::Relaxed) == group)
-            .map(|(_, child)| child.clone())
+            .map(|(pid, child)| (*pid, child.clone()))
             .collect()
     }
 
@@ -519,9 +515,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 
     /// Returns the live child `Process` with pid `pid`, if this process has one (see
-    /// `children`'s doc comment) -- used by `do_kill`'s remote-child case, the one form of
-    /// "signal some other, specific process" this shim can actually reach without a full
-    /// shim-wide pid registry.
+    /// `children`'s doc comment) -- `do_kill`'s fallback for a local child the cross-process
+    /// registry could not hold (registry disabled on this platform, or full).
     pub(crate) fn find_child(&self, pid: i32) -> Option<Arc<Process<Platform>>> {
         self.children
             .lock()
@@ -2241,6 +2236,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if !no_reap {
             process.children.lock().retain(|(p, _)| *p != child_pid);
+            self.xproc_unregister(child_pid);
         }
 
         // `siginfo_t` on x86-64: si_signo, si_errno, si_code are the first three 32-bit words,
@@ -2369,6 +2365,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             self.import_cross_process_writable_layer(handle);
             process.reap_cross_process_child(pid);
+            self.xproc_unregister(pid);
             self.release_cross_process_fork_slot();
             let encoded = decode_cross_process_wait_status(raw_exit);
             if let Some(wstatus) = wstatus {
@@ -2521,6 +2518,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
+                    self.xproc_unregister(cross_pid);
                     self.release_cross_process_fork_slot();
                     let encoded = decode_cross_process_wait_status(raw_exit);
                     if let Some(wstatus) = wstatus {
@@ -2596,6 +2594,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // remove it from our children list. Linux does not let you wait for the same child
         // twice, so this must happen exactly once, after confirming exit.
         process.children.lock().retain(|(p, _)| *p != child_pid);
+            self.xproc_unregister(child_pid);
 
         let encoded = match exit_status {
             // Linux wait status encoding: normal exit is (exit_code & 0xff) << 8.
@@ -3000,8 +2999,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             flags,
                         });
                     }
-                    // A pty fd (master OR slave) does not block the fork, and is not carried
-                    // directly -- there is no inheritable Windows HANDLE behind either end
+                    // A pty MASTER fd (a slave is carried by the arm above) does not block the
+                    // fork, and is not carried -- there is no inheritable Windows HANDLE behind it
                     // (`PtyHalf`'s `crate::channel::Channel`/`Arc<Pollee>` are private-heap
                     // `Arc`s, the same class of pointer `SharedPtyTable` exists to route around,
                     // see `syscalls::pty`'s own "Shared cross-process pty data plane" doc
@@ -3021,6 +3020,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // known tcache-corruption class) -- confirmed live: `pty_fork_probe.c`
                     // SIGSEGV'd under exactly this refusal-then-thread-fallback path before this
                     // fix, see `docs/AGENTS_ARCHIVE_2026-09-22.md`.
+                    // A pty SLAVE is carried by reopening `/dev/pts/<id>` in the child (see
+                    // `carriable_pty_slave_for_raw_fd`): it is the stdio of a `forkpty()` child
+                    // and of every command a shell inside a terminal runs.
+                    None if let Some(fd) = i32::try_from(*raw_fd).ok()
+                        && let Some((path, flags)) = self.carriable_pty_slave_for_raw_fd(*raw_fd) =>
+                    {
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = fd, path:% = path;
+                            "clone: carrying a pty slave into the cross-process child"
+                        );
+                        inherited_files.push(litebox::platform::ForkInheritedFile {
+                            fd,
+                            path,
+                            flags,
+                            offset: 0,
+                        });
+                    }
                     None if self.raw_fd_subsystem_name(*raw_fd) == "pty" => {
                         dropped_pty += 1;
                         litebox_util_log::debug!(
@@ -3445,6 +3461,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_files,
             inherited_eventfds,
             self.sigreturn_trampoline_addr(),
+            self.prepare_fork_child_identity(child_tid),
         );
         if handle.is_none() {
             // No child was actually created -- undo the optimistic reservation immediately
@@ -3688,6 +3705,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// full live-reproduced evidence. A no-op when `signal` is `None` (the raw `clone()`/`clone3`
     /// caller explicitly passed `exit_signal == 0`, real Linux's own "no signal on exit" encoding)
     /// -- nothing to deliver, so no notifier thread to spawn either.
+    /// The identity a cross-process fork child comes up with (see
+    /// [`litebox::platform::ForkChildIdentity`]), pre-registering the child in the cross-process
+    /// registry so signals sent before it is running wait in its slot.
+    fn prepare_fork_child_identity(&self, child_tid: i32) -> litebox::platform::ForkChildIdentity {
+        let pgid = self.sys_getpgid(0).unwrap_or(self.pid.get());
+        self.xproc_preregister_child(child_tid, pgid);
+        litebox::platform::ForkChildIdentity {
+            pid: child_tid,
+            ppid: self.pid.get(),
+            pgid,
+        }
+    }
+
     fn arm_cross_process_exit_notifier(
         &self,
         handle: litebox::platform::CrossProcessChildHandle,
@@ -4006,6 +4036,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Ok(0);
                 }
                 self.process().register_cross_process_child(child_tid, handle);
+                self.xproc_child_spawned(child_tid, handle);
                 self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
@@ -4218,6 +4249,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Real fork() inherits the parent's current rlimits rather than resetting to
             // program-start defaults (see `ResourceLimits::copy_from`'s doc comment).
             thread.process.limits.copy_from(&self.process().limits);
+            // A forked child starts in its parent's process group.
+            thread
+                .process
+                .pgid
+                .store(self.sys_getpgid(0).unwrap_or(self.pid.get()), Ordering::Relaxed);
 
             // The captured ctx's registers may hold addresses into the PARENT's address space --
             // the child's code, stack, and everything else generally live at a different host
@@ -4840,10 +4876,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         self.sigreturn_trampoline_addr(),
+                        self.prepare_fork_child_identity(child_tid),
                     )
             {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
+                self.xproc_child_spawned(child_tid, handle);
                 self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(),
@@ -4905,6 +4943,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .children
                 .lock()
                 .push((child_tid, thread.process.clone()));
+            if let Some(host) = core::num::NonZeroU32::new(self.global.platform.current_host_pid()) {
+                self.xproc_register_local(child_tid, &thread.process, host.get(), false);
+            }
 
             // `fs_base` was already computed above (before the cross-process branch), fixing up
             // the ABI self-pointer slot at the same time -- reused verbatim here for the
@@ -5719,21 +5760,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getpgid`.
     ///
-    /// We have no global pid registry (see `do_kill`'s doc comment), so `pid` may only name the
-    /// calling process itself (`0`, or the caller's own pid) or a live direct child (reachable
-    /// via `children`, the same reachability `do_kill`'s remote-child case relies on) --
-    /// matching real Linux's `ESRCH` for any other pid, since there is nowhere to look one up.
+    /// `pid` may name the caller, a direct local child, or any process in the cross-process
+    /// registry (`syscalls::signal::xproc`), which also covers `LITEBOX_PROCESS_FORK=1` children.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
-        if pid == 0 || pid == self.pid.get() {
-            Ok(self.process().pgid.load(Ordering::Relaxed))
-        } else if pid > 0 {
-            self.process()
-                .find_child(pid)
-                .map(|child| child.pgid.load(Ordering::Relaxed))
-                .ok_or(Errno::ESRCH)
-        } else {
-            Err(Errno::ESRCH)
+        let own = pid == 0 || pid == self.pid.get();
+        let pid = if own { self.pid.get() } else { pid };
+        if pid <= 0 {
+            return Err(Errno::ESRCH);
         }
+        if let Some(pgid) = self.xproc_pgid_of(pid) {
+            if own {
+                self.process().pgid.store(pgid, Ordering::Relaxed);
+            }
+            return Ok(pgid);
+        }
+        if own {
+            return Ok(self.process().pgid.load(Ordering::Relaxed));
+        }
+        self.process()
+            .find_child(pid)
+            .map(|child| child.pgid.load(Ordering::Relaxed))
+            .ok_or(Errno::ESRCH)
     }
 
     /// Handle syscall `setpgid`.
@@ -5741,39 +5788,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Real Linux additionally restricts `setpgid` to processes within the same session and
     /// forbids changing the pgid of a process that has already called `execve` (`EACCES`); we
     /// don't model sessions or "has this process execve'd yet" at all, so those checks are not
-    /// enforced -- only the pid-target restriction (see [`Self::sys_getpgid`]) and `EINVAL` for a
-    /// negative `pgid` are. `pid` may target a live direct child, not just self -- the standard
-    /// shell-job-control pattern of a parent shell moving a freshly forked-but-not-yet-exec'd
-    /// child into a (possibly brand new) pipeline process group before letting it run.
+    /// enforced. `pid` may be the caller or one of its children -- local or cross-process -- the
+    /// standard shell-job-control pattern of a parent shell moving a freshly forked child into a
+    /// (possibly brand new) pipeline process group before letting it run.
     pub(crate) fn sys_setpgid(&self, pid: i32, requested_group: i32) -> Result<(), Errno> {
         if requested_group < 0 {
             return Err(Errno::EINVAL);
         }
-        let (target_process, target_own_pid) = if pid == 0 || pid == self.pid.get() {
-            (self.process().clone(), self.pid.get())
-        } else if pid > 0 {
-            let child = self.process().find_child(pid).ok_or(Errno::ESRCH)?;
-            (child, pid)
-        } else {
+        let target_pid = if pid == 0 { self.pid.get() } else { pid };
+        if target_pid <= 0 {
             return Err(Errno::ESRCH);
-        };
+        }
         let target_pgid = if requested_group == 0 {
-            target_own_pid
+            target_pid
         } else {
             requested_group
         };
-        target_process.pgid.store(target_pgid, Ordering::Relaxed);
+        let local = if target_pid == self.pid.get() {
+            Some(self.process().clone())
+        } else {
+            self.process().find_child(target_pid)
+        };
+        if local.is_none() && self.process().find_cross_process_child(target_pid).is_none() {
+            return Err(Errno::ESRCH);
+        }
+        if let Some(process) = &local {
+            process.pgid.store(target_pgid, Ordering::Relaxed);
+        }
+        self.xproc_set_pgid(target_pid, target_pgid);
         Ok(())
     }
 
     /// Handle syscall `setsid`.
     ///
     /// Real Linux fails with `EPERM` if the caller is already a process group leader (a session
-    /// leader always is). We don't model sessions or true parent/child pgid inheritance at all
-    /// (see `sys_setpgid`'s doc comment) -- and *every* process here starts out as its own
-    /// process-group leader by construction (`Process::new` seeds `pgid` with the process's own
-    /// pid) -- so enforcing that check faithfully would make `setsid()` unconditionally fail for
-    /// exactly the caller that most needs it to succeed: a freshly `fork()`ed child running
+    /// leader always is). We don't model sessions at all (see `sys_setpgid`'s doc comment), so
+    /// enforcing that check faithfully would risk failing `setsid()` for exactly the caller that
+    /// most needs it to succeed: a freshly `fork()`ed child running
     /// glibc's `login_tty()` (the primitive under `forkpty()`/`openpty()`-based tools --
     /// node-pty, Python's `os.forkpty()`, tmux, `script`), which always calls `setsid()`
     /// immediately after `fork()` and before anything else. Matching this build's existing
@@ -5787,6 +5838,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     )]
     pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
         self.process().pgid.store(self.pid.get(), Ordering::Relaxed);
+        self.xproc_set_pgid(self.pid.get(), self.pid.get());
         Ok(self.pid.get())
     }
 
@@ -7501,8 +7553,8 @@ mod tests {
     #[test]
     fn test_kill_genuine_remote_pid_still_fails() {
         // A pid that is neither self, self's own process group, nor a direct child (the one
-        // remote-process case `do_kill` can actually reach -- see the tests below) is a real,
-        // specific target this shim genuinely cannot find (no shim-wide pid registry) -- reporting
+        // remote-process case `do_kill` can reach without the cross-process registry, which this
+        // test platform does not enable) is a target this shim cannot find -- reporting
         // that honestly (ESRCH) is correct, not a regression to "fix" by pretending to deliver it.
         use litebox_common_linux::signal::Signal;
 

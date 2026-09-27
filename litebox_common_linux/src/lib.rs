@@ -885,12 +885,24 @@ bitflags::bitflags! {
     /// for why `Termios.c_lflag` itself stays a plain `tcflag_t`, not this type.
     #[derive(Debug, Clone, Copy)]
     pub struct LFlagBits: tcflag_t {
+        /// Generate `SIGINT`/`SIGQUIT`/`SIGTSTP` for the `VINTR`/`VQUIT`/`VSUSP` characters.
+        const ISIG = 0o0000001;
         /// Echo input characters back to the terminal as they're typed.
         const ECHO = 0o0000010;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
 }
+
+/// `c_cc` indices of the signal-generating special characters.
+pub const VINTR: usize = 0;
+pub const VQUIT: usize = 1;
+pub const VSUSP: usize = 10;
+/// Linux's default `c_cc` for a fresh terminal (`INIT_C_CC`): ^C ^\ DEL ^U ^D, VTIME 0,
+/// VMIN 1, VSWTC 0, ^Q ^S ^Z, VEOL 0, ^R ^O ^W ^V, VEOL2 0.
+pub const DEFAULT_C_CC: [u8; 19] = [
+    0x03, 0x1c, 0x7f, 0x15, 0x04, 0, 1, 0, 0x11, 0x13, 0x1a, 0, 0x12, 0x0f, 0x17, 0x16, 0, 0, 0,
+];
 
 /// `c_oflag` bit: enable implementation-defined output processing. Prefer [`OFlagBits::OPOST`]
 /// for new code; this bare constant remains for callers that only need the raw numeric value.

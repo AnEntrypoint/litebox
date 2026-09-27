@@ -616,6 +616,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
         let my_daemon_pty_masters =
             Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
+        let my_xproc_local = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -645,6 +646,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         ),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
+                        process_table: syscalls::signal::xproc::SharedProcessTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
@@ -668,6 +670,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             fifo_registry: my_fifo_registry,
             pty_registry: my_pty_registry,
             daemon_pty_masters: my_daemon_pty_masters,
+            xproc_local: my_xproc_local,
         })
     }
 }
@@ -919,6 +922,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             .0
             .bootstrap_process
             .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
+        entrypoints.task.xproc_register_self(false);
 
         let (path, argv) = entrypoints
             .task
@@ -1007,7 +1011,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let cx = wait_state.context();
         match handle {
             Some(handle) => handle
-                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf, &self.0.shared_pty)),
+                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                    end.write(&cx, buf, &self.0.shared_pty, &|pgid, sig| {
+                        self.0.xproc_signal_group(pgid, sig)
+                    })
+                }),
             None => syscalls::pty::poll_shared(&cx, false, || {
                 self.0.shared_pty.try_write_side(pty_id, true, buf)
             }),
@@ -1049,6 +1057,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         task: litebox_common_linux::TaskParams,
         pm: PageManager<Platform, PAGE_SIZE>,
         sigreturn_trampoline: usize,
+        pgid: Option<i32>,
     ) -> LinuxShimEntrypoints<Platform, FS> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -1081,7 +1090,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         // starting state exactly).
         signals.set_sigreturn_trampoline_for_fork_adoption(sigreturn_trampoline);
 
-        LinuxShimEntrypoints {
+        let entrypoints = LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
@@ -1104,7 +1113,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 signals: RefCell::new(signals),
                 attached_pty_id: Cell::new(None),
             },
+        };
+        if let Some(pgid) = pgid {
+            entrypoints
+                .task
+                .process()
+                .pgid
+                .store(pgid, core::sync::atomic::Ordering::Relaxed);
         }
+        // This process is the whole of its own host process, so a remote `SIGKILL` may end it
+        // by terminating the host process.
+        entrypoints.task.xproc_register_self(true);
+        entrypoints
     }
 
     /// Get the page manager for the shim's bootstrap process (the one created by the first
@@ -3133,6 +3153,10 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     daemon_pty_masters: Arc<
         litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>>,
     >,
+    /// The guest processes running in THIS host process, by pid -- per-process by design (it
+    /// holds `Weak` pointers into this process's heap); the cross-process view is
+    /// `GlobalState::process_table`.
+    pub(crate) xproc_local: Arc<syscalls::signal::xproc::LocalProcessMap<Platform>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -3152,6 +3176,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             fifo_registry: self.fifo_registry.clone(),
             pty_registry: self.pty_registry.clone(),
             daemon_pty_masters: self.daemon_pty_masters.clone(),
+            xproc_local: self.xproc_local.clone(),
         }
     }
 }
@@ -3400,6 +3425,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// which one allocated it. A plain field of this same struct, same free-riding-on-
     /// `GlobalState`'s-own-sharing rationale as `unix_addr_presence`.
     shared_pty: syscalls::pty::SharedPtyTable<Platform>,
+    /// Every guest process in the fork family, by guest pid: which host process runs it, its
+    /// process group, and signals posted to it from other host processes. Pointer-free, so it is
+    /// shared across host processes along with the rest of this struct. See
+    /// [`syscalls::signal::xproc`].
+    pub(crate) process_table: syscalls::signal::xproc::SharedProcessTable,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
     /// The live pipe behind each open FIFO, keyed by the FIFO's `(dev, ino)`.

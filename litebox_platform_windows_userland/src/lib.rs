@@ -12582,6 +12582,96 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         process_fork::diagnostic_cross_process_wait4_probe(register);
     }
 
+    fn current_host_pid(&self) -> u32 {
+        std::process::id()
+    }
+
+    fn cross_process_child_host_pid(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<u32> {
+        // `handle.0` is the child task's thread handle (see `wait_for_cross_process_exit`).
+        let pid = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessIdOfThread(
+                handle.0 as windows_sys::Win32::Foundation::HANDLE,
+            )
+        };
+        (pid != 0).then_some(pid)
+    }
+
+    fn start_signal_wake_listener(
+        &'static self,
+        on_wake: alloc::boxed::Box<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *STARTED.get_or_init(|| {
+            let name = signal_wake_event_name(std::process::id());
+            // Auto-reset: one `SetEvent` from any number of senders wakes the listener once,
+            // and the listener drains every pending slot on each wake, so coalescing is safe.
+            let event = unsafe {
+                Win32_Threading::CreateEventW(core::ptr::null(), 0, 0, name.as_ptr())
+            };
+            if event.is_null() {
+                litebox_util_log::warn!(
+                    err:% = std::io::Error::last_os_error();
+                    "start_signal_wake_listener: CreateEventW failed, cross-process signals to                      this process are only noticed at its next signal check"
+                );
+                return false;
+            }
+            let event = event as usize;
+            std::thread::spawn(move || {
+                // The event exists before this first drain, so a sender that set a pending bit
+                // before the event existed is covered here and every later one wakes the loop.
+                on_wake();
+                loop {
+                    let r = unsafe {
+                        windows_sys::Win32::System::Threading::WaitForSingleObject(
+                            event as windows_sys::Win32::Foundation::HANDLE,
+                            windows_sys::Win32::System::Threading::INFINITE,
+                        )
+                    };
+                    if r != 0 {
+                        return;
+                    }
+                    on_wake();
+                }
+            });
+            true
+        })
+    }
+
+    fn wake_signal_listener(&self, host_pid: u32) -> bool {
+        let name = signal_wake_event_name(host_pid);
+        let event = unsafe {
+            Win32_Threading::OpenEventW(Win32_Threading::EVENT_MODIFY_STATE, 0, name.as_ptr())
+        };
+        if event.is_null() {
+            return false;
+        }
+        let ok = unsafe { Win32_Threading::SetEvent(event) } != 0;
+        unsafe {
+            Win32_Foundation::CloseHandle(event);
+        }
+        ok
+    }
+
+    fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {
+        if host_pid == 0 || host_pid == std::process::id() {
+            return false;
+        }
+        let handle = unsafe {
+            Win32_Threading::OpenProcess(Win32_Threading::PROCESS_TERMINATE, 0, host_pid)
+        };
+        if handle.is_null() {
+            return false;
+        }
+        let ok = unsafe { Win32_Threading::TerminateProcess(handle, exit_code) } != 0;
+        unsafe {
+            Win32_Foundation::CloseHandle(handle);
+        }
+        ok
+    }
+
     fn take_cross_process_writable_layer_export(
         &self,
         handle: litebox::platform::CrossProcessChildHandle,
@@ -12636,6 +12726,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         inherited_files: std::vec::Vec<litebox::platform::ForkInheritedFile>,
         inherited_eventfds: std::vec::Vec<litebox::platform::ForkInheritedEventfd>,
         sigreturn_trampoline: usize,
+        identity: litebox::platform::ForkChildIdentity,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
@@ -12763,6 +12854,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             &inherited_files,
             &inherited_eventfds,
             sigreturn_trampoline,
+            identity,
         ) {
             Ok(Some((pid, process_handle, thread_handle))) => {
                 litebox_util_log::debug!(
@@ -13695,4 +13787,12 @@ mod tests {
             "no stdin handle attached at all must report ready (matches EOF semantics)"
         );
     }
+}
+
+/// Name of host process `host_pid`'s cross-process signal wake event, NUL-terminated UTF-16.
+fn signal_wake_event_name(host_pid: u32) -> std::vec::Vec<u16> {
+    format!(r"Local\litebox-sigwake-{host_pid}")
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect()
 }

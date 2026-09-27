@@ -1822,13 +1822,15 @@ fn diag_process_fork_task_resume_probe(
         return;
     };
 
-    // Stdio-only, single-thread, freshly-"execve'd"-looking process shape -- mirrors the same
-    // credentials/pid/ppid a real forked child would carry. pid==tid matches `load_program`'s own
-    // bootstrap-process convention (a single-threaded process's tid equals its pid).
-    let pid = std::process::id().cast_signed();
+    // The guest identity the parent's `fork()` promised: the pid it returned (so `getpid()` here
+    // matches the parent's `$!`/`wait4()`/`kill()`), the parent's pid, and the inherited process
+    // group. pid==tid, as for any freshly forked single-threaded process. Falls back to the host
+    // pid only for a spawn that carried no identity.
+    let identity = pf::fork_child_guest_identity();
+    let pid = identity.map_or(std::process::id().cast_signed(), |id| id.pid);
     let task_params = litebox_common_linux::TaskParams {
         pid,
-        ppid: pid,
+        ppid: identity.map_or(pid, |id| id.ppid),
         uid: 0,
         euid: 0,
         gid: 0,
@@ -1844,7 +1846,13 @@ fn diag_process_fork_task_resume_probe(
         .and_then(|s| usize::from_str_radix(&s, 16).ok())
         .unwrap_or(0);
     let entrypoints =
-        shim.adopt_forked_process(fs, task_params, page_manager, sigreturn_trampoline);
+        shim.adopt_forked_process(
+            fs,
+            task_params,
+            page_manager,
+            sigreturn_trampoline,
+            identity.map(|id| id.pgid),
+        );
 
     // Reopen the regular-file fds the parent held.
     //

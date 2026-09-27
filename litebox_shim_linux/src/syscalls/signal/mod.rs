@@ -7,6 +7,7 @@
 mod aarch64;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
+pub(crate) mod xproc;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64 as arch;
@@ -962,14 +963,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         // `pid == 0` (send to the caller's own process group), a negative `pid` (send to process
-        // group `-pid`), and `pid == -1` (send to every process the caller may signal) are
-        // approximated as "signal self plus any live child currently in that same group": this
-        // shim has no registry of *arbitrary* other live processes to enumerate a process group
-        // or the whole guest (see `sys_setpgid`'s doc comment on why sessions/cross-process pid
-        // lookups aren't modeled at all), but a live child that's been moved into the group via
-        // `setpgid()` -- the standard shell-job-control/process-supervisor pattern of putting a
-        // whole spawned pipeline into one group -- *is* reachable via `children`, covering
-        // "kill the whole pipeline"/"kill the whole group" without needing a general registry.
+        // group `-pid`), and `pid == -1` (send to every process the caller may signal): the caller
+        // is signalled directly when it is a target, and every other target is found through the
+        // cross-process process registry (`xproc`), which records each guest process's group
+        // wherever it runs.
         let self_pgid = self.sys_getpgid(0)?;
         let targets_self = match pid {
             None | Some(0 | -1) => true,
@@ -992,9 +989,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 _ => None,
             });
         if let Some(group) = target_group {
-            for child in &self.process().children_in_group(group) {
-                deliver_to_child(child);
-                delivered = true;
+            // The registry reaches every registered process in the group (or, for `-1`, every
+            // process but init and the caller), wherever it runs; `children_in_group` covers any
+            // local child the registry could not hold.
+            let reached = if pid == Some(-1) {
+                self.xproc_send_many(signal, |v| v.pid != 1)
+            } else {
+                self.xproc_send_many(signal, |v| v.pgid == group)
+            };
+            delivered |= !reached.is_empty();
+            for (child_pid, child) in &self.process().children_in_group(group) {
+                if !reached.contains(child_pid) {
+                    deliver_to_child(child);
+                    delivered = true;
+                }
             }
             // A group op targeting neither self's own group nor any reachable child's group has
             // literally nothing this shim can deliver to -- ESRCH, matching real Linux's
@@ -1004,40 +1012,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if targets_self {
             return Ok(0);
         }
-        // A genuine remote pid (some other, specific process): still no shim-wide pid registry to
-        // find an arbitrary process by pid, but a *direct child* of the caller is reachable via
-        // `children` (populated by `do_clone`'s process-clone branch) -- covering the single most
-        // common real-world case, a supervisor/process-manager signaling a worker it spawned.
+        // Any other specific pid: the cross-process registry (`xproc`) knows every registered
+        // process, whether it runs in this host process or another one (a
+        // `LITEBOX_PROCESS_FORK=1` child). A direct local child is still found without it when the
+        // registry is disabled or full.
         if let Some(pid) = pid
             && pid > 0
-            && let Some(child) = self.process().find_child(pid)
         {
-            deliver_to_child(&child);
-            return Ok(0);
+            if self.xproc_send(pid, signal).is_ok() {
+                return Ok(0);
+            }
+            if let Some(child) = self.process().find_child(pid) {
+                deliver_to_child(&child);
+                return Ok(0);
+            }
         }
-        // Pass 141, documented gap: a cross-process `fork()` child (`LITEBOX_PROCESS_FORK=1`) is
-        // tracked in `Process::cross_process_children`, not `children` -- `find_child` above
-        // never finds it, so it would otherwise fall through to the generic "unsupported remote
-        // pid" `ESRCH` below silently. Distinguish that specific case in the log so it reads as
-        // "known, scoped-out signal delivery" rather than "the shim has no idea what this pid
-        // is" -- the child is real and reachable via `sys_wait4`, just not signalable yet; see
-        // `Process::cross_process_children`'s doc comment for the full scope statement.
-        if let Some(pid) = pid
-            && pid > 0
-            && self.process().find_cross_process_child(pid).is_some()
-        {
-            log_unsupported!(
-                "sys_kill with pid={pid}: signal delivery to a cross-process fork() child is not \
-                 implemented (pass 141 documented gap -- wait4() works, kill() does not)"
-            );
-            return Err(Errno::ESRCH);
-        }
-        log_unsupported!("sys_kill with a remote pid that isn't a direct child");
+        log_unsupported!("sys_kill with a pid that is neither registered nor a direct child");
         Err(Errno::ESRCH)
     }
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
+        self.xproc_drain_own();
         let blocked = self.signals.borrow().blocked.get();
         let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
         if !thread_pending.is_empty() {
@@ -1066,6 +1062,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             tid:% = self.tid.get(), rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
             "drm-diag: process_signals entry with ctx"
         );
+        self.xproc_drain_own();
         let mut iter_count: u32 = 0;
         loop {
             iter_count += 1;

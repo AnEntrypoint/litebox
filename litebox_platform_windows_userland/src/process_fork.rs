@@ -902,6 +902,21 @@ pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
     "LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE";
 
+/// Carries the child's guest identity as `pid:ppid:pgid` (decimal): the pid the parent's `fork()`
+/// returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/`kill()` view of it
+/// instead of being the child's unrelated Windows process id. Never guest-visible.
+pub const FORK_CHILD_GUEST_IDENTITY_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY";
+
+/// Parses [`FORK_CHILD_GUEST_IDENTITY_ENV_VAR`] from this process's environment.
+pub fn fork_child_guest_identity() -> Option<litebox::platform::ForkChildIdentity> {
+    let raw = std::env::var(FORK_CHILD_GUEST_IDENTITY_ENV_VAR).ok()?;
+    let mut parts = raw.split(':').map(str::parse::<i32>);
+    let pid = parts.next()?.ok()?;
+    let ppid = parts.next()?.ok()?;
+    let pgid = parts.next()?.ok()?;
+    (pid > 0).then_some(litebox::platform::ForkChildIdentity { pid, ppid, pgid })
+}
+
 /// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
 /// `fd:handle:direction` triples separated by commas (e.g. `3:1a4:w,0:1b0:r`), where `handle` is
 /// the hex value of an inheritable Windows pipe handle already present in the child by virtue of
@@ -1776,6 +1791,7 @@ pub fn spawn_process_fork_child(
     inherited_files: &[litebox::platform::ForkInheritedFile],
     inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
     sigreturn_trampoline: usize,
+    identity: litebox::platform::ForkChildIdentity,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1804,6 +1820,10 @@ pub fn spawn_process_fork_child(
         (
             FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR,
             format!("{sigreturn_trampoline:x}"),
+        ),
+        (
+            FORK_CHILD_GUEST_IDENTITY_ENV_VAR,
+            format!("{}:{}:{}", identity.pid, identity.ppid, identity.pgid),
         ),
         // A fork child must never publish host ports.
         //

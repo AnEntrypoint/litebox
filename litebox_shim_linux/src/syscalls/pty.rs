@@ -9,11 +9,12 @@
 //!
 //! **Input-side line discipline is only partially implemented**: raw-mode echo (`ECHO` set
 //! without `ICANON` -- e.g. `stty -icanon echo`) works (see [`PtyEnd::write`]'s echo handling),
-//! but there is no kernel-side canonical-mode input buffering (no backspace/erase editing, since
-//! that needs a buffer of not-yet-"readable" bytes this module doesn't have) and no
-//! signal-generating special characters (^C/^Z/^\ -- these need cross-process signal delivery,
-//! which this shim doesn't have at all yet, pty or otherwise). Bytes written to the master appear
-//! verbatim on the slave's read side unless `ECHO` is explicitly set. This covers every consumer
+//! and so does `ISIG` (the `VINTR`/`VQUIT`/`VSUSP` characters written to the master signal the
+//! foreground process group through the cross-process registry `syscalls::signal::xproc`, see
+//! [`PtyEnd::write`]), but there is no kernel-side canonical-mode input buffering (no
+//! backspace/erase editing, since that needs a buffer of not-yet-"readable" bytes this module
+//! doesn't have). Other bytes written to the master appear verbatim on the slave's read side
+//! unless `ECHO` is explicitly set. This covers every consumer
 //! that puts the pty into raw mode itself (which is what `node-pty`, `ptyprocess`/`pexpect`, and
 //! most modern pty libraries do immediately after opening) but not a guest shell relying on the
 //! kernel for full cooked-mode line editing.
@@ -499,10 +500,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
                 .is_ok()
             {
                 slot.id.store(id, Ordering::Relaxed);
-                *slot.termios.lock() = Termios {
-                    c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
-                    ..Termios::default()
-                };
+                *slot.termios.lock() = default_pty_termios();
                 *slot.winsize.lock() = Winsize::default();
                 slot.fg_pgid.store(0, Ordering::Relaxed);
                 slot.locked.store(locked, Ordering::Relaxed);
@@ -666,6 +664,10 @@ impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
 
     pub(crate) fn get_termios(&self) -> Termios {
         match self {
+            // Another process in the fork family may have changed it through the shared slot
+            // (e.g. a cross-process-forked shell on the slave going raw), and every local setter
+            // writes the shared slot too, so a published slot is the authoritative copy.
+            Self::Local(p, shared) if shared.exists(p.id) => shared.get_termios(p.id),
             Self::Local(p, _) => p.get_termios(),
             Self::Shared(id, t) => t.get_termios(*id),
         }
@@ -683,6 +685,7 @@ impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
 
     pub(crate) fn get_winsize(&self) -> Winsize {
         match self {
+            Self::Local(p, shared) if shared.exists(p.id) => shared.get_winsize(p.id),
             Self::Local(p, _) => p.get_winsize(),
             Self::Shared(id, t) => t.get_winsize(*id),
         }
@@ -700,6 +703,7 @@ impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
 
     pub(crate) fn get_fg_pgid(&self) -> i32 {
         match self {
+            Self::Local(p, shared) if shared.exists(p.id) => shared.get_fg_pgid(p.id),
             Self::Local(p, _) => p.get_fg_pgid(),
             Self::Shared(id, t) => t.get_fg_pgid(*id),
         }
@@ -972,11 +976,83 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     /// On the *master* side only, if the pty's termios has `ECHO` set, the bytes actually
     /// accepted are also best-effort echoed back to the master's own read side (see
     /// [`PtyHalf::echo`]) -- this is raw-mode echo (`stty -icanon echo`), not canonical-mode line
-    /// editing: no input buffering, no backspace/erase handling, and no `ISIG` special characters
-    /// (^C/^Z/^\). `ECHO` is never set by default (see [`new_pty_pair`]'s termios default), so
+    /// editing: no input buffering and no backspace/erase handling. `ECHO` is never set by
+    /// default (see [`default_pty_termios`]), so
     /// this only ever fires for a consumer that explicitly opts in via `TCSETS`. Local-transport
     /// only, same scope limit as `ONLCR` above.
+    ///
+    /// On the *master* side, with `ISIG` set and a foreground process group recorded
+    /// (`TIOCSPGRP`), each `VINTR`/`VQUIT`/`VSUSP` byte is consumed instead of forwarded and
+    /// `SIGINT`/`SIGQUIT`/`SIGTSTP` is sent to that group through `signal_group` -- Ctrl-C,
+    /// Ctrl-Backslash and Ctrl-Z in a terminal emulator. The input queue is not flushed (as if
+    /// `NOFLSH` were set) and nothing is echoed for the character.
     pub(crate) fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+        shared: &SharedPtyTable<Platform>,
+        signal_group: &dyn Fn(i32, litebox_common_linux::signal::Signal) -> bool,
+    ) -> Result<usize, Errno> {
+        use litebox_common_linux::signal::Signal;
+        if !self.is_master() {
+            return self.write_through(cx, buf, shared);
+        }
+        let state = self.pty_state(shared);
+        let termios = state.get_termios();
+        let fg_pgid = state.get_fg_pgid();
+        litebox_util_log::debug!(
+            pty:% = state.id(), c_lflag:% = termios.c_lflag, fg_pgid:% = fg_pgid, len:% = buf.len();
+            "pty master write: ISIG check"
+        );
+        if !litebox_common_linux::LFlagBits::from_bits_retain(termios.c_lflag)
+            .contains(litebox_common_linux::LFlagBits::ISIG)
+            || fg_pgid <= 0
+        {
+            return self.write_through(cx, buf, shared);
+        }
+        let special = |b: u8| {
+            [
+                (litebox_common_linux::VINTR, Signal::SIGINT),
+                (litebox_common_linux::VQUIT, Signal::SIGQUIT),
+                (litebox_common_linux::VSUSP, Signal::SIGTSTP),
+            ]
+            .into_iter()
+            .find(|&(i, _)| termios.c_cc[i] != 0 && termios.c_cc[i] == b)
+            .map(|(_, sig)| sig)
+        };
+        let mut consumed = 0;
+        while consumed < buf.len() {
+            let rest = &buf[consumed..];
+            let plain = rest
+                .iter()
+                .position(|&b| special(b).is_some())
+                .unwrap_or(rest.len());
+            if plain > 0 {
+                match self.write_through(cx, &rest[..plain], shared) {
+                    Ok(n) => {
+                        consumed += n;
+                        if n < plain {
+                            return Ok(consumed);
+                        }
+                    }
+                    Err(e) if consumed == 0 => return Err(e),
+                    Err(_) => return Ok(consumed),
+                }
+                continue;
+            }
+            if let Some(signal) = special(rest[0]) {
+                let reached = signal_group(fg_pgid, signal);
+                litebox_util_log::debug!(
+                    fg_pgid:% = fg_pgid, signal:? = signal, reached:% = reached;
+                    "pty master write: ISIG character signalled the foreground process group"
+                );
+            }
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    fn write_through(
         &self,
         cx: &WaitContext<'_, Platform>,
         buf: &[u8],
@@ -1017,6 +1093,20 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     }
 }
 
+/// A fresh pty's termios: `OPOST|ONLCR` output processing and `ISIG` with Linux's default
+/// special characters -- the parts of the line discipline this module implements (see
+/// [`PtyEnd::write`]). Every other flag (input processing, canonical-mode buffering, echo) stays
+/// at zero, since claiming those via `TCGETS` would mislead a guest deciding its own behavior
+/// from what it reads back.
+fn default_pty_termios() -> Termios {
+    Termios {
+        c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
+        c_lflag: litebox_common_linux::LFlagBits::ISIG.bits(),
+        c_cc: litebox_common_linux::DEFAULT_C_CC,
+        ..Termios::default()
+    }
+}
+
 /// Allocate a new pty pair: `(master, slave)`, both already inserted into the descriptor table
 /// (the caller decides which raw fd, if any, each side ends up installed at).
 pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
@@ -1028,14 +1118,7 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         // `c_oflag` defaults to `OPOST | ONLCR` -- matching a real, freshly allocated Linux
         // pty's cooked-mode default -- because that's the one piece of output-side line
         // discipline this module actually implements (see `PtyEnd::write`'s doc comment).
-        // Every other flag (input processing, canonical-mode input buffering/echo, ISIG special
-        // characters) stays at zero: this module doesn't implement any of those, so claiming
-        // otherwise via TCGETS would be actively misleading to a guest program deciding its own
-        // behavior based on what it reads back.
-        termios: Mutex::new(Termios {
-            c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
-            ..Termios::default()
-        }),
+        termios: Mutex::new(default_pty_termios()),
         winsize: Mutex::new(Winsize::default()),
         fg_pgid: AtomicI32::new(0),
         locked: AtomicBool::new(true),
