@@ -370,6 +370,25 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
     }
 }
 
+/// The `SIGCHLD` a parent receives when child `pid` terminates with `status`: `si_code`
+/// `CLD_EXITED`/`CLD_KILLED` with the child's pid, uid and exit code or signal. Programs such as
+/// util-linux `script` reap only on those codes, so a plain `SI_USER` siginfo leaves them waiting.
+pub(crate) fn siginfo_child(signal: Signal, pid: i32, uid: u32, status: ExitStatus) -> Siginfo {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    let (code, value) = match status {
+        ExitStatus::Exit(c) => (CLD_EXITED, i32::from(c.cast_unsigned())),
+        ExitStatus::Signal(s) => (CLD_KILLED, s.as_i32()),
+    };
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code,
+        __pad: 0,
+        data: SiginfoData::new_child(pid, uid, value),
+    }
+}
+
 /// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
 /// `tkill()`, or `tgkill()`.
 pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {

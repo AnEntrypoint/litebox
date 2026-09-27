@@ -3150,7 +3150,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// track a partial-write remainder across calls: either every byte of `data` fits right now
     /// and is written, or NONE of it is and the buffer is left exactly as it was. Never blocks,
     /// never panics.
-    fn try_write_all(&self, data: &[u8]) -> bool {
+    pub(crate) fn try_write_all(&self, data: &[u8]) -> bool {
         let mut cursor = self.cursor.lock();
         if cursor.write_shutdown {
             return false;
@@ -3213,7 +3213,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         cursor.write_pos == cursor.read_pos
     }
 
-    fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         let cursor = self.cursor.lock();
         cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
     }

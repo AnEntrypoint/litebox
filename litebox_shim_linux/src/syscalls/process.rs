@@ -381,6 +381,21 @@ pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
 /// as `WIFSIGNALED(SIGKILL)`: the child is definitely gone, and "killed" is a safe, conservative
 /// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
 /// code.
+/// The [`ExitStatus`] behind a cross-process child's raw exit code, with the same
+/// no-marker-means-`SIGKILL` fallback as [`decode_cross_process_wait_status`].
+pub(crate) fn decode_cross_process_exit_status(raw_exit_code: u32) -> ExitStatus {
+    let low = (raw_exit_code & 0xff).cast_signed();
+    if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
+        return ExitStatus::Signal(litebox_common_linux::signal::Signal::SIGKILL);
+    }
+    if raw_exit_code & CROSS_PROCESS_EXIT_SIGNAL_FLAG != 0 {
+        litebox_common_linux::signal::Signal::try_from(low)
+            .map_or(ExitStatus::Signal(litebox_common_linux::signal::Signal::SIGKILL), ExitStatus::Signal)
+    } else {
+        ExitStatus::Exit((low as u8).cast_signed())
+    }
+}
+
 pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
     const SIGKILL: i32 = 9;
     if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
@@ -1911,10 +1926,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tid:% = self.tid.get();
                     "DIAG prepare_for_exit: calling parent.interrupt_all_threads()"
                 );
+                let status = self.process().inner.lock().exit_status;
                 parent.shared_pending.lock().push(
                     &parent.limits,
                     signal,
-                    super::signal::siginfo_kill(signal),
+                    super::signal::siginfo_child(
+                        signal,
+                        self.pid.get(),
+                        self.credentials.uid,
+                        status,
+                    ),
                 );
                 parent.interrupt_all_threads();
             }
@@ -3720,18 +3741,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn arm_cross_process_exit_notifier(
         &self,
+        child_pid: i32,
         handle: litebox::platform::CrossProcessChildHandle,
         signal: Option<litebox_common_linux::signal::Signal>,
     ) {
         let Some(signal) = signal else { return };
         let process = self.process();
+        let uid = self.credentials.uid;
         self.global.platform.spawn_cross_process_exit_notifier(
             handle,
-            alloc::boxed::Box::new(move || {
-                process
-                    .shared_pending
-                    .lock()
-                    .push(&process.limits, signal, super::signal::siginfo_kill(signal));
+            alloc::boxed::Box::new(move |raw_exit_code| {
+                let status = decode_cross_process_exit_status(raw_exit_code);
+                process.shared_pending.lock().push(
+                    &process.limits,
+                    signal,
+                    super::signal::siginfo_child(signal, child_pid, uid, status),
+                );
                 process.interrupt_all_threads();
             }),
         );
@@ -4037,7 +4062,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 self.process().register_cross_process_child(child_tid, handle);
                 self.xproc_child_spawned(child_tid, handle);
-                self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
+                self.arm_cross_process_exit_notifier(child_tid, handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
@@ -4882,7 +4907,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
                 self.xproc_child_spawned(child_tid, handle);
-                self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
+                self.arm_cross_process_exit_notifier(child_tid, handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(),
                     child_tid:% = child_tid;

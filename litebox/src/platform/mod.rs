@@ -1074,8 +1074,8 @@ pub trait ForkChildVerificationProvider {
     }
 
     /// Arranges for `on_exit` to run (on some platform-chosen thread, NOT necessarily the calling
-    /// one) once the real OS process identified by `handle` terminates -- the async counterpart to
-    /// [`Self::wait_for_cross_process_exit`]'s blocking wait.
+    /// one) with the raw OS exit code once the real OS process identified by `handle` terminates
+    /// -- the async counterpart to [`Self::wait_for_cross_process_exit`]'s blocking wait.
     ///
     /// Exists because a `LITEBOX_PROCESS_FORK=1` child's exit has no path into this process's own
     /// in-guest signal-delivery machinery otherwise. `Process::prepare_for_exit`
@@ -1110,7 +1110,7 @@ pub trait ForkChildVerificationProvider {
     fn spawn_cross_process_exit_notifier(
         &'static self,
         handle: CrossProcessChildHandle,
-        on_exit: alloc::boxed::Box<dyn FnOnce() + Send>,
+        on_exit: alloc::boxed::Box<dyn FnOnce(u32) + Send>,
     ) {
         let _ = handle;
         drop(on_exit);

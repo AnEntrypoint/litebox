@@ -1870,7 +1870,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
                     handle.with_entry(|end| {
-                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.shared_pty)
+                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.pty_io())
                     })
                 },
                 |fd| {
@@ -2044,7 +2044,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
                     handle.with_entry(|end| {
-                        end.write(&self.wait_cx(), buf, &self.global.shared_pty, &|pgid, sig| {
+                        end.write(&self.wait_cx(), buf, &self.global.pty_io(), &|pgid, sig| {
                             self.global.xproc_signal_group(pgid, sig)
                         })
                     })
@@ -2661,15 +2661,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
                 };
-                // Closing the *master* side's last reference releases this shim's own held
-                // template copy of the slave (see `GlobalState::ptmx_closed`); any fds a guest
-                // already obtained via `/dev/pts/<id>` keep working exactly like any other
-                // `dup()`'d fd surviving the original fd's close.
-                if let Some(end) = &entry
-                    && end.is_master()
-                    && let Some(id) = end.local_id()
-                {
-                    self.global.ptmx_closed(id);
+                // The last close of a master releases the pty (see `GlobalState::ptmx_closed`);
+                // the last close of a shared slave drops it from the open-slave count that
+                // decides when master reads report `EIO`.
+                if let Some(end) = &entry {
+                    self.global.pty_description_closed(end);
                 }
                 // do not hold any locks while dropping the entry
                 drop(entry);

@@ -593,13 +593,39 @@ map" below). Condensed current-state trail:
     and every command a shell in a pty runs used to lose its stdio. Verified with a `perl` forkpty
     harness: `^C` written to the master → child `bash` trap exits 5 / plain `sleep` dies
     `WIFSIGNALED(2)`.
-  - **Open**: output a cross-process child writes to a carried slave never reaches a LOCAL master
-    in the allocating process (its reads use only the local channel, the shared ring is only
-    mirrored into) — `script` shows nothing and hangs; the pty data plane needs the shared rings to
-    be the one transport once published. No SIGSTOP/SIGCONT job-control semantics across hosts; no
+  - **Open**: (pty output gap: fixed 111th, below.) No SIGSTOP/SIGCONT job-control semantics across hosts; no
     `si_pid` in the cross-process `siginfo`; SIGKILL-by-`TerminateProcess` also kills any
     thread-based descendants living in that host process; no input-queue flush/`^C` echo on
     `ISIG`; tkill/tgkill to a thread in another host process still `ESRCH`.
+
+- **111th -- pty data path unified on `SharedPtyTable`; `SIGCHLD` carries a real child siginfo.**
+  - **Pty**: a published pty (any free slot of the 8) has NO in-process channel any more: `/dev/ptmx`
+    returns a `SharedMaster`, every `/dev/pts/<id>`/`TIOCGPTPEER` open a new `SharedSlave`, and all
+    reads/writes/readiness go through the slot's rings (before, a local master read only its
+    channel while other processes' slave output went into a ring nobody read). Line discipline on
+    the ring path: `ISIG`, `ICRNL` (Enter from a terminal emulator is ``), `ECHO`, `OPOST|ONLCR`,
+    DSR reply. Open slaves are counted per host process in the slot; once one was opened and none
+    remains (or its host died) master `read` = `EIO` and poll = `IN|HUP`; master closed/host gone ->
+    slave read EOF, slave write `EIO`. `poll`/`epoll` put `Shared*` pty fds on the existing 15ms
+    bounded-repoll path (no cross-process wake exists). Fresh ptys now default to Linux's
+    `ICRNL`+`ECHO` (+`ISIG`, `ONLCR`, `CS8|CREAD|B38400`); without `ECHO` readline never shows typed
+    input. `ICANON` stays unset (no canonical buffering). `--pty-mode` keeps no-`ECHO`/no-`ICRNL`.
+    Only a 9th simultaneous pty falls back to the old in-process pair (process-local).
+  - **`SIGCHLD`**: both the thread-path exit notify and the cross-process exit notifier sent it with
+    `SI_USER`; util-linux `script` reaps only on `CLD_EXITED`/`CLD_KILLED` and hung forever.
+    `siginfo_child` now sets code/pid/uid/status (`spawn_cross_process_exit_notifier`'s callback
+    receives the raw exit code), and signalfd fills `ssi_pid`/`ssi_uid`/`ssi_status`.
+  - **Verified** (`debian:stable-slim`, logs `.wfgy/pass111_*.log`): `script -qc 'echo
+    hello_from_child; ls /' /dev/null` prints both and exits 0 in ~1s (was: no output, hang);
+    forkpty harness `.wfgy/pass111_forkpty.pl` reads the child's `child_says_hi
+...` then
+    `EIO`(5); interactive `bash -i` on the slave: typed `echo x` echoed, `` -> runs, `x` read
+    back, `exit` -> `EIO`; `^C` -> trap exit 5; single-process pty (`.wfgy/pass111_nofork.pl`, with and
+    without `LITEBOX_PROCESS_FORK`) and 9-pty fallback and `--pty-mode` still work; pass-110 signal
+    tests unchanged.
+  - **Open**: no canonical-mode line editing (erase/kill/`^D`-as-EOF); `ECHOCTL` not rendered
+    (`^C` not echoed, a `^D` is echoed raw); ring is 2 KiB per direction; master/slave readiness
+    across processes is polled at 15ms, not event-driven.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/

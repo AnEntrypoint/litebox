@@ -987,11 +987,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
         match handle {
-            Some(handle) => {
-                handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf, &self.0.shared_pty))
-            }
+            Some(handle) => handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                end.read(&cx, buf, &self.0.pty_io())
+            }),
             None => syscalls::pty::poll_shared(&cx, false, || {
-                self.0.shared_pty.try_read_side(pty_id, true, buf)
+                self.0.shared_pty.try_read_side(pty_id, true, buf, &self.0.pty_io())
             }),
         }
     }
@@ -1012,12 +1012,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         match handle {
             Some(handle) => handle
                 .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
-                    end.write(&cx, buf, &self.0.shared_pty, &|pgid, sig| {
+                    end.write(&cx, buf, &self.0.pty_io(), &|pgid, sig| {
                         self.0.xproc_signal_group(pgid, sig)
                     })
                 }),
             None => syscalls::pty::poll_shared(&cx, false, || {
-                self.0.shared_pty.try_write_side(pty_id, true, buf)
+                self.0
+                    .shared_pty
+                    .try_write_side(pty_id, true, buf, false, &self.0.pty_io())
             }),
         }
     }

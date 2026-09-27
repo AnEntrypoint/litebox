@@ -42,6 +42,19 @@ bitflags::bitflags! {
     }
 }
 
+/// Whether a pty fd uses the shared transport, whose peer may be in another process and so can
+/// never notify an observer here: pollers must re-check it on a bounded interval.
+fn pty_needs_repoll<Platform: ShimPlatform, FS: ShimFS>(
+    global: &GlobalStateHandle<Platform, FS>,
+    pty: &TypedFd<super::pty::PtySubsystem<Platform>>,
+) -> bool {
+    global
+        .litebox
+        .descriptor_table()
+        .entry_handle(pty)
+        .is_some_and(|h| h.with_entry(|end: &super::pty::PtyEnd<Platform>| end.needs_repoll()))
+}
+
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
@@ -267,7 +280,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             }
             EpollDescriptor::Pty(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| entry.with_iopollable(|iop| poll(iop, observer))))
+                Some(handle.with_entry(|entry: &super::pty::PtyEnd<Platform>| {
+                    entry.poll_events(&global.pty_io(), observer, mask)
+                        & (mask | Events::ALWAYS_POLLED)
+                }))
             }
             EpollDescriptor::Signalfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
@@ -420,6 +436,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 ),
                 Some(EpollDescriptor::Timerfd(_)) => true,
                 Some(EpollDescriptor::Unix(_)) => true,
+                Some(EpollDescriptor::Pty(pty)) => pty_needs_repoll(global, &pty),
                 _ => false,
             }
         })
@@ -454,6 +471,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                         Some(EpollDescriptor::File(_))
                             | Some(EpollDescriptor::Timerfd(_))
                             | Some(EpollDescriptor::Unix(_))
+                            | Some(EpollDescriptor::Pty(_))
                     )
             })
             .map(|(key, entry)| (key.0, entry.clone()))
@@ -1051,6 +1069,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
                     .is_ok_and(|desc| {
                         matches!(&desc, EpollDescriptor::Unix(_))
+                            || matches!(&desc, EpollDescriptor::Pty(pty) if pty_needs_repoll(global, pty))
                             || matches!(&desc, EpollDescriptor::File(file)
                         if global.litebox.descriptor_table().with_metadata(
                             file,

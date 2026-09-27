@@ -372,6 +372,28 @@ pub struct SiginfoData {
 }
 
 impl SiginfoData {
+    /// The `SIGCHLD` arm of `_sifields`: `si_pid`, `si_uid`, `si_status` (the raw exit code for
+    /// `CLD_EXITED`, the signal number for `CLD_KILLED`).
+    pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {
+        let mut pad = [0u32; 28];
+        pad[0] = pid.cast_unsigned();
+        pad[1] = uid;
+        pad[2] = status.cast_unsigned();
+        Self { pad }
+    }
+
+    /// `si_pid` and `si_uid`, which every non-fault siginfo layout places first.
+    pub fn sender(&self) -> (i32, u32) {
+        let pad = self.pad;
+        (pad[0].cast_signed(), pad[1])
+    }
+
+    /// `si_status` of the `SIGCHLD` layout.
+    pub fn child_status(&self) -> i32 {
+        let pad = self.pad;
+        pad[2].cast_signed()
+    }
+
     pub fn new_addr(addr: usize) -> Self {
         let mut pad = [0u32; 28];
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());

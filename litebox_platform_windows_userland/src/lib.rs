@@ -12548,7 +12548,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     fn spawn_cross_process_exit_notifier(
         &'static self,
         handle: litebox::platform::CrossProcessChildHandle,
-        on_exit: alloc::boxed::Box<dyn FnOnce() + Send>,
+        on_exit: alloc::boxed::Box<dyn FnOnce(u32) + Send>,
     ) {
         // This thread's only job is the blocking wait -- `wait_for_cross_process_exit` already
         // does it, same `HANDLE`-safety contract as every other cross-process-wait call above
@@ -12566,12 +12566,12 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 "[wait4_diag] arm_cross_process_exit_notifier: background wait thread starting, handle={:p}",
                 handle.0 as windows_sys::Win32::Foundation::HANDLE
             );
-            self.wait_for_cross_process_exit(handle);
+            let raw_exit_code = self.wait_for_cross_process_exit(handle);
             eprintln!(
                 "[wait4_diag] arm_cross_process_exit_notifier: blocking wait returned, invoking on_exit(), handle={:p}",
                 handle.0 as windows_sys::Win32::Foundation::HANDLE
             );
-            on_exit();
+            on_exit(raw_exit_code);
         });
     }
 

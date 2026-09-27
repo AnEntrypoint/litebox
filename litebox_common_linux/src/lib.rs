@@ -894,6 +894,21 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `c_iflag` bits this codebase interprets -- see [`OFlagBits`] for why `Termios.c_iflag`
+    /// itself stays a plain `tcflag_t`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct IFlagBits: tcflag_t {
+        /// Translate carriage return to newline on input.
+        const ICRNL = 0o0000400;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// `c_cflag` of a fresh Linux terminal: `B38400 | CS8 | CREAD`.
+pub const DEFAULT_C_CFLAG: tcflag_t = 0o17 | 0o60 | 0o200;
+
 /// `c_cc` indices of the signal-generating special characters.
 pub const VINTR: usize = 0;
 pub const VQUIT: usize = 1;
