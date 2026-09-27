@@ -1196,6 +1196,17 @@ pub trait ForkChildVerificationProvider {
     /// build their own per-thread wait state -- every caller already holds the platform as
     /// `&'static` (`GlobalState::platform`), so this costs nothing.
     ///
+    /// `comm` is the PARENT's own current `Task::comm` bytes (raw, NUL-padded, `TASK_COMM_LEN`
+    /// long) -- on real Linux a forked child's `comm` is the parent's, verbatim, until the
+    /// child's own `execve` (or `PR_SET_NAME`) renames it. The thread-based `clone()` path already
+    /// gets this right (`comm: self.comm.clone()`), but the CHILD's own freshly-built `Task`
+    /// (`adopt_forked_process`, never `clone_for_new_task`) has no `self` to copy from, so the
+    /// caller must thread the parent's value through explicitly -- same shape as
+    /// `sigreturn_trampoline` below, and found the same way (by reading `adopt_forked_process`'s
+    /// own unconditional `[0; TASK_COMM_LEN]` next to the correct thread-based `self.comm.clone()`
+    /// and asking why they differed). Without this, EVERY cross-process fork child starts with an
+    /// empty `comm` regardless of what its parent was actually named, until its own `execve`.
+    ///
     /// `sigreturn_trampoline` is the PARENT's own already-established
     /// `Task::ensure_sigreturn_trampoline` address (0 if never established) -- real guest memory
     /// at that address is already correctly carried over by the ordinary group-copy mechanism,
@@ -1216,6 +1227,7 @@ pub trait ForkChildVerificationProvider {
         inherited_files: alloc::vec::Vec<ForkInheritedFile>,
         inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
         inherited_shim_fds: alloc::vec::Vec<ForkInheritedShimFd>,
+        comm: [u8; 16],
         sigreturn_trampoline: usize,
         identity: ForkChildIdentity,
     ) -> Option<CrossProcessChildHandle> {
@@ -1225,6 +1237,7 @@ pub trait ForkChildVerificationProvider {
         let _ = inherited_pipes;
         let _ = inherited_files;
         let _ = inherited_eventfds;
+        let _ = comm;
         let _ = sigreturn_trampoline;
         let _ = identity;
         None

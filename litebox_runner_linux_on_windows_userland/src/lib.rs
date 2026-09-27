@@ -1845,11 +1845,20 @@ fn diag_process_fork_task_resume_probe(
         .ok()
         .and_then(|s| usize::from_str_radix(&s, 16).ok())
         .unwrap_or(0);
+    // See `LinuxShim::adopt_forked_process`'s own doc comment on `comm`: the parent's own current
+    // `comm` bytes, carried across the `CreateProcessW` boundary the same way
+    // `sigreturn_trampoline` is, via `process_fork::FORK_CHILD_COMM_ENV_VAR`.
+    let comm: [u8; 16] = std::env::var(pf::FORK_CHILD_COMM_ENV_VAR)
+        .ok()
+        .and_then(|s| pf::hex_decode(&s))
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .unwrap_or([0; 16]);
     let entrypoints =
         shim.adopt_forked_process(
             fs,
             task_params,
             page_manager,
+            comm,
             sigreturn_trampoline,
             identity.map(|id| id.pgid),
         );

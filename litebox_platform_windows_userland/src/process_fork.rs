@@ -902,6 +902,18 @@ pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
     "LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE";
 
+/// Carries the PARENT's own current `Task::comm` bytes (hex-encoded, so an embedded NUL byte
+/// survives the env-var boundary intact) across the `CreateProcessW`-spawned child boundary -- see
+/// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s own doc comment on its
+/// `comm` parameter for the full bug this closes (found investigating the same lazy-fork-commit
+/// SIGABRT crash `FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR` was: `LinuxShim::adopt_forked_process`
+/// unconditionally builds the child's own freshly-built `Task` with an EMPTY `comm`, unlike the
+/// thread-based `clone()` path's correct `comm: self.comm.clone()`, so every cross-process fork
+/// child showed a blank `comm` in `DIAG_TIMELINE`/`LITEBOX_DIAG_SYSCALL_TIMELINE` until its own
+/// `execve` -- masquerading as "comm is never inherited at fork" in general before this env var
+/// closed the gap for this one path). Never guest-visible.
+pub const FORK_CHILD_COMM_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_COMM";
+
 /// Carries the child's guest identity as `pid:ppid:pgid` (decimal): the pid the parent's `fork()`
 /// returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/`kill()` view of it
 /// instead of being the child's unrelated Windows process id. Never guest-visible.
@@ -1796,6 +1808,7 @@ pub fn spawn_process_fork_child(
     inherited_files: &[litebox::platform::ForkInheritedFile],
     inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
     inherited_shim_fds: &[litebox::platform::ForkInheritedShimFd],
+    comm: [u8; 16],
     sigreturn_trampoline: usize,
     identity: litebox::platform::ForkChildIdentity,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
@@ -1827,6 +1840,7 @@ pub fn spawn_process_fork_child(
             FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR,
             format!("{sigreturn_trampoline:x}"),
         ),
+        (FORK_CHILD_COMM_ENV_VAR, hex_encode(&comm)),
         (
             FORK_CHILD_GUEST_IDENTITY_ENV_VAR,
             format!("{}:{}:{}", identity.pid, identity.ppid, identity.pgid),

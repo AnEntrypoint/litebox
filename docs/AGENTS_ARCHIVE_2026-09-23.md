@@ -2505,3 +2505,150 @@ zero-`diag-commit`-lines-for-this-pid evidence above, so this candidate did not 
 was observed on its own. Never resolved by a live session -- **the actual bug turned out to be
 unrelated to any of this**: see AGENTS.md's own 109th-pass entry, `sys_execve`'s disarm-ordering,
 not a memory-allocation bug.
+
+## 109th-113th pass full narrative (drained from AGENTS.md by the 114th pass)
+
+- **109th -- fixed the crash the 102nd/106th/107th passes chased**: `sys_execve` called
+  `end_fork_child_verification()` (which disarms `lazy_fork_commit`'s child-side servicing) at
+  function ENTRY, before `copy_vector` read `argv`/`envp` from the old program's still-lazy pages
+  and before `kill_other_threads()`/`ElfLoader::new` could still fail and return to the OLD program.
+  A failed `copy_vector` (`EFAULT` off a not-yet-serviced lazy page) after disarming left the STILL-
+  RUNNING old program's own subsequent heap access unserviceable -- the deterministic
+  `cr2=0x111156f60` fault was a `bash` heap address, not a `/usr/bin/rm` mapping at all. Fixed by
+  moving the disarm call to directly after `kill_other_threads()` succeeds (litebox-main's own
+  `24cb72d`). Also fixed the same pass: the AF_UNIX stream `lookup()`'s presence-miss WARN firing on
+  every connect that then succeeds via `connect_cross_process` (`d16e5ce` -- this had been
+  misdiagnosed by the 103rd pass as `xfwm4` stuck retrying).
+- **110th -- cross-process signal delivery (`LITEBOX_PROCESS_FORK=1`) implemented and verified;
+  pty `ISIG` (Ctrl-C/^Z) and pty-slave carrying across a cross-process fork added.**
+  - **Guest pid bug found and fixed**: the parent's `fork()` returned `child_tid` (e.g. `2`) while
+    the child called itself by its Windows PID (`std::process::id()`, `ppid` = itself). The child
+    now gets `pid:ppid:pgid` via `LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY`
+    (`litebox::platform::ForkChildIdentity`, new `spawn_cross_process_fork_child` parameter), so
+    `$BASHPID` in the child == `$!` in the parent. Forked children (both paths) now inherit the
+    parent's pgid instead of leading their own group.
+  - **Registry**: `SharedProcessTable` (512 pointer-free slots in `GlobalState`) + per-host-process
+    `GlobalStateHandle::xproc_local` (pid -> `Weak<Process>`). Registered: bootstrap, every
+    thread-based fork child, every cross-process child (pre-registered by the parent before the
+    spawn with the parent's host pid, repointed to the child's host pid after it, re-found by the
+    child's own `adopt_forked_process`). Released at `wait4` reap; a slot whose own host process is
+    dead is released on the next send to it (orphans) or when the table is full. `getpgid`/
+    `setpgid`/`setsid` go through it, so `kill(-pgid)`/`kill(0)`/`kill(-1)` reach every host
+    process. New platform hooks (`litebox/src/platform/mod.rs`): `current_host_pid` (0 = registry
+    off, the default for non-Windows platforms), `cross_process_child_host_pid`,
+    `start_signal_wake_listener`, `wake_signal_listener`, `terminate_host_process`.
+  - **Verified** (`debian:stable-slim`, release, `LITEBOX_PROCESS_FORK=1`, logs `.wfgy/pass110_*.log`):
+    `sleep 30 & kill -0/-TERM; wait` -> `kill0_rc=0 term_rc=0 wait_status=143` (was ESRCH + a full
+    30s wait with status 0); subshell `trap ... TERM` -> `got_term`, status 3; `kill -9` -> 137;
+    `set -m` group kill of a job and of a job whose own children inherited its pgid -> all members
+    143, a job in another group untouched; a grandchild (not the caller's child) found via `$( )`
+    killed by pid, then `kill -0` -> ESRCH; `for /bin/true` loop -> `ok`. Thread path (flag unset):
+    identical to the pre-change binary (test 1 passes; subshell/`sleep` children still `Aborted`
+    134 with `A NULL argv[0] was passed through an exec system call` on BOTH binaries -- the
+    thread-based fork's own pre-existing corruption, not this change).
+  - **pty**: `PtyEnd::write` on a master with `ISIG` consumes `VINTR`/`VQUIT`/`VSUSP` and signals
+    the pty's foreground group (`xproc_signal_group`); a fresh pty now reports Linux's default
+    `ISIG` + `c_cc`. `PtyStateRef::Local` getters now prefer the published shared slot (another
+    process's `TIOCSCTTY`/`TCSETS` was invisible to the allocating process). A pty SLAVE fd is now
+    carried across a cross-process fork by reopening `/dev/pts/<id>`
+    (`carriable_pty_slave_for_raw_fd`) instead of being dropped -- the child of `forkpty()`/`script`
+    and every command a shell in a pty runs used to lose its stdio. Verified with a `perl` forkpty
+    harness: `^C` written to the master -> child `bash` trap exits 5 / plain `sleep` dies
+    `WIFSIGNALED(2)`.
+  - **Open**: (pty output gap: fixed 111th, below.) No SIGSTOP/SIGCONT job-control semantics across
+    hosts; no `si_pid` in the cross-process `siginfo`; SIGKILL-by-`TerminateProcess` also kills any
+    thread-based descendants living in that host process; no input-queue flush/`^C` echo on
+    `ISIG`; tkill/tgkill to a thread in another host process still `ESRCH`.
+
+- **111th -- pty data path unified on `SharedPtyTable`; `SIGCHLD` carries a real child siginfo.**
+  - **Pty**: a published pty (any free slot of the 8) has NO in-process channel any more: `/dev/ptmx`
+    returns a `SharedMaster`, every `/dev/pts/<id>`/`TIOCGPTPEER` open a new `SharedSlave`, and all
+    reads/writes/readiness go through the slot's rings (before, a local master read only its
+    channel while other processes' slave output went into a ring nobody read). Line discipline on
+    the ring path: `ISIG`, `ICRNL` (Enter from a terminal emulator is CR), `ECHO`, `OPOST|ONLCR`,
+    DSR reply. Open slaves are counted per host process in the slot; once one was opened and none
+    remains (or its host died) master `read` = `EIO` and poll = `IN|HUP`; master closed/host gone ->
+    slave read EOF, slave write `EIO`. `poll`/`epoll` put `Shared*` pty fds on the existing 15ms
+    bounded-repoll path (no cross-process wake exists). Fresh ptys now default to Linux's
+    `ICRNL`+`ECHO` (+`ISIG`, `ONLCR`, `CS8|CREAD|B38400`); without `ECHO` readline never shows typed
+    input. `ICANON` stays unset (no canonical buffering). `--pty-mode` keeps no-`ECHO`/no-`ICRNL`.
+    Only a 9th simultaneous pty falls back to the old in-process pair (process-local).
+  - **`SIGCHLD`**: both the thread-path exit notify and the cross-process exit notifier sent it with
+    `SI_USER`; util-linux `script` reaps only on `CLD_EXITED`/`CLD_KILLED` and hung forever.
+    `siginfo_child` now sets code/pid/uid/status (`spawn_cross_process_exit_notifier`'s callback
+    receives the raw exit code), and signalfd fills `ssi_pid`/`ssi_uid`/`ssi_status`.
+  - **Verified** (`debian:stable-slim`, logs `.wfgy/pass111_*.log`): `script -qc 'echo
+    hello_from_child; ls /' /dev/null` prints both and exits 0 in ~1s (was: no output, hang);
+    forkpty harness `.wfgy/pass111_forkpty.pl` reads the child's `child_says_hi` then
+    `EIO`(5); interactive `bash -i` on the slave: typed `echo x` echoed, CR -> runs, `x` read
+    back, `exit` -> `EIO`; `^C` -> trap exit 5; single-process pty (`.wfgy/pass111_nofork.pl`, with
+    and without `LITEBOX_PROCESS_FORK`) and 9-pty fallback and `--pty-mode` still work; pass-110
+    signal tests unchanged.
+  - **Open**: no canonical-mode line editing (erase/kill/`^D`-as-EOF); `ECHOCTL` not rendered
+    (`^C` not echoed, a `^D` is echoed raw); ring is 2 KiB per direction; master/slave readiness
+    across processes is polled at 15ms, not event-driven.
+
+- **112th -- unix sockets carried across a cross-process fork (no more thread-path fallback).**
+  `UnixSocket::fork_carry`/`from_fork_spec` (`unix.rs`) + `ForkInheritedShimFd` (opaque spec in
+  `LITEBOX_INTERNAL_FORK_CHILD_SHIM_FDS`, rebuilt by `install_shim_fd_at_fd`). Connected
+  stream/seqpacket: a local pair is PROMOTED onto a `SharedUnixConnTable` slot (`ConnLink`
+  shared by both ends; after promotion both local ends and the child use only the slot, each
+  local end first draining its own pre-promotion channel; the carried end's unread queue moves
+  into the slot; SEQPACKET slots are record-framed). Slot holders are counted per side per HOST
+  process (`SharedConnSlot::hold`), parent pre-holds for the child, child transfers the count;
+  peer gets EOF/EPIPE when a side has no live holder. Listener: rebuilt in the child, advertised in
+  `unix_addr_presence` under the child pid at fork time; child `accept()` takes cross-process
+  connects from the shared queue (connects from the parent's own host still go to the parent's
+  backlog). Fresh unbound stream/dgram sockets recreated. CLOEXEC rule unchanged except addressless
+  socketpairs are carried. Fixed along the way: dead-slot reclaim compared GUEST pids to host
+  processes since the 110th pass (could free live slots) -- now holder-based; `fs::import::
+  import_all` aborted at the first failing entry and every child re-exports Xvfb's 0444
+  `/tmp/.X1-lock`, so every cross-process child's writes were silently dropped (89-90 `failed to
+  import` WARNs/boot) -- now chmod-write-restore + keep going, path in the error.
+  - **Verified** (`.wfgy/pass112_unix.pl`, `pass112_*.log`): socketpair round trip + pre-fork queued
+    data + EOF on child exit; SEQPACKET `m1`/`m2` boundaries; grandchild uses inherited connected
+    socket to a server in a third process which `accept()`s on an inherited listener; bash holding
+    a unix socket runs the trap/kill test cross-process (`got_term`, 3, no fallback -- same test
+    aborts with `invalid stdio handle` on the thread path); 110th/111th tests unchanged.
+  - **Boots** (`pass103_trimmed_boot1.ps1`, non-lazy): 0 `not eligible` in all 3 (baseline 11).
+    boot1: xfwm4/xfsettingsd/xfce4-panel launched, WM_POLL n=5, RAM crater kill at 140s. boot2/3:
+    no crater (>=3.5GB free for 300s) but `xfce4-session` never spawned its children, one
+    `connect_cross_process ... never accepted` to `/tmp/.X11-unix/X1`, `DE_FAILED after 200s`;
+    boot3 showed the import bug above (fixed after; not re-booted -- host RAM fell to 3.8GB).
+    `DE_UP` not reached.
+  - **Open**: SCM_RIGHTS over a slot = `EOPNOTSUPP`+warn (dbus fd passing across processes);
+    datagram socketpairs and bound/connected dgram, bound-unconnected and connecting streams still
+    refuse; slot ring is 2 KiB/direction, 64 slots, 15ms repoll; a cross-process `connect()`ed
+    SEQPACKET is still unframed; child-listener sees only cross-process connects.
+
+- **113th -- fixed a real diagnostic-tooling bug that was hiding useful evidence, confirmed
+  `xfce4-session`'s "Cannot open display: ." is a RACE not a deterministic bug, and got the
+  furthest yet toward `DE_UP` on the non-lazy path (no crash, RAM crater is the sole blocker).**
+  - **`is_syscall_timeline_target_comm` (`litebox_shim_linux/src/diag.rs`) fixed**:
+    `target.starts_with(trimmed)` is trivially true when `trimmed` (`comm`) is empty, which it is
+    for every guest thread between `clone()` and its first `execve()` -- so
+    `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session` traced the pre-exec bootstrap syscalls of EVERY
+    forked thread on the whole boot, never reaching `xfce4-session` at all before the volume
+    exhausted host RAM. Now requires a non-empty `comm`. This tool is now trustworthy again for a
+    single-comm target.
+  - **New permanent diagnostic**: `[diag-xfce4session-envp]` in `sys_execve`
+    (`litebox_shim_linux/src/syscalls/process.rs`), fires only when the execve path ends in
+    `xfce4-session`, dumps `fork_relocations.is_some()` and the `DISPLAY` envp entry straight to
+    stderr. Live-confirmed (`.wfgy/pass113_envp_diag2.err.log`): `DISPLAY=:1` reaches `execve`
+    intact every time -- rules OUT the `copy_vector`/`heal()` staleness class as the cause of the
+    103rd/112th passes' symptom.
+  - **Using the now-fixed syscall timeline** (`.wfgy/pass113_xfce_trace6.err.log`, a clean, non-
+    crashing run): `xfce4-session`'s own `socket()`+`connect()` to the X11 socket fails on its
+    FIRST attempt (`addrlen=25`, abstract-namespace form) then SUCCEEDS on a second
+    `socket()`+`connect()` (`addrlen=20`, path form) -- normal, expected libxcb client behavior.
+    This run printed no `Cannot open display` at all, reached `DE_LAUNCHED_DIRECT` and `WM_POLL
+    n=1`..`n=4` (~40s, zero crash), on the SAME script that produced `Cannot open display` +
+    immediate `exit(1)` in the 112th pass's own runs. Conclusion: a **timing race**, not a
+    deterministic corruption bug.
+  - **RAM crater re-confirmed as the real, sole remaining blocker on the non-lazy path**: the clean
+    run reached `WM_POLL n=4`/128s elapsed before falling below the kill-switch threshold at 14-15
+    concurrent processes -- Track B item 1's own long-documented shape, not a new bug.
+  - **Lazy-mode NOT re-verified on a real boot this pass**: host RAM was severely, externally
+    contended (an unrelated ~7GB Chrome process; free RAM oscillated ~0.1-6.5GB) -- two lazy-mode
+    boot attempts both hit genuine RAM exhaustion (`ENOMEM` loading `cc1`, real memory pressure, not
+    a new correctness bug) before reaching `xfce4-session` at all.

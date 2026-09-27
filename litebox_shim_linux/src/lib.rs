@@ -1042,13 +1042,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// `load_program`/ELF-loads a forked child -- it constructs a `Task` directly from the
     /// parent's already-running state. The difference here is that there is no parent `Task` in
     /// this process to copy from (the parent lives in a different OS process); every field is
-    /// built fresh from the caller-supplied `pm`/`pid`/`ppid`/credentials, mirroring a stdio-only,
-    /// single-thread, freshly-execve'd-looking process shape.
+    /// built fresh from the caller-supplied `pm`/`pid`/`ppid`/credentials/`comm`, mirroring a
+    /// stdio-only, single-thread, freshly-execve'd-looking process shape -- `comm` and
+    /// `sigreturn_trampoline` are the two fields real-Linux `fork()` semantics say must instead
+    /// carry the PARENT's actual value, so both are threaded through explicitly by the caller
+    /// rather than left at a fresh-process default (see each parameter's own doc below).
     ///
     /// Returns bare `LinuxShimEntrypoints`, not a `LoadedProgram` -- there is no ELF-derived
     /// initial register state to report (the caller already has the forked child's own translated
     /// `PtRegs`, captured at the parent's `fork()` call site) and no argv/envp/entry point to
     /// resolve.
+    ///
+    /// `comm` is the PARENT's own current `comm` bytes -- on real Linux a forked child's `comm` is
+    /// the parent's, verbatim, until the child's own `execve`/`PR_SET_NAME`. See
+    /// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s doc comment on its
+    /// own `comm` parameter for the bug this closes: this function used to unconditionally build
+    /// the child with an EMPTY `comm`, unlike `do_clone`'s thread-based path's correct
+    /// `comm: self.comm.clone()` -- confirmed live (every cross-process fork child showed a blank
+    /// `comm` in `DIAG_TIMELINE`/`LITEBOX_DIAG_SYSCALL_TIMELINE` regardless of its parent's real
+    /// name) before being misread as "comm is never inherited at fork" in general.
     ///
     /// `sigreturn_trampoline` is the PARENT's own already-established
     /// `Task::ensure_sigreturn_trampoline` address (`0` if the parent never established one) --
@@ -1064,6 +1076,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         pm: PageManager<Platform, PAGE_SIZE>,
+        comm: [u8; litebox_common_linux::TASK_COMM_LEN],
         sigreturn_trampoline: usize,
         pgid: Option<i32>,
     ) -> LinuxShimEntrypoints<Platform, FS> {
@@ -1114,7 +1127,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     egid,
                 }
                 .into(),
-                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                comm: comm.into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),

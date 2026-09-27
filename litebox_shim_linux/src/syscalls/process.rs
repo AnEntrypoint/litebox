@@ -3503,6 +3503,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_files,
             inherited_eventfds,
             inherited_shim_fds,
+            self.comm.get(),
             self.sigreturn_trampoline_addr(),
             self.prepare_fork_child_identity(child_tid),
         );
@@ -4930,6 +4931,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
+                        self.comm.get(),
                         self.sigreturn_trampoline_addr(),
                         self.prepare_fork_child_identity(child_tid),
                     )
