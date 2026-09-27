@@ -2358,8 +2358,49 @@ pub fn spawn_process_fork_child(
     // `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER=1` (opt-in, diagnostic-only): the debug loop below
     // blocks this call until the child either hits a fault or exits, so it must never run in the
     // default/production path.
-    let external_debugger_requested =
-        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER").is_some();
+    //
+    // 113th pass: on a real desktop boot there are dozens of cross-process forks before the one
+    // under investigation, and this diagnostic's own blocking wait multiplies real per-fork
+    // latency badly enough to change boot timing -- `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_
+    // SKIP=<n>` (diagnostic-only, defaults to 0 = unchanged prior behavior) lets the first `n`
+    // cross-process forks proceed with no debugger attached at all, so only the fork actually
+    // under investigation pays this cost.
+    //
+    // 113th pass, IMPORTANT METHODOLOGICAL FINDING -- do not reuse this diagnostic to investigate
+    // `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` bugs without reading this first:
+    // `DebugActiveProcess` gives the debugger FIRST-CHANCE ownership of every exception in the
+    // debuggee. `observe_real_resume_fault`'s own loop reports the event and calls
+    // `ContinueDebugEvent(..., DBG_CONTINUE)`, which simply retries the faulting instruction --
+    // it does NOT let the exception continue to the process's own in-process VEH afterward (a
+    // debugger's DBG_CONTINUE on a first-chance exception bypasses SEH/VEH entirely per Win32
+    // exception-dispatch semantics; VEH only runs when no debugger claims the exception first).
+    // `lazy_commit_veh`/`guard_cow_write_fault_veh` are THEMSELVES ordinary VEH handlers -- with
+    // this diagnostic attached, every one of their own DELIBERATE, EXPECTED lazy/guard-cow page
+    // faults gets reported here and then retried with no servicing at all, so the same page faults
+    // identically forever instead of being lazily populated once and moving on. Live-confirmed:
+    // enabling this diagnostic on a lazy-mode boot made the RAM crater arrive FASTER and at LOWER
+    // starting free-RAM thresholds than the same boot with no diagnostic at all
+    // (`.wfgy/pass113_extdebug{2,3}.poll.log` vs `pass113_lazy_final.poll.log`'s clean 200s run) --
+    // this tool actively starves the very mechanism it was being used to investigate. Safe to use
+    // for a genuinely unrecoverable crash where VEH would never help anyway (its original 143rd/
+    // 144th-pass purpose); NOT safe for any bug where a working VEH-based fault handler is part of
+    // the normal, expected control flow. Use a live `cdb -p` attach (which lets you choose whether
+    // to pass the exception to VEH via `gh`/`gn`) or unperturbed logging instead for lazy-fork bugs.
+    static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    let external_debugger_skip: u32 = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
+        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let external_debugger_fork_index =
+        EXTERNAL_DEBUGGER_FORK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let external_debugger_requested = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER")
+        .is_some()
+        && external_debugger_fork_index >= external_debugger_skip;
+    if external_debugger_requested {
+        eprintln!(
+            "[process_fork_diag] real-resume: external debugger attaching for fork_index={external_debugger_fork_index} (skip={external_debugger_skip})"
+        );
+    }
     let debug_attached = external_debugger_requested
         && unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcess(pid) } != 0;
     if external_debugger_requested && !debug_attached {
