@@ -660,6 +660,42 @@ opening paragraph warns about).
       NOT proven to be the same bug. `DE_UP` not attempted this pass (blocked throughout on this
       same investigation, not on RAM by the time this lead was found -- RAM was a healthy 4-6GB for
       this entire sequence).
+    - **Follow-up, same pass: added the identical throttled marker to the MAIN handler,
+      `vectored_exception_handler` (`lib.rs`), and found the strongest correlation yet** --
+      `.wfgy/pass114_mainveh_run1.err.log` shows the main handler itself entered at
+      `addr=0x7feffffef000` three separate times, each on a hit-count consistent with belonging to
+      the SAME process that goes on to crash (winpid=19588, `exit_code=3221225477`, elapsed
+      1764ms) -- interleaved with `guard_cow_write_fault_veh`'s own hits landing on ORDINARY guest
+      addresses only (not the trampoline), consistent with it correctly declining this one (an
+      execute-type fault, outside its own write-only check) and letting it fall through to the main
+      handler, exactly as designed. **This is a real, meaningful correlation from live log
+      evidence, not yet a certainty**: the shared log interleaves lines from multiple concurrently-
+      running cross-process children (each with its OWN independent `HITS` counter restarting at
+      1), so attributing all three `addr=0x7feffffef000` lines to the SAME single process by
+      proximity in the log, rather than confirming it via an explicit pid/winpid tag on each line,
+      is inference, not proof. Still the single strongest lead of this whole pass: the main
+      handler's OWN sigreturn-trampoline recognition path (`LinuxShimEntrypoints::exception`'s
+      x86_64 branch, cited in `ensure_sigreturn_trampoline`'s own doc comment) is what's supposed
+      to catch exactly this address and redirect to `sys_rt_sigreturn` -- if it is failing to
+      recognize it specifically for a fault on a THREAD OTHER than the one that established the
+      trampoline (my writer threads, real concurrently-running guest threads distinct from the
+      thread that originally called `os.fork()`), that would be a genuine, novel, thread-scoping
+      bug in the recognition check itself, distinct from every trampoline-address bug this
+      investigation has found before (all of which were about a group/range EXCLUSION, not about
+      the RECOGNITION check misfiring for a legitimately-reached address on the wrong thread).
+    - **Next pickup, precise, superseding the guard-cow-specific items above**: (a) add pid/winpid
+      to every entry-marker line (not just hit-count) so cross-process log interleaving stops being
+      a confound -- a two-minute change to `diag_raw_print`'s call sites here, not yet done. (b)
+      Read `LinuxShimEntrypoints::exception`'s x86_64 branch and whatever it uses to recognize "this
+      fault's address == this PROCESS's sigreturn trampoline" -- does it look up the trampoline via
+      the CURRENT thread's own `Task`, or a process-wide value shared correctly across threads?  A
+      per-thread lookup that only some threads populate correctly would exactly explain a
+      thread-scoped miss. (c) Only after (a)/(b): decide whether this is the same bug as the
+      guard-cow trampoline-collision loop documented above (both involve `0x7feffffef000` and a
+      multi-threaded parent, but via seemingly different mechanisms -- write-fault interception vs.
+      execute-fault recognition) or two independent bugs sharing an address by construction (the
+      trampoline is placed at one deterministic address, so multiple unrelated bugs touching it
+      would all cite the same address without being the same bug).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/

@@ -898,6 +898,23 @@ unsafe extern "system" fn vectored_exception_handler(
     // `TlsGetValue` call, which depends on a working TEB) risks running with it wrong.
     WindowsUserland::restore_thread_gs_base_if_cleared();
 
+    // 114th pass, investigation-only: see `lazy_fork_commit.rs`'s own identical (throttled)
+    // marker on `lazy_commit_veh`/`guard_cow_write_fault_veh` -- establishes whether THIS, the
+    // main handler, is ever reached for a given fault, on the same low-overhead basis.
+    if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
+        static HITS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let n = HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_multiple_of(4096) || n <= 4 {
+            let rec = unsafe { &*(*exception_info).ExceptionRecord };
+            diag_raw_print(
+                b"[diag-veh-entry] vectored_exception_handler hit=0x",
+                n,
+                b" addr=0x",
+                rec.ExceptionInformation.get(1).copied().unwrap_or(0),
+            );
+        }
+    }
+
     // Overflow guard for this invocation's own `VEH_FRAME_STRIDE` slice (PRD
     // `veh-frame-stride-has-no-overflow-guard`, see `VehFrameCanaryGuard`'s own doc comment for
     // the full reasoning). Placed as early as practical -- right after the GS_BASE repair, which
