@@ -2366,26 +2366,24 @@ pub fn spawn_process_fork_child(
     // cross-process forks proceed with no debugger attached at all, so only the fork actually
     // under investigation pays this cost.
     //
-    // 113th pass, IMPORTANT METHODOLOGICAL FINDING -- do not reuse this diagnostic to investigate
-    // `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` bugs without reading this first:
-    // `DebugActiveProcess` gives the debugger FIRST-CHANCE ownership of every exception in the
-    // debuggee. `observe_real_resume_fault`'s own loop reports the event and calls
-    // `ContinueDebugEvent(..., DBG_CONTINUE)`, which simply retries the faulting instruction --
-    // it does NOT let the exception continue to the process's own in-process VEH afterward (a
-    // debugger's DBG_CONTINUE on a first-chance exception bypasses SEH/VEH entirely per Win32
-    // exception-dispatch semantics; VEH only runs when no debugger claims the exception first).
-    // `lazy_commit_veh`/`guard_cow_write_fault_veh` are THEMSELVES ordinary VEH handlers -- with
-    // this diagnostic attached, every one of their own DELIBERATE, EXPECTED lazy/guard-cow page
-    // faults gets reported here and then retried with no servicing at all, so the same page faults
-    // identically forever instead of being lazily populated once and moving on. Live-confirmed:
-    // enabling this diagnostic on a lazy-mode boot made the RAM crater arrive FASTER and at LOWER
-    // starting free-RAM thresholds than the same boot with no diagnostic at all
-    // (`.wfgy/pass113_extdebug{2,3}.poll.log` vs `pass113_lazy_final.poll.log`'s clean 200s run) --
-    // this tool actively starves the very mechanism it was being used to investigate. Safe to use
-    // for a genuinely unrecoverable crash where VEH would never help anyway (its original 143rd/
-    // 144th-pass purpose); NOT safe for any bug where a working VEH-based fault handler is part of
-    // the normal, expected control flow. Use a live `cdb -p` attach (which lets you choose whether
-    // to pass the exception to VEH via `gh`/`gn`) or unperturbed logging instead for lazy-fork bugs.
+    // 113th pass, real cost finding (corrected from an earlier, WRONG draft of this same comment
+    // that claimed `ContinueDebugEvent`'s status here bypasses this process's own VEH -- it does
+    // not: `observe_real_resume_fault`'s own loop below already uses `DBG_EXCEPTION_NOT_HANDLED`
+    // for every real exception, precisely so the guest's own VEH gets the normal second-chance
+    // dispatch, exactly as its own existing comment there already documented; only the ONE
+    // synthetic `DbgBreakPoint` attach breakpoint gets `DBG_CONTINUE`). The REAL cost is simpler:
+    // each observed exception pays a real `WaitForDebugEvent` round trip plus `OpenThread`/
+    // `GetThreadContext`/a multi-field `eprintln!`/`CloseHandle` before `ContinueDebugEvent` lets
+    // VEH proceed -- for a lazy-fork-commit/guard-cow child, which can legitimately take MANY
+    // deliberate page faults during ordinary startup, this per-fault overhead compounds into a
+    // real, measured slowdown (live-confirmed: enabling this diagnostic on a lazy-mode boot made
+    // the RAM crater arrive faster than the same boot with no diagnostic attached,
+    // `.wfgy/pass113_extdebug{2,3}.poll.log` vs `pass113_lazy_final.poll.log`'s clean 200s run) --
+    // a slower-running observed child holds its own memory longer while more concurrent siblings
+    // pile up. Use the `_SKIP` env var above to keep this cost off every fork except the one under
+    // investigation; for a lazy-fork-commit bug specifically, prefer unperturbed logging over this
+    // diagnostic where possible, since even a correctly-passed-through exception still costs real
+    // wall-clock time this mechanism's own timing-sensitive bugs may be exposed by.
     static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
         std::sync::atomic::AtomicU32::new(0);
     let external_debugger_skip: u32 = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
