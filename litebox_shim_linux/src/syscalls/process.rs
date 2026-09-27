@@ -6638,14 +6638,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // costs nothing on the normal path.
         let fork_relocations = self.global.platform.current_thread_fork_relocations();
 
-        // `execve` replaces the address space wholesale: any stale pointer into the parent's
-        // pre-`fork()` ranges is unreachable from here on, so post-`fork()` verification (if it
-        // was armed for this thread) has served its purpose and must stop. Deferred until after
-        // `fork_relocations` above is captured, and after `copy_vector` below has used it --
-        // ending verification only clears `fork_verify`'s OWN single-step bookkeeping, not the
-        // `Arc` this function now holds its own clone of.
-        self.global.platform.end_fork_child_verification();
-
         // Copy pathname
         let pathname = heal(pathname, fork_relocations.as_deref());
         let Some(path_cstr) = pathname.to_cstring::<Platform>() else {
@@ -6708,6 +6700,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // will exit; return any error code.
             return Err(Errno::EBUSY);
         }
+
+        // Only now, past the point of no return, may post-fork verification and lazy-fork-commit
+        // servicing be disarmed: every earlier `return Err` above resumes the OLD program, which
+        // still needs both (an early disarm made a failed `execve` -- e.g. `EFAULT` from
+        // `copy_vector` reading a not-yet-serviced lazy page -- SIGSEGV on its next heap access).
+        self.global.platform.end_fork_child_verification();
 
         // If this process is still a `CLONE_VFORK` child sharing its address space with a live,
         // suspended parent (see `Process::detach_pm_for_vfork_execve`'s doc comment), detach it
