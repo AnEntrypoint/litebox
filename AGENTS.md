@@ -419,297 +419,40 @@ opening paragraph warns about).
   fallbacks, and non-lazy (`LITEBOX_PROCESS_FORK=1` alone) is correctness-clean end to end -- the
   sole remaining blocker on that path is Track B item 1's own RAM crater (below), a resource/timing
   question now, not a correctness one.
-- **114th -- fixed the comm-inheritance bug the 113th pass surfaced (see this file's own top
-  paragraph and `litebox_shim_linux/src/lib.rs`'s `adopt_forked_process` doc comment for the full
-  fix); host RAM stayed too contended all pass for a full DE boot (two attempts, one hit this
-  pass's own kill-switch, one was killed by the harness's own memory-safety reaper) so the
-  lazy-fork SIGABRT itself was not captured live again. Instead, read `lazy_fork_commit.rs`'s
-  guard-cow capture/double-checked-state-read mechanism in full (`guard_cow_write_fault_veh`,
-  `lazy_commit_veh`'s guard-cow branch) looking for a subtler bug than the ones the 88th-102nd
-  passes already found and fixed -- found no new bug by reading alone, but built a genuinely new,
-  targeted synthetic stress test to check empirically rather than guess further:
-  `.wfgy/pass114_torn_read_probe.sh`/`.py` forks a child that does NOT `execve` (matching the real
-  crash's own shape) and scans 64 self-consistency-checksummed anonymous-mmap pages for 3s while
-  the PARENT concurrently busy-rewrites all 64 pages ~4.87 million page-generations' worth --
-  **zero torn/corrupted reads detected** (`.wfgy/pass114_torn_read_run3.err.log`:
-  `CHILD_DONE scans=25472 torn=0`, `PARENT_DONE gens_written=4868160`). This is real negative
-  evidence, heavier than the 113th pass's own bash-level sequential/concurrent repros (which never
-  touched the SAME memory hard enough to stress the capture path this directly): the core
-  guard-cow snapshot mechanism does not exhibit trivial torn reads under sustained single-threaded
-  parent write pressure on plain anonymous pages. **Not yet tested**: a genuinely multi-THREADED
-  parent (real OS-level concurrent writers to the SAME page, closer to `xfce4-session`'s own
-  glib-main-loop-plus-worker-threads shape) -- blocked this pass on the guest image having no
-  working `cc1` (`gcc: fatal error: cannot execute 'cc1'`, `webtop:debian-xfce`), so the probe had
-  to be written in Python (`os.fork`/`mmap`), whose GIL likely serializes the parent's own writes
-  at the bytecode level regardless of real OS thread count -- a C-level multi-threaded version of
-  this exact probe is the next concrete step for this angle, once a compiler-capable environment is
-  set up (or `cc1` itself is diagnosed as missing vs. unreachable under litebox). Also worth
-  reconsidering: the original 113th-pass crash report's own "comm still blank at the moment of
-  death" detail is NOT independent evidence of "before execve" -- every cross-process fork child
-  showed blank comm regardless, pre-114th-pass-fix, so it says nothing about how far into
-  pre-`execve` startup the real crash occurs; re-run `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`
-  (now genuinely trustworthy, confirmed working end-to-end in a real boot this pass -- see
-  `.wfgy/pass114_lazy_commtrace.err.log`'s `comm=xfce4-session` lines) the next time a real boot
-  reaches the crash, to see exactly what syscalls the crashing child issues before it aborts.
-  - **NEW real host-level crash found this same pass, NOT YET CONFIRMED REPRODUCIBLE (one
-    occurrence only -- host RAM cratered to ~1GB free immediately after, from an UNRELATED external
-    process per this session's own repeated pattern, before a second attempt could run)**: extended
-    the torn-read probe above (`.wfgy/pass114_torn_read_probe.sh`'s THIRD revision,
-    `.wfgy/pass114_torn_read_run.ps1` with `RunName=pass114_torn_read_run5`) to start 4 real
-    `ctypes.memmove`-backed (GIL-releasing) writer threads BEFORE calling `os.fork()` and keep them
-    running straight through the fork() call itself -- a window NO prior repro (this pass's own
-    single-post-fork-thread version, or the 113th pass's bash-level ones) ever exercised: OTHER
-    already-running parent threads writing to the SAME lazy-eligible pages WHILE this module's own
-    guard-page installation (per-page, not one atomic operation across the whole group -- see
-    `guard_one_page`'s own doc comment) is still in progress for THIS fork. Result
-    (`.wfgy/pass114_torn_read_run5.err.log`): the THIRD of three cross-process-fork children spawned
-    in this one bash script run (the first two are ordinary bash fork+exec for `which`/`cat`, both
-    exit cleanly with litebox's own `0xc0de0000` clean-exit encoding; the third is bash forking to
-    exec `python3 /tmp/probe3.py`, which is where the real test runs) reported
-    `exit_code=3221225477` = `0xC0000005` = a genuine HOST-LEVEL `STATUS_ACCESS_VIOLATION`, ~1.7s
-    after entering real guest execution -- the SAME general symptom class (a Windows AV, not a
-    guest-level Linux signal) as the 89th/90th passes' `xfce4-session` crashes, not the SIGABRT this
-    whole investigation has been chasing, so this may be a DIFFERENT bug, or a different-looking
-    symptom of the same TOCTOU class -- genuinely unknown yet. **Notably absent**: no
-    `RECOVERY_LOG`/`RECENT_FAULTS`/stack-walk output anywhere in the log despite "Host-side crash
-    machinery"'s own claim that a fatal host fault always dumps one ungated -- either this
-    particular AV happens outside litebox's own VEH-registered scope (plausible: multi-threaded
-    `ctypes`/pthread setup during Python/glibc startup, before the fork even happens, is a real
-    candidate this pass never isolated) or the dump went somewhere this capture didn't redirect.
-    **Next pickup, precise**: (a) re-run the exact same script once host RAM is genuinely free
-    again, with `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` added, to see whether the crash recurs and
-    whether it's inside guard-cow's own code at all or earlier (Python/ctypes/pthread startup,
-    unrelated to lazy-fork-commit); (b) if it recurs, bisect by first testing the SAME script with
-    `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` UNSET (still `LITEBOX_PROCESS_FORK=1`)
-    to establish whether this is guard-cow-specific or a general multi-threaded-cross-process-fork
-    bug; (c) do NOT assume this is the SAME bug as the SIGABRT without that bisection -- it is a
-    different exception code and a different observed timing shape, found by a genuinely different
-    repro, and conflating them without evidence would repeat the 91st-96th passes' own
-    misattribution mistake.
-  - **CONFIRMED, BISECTED, real bug (RAM recovered mid-pass; live-tested, not just theorized) --
-    guard-cow has its OWN, DIFFERENT, HOST-LEVEL memory-safety bug under a genuinely multi-threaded
-    parent, distinct from (and not a fix for, in this exact shape) the pre-existing Bug 4 TOCTOU it
-    was built to close.** Full bisection matrix, same `pass114_torn_read_probe.sh` (pre-fork
-    writer-threads) repro, three configs:
-    - `LITEBOX_PROCESS_FORK=1` alone (eager copy, no lazy anything) --
-      `.wfgy/pass114_bisect_nolazy_run.err.log`: **clean**. `CHILD_DONE scans=25408 torn=0`,
-      `PARENT_DONE child_exit=0 total_writes=101233536`, all four forks (bash's own for `which`/
-      `cat`/`python3`, plus the nested `os.fork()` python3 itself issues) exit with litebox's clean
-      `0xc0de0000` encoding.
-    - `LITEBOX_LAZY_FORK_COMMIT=1` alone, guard-cow UNSET --
-      `.wfgy/pass114_bisect_lazyonly_run.err.log`: crashes, but with a **GUEST-level `SIGSEGV`**
-      (`exit_code=0xc0de800b`, decodes to litebox's signal-exit encoding for signal 11; shell-visible
-      as `RC=139`) -- this is the ALREADY-DOCUMENTED Bug 4 TOCTOU (a lazily-serviced fault reading
-      the parent's CURRENT, not fork-time, memory), expected and unsurprising for a fork-without-
-      `execve` child under heavy concurrent parent writes with no snapshot protection at all.
-    - `LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1` (the combination meant to CLOSE Bug
-      4) -- `.wfgy/pass114_delay_confirm_run.err.log`/`run2.err.log`: crashes with a **HOST-level
-      `STATUS_ACCESS_VIOLATION`** (`exit_code=3221225477`=`0xC0000005`) instead -- three independent
-      occurrences across this pass, elapsed_ms_since_thread_start clustering at 1732/1766/1834ms.
-      **This is a real memory-safety bug in guard-cow's OWN implementation** (a genuine Windows
-      exception in litebox's own host-side Rust/Windows-API code, not a guest-level signal at all),
-      triggered specifically when the forking parent has OTHER real, concurrently-running guest
-      threads at fork time -- guard-cow does not just fail to close Bug 4 for this shape, it
-      introduces a WORSE, host-level crash of its own.
-    - **What immediately precedes the crash** (`.wfgy/pass114_delay_confirm_run2.err.log`, with
-      `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` for full visibility): the crashing process is python3's OWN
-      NESTED `os.fork()` (the SECOND cross-process fork in this one script -- bash's own fork-to-
-      exec-`python3` is the first, already running before this) guarding roughly two dozen distinct
-      batched regions covering the WHOLE address space, including one spanning **44310 pages
-      (~173MB)** -- confirms real installation work, not a trivial single-page operation, and
-      confirms the earlier per-page-`guard_one_page` delay theory (below) does not even apply to
-      MOST of this: `try_guard_region_batched`'s single-`VirtualProtect`-per-region fast path
-      handled every region shown, `guard_one_page` was never reached for any of them. The crash
-      report follows immediately after the LAST region's batched install line, while this
-      process's other real threads (this pass's own pre-fork writer threads, still alive and
-      running in the PARENT of this nested fork -- remember, only the calling thread survives INTO
-      the child, but the PARENT's other threads keep running throughout) are actively writing.
-    - **The original per-page-installation-window theory (this entry's earlier draft, kept below
-      for the record) is NOT confirmed as the actual mechanism** -- the crash timing did not shift
-      meaningfully when an artificial per-page delay (`LITEBOX_DIAG_GUARD_INSTALL_DELAY_US=2000`)
-      was added, exactly because the batched fast path bypasses the per-page code entirely for a
-      contention-free region (the common case, confirmed live here). The REAL mechanism is still
-      unknown -- candidates not yet checked: a bug in `try_guard_region_batched`'s OWN batched
-      bookkeeping specifically when it runs MANY times in one fork (each of ~20+ regions getting
-      its own `HashMap` entry and `Box::leak`'d snapshot table) while OTHER guest threads are
-      concurrently executing arbitrary host-side code (their own `ctypes.memmove` calls, which are
-      themselves going through litebox's OWN syscall/memory-access shimming) that could contend
-      for the SAME global state (`GUARD_PAGE_REGISTRY`'s mutex, the global allocator, or the
-      per-thread scheduling/GIL-equivalent mechanism litebox uses to let multiple guest OS threads
-      run real concurrent host code); or a bug specific to the 44310-page region's sheer size
-      (an overflow, an allocation failure treated as success, or similar) that the earlier
-      `allocate_pages`-focused 106th/107th passes' own investigation never considered because it
-      predates guard-cow's batched path (101st pass) entirely.
-    - **Next pickup, precise**: (a) get a real Windows crash dump/stack walk for this exact crash --
-      none appeared in any of this pass's logs despite "Host-side crash machinery"'s claim that a
-      fatal host fault always dumps one ungated; find out why (wrong output stream? outside VEH's
-      registered scope? crashing in a thread the recovery machinery doesn't cover?) as step one,
-      since a real stack trace would very likely settle this outright. (b) If no dump is available,
-      a live `cdb -p` attach on THIS exact repro (now proven cheap, reliable, and NOT needing a full
-      DE boot -- `.wfgy/pass114_torn_read_probe.sh` + `.wfgy/pass114_delay_confirm_run.ps1`) is a
-      much better target than the original `xfce4-session` SIGABRT ever was, since it reproduces in
-      under 2 seconds with `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG`/`_NO_FAULT_WATCHDOG` already
-      set. (c) Once root-caused, re-run the ORIGINAL `xfce4-session` SIGABRT repro (comm-based
-      tracing now works, see above) to check whether the SAME fix closes it too -- plausible given
-      both involve a genuinely multi-threaded parent forking under guard-cow, but NOT yet confirmed,
-      and must not be assumed.
-  - **Superseded draft (kept for the record, not re-derive)**: the ORIGINAL theory here proposed
-    that `guard_one_page`'s per-page `VirtualProtect` loop (no thread-suspension during it) was the
-    mechanism, and designed `LITEBOX_DIAG_GUARD_INSTALL_DELAY_US` (`lazy_fork_commit.rs`, committed
-    `401c6c6`) to confirm it by artificially widening that specific window. The bisection above shows
-    the crash recurs with statistically the same timing regardless of that delay, and the crashing
-    region went through the BATCHED path (`try_guard_region_batched`) which never calls
-    `guard_one_page` at all when contention-free -- so this specific mechanism is not what's
-    happening here, though the diagnostic itself (still default-off, zero-effect-when-unset) remains
-    in the tree and could matter for a genuinely CONTENDED join (two live generations on the same
-    page), which is a real but much narrower case than what this pass's repro exercises.
-  - **Also refuted, by direct rebuild+test (not just reasoning)**: that the crash was a
-    `__chkstk`-style stack-overflow from `guard_cow_write_fault_veh`'s/`lazy_commit_veh`'s own
-    on-stack `[u8; PAGE_SIZE]` buffer, running (like the ORIGINAL, now-protected main
-    `vectored_exception_handler`, per its own extensively-documented history) while `rsp` was still
-    a guest-address value unrecognized by Windows' stack-overflow bookkeeping. Moved both buffers
-    into a shared `thread_local!` scratch buffer (`FAULT_SCRATCH_BUF`, `try_borrow_mut`-safe against
-    reentrancy, committed alongside this entry) to remove that specific frame-growth trigger without
-    touching the invasive naked-wrapper machinery -- rebuilt, re-ran the identical repro
-    (`.wfgy/pass114_fixtest_run1.err.log`): the SAME `STATUS_ACCESS_VIOLATION` at the SAME ~1.7s
-    mark recurred unchanged. This specific mechanism is not it either; the fix is kept in the tree
-    regardless since it is a real, harmless-by-construction hardening (a large on-stack buffer in
-    an unprotected VEH handler is a latent risk independent of whether it explains THIS crash).
-  - **A real, confirmed, THIRD instance of an already-known bug class -- but DIRECTLY REFUTED as
-    the STATUS_ACCESS_VIOLATION's own proximate cause by a same-pass follow-up test (see below);
-    kept as its own open, real, worth-fixing bug, not conflated with the crash it does not
-    reliably explain.** Added an unconditional,
-    allocation-free entry marker (`LITEBOX_DIAG_VEH_ENTRY_MARKERS=1`, `diag_raw_print`, committed
-    alongside this entry) to both `lazy_commit_veh` and `guard_cow_write_fault_veh` to establish
-    whether either handler is even reached before the crash. Enabling it changed the outcome
-    entirely: instead of crashing, the run became so slow it never finished within a 30s window --
-    `.wfgy/pass114_entrymarker_run1.err.log` shows **149,334** entries into
-    `guard_cow_write_fault_veh` alone, all but a handful at the EXACT SAME address,
-    `addr=0x7feffffef000` -- **this is not a new address**: it is BYTE-IDENTICAL to the
-    sigreturn-trampoline address the 103rd-105th passes already root-caused and fixed TWICE, once
-    in `lazy_commit_veh` (104th pass, `classify_lazy_eligible_groups` excludes the trampoline's
-    own group) and once in `fork_verify.rs`'s independent stale-pointer healer (105th pass). Both
-    of those fixes are real, landed, and still correct for what they cover -- but neither one ever
-    touched `guard_cow_write_fault_veh`, and this run proves live that it has THE SAME address
-    problem: a THIRD, never-patched instance of the same bug class, not a coincidence (this exact
-    address recurring by chance across independent passes would itself be the surprising outcome).
-    - **Why the exclusion doesn't already cover this, most likely explanation (reasoned from
-      `ensure_sigreturn_trampoline`'s own doc comment, `litebox_shim_linux/src/syscalls/signal/
-      mod.rs:528-598` (aarch64) `:637+` (x86_64), NOT yet confirmed live)**: the trampoline is
-      allocated LAZILY, via a real guest `mmap(addr_hint=0, ...)` on the process's OWN first need
-      to deliver a signal -- NOT a fixed, always-present address from the moment of fork.
-      `classify_lazy_eligible_groups`'s own trampoline exclusion only has something to exclude if
-      `sigreturn_trampoline != 0` (already established) AT THE EXACT MOMENT of the fork call that
-      set up guard-cow's protected groups. For this pass's own repro, the crashing fork is python3
-      itself calling a SECOND, NESTED `os.fork()` (bash's own fork-to-exec-python3 is the first) --
-      very plausibly BEFORE python3's own interpreter has ever needed to establish ITS OWN
-      trampoline (no signal delivered yet). If the trampoline then gets allocated for the FIRST
-      TIME *after* this fork's guard-cow groups are already claimed -- and the guest's own `mmap`
-      picks an address (deterministically, matching prior passes' own `0x7feffffef000` observation)
-      that lands inside (or adjacent to, if `try_guard_region_batched`'s batching rounds to a wider
-      VirtualQuery-uniform region) a range ALREADY claimed by guard-cow for this fork -- the
-      trampoline's own `sys_mprotect(PROT_READ_WRITE)`-then-`write_at_offset` sequence (seeding the
-      trampoline bytes, `mod.rs:571-596`/`:638+`) becomes a genuine WRITE into a page
-      `GUARD_PAGE_REGISTRY` still believes it owns, and `guard_cow_write_fault_veh` -- which has NO
-      trampoline-address exclusion of its own, unlike `lazy_commit_veh` -- intercepts it. Whether
-      the SUBSEQUENT restore-and-retry cycle then correctly grants write access (a one-time capture,
-      matching the mechanism's own intended design) or gets stuck (this run's own 149,334-count
-      suggests it does NOT resolve) is the open question -- this is REASONED, not yet confirmed by
-      a live debugger session or by reading `try_guard_region_batched`'s exact interaction with a
-      brand-new, POST-claim guest `mmap` landing inside an already-claimed range.
-    - **CORRECTED, same pass, by direct re-test (not left standing as an untested guess)**: my own
-      first-draft "immediate consequence" paragraph here originally speculated that this loop,
-      running at full un-throttled speed, was most plausibly what consumes the time before the
-      STATUS_ACCESS_VIOLATION. Built the throttled hit-counter this same entry's own "next pickup"
-      called for (`AtomicUsize`, printed only every 4096th hit or the first 4, committed) and
-      re-ran the identical repro (`.wfgy/pass114_throttled_run1.err.log`): the crash recurred
-      (`exit_code=3221225477`, elapsed 1922ms) with `guard_cow_write_fault_veh` hit only **4 times
-      total** in the whole run, at ordinary guest addresses (`0x111156818`, `0x28`,
-      `0x111155f28`, `0x111148090`) -- **NONE at `0x7feffffef000`, and no runaway loop at all this
-      time**. The trampoline-collision refault loop is therefore a REAL bug (still confirmed by the
-      149,334-hit run) but an INTERMITTENT one, and NOT reliably what produces the
-      STATUS_ACCESS_VIOLATION -- this run crashed cleanly without it ever firing. **Do not repeat
-      my own first-draft mistake here**: these are two separate findings needing separate
-      root-causing, not one explaining the other. The crash's own true proximate cause is still
-      unknown; the last thing logged before it in this run was yet another `guard-cow: batched
-      region 0x7fefff1e0000..0x7fefff2e0000` install (a DIFFERENT region, not obviously related to
-      either the trampoline or the 4 ordinary-looking write-fault hits above), which may or may not
-      be causally connected -- not established either way.
-    - **Next pickup, precise, for the trampoline-collision loop (real, confirmed, still open on its
-      own merits)**: (a) reproduce it again with the SAME throttled counter -- this pass's own
-      data shows it does not fire every run, so a few repeats under identical conditions are needed
-      before concluding anything about ITS OWN trigger rate. (b) Read `try_guard_region_batched`'s and `guard_one_page`'s own interaction with a
-      brand-new guest `mmap`/`mprotect` landing inside an address range they already track -- does
-      `sys_mmap`/`sys_mprotect`'s OWN implementation know to invalidate or coordinate with
-      `GUARD_PAGE_REGISTRY` for a range it did not itself allocate the guard for, the same class of
-      gap Bug 6b (100th pass) already fixed for `mprotect`/`munmap` specifically? This new case is a
-      fresh `mmap`, not a `munmap`/`mprotect` of already-guarded memory, so Bug 6b's own fix may not
-      cover it. (c) If confirmed, the fix shape likely mirrors `lazy_commit_veh`'s own 104th-pass
-      defense-in-depth: give `guard_cow_write_fault_veh` its own trampoline-address exclusion check
-      (`Task::sigreturn_trampoline_addr()`, already threaded through `fork_verify.rs` since the
-      105th pass -- reuse the SAME plumbing) OR, more robustly, make `ensure_sigreturn_trampoline`
-      itself check/clear any stale `GUARD_PAGE_REGISTRY` entry for the address its own `mmap` just
-      returned before writing to it, closing this for ANY future handler rather than patching each
-      one individually as it's discovered (this is now the THIRD instance of the same address
-      problem in three different handlers -- a strong signal the fix belongs at the trampoline's
-      OWN allocation site, not scattered across every VEH handler that might touch it).
-    - All new diagnostics this pass (`FAULT_SCRATCH_BUF`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS` with its
-      own throttled hit-counter, and the refuted per-page-delay one) are committed and
-      default-off/zero-effect. No fix has landed for either the trampoline-collision loop or the
-      STATUS_ACCESS_VIOLATION's own real cause -- both remain genuinely open, confirmed real,
-      NOT proven to be the same bug. `DE_UP` not attempted this pass (blocked throughout on this
-      same investigation, not on RAM by the time this lead was found -- RAM was a healthy 4-6GB for
-      this entire sequence).
-    - **Follow-up, same pass: added the identical throttled marker to the MAIN handler,
-      `vectored_exception_handler` (`lib.rs`), first WITHOUT pid tagging, appeared to correlate
-      the crashing process with the trampoline address -- then DEFINITIVELY REFUTED, same pass, by
-      adding real pid tags and re-testing.** First attempt (`.wfgy/pass114_mainveh_run1.err.log`,
-      no pid tag): the main handler was entered at `addr=0x7feffffef000` three times, at hit-counts
-      that LOOKED consistent with the process that went on to crash -- flagged at the time as "a
-      correlation, not a certainty, because of log interleaving" and NOT acted on further before
-      verifying. That caution was warranted: added `GetCurrentProcessId()` to all three entry
-      markers (`FAULT_SCRATCH_BUF`'s own commit, same pass) and re-ran the IDENTICAL repro
-      (`.wfgy/pass114_pidtag_run1.err.log`). The crashing process this run was `winpid=25608`
-      (`0x6408`, `exit_code=3221225477`, elapsed 1902ms) -- and EVERY `addr=0x7feffffef000` hit in
-      the ENTIRE log belongs to `pid=0x341c`, a completely different, non-crashing process. The
-      crashing process (`0x6408`) shows only `addr=0x0` noise (single-step-class exceptions,
-      unrelated) in `lazy_commit_veh`/`vectored_exception_handler`, and ZERO entries at all in
-      `guard_cow_write_fault_veh` in this run. **The "main handler recognizes the trampoline for
-      the crashing process" theory is refuted by direct pid-tagged evidence, not merely
-      unconfirmed** -- exactly the log-interleaving confound flagged (and, this time, actually
-      chased down) rather than left as a plausible-looking but wrong lead.
-    - **Where this leaves the investigation, stated plainly**: three real, distinct, well-tested
-      hypotheses for the STATUS_ACCESS_VIOLATION have now been tried and refuted with direct
-      evidence this pass alone (per-page guard-install timing; on-stack-buffer `__chkstk`
-      stack-overflow; sigreturn-trampoline recognition/collision, in two different forms). The
-      crashing process, in the one run with full pid-tagged visibility, shows essentially NO
-      meaningful activity in either `lazy_fork_commit.rs` handler before it dies -- meaning the
-      fault most likely either (a) happens in an exception TYPE neither marker's unconditional
-      placement would miss (both markers fire on EVERY VEH entry regardless of exception code, so
-      this is unlikely), or (b) happens BEFORE reaching either Rust-level marker at all -- inside
-      the naked `vectored_exception_handler_entry` trampoline itself (`lib.rs`, its own fast-path
-      assembly, or the stack-swap sequence before it ever calls into the Rust
-      `vectored_exception_handler` body where this pass's own marker sits), or in some other
-      mechanism entirely outside this process's own registered VEH chain. **(b) is the more likely
-      explanation given the total silence** -- a fault the VEH chain never sees at all, at either
-      entry point, is fully consistent with "zero diagnostic output anywhere," which is what every
-      capture of this crash has shown from the very first occurrence.
-    - **Next pickup, precise**: instrumenting the NAKED trampoline itself needs care (no Rust
-      prelude, guest-address stack still in effect at its own entry -- `diag_raw_print`'s own small
-      stack frame may or may not be safe to call from inside `vectored_exception_handler_entry`
-      before its own stack-swap runs; check `__chkstk`'s guard-page-probe threshold against that
-      frame's real size before assuming it's fine, given this pass's OWN refuted-on-direct-test
-      history with stack-frame theories). A live debugger remains the more reliable path if one
-      becomes available (`cdb` is NOT currently installed in this environment -- confirmed this
-      pass, `where cdb`/`cdb -version` both fail -- installing Debugging Tools for Windows, or
-      enabling WER LocalDumps via `HKLM/HKCU\...\Windows Error Reporting\LocalDumps` -- also
-      confirmed NOT currently configured, read-only checked this pass -- would need the user's own
-      decision, since both are "modify system settings," not something to do unilaterally). Given
-      this pass's own repeated experience (three real, wrong-but-plausible-looking leads in a row,
-      each only refuted by an actual, careful, harder-evidence follow-up test), the standing
-      instruction for whoever picks this up next is explicit: get PID/winpid tagging on ANY new
-      diagnostic before drawing ANY conclusion from it, not after.
-
+- **114th (full narrative drained to `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "114th pass full
+  narrative" section)** -- fixed the comm-inheritance bug (see this file's own top paragraph,
+  committed, live-verified). Host RAM stayed too contended most of the pass for a full DE boot, so
+  the lazy-fork SIGABRT itself was not captured live again. Built a new synthetic stress test
+  instead: a fork-without-`execve` child scanning checksummed pages while the parent concurrently
+  rewrites them -- zero torn reads under single-threaded parent pressure (real negative evidence).
+  Extended it with real pre-fork writer threads (exercising a race window no prior repro touched)
+  and found a genuine NEW host-level `STATUS_ACCESS_VIOLATION`, reproducible in under 2 seconds
+  (no full boot needed). **Full bisection (three configs) confirmed guard-cow has its own,
+  different, host-level memory-safety bug under a multi-threaded parent** -- distinct from, and not
+  a fix for, the pre-existing Bug 4 TOCTOU it was built to close (plain eager-copy fork: clean;
+  lazy-commit alone: the already-known guest-level Bug 4 SIGSEGV; lazy+guard-cow: the new
+  host-level AV instead). **Three real, distinct root-cause hypotheses were tried and refuted this
+  pass, each by direct rebuild+test**: a per-page guard-install timing race (refuted -- the
+  crashing region used the batched, non-per-page path); a `__chkstk` stack-overflow from an
+  on-stack buffer in the unprotected VEH handlers (refuted -- moved to a `thread_local!` scratch
+  buffer, `FAULT_SCRATCH_BUF`, kept as real hardening regardless, crash recurred unchanged); and a
+  sigreturn-trampoline collision/recognition bug, in two forms -- one CONFIRMED real (a third,
+  never-patched instance of the address-collision bug class the 104th/105th passes already fixed
+  twice elsewhere, `guard_cow_write_fault_veh` looping 149,334 times at the known trampoline
+  address in one run) but shown INTERMITTENT and not reliably the crash's own cause by a throttled
+  follow-up; the other (the main handler's own trampoline recognition) INITIALLY looked correlated
+  but was DEFINITIVELY REFUTED once real pid-tagging was added to the diagnostic -- the apparent
+  correlation was pure cross-process log interleaving. **Net result**: the crashing process itself
+  shows essentially no meaningful VEH activity before dying, pointing at the naked
+  `vectored_exception_handler_entry` trampoline itself (or something outside the registered VEH
+  chain entirely) as the next place to look -- `cdb` is confirmed not installed and WER LocalDumps
+  confirmed not configured in this environment (read-only checks only, no system changes made).
+  **Standing lesson, stated explicitly for whoever picks this up next**: get pid/winpid tagging on
+  ANY new diagnostic before drawing ANY conclusion from it -- three plausible-looking leads were
+  tried and refuted in a row this pass alone. All diagnostics added (`FAULT_SCRATCH_BUF`,
+  `LITEBOX_DIAG_GUARD_INSTALL_DELAY_US`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS`) are committed,
+  default-off, zero-effect. No fix has landed for either the confirmed trampoline-collision loop or
+  the STATUS_ACCESS_VIOLATION's own real cause. `DE_UP` not attempted this pass.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
