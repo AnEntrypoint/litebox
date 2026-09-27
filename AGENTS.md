@@ -451,6 +451,41 @@ opening paragraph warns about).
   (now genuinely trustworthy, confirmed working end-to-end in a real boot this pass -- see
   `.wfgy/pass114_lazy_commtrace.err.log`'s `comm=xfce4-session` lines) the next time a real boot
   reaches the crash, to see exactly what syscalls the crashing child issues before it aborts.
+  - **NEW real host-level crash found this same pass, NOT YET CONFIRMED REPRODUCIBLE (one
+    occurrence only -- host RAM cratered to ~1GB free immediately after, from an UNRELATED external
+    process per this session's own repeated pattern, before a second attempt could run)**: extended
+    the torn-read probe above (`.wfgy/pass114_torn_read_probe.sh`'s THIRD revision,
+    `.wfgy/pass114_torn_read_run.ps1` with `RunName=pass114_torn_read_run5`) to start 4 real
+    `ctypes.memmove`-backed (GIL-releasing) writer threads BEFORE calling `os.fork()` and keep them
+    running straight through the fork() call itself -- a window NO prior repro (this pass's own
+    single-post-fork-thread version, or the 113th pass's bash-level ones) ever exercised: OTHER
+    already-running parent threads writing to the SAME lazy-eligible pages WHILE this module's own
+    guard-page installation (per-page, not one atomic operation across the whole group -- see
+    `guard_one_page`'s own doc comment) is still in progress for THIS fork. Result
+    (`.wfgy/pass114_torn_read_run5.err.log`): the THIRD of three cross-process-fork children spawned
+    in this one bash script run (the first two are ordinary bash fork+exec for `which`/`cat`, both
+    exit cleanly with litebox's own `0xc0de0000` clean-exit encoding; the third is bash forking to
+    exec `python3 /tmp/probe3.py`, which is where the real test runs) reported
+    `exit_code=3221225477` = `0xC0000005` = a genuine HOST-LEVEL `STATUS_ACCESS_VIOLATION`, ~1.7s
+    after entering real guest execution -- the SAME general symptom class (a Windows AV, not a
+    guest-level Linux signal) as the 89th/90th passes' `xfce4-session` crashes, not the SIGABRT this
+    whole investigation has been chasing, so this may be a DIFFERENT bug, or a different-looking
+    symptom of the same TOCTOU class -- genuinely unknown yet. **Notably absent**: no
+    `RECOVERY_LOG`/`RECENT_FAULTS`/stack-walk output anywhere in the log despite "Host-side crash
+    machinery"'s own claim that a fatal host fault always dumps one ungated -- either this
+    particular AV happens outside litebox's own VEH-registered scope (plausible: multi-threaded
+    `ctypes`/pthread setup during Python/glibc startup, before the fork even happens, is a real
+    candidate this pass never isolated) or the dump went somewhere this capture didn't redirect.
+    **Next pickup, precise**: (a) re-run the exact same script once host RAM is genuinely free
+    again, with `LITEBOX_DIAG_LAZY_FORK_COMMIT=1` added, to see whether the crash recurs and
+    whether it's inside guard-cow's own code at all or earlier (Python/ctypes/pthread startup,
+    unrelated to lazy-fork-commit); (b) if it recurs, bisect by first testing the SAME script with
+    `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` UNSET (still `LITEBOX_PROCESS_FORK=1`)
+    to establish whether this is guard-cow-specific or a general multi-threaded-cross-process-fork
+    bug; (c) do NOT assume this is the SAME bug as the SIGABRT without that bisection -- it is a
+    different exception code and a different observed timing shape, found by a genuinely different
+    repro, and conflating them without evidence would repeat the 91st-96th passes' own
+    misattribution mistake.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
