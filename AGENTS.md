@@ -18,7 +18,8 @@ remaining drain candidates for a future pass (the pass-history bullets above thi
 condensed close to the point of losing load-bearing detail; further cuts there risk exactly the
 "claim nobody could point at" failure mode this file's own opening paragraph warns against).
 
-**Where things stand, in one paragraph (updated 113th pass, final)**: three real gaps that used to
+**Where things stand, in one paragraph (updated 113th pass; comm-inheritance fix and new negative
+evidence added by the 114th pass, see its own pass-history entry below)**: three real gaps that used to
 force every cross-process fork onto the crash-prone thread-based relocating path are now closed --
 109th-112th passes landed cross-process `kill()`/process-groups/`SIGCHLD` siginfo, a single shared
 data path for ptys (Ctrl-C, `script`, interactive terminals all verified), and unix-socket carrying
@@ -418,6 +419,38 @@ opening paragraph warns about).
   fallbacks, and non-lazy (`LITEBOX_PROCESS_FORK=1` alone) is correctness-clean end to end -- the
   sole remaining blocker on that path is Track B item 1's own RAM crater (below), a resource/timing
   question now, not a correctness one.
+- **114th -- fixed the comm-inheritance bug the 113th pass surfaced (see this file's own top
+  paragraph and `litebox_shim_linux/src/lib.rs`'s `adopt_forked_process` doc comment for the full
+  fix); host RAM stayed too contended all pass for a full DE boot (two attempts, one hit this
+  pass's own kill-switch, one was killed by the harness's own memory-safety reaper) so the
+  lazy-fork SIGABRT itself was not captured live again. Instead, read `lazy_fork_commit.rs`'s
+  guard-cow capture/double-checked-state-read mechanism in full (`guard_cow_write_fault_veh`,
+  `lazy_commit_veh`'s guard-cow branch) looking for a subtler bug than the ones the 88th-102nd
+  passes already found and fixed -- found no new bug by reading alone, but built a genuinely new,
+  targeted synthetic stress test to check empirically rather than guess further:
+  `.wfgy/pass114_torn_read_probe.sh`/`.py` forks a child that does NOT `execve` (matching the real
+  crash's own shape) and scans 64 self-consistency-checksummed anonymous-mmap pages for 3s while
+  the PARENT concurrently busy-rewrites all 64 pages ~4.87 million page-generations' worth --
+  **zero torn/corrupted reads detected** (`.wfgy/pass114_torn_read_run3.err.log`:
+  `CHILD_DONE scans=25472 torn=0`, `PARENT_DONE gens_written=4868160`). This is real negative
+  evidence, heavier than the 113th pass's own bash-level sequential/concurrent repros (which never
+  touched the SAME memory hard enough to stress the capture path this directly): the core
+  guard-cow snapshot mechanism does not exhibit trivial torn reads under sustained single-threaded
+  parent write pressure on plain anonymous pages. **Not yet tested**: a genuinely multi-THREADED
+  parent (real OS-level concurrent writers to the SAME page, closer to `xfce4-session`'s own
+  glib-main-loop-plus-worker-threads shape) -- blocked this pass on the guest image having no
+  working `cc1` (`gcc: fatal error: cannot execute 'cc1'`, `webtop:debian-xfce`), so the probe had
+  to be written in Python (`os.fork`/`mmap`), whose GIL likely serializes the parent's own writes
+  at the bytecode level regardless of real OS thread count -- a C-level multi-threaded version of
+  this exact probe is the next concrete step for this angle, once a compiler-capable environment is
+  set up (or `cc1` itself is diagnosed as missing vs. unreachable under litebox). Also worth
+  reconsidering: the original 113th-pass crash report's own "comm still blank at the moment of
+  death" detail is NOT independent evidence of "before execve" -- every cross-process fork child
+  showed blank comm regardless, pre-114th-pass-fix, so it says nothing about how far into
+  pre-`execve` startup the real crash occurs; re-run `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`
+  (now genuinely trustworthy, confirmed working end-to-end in a real boot this pass -- see
+  `.wfgy/pass114_lazy_commtrace.err.log`'s `comm=xfce4-session` lines) the next time a real boot
+  reaches the crash, to see exactly what syscalls the crashing child issues before it aborts.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
