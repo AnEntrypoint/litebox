@@ -1133,9 +1133,10 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
         let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(4096) || n <= 4 {
             let rec = unsafe { &*(*info).ExceptionRecord };
+            let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
             crate::diag_raw_print(
-                b"[diag-veh-entry] lazy_commit_veh hit=0x",
-                n,
+                b"[diag-veh-entry] lazy_commit_veh pid=0x",
+                pid as usize,
                 b" addr=0x",
                 rec.ExceptionInformation.get(1).copied().unwrap_or(0),
             );
@@ -2132,9 +2133,10 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
         static HITS: AtomicUsize = AtomicUsize::new(0);
         let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(4096) || n <= 4 {
+            let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
             crate::diag_raw_print(
-                b"[diag-veh-entry] guard_cow_write_fault_veh hit=0x",
-                n,
+                b"[diag-veh-entry] guard_cow_write_fault_veh pid=0x",
+                pid as usize,
                 b" addr=0x",
                 rec.ExceptionInformation.get(1).copied().unwrap_or(0),
             );

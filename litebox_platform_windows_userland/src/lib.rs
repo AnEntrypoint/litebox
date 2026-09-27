@@ -906,9 +906,10 @@ unsafe extern "system" fn vectored_exception_handler(
         let n = HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if n.is_multiple_of(4096) || n <= 4 {
             let rec = unsafe { &*(*exception_info).ExceptionRecord };
+            let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
             diag_raw_print(
-                b"[diag-veh-entry] vectored_exception_handler hit=0x",
-                n,
+                b"[diag-veh-entry] vectored_exception_handler pid=0x",
+                pid as usize,
                 b" addr=0x",
                 rec.ExceptionInformation.get(1).copied().unwrap_or(0),
             );

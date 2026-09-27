@@ -661,41 +661,54 @@ opening paragraph warns about).
       same investigation, not on RAM by the time this lead was found -- RAM was a healthy 4-6GB for
       this entire sequence).
     - **Follow-up, same pass: added the identical throttled marker to the MAIN handler,
-      `vectored_exception_handler` (`lib.rs`), and found the strongest correlation yet** --
-      `.wfgy/pass114_mainveh_run1.err.log` shows the main handler itself entered at
-      `addr=0x7feffffef000` three separate times, each on a hit-count consistent with belonging to
-      the SAME process that goes on to crash (winpid=19588, `exit_code=3221225477`, elapsed
-      1764ms) -- interleaved with `guard_cow_write_fault_veh`'s own hits landing on ORDINARY guest
-      addresses only (not the trampoline), consistent with it correctly declining this one (an
-      execute-type fault, outside its own write-only check) and letting it fall through to the main
-      handler, exactly as designed. **This is a real, meaningful correlation from live log
-      evidence, not yet a certainty**: the shared log interleaves lines from multiple concurrently-
-      running cross-process children (each with its OWN independent `HITS` counter restarting at
-      1), so attributing all three `addr=0x7feffffef000` lines to the SAME single process by
-      proximity in the log, rather than confirming it via an explicit pid/winpid tag on each line,
-      is inference, not proof. Still the single strongest lead of this whole pass: the main
-      handler's OWN sigreturn-trampoline recognition path (`LinuxShimEntrypoints::exception`'s
-      x86_64 branch, cited in `ensure_sigreturn_trampoline`'s own doc comment) is what's supposed
-      to catch exactly this address and redirect to `sys_rt_sigreturn` -- if it is failing to
-      recognize it specifically for a fault on a THREAD OTHER than the one that established the
-      trampoline (my writer threads, real concurrently-running guest threads distinct from the
-      thread that originally called `os.fork()`), that would be a genuine, novel, thread-scoping
-      bug in the recognition check itself, distinct from every trampoline-address bug this
-      investigation has found before (all of which were about a group/range EXCLUSION, not about
-      the RECOGNITION check misfiring for a legitimately-reached address on the wrong thread).
-    - **Next pickup, precise, superseding the guard-cow-specific items above**: (a) add pid/winpid
-      to every entry-marker line (not just hit-count) so cross-process log interleaving stops being
-      a confound -- a two-minute change to `diag_raw_print`'s call sites here, not yet done. (b)
-      Read `LinuxShimEntrypoints::exception`'s x86_64 branch and whatever it uses to recognize "this
-      fault's address == this PROCESS's sigreturn trampoline" -- does it look up the trampoline via
-      the CURRENT thread's own `Task`, or a process-wide value shared correctly across threads?  A
-      per-thread lookup that only some threads populate correctly would exactly explain a
-      thread-scoped miss. (c) Only after (a)/(b): decide whether this is the same bug as the
-      guard-cow trampoline-collision loop documented above (both involve `0x7feffffef000` and a
-      multi-threaded parent, but via seemingly different mechanisms -- write-fault interception vs.
-      execute-fault recognition) or two independent bugs sharing an address by construction (the
-      trampoline is placed at one deterministic address, so multiple unrelated bugs touching it
-      would all cite the same address without being the same bug).
+      `vectored_exception_handler` (`lib.rs`), first WITHOUT pid tagging, appeared to correlate
+      the crashing process with the trampoline address -- then DEFINITIVELY REFUTED, same pass, by
+      adding real pid tags and re-testing.** First attempt (`.wfgy/pass114_mainveh_run1.err.log`,
+      no pid tag): the main handler was entered at `addr=0x7feffffef000` three times, at hit-counts
+      that LOOKED consistent with the process that went on to crash -- flagged at the time as "a
+      correlation, not a certainty, because of log interleaving" and NOT acted on further before
+      verifying. That caution was warranted: added `GetCurrentProcessId()` to all three entry
+      markers (`FAULT_SCRATCH_BUF`'s own commit, same pass) and re-ran the IDENTICAL repro
+      (`.wfgy/pass114_pidtag_run1.err.log`). The crashing process this run was `winpid=25608`
+      (`0x6408`, `exit_code=3221225477`, elapsed 1902ms) -- and EVERY `addr=0x7feffffef000` hit in
+      the ENTIRE log belongs to `pid=0x341c`, a completely different, non-crashing process. The
+      crashing process (`0x6408`) shows only `addr=0x0` noise (single-step-class exceptions,
+      unrelated) in `lazy_commit_veh`/`vectored_exception_handler`, and ZERO entries at all in
+      `guard_cow_write_fault_veh` in this run. **The "main handler recognizes the trampoline for
+      the crashing process" theory is refuted by direct pid-tagged evidence, not merely
+      unconfirmed** -- exactly the log-interleaving confound flagged (and, this time, actually
+      chased down) rather than left as a plausible-looking but wrong lead.
+    - **Where this leaves the investigation, stated plainly**: three real, distinct, well-tested
+      hypotheses for the STATUS_ACCESS_VIOLATION have now been tried and refuted with direct
+      evidence this pass alone (per-page guard-install timing; on-stack-buffer `__chkstk`
+      stack-overflow; sigreturn-trampoline recognition/collision, in two different forms). The
+      crashing process, in the one run with full pid-tagged visibility, shows essentially NO
+      meaningful activity in either `lazy_fork_commit.rs` handler before it dies -- meaning the
+      fault most likely either (a) happens in an exception TYPE neither marker's unconditional
+      placement would miss (both markers fire on EVERY VEH entry regardless of exception code, so
+      this is unlikely), or (b) happens BEFORE reaching either Rust-level marker at all -- inside
+      the naked `vectored_exception_handler_entry` trampoline itself (`lib.rs`, its own fast-path
+      assembly, or the stack-swap sequence before it ever calls into the Rust
+      `vectored_exception_handler` body where this pass's own marker sits), or in some other
+      mechanism entirely outside this process's own registered VEH chain. **(b) is the more likely
+      explanation given the total silence** -- a fault the VEH chain never sees at all, at either
+      entry point, is fully consistent with "zero diagnostic output anywhere," which is what every
+      capture of this crash has shown from the very first occurrence.
+    - **Next pickup, precise**: instrumenting the NAKED trampoline itself needs care (no Rust
+      prelude, guest-address stack still in effect at its own entry -- `diag_raw_print`'s own small
+      stack frame may or may not be safe to call from inside `vectored_exception_handler_entry`
+      before its own stack-swap runs; check `__chkstk`'s guard-page-probe threshold against that
+      frame's real size before assuming it's fine, given this pass's OWN refuted-on-direct-test
+      history with stack-frame theories). A live debugger remains the more reliable path if one
+      becomes available (`cdb` is NOT currently installed in this environment -- confirmed this
+      pass, `where cdb`/`cdb -version` both fail -- installing Debugging Tools for Windows, or
+      enabling WER LocalDumps via `HKLM/HKCU\...\Windows Error Reporting\LocalDumps` -- also
+      confirmed NOT currently configured, read-only checked this pass -- would need the user's own
+      decision, since both are "modify system settings," not something to do unilaterally). Given
+      this pass's own repeated experience (three real, wrong-but-plausible-looking leads in a row,
+      each only refuted by an actual, careful, harder-evidence follow-up test), the standing
+      instruction for whoever picks this up next is explicit: get PID/winpid tagging on ANY new
+      diagnostic before drawing ANY conclusion from it, not after.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
