@@ -59,12 +59,25 @@ than a synthetic subshell. **`DE_UP` has not been reached by any of the 113 pass
 lazy-fork flags remain default OFF.** Recorded as tracked defects in `.gm/prd.yml`:
 `non-lazy-fork-ram-crater-before-de-up` (resource/timing, non-lazy) and the pre-existing
 lazy-fork-commit TOCTOU item (rescoped to include this new real-workload repro). **Next pickup**:
-(a) non-lazy -- just re-run `.wfgy/pass113_de_only_ready_seed.tar`-based boots under genuinely
-sustained 6GB+-free host RAM (no concurrent large host process) until one survives past `xfwm4`'s
-own startup; this needs no further code changes, only a clean environment. (b) lazy -- a live `cdb
--pv` attach on the aborting child (guest pid recoverable via `DIAG_TIMELINE clone`/the winpid in
-`task-resume-probe`) is now finally warranted, since this is a real, reproducible, comm-identified
-crash in the actual target workload, not a hard-to-pin synthetic repro.
+(a) non-lazy -- **corrected, live-measured**: 6GB free at boot start is NOT enough on its own --
+two independent runs starting at 6.09-6.36GB free both cratered at the identical `WM_POLL n=4`
+point (~130s elapsed, 14->15->17 processes, 0.6-0.8GB free) with zero correctness issue either
+time. The boot's own cumulative committed-memory need by this point is a real, consistent ~5GB+
+regardless of starting headroom in this range -- needs either more like 8-10GB+ free sustained, or
+a genuine reduction in Track B item 1's own cumulative cost (the original, still-open 76th-82nd
+pass investigation). This needs no further code changes, only more host RAM than has been
+available this session. (b) lazy -- **negative evidence gathered, real trigger still not isolated
+to a cheap repro**: neither a sequential fork-no-exec/`wait4`/fork-no-exec-again pattern nor a
+genuinely CONCURRENT two-outstanding-children pattern (both on `debian:stable-slim`,
+`.wfgy/pass113_sigabrt_repro.sh`/`pass113_concurrent_repro.sh`) reproduces the crash -- both ran
+clean, no `Signal(6)`, both children exited normally. The real trigger likely needs the SPECIFIC
+shape only the real boot has: `xfce4-session`'s own vfork'd `/bin/sh`->`iceauth` chain (shares the
+SAME Windows process as `xfce4-session` itself, unlike an ordinary cross-process sibling) still
+alive/untracked-as-reaped at the moment a THIRD, genuinely cross-process child is forked -- not yet
+tested in isolation. A live `cdb` attach on the real boot repro remains the fallback: invasive
+`cdb -p <winpid>` (per the 93rd pass's own correction -- **`-pv` cannot receive debug events at
+all**, despite this file having said `-pv` above before this correction), `qd` to detach, never
+bare `q`; guest pid recoverable via `DIAG_TIMELINE clone`/the winpid in `task-resume-probe`.
 
 ## The cheap repro — start here
 
