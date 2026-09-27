@@ -73,11 +73,52 @@ genuinely CONCURRENT two-outstanding-children pattern (both on `debian:stable-sl
 clean, no `Signal(6)`, both children exited normally. The real trigger likely needs the SPECIFIC
 shape only the real boot has: `xfce4-session`'s own vfork'd `/bin/sh`->`iceauth` chain (shares the
 SAME Windows process as `xfce4-session` itself, unlike an ordinary cross-process sibling) still
-alive/untracked-as-reaped at the moment a THIRD, genuinely cross-process child is forked -- not yet
-tested in isolation. A live `cdb` attach on the real boot repro remains the fallback: invasive
-`cdb -p <winpid>` (per the 93rd pass's own correction -- **`-pv` cannot receive debug events at
-all**, despite this file having said `-pv` above before this correction), `qd` to detach, never
-bare `q`; guest pid recoverable via `DIAG_TIMELINE clone`/the winpid in `task-resume-probe`.
+alive/untracked-as-reaped at the moment a THIRD, genuinely cross-process child is forked -- **this
+hypothesis is now REFUTED by careful re-reading, not just untested**: real vfork semantics (and
+this codebase's own implementation, `Process::wait_for_vfork_done`) block the PARENT's own thread
+entirely until the vfork child calls `execve`/exits, and `detach_pm_for_vfork_execve` gives the
+`execve`'ing child (`iceauth`) a brand-new, fully-detached `PageManager` at the START of its own
+`sys_execve`, before touching memory -- so by the time `xfce4-session`'s thread is even running
+again (to fork the crashing child), the vfork sharing has ALREADY ended and nothing else has any
+claim on its memory. Drop this angle; it does not explain the crash.
+  - **Real, general (non-crash-specific) gap found while investigating**: a freshly `clone()`d
+    task's `comm` is NEVER copied from the parent (unlike real Linux, where a forked child inherits
+    `comm` until its own `execve` renames it) -- it stays the unset/inherited-empty value the whole
+    time, confirmed general (every forked child shows this in `DIAG_TIMELINE clone`, not just the
+    crashing one). This means `LITEBOX_DIAG_SYSCALL_TIMELINE`'s comm-based filter can NEVER see a
+    forked child's own pre-`execve` syscalls -- exactly the blind spot that made the earlier "zero
+    syscalls ever traced for the crashing pid" finding meaningless (it was the filter's own blind
+    spot, not evidence the child never executed anything). **Fixed the tooling, not yet the comm-
+    inheritance gap itself**: added `LITEBOX_DIAG_SYSCALL_TIMELINE_PID=<comma-list>` (`diag.rs`,
+    `lib.rs`), a pid-based companion filter that works across the `clone()`/`execve()` boundary
+    since pid, unlike comm, is stable and already known from `DIAG_TIMELINE`. Not yet used
+    successfully to capture the crash -- every attempt this pass (`.wfgy/pass113_pidtrace{,2}.err.
+    log`, targeting pids `48-53`) cratered on RAM before reaching that pid range at all; host RAM
+    was trending steadily downward through this whole stretch (an unrelated Chrome+session-wide
+    load, not litebox's own behavior) and never gave a sustained window. **Whether `comm` SHOULD be
+    inherited at fork time (a real correctness question independent of this crash) is not yet
+    investigated** -- worth a look on its own, separate from this pickup.
+  - **Also tried and correctly abandoned this pass**: `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER`
+    (a pre-existing, 143rd/144th-pass kernel-debug-event observer) plus a new
+    `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP=<n>` gate added this pass to scope it to only
+    the fork under investigation. It correctly passes exceptions through to VEH
+    (`DBG_EXCEPTION_NOT_HANDLED`, confirmed by re-reading `observe_real_resume_fault` -- an EARLIER
+    draft of this same paragraph wrongly claimed it bypasses VEH via `DBG_CONTINUE`; that claim was
+    corrected in the same pass, `162fe02`, rather than left standing), but its own real per-event
+    overhead (a `WaitForDebugEvent` round trip, `GetThreadContext`, a multi-field `eprintln!`, per
+    fault) was enough to measurably worsen the RAM crater on a lazy-fork-commit boot (which can
+    legitimately take many deliberate page faults during ordinary startup) -- confirmed by direct
+    comparison against the clean, undiagnosed `pass113_lazy_final` run. Kept the `_SKIP` gate
+    (harmless when unset, real use for a genuinely unrecoverable non-lazy crash where this overhead
+    doesn't matter), but it is not the right tool for THIS specific investigation.
+  - **Next pickup, precise**: once host RAM is genuinely, sustainedly free (the 8-10GB already
+    established as insufficient at 6GB doesn't even apply here -- this pass never even reached 5GB
+    sustained), re-run with `LITEBOX_DIAG_SYSCALL_TIMELINE_PID=48,49,50,51,52,53` (or whatever pids
+    a fresh `DIAG_TIMELINE clone`/`execve` sequence shows for `xfce4-session`'s own children on that
+    specific run -- pid allocation has been consistent run-to-run for this exact seed script in
+    prior passes, but confirm rather than assume) to finally see the crashing child's OWN pre-
+    `execve` syscalls, which no capture has ever shown before. `.wfgy/pass113_pidtrace.ps1` is ready
+    to use as-is.
 
 ## The cheap repro — start here
 
