@@ -1412,7 +1412,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             return Err(Errno::EINVAL);
         };
         let Some(entry) = guard.get(&key) else {
-            log_cross_process_presence_miss(task, &key);
+            // No presence-miss log here: the only caller, `connect`, falls through to
+            // `connect_cross_process`, which logs only when the cross-process attempt itself fails.
             return Err(Errno::ECONNREFUSED);
         };
         match &entry.0 {
@@ -1592,10 +1593,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 slot
             }
             Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut)) => {
-                litebox_util_log::debug!(
+                litebox_util_log::warn!(
                     self_pid:% = self_pid,
-                    request_idx:% = request_idx;
-                    "DIAG connect_cross_process: request TIMED OUT, cancelling"
+                    request_idx:% = request_idx,
+                    key_bytes:? = key_bytes;
+                    "connect_cross_process: listener in another process never accepted within \
+                     SHARED_UNIX_CROSS_CONNECT_TIMEOUT, cancelling and returning ECONNREFUSED"
                 );
                 task.global
                     .unix_shared_connect_queue
