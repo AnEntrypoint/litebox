@@ -39,8 +39,21 @@ large Chrome process) to get a clean run; the cheap isolated repro
 (`.wfgy/pass105_xset_repro.sh`) should still be re-checked clean before trusting it. **Both lazy-fork
 flags remain default OFF. `DE_UP` has not been reached by any of the 113 passes to date, but for the
 first time the non-lazy path's own remaining blocker is narrowed to exactly one thing: Track B item
-1's RAM crater.** Next pickup: re-run the lazy-mode full boot (`.wfgy/pass110_lazy_boot1.ps1`) once
-host RAM is genuinely free (6GB+, sustained) to check whether it now reaches `DE_UP`.
+1's RAM crater.** Also 113th: found and fixed the actual mechanism behind the `Cannot open display`
+race in the TEST HARNESS itself (not litebox source) -- `de_only.sh`'s own `XSOCK_WAIT_DONE` loop
+only checks that Xvfb's socket FILE exists, not that its connection-accepting state is actually
+ready, and `PROBE_XSET` ran the real connectivity probe exactly ONCE with no retry before launching
+`xfce4-session`, whose own single-shot `XOpenDisplay` has no retry of its own. Fixed harness-side
+(new seed `.wfgy/pass113_de_only_ready_seed.tar`, built from `pass103_de_only_trimmed_seed.tar` with
+`PROBE_XSET` now retrying its OWN connect probe up to 15s before proceeding) -- live-verified the
+retry loop is a correct no-op on the fast path (`attempts=0` in a clean run,
+`.wfgy/pass113_ready_boot1.out.log`) but not yet verified to actually CLOSE the race (every attempt
+this pass hit the same external RAM contention below before reaching `xfce4-session` again). **Next
+pickup**: use `pass113_de_only_ready_seed.tar` (not the older `_trimmed_` one) for all future
+non-lazy boot attempts, and once host RAM is genuinely free (6GB+, sustained, no large unrelated
+process) run it to completion to confirm `Cannot open display` no longer recurs; separately, re-run
+the lazy-mode full boot (`.wfgy/pass110_lazy_boot1.ps1`, also worth pointing at the new ready-seed)
+to check whether IT now reaches `DE_UP` (the RAM crater fix + this race fix combined may be enough).
 
 ## The cheap repro — start here
 
