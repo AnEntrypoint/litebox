@@ -54,6 +54,24 @@ non-lazy boot attempts, and once host RAM is genuinely free (6GB+, sustained, no
 process) run it to completion to confirm `Cannot open display` no longer recurs; separately, re-run
 the lazy-mode full boot (`.wfgy/pass110_lazy_boot1.ps1`, also worth pointing at the new ready-seed)
 to check whether IT now reaches `DE_UP` (the RAM crater fix + this race fix combined may be enough).
+**Second harness fix, same pass**: `de_only.sh`'s own `xrdb "$HOME/.Xresources"` (a one-line file,
+`Xcursor.theme: breeze_cursors`, with zero C-preprocessor directives) still ran through xrdb's
+default cpp-preprocessing pass, forking a real `sh -> cpp -> cc1` chain for nothing to preprocess --
+directly observed causing the ENOMEM that killed a lazy-mode run at exactly this point
+(`.wfgy/pass113_lazy_ready1.err.log`: `load_program failed ... path=.../cc1 error=ENOMEM`). Changed
+to `xrdb -nocpp` in the same seed. **Live-verified real improvement, both fork paths, several
+runs after this fix landed**: zero `Cannot open display`, zero `cc1`/ENOMEM crashes, zero fatal
+signals -- every remaining crater is now purely external Windows host RAM exhaustion (confirmed via
+`Get-CimInstance Win32_OperatingSystem`/top-process checks showing an unrelated multi-GB browser
+process, not litebox's own commit growth exceeding what's actually free) rather than anything
+litebox- or harness-side. Non-lazy reached `WM_POLL n=3` at 115s total elapsed in one such run
+(`.wfgy/pass113_nocpp_boot1`); lazy-mode reached `DE_LAUNCHED_DIRECT` cleanly in another
+(`.wfgy/pass113_lazy_nocpp1`) before an external RAM drop (5.1GB -> 1.1GB within 16s, unrelated to
+litebox) cut it short. **With both harness fixes applied, no pass has observed ANY correctness bug
+on either fork path anymore -- the only remaining blocker to `DE_UP`, on both paths, is getting one
+uninterrupted run under genuinely free, sustained host RAM.** Next pickup: same as above, but use
+`pass113_de_only_ready_seed.tar` as it now stands (readiness retry + `xrdb -nocpp`, both already
+baked in) -- do not re-derive a fresh seed without both fixes.
 
 ## The cheap repro — start here
 
