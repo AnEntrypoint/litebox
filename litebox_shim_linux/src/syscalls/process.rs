@@ -6795,6 +6795,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             copy_vector::<Platform>(envp, "envp", fork_relocations.as_deref())?
         };
 
+        // One-off diagnostic (113th pass, litebox-main): xfce4-session prints "Cannot open
+        // display: ." and exits(1) immediately after execve on the cross-process-fork path, and
+        // this crate's own copy_vector doc comment already records a live-confirmed prior
+        // instance of exactly this symptom (a stale, untranslated envp entry on the OLD
+        // thread-based eager-duplicate path). This checks whether the SAME symptom -- envp
+        // reaching here already wrong -- recurs for the CURRENT cross-process/vfork paths, or
+        // whether the corruption (if any) happens later, closer to the observed exit. Fires only
+        // for this one path name, straight to stderr, zero cost for every other execve.
+        if path.ends_with("xfce4-session") {
+            let comm_bytes = self.comm.get();
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-xfce4session-envp] pid={} fork_relocations={} envp_count={} \
+                     display_entry={:?}",
+                    self.pid.get(),
+                    fork_relocations.is_some(),
+                    envp_vec.len(),
+                    envp_vec
+                        .iter()
+                        .find(|e| e.as_bytes().starts_with(b"DISPLAY="))
+                        .map(|e| alloc::string::String::from_utf8_lossy(e.as_bytes()).into_owned()),
+                ),
+            );
+            let _ = comm_bytes;
+        }
+
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
