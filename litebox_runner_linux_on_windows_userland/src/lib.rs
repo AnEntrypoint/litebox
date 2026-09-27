@@ -1892,6 +1892,30 @@ fn diag_process_fork_task_resume_probe(
         }
     }
 
+    // Rebuild the unix sockets the parent carried (`litebox::platform::ForkInheritedShimFd`).
+    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_SHIM_FDS_ENV_VAR)
+        && let Some(spec) = spec.to_str()
+    {
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let parsed = item.split_once(':').and_then(|(fd, hex)| {
+                let fd = i32::from_str_radix(fd, 16).ok()?;
+                let spec = String::from_utf8(pf::hex_decode(hex)?).ok()?;
+                Some((fd, spec))
+            });
+            let Some((fd, spec)) = parsed else {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): unparseable inherited shim-fd entry {item:?}, guest fd will be missing"
+                );
+                continue;
+            };
+            if entrypoints.install_shim_fd_at_fd(fd, &spec).is_none() {
+                eprintln!(
+                    "[process_fork_diag] task-resume-probe (child): could not rebuild carried unix socket at guest fd {fd} (spec {spec:?}), it will be missing"
+                );
+            }
+        }
+    }
+
     if let Some(spec) = std::env::var_os(pf::FORK_CHILD_FILE_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {

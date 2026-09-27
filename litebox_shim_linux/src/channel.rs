@@ -102,6 +102,11 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
         self.endpoint.rb.lock().is_empty()
     }
 
+    /// Folds over every queued item, front to back, without consuming any.
+    pub(crate) fn fold_queued<A>(&self, init: A, f: impl FnMut(A, &T) -> A) -> A {
+        self.endpoint.rb.lock().iter().fold(init, f)
+    }
+
     /// Peeks at the first item in the channel and conditionally consumes it.
     ///
     /// This method allows examining and potentially modifying the first item in the

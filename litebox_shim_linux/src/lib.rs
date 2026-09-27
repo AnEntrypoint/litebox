@@ -393,6 +393,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         self.task.install_eventfd_at_fd(target_fd, count, flags)
     }
 
+    /// Rebuild a carried shim-level fd (a unix socket) at exactly `target_fd` from the spec its
+    /// cross-process fork parent wrote. Same thread requirement as the other installers.
+    pub fn install_shim_fd_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        self.task.install_unix_at_fd(target_fd, spec)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }

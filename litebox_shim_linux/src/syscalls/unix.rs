@@ -73,6 +73,9 @@ pub(crate) enum UnixSocketAddr {
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
     Path((String, FileFd<FS>, Arc<FS>)),
+    /// A path a cross-process fork child's carried listener names but could not open (its
+    /// socket file belongs to the parent, which keeps it open).
+    UnopenedPath(String),
     Abstract(Vec<u8>),
 }
 
@@ -177,7 +180,9 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
     /// Converts this bound address to a key for the global address table.
     fn to_key(&self) -> UnixSocketAddrKey {
         match self {
-            Self::Path((path, ..)) => UnixSocketAddrKey::Path(path.clone()),
+            Self::Path((path, ..)) | Self::UnopenedPath(path) => {
+                UnixSocketAddrKey::Path(path.clone())
+            }
             Self::Abstract(addr) => UnixSocketAddrKey::Abstract(addr.clone()),
         }
     }
@@ -189,7 +194,7 @@ impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
             Self::Path((_, file, fs)) => {
                 let _ = fs.close(file);
             }
-            Self::Abstract(_) => {}
+            Self::UnopenedPath(_) | Self::Abstract(_) => {}
         }
     }
 }
@@ -197,7 +202,9 @@ impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
 impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
     fn from(addr: &UnixBoundSocketAddr<FS>) -> Self {
         match addr {
-            UnixBoundSocketAddr::Path((path, ..)) => UnixSocketAddr::Path(path.clone()),
+            UnixBoundSocketAddr::Path((path, ..)) | UnixBoundSocketAddr::UnopenedPath(path) => {
+                UnixSocketAddr::Path(path.clone())
+            }
             UnixBoundSocketAddr::Abstract(data) => UnixSocketAddr::Abstract(data.clone()),
         }
     }
@@ -283,6 +290,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
             backlog,
             global: global.clone(),
             owner_pid,
+            carried: false,
         })
     }
 
@@ -549,6 +557,9 @@ struct UnixListenStream<Platform: ShimPlatform, FS: ShimFS> {
     /// `Drop` can remove exactly that entry (see `SharedUnixAddrPresenceTable::remove`'s
     /// same-owner-only contract).
     owner_pid: u32,
+    /// Rebuilt in a cross-process fork child: its presence entry is its own, but the address
+    /// table entry (and the bound address itself) belong to the parent.
+    carried: bool,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixListenStream<Platform, FS> {
@@ -578,10 +589,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixListenStream<Platform, FS>
         let key = self.backlog.addr.to_key();
         let mut table = self.global.unix_addr_table.write();
         // Only remove the entry if it still points to our backlog
-        if let Some(UnixEntry(UnixEntryInner::Stream(backlog))) = table.get(&key)
-            && Arc::ptr_eq(backlog, &self.backlog)
-        {
+        let registered_here = matches!(
+            table.get(&key),
+            Some(UnixEntry(UnixEntryInner::Stream(backlog))) if Arc::ptr_eq(backlog, &self.backlog)
+        );
+        if registered_here {
             table.remove(&key);
+        }
+        if registered_here || self.carried {
             let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
             self.global
                 .unix_addr_presence
@@ -706,13 +721,20 @@ struct Message<Platform: ShimPlatform, FS: ShimFS> {
     fds: Vec<AnyDupFd<Platform, FS>>,
 }
 
-/// The two ways a [`UnixConnectedStream`] moves bytes to/from its peer. `Local` is the original,
-/// unchanged same-process path (an `Arc`-boxed `crate::channel::Channel`, unusable across a real
-/// process boundary). `Shared` is the new cross-process-fork path: a slot in
-/// [`SharedUnixConnTable`], living in the shared kernel arena, with no `Arc`/`Box`/pointer
-/// crossing between the two processes anywhere -- see that type's own module doc comment for the
-/// full rendezvous design and its explicit scope limits (byte-stream only, no genuine cross-
-/// process wakeup).
+/// The two ways a [`UnixConnectedStream`] moves bytes to/from its peer.
+///
+/// `Local` is the same-process path: an `Arc`-boxed `crate::channel::Channel` per direction,
+/// unusable across a real process boundary. Both ends of a local pair share one [`ConnLink`];
+/// when either end is carried into a `LITEBOX_PROCESS_FORK=1` child, the pair is PROMOTED onto a
+/// [`SharedUnixConnTable`] slot (see [`UnixConnectedStream::promote_for_fork`]), and from then on
+/// both local ends, and the child's copy, send only through that slot. Each promoted local end
+/// still drains whatever its own channel had queued before promotion first, so no byte is
+/// reordered.
+///
+/// `Shared` is an endpoint whose only transport is a slot: a cross-process `connect()`/`accept()`,
+/// or the child's copy of a carried connection. See the "Shared cross-process AF_UNIX connection
+/// data plane" comment near [`SharedUnixConnTable`] for the design and its limits (no
+/// `SCM_RIGHTS`, no cross-process wakeup).
 enum ConnTransport<Platform: ShimPlatform, FS: ShimFS> {
     Local {
         addr: AddrView<FS>,
@@ -720,6 +742,11 @@ enum ConnTransport<Platform: ShimPlatform, FS: ShimFS> {
         recv_channel: crate::channel::ReadEnd<Platform, Message<Platform, FS>>,
         /// The write end of the connected peer socket for sending messages.
         connected_send_channel: crate::channel::WriteEnd<Platform, Message<Platform, FS>>,
+        /// Shared with the other end of this pair.
+        link: Arc<ConnLink<Platform, FS>>,
+        /// This end's side of the slot the pair is promoted to (the first end of a pair is the
+        /// client side).
+        is_client: bool,
     },
     Shared {
         global: GlobalStateHandle<Platform, FS>,
@@ -729,12 +756,199 @@ enum ConnTransport<Platform: ShimPlatform, FS: ShimFS> {
         is_client: bool,
         local_addr: UnixSocketAddr,
         peer_addr: UnixSocketAddr,
-        /// Set true by this endpoint's own `Drop`/`shutdown(SHUT_RD)` -- distinct from the ring's
-        /// own `write_shutdown` (which tracks the PEER's write direction), needed because a
-        /// `Shared` connection has no `channel::EndPointer`-style `Arc` this side can inspect to
-        /// ask "did I already shut myself down".
+        /// Set true by this endpoint's own `shutdown(SHUT_RD)` -- distinct from the ring's own
+        /// `write_shutdown` (which tracks the PEER's write direction).
         self_read_shutdown: AtomicBool,
     },
+}
+
+/// What the two ends of a local pair share: whether, and to which slot, the pair was promoted.
+struct ConnLink<Platform: ShimPlatform, FS: ShimFS> {
+    /// Serializes a promotion against the ends' channel writes, so no channel write lands after
+    /// the pair switched to its slot.
+    lock: Mutex<Platform, ()>,
+    /// The promoted slot, or `u32::MAX`. Set after `global`.
+    slot: AtomicU32,
+    global: once_cell::race::OnceBox<GlobalStateHandle<Platform, FS>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> ConnLink<Platform, FS> {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            slot: AtomicU32::new(u32::MAX),
+            global: once_cell::race::OnceBox::new(),
+        }
+    }
+}
+
+/// One endpoint's view of a [`SharedUnixConnTable`] slot: the only data path of a `Shared`
+/// endpoint and of a promoted `Local` one.
+struct SharedView<'a, Platform: ShimPlatform, FS: ShimFS> {
+    global: &'a GlobalStateHandle<Platform, FS>,
+    slot: u32,
+    is_client: bool,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
+    fn slot_ref(&self) -> &SharedConnSlot<Platform> {
+        self.global.unix_shared_conn_table.get(self.slot)
+    }
+
+    /// `(ring this side reads from, ring this side writes to)`.
+    fn rings(&self) -> (&SharedByteRing<Platform>, &SharedByteRing<Platform>) {
+        let slot_ref = self.slot_ref();
+        if self.is_client {
+            (&slot_ref.server_to_client, &slot_ref.client_to_server)
+        } else {
+            (&slot_ref.client_to_server, &slot_ref.server_to_client)
+        }
+    }
+
+    fn platform(&self) -> &Platform {
+        self.global.platform
+    }
+
+    /// The peer will never write again: it shut its write side down, or no live host process
+    /// holds the peer side any more.
+    fn peer_gone(&self) -> bool {
+        let (read_ring, _) = self.rings();
+        if read_ring.is_shutdown() {
+            return true;
+        }
+        if self.slot_ref().side_gone(!self.is_client, self.platform()) {
+            read_ring.shutdown();
+            return true;
+        }
+        false
+    }
+
+    fn hold(&self) {
+        self.slot_ref()
+            .hold(self.is_client, self.platform().current_host_pid());
+    }
+
+    /// One holder of this side is gone. Once none remains, this side's write direction ends;
+    /// once neither side is held, the slot returns to the pool.
+    fn release_holder(&self) {
+        let slot_ref = self.slot_ref();
+        slot_ref.release(self.is_client, self.platform().current_host_pid());
+        if slot_ref.side_gone(self.is_client, self.platform()) {
+            let (_, write_ring) = self.rings();
+            write_ring.shutdown();
+            if slot_ref.side_gone(!self.is_client, self.platform()) {
+                self.global.unix_shared_conn_table.free(self.slot);
+            }
+        }
+    }
+
+    /// Prefers an atomic all-or-nothing write (temporary backpressure resolves via the normal
+    /// `EAGAIN`-then-retry path); a byte stream degrades to a genuine short write only for a
+    /// single message bigger than the whole ring, a record-framed slot refuses one (`EMSGSIZE`).
+    fn send(&self, msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
+        if !msg.fds.is_empty() {
+            litebox_util_log::warn!(
+                slot:% = self.slot, n_fds:% = msg.fds.len();
+                "unix socket: SCM_RIGHTS over a cross-process connection is not supported; \
+                 refusing the send with EOPNOTSUPP rather than dropping the fds"
+            );
+            return Err((msg, Errno::EOPNOTSUPP));
+        }
+        let (_, write_ring) = self.rings();
+        if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
+        {
+            return Err((msg, Errno::EPIPE));
+        }
+        if self.slot_ref().framed.load(Ordering::Acquire) {
+            if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
+                return Err((msg, Errno::EMSGSIZE));
+            }
+            return if write_ring.try_write_record(&msg.data) {
+                Ok(msg.data.len())
+            } else {
+                Err((msg, Errno::EAGAIN))
+            };
+        }
+        if msg.data.is_empty() {
+            return Ok(0);
+        }
+        if msg.data.len() > SHARED_UNIX_CONN_BUF {
+            let n = write_ring.try_write(&msg.data[..SHARED_UNIX_CONN_BUF]);
+            return if n == 0 {
+                Err((msg, Errno::EAGAIN))
+            } else {
+                Ok(n)
+            };
+        }
+        if !write_ring.try_write_all(&msg.data) {
+            return Err((msg, Errno::EAGAIN));
+        }
+        litebox_util_log::debug!(
+            slot:% = self.slot, is_client:% = self.is_client, len:% = msg.data.len();
+            "DIAG shared unix send: wrote"
+        );
+        Ok(msg.data.len())
+    }
+
+    /// Reads bytes (or, on a record-framed slot, exactly one record). Never carries `SCM_RIGHTS`
+    /// fds -- the sending side refuses them up front.
+    fn recv(
+        &self,
+        buf: &mut [u8],
+        self_read_shutdown: bool,
+    ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
+        if self_read_shutdown {
+            return Err(TryOpError::Other(Errno::ESHUTDOWN));
+        }
+        let (read_ring, _) = self.rings();
+        let got = if self.slot_ref().framed.load(Ordering::Acquire) {
+            read_ring.try_read_record(buf)
+        } else {
+            let n = read_ring.try_read(buf);
+            (n > 0).then_some(n)
+        };
+        if let Some(n) = got {
+            litebox_util_log::debug!(
+                slot:% = self.slot, is_client:% = self.is_client, total_read:% = n,
+                prefix_hex:? = &buf[..n.min(4096)];
+                "diag-unix-shared-read-bytes"
+            );
+            return Ok((n, Vec::new()));
+        }
+        if self.peer_gone() && read_ring.is_empty() {
+            return Err(TryOpError::Other(Errno::ESHUTDOWN));
+        }
+        Err(TryOpError::TryAgain)
+    }
+
+    fn events(&self, self_read_shutdown: bool) -> Events {
+        let (read_ring, write_ring) = self.rings();
+        let mut events = Events::empty();
+        let peer_gone = self.peer_gone();
+        if self_read_shutdown || peer_gone {
+            events |= Events::RDHUP | Events::IN;
+            if write_ring.is_shutdown() || peer_gone {
+                events |= Events::HUP;
+            }
+        }
+        if !read_ring.is_empty() {
+            events |= Events::IN;
+        }
+        if !write_ring.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
+
+    /// Returns whether this call shut the write direction down.
+    fn shutdown_write(&self) -> bool {
+        let (_, write_ring) = self.rings();
+        if write_ring.is_shutdown() {
+            return false;
+        }
+        write_ring.shutdown();
+        true
+    }
 }
 
 /// Represents a connected Unix stream socket.
@@ -748,30 +962,34 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for ConnTransport<Platform, FS> {
     fn drop(&mut self) {
-        // `Local`'s two channel ends already shut themselves down via their own `Drop` impls
-        // (`channel.rs`) -- nothing extra needed here. `Shared` has no such per-field `Drop`
-        // (its fields are a plain index/bools, not `Arc`-boxed endpoints), so this is the only
-        // place that can mark this endpoint's own direction shut down and, once BOTH sides are
-        // gone, release the slot back to the shared pool.
-        if let ConnTransport::Shared {
-            global, slot, is_client, ..
-        } = self
-        {
-            let table = &global.unix_shared_conn_table;
-            let slot_ref = table.get(*slot);
-            if *is_client {
-                slot_ref.client_to_server.shutdown();
-            } else {
-                slot_ref.server_to_client.shutdown();
+        // A local end's channels shut themselves down via their own `Drop` impls; an endpoint on
+        // a slot (shared, or promoted local) releases its holder record instead.
+        match self {
+            ConnTransport::Shared {
+                global,
+                slot,
+                is_client,
+                ..
+            } => SharedView {
+                global,
+                slot: *slot,
+                is_client: *is_client,
             }
-            // Both directions shut down (i.e. both endpoints have dropped, or one dropped after
-            // already shutting down its write side and the other direction was already shut by
-            // the peer's own earlier drop) -- safe to reclaim the slot. This is a conservative,
-            // best-effort check: worst case a slot is freed slightly late (bounded by
-            // SHARED_UNIX_CONN_CAPACITY, self-healing on the next connection churn), never
-            // double-freed (each endpoint's `Drop` runs at most once).
-            if slot_ref.client_to_server.is_shutdown() && slot_ref.server_to_client.is_shutdown() {
-                table.free(*slot);
+            .release_holder(),
+            ConnTransport::Local {
+                link, is_client, ..
+            } => {
+                let slot = link.slot.load(Ordering::Acquire);
+                if slot != u32::MAX
+                    && let Some(global) = link.global.get()
+                {
+                    SharedView {
+                        global,
+                        slot,
+                        is_client: *is_client,
+                    }
+                    .release_holder();
+                }
             }
         }
     }
@@ -803,11 +1021,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
         let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
+        let link = Arc::new(ConnLink::new());
         let first = UnixConnectedStream {
             transport: ConnTransport::Local {
                 addr: addr1,
                 recv_channel,
                 connected_send_channel: send_channel_peer,
+                link: link.clone(),
+                is_client: true,
             },
             pollee: pollee1,
             peer_cred: second_cred,
@@ -817,6 +1038,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 addr: addr2,
                 recv_channel: recv_channel_peer,
                 connected_send_channel: send_channel,
+                link,
+                is_client: false,
             },
             pollee: pollee2,
             peer_cred: first_cred,
@@ -838,9 +1061,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         (first, second)
     }
 
-    /// Constructs the `Shared`-transport half of a genuinely cross-process connection --
-    /// see [`ConnTransport::Shared`]'s doc comment. `is_client` selects which of the slot's two
-    /// [`SharedByteRing`]s this side reads/writes.
+    /// Constructs a `Shared`-transport endpoint on `slot`, counted as one more holder of its
+    /// side. `is_client` selects which of the slot's two [`SharedByteRing`]s this side
+    /// reads/writes.
     fn new_shared(
         global: GlobalStateHandle<Platform, FS>,
         slot: u32,
@@ -849,6 +1072,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         peer_addr: UnixSocketAddr,
         peer_cred: Ucred,
     ) -> Self {
+        SharedView {
+            global: &global,
+            slot,
+            is_client,
+        }
+        .hold();
         Self {
             transport: ConnTransport::Shared {
                 global,
@@ -863,18 +1092,142 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
     }
 
-    /// For `Shared` transport, returns `(ring this side reads from, ring this side writes to)`.
-    fn shared_rings(
-        global: &GlobalStateHandle<Platform, FS>,
-        slot: u32,
-        is_client: bool,
-    ) -> (&SharedByteRing<Platform>, &SharedByteRing<Platform>) {
-        let slot_ref = global.unix_shared_conn_table.get(slot);
-        if is_client {
-            (&slot_ref.server_to_client, &slot_ref.client_to_server)
-        } else {
-            (&slot_ref.client_to_server, &slot_ref.server_to_client)
+    /// The slot this endpoint sends through, if any: always for `Shared`, once promoted for
+    /// `Local`.
+    fn shared_view(&self) -> Option<SharedView<'_, Platform, FS>> {
+        match &self.transport {
+            ConnTransport::Shared {
+                global,
+                slot,
+                is_client,
+                ..
+            } => Some(SharedView {
+                global,
+                slot: *slot,
+                is_client: *is_client,
+            }),
+            ConnTransport::Local {
+                link, is_client, ..
+            } => {
+                let slot = link.slot.load(Ordering::Acquire);
+                if slot == u32::MAX {
+                    return None;
+                }
+                Some(SharedView {
+                    global: link.global.get()?,
+                    slot,
+                    is_client: *is_client,
+                })
+            }
         }
+    }
+
+    fn self_read_shutdown(&self) -> bool {
+        match &self.transport {
+            ConnTransport::Shared {
+                self_read_shutdown, ..
+            } => self_read_shutdown.load(Ordering::Acquire),
+            ConnTransport::Local { recv_channel, .. } => recv_channel.is_shutdown(),
+        }
+    }
+
+    /// Moves this connection onto a [`SharedUnixConnTable`] slot so a cross-process fork child
+    /// can hold this end too, and returns `(slot, is_client)`.
+    ///
+    /// For a local pair: allocates the slot (first promotion of the pair), counts both local ends
+    /// as holders in this host process, and moves this end's unread queued messages into the
+    /// slot, so the child's copy of this end reads them too. The other local end keeps reading
+    /// its own queued messages first and then the slot. Refused -- the caller then keeps the
+    /// fork on the thread-based path -- when this end has queued `SCM_RIGHTS` fds or more unread
+    /// data than the slot's ring holds, or the table is full.
+    fn promote_for_fork(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        own_cred: Ucred,
+        framed: bool,
+    ) -> Result<(u32, bool), &'static str> {
+        let (recv_channel, link, is_client) = match &self.transport {
+            ConnTransport::Shared {
+                slot, is_client, ..
+            } => return Ok((*slot, *is_client)),
+            ConnTransport::Local {
+                recv_channel,
+                link,
+                is_client,
+                ..
+            } => (recv_channel, link, *is_client),
+        };
+        let _guard = link.lock.lock();
+        let (bytes, messages, has_fds) =
+            recv_channel.fold_queued((0usize, 0usize, false), |(b, n, f), m| {
+                (b + m.data.len(), n + 1, f || !m.fds.is_empty())
+            });
+        if has_fds {
+            return Err("unread SCM_RIGHTS fds queued on a unix socket");
+        }
+        let need = bytes + if framed { 4 * messages } else { 0 };
+        let table = &global.unix_shared_conn_table;
+        let existing = link.slot.load(Ordering::Acquire);
+        let slot = if existing == u32::MAX {
+            if need > SHARED_UNIX_CONN_BUF {
+                return Err("more unread data queued on a unix socket than a shared ring holds");
+            }
+            let (client_cred, server_cred) = if is_client {
+                (own_cred, self.peer_cred)
+            } else {
+                (self.peer_cred, own_cred)
+            };
+            let slot = table
+                .alloc(global.platform, &client_cred, &server_cred)
+                .ok_or("shared unix connection table full")?;
+            let slot_ref = table.get(slot);
+            slot_ref.framed.store(framed, Ordering::Release);
+            let me = global.platform.current_host_pid();
+            slot_ref.hold(is_client, me);
+            if recv_channel.is_peer_shutdown() {
+                // The other end already closed: its side counts as gone from the start.
+                slot_ref.mark_side_gone(!is_client);
+            } else {
+                slot_ref.hold(!is_client, me);
+            }
+            let _ = link.global.set(alloc::boxed::Box::new(global.clone()));
+            link.slot.store(slot, Ordering::Release);
+            slot
+        } else {
+            let view = SharedView {
+                global,
+                slot: existing,
+                is_client,
+            };
+            let (read_ring, _) = view.rings();
+            if need > 0 && !read_ring.is_empty() {
+                return Err("unread data queued on both a unix socket's channel and its slot");
+            }
+            if need > read_ring.free_space() {
+                return Err("more unread data queued on a unix socket than its shared ring holds");
+            }
+            existing
+        };
+        let view = SharedView {
+            global,
+            slot,
+            is_client,
+        };
+        let (read_ring, _) = view.rings();
+        while let Ok(data) =
+            recv_channel.peek_and_consume_one(|m| Ok((true, core::mem::take(&mut m.data))))
+        {
+            let written = if framed {
+                read_ring.try_write_record(&data)
+            } else {
+                read_ring.try_write_all(&data)
+            };
+            debug_assert!(written, "capacity was checked above");
+        }
+        if recv_channel.is_peer_shutdown() {
+            read_ring.shutdown();
+        }
+        Ok((slot, is_client))
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -898,40 +1251,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     }
 
     /// Returns the number of bytes actually accepted on success -- always `msg.data.len()` for
-    /// `Local` transport (its underlying `Channel` pushes one whole `Message` atomically, no
-    /// partial concept), but possibly LESS than `msg.data.len()` for `Shared` transport on an
-    /// over-sized single write (see [`Self::try_sendto_shared`]/[`SHARED_UNIX_CONN_BUF`]'s doc
-    /// comments).
+    /// the local channel (it pushes one whole `Message` atomically), but possibly LESS on a slot
+    /// for an over-sized single write (see [`SharedView::send`]).
     fn try_sendto(
         &self,
         msg: Message<Platform, FS>,
     ) -> Result<usize, (Message<Platform, FS>, Errno)> {
-        let ConnTransport::Local {
-            connected_send_channel,
-            ..
-        } = &self.transport
-        else {
-            return self.try_sendto_shared(msg);
+        let (connected_send_channel, link) = match &self.transport {
+            ConnTransport::Shared { .. } => {
+                return self.shared_view().expect("shared endpoint").send(msg);
+            }
+            ConnTransport::Local {
+                connected_send_channel,
+                link,
+                ..
+            } => (connected_send_channel, link),
         };
+        let _guard = link.lock.lock();
+        if let Some(view) = self.shared_view() {
+            drop(_guard);
+            return view.send(msg);
+        }
         // TODO: write partial data?
         let len = msg.data.len();
         let sock_id = self as *const _ as usize;
         // `LITEBOX_DRM_TRACE=1` (reused; same flag already wired end-to-end for DRM tracing, see
-        // `drm::drm_trace_enabled`'s doc comment -- not adding a new env var to avoid touching
-        // the runner's own std-only `env::var_os` call site, which is mid-edit by a peer session
-        // this pass): dump a bounded hex prefix of the bytes actually written to a unix stream.
-        // This is the X11-protocol-decode instrumentation for AGENTS.md's "Rendering/scanout
-        // blocker" investigation -- an X11 request over a unix-domain socket starts with a 1-byte
-        // opcode (CreateWindow=1, MapWindow=8, ConfigureWindow=12, ...). A 32-byte prefix was
-        // tried first and was NOT enough: a `write()` syscall on a busy X11 client socket
-        // typically batches several small requests together (observed live: a single write
-        // covering the whole QueryExtension/CreateGC/GetProperty/... startup sequence), so a
-        // short prefix only ever shows the first one or two requests before running off the end
-        // of the capture window -- exactly the failure mode that made the CreateWindow/MapWindow
-        // question undecidable with 32 bytes. Raised to 4096 (most individual X11 requests,
-        // including a `CreateWindow` with a full property/attribute list, fit well inside this;
-        // only genuinely large payloads like `PutImage`/`ChangeProperty` with big property data
-        // exceed it, which is fine -- those aren't the requests this trace needs to see in full).
+        // `drm::drm_trace_enabled`'s doc comment): dump a bounded hex prefix of the bytes actually
+        // written to a unix stream -- the X11-protocol-decode instrumentation for AGENTS.md's
+        // "Rendering/scanout blocker" investigation. 4096 bytes, since one `write()` on a busy X11
+        // client socket typically batches several requests.
         if crate::syscalls::drm::drm_trace_enabled() {
             let n = core::cmp::min(msg.data.len(), 4096);
             litebox_util_log::debug!(
@@ -951,61 +1299,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         result
     }
 
-    /// `Shared`-transport half of [`Self::try_sendto`] -- see [`ConnTransport::Shared`]'s doc
-    /// comment for the byte-stream-only, no-`SCM_RIGHTS` scope limit this enforces. Prefers an
-    /// atomic all-or-nothing write (temporary backpressure resolves via the normal `EAGAIN`-then-
-    /// retry path); only degrades to a genuine short write for the one case that could never
-    /// resolve any other way -- a single message bigger than the whole ring.
-    fn try_sendto_shared(
-        &self,
-        msg: Message<Platform, FS>,
-    ) -> Result<usize, (Message<Platform, FS>, Errno)> {
-        let ConnTransport::Shared {
-            global,
-            slot,
-            is_client,
-            ..
-        } = &self.transport
-        else {
-            unreachable!("try_sendto_shared only called for ConnTransport::Shared");
-        };
-        if !msg.fds.is_empty() {
-            return Err((msg, Errno::EOPNOTSUPP));
-        }
-        let (_, write_ring) = Self::shared_rings(global, *slot, *is_client);
-        if write_ring.is_shutdown() {
-            return Err((msg, Errno::EPIPE));
-        }
-        if msg.data.is_empty() {
-            return Ok(0);
-        }
-        if msg.data.len() > SHARED_UNIX_CONN_BUF {
-            let n = write_ring.try_write(&msg.data[..SHARED_UNIX_CONN_BUF]);
-            litebox_util_log::debug!(
-                slot:% = *slot, is_client:% = *is_client, len:% = n;
-                "DIAG try_sendto_shared: partial write (oversized message)"
-            );
-            return if n == 0 {
-                Err((msg, Errno::EAGAIN))
-            } else {
-                Ok(n)
-            };
-        }
-        if !write_ring.try_write_all(&msg.data) {
-            return Err((msg, Errno::EAGAIN));
-        }
-        // `diag_cursor()` read AFTER the write (2026-09-20) -- pairs with the same call in
-        // `check_io_events_shared` to prove/disprove cross-process visibility of this exact
-        // cursor update from the writer's OWN process's point of view.
-        let (wp, rp) = write_ring.diag_cursor();
-        litebox_util_log::debug!(
-            slot:% = *slot, is_client:% = *is_client, len:% = msg.data.len(),
-            write_pos_after:% = wp, read_pos_after:% = rp;
-            "DIAG try_sendto_shared: wrote"
-        );
-        Ok(msg.data.len())
-    }
-
     /// Reads up to `buf.len()` bytes, same message-boundary-spanning behavior as before, plus any
     /// `SCM_RIGHTS` fds attached to a message this call reads the FIRST byte of (a message whose
     /// `data` is already partially drained by an earlier call had its fds delivered on that
@@ -1016,9 +1309,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
-        let ConnTransport::Local { recv_channel, .. } = &self.transport else {
-            return self.try_recvfrom_shared(buf);
+        let recv_channel = match &self.transport {
+            ConnTransport::Local { recv_channel, .. } => recv_channel,
+            ConnTransport::Shared { .. } => {
+                return self
+                    .shared_view()
+                    .expect("shared endpoint")
+                    .recv(buf, self.self_read_shutdown());
+            }
         };
+        if recv_channel.is_empty()
+            && let Some(view) = self.shared_view()
+        {
+            return view.recv(buf, self.self_read_shutdown());
+        }
         let mut total_read = 0;
         let mut fds = Vec::new();
         // `buf` itself is reassigned (advanced) below as bytes are consumed; keep a raw pointer
@@ -1056,8 +1360,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             buf = &mut buf[n..];
         }
         // See `try_sendto`'s matching comment: same `LITEBOX_DRM_TRACE=1` reuse, same bounded hex
-        // prefix, this time on bytes actually delivered back to the reading process (an X11
-        // reply/error/event starts with a 1-byte type byte: 0=Error, 1=Reply, 2+=Event).
+        // prefix, this time on bytes actually delivered back to the reading process.
         if crate::syscalls::drm::drm_trace_enabled() && total_read > 0 {
             let n = core::cmp::min(total_read, 4096);
             // SAFETY: `buf_start` points at the start of the caller-provided buffer, which is
@@ -1079,84 +1382,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         Ok((total_read, fds))
     }
 
-    /// `Shared`-transport half of [`Self::try_recvfrom`]. Pure byte-stream (no message
-    /// boundaries to preserve -- [`SharedByteRing`] never had any), and always reports an empty
-    /// `fds` list (see [`ConnTransport::Shared`]'s scope-limit doc comment: `SCM_RIGHTS` is
-    /// rejected up front on the sending side, so there is never anything to deliver here).
-    fn try_recvfrom_shared(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
-        let ConnTransport::Shared {
-            global,
-            slot,
-            is_client,
-            self_read_shutdown,
-            ..
-        } = &self.transport
-        else {
-            unreachable!("try_recvfrom_shared only called for ConnTransport::Shared");
-        };
-        if self_read_shutdown.load(Ordering::Acquire) {
-            return Err(TryOpError::Other(Errno::ESHUTDOWN));
-        }
-        let (read_ring, _) = Self::shared_rings(global, *slot, *is_client);
-        let n = read_ring.try_read(buf);
-        if n > 0 {
-            litebox_util_log::debug!(
-                slot:% = *slot, is_client:% = *is_client, len:% = n;
-                "DIAG try_recvfrom_shared: read"
-            );
-            // Same hex-prefix trace `try_recvfrom` (the `Local`-transport sibling) already has for
-            // its own `LITEBOX_DRM_TRACE`-gated variant, extended to the `Shared`-transport path --
-            // Xvfb's own X11 socket runs over `Shared`, and this path never had this diagnostic, so
-            // the 30th-pass investigation into Xvfb's deterministic mid-boot SIGSEGV could see WHICH
-            // bytes it read but not their actual content, only length. Gated on this module's own
-            // `LITEBOX_LOG` debug level (same as the plain length-only event two lines up) rather
-            // than `drm_trace_enabled()`'s `AtomicBool`: that flag is set exactly once, by the
-            // top-level runner's own startup routine (`litebox_runner_linux_on_windows_userland::
-            // run`), which a `LITEBOX_PROCESS_FORK=1` cross-process fork CHILD's own resume path
-            // never re-invokes (confirmed live, 2026-09-21 -- zero `diag-unix-shared-read-bytes`
-            // lines from a boot where `LITEBOX_DRM_TRACE=1` was exported to the whole process tree
-            // and `litebox_shim_linux::syscalls::unix=debug`'s own sibling lines fired thousands of
-            // times in the SAME child processes), so it silently stays `false` in every fork child,
-            // Xvfb included -- the one process this trace exists to observe. `LITEBOX_LOG`'s
-            // `EnvFilter`, by contrast, is already proven live to re-initialize correctly per fork
-            // child (every other diagnostic in this investigation relied on exactly that). Bounded
-            // to the same 4096-byte cap as the `Local`-path sibling.
-            let preview_len = n.min(4096);
-            litebox_util_log::debug!(
-                slot:% = *slot, is_client:% = *is_client, total_read:% = n,
-                prefix_hex:? = &buf[..preview_len];
-                "diag-unix-shared-read-bytes"
-            );
-            self.pollee.notify_observers(Events::OUT);
-            return Ok((n, Vec::new()));
-        }
-        if read_ring.is_shutdown() {
-            return Err(TryOpError::Other(Errno::ESHUTDOWN));
-        }
-        Err(TryOpError::TryAgain)
-    }
-
-    /// `SOCK_SEQPACKET`'s own boundary-preserving read: unlike [`Self::try_recvfrom`], never
-    /// spans more than the ONE message at the front of `recv_channel`. A message larger than
-    /// `buf` is truncated (matching real Linux `recv(2)`'s "excess bytes in a datagram are
-    /// discarded" behavior for message-boundary-preserving socket types) rather than left
-    /// partially in the queue for a follow-up read to continue.
+    /// `SOCK_SEQPACKET`'s own boundary-preserving read: never spans more than ONE message. A
+    /// message larger than `buf` is truncated (matching real Linux `recv(2)`'s "excess bytes in a
+    /// datagram are discarded" behavior) rather than left partially queued.
     ///
-    /// `Shared` transport has no message-boundary concept at all (see [`ConnTransport::Shared`]'s
-    /// doc comment: byte-stream only) -- `SOCK_SEQPACKET` over a genuinely cross-process
-    /// connection degrades to the same behavior as [`Self::try_recvfrom_shared`], which is a
-    /// disclosed, guest-observable difference from real boundary-preserving `SEQPACKET` semantics
-    /// rather than a panic; no real boot-critical guest (X11, D-Bus) uses `SOCK_SEQPACKET`.
+    /// On a slot, boundaries hold only when the slot is record-framed (a promoted local pair);
+    /// a genuinely cross-process `connect()`ed `SOCK_SEQPACKET` connection is a plain byte stream,
+    /// a disclosed difference rather than a panic.
     fn try_recvfrom_one_message(
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
-        let ConnTransport::Local { recv_channel, .. } = &self.transport else {
-            return self.try_recvfrom_shared(buf);
+        let recv_channel = match &self.transport {
+            ConnTransport::Local { recv_channel, .. } => recv_channel,
+            ConnTransport::Shared { .. } => {
+                return self
+                    .shared_view()
+                    .expect("shared endpoint")
+                    .recv(buf, self.self_read_shutdown());
+            }
         };
+        if recv_channel.is_empty()
+            && let Some(view) = self.shared_view()
+        {
+            return view.recv(buf, self.self_read_shutdown());
+        }
         let mut fds = Vec::new();
         let n = recv_channel.peek_and_consume_one(|msg| {
             fds.append(&mut msg.fds);
@@ -1175,14 +1425,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     }
 
     fn check_io_events(&self) -> Events {
-        let ConnTransport::Local {
-            recv_channel,
-            connected_send_channel,
-            ..
-        } = &self.transport
-        else {
-            return self.check_io_events_shared();
+        let (recv_channel, connected_send_channel) = match &self.transport {
+            ConnTransport::Local {
+                recv_channel,
+                connected_send_channel,
+                ..
+            } => (recv_channel, connected_send_channel),
+            ConnTransport::Shared { .. } => {
+                return self
+                    .shared_view()
+                    .expect("shared endpoint")
+                    .events(self.self_read_shutdown());
+            }
         };
+        if let Some(view) = self.shared_view() {
+            let mut events = view.events(recv_channel.is_shutdown());
+            if !recv_channel.is_empty() {
+                events |= Events::IN;
+            }
+            return events;
+        }
         let mut events = Events::empty();
         let is_read_shutdown = recv_channel.is_shutdown();
         let is_peer_write_shutdown = recv_channel.is_peer_shutdown();
@@ -1202,94 +1464,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         events
     }
 
-    fn check_io_events_shared(&self) -> Events {
-        let ConnTransport::Shared {
-            global,
-            slot,
-            is_client,
-            self_read_shutdown,
-            ..
-        } = &self.transport
-        else {
-            unreachable!("check_io_events_shared only called for ConnTransport::Shared");
-        };
-        let (read_ring, write_ring) = Self::shared_rings(global, *slot, *is_client);
-        let mut events = Events::empty();
-        let is_read_shutdown = self_read_shutdown.load(Ordering::Acquire);
-        let is_peer_write_shutdown = read_ring.is_shutdown();
-        if is_read_shutdown || is_peer_write_shutdown {
-            events |= Events::RDHUP | Events::IN;
-            if write_ring.is_shutdown() {
-                events |= Events::HUP;
-            }
-        }
-        if !read_ring.is_empty() {
-            events |= Events::IN;
-        }
-        if !write_ring.is_full() {
-            events |= Events::OUT;
-        }
-        // 1-in-100 throttled + always-log-on-nonzero-cursor (2026-09-20): definitive answer to
-        // whether THIS process's view of the peer-written ring's cursor ever advances off
-        // (0, 0) at all -- if `write_pos` is stuck at 0 here while the writer's own process
-        // logged a successful `try_write_all`/`try_sendto_shared: wrote` for this exact slot,
-        // that's live proof of a cross-process shared-memory visibility gap (same root-cause
-        // shape as the earlier writable-layer-visibility bug), not a logic bug in this
-        // readiness check itself.
-        static DIAG_CIOE_COUNTER: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
-        let (wp, rp) = read_ring.diag_cursor();
-        let call_idx = DIAG_CIOE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if wp != 0 || call_idx % 100 == 0 {
-            litebox_util_log::debug!(
-                slot:% = *slot,
-                is_client:% = *is_client,
-                read_write_pos:% = wp,
-                read_read_pos:% = rp,
-                computed_events:? = events;
-                "DIAG check_io_events_shared: read_ring cursor snapshot"
-            );
-        }
-        events
-    }
-
     fn shutdown(&self, how: ShutdownHow) {
+        let mut events = Events::empty();
         match &self.transport {
             ConnTransport::Local {
                 recv_channel,
                 connected_send_channel,
                 ..
             } => {
-                let mut events = Events::empty();
                 if how.is_shutdown_read() && recv_channel.shutdown() {
                     events |= Events::IN | Events::RDHUP;
                 }
                 if how.is_shutdown_write() && connected_send_channel.shutdown() {
                     events |= Events::OUT | Events::HUP;
                 }
-                self.pollee.notify_observers(events);
+                if how.is_shutdown_write()
+                    && let Some(view) = self.shared_view()
+                    && view.shutdown_write()
+                {
+                    events |= Events::OUT | Events::HUP;
+                }
             }
             ConnTransport::Shared {
-                global,
-                slot,
-                is_client,
                 self_read_shutdown,
                 ..
             } => {
-                let mut events = Events::empty();
                 if how.is_shutdown_read() && !self_read_shutdown.swap(true, Ordering::AcqRel) {
                     events |= Events::IN | Events::RDHUP;
                 }
-                if how.is_shutdown_write() {
-                    let (_, write_ring) = Self::shared_rings(global, *slot, *is_client);
-                    if !write_ring.is_shutdown() {
-                        write_ring.shutdown();
-                        events |= Events::OUT | Events::HUP;
-                    }
+                if how.is_shutdown_write()
+                    && self.shared_view().expect("shared endpoint").shutdown_write()
+                {
+                    events |= Events::OUT | Events::HUP;
                 }
-                self.pollee.notify_observers(events);
             }
         }
+        self.pollee.notify_observers(events);
     }
 }
 
@@ -1529,9 +1739,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         };
         let (kind, key_bytes) = presence_kind_and_bytes(&key);
         let self_pid = task.pid.get() as u32;
+        // Any advertised listener, this process's own included: a listener carried into a
+        // cross-process fork child is advertised under the child's pid but is not in its local
+        // address table, and takes this connect from the shared queue.
         match task.global.unix_addr_presence.lookup(kind, key_bytes) {
-            Some(owner_pid) if owner_pid != self_pid => {}
-            _ => {
+            Some(_) => {}
+            None => {
                 log_cross_process_presence_miss(task, &key);
                 return Err(Errno::ECONNREFUSED);
             }
@@ -2972,12 +3185,15 @@ fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
 //
 // # Explicit scope limits (guest-reachable, never a panic on the excluded paths)
 //
-// - **Byte-stream only.** `Message::fds` (`SCM_RIGHTS`) has no representation here -- a
-//   `TypedFd`/`AnyDupFd` is fundamentally a handle into ONE process's own descriptor table, not
-//   plain bytes, and cannot be made shared-memory-native by this pattern at all. `try_sendto`
-//   refuses a non-empty `fds` list on a `Shared`-transport connection with `EOPNOTSUPP` (never
-//   silently drops them -- a caller that actually depended on a donated fd must see a clean
-//   error, not a mysteriously missing descriptor on the other end).
+// - **No `SCM_RIGHTS`.** `Message::fds` has no representation here -- a `TypedFd`/`AnyDupFd` is
+//   a handle into ONE process's own descriptor table, not plain bytes. `SharedView::send` refuses
+//   a non-empty `fds` list with `EOPNOTSUPP` and a warning (never silently drops them).
+// - **Byte stream, except a promoted `SOCK_SEQPACKET` pair**, whose slot is record-framed
+//   (`SharedConnSlot::framed`); a `connect()`ed cross-process `SOCK_SEQPACKET` connection is a
+//   plain byte stream.
+// - **Holders are counted per host process** (`SharedConnSlot::hold`): after a cross-process fork
+//   the parent and child hold the same side, and the peer sees EOF/`EPIPE` only once every holder
+//   of that side is gone or its host process died.
 // - **No genuine cross-process wakeup.** Nothing in this codebase can deliver a Windows-level
 //   wake from one process's write into a blocked wait in a different process's `Pollee` (that
 //   would need `litebox_platform_windows_userland/src/xproc_sync.rs`'s named-event primitive,
@@ -3099,7 +3315,7 @@ pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 64;
 /// `SHARED_UNIX_CONN_CAPACITY * 2 * SHARED_UNIX_CONN_BUF` = 32 KiB -- see
 /// [`SHARED_UNIX_CONN_CAPACITY`]'s doc comment for why this is deliberately small, not generous.
 /// A single write larger than this never hangs regardless (see [`SharedByteRing::try_write`] and
-/// its call site in `UnixConnectedStream::try_sendto_shared`): it degrades to a real short write
+/// its call site in `SharedView::send`): it degrades to a real short write
 /// of the first `SHARED_UNIX_CONN_BUF` bytes, matching a real kernel socket's own short-write
 /// behavior on an over-sized single `write(2)`, rather than looping on `EAGAIN` forever.
 const SHARED_UNIX_CONN_BUF: usize = 2048;
@@ -3213,6 +3429,48 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         cursor.write_pos == cursor.read_pos
     }
 
+    pub(crate) fn free_space(&self) -> usize {
+        let cursor = self.cursor.lock();
+        SHARED_UNIX_CONN_BUF - cursor.write_pos.wrapping_sub(cursor.read_pos)
+    }
+
+    /// Writes `data` as one record -- a 4-byte little-endian length, then the bytes -- all or
+    /// nothing. The message-boundary-preserving form a promoted `SOCK_SEQPACKET` connection uses.
+    pub(crate) fn try_write_record(&self, data: &[u8]) -> bool {
+        let Ok(len) = u32::try_from(data.len()) else {
+            return false;
+        };
+        let mut framed = Vec::with_capacity(4 + data.len());
+        framed.extend_from_slice(&len.to_le_bytes());
+        framed.extend_from_slice(data);
+        self.try_write_all(&framed)
+    }
+
+    /// Consumes one whole record written by [`Self::try_write_record`], copying at most
+    /// `out.len()` bytes of it (the rest is discarded, as a datagram read truncates). `None` when
+    /// no complete record is queued.
+    pub(crate) fn try_read_record(&self, out: &mut [u8]) -> Option<usize> {
+        let mut cursor = self.cursor.lock();
+        let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        if avail < 4 {
+            return None;
+        }
+        let at = |cursor: &RingCursor, i: usize| {
+            self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF].load(Ordering::Relaxed)
+        };
+        let len = u32::from_le_bytes([at(&cursor, 0), at(&cursor, 1), at(&cursor, 2), at(&cursor, 3)])
+            as usize;
+        if avail < 4 + len {
+            return None;
+        }
+        let n = out.len().min(len);
+        for (i, b) in out.iter_mut().take(n).enumerate() {
+            *b = at(&cursor, 4 + i);
+        }
+        cursor.read_pos = cursor.read_pos.wrapping_add(4 + len);
+        Some(n)
+    }
+
     pub(crate) fn is_full(&self) -> bool {
         let cursor = self.cursor.lock();
         cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
@@ -3224,16 +3482,6 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 
     pub(crate) fn is_shutdown(&self) -> bool {
         self.cursor.lock().write_shutdown
-    }
-
-    /// Diagnostic-only (2026-09-20): exposes the raw cursor for the targeted, throttled
-    /// `check_io_events_shared` trace below -- answers definitively whether a reader in a
-    /// DIFFERENT process ever observes the writer's cursor update at all (root-causing the
-    /// AF_UNIX Xvfb-never-reads-`xset q` gap), as opposed to inferring it indirectly from
-    /// `is_empty()` alone.
-    fn diag_cursor(&self) -> (usize, usize) {
-        let cursor = self.cursor.lock();
-        (cursor.write_pos, cursor.read_pos)
     }
 }
 
@@ -3251,9 +3499,99 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     server_pid: AtomicU32,
     server_uid: AtomicU32,
     server_gid: AtomicU32,
+    /// Endpoints holding each side (index 0 = client, 1 = server), counted per host process
+    /// (`holder_hosts[side][i]` holds `holder_counts[side][i]` of them): after a cross-process
+    /// fork the parent and child both hold the same side, and a side ends only when every holder
+    /// is gone -- or its host process died without dropping it.
+    holder_hosts: [[AtomicU32; CONN_HOLDER_HOSTS]; 2],
+    holder_counts: [[AtomicU32; CONN_HOLDER_HOSTS]; 2],
+    side_ever_held: [AtomicBool; 2],
+    /// The rings carry length-prefixed records (a promoted `SOCK_SEQPACKET` connection).
+    framed: AtomicBool,
+}
+
+/// Distinct host processes that can hold one side of a shared connection at once.
+const CONN_HOLDER_HOSTS: usize = 8;
+
+fn conn_side(is_client: bool) -> usize {
+    if is_client { 0 } else { 1 }
 }
 
 impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
+    fn hold(&self, is_client: bool, host: u32) {
+        let side = conn_side(is_client);
+        self.side_ever_held[side].store(true, Ordering::Release);
+        let hosts = &self.holder_hosts[side];
+        let counts = &self.holder_counts[side];
+        for (h, c) in hosts.iter().zip(counts) {
+            if h.load(Ordering::Acquire) == host && c.load(Ordering::Acquire) > 0 {
+                c.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
+        }
+        for (h, c) in hosts.iter().zip(counts) {
+            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                h.store(host, Ordering::Release);
+                return;
+            }
+        }
+        litebox_util_log::warn!(
+            host:% = host;
+            "shared unix connection: more host processes hold one side than tracked; this \
+             holder is not counted"
+        );
+    }
+
+    fn release(&self, is_client: bool, host: u32) {
+        let side = conn_side(is_client);
+        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+            if h.load(Ordering::Acquire) == host
+                && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The side was held and no live host process holds it any more.
+    fn side_gone(&self, is_client: bool, platform: &Platform) -> bool {
+        let side = conn_side(is_client);
+        if !self.side_ever_held[side].load(Ordering::Acquire) {
+            return false;
+        }
+        let me = platform.current_host_pid();
+        let mut any = false;
+        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+            if c.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let host = h.load(Ordering::Acquire);
+            if host == me || platform.is_process_alive(host) {
+                any = true;
+            } else {
+                c.store(0, Ordering::Release);
+            }
+        }
+        !any
+    }
+
+    /// Marks a side as held once and already gone: its endpoint closed before the connection was
+    /// promoted to this slot.
+    fn mark_side_gone(&self, is_client: bool) {
+        self.side_ever_held[conn_side(is_client)].store(true, Ordering::Release);
+    }
+
+    fn reset_holders(&self) {
+        for side in 0..2 {
+            for c in &self.holder_counts[side] {
+                c.store(0, Ordering::Release);
+            }
+            self.side_ever_held[side].store(false, Ordering::Release);
+        }
+        self.framed.store(false, Ordering::Release);
+    }
+
     fn new_empty() -> Self {
         Self {
             state: AtomicU32::new(CONN_SLOT_EMPTY),
@@ -3265,6 +3603,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             server_pid: AtomicU32::new(0),
             server_uid: AtomicU32::new(0),
             server_gid: AtomicU32::new(0),
+            holder_hosts: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(0))),
+            holder_counts: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(0))),
+            side_ever_held: [AtomicBool::new(false), AtomicBool::new(false)],
+            framed: AtomicBool::new(false),
         }
     }
 
@@ -3349,6 +3691,7 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             {
                 slot.client_to_server.reset();
                 slot.server_to_client.reset();
+                slot.reset_holders();
                 slot.client_pid.store(client_cred.pid as u32, Ordering::Relaxed);
                 slot.client_uid.store(client_cred.uid, Ordering::Relaxed);
                 slot.client_gid.store(client_cred.gid, Ordering::Relaxed);
@@ -3361,17 +3704,16 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         None
     }
 
-    /// If `slot` is `OCCUPIED` but both its client and server owning processes are confirmed
-    /// dead, frees it back to `EMPTY` and returns `true`. A CAS guards the actual free so two
+    /// If `slot` is `OCCUPIED` but no live host process holds either side, frees it back to
+    /// `EMPTY` and returns `true`. (The credential pids are guest pids, not host pids, so
+    /// liveness is judged from the per-host holder records.) A CAS guards the actual free so two
     /// racing callers that both observe the same orphaned slot never double-free it -- the loser
     /// simply returns `false` and moves on (to the next slot, or a later call).
     fn reclaim_dead_slot(&self, slot: &SharedConnSlot<Platform>, platform: &Platform) -> bool {
         if slot.state.load(Ordering::Acquire) != CONN_SLOT_OCCUPIED {
             return false;
         }
-        let client_pid = slot.client_pid.load(Ordering::Relaxed);
-        let server_pid = slot.server_pid.load(Ordering::Relaxed);
-        if platform.is_process_alive(client_pid) || platform.is_process_alive(server_pid) {
+        if !(slot.side_gone(true, platform) && slot.side_gone(false, platform)) {
             return false;
         }
         let reclaimed = slot
@@ -3672,5 +4014,252 @@ impl SharedUnixConnectQueue {
              it within a bounded spin -- leaking this slot (existing degrade-not-panic \
              philosophy, self-healing once the whole fork family exits)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrying a unix socket into a `LITEBOX_PROCESS_FORK=1` cross-process fork child.
+//
+// The child is a separate host process, so an fd can only follow it as a description it rebuilds
+// on its side: `UnixSocket::fork_carry` writes one (a "spec" string), the platform ships it in the
+// child's environment, and `UnixSocket::from_fork_spec` rebuilds the socket there.
+//
+// - A connected stream/seqpacket socket is promoted onto a `SharedUnixConnTable` slot (see
+//   `UnixConnectedStream::promote_for_fork`); parent and child then hold the same side of the
+//   same slot. The parent counts one extra holder of that side on the child's behalf, so the
+//   peer cannot see EOF while the child is still starting; the child moves that count to its own
+//   host process when it rebuilds the endpoint.
+// - A listener is rebuilt in the child without registering the address again; the child's
+//   `accept()` takes cross-process connects from `SharedUnixConnectQueue`, while connects from
+//   the parent's own host process keep going to the parent's backlog.
+// - An unbound, unconnected stream or datagram socket is rebuilt fresh.
+// - Everything else (a bound but unconnected socket, a connect in progress, a bound or connected
+//   datagram socket including a datagram socketpair) is refused, and the fork stays on the
+//   thread-based path.
+
+fn encode_unix_addr(addr: &UnixSocketAddr) -> String {
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| alloc::format!("{b:02x}")).collect::<String>();
+    match addr {
+        UnixSocketAddr::Unnamed => String::from("u"),
+        UnixSocketAddr::Path(p) => alloc::format!("p{}", hex(p.as_bytes())),
+        UnixSocketAddr::Abstract(a) => alloc::format!("a{}", hex(a)),
+    }
+}
+
+fn decode_unix_addr(s: &str) -> Option<UnixSocketAddr> {
+    let unhex = |h: &str| -> Option<Vec<u8>> {
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok())
+            .collect()
+    };
+    match s.split_at_checked(1)? {
+        ("u", "") => Some(UnixSocketAddr::Unnamed),
+        ("p", h) => Some(UnixSocketAddr::Path(String::from_utf8(unhex(h)?).ok()?)),
+        ("a", h) => Some(UnixSocketAddr::Abstract(unhex(h)?)),
+        _ => None,
+    }
+}
+
+/// What the parent must undo if the fork that a [`UnixSocket::fork_carry`] was made for does not
+/// happen: the connection holder it counted, or the listener presence it advertised, on the
+/// child's behalf.
+pub(crate) enum UnixCarryHold {
+    Conn { slot: u32, is_client: bool },
+    Presence { key: UnixSocketAddrKey, owner_pid: u32 },
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
+    /// Whether [`Self::fork_carry`] can carry this socket; the reason when it cannot. Changes
+    /// nothing.
+    pub(super) fn fork_carry_check(&self) -> Result<(), &'static str> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
+                UnixStreamState::Init(init) if init.addr.is_none() => Ok(()),
+                UnixStreamState::Init(_) => Err("unix-socket(bound,unconnected)"),
+                UnixStreamState::Listen(_) | UnixStreamState::Connected(_) => Ok(()),
+                UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
+            }),
+            UnixSocketInner::Datagram(datagram) => {
+                let inner = datagram.inner.read();
+                if inner.addr.is_none()
+                    && inner.recv_channel.is_none()
+                    && inner.connected_send_channel.is_none()
+                {
+                    Ok(())
+                } else {
+                    Err("unix-datagram(bound-or-connected)")
+                }
+            }
+        }
+    }
+
+    /// Describes this socket for a cross-process fork child (see this section's comment),
+    /// promoting a connection onto a shared slot. `own_cred` is the forking task's.
+    ///
+    /// A listener is advertised under `child_pid` right away, so a connect made after the parent
+    /// closes its own copy but before the child is running still finds it (and waits in the shared
+    /// queue for the child's `accept()`), as it would on Linux, where the socket never went away.
+    pub(super) fn fork_carry(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        own_cred: Ucred,
+        child_pid: i32,
+    ) -> Result<(String, Option<UnixCarryHold>), &'static str> {
+        self.fork_carry_check()?;
+        let status = self.get_status().bits();
+        let body = match &self.inner {
+            UnixSocketInner::Datagram(_) => return Ok((alloc::format!("{status:x};D"), None)),
+            UnixSocketInner::Stream(stream) => {
+                let seq = u8::from(stream.preserve_boundaries);
+                stream.with_state_ref(|state| match state {
+                    UnixStreamState::Init(_) => Ok((alloc::format!("I,{seq}"), None)),
+                    UnixStreamState::Listen(listen) => {
+                        let backlog = &listen.backlog;
+                        let cred = backlog.listener_cred;
+                        let key = backlog.addr.to_key();
+                        let owner_pid = child_pid.cast_unsigned();
+                        let (kind, bytes) = presence_kind_and_bytes(&key);
+                        if !global.unix_addr_presence.insert(kind, bytes, owner_pid) {
+                            return Err("unix-socket(listener; shared presence table full)");
+                        }
+                        Ok((
+                            alloc::format!(
+                                "L,{seq},{},{},{},{},{}",
+                                backlog.state.lock().limit,
+                                cred.pid,
+                                cred.uid,
+                                cred.gid,
+                                encode_unix_addr(&UnixSocketAddr::from(backlog.addr.as_ref()))
+                            ),
+                            Some(UnixCarryHold::Presence { key, owner_pid }),
+                        ))
+                    }
+                    UnixStreamState::Connected(conn) => {
+                        let (slot, is_client) =
+                            conn.promote_for_fork(global, own_cred, stream.preserve_boundaries)?;
+                        let me = global.platform.current_host_pid();
+                        global
+                            .unix_shared_conn_table
+                            .get(slot)
+                            .hold(is_client, me);
+                        let peer = conn.peer_cred;
+                        Ok((
+                            alloc::format!(
+                                "C,{seq},{slot},{},{me},{},{},{},{},{}",
+                                u8::from(is_client),
+                                peer.pid,
+                                peer.uid,
+                                peer.gid,
+                                encode_unix_addr(&conn.get_local_addr()),
+                                encode_unix_addr(&conn.get_peer_addr())
+                            ),
+                            Some(UnixCarryHold::Conn { slot, is_client }),
+                        ))
+                    }
+                    UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
+                })?
+            }
+        };
+        Ok((alloc::format!("{status:x};{}", body.0), body.1))
+    }
+
+    /// Undoes a [`Self::fork_carry`] whose fork did not happen.
+    pub(super) fn fork_carry_abandon(global: &GlobalStateHandle<Platform, FS>, hold: UnixCarryHold) {
+        match hold {
+            UnixCarryHold::Conn { slot, is_client } => SharedView {
+                global,
+                slot,
+                is_client,
+            }
+            .release_holder(),
+            UnixCarryHold::Presence { key, owner_pid } => {
+                let (kind, bytes) = presence_kind_and_bytes(&key);
+                global.unix_addr_presence.remove(kind, bytes, owner_pid);
+            }
+        }
+    }
+
+    /// Rebuilds, in a cross-process fork child, the socket a parent's [`Self::fork_carry`]
+    /// described.
+    pub(super) fn from_fork_spec(task: &Task<Platform, FS>, spec: &str) -> Option<Self> {
+        let (status, body) = spec.split_once(';')?;
+        let status = OFlags::from_bits_truncate(u32::from_str_radix(status, 16).ok()?);
+        let mut fields = body.split(',');
+        let kind = fields.next()?;
+        let inner = if kind == "D" {
+            UnixSocketInner::Datagram(UnixDatagram::new())
+        } else {
+            let seq = fields.next()? == "1";
+            let state = match kind {
+                "I" => UnixStreamState::Init(UnixInitStream::new()),
+                "L" => {
+                    let limit = fields.next()?.parse().ok()?;
+                    let cred = Ucred {
+                        pid: fields.next()?.parse().ok()?,
+                        uid: fields.next()?.parse().ok()?,
+                        gid: fields.next()?.parse().ok()?,
+                    };
+                    // Opened, not created: the parent already bound it. Not put in this process's
+                    // address table (the parent's backlog serves connects from the parent's own
+                    // host process); the parent already advertised it in the shared presence
+                    // table under this process's pid (see `fork_carry`), so cross-process connects
+                    // keep reaching this listener after the parent closes its copy.
+                    let addr = decode_unix_addr(fields.next()?)?;
+                    let addr = match (addr.clone().bind(task, false), addr) {
+                        (Ok(bound), _) => bound,
+                        (Err(err), UnixSocketAddr::Path(path)) => {
+                            litebox_util_log::debug!(
+                                path:% = path, err:? = err;
+                                "carried unix listener: could not open its socket file; keeping                                  the name only"
+                            );
+                            UnixBoundSocketAddr::UnopenedPath(path)
+                        }
+                        (Err(_), _) => return None,
+                    };
+                    let owner_pid = task.pid.get().cast_unsigned();
+                    UnixStreamState::Listen(UnixListenStream {
+                        backlog: Arc::new(Backlog::new(addr, limit, Pollee::new(), cred)),
+                        global: task.global.clone(),
+                        owner_pid,
+                        carried: true,
+                    })
+                }
+                "C" => {
+                    let slot: u32 = fields.next()?.parse().ok()?;
+                    let is_client = fields.next()? == "1";
+                    let parent_host: u32 = fields.next()?.parse().ok()?;
+                    let peer_cred = Ucred {
+                        pid: fields.next()?.parse().ok()?,
+                        uid: fields.next()?.parse().ok()?,
+                        gid: fields.next()?.parse().ok()?,
+                    };
+                    let local_addr = decode_unix_addr(fields.next()?)?;
+                    let peer_addr = decode_unix_addr(fields.next()?)?;
+                    if slot as usize >= SHARED_UNIX_CONN_CAPACITY {
+                        return None;
+                    }
+                    let conn = UnixConnectedStream::new_shared(
+                        task.global.clone(),
+                        slot,
+                        is_client,
+                        local_addr,
+                        peer_addr,
+                        peer_cred,
+                    );
+                    // The holder the parent counted for this child now lives here.
+                    task.global
+                        .unix_shared_conn_table
+                        .get(slot)
+                        .release(is_client, parent_host);
+                    UnixStreamState::Connected(conn)
+                }
+                _ => return None,
+            };
+            UnixSocketInner::Stream(UnixStream::new(state, seq))
+        };
+        let socket = Self::new_with_inner(inner, SockFlags::empty());
+        socket.set_status(status, true);
+        Some(socket)
     }
 }

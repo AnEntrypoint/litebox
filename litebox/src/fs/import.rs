@@ -19,7 +19,8 @@ pub enum ImportError {
     Mkdir,
     MakeFifo,
     Symlink,
-    Open,
+    /// Opening the named file for writing failed.
+    Open(alloc::string::String, super::errors::OpenError),
     Write,
     Close,
 }
@@ -34,7 +35,19 @@ pub enum ImportError {
 /// Never in practice: the internal header cast can only fail to deref if `tar_data`'s length
 /// were shorter than the loop's own bounds check allows, which is structurally impossible given
 /// the `while block_index < total_blocks` guard immediately above it.
+///
+/// One entry failing does not stop the import: every other entry is still applied and the first
+/// error is returned at the end. (A cross-process fork child re-exports everything it adopted, so
+/// one stale unwritable file used to discard all of the child's real writes.)
 pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), ImportError> {
+    let mut first_error: Option<ImportError> = None;
+    let mut record = |r: Result<(), ImportError>| {
+        if let Err(e) = r
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
+    };
     let mut block_index = 0usize;
     let total_blocks = tar_data.len() / BLOCKSIZE;
     while block_index < total_blocks {
@@ -74,11 +87,11 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
         match typeflag {
             tar_no_std::TypeFlag::DIRTYPE => match fs.mkdir(&*path, mode) {
                 Ok(()) | Err(super::errors::MkdirError::AlreadyExists) => {}
-                Err(_) => return Err(ImportError::Mkdir),
+                Err(_) => record(Err(ImportError::Mkdir)),
             },
             tar_no_std::TypeFlag::FIFOTYPE => match fs.make_fifo(&*path, mode) {
                 Ok(()) | Err(super::errors::MkdirError::AlreadyExists) => {}
-                Err(_) => return Err(ImportError::MakeFifo),
+                Err(_) => record(Err(ImportError::MakeFifo)),
             },
             tar_no_std::TypeFlag::SYMTYPE => {
                 let Ok(target) = header.linkname.as_str() else {
@@ -91,10 +104,9 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                     // child's real writes. See gm mutable fs-import-symlink-replace-fork.
                     Err(super::errors::SymlinkError::AlreadyExists) => {
                         let _ = fs.unlink(&*path);
-                        fs.symlink(target, &*path)
-                            .map_err(|_| ImportError::Symlink)?;
+                        record(fs.symlink(target, &*path).map_err(|_| ImportError::Symlink));
                     }
-                    Err(_) => return Err(ImportError::Symlink),
+                    Err(_) => record(Err(ImportError::Symlink)),
                 }
             }
             tar_no_std::TypeFlag::REGTYPE | tar_no_std::TypeFlag::AREGTYPE => {
@@ -107,21 +119,7 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 block_index += payload_blocks;
 
                 let contents: &[u8] = tar_data.get(content_start..content_end).unwrap_or(&[]);
-
-                let fd = fs
-                    .open(&*path, OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC, mode)
-                    .map_err(|_| ImportError::Open)?;
-                let mut written = 0;
-                while written < contents.len() {
-                    let n = fs
-                        .write(&fd, &contents[written..], None)
-                        .map_err(|_| ImportError::Write)?;
-                    if n == 0 {
-                        break;
-                    }
-                    written += n;
-                }
-                fs.close(&fd).map_err(|_| ImportError::Close)?;
+                record(import_file(fs, &path, mode, contents));
             }
             _ => {
                 // Character devices and hardlinks: not produced by `export_all`, skipped.
@@ -130,7 +128,50 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
             }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Writes one regular file. The import applies another process's writes to the one shared
+/// filesystem, so a file whose mode forbids writing (e.g. Xvfb's 0444 `/tmp/.X1-lock`, re-exported
+/// by every child) is made writable for the write and its mode restored afterward.
+fn import_file<FS: FileSystem>(
+    fs: &FS,
+    path: &str,
+    mode: Mode,
+    contents: &[u8],
+) -> Result<(), ImportError> {
+    let flags = OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC;
+    let (fd, restore_mode) = match fs.open(path, flags, mode) {
+        Ok(fd) => (fd, false),
+        Err(super::errors::OpenError::AccessNotAllowed) => {
+            fs.chmod(path, mode | Mode::WUSR)
+                .map_err(|_| ImportError::Open(String::from(path), super::errors::OpenError::AccessNotAllowed))?;
+            let fd = fs
+                .open(path, flags, mode)
+                .map_err(|e| ImportError::Open(String::from(path), e))?;
+            (fd, true)
+        }
+        Err(e) => return Err(ImportError::Open(String::from(path), e)),
+    };
+    let mut result = Ok(());
+    let mut written = 0;
+    while written < contents.len() {
+        match fs.write(&fd, &contents[written..], None) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(_) => {
+                result = Err(ImportError::Write);
+                break;
+            }
+        }
+    }
+    if fs.close(&fd).is_err() && result.is_ok() {
+        result = Err(ImportError::Close);
+    }
+    if restore_mode {
+        let _ = fs.chmod(path, mode);
+    }
+    result
 }
 
 fn normalize(filename: &str) -> String {

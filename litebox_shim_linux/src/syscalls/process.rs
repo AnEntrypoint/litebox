@@ -2917,6 +2917,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             alloc::vec::Vec::new();
         let mut inherited_eventfds: alloc::vec::Vec<litebox::platform::ForkInheritedEventfd> =
             alloc::vec::Vec::new();
+        // Unix sockets to carry. Carrying one promotes a connection onto a shared slot, so it is
+        // done only once the fork is known to be eligible, right before the spawn.
+        let mut unix_to_carry: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut uncarriable = 0usize;
         // WHICH subsystems blocked, deduplicated -- reported once per refused fork at `warn` so the
         // answer to "what do I teach next" is visible without turning on a debug firehose. The
@@ -3065,6 +3068,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             "clone: dropping a pty fd rather than refusing the fork; SharedPtyTable lets the child re-open it by id instead"
                         );
                     }
+                    // A unix socket is carried: a connection is promoted onto a shared slot both
+                    // processes use, a listener is rebuilt in the child, an unbound fresh socket
+                    // is recreated (`UnixSocket::fork_carry`). Close-on-exec ones are carried
+                    // only when they are an addressless `socketpair(2)` end: that is the fd a
+                    // child really uses before exec (54th pass: `dbus-daemon`'s activation
+                    // babysitter reports its pid over one, so dropping it made every D-Bus
+                    // activation "exit, reason unknown"). Any other close-on-exec unix socket --
+                    // the X11 and D-Bus client connections every desktop process holds -- is
+                    // dropped by the rule below, which avoids moving every such connection onto a
+                    // slow, capacity-bounded shared slot on each fork.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "unix-socket"
+                        && (!self.raw_fd_is_cloexec(*raw_fd)
+                            || self.raw_fd_is_addressless_unix_socket_pair(*raw_fd)) =>
+                    {
+                        match self.raw_fd_unix_carry_check(*raw_fd) {
+                            Some(Ok(())) => unix_to_carry.push(*raw_fd),
+                            refusal => {
+                                let kind = match refusal {
+                                    Some(Err(kind)) => kind,
+                                    _ => "unix-socket",
+                                };
+                                uncarriable += 1;
+                                if self.raw_fd_is_cloexec(*raw_fd) {
+                                    uncarriable_cloexec += 1;
+                                }
+                                if !uncarriable_kinds.iter().any(|k| *k == kind) {
+                                    uncarriable_kinds.push(kind);
+                                }
+                                litebox_util_log::debug!(
+                                    tid:% = self.tid.get(), fd:% = raw_fd, kind:% = kind;
+                                    "clone: cross-process fork() cannot carry this unix socket"
+                                );
+                            }
+                        }
+                    }
                     // A close-on-exec fd does not block the fork, and is not carried.
                     //
                     // This is the Win32 rendering of what the guest already declared, not a
@@ -3079,56 +3117,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // cross-process fork -- 95.1% -- were close-on-exec, overwhelmingly the X11 and
                     // D-Bus connections every desktop process holds and every one of them opens
                     // `SOCK_CLOEXEC` precisely so a spawned child will not inherit it.
-                    //
-                    // 54th-pass fix (`docs/AGENTS_ARCHIVE_2026-09-22.md`): a `socketpair(2)`
-                    // result is exactly the "child USES this fd before exec" case the general
-                    // CLOEXEC-drop rule below documents as broken -- and real processes use it for
-                    // precisely that reason. Live-traced root cause: `dbus-daemon`'s own service
-                    // activation forks a "babysitter" whose FIRST action (`write_pid`, real
-                    // upstream `dbus/dbus-spawn-unix.c`: `babysitter_pipe = _dbus_socketpair(...,
-                    // TRUE, ...)`, i.e. CLOEXEC, used well before any `exec()` of the real target)
-                    // writes its own pid back to the daemon over exactly this kind of fd. Dropping
-                    // it silently (the general rule below) left the daemon's own end of that
-                    // *specific pair* referencing a peer that was NEVER given a live copy in the
-                    // cross-process child from the moment of fork -- observed live as the daemon
-                    // reading an immediate EOF/HUP and logging "Activated service '<X>' failed:
-                    // Process <X> exited, reason unknown" within ~1ms of the fork() call
-                    // returning, EVERY TIME, for EVERY D-Bus service activation
-                    // (`org.a11y.Bus`/`org.xfce.Xfconf`/`org.a11y.atspi.Registry` all hit this),
-                    // which is upstream of the `xfwm4`-never-launches/`GLib-GIO-CRITICAL`-flood
-                    // symptom the 43rd-53rd passes chased. Confirmed NOT a premature-exit-report
-                    // bug in `try_wait_for_cross_process_exit`/`arm_cross_process_exit_notifier`
-                    // (the leading hypothesis going into this pass): live `GetProcessTimes`-based
-                    // instrumentation on both call sites (`wait4_diag` in
-                    // `litebox_platform_windows_userland/src/process_fork.rs` and `lib.rs`) proved
-                    // the real Windows process for one such babysitter stayed alive for a REAL,
-                    // `GetProcessTimes`-sourced 3856ms after its own `CreateProcessW`, while the
-                    // daemon's "exited, reason unknown" print landed under 1ms after the fork()
-                    // syscall returned to the guest -- 3.8+ real seconds BEFORE either
-                    // `WaitForSingleObject` call this pass instrumented had returned anything at
-                    // all for that handle. `raw_fd_is_addressless_unix_socket_pair` (`net.rs`)
-                    // distinguishes this narrow case (BOTH ends `Unnamed`, real Linux's own
-                    // definition of a `socketpair(2)` result) from the overwhelming common case of
-                    // an ordinary named-peer CLOEXEC client socket (X11/D-Bus connections, 95.1% of
-                    // all cross-process-fork CLOEXEC drops per the measurement below) -- those keep
-                    // being silently dropped exactly as before, so this fix does not reintroduce
-                    // the thread-based-fork tcache-corruption exposure for the common case, only
-                    // for the narrow pre-exec-IPC one that was actually wrong.
-                    None if self.raw_fd_is_cloexec(*raw_fd)
-                        && self.raw_fd_subsystem_name(*raw_fd) == "unix-socket"
-                        && self.raw_fd_is_addressless_unix_socket_pair(*raw_fd) =>
-                    {
-                        uncarriable += 1;
-                        uncarriable_cloexec += 1;
-                        let subsystem = "unix-socket-pair(addressless,pre-exec-IPC)";
-                        if !uncarriable_kinds.iter().any(|k| *k == subsystem) {
-                            uncarriable_kinds.push(subsystem);
-                        }
-                        litebox_util_log::debug!(
-                            tid:% = self.tid.get(), fd:% = raw_fd;
-                            "clone: cross-process fork() cannot carry this fd -- addressless unix-socket-pair (socketpair), likely pre-exec IPC (e.g. dbus babysitter protocol), refusing rather than silently dropping"
-                        );
-                    }
                     // THE DEVIATION, stated rather than hidden. Linux keeps a `CLOEXEC` fd alive in
                     // the child between `fork()` and `execve()`; Windows has no such gap, because
                     // it has no fork. A child that USES one of these fds before exec sees `EBADF`
@@ -3181,7 +3169,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 dropped_pty:% = dropped_pty,
                 carried_pipes:% = inherited_pipes.len(),
                 carried_files:% = inherited_files.len(),
-                carried_eventfds:% = inherited_eventfds.len();
+                carried_eventfds:% = inherited_eventfds.len(),
+                carried_unix:% = unix_to_carry.len();
                 "clone: cross-process fork() not eligible -- these fd subsystems cannot cross the process boundary yet; each one taught is one more fork that gets a real address space instead of the thread-based relocating fallback"
             );
             return None;
@@ -3474,6 +3463,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Admission control (76th pass) -- bounds how many rootfs-rebuilding cross-process
         // children can be simultaneously alive; see `reserve_cross_process_fork_slot`'s own doc
         // comment for the full RAM-crater evidence and mechanism.
+        let mut inherited_shim_fds: alloc::vec::Vec<litebox::platform::ForkInheritedShimFd> =
+            alloc::vec::Vec::new();
+        let mut unix_holds = alloc::vec::Vec::new();
+        for raw_fd in unix_to_carry {
+            match self.raw_fd_unix_carry(raw_fd, child_tid) {
+                Ok((spec, hold)) => {
+                    litebox_util_log::debug!(
+                        tid:% = self.tid.get(), fd:% = raw_fd, spec:% = spec;
+                        "clone: carrying a unix socket into the cross-process child"
+                    );
+                    inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                        fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                        spec,
+                    });
+                    unix_holds.extend(hold);
+                }
+                Err(reason) => {
+                    litebox_util_log::warn!(
+                        tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
+                        fd:% = raw_fd, reason:% = reason;
+                        "clone: cross-process fork() not eligible -- a unix socket could not be carried"
+                    );
+                    for hold in unix_holds {
+                        crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
+                            &self.global,
+                            hold,
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
         self.reserve_cross_process_fork_slot();
         let handle = self.global.platform.spawn_cross_process_fork_child(
             &relocations,
@@ -3481,13 +3502,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_pipes,
             inherited_files,
             inherited_eventfds,
+            inherited_shim_fds,
             self.sigreturn_trampoline_addr(),
             self.prepare_fork_child_identity(child_tid),
         );
         if handle.is_none() {
             // No child was actually created -- undo the optimistic reservation immediately
-            // rather than leaving it held until some future reap that will never come.
+            // rather than leaving it held until some future reap that will never come, and the
+            // holders counted for the child on carried unix sockets.
             self.release_cross_process_fork_slot();
+            for hold in unix_holds {
+                crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
+                    &self.global,
+                    hold,
+                );
+            }
         }
 
         // Second half of the same probe: a THIRD write, strictly AFTER `spawn_cross_process_fork_
@@ -4897,6 +4926,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .spawn_cross_process_fork_child(
                         &relocations,
                         full_gprs,
+                        alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),
                         alloc::vec::Vec::new(),

@@ -1215,9 +1215,11 @@ pub trait ForkChildVerificationProvider {
         inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
         inherited_files: alloc::vec::Vec<ForkInheritedFile>,
         inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
+        inherited_shim_fds: alloc::vec::Vec<ForkInheritedShimFd>,
         sigreturn_trampoline: usize,
         identity: ForkChildIdentity,
     ) -> Option<CrossProcessChildHandle> {
+        let _ = inherited_shim_fds;
         let _ = relocations;
         let _ = full_gprs;
         let _ = inherited_pipes;
@@ -1556,6 +1558,15 @@ impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>
 /// outlives the specific task a parent's `wait4()` actually asked about).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossProcessChildHandle(pub usize);
+
+/// An fd whose state only the shim understands (a unix socket), described by `spec`: an opaque
+/// string the shim wrote in the parent and parses again in a cross-process fork child. The
+/// platform only transports it.
+#[derive(Debug, Clone)]
+pub struct ForkInheritedShimFd {
+    pub fd: i32,
+    pub spec: alloc::string::String,
+}
 
 /// The guest identity a cross-process fork child must come up with: the pid the parent's
 /// `fork()` returned (so `getpid()` in the child equals `$!` in the parent), its parent's pid,

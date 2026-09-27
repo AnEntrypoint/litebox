@@ -6785,12 +6785,74 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Task-level wrapper around `FilesState::raw_fd_is_addressless_unix_socket_pair` (`net.rs`)
     /// -- see that method's own doc comment for the full rationale. Used by
-    /// `try_cross_process_fork` to refuse (not silently drop) a `socketpair(2)`-originated CLOEXEC
-    /// fd, matching how every other genuinely uncarriable fd kind already refuses the whole fork.
+    /// `try_cross_process_fork` to carry (not silently drop) a `socketpair(2)`-originated CLOEXEC
+    /// fd.
     pub(crate) fn raw_fd_is_addressless_unix_socket_pair(&self, raw_fd: usize) -> bool {
         self.files
             .borrow()
             .raw_fd_is_addressless_unix_socket_pair(&self.global, raw_fd)
+    }
+
+    /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
+    pub(crate) fn raw_fd_unix_carry_check(&self, raw_fd: usize) -> Option<Result<(), &'static str>> {
+        self.files
+            .borrow()
+            .raw_fd_unix_carry_check(&self.global, raw_fd)
+    }
+
+    /// See `FilesState::raw_fd_unix_carry` (`net.rs`). The spec is prefixed with whether the fd
+    /// is close-on-exec, so the child can restore that too.
+    pub(crate) fn raw_fd_unix_carry(
+        &self,
+        raw_fd: usize,
+        child_pid: i32,
+    ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str>
+    {
+        let cloexec = self.raw_fd_is_cloexec(raw_fd);
+        let (spec, hold) = self
+            .files
+            .borrow()
+            .raw_fd_unix_carry(&self.global, raw_fd, self.peer_cred(), child_pid)?;
+        Ok((alloc::format!("{}|{spec}", u8::from(cloexec)), hold))
+    }
+
+    /// Rebuilds, at exactly `target_fd`, a unix socket a cross-process fork parent carried (see
+    /// `Task::raw_fd_unix_carry`).
+    pub(crate) fn install_unix_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, spec) = spec.split_once('|')?;
+        let socket = crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec)?;
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(typed)
+            .map_err(|typed| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+            })
+            .ok()?;
+        drop(files);
+        let raw = i32::try_from(raw).ok()?;
+        let flags = (cloexec == "1").then_some(OFlags::CLOEXEC);
+        if raw != target_fd {
+            let moved = self.sys_dup(raw, Some(target_fd), flags).is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        if flags.is_some() {
+            let files = self.files.borrow();
+            let desc = usize::try_from(target_fd).ok()?;
+            set_file_descriptor_flags(
+                desc,
+                &self.global,
+                &files,
+                FileDescriptorFlags::FD_CLOEXEC,
+            )
+            .ok()?;
+        }
+        Some(())
     }
 
     pub(crate) fn raw_fd_subsystem_name(&self, raw_fd: usize) -> &'static str {

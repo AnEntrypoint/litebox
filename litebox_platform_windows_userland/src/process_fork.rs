@@ -907,6 +907,11 @@ pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
 /// instead of being the child's unrelated Windows process id. Never guest-visible.
 pub const FORK_CHILD_GUEST_IDENTITY_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY";
 
+/// Carries shim-level fds (unix sockets) a cross-process fork child must rebuild, as
+/// `fd:hexspec` pairs separated by commas; each spec is opaque to the platform (see
+/// `litebox::platform::ForkInheritedShimFd`). Never guest-visible.
+pub const FORK_CHILD_SHIM_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_SHIM_FDS";
+
 /// Parses [`FORK_CHILD_GUEST_IDENTITY_ENV_VAR`] from this process's environment.
 pub fn fork_child_guest_identity() -> Option<litebox::platform::ForkChildIdentity> {
     let raw = std::env::var(FORK_CHILD_GUEST_IDENTITY_ENV_VAR).ok()?;
@@ -1790,6 +1795,7 @@ pub fn spawn_process_fork_child(
     child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
     inherited_files: &[litebox::platform::ForkInheritedFile],
     inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
+    inherited_shim_fds: &[litebox::platform::ForkInheritedShimFd],
     sigreturn_trampoline: usize,
     identity: litebox::platform::ForkChildIdentity,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
@@ -1824,6 +1830,14 @@ pub fn spawn_process_fork_child(
         (
             FORK_CHILD_GUEST_IDENTITY_ENV_VAR,
             format!("{}:{}:{}", identity.pid, identity.ppid, identity.pgid),
+        ),
+        (
+            FORK_CHILD_SHIM_FDS_ENV_VAR,
+            inherited_shim_fds
+                .iter()
+                .map(|f| format!("{:x}:{}", f.fd, hex_encode(f.spec.as_bytes())))
+                .collect::<Vec<_>>()
+                .join(","),
         ),
         // A fork child must never publish host ports.
         //

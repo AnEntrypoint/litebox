@@ -160,6 +160,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         handle.with_entry(|entry| netlink_op(entry))
     }
 
+    /// Whether the unix socket at `raw_fd` can be carried into a cross-process fork child (see
+    /// `UnixSocket::fork_carry_check`); `None` when `raw_fd` is not a unix socket.
+    pub(crate) fn raw_fd_unix_carry_check(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        raw_fd: usize,
+    ) -> Option<Result<(), &'static str>> {
+        let raw_fd = u32::try_from(raw_fd).ok()?;
+        self.with_socket_netlink(
+            global,
+            raw_fd,
+            |_inet| Err(Errno::ENOTSOCK),
+            |unix| Ok(unix.fork_carry_check()),
+            |_netlink| Err(Errno::ENOTSOCK),
+        )
+        .ok()
+    }
+
+    /// Describes the unix socket at `raw_fd` for a cross-process fork child, promoting a
+    /// connection onto a shared slot (see `UnixSocket::fork_carry`).
+    pub(crate) fn raw_fd_unix_carry(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        raw_fd: usize,
+        own_cred: litebox_common_linux::Ucred,
+        child_pid: i32,
+    ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str> {
+        let raw_fd = u32::try_from(raw_fd).map_err(|_| "fd out of range")?;
+        self.with_socket_netlink(
+            global,
+            raw_fd,
+            |_inet| Err(Errno::ENOTSOCK),
+            |unix| Ok(unix.fork_carry(global, own_cred, child_pid)),
+            |_netlink| Err(Errno::ENOTSOCK),
+        )
+        .map_err(|_| "not a unix socket")?
+    }
+
     /// `true` only for a Unix-domain socket fd that is BOTH unbound (never `bind()`ed to a real
     /// filesystem/abstract address) AND unconnected-to-a-named-peer -- i.e. one half of a
     /// `socketpair(2)` result, real Linux's own definition of "unnamed" for this address family
@@ -174,7 +212,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// protocol, confirmed live against upstream `dbus-spawn-unix.c`'s `_dbus_socketpair` call use
     /// this exact shape), so unlike an ordinary named-address CLOEXEC socket, dropping this kind
     /// silently produces WRONG guest-visible behavior rather than a merely-unavailable-post-exec
-    /// fd -- see that call site's own doc comment for the full evidence chain.
+    /// fd -- that call site carries it into the child instead.
     pub(crate) fn raw_fd_is_addressless_unix_socket_pair(
         &self,
         global: &GlobalStateHandle<Platform, FS>,

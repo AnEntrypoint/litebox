@@ -12725,6 +12725,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         inherited_pipes: std::vec::Vec<(i32, litebox::platform::ForkPipeBridge)>,
         inherited_files: std::vec::Vec<litebox::platform::ForkInheritedFile>,
         inherited_eventfds: std::vec::Vec<litebox::platform::ForkInheritedEventfd>,
+        inherited_shim_fds: std::vec::Vec<litebox::platform::ForkInheritedShimFd>,
         sigreturn_trampoline: usize,
         identity: litebox::platform::ForkChildIdentity,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
@@ -12853,6 +12854,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             &child_pipe_handles,
             &inherited_files,
             &inherited_eventfds,
+            &inherited_shim_fds,
             sigreturn_trampoline,
             identity,
         ) {
