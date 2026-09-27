@@ -2404,3 +2404,104 @@ thread-based-fork tcache corruption class, not a regression from this pass's own
     `.wfgy/pass105_xset_repro_lazy_fixed.{err,out,poll}.log` (after-fix, 0 `0x7feffffef000` hits),
     `.wfgy/pass105_xset_repro_nolazy.ps1`/`.{err,out,poll}.log` (control, `LITEBOX_PROCESS_FORK=1`
     alone, 0 fatal signals both before and after this pass's fix).
+
+## 106th-107th pass full narrative (drained from AGENTS.md by the 113th pass)
+
+**106th** -- investigated the 105th pass's open `/usr/bin/rm` crash with a new, targeted diagnostic
+(extended `LITEBOX_LOG=...,litebox_shim_linux=debug` plus `LITEBOX_DIAG_MM=1`); ruled out three
+hypotheses with hard evidence, narrowed the real mechanism, did NOT find or fix the root cause -- no
+source or `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` behavior changed this pass.
+
+Ruled out (all three, by direct log evidence, not guessing): (1) NOT the FS_BASE-repair mechanism
+itself being buggy -- the `[diag-recover-fsbase]` line's own printed `fsbase=` value is a healthy
+non-zero constant (`0x7feffffb1740`) every single time, meaning the repair loop's own
+`rdfsbase()==0` guard is false and no repair is even attempted; the line is merely co-located with
+the crash, not causal. (2) NOT `load_program` returning an error -- `sys_execve`'s own
+`load_program failed after point of no return, killing process with SIGSEGV` `warn!` (default log
+level, would always show) never appears anywhere in any of this pass's logs. (3) NOT a repeat of
+either fixed trampoline bug -- zero `0x7feffffef000` hits in every capture.
+
+New hard evidence, `litebox_shim_linux::lib.rs`'s existing `diag-guest-exception` diagnostic
+(`litebox_shim_linux=debug`, `.wfgy/pass106_rm_diag2.err.log:51459` and 5 other byte-identical
+occurrences across two independent runs): the fatal fault is a genuine guest user-mode `#PF`
+(`exception=Exception(14) kernel_mode=false error_code=0x4` = user-mode, not-present, read) at a
+fully deterministic address (`cr2=0x111156f60`, `rip=0x7feffc2f3e56`, `rdx=0x7feffc445b40` --
+byte-identical across independent pids/runs, ruling out a race/timing bug). The faulting
+instruction (`rip` byte-dumped: `80 38 43` = `cmp byte [rax], 0x43`) reads a byte at `cr2`.
+litebox's own guest `Vmem` tracking believes the address IS validly mapped (`mapping overlapping
+cr2 range_start=0x111148000 range_end=0x111169000
+flags=VM_READ|VM_WRITE|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC`) -- i.e. a genuine desync between
+litebox's guest-level bookkeeping (present, r/w) and the real underlying Windows memory
+(not-present) for a page inside a mapping `/usr/bin/rm`'s own post-`execve` load created.
+
+Investigated but NOT confirmed as the mechanism: read `WindowsUserland::allocate_pages`'s entire
+fixed-address commit path (`lib.rs:7785-8541`) end to end looking for a spot where a commit failure
+could be silently treated as success -- found none. Also directly disproved that the crashing
+mapping was created via `allocate_pages` at all in THIS pid: `LITEBOX_DIAG_MM=1`'s own
+`diag-commit`/`DIAG allocate_pages` lines are confirmed reaching this exact forked-then-`execve`'d
+process (its own later `diag-decommit` lines DO appear, post-crash, during teardown) yet ZERO
+`diag-commit`/`allocate_pages` lines exist for this pid anywhere before the crash -- the mapping's
+real backing was created by a different mechanism than the traced anonymous-commit path (most
+likely litebox's memory-mapped/CoW-view ELF-segment loading, not yet read this pass).
+
+Next pickup (as of 106th, later superseded by the 109th pass's own fix from an unrelated angle):
+read the memory-mapped/CoW-view file-backed loading path for how it creates a fresh guest mapping
+after `execve` and whether/how it can register a guest `Vmem` entry as present without the real
+Windows backing actually being committed. Both lazy flags stayed default OFF; `DE_UP` not
+attempted this pass.
+
+Logs: `.wfgy/pass106_rm_diag.ps1`/`.{out,err,poll}.log` (first repro, confirms 6/6 same crash
+signature as 105th), `.wfgy/pass106_rm_diag2.ps1`/`.{out,err,poll}.log` (with
+`litebox_shim_linux=debug`+`LITEBOX_DIAG_MM=1`, the `diag-guest-exception`/deterministic-address
+evidence above).
+
+**107th** -- re-read the ELF-segment-loading path end to end (`litebox_shim_linux/src/loader/elf.rs`,
+`WindowsUserland::try_allocate_cow_pages`/`allocate_pages` in
+`litebox_platform_windows_userland/src/lib.rs`) and re-mined the 106th pass's own existing log
+(`.wfgy/pass106_rm_diag2.err.log`, reused unmodified -- no new boot run this pass) with sharper,
+targeted greps. Ruled the CoW-mmap hypothesis the 106th pass flagged as unread OUT with direct
+evidence, found a real, previously-undocumented stale-diagnostic false lead, and narrowed the real
+candidate mechanism to a specific, named function -- but did NOT reach a live cdb session, so the
+root cause was still NOT confirmed and NO code changed this pass. Both lazy flags stayed default
+OFF; `DE_UP` not attempted.
+
+CoW-mmap/`MapViewOfFile3` hypothesis (the 106th pass's own "not yet read" pointer) REFUTED by
+direct evidence, not further reading alone: `litebox_shim_linux/src/loader/elf.rs`'s
+`ElfFile::{reserve,map_file,map_zero,protect}` all go through plain `task.sys_mmap`/`sys_mprotect`
+-- the same syscall surface as every other guest mapping, not a distinct code path. The genuinely
+separate Windows-only fast path, `WindowsUserland::try_allocate_cow_pages`, maps host-rootfs-tar-
+backed file content via a real `MapViewOfFile3` section view and logs unconditionally under
+`diag-cow` whenever `LITEBOX_DIAG_MM=1` is set -- `grep -c "diag-cow" .wfgy/pass106_rm_diag2.err.log`
+was 0 across the whole ~44 MB capture, even though `LITEBOX_DIAG_MM=1` was genuinely set for that
+exact run and plenty of unrelated `diag-cow`-gated-sibling `diag-commit`/`diag-decommit` lines
+fired for other processes throughout the same log. This path was never taken for this crash at all.
+
+Re-derived the 106th pass's own "zero `allocate_pages` activity for the crashing pid" claim
+directly (not trusted secondhand) -- confirmed not one `diag-commit`/`DIAG allocate_pages` line
+fired anywhere in this process's entire post-`execve` life before it died. `clone: cross-process
+fork() copy plan` for this exact pid confirmed `execve` genuinely reused the pre-exec low-address
+neighborhood for the new image and confirmed (via `try_cross_process_fork entry`/`orig_rax=56`
+immediately preceding) that this child's own creation was plain cross-process `fork()`, ruling out
+`CLONE_VFORK`/`new_for_vfork_execve_detach`'s `VM_FOREIGN_LIVE_NEVER_REPLACE` placeholder mechanism
+as directly relevant.
+
+A real, previously-undocumented stale-diagnostic false lead found and ruled unreliable (not itself
+fixed -- diagnostic-only, does not affect runtime behavior): the same crashing pid emitted a
+`vmem-adopt-probe` "VMA layout adoption MISMATCH" whose own `tracked`/`sorted_expected` comparison
+was never updated to exclude `VM_OWN_FORK_PADDING` placeholder entries the way it already
+explicitly excludes `VM_SHARED` (45th pass) and `PROT_NONE` (52nd pass) -- very likely the same
+"stale diagnostic filter, not a real bug" pattern those two passes already hit, not new evidence
+of memory corruption.
+
+Leading candidate mechanism, found by reading `WindowsUserland::allocate_pages`'s own
+`reserve_and_commit` closure closely, NOT confirmed live: a failed fixed-address
+`VirtualAlloc2(MEM_RESERVE)` whose error is `ERROR_INVALID_ADDRESS` is assumed by this existing
+code to mean "the granule may already be reserved, by us" and is handled by blindly attempting the
+commit anyway. Combined with `deallocate_pages` never calling real `MEM_RELEASE` (only
+`MEM_DECOMMIT`), a stale lazy-fork-commit reservation could in principle collide with a
+freshly-`execve`'d image's own fixed-address allocation -- but this specific branch unconditionally
+emits a `diag-commit` line on success, which directly contradicted the confirmed
+zero-`diag-commit`-lines-for-this-pid evidence above, so this candidate did not fully explain what
+was observed on its own. Never resolved by a live session -- **the actual bug turned out to be
+unrelated to any of this**: see AGENTS.md's own 109th-pass entry, `sys_execve`'s disarm-ordering,
+not a memory-allocation bug.

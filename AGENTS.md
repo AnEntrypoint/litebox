@@ -382,188 +382,28 @@ map" below). Condensed current-state trail:
   trampoline instance). New evidence: the clearest crash follows `DIAG_TIMELINE execve
   argv0=/usr/bin/rm` immediately after a `[diag-recover-fsbase]` line. Root cause not found; both
   lazy flags stay default OFF, not safe for a real boot.
-- **106th — investigated the 105th pass's open `/usr/bin/rm` crash with a new, targeted diagnostic
-  (extended `LITEBOX_LOG=...,litebox_shim_linux=debug` plus `LITEBOX_DIAG_MM=1`); ruled out three
-  hypotheses with hard evidence, narrowed the real mechanism, did NOT find or fix the root cause —
-  no source or `LITEBOX_LAZY_FORK_COMMIT`/`LITEBOX_LAZY_FORK_GUARD_COW` behavior changed this pass.**
-  - **Ruled out (all three, by direct log evidence, not guessing)**: (1) NOT the FS_BASE-repair
-    mechanism itself being buggy — the `[diag-recover-fsbase]` line's own printed `fsbase=` value is
-    a healthy non-zero constant (`0x7feffffb1740`) every single time, meaning the repair loop's own
-    `rdfsbase()==0` guard is false and no repair is even attempted; the line is merely co-located
-    with the crash, not causal. (2) NOT `load_program` returning an error — `sys_execve`'s own
-    `"load_program failed after point of no return, killing process with SIGSEGV"` `warn!` (default
-    log level, would always show) never appears anywhere in any of this pass's logs. (3) NOT a
-    repeat of either fixed trampoline bug — zero `0x7feffffef000` hits in every capture.
-  - **New hard evidence, `litebox_shim_linux::lib.rs`'s existing (pass-257) `diag-guest-exception`
-    diagnostic** (`litebox_shim_linux=debug`, `.wfgy/pass106_rm_diag2.err.log:51459` and 5 other
-    byte-identical occurrences across two independent runs): the fatal fault is a genuine guest
-    user-mode `#PF` (`exception=Exception(14) kernel_mode=false error_code=0x4` = user-mode,
-    not-present, read) at a **fully deterministic** address (`cr2=0x111156f60`, `rip=0x7feffc2f3e56`,
-    `rdx=0x7feffc445b40` — byte-identical across independent pids/runs, ruling out a race/timing
-    bug). The faulting instruction (`rip` byte-dumped: `80 38 43` = `cmp byte [rax], 0x43`) reads a
-    byte at `cr2`. **litebox's own guest `Vmem` tracking believes the address IS validly mapped**
-    (`mapping overlapping cr2 range_start=0x111148000 range_end=0x111169000
-    flags=VM_READ|VM_WRITE|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC`) — i.e. a genuine desync between
-    litebox's guest-level bookkeeping (present, r/w) and the real underlying Windows memory
-    (not-present) for a page inside a mapping `/usr/bin/rm`'s own post-`execve` load created.
-  - **Investigated but NOT confirmed as the mechanism**: read `WindowsUserland::allocate_pages`'s
-    entire fixed-address commit path (`lib.rs:7785-8541`, `reserve_and_commit`/the
-    `MEM_RESERVE|MEM_COMMIT` collision-recovery logic/the final per-region `MEM_RESERVE|MEM_COMMIT`
-    match arm) end to end looking for a spot where a commit failure could be silently treated as
-    success — found none: every commit failure path in this function either returns an explicit
-    `AllocationError` or `assert!`s (would panic loudly, and no such panic appears in any capture).
-    Also directly disproved that the crashing mapping was created via `allocate_pages` at all in
-    THIS pid: `LITEBOX_DIAG_MM=1`'s own `diag-commit`/`DIAG allocate_pages` lines are confirmed
-    reaching this exact forked-then-`execve`'d process (its own later `diag-decommit` lines DO
-    appear, post-crash, during teardown) yet ZERO `diag-commit`/`allocate_pages` lines exist for this
-    pid anywhere before the crash — the mapping's real backing was created by a different mechanism
-    than the traced anonymous-commit path (most likely litebox's memory-mapped/CoW-view ELF-segment
-    loading, not yet read this pass).
-  - **Next pickup, precise**: read the memory-mapped/CoW-view file-backed loading path (likely
-    `map_shared_memory`/the ELF loader's own segment-mapping call, not `allocate_pages`) for how it
-    creates a fresh guest mapping after `execve` and whether/how it can register a guest `Vmem` entry
-    as present without the real Windows backing actually being committed — this pass's own new
-    evidence (no `allocate_pages` diagnostic ever fires for the crashing pid) directly rules
-    `allocate_pages` out as the creation site and points here instead. If code reading doesn't
-    resolve it quickly, a live `cdb -p` attach (debug build) breaking on `/usr/bin/rm`'s own
-    post-`execve` resume and single-stepping to the fault is the fallback, per this investigation's
-    own standing practice. **Both lazy flags stay default OFF; still not safe for a real boot;
-    `DE_UP` not attempted this pass** (blocked on this same open bug, matching every pass since the
-    103rd).
-  - Logs: `.wfgy/pass106_rm_diag.ps1`/`.{out,err,poll}.log` (first repro, confirms 6/6 same crash
-    signature as 105th), `.wfgy/pass106_rm_diag2.ps1`/`.{out,err,poll}.log` (with
-    `litebox_shim_linux=debug`+`LITEBOX_DIAG_MM=1`, the `diag-guest-exception`/deterministic-address
-    evidence above).
-- **107th -- re-read the ELF-segment-loading path end to end (`litebox_shim_linux/src/loader/elf.rs`,
-  `WindowsUserland::try_allocate_cow_pages`/`allocate_pages` in `litebox_platform_windows_userland/
-  src/lib.rs`) and re-mined the 106th pass's OWN existing log
-  (`.wfgy/pass106_rm_diag2.err.log`, reused unmodified -- no new boot run this pass) with sharper,
-  targeted greps. Ruled the CoW-mmap hypothesis the 106th pass flagged as unread OUT with direct
-  evidence, found a real, previously-undocumented stale-diagnostic false lead, and narrowed the real
-  candidate mechanism to a specific, named function -- but did NOT reach a live cdb session, so the
-  root cause is still NOT confirmed and NO code changed this pass. Both lazy flags stay default OFF;
-  `DE_UP` not attempted.**
-  - **CoW-mmap/`MapViewOfFile3` hypothesis (the 106th pass's own "not yet read" pointer) REFUTED by
-    direct evidence, not further reading alone**: `litebox_shim_linux/src/loader/elf.rs`'s
-    `ElfFile::{reserve,map_file,map_zero,protect}` all go through plain `task.sys_mmap`/`sys_mprotect`
-    -- the same syscall surface as every other guest mapping, not a distinct code path. The genuinely
-    separate Windows-only fast path, `WindowsUserland::try_allocate_cow_pages`
-    (`litebox_platform_windows_userland/src/lib.rs:8898`), maps host-rootfs-tar-backed file content
-    via a real `MapViewOfFile3` section view and logs unconditionally under `diag-cow` whenever
-    `LITEBOX_DIAG_MM=1` is set (`diag_mm_enabled()`, the SAME gate `diag-commit`/`diag-decommit` use)
-    -- `grep -c "diag-cow" .wfgy/pass106_rm_diag2.err.log` is **0** across the whole ~44 MB capture,
-    even though `LITEBOX_DIAG_MM=1` was genuinely set for that exact run (confirmed via
-    `.wfgy/pass106_rm_diag2.ps1:10`) and plenty of unrelated `diag-cow`-gated-sibling `diag-commit`/
-    `diag-decommit` lines fire for OTHER processes throughout the same log. This path is never taken
-    for this crash at all; drop it as a lead.
-  - **Re-derived the 106th pass's own "zero `allocate_pages` activity for the crashing pid" claim
-    directly (not trusted secondhand)**: `awk 'NR<51459 && /pid=22876\b/'` (the exact crashing pid,
-    exact log line the fault fires on) against the full pre-crash window (pid 22876 spawns at line
-    48681, `execve`s `/usr/bin/rm` at line 51373, faults at line 51459 -- ~11ms of guest time after
-    `execve`) returns **zero** lines of any kind carrying `pid=22876` other than the fork-spawn
-    announcement, `drm-diag`/signal-loop noise, the `DIAG_TIMELINE`/`diag-guest-exception` lines
-    already known, and (only AFTER the crash, during teardown) a long run of `diag-decommit:
-    VirtualFree(MEM_DECOMMIT)` lines. Confirms the 106th pass's finding is solid: not one
-    `diag-commit`/`DIAG allocate_pages` line -- not even a bare "reserve, no commit" one -- fires
-    anywhere in this process's entire post-`execve` life before it dies, for what should be several
-    real allocation calls (the ELF loader's own outer `PROT_NONE` reservation, N `map_file` PT_LOAD
-    segments, a `map_zero` BSS, and a fresh `create_stack_pages` stack).
-  - **`clone: cross-process fork() copy plan` line for THIS exact pid (line 48684) directly read**:
-    `regions=116 groups=8 total_bytes=194379776 first=20971520 last_end=140668768813056
-    heap_top=4581658624` -- pid 22876 (before it became `/usr/bin/rm`) was itself a genuine
-    cross-process fork child with 8 fork-carried groups spanning both a low (~20 MiB) and a high
-    (~0x7fef...) address neighborhood, `heap_top=4581658624` (`0x111164000`) -- close to, but not
-    identical to, the CRASHING process's own POST-`execve` `brk` (`0x111169000`, from the
-    `vmem-adopt-probe` line at the SAME pid two paragraphs below). This directly confirms `execve`
-    genuinely reused the pre-exec low-address neighborhood for the new image (expected: `execve`
-    never changes the guest pid, and `elf.rs`'s own low-address ASLR-salt hint,
-    `DEFAULT_LOW_ADDR + (pid % 1024) * 4 GiB`, is a pure function of `task.pid` alone -- so a fresh
-    `execve`'d image's preferred load address is DETERMINISTICALLY the same neighborhood the
-    pre-exec image used). Also directly confirms (via `try_cross_process_fork entry`/`orig_rax=56`
-    immediately preceding) that this child's OWN creation was plain cross-process `fork()`, ruling
-    out `CLONE_VFORK`/`new_for_vfork_execve_detach`'s `VM_FOREIGN_LIVE_NEVER_REPLACE` placeholder
-    mechanism (`litebox/src/mm/linux.rs:851-878`) as directly relevant -- that mechanism's own
-    placeholder VMAs carry ONLY the `VM_FOREIGN_LIVE_NEVER_REPLACE` bit, never `VM_READ`/`VM_WRITE`,
-    which does not match the crash's own `diag-guest-exception` report
-    (`flags=VM_READ|VM_WRITE|VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC`, a real, fully-fleshed-out VMA, not
-    a bare collision placeholder).
-  - **A real, previously-undocumented stale-diagnostic false lead found and ruled unreliable (not
-    itself fixed -- diagnostic-only, does not affect runtime behavior)**: the SAME crashing pid emits
-    `[process_fork_diag] vmem-adopt-probe (child): VMA layout adoption MISMATCH -- 30/31 differing
-    region(s), count 44 vs 30/31, brk 0x111169000 vs 0x111169000` at several points in the log
-    (e.g. lines 48753-48755), with a `brk` value that EXACTLY matches the crashing region's own
-    `range_end`. This is suspicious by proximity, but reading
-    `diag_process_fork_vmem_adopt_probe` (`litebox_runner_linux_on_windows_userland/src/lib.rs:1601-
-    1754`) shows its own `tracked`/`sorted_expected` comparison was never updated to exclude
-    `VM_OWN_FORK_PADDING` placeholder entries (`litebox/src/mm/linux.rs:1006-1030`, added by the 84th
-    pass's Bug 1 fix) the way it already explicitly excludes `VM_SHARED` (45th pass) and `PROT_NONE`
-    (52nd pass) -- `sorted_expected`'s filter has no `VM_OWN_FORK_PADDING` exclusion at all, while
-    `tracked` (built from the SAME `PageManager::new_adopting_existing_memory` real adoption code)
-    legitimately contains one placeholder entry per fork-carried group's own rounding-gap remainder.
-    A process with `groups=8` (per the copy-plan line above) plausibly accounts for most or all of the
-    44-vs-30 discrepancy through this alone -- i.e. this is very likely the SAME "stale diagnostic
-    filter, not a real bug" pattern the 45th/52nd passes already hit twice before, not new evidence of
-    memory corruption. **Flagging this explicitly so the next pass does not re-spend time chasing it
-    as if it were a live lead** -- if it turns out to matter after all, it needs to be established
-    with the `VM_OWN_FORK_PADDING` filter added to this diagnostic first, not assumed either way.
-  - **Leading candidate mechanism, found by reading `WindowsUserland::allocate_pages`'s own
-    `reserve_and_commit` closure closely (`litebox_platform_windows_userland/src/lib.rs:7845-7954`),
-    NOT yet confirmed live**: a failed fixed-address `VirtualAlloc2(MEM_RESERVE)` whose error is
-    `ERROR_INVALID_ADDRESS` is assumed by this existing code to mean "the granule may already be
-    reserved, by us" (a real, understood, and previously-correct case: two neighboring guest
-    allocations sharing one 64 KiB Windows granule, e.g. CoW-view flank restoration) and is handled
-    by blindly ATTEMPTING THE COMMIT ANYWAY, trusting that the commit's own success/failure is what
-    actually discriminates a genuine same-purpose collision from a real conflict (own comment,
-    lines 7908-7926: "Distinguish them by simply attempting the commit: if the address space is
-    already ours, `MEM_COMMIT` succeeds"). This reasoning is NOT actually pid/purpose-aware --
-    Windows' own `VirtualAlloc2(MEM_COMMIT)` will happily succeed against ANY valid `MEM_RESERVE`
-    region already owned by the CURRENT PROCESS, regardless of which logical allocation originally
-    reserved it or why. `lazy_fork_commit::reserve_group_lazy`'s own `VirtualAlloc2(MEM_RESERVE)`
-    calls (real, `MEM_RESERVE`-only, no commit) are made for the WHOLE fork-carried group span,
-    entirely OUTSIDE this `allocate_pages`/`Vmem` accounting, and (per `deallocate_pages`'s own
-    `VirtualFree(..., MEM_DECOMMIT)`-only behavior -- it never calls `MEM_RELEASE` anywhere in this
-    codebase) that raw Windows-level reservation is NEVER actually released for the life of the
-    process, even across `execve`'s own `release_memory` teardown (which only removes litebox's OWN
-    `Vmem` bookkeeping for the range, not the underlying Windows allocation) -- for any sub-range a
-    lazy fork child never happened to touch/fault-in before calling `execve`. Combined with the
-    deterministic pid-salted low-address reuse confirmed above, this creates exactly the right shape
-    for a genuine collision: a freshly-`execve`'d image's own fixed-address allocation landing
-    squarely inside a STALE, never-released, still-valid `MEM_RESERVE` region left over from the
-    SAME process's own pre-exec lazy-fork-commit group -- and this existing `maybe_already_reserved`
-    fallback was written for a different, narrower, genuinely-safe case, with no check that
-    distinguishes "a legitimate same-allocation flank" from "an unrelated stale reservation from a
-    program that no longer exists in this process's guest image." **However, this specific branch DOES
-    unconditionally emit a `diag-commit` line on success (lines 7935-7942) -- which directly
-    CONTRADICTS the confirmed zero-`diag-commit`-lines-for-pid-22876 evidence above, so this exact
-    branch, on its own, is not sufficient to explain what was actually observed.** The next pass needs
-    to explain BOTH facts together (a real Windows-level collision against a stale lazy reservation,
-    AND a code path that produces no `diag-commit`/`diag-cow`/any other allocation-diagnostic output
-    at all) -- possibilities not yet checked: (a) the collision is detected and handled in a
-    DIFFERENT branch of `allocate_pages` (the `suggested_range.start != 0` fixed-address path has
-    more than just `reserve_and_commit`; the foreign-claim/relocation logic downstream of it was not
-    read this pass), (b) the outer `PROT_NONE` `reserve()` call itself takes a genuinely different,
-    unlogged code path (a bare reservation with no commit may not be gated by `diag_mm_enabled()` at
-    all -- not checked this pass), or (c) the crashing memory was never touched by `allocate_pages` in
-    THIS process's lifetime at all, meaning the Vmem entry describing it must have survived from
-    BEFORE `execve` despite `release_memory`'s teardown -- which would point back at
-    `Vmem::release_memory`/`remove_mapping`'s own per-VMA walk (`litebox/src/mm/mod.rs:1310-1335`,
-    `litebox/src/mm/linux.rs:1103+`) rather than `allocate_pages` at all, and was not fully traced
-    this pass either.
-  - **Next pickup, precise**: a live `cdb -p` attach (debug build, invasive `-p`, not `-pv`) breaking
-    on `WindowsUserland::allocate_pages`'s `reserve_and_commit` closure AND on
-    `Vmem::release_memory`/`remove_mapping`, specifically for pid 22876's own guest-pid-equivalent
-    process (or an equally cheap fresh repro reproducing the SAME shape -- the existing
-    `.wfgy/pass105_xset_repro.sh` under the same env as `.wfgy/pass106_rm_diag2.ps1` already does)
-    is very likely to settle this in one session: watch whether `execve`'s own `release_memory` call
-    genuinely removes the `[0x111148000, 0x111169000)`-neighborhood `Vmem` entries, and if so, watch
-    whether the FRESH ELF loader's own `allocate_pages` calls for `/usr/bin/rm`'s segments/BSS/stack
-    are ever actually reached/executed for that exact address range, or whether some earlier
-    short-circuit (a Vmem overlap check, a "range already claimed" fast path) skips real allocation
-    entirely while still marking the range as tracked/valid. No source changed this pass; this is a
-    narrowing/evidence pass only, matching the 104th/105th passes' own "log evidence, not yet a live
-    session" style before their respective fixes landed.
-  - No new logs this pass (reused `.wfgy/pass106_rm_diag2.err.log` unmodified) -- no boot run, no
-    build, no RAM used beyond static analysis.
+- **106th-107th (compacted; full narrative, including the deterministic-address evidence, the
+  refuted CoW-mmap hypothesis, and the `allocate_pages`/`reserve_and_commit` near-miss analysis:
+  `docs/AGENTS_ARCHIVE_2026-09-23.md`'s "106th-107th pass full narrative" section)** -- both passes
+  investigated the 105th pass's open `/usr/bin/rm` crash (a fully deterministic guest `#PF` at
+  `cr2=0x111156f60`, litebox's own `Vmem` believing the page present while the real Windows backing
+  was not) purely by code reading and re-mining existing logs, ruling out several real candidates
+  (`allocate_pages` itself, the CoW-mmap fast path, a stale VMA-adoption diagnostic filter) with
+  direct evidence but not finding the actual mechanism. **Superseded**: the 109th pass root-caused
+  and fixed this exact crash from a completely different angle (`sys_execve`'s disarm-ordering, not
+  a memory-allocation bug at all) -- see that entry below for the real fix. Neither pass's own
+  "next pickup" (a live `cdb` attach on `allocate_pages`/`release_memory`) was ever needed.
+- **109th -- fixed the crash the 102nd/106th/107th passes chased**: `sys_execve` called
+  `end_fork_child_verification()` (which disarms `lazy_fork_commit`'s child-side servicing) at
+  function ENTRY, before `copy_vector` read `argv`/`envp` from the old program's still-lazy pages
+  and before `kill_other_threads()`/`ElfLoader::new` could still fail and return to the OLD program.
+  A failed `copy_vector` (`EFAULT` off a not-yet-serviced lazy page) after disarming left the STILL-
+  RUNNING old program's own subsequent heap access unserviceable -- the deterministic
+  `cr2=0x111156f60` fault was a `bash` heap address, not a `/usr/bin/rm` mapping at all. Fixed by
+  moving the disarm call to directly after `kill_other_threads()` succeeds (litebox-main's own
+  `24cb72d`). Also fixed the same pass: the AF_UNIX stream `lookup()`'s presence-miss WARN firing on
+  every connect that then succeeds via `connect_cross_process` (`d16e5ce` -- this had been
+  misdiagnosed by the 103rd pass as `xfwm4` stuck retrying).
 - **110th -- cross-process signal delivery (`LITEBOX_PROCESS_FORK=1`) implemented and verified;
   pty `ISIG` (Ctrl-C/\/Z) and pty-slave carrying across a cross-process fork added.**
   - **Guest pid bug found and fixed**: the parent's `fork()` returned `child_tid` (e.g. `2`) while
