@@ -259,10 +259,20 @@ pub fn is_syscall_timeline_target_comm(comm: &[u8]) -> bool {
     }
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
-    SYSCALL_TIMELINE_COMMS
-        .lock()
-        .iter()
-        .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
+    // A not-yet-`execve`'d thread's `comm` is empty (inherited/unset) -- `target.starts_with(b"")`
+    // is trivially true for every target, which used to match every such thread against every
+    // configured name, firing this diagnostic for the pre-exec bootstrap syscalls
+    // (`set_robust_list`/`rt_sigprocmask`/`getpid`/`close`/`rt_sigaction`/...) of literally every
+    // forked guest thread on the boot, not just the intended target process. Live-caught: a
+    // `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session` run never reached `xfce4-session` at all
+    // before the unrelated volume exhausted host RAM. The truncation-prefix match below only
+    // ever makes sense once `execve` has actually named the process (a real Linux truncation is
+    // exactly `min(15, name.len())` non-zero bytes), so require a non-empty `trimmed`.
+    !trimmed.is_empty()
+        && SYSCALL_TIMELINE_COMMS
+            .lock()
+            .iter()
+            .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
 }
 
 /// Optional narrowing filter for the `litebox_diag::socket_read` payload-preview diagnostic
