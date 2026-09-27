@@ -115,8 +115,8 @@ flooded across every concurrently-forked process during a boot's fork storm).
   `WIFSIGNALED(9)` exit code. Stop/continue get no special cross-process semantics.
 - **A `socketpair(2)`-originated fd (both ends `Unnamed`) is NOT safe to drop as CLOEXEC across a
   cross-process fork** — real processes (`dbus-daemon`'s babysitter) use it for pre-`exec()`
-  bookkeeping; `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) refuses it (falls back to
-  thread-based fork) rather than silently dropping it (54th).
+  bookkeeping; `raw_fd_is_addressless_unix_socket_pair` (`net.rs`) makes it CARRIED (112th; it
+  used to refuse the fork), while other CLOEXEC unix sockets stay dropped (54th).
 - **A `TypedFd`'s index is only valid against the SAME `Descriptors` instance that `insert()`ed
   it** — reading one back against a different process's table is out-of-bounds or resolves to an
   unrelated entry; every accessor in `litebox/src/fd/mod.rs` returns `None` rather than panicking
@@ -199,8 +199,8 @@ thread-based default's 100% tcache-corruption rate (ADVISORY-001 §3N is thread-
 **Eligibility** — an already-borrowed fd table, a beyond-stdio fd that isn't a pipe end/path-recorded
 regular file/eventfd/close-on-exec/pty (overridable by `LITEBOX_PROCESS_FORK_IGNORE_FDS`), or an
 unsanitizable `fs_base`/context. No by-name gate exists (34th) — only this global opt-in env var
-plus the per-fork fd-kind scan; the only remaining blocking kind on a real `debian-xfce` boot is
-`unix-socket`. Fork-child GPR/vmem-adopt cost is small (~1.2s, down from ~3.5-5s); the rootfs
+plus the per-fork fd-kind scan; since the 112th pass no fd kind blocks a real `debian-xfce` boot
+(0 `not eligible` in 3 boots; was 11-18). Fork-child GPR/vmem-adopt cost is small (~1.2s, down from ~3.5-5s); the rootfs
 index-merge cost the 56th pass fixed is NOT the dominant per-fork cost any more (confirmed 100%
 cache-hit, `LITEBOX_DIAG_FORK_TIMING=1`, 75th: real per-fork rootfs cost ~83-140ms). The real
 per-fork-count cost is each fork being a separate Windows process with its own ~350MB-1.1GB peak
@@ -626,6 +626,39 @@ map" below). Condensed current-state trail:
   - **Open**: no canonical-mode line editing (erase/kill/`^D`-as-EOF); `ECHOCTL` not rendered
     (`^C` not echoed, a `^D` is echoed raw); ring is 2 KiB per direction; master/slave readiness
     across processes is polled at 15ms, not event-driven.
+
+- **112th -- unix sockets carried across a cross-process fork (no more thread-path fallback).**
+  `UnixSocket::fork_carry`/`from_fork_spec` (`unix.rs`) + `ForkInheritedShimFd` (opaque spec in
+  `LITEBOX_INTERNAL_FORK_CHILD_SHIM_FDS`, rebuilt by `install_shim_fd_at_fd`). Connected
+  stream/seqpacket: a local pair is PROMOTED onto a `SharedUnixConnTable` slot (`ConnLink`
+  shared by both ends; after promotion both local ends and the child use only the slot, each
+  local end first draining its own pre-promotion channel; the carried end's unread queue moves
+  into the slot; SEQPACKET slots are record-framed). Slot holders are counted per side per HOST
+  process (`SharedConnSlot::hold`), parent pre-holds for the child, child transfers the count;
+  peer gets EOF/EPIPE when a side has no live holder. Listener: rebuilt in the child, advertised in
+  `unix_addr_presence` under the child pid at fork time; child `accept()` takes cross-process
+  connects from the shared queue (connects from the parent's own host still go to the parent's
+  backlog). Fresh unbound stream/dgram sockets recreated. CLOEXEC rule unchanged except addressless
+  socketpairs are carried. Fixed along the way: dead-slot reclaim compared GUEST pids to host
+  processes since the 110th pass (could free live slots) -- now holder-based; `fs::import::
+  import_all` aborted at the first failing entry and every child re-exports Xvfb's 0444
+  `/tmp/.X1-lock`, so every cross-process child's writes were silently dropped (89-90 `failed to
+  import` WARNs/boot) -- now chmod-write-restore + keep going, path in the error.
+  - **Verified** (`.wfgy/pass112_unix.pl`, `pass112_*.log`): socketpair round trip + pre-fork queued
+    data + EOF on child exit; SEQPACKET `m1`/`m2` boundaries; grandchild uses inherited connected
+    socket to a server in a third process which `accept()`s on an inherited listener; bash holding
+    a unix socket runs the trap/kill test cross-process (`got_term`, 3, no fallback -- same test
+    aborts with `invalid stdio handle` on the thread path); 110th/111th tests unchanged.
+  - **Boots** (`pass103_trimmed_boot1.ps1`, non-lazy): 0 `not eligible` in all 3 (baseline 11).
+    boot1: xfwm4/xfsettingsd/xfce4-panel launched, WM_POLL n=5, RAM crater kill at 140s. boot2/3:
+    no crater (>=3.5GB free for 300s) but `xfce4-session` never spawned its children, one
+    `connect_cross_process ... never accepted` to `/tmp/.X11-unix/X1`, `DE_FAILED after 200s`;
+    boot3 showed the import bug above (fixed after; not re-booted -- host RAM fell to 3.8GB).
+    `DE_UP` not reached.
+  - **Open**: SCM_RIGHTS over a slot = `EOPNOTSUPP`+warn (dbus fd passing across processes);
+    datagram socketpairs and bound/connected dgram, bound-unconnected and connecting streams still
+    refuse; slot ring is 2 KiB/direction, 64 slots, 15ms repoll; a cross-process `connect()`ed
+    SEQPACKET is still unframed; child-listener sees only cross-process connects.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
