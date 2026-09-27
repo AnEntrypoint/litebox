@@ -1124,15 +1124,22 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
     // `diag_raw_print` mechanism `lib.rs`'s own VEH uses on its hazardous-stack path) -- proves
     // whether this handler's own Rust body is even reached for a given fault, before anything
     // else in this function runs. Gated on an env var so it costs nothing by default; NOT meant
-    // to ship enabled.
+    // to ship enabled. Throttled to every 4096th hit (an atomic increment, not a `WriteFile`, on
+    // every other one) so this diagnostic's own overhead does not itself change a refault loop's
+    // timing enough to hide it -- the exact trap the un-throttled version (149,334 prints in one
+    // run) fell into.
     if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
-        let rec = unsafe { &*(*info).ExceptionRecord };
-        crate::diag_raw_print(
-            b"[diag-veh-entry] lazy_commit_veh code=0x",
-            rec.ExceptionCode as usize,
-            b" addr=0x",
-            rec.ExceptionInformation.get(1).copied().unwrap_or(0),
-        );
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(4096) || n <= 4 {
+            let rec = unsafe { &*(*info).ExceptionRecord };
+            crate::diag_raw_print(
+                b"[diag-veh-entry] lazy_commit_veh hit=0x",
+                n,
+                b" addr=0x",
+                rec.ExceptionInformation.get(1).copied().unwrap_or(0),
+            );
+        }
     }
     // Bug 7 (100th pass) -- see [`DISARMED_BY_EXECVE`]'s own doc comment. Checked FIRST, before
     // even `LAZY_RANGES`: once this process has `execve`'d, its old fork-time ranges no longer
@@ -2120,14 +2127,18 @@ pub fn invalidate_guarded_range(range: &Range<usize>) {
 /// mere presence.
 unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rec = unsafe { &*(*info).ExceptionRecord };
-    // 114th pass, investigation-only: see `lazy_commit_veh`'s own identical marker.
+    // 114th pass, investigation-only: see `lazy_commit_veh`'s own identical (throttled) marker.
     if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
-        crate::diag_raw_print(
-            b"[diag-veh-entry] guard_cow_write_fault_veh code=0x",
-            rec.ExceptionCode as usize,
-            b" addr=0x",
-            rec.ExceptionInformation.get(1).copied().unwrap_or(0),
-        );
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(4096) || n <= 4 {
+            crate::diag_raw_print(
+                b"[diag-veh-entry] guard_cow_write_fault_veh hit=0x",
+                n,
+                b" addr=0x",
+                rec.ExceptionInformation.get(1).copied().unwrap_or(0),
+            );
+        }
     }
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {

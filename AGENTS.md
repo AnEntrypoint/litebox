@@ -575,7 +575,10 @@ opening paragraph warns about).
     mark recurred unchanged. This specific mechanism is not it either; the fix is kept in the tree
     regardless since it is a real, harmless-by-construction hardening (a large on-stack buffer in
     an unprotected VEH handler is a latent risk independent of whether it explains THIS crash).
-  - **THE STRONGEST LEAD FOUND THIS PASS, NOT YET CONFIRMED OR FIXED**: added an unconditional,
+  - **A real, confirmed, THIRD instance of an already-known bug class -- but DIRECTLY REFUTED as
+    the STATUS_ACCESS_VIOLATION's own proximate cause by a same-pass follow-up test (see below);
+    kept as its own open, real, worth-fixing bug, not conflated with the crash it does not
+    reliably explain.** Added an unconditional,
     allocation-free entry marker (`LITEBOX_DIAG_VEH_ENTRY_MARKERS=1`, `diag_raw_print`, committed
     alongside this entry) to both `lazy_commit_veh` and `guard_cow_write_fault_veh` to establish
     whether either handler is even reached before the crash. Enabling it changed the outcome
@@ -614,21 +617,28 @@ opening paragraph warns about).
       suggests it does NOT resolve) is the open question -- this is REASONED, not yet confirmed by
       a live debugger session or by reading `try_guard_region_batched`'s exact interaction with a
       brand-new, POST-claim guest `mmap` landing inside an already-claimed range.
-    - **Real, immediate consequence for the ORIGINAL STATUS_ACCESS_VIOLATION**: this run's own
-      diagnostic overhead (a `WriteFile` syscall per entry) was enough to slow the refault loop down
-      into "visibly stuck, never finishes" instead of "crashes at ~1.7s" -- meaning the SAME loop,
-      running at FULL SPEED (no entry markers), most plausibly IS what consumes the time between
-      fork and the STATUS_ACCESS_VIOLATION, and may be a DIRECT contributor to or cause of it (e.g.
-      exhausting some bounded resource the loop touches on every iteration -- a handle table, a
-      `Box::leak`'d allocation per failed restore attempt, or similar) rather than a separate,
-      unrelated bug. **Do not treat these as two separate bugs without evidence either way.**
-    - **Next pickup, precise**: (a) re-run the identical repro with `LITEBOX_DIAG_VEH_ENTRY_MARKERS`
-      UNSET (its own overhead changes the very timing being investigated) but with a NEW, narrower,
-      low-overhead counter -- a single `AtomicUsize` incremented on every `guard_cow_write_fault_veh`
-      entry at this exact address, printed ONCE via `diag_raw_print` only every Nth hit (e.g. every
-      4096th) -- to confirm the loop still runs at full speed and reaches the SAME STATUS_ACCESS_
-      VIOLATION, correlating the eventual crash against a real hit-count rather than wall-clock time
-      alone. (b) Read `try_guard_region_batched`'s and `guard_one_page`'s own interaction with a
+    - **CORRECTED, same pass, by direct re-test (not left standing as an untested guess)**: my own
+      first-draft "immediate consequence" paragraph here originally speculated that this loop,
+      running at full un-throttled speed, was most plausibly what consumes the time before the
+      STATUS_ACCESS_VIOLATION. Built the throttled hit-counter this same entry's own "next pickup"
+      called for (`AtomicUsize`, printed only every 4096th hit or the first 4, committed) and
+      re-ran the identical repro (`.wfgy/pass114_throttled_run1.err.log`): the crash recurred
+      (`exit_code=3221225477`, elapsed 1922ms) with `guard_cow_write_fault_veh` hit only **4 times
+      total** in the whole run, at ordinary guest addresses (`0x111156818`, `0x28`,
+      `0x111155f28`, `0x111148090`) -- **NONE at `0x7feffffef000`, and no runaway loop at all this
+      time**. The trampoline-collision refault loop is therefore a REAL bug (still confirmed by the
+      149,334-hit run) but an INTERMITTENT one, and NOT reliably what produces the
+      STATUS_ACCESS_VIOLATION -- this run crashed cleanly without it ever firing. **Do not repeat
+      my own first-draft mistake here**: these are two separate findings needing separate
+      root-causing, not one explaining the other. The crash's own true proximate cause is still
+      unknown; the last thing logged before it in this run was yet another `guard-cow: batched
+      region 0x7fefff1e0000..0x7fefff2e0000` install (a DIFFERENT region, not obviously related to
+      either the trampoline or the 4 ordinary-looking write-fault hits above), which may or may not
+      be causally connected -- not established either way.
+    - **Next pickup, precise, for the trampoline-collision loop (real, confirmed, still open on its
+      own merits)**: (a) reproduce it again with the SAME throttled counter -- this pass's own
+      data shows it does not fire every run, so a few repeats under identical conditions are needed
+      before concluding anything about ITS OWN trigger rate. (b) Read `try_guard_region_batched`'s and `guard_one_page`'s own interaction with a
       brand-new guest `mmap`/`mprotect` landing inside an address range they already track -- does
       `sys_mmap`/`sys_mprotect`'s OWN implementation know to invalidate or coordinate with
       `GUARD_PAGE_REGISTRY` for a range it did not itself allocate the guard for, the same class of
@@ -643,10 +653,13 @@ opening paragraph warns about).
       one individually as it's discovered (this is now the THIRD instance of the same address
       problem in three different handlers -- a strong signal the fix belongs at the trampoline's
       OWN allocation site, not scattered across every VEH handler that might touch it).
-    - Both new diagnostics (`FAULT_SCRATCH_BUF`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS`) and the refuted
-      per-page-delay one are committed and default-off/zero-effect; no fix has landed for the actual
-      bug yet. `DE_UP` not attempted this pass (blocked throughout on this same investigation, not
-      on RAM by the time this lead was found -- RAM was a healthy 4-6GB for this entire sequence).
+    - All new diagnostics this pass (`FAULT_SCRATCH_BUF`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS` with its
+      own throttled hit-counter, and the refuted per-page-delay one) are committed and
+      default-off/zero-effect. No fix has landed for either the trampoline-collision loop or the
+      STATUS_ACCESS_VIOLATION's own real cause -- both remain genuinely open, confirmed real,
+      NOT proven to be the same bug. `DE_UP` not attempted this pass (blocked throughout on this
+      same investigation, not on RAM by the time this lead was found -- RAM was a healthy 4-6GB for
+      this entire sequence).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
