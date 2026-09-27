@@ -247,6 +247,58 @@ pub fn syscall_timeline_enabled() -> bool {
     SYSCALL_TIMELINE_ENABLED.load(Ordering::Acquire)
 }
 
+/// Companion pid-based target list for [`SYSCALL_TIMELINE_COMMS`] -- see
+/// [`init_syscall_timeline_pids`]'s own doc comment for why the comm-based filter alone cannot
+/// see a forked child's own pre-`execve` syscalls.
+static SYSCALL_TIMELINE_PIDS: spin::Mutex<Vec<i32>> = spin::Mutex::new(Vec::new());
+static SYSCALL_TIMELINE_PIDS_INIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Call once, early, with a closure performing the platform's `env_value` lookup for
+/// `LITEBOX_DIAG_SYSCALL_TIMELINE_PID`. Same lazy-latch shape as [`init_syscall_timeline`].
+///
+/// # Why a separate, pid-based filter is needed
+///
+/// 113th pass: a freshly `clone()`d task's `comm` is the inherited/unset value (`comm` is never
+/// copied from the parent at fork time in this codebase, unlike real Linux) until that task's OWN
+/// `execve` renames it -- so [`is_syscall_timeline_target_comm`]'s comm-based filter can NEVER see
+/// a forked child's pre-`execve` syscalls, no matter what comm is configured, because the comm the
+/// investigator actually knows (the PARENT's name) is not what the CHILD's own early syscalls carry.
+/// This left a real investigation gap: a child that crashes before ever reaching its own `execve`
+/// (so it never acquires ANY of the comms this diagnostic can target) is invisible to it entirely.
+/// A guest pid, unlike comm, IS known and stable across a `clone()`/`execve()` boundary (it never
+/// changes), and is exactly what `DIAG_TIMELINE clone`/`execve` already print -- so a pid-based
+/// companion filter closes this gap while keeping the same "explicit enumeration, never a
+/// wildcard" safety property `is_syscall_timeline_target_comm` already established (a bounded,
+/// investigator-supplied pid list, not "every process", so the original OOM concern doesn't recur).
+///
+/// - unset or empty -> off (no pids traced by this filter)
+/// - a comma-separated list of pids, e.g. `51,53`
+pub fn init_syscall_timeline_pids(value: impl FnOnce() -> Option<String>) {
+    if SYSCALL_TIMELINE_PIDS_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let pids: Vec<i32> = match value() {
+        None => Vec::new(),
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect(),
+    };
+    if !pids.is_empty() {
+        SYSCALL_TIMELINE_ENABLED.store(true, Ordering::Release);
+    }
+    *SYSCALL_TIMELINE_PIDS.lock() = pids;
+    SYSCALL_TIMELINE_PIDS_INIT.store(true, Ordering::Release);
+}
+
+/// Whether `pid` is one [`init_syscall_timeline_pids`]'s own list is aimed at.
+pub fn is_syscall_timeline_target_pid(pid: i32) -> bool {
+    SYSCALL_TIMELINE_PIDS.lock().contains(&pid)
+}
+
 /// Whether `comm` (the raw, NUL-padded `[u8; 16]`-shaped process name, as read from
 /// `Task::comm`) is one the timeline is aimed at.
 ///

@@ -1965,9 +1965,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         crate::diag::init_socket_read_filter(|| {
             self.global.platform.env_value("LITEBOX_DIAG_SOCKET_READ_TARGET")
         });
+        // 113th pass: companion pid-based filter (see `init_syscall_timeline_pids`'s own doc
+        // comment) -- necessary because `comm` is never inherited at fork time in this codebase,
+        // so a forked child's own pre-`execve` syscalls can never match a comm-based target.
+        crate::diag::init_syscall_timeline_pids(|| {
+            self.global.platform.env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
+        });
         let comm_bytes = self.comm.get();
         let is_target = crate::diag::syscall_timeline_enabled()
-            && crate::diag::is_syscall_timeline_target_comm(&comm_bytes);
+            && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
+                || crate::diag::is_syscall_timeline_target_pid(self.pid.get()));
         if is_target {
             // Straight to stderr, not through `litebox_util_log` -- see
             // `diag::emit_timeline_line` for why (the log macros are gated on `LITEBOX_LOG`,
