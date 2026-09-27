@@ -563,6 +563,90 @@ opening paragraph warns about).
     happening here, though the diagnostic itself (still default-off, zero-effect-when-unset) remains
     in the tree and could matter for a genuinely CONTENDED join (two live generations on the same
     page), which is a real but much narrower case than what this pass's repro exercises.
+  - **Also refuted, by direct rebuild+test (not just reasoning)**: that the crash was a
+    `__chkstk`-style stack-overflow from `guard_cow_write_fault_veh`'s/`lazy_commit_veh`'s own
+    on-stack `[u8; PAGE_SIZE]` buffer, running (like the ORIGINAL, now-protected main
+    `vectored_exception_handler`, per its own extensively-documented history) while `rsp` was still
+    a guest-address value unrecognized by Windows' stack-overflow bookkeeping. Moved both buffers
+    into a shared `thread_local!` scratch buffer (`FAULT_SCRATCH_BUF`, `try_borrow_mut`-safe against
+    reentrancy, committed alongside this entry) to remove that specific frame-growth trigger without
+    touching the invasive naked-wrapper machinery -- rebuilt, re-ran the identical repro
+    (`.wfgy/pass114_fixtest_run1.err.log`): the SAME `STATUS_ACCESS_VIOLATION` at the SAME ~1.7s
+    mark recurred unchanged. This specific mechanism is not it either; the fix is kept in the tree
+    regardless since it is a real, harmless-by-construction hardening (a large on-stack buffer in
+    an unprotected VEH handler is a latent risk independent of whether it explains THIS crash).
+  - **THE STRONGEST LEAD FOUND THIS PASS, NOT YET CONFIRMED OR FIXED**: added an unconditional,
+    allocation-free entry marker (`LITEBOX_DIAG_VEH_ENTRY_MARKERS=1`, `diag_raw_print`, committed
+    alongside this entry) to both `lazy_commit_veh` and `guard_cow_write_fault_veh` to establish
+    whether either handler is even reached before the crash. Enabling it changed the outcome
+    entirely: instead of crashing, the run became so slow it never finished within a 30s window --
+    `.wfgy/pass114_entrymarker_run1.err.log` shows **149,334** entries into
+    `guard_cow_write_fault_veh` alone, all but a handful at the EXACT SAME address,
+    `addr=0x7feffffef000` -- **this is not a new address**: it is BYTE-IDENTICAL to the
+    sigreturn-trampoline address the 103rd-105th passes already root-caused and fixed TWICE, once
+    in `lazy_commit_veh` (104th pass, `classify_lazy_eligible_groups` excludes the trampoline's
+    own group) and once in `fork_verify.rs`'s independent stale-pointer healer (105th pass). Both
+    of those fixes are real, landed, and still correct for what they cover -- but neither one ever
+    touched `guard_cow_write_fault_veh`, and this run proves live that it has THE SAME address
+    problem: a THIRD, never-patched instance of the same bug class, not a coincidence (this exact
+    address recurring by chance across independent passes would itself be the surprising outcome).
+    - **Why the exclusion doesn't already cover this, most likely explanation (reasoned from
+      `ensure_sigreturn_trampoline`'s own doc comment, `litebox_shim_linux/src/syscalls/signal/
+      mod.rs:528-598` (aarch64) `:637+` (x86_64), NOT yet confirmed live)**: the trampoline is
+      allocated LAZILY, via a real guest `mmap(addr_hint=0, ...)` on the process's OWN first need
+      to deliver a signal -- NOT a fixed, always-present address from the moment of fork.
+      `classify_lazy_eligible_groups`'s own trampoline exclusion only has something to exclude if
+      `sigreturn_trampoline != 0` (already established) AT THE EXACT MOMENT of the fork call that
+      set up guard-cow's protected groups. For this pass's own repro, the crashing fork is python3
+      itself calling a SECOND, NESTED `os.fork()` (bash's own fork-to-exec-python3 is the first) --
+      very plausibly BEFORE python3's own interpreter has ever needed to establish ITS OWN
+      trampoline (no signal delivered yet). If the trampoline then gets allocated for the FIRST
+      TIME *after* this fork's guard-cow groups are already claimed -- and the guest's own `mmap`
+      picks an address (deterministically, matching prior passes' own `0x7feffffef000` observation)
+      that lands inside (or adjacent to, if `try_guard_region_batched`'s batching rounds to a wider
+      VirtualQuery-uniform region) a range ALREADY claimed by guard-cow for this fork -- the
+      trampoline's own `sys_mprotect(PROT_READ_WRITE)`-then-`write_at_offset` sequence (seeding the
+      trampoline bytes, `mod.rs:571-596`/`:638+`) becomes a genuine WRITE into a page
+      `GUARD_PAGE_REGISTRY` still believes it owns, and `guard_cow_write_fault_veh` -- which has NO
+      trampoline-address exclusion of its own, unlike `lazy_commit_veh` -- intercepts it. Whether
+      the SUBSEQUENT restore-and-retry cycle then correctly grants write access (a one-time capture,
+      matching the mechanism's own intended design) or gets stuck (this run's own 149,334-count
+      suggests it does NOT resolve) is the open question -- this is REASONED, not yet confirmed by
+      a live debugger session or by reading `try_guard_region_batched`'s exact interaction with a
+      brand-new, POST-claim guest `mmap` landing inside an already-claimed range.
+    - **Real, immediate consequence for the ORIGINAL STATUS_ACCESS_VIOLATION**: this run's own
+      diagnostic overhead (a `WriteFile` syscall per entry) was enough to slow the refault loop down
+      into "visibly stuck, never finishes" instead of "crashes at ~1.7s" -- meaning the SAME loop,
+      running at FULL SPEED (no entry markers), most plausibly IS what consumes the time between
+      fork and the STATUS_ACCESS_VIOLATION, and may be a DIRECT contributor to or cause of it (e.g.
+      exhausting some bounded resource the loop touches on every iteration -- a handle table, a
+      `Box::leak`'d allocation per failed restore attempt, or similar) rather than a separate,
+      unrelated bug. **Do not treat these as two separate bugs without evidence either way.**
+    - **Next pickup, precise**: (a) re-run the identical repro with `LITEBOX_DIAG_VEH_ENTRY_MARKERS`
+      UNSET (its own overhead changes the very timing being investigated) but with a NEW, narrower,
+      low-overhead counter -- a single `AtomicUsize` incremented on every `guard_cow_write_fault_veh`
+      entry at this exact address, printed ONCE via `diag_raw_print` only every Nth hit (e.g. every
+      4096th) -- to confirm the loop still runs at full speed and reaches the SAME STATUS_ACCESS_
+      VIOLATION, correlating the eventual crash against a real hit-count rather than wall-clock time
+      alone. (b) Read `try_guard_region_batched`'s and `guard_one_page`'s own interaction with a
+      brand-new guest `mmap`/`mprotect` landing inside an address range they already track -- does
+      `sys_mmap`/`sys_mprotect`'s OWN implementation know to invalidate or coordinate with
+      `GUARD_PAGE_REGISTRY` for a range it did not itself allocate the guard for, the same class of
+      gap Bug 6b (100th pass) already fixed for `mprotect`/`munmap` specifically? This new case is a
+      fresh `mmap`, not a `munmap`/`mprotect` of already-guarded memory, so Bug 6b's own fix may not
+      cover it. (c) If confirmed, the fix shape likely mirrors `lazy_commit_veh`'s own 104th-pass
+      defense-in-depth: give `guard_cow_write_fault_veh` its own trampoline-address exclusion check
+      (`Task::sigreturn_trampoline_addr()`, already threaded through `fork_verify.rs` since the
+      105th pass -- reuse the SAME plumbing) OR, more robustly, make `ensure_sigreturn_trampoline`
+      itself check/clear any stale `GUARD_PAGE_REGISTRY` entry for the address its own `mmap` just
+      returned before writing to it, closing this for ANY future handler rather than patching each
+      one individually as it's discovered (this is now the THIRD instance of the same address
+      problem in three different handlers -- a strong signal the fix belongs at the trampoline's
+      OWN allocation site, not scattered across every VEH handler that might touch it).
+    - Both new diagnostics (`FAULT_SCRATCH_BUF`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS`) and the refuted
+      per-page-delay one are committed and default-off/zero-effect; no fix has landed for the actual
+      bug yet. `DE_UP` not attempted this pass (blocked throughout on this same investigation, not
+      on RAM by the time this lead was found -- RAM was a healthy 4-6GB for this entire sequence).
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/

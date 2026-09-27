@@ -926,6 +926,25 @@ static LAZY_RANGES: OnceLock<Vec<Range<usize>>> = OnceLock::new();
 /// `AtomicIsize` and cast back to `Handle` at each use -- read-only after
 /// [`install_if_configured`]'s single write.
 static PARENT_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+// 114th pass -- see `lazy_commit_veh`/`guard_cow_write_fault_veh`'s own call sites for why this
+// exists: both handlers are registered directly via `AddVectoredExceptionHandler`, unlike
+// `vectored_exception_handler` (`lib.rs`), which needed a dedicated `#[unsafe(naked)]` stack-swap
+// entry point (`vectored_exception_handler_entry`) specifically because a normal, sizeable Rust
+// stack frame running while `rsp` is still a GUEST-address value (real committed memory, but
+// unregistered with Windows' own per-thread guard-page/stack-overflow bookkeeping) trips
+// `__chkstk`'s guard-page probe and silently exhausts the thread's real stack -- see that
+// function's own doc comment for the full mechanism, confirmed live for the main handler's own
+// frame. Neither of these two handlers ever got the same protection, and each had a 4 KiB
+// `[u8; PAGE_SIZE]` array on its own stack frame -- exactly the kind of large, sudden frame growth
+// that trips the probe. Moving it here (thread-local, not part of either function's own growing
+// stack frame) removes that specific frame-growth trigger without needing the full naked-wrapper
+// treatment. `try_borrow_mut` (not `borrow_mut`) on genuine reentrancy, matching this project's own
+// existing precedent (`lib.rs`'s `RECENT_FAULTS`/`RECOVERY_LOG`) -- a VEH handler must never panic.
+thread_local! {
+    static FAULT_SCRATCH_BUF: core::cell::RefCell<[u8; PAGE_SIZE]> =
+        const { core::cell::RefCell::new([0u8; PAGE_SIZE]) };
+}
 /// Diagnostic-only (`LITEBOX_DIAG_LAZY_FORK_COMMIT=1`): total lazy faults this process's own
 /// [`lazy_commit_veh`] has serviced, and how many of those found the parent's data unreadable
 /// (left zero-filled). Never consulted for correctness -- purely observational counters for
@@ -1101,6 +1120,20 @@ pub fn install_if_configured() {
 static VEH_ENTRY_COUNT_DIAG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // 114th pass, investigation-only: unconditional, allocation-free entry marker (same
+    // `diag_raw_print` mechanism `lib.rs`'s own VEH uses on its hazardous-stack path) -- proves
+    // whether this handler's own Rust body is even reached for a given fault, before anything
+    // else in this function runs. Gated on an env var so it costs nothing by default; NOT meant
+    // to ship enabled.
+    if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
+        let rec = unsafe { &*(*info).ExceptionRecord };
+        crate::diag_raw_print(
+            b"[diag-veh-entry] lazy_commit_veh code=0x",
+            rec.ExceptionCode as usize,
+            b" addr=0x",
+            rec.ExceptionInformation.get(1).copied().unwrap_or(0),
+        );
+    }
     // Bug 7 (100th pass) -- see [`DISARMED_BY_EXECVE`]'s own doc comment. Checked FIRST, before
     // even `LAZY_RANGES`: once this process has `execve`'d, its old fork-time ranges no longer
     // mean anything about the CURRENT guest image, and must never be used to service a fault.
@@ -1164,7 +1197,8 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
 
     let parent_handle = PARENT_HANDLE.load(Ordering::SeqCst) as Handle;
     if !parent_handle.is_null() {
-        let mut buf = [0u8; PAGE_SIZE];
+        let Ok(copied) = FAULT_SCRATCH_BUF.with(|cell| -> Result<bool, ()> {
+        let mut buf = cell.try_borrow_mut().map_err(|_| ())?;
         let mut read_len: usize = 0;
         let live_ok = unsafe {
             ReadProcessMemory(
@@ -1234,7 +1268,26 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
             unsafe {
                 core::ptr::copy_nonoverlapping(buf.as_ptr(), page_addr as *mut u8, PAGE_SIZE);
             }
-        } else {
+        }
+        Ok(used_snapshot || live_ok)
+        }) else {
+            // Reentrant on this thread (this scratch buffer already borrowed by an outer
+            // invocation) -- astronomically rare, but must never panic inside a VEH handler.
+            // Fall back to the SAME "unreadable" outcome the live-read-failed branch already
+            // uses below: leave the freshly-committed page zero-filled and keep servicing the
+            // fault rather than declining it (declining here would turn a benign reentrancy
+            // hiccup into a real guest SIGSEGV for no reason).
+            LAZY_FAULTS_ZERO_FILLED.fetch_add(1, Ordering::Relaxed);
+            let n = LAZY_FAULTS_SERVICED.fetch_add(1, Ordering::Relaxed) + 1;
+            if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() && n <= 40 {
+                eprintln!(
+                    "[lazy_fork_commit] fault #{n} serviced: page={page_addr:#x} zero_filled_so_far={} (scratch buffer reentrant)",
+                    LAZY_FAULTS_ZERO_FILLED.load(Ordering::Relaxed)
+                );
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        };
+        if !copied {
             LAZY_FAULTS_ZERO_FILLED.fetch_add(1, Ordering::Relaxed);
         }
         // else (zero-filled case): unreadable in the parent (real, unmapped padding) -- leave the
@@ -2067,6 +2120,15 @@ pub fn invalidate_guarded_range(range: &Range<usize>) {
 /// mere presence.
 unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rec = unsafe { &*(*info).ExceptionRecord };
+    // 114th pass, investigation-only: see `lazy_commit_veh`'s own identical marker.
+    if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
+        crate::diag_raw_print(
+            b"[diag-veh-entry] guard_cow_write_fault_veh code=0x",
+            rec.ExceptionCode as usize,
+            b" addr=0x",
+            rec.ExceptionInformation.get(1).copied().unwrap_or(0),
+        );
+    }
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -2135,24 +2197,37 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
     // `EXCEPTION_CONTINUE_EXECUTION` too. Deleting the entry instead would leave that second
     // thread's fault matching nothing, with no other handler able to resolve it.
     if !entry.pending.is_empty() {
-        let mut buf = [0u8; PAGE_SIZE];
-        unsafe {
-            core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
-        }
-        let n = entry.pending.len();
-        for p in entry.pending.drain(..) {
-            if pending_generation_alive(&p) {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(buf.as_ptr(), (*p.slot.bytes.get()).as_mut_ptr(), PAGE_SIZE);
-                }
-                p.slot.state.store(1, Ordering::Release);
+        // 114th pass: `FAULT_SCRATCH_BUF` (see its own doc comment) in place of an on-stack
+        // `[u8; PAGE_SIZE]` -- this handler is registered directly via
+        // `AddVectoredExceptionHandler` with no naked stack-swap protection, so a large stack
+        // frame growing while `rsp` is still a guest-address value risks tripping `__chkstk`.
+        // `try_borrow_mut`, not `borrow_mut`: on the (astronomically rare) reentrant case, skip
+        // the capture rather than panic -- the pending generations simply stay pending for a
+        // future write-fault attempt (or fall back to their own live-read path), the same
+        // degraded-but-correct-enough outcome a failed `VirtualProtect` already produces
+        // elsewhere in this function.
+        FAULT_SCRATCH_BUF.with(|cell| {
+            let Ok(mut buf) = cell.try_borrow_mut() else {
+                return;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
             }
-        }
-        if diag {
-            eprintln!(
-                "[lazy_fork_commit] guard-cow: parent write-fault captured page={page_addr:#x} generations={n}"
-            );
-        }
+            let n = entry.pending.len();
+            for p in entry.pending.drain(..) {
+                if pending_generation_alive(&p) {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(buf.as_ptr(), (*p.slot.bytes.get()).as_mut_ptr(), PAGE_SIZE);
+                    }
+                    p.slot.state.store(1, Ordering::Release);
+                }
+            }
+            if diag {
+                eprintln!(
+                    "[lazy_fork_commit] guard-cow: parent write-fault captured page={page_addr:#x} generations={n}"
+                );
+            }
+        });
     }
 
     let mut discard_old: u32 = 0;
