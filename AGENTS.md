@@ -18,22 +18,29 @@ remaining drain candidates for a future pass (the pass-history bullets above thi
 condensed close to the point of losing load-bearing detail; further cuts there risk exactly the
 "claim nobody could point at" failure mode this file's own opening paragraph warns against).
 
-**Where things stand, in one paragraph (updated 106th pass)**: cross-process fork
-(`LITEBOX_PROCESS_FORK=1`) alone remains solid and the default-safe path -- `xfwm4` launches and
-survives (no crash) with real X11 windows created, but the boot still hits the long-standing
-pre-83rd-pass RAM crater (Track B item 1) before `DE_UP`. **`LITEBOX_LAZY_FORK_COMMIT=1
-LITEBOX_LAZY_FORK_GUARD_COW=1` is STILL NOT safe and must NOT be used for a real boot attempt.** Two
-independent sigreturn-trampoline livelock bugs were found and fixed (104th: `lazy_commit_veh`; 105th:
-`fork_verify.rs`'s own cross-process safety net) -- zero `0x7feffffef000` faults remain. **A THIRD,
-distinct bug remains open and still crashes the cheap isolated repro** (`.wfgy/pass105_xset_repro.sh`,
-`Xvfb`+`xset q`, both lazy flags on): a deterministic guest user-mode page fault
-(`cr2=0x111156f60`, byte-identical across independent runs) where litebox's own guest memory
-tracking believes a page is validly mapped but the real Windows backing is not present, in a mapping
-`/usr/bin/rm`'s own post-`execve` load created. The 106th pass ruled out the FS_BASE-repair mechanism,
-a `load_program` failure, and `allocate_pages` itself as candidates (see pass-history entry below) but
-did not find the actual creation site. **Both lazy-fork flags remain default OFF. `DE_UP` has not been
-reached by any of the 106 passes to date.** See "Cross-process fork"'s own "Open, in rough priority
-order" item 1 for the precise next pickup.
+**Where things stand, in one paragraph (updated 113th pass)**: three real gaps that used to force
+every cross-process fork onto the crash-prone thread-based relocating path are now closed --
+109th-112th passes landed cross-process `kill()`/process-groups/`SIGCHLD` siginfo, a single shared
+data path for ptys (Ctrl-C, `script`, interactive terminals all verified), and unix-socket carrying
+(connected streams, socketpairs, listeners) -- real boots now show **zero** `not eligible` fallbacks
+(`.wfgy/pass112_boot{1,2,3}.err.log`). The 103rd pass's `xfce4-session: Cannot open display: .` +
+immediate `exit(1)` **is a RACE, not a deterministic bug**: a 113th-pass diagnostic
+(`[diag-xfce4session-envp]`, `litebox_shim_linux/src/syscalls/process.rs`) proves `envp` reaches
+`execve` with `DISPLAY=:1` intact every time, and a clean run (`.wfgy/pass113_xfce_trace6.err.log`)
+shows `xfce4-session`'s own X11 `connect()` succeeding on its normal second attempt (abstract-then-
+path fallback) with zero crash -- that run reached `WM_POLL n=4` (~40s of polling) before the
+pre-83rd-pass RAM crater (Track B item 1, still open) finally killed it. **Non-lazy
+(`LITEBOX_PROCESS_FORK=1` alone) is the furthest any pass has gotten toward `DE_UP` without a crash**
+-- the sole remaining blocker on this path is that same RAM crater, not a correctness bug.
+**`LITEBOX_LAZY_FORK_COMMIT=1 LITEBOX_LAZY_FORK_GUARD_COW=1`** (the mechanism that actually fixes the
+RAM crater) has its own three known sigreturn-trampoline/`fork_verify` bugs fixed (104th/105th) but
+was NOT re-verified on a real full boot this pass -- host RAM was too contended (an unrelated,
+large Chrome process) to get a clean run; the cheap isolated repro
+(`.wfgy/pass105_xset_repro.sh`) should still be re-checked clean before trusting it. **Both lazy-fork
+flags remain default OFF. `DE_UP` has not been reached by any of the 113 passes to date, but for the
+first time the non-lazy path's own remaining blocker is narrowed to exactly one thing: Track B item
+1's RAM crater.** Next pickup: re-run the lazy-mode full boot (`.wfgy/pass110_lazy_boot1.ps1`) once
+host RAM is genuinely free (6GB+, sustained) to check whether it now reaches `DE_UP`.
 
 ## The cheap repro — start here
 
@@ -659,6 +666,52 @@ map" below). Condensed current-state trail:
     datagram socketpairs and bound/connected dgram, bound-unconnected and connecting streams still
     refuse; slot ring is 2 KiB/direction, 64 slots, 15ms repoll; a cross-process `connect()`ed
     SEQPACKET is still unframed; child-listener sees only cross-process connects.
+- **113th -- fixed a real diagnostic-tooling bug that was hiding useful evidence, confirmed
+  `xfce4-session`'s "Cannot open display: ." is a RACE not a deterministic bug, and got the
+  furthest yet toward `DE_UP` on the non-lazy path (no crash, RAM crater is the sole blocker).**
+  - **`is_syscall_timeline_target_comm` (`litebox_shim_linux/src/diag.rs`) fixed**:
+    `target.starts_with(trimmed)` is trivially true when `trimmed` (`comm`) is empty, which it is
+    for every guest thread between `clone()` and its first `execve()` -- so
+    `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session` traced the pre-exec bootstrap syscalls of EVERY
+    forked thread on the whole boot, never reaching `xfce4-session` at all before the volume
+    exhausted host RAM. Now requires a non-empty `comm`. This tool (the project's own "what is this
+    specific process doing" instrument) is now trustworthy again for a single-comm target.
+  - **New permanent diagnostic**: `[diag-xfce4session-envp]` in `sys_execve`
+    (`litebox_shim_linux/src/syscalls/process.rs`), fires only when the execve path ends in
+    `xfce4-session`, dumps `fork_relocations.is_some()` and the `DISPLAY` envp entry straight to
+    stderr. Live-confirmed (`.wfgy/pass113_envp_diag2.err.log`): `DISPLAY=:1` reaches `execve`
+    intact every time -- rules OUT the `copy_vector`/`heal()` staleness class (that function's own
+    doc comment already documents a similar-LOOKING but mechanistically DIFFERENT prior DISPLAY
+    bug, on the old thread-based eager-duplicate path) as the cause of the 103rd/112th passes'
+    symptom.
+  - **Using the now-fixed syscall timeline** (`.wfgy/pass113_xfce_trace6.err.log`, a clean, non-
+    crashing run): `xfce4-session`'s own `socket()`+`connect()` to the X11 socket fails on its
+    FIRST attempt (`addrlen=25`, almost certainly the abstract-namespace form) then SUCCEEDS on a
+    second `socket()`+`connect()` (`addrlen=20`, the path form) -- this is normal, expected libxcb
+    client behavior, not a bug. This run printed no `Cannot open display` at all, reached
+    `DE_LAUNCHED_DIRECT` and `WM_POLL n=1`..`n=4` (~40s of polling, zero crash), and was only ever
+    stopped by an external cutoff -- the SAME `pass103_trimmed_boot1.ps1` script that produced
+    `Cannot open display` + immediate `exit(1)` in the 112th pass's own `boot2`/`boot3` runs, on the
+    same code. Conclusion: that symptom is a **timing race** (most likely `xfce4-session`'s first
+    connection attempt landing before Xvfb's socket is fully ready under some schedules, or a
+    fork-admission-timing interaction), not a deterministic corruption bug -- do not re-open the
+    `copy_vector`/envp angle without NEW evidence, and don't assume a future "Cannot open display"
+    sighting is this exact mechanism without checking whether it's a repeat of THIS race first.
+  - **RAM crater re-confirmed as the real, sole remaining blocker on the non-lazy path**: the clean
+    run above (`.wfgy/pass113_full_boot.poll.log`) ran 300s' worth of the script's own loop,
+    reaching `WM_POLL n=4`/128s elapsed before falling below the kill-switch threshold at 14-15
+    concurrent processes -- Track B item 1's own long-documented shape, not a new bug.
+  - **Lazy-mode NOT re-verified on a real boot this pass**: host RAM was severely, externally
+    contended for most of this pass (an unrelated ~7GB Chrome process; free RAM oscillated between
+    ~0.1GB and ~6.5GB on a ~1-2 minute cycle, unrelated to anything litebox did) -- two lazy-mode
+    boot attempts both hit genuine RAM exhaustion (`ENOMEM` loading `cc1`, i.e. real memory
+    pressure, not a new correctness bug) before reaching `xfce4-session` at all. **Next pickup**:
+    once host RAM is genuinely free and STAYS free (6GB+ sustained, no large unrelated process),
+    re-run `.wfgy/pass110_lazy_boot1.ps1` (or a fresh equivalent) to completion and check whether it
+    now reaches `DE_UP` -- every correctness bug found so far this session (sigreturn-trampoline
+    x2, unix-socket carrying, signals, ptys) applies equally to both fork paths, so there is no
+    known reason left to expect lazy-mode NOT to reach `DE_UP` if it gets enough real RAM headroom
+    to avoid an unrelated crash first.
 
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
