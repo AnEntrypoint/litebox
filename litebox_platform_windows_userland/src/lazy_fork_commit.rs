@@ -712,6 +712,17 @@ pub fn guard_cow_enabled() -> bool {
     std::env::var_os("LITEBOX_LAZY_FORK_GUARD_COW").is_some()
 }
 
+/// 114th-pass confirmation-only diagnostic -- see [`guard_one_page`]'s own call site for what this
+/// tests and why. `LITEBOX_DIAG_GUARD_INSTALL_DELAY_US=<microseconds>`, unset/unparseable = no
+/// delay (identical to today's behavior). Never intended for a real boot; a positive value here
+/// makes every fork pay for it on every guarded page.
+fn guard_install_artificial_delay_us() -> Option<u64> {
+    std::env::var("LITEBOX_DIAG_GUARD_INSTALL_DELAY_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&us| us > 0)
+}
+
 /// Parent-side: given the SAME `group_relocations`/`vma_layout` `spawn_process_fork_child`
 /// already has in hand, returns the subset of `group_relocations` eligible for lazy treatment --
 /// empty unless [`lazy_fork_commit_enabled`], and always excluding any group whose covering
@@ -1465,6 +1476,15 @@ fn ensure_guard_cow_veh_installed() {
 /// group) -- narrows Bug 4's original TOCTOU risk to just that one page, never a NEW hazard beyond
 /// what already existed before this mechanism did.
 fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_index: usize, diag: bool) {
+    // 114th-pass confirmation diagnostic ONLY -- artificially widens the real
+    // "page not yet guard-protected while another parent thread can still write to it with no
+    // fault at all" window this module's own doc comment (see AGENTS.md's 114th-pass entry)
+    // theorizes about, so a torn/stale-read repro that otherwise needs a genuinely unlucky timing
+    // hit becomes reliably reproducible if the theory is right. Env-var gated, default OFF,
+    // zero effect on any existing behavior when unset -- never intended to ship enabled.
+    if let Some(us) = guard_install_artificial_delay_us() {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
     let Some(slot) = claim.table.get(slot_index) else {
         return;
     };
