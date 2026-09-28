@@ -904,7 +904,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             RootfsSource::OciLayers {
                 layers,
                 resolved_layers_json,
-            } => match read_merged_rootfs_index_cache(&resolved_layers_json) {
+            } => {
+                register_layer_sources(&layers);
+                match read_merged_rootfs_index_cache(&resolved_layers_json) {
                 Some(entries) => {
                     shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, layers, entries)
                 }
@@ -914,6 +916,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         write_merged_rootfs_index_cache(&resolved_layers_json, entries);
                     }
                     fs
+                }
                 }
             }
         }
@@ -1544,6 +1547,7 @@ fn diag_process_fork_globalstate_probe_inner() {
     // `MergedRootfsIndexCache*`'s own doc comments for the full mechanism and the measured cost
     // this removes (3.2-3.5s of the ~3.9s this child otherwise spends before it can even resume
     // guest execution).
+    register_layer_sources(&tar_layers);
     let fs = match &layer_digests_json {
         Some(digests_json) => match read_merged_rootfs_index_cache(digests_json) {
             Some(entries) => {
@@ -1873,6 +1877,9 @@ fn diag_process_fork_task_resume_probe(
     // See `LinuxShim::adopt_forked_process`'s own doc comment on `comm`: the parent's own current
     // `comm` bytes, carried across the `CreateProcessW` boundary the same way
     // `sigreturn_trampoline` is, via `process_fork::FORK_CHILD_COMM_ENV_VAR`.
+    if let Ok(path) = std::env::var(pf::FORK_CHILD_LAZY_FILE_ENV_VAR) {
+        litebox_platform_windows_userland::adopt_inherited_lazy_file_maps(&path);
+    }
     let comm: [u8; 16] = std::env::var(pf::FORK_CHILD_COMM_ENV_VAR)
         .ok()
         .and_then(|s| pf::hex_decode(&s))
@@ -2378,6 +2385,16 @@ fn diag_process_fork_task_resume_probe(
 /// cache already exists to eliminate one stage earlier in this same pipeline. This cache applies
 /// the identical idea one stage later: cache the MERGE's own result, not just its raw inputs.
 const MERGED_ROOTFS_INDEX_CACHE_VERSION: u32 = 1;
+
+/// Numbers each borrowed (host-mmapped) layer by its position so demand-paged file mappings can be
+/// re-described to a fork child, which maps the same layers at different addresses.
+fn register_layer_sources(layers: &[std::borrow::Cow<'static, [u8]>]) {
+    for (index, layer) in layers.iter().enumerate() {
+        if let std::borrow::Cow::Borrowed(data) = layer {
+            litebox_platform_windows_userland::register_lazy_file_source(index, data);
+        }
+    }
+}
 
 /// Build a compact, filesystem-safe cache-file identifier from `resolved_layers_json` (the same
 /// already-resolved-digest-list JSON string both `run()`'s own boot and every cross-process fork

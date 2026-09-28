@@ -914,6 +914,9 @@ pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
 /// closed the gap for this one path). Never guest-visible.
 pub const FORK_CHILD_COMM_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_COMM";
 
+/// Path of the descriptor file a fork child re-arms its demand-paged file mappings from.
+pub const FORK_CHILD_LAZY_FILE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_LAZY_FILE";
+
 /// Carries the child's guest identity as `pid:ppid:pgid` (decimal): the pid the parent's `fork()`
 /// returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/`kill()` view of it
 /// instead of being the child's unrelated Windows process id. Never guest-visible.
@@ -1811,6 +1814,7 @@ pub fn spawn_process_fork_child(
     comm: [u8; 16],
     sigreturn_trampoline: usize,
     identity: litebox::platform::ForkChildIdentity,
+    lazy_file_map_path: Option<&str>,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
@@ -1867,6 +1871,9 @@ pub fn spawn_process_fork_child(
         // because omission means inherit here.
         ("LITEBOX_PUBLISH", String::new()),
     ];
+    if let Some(path) = lazy_file_map_path {
+        child_env.push((FORK_CHILD_LAZY_FILE_ENV_VAR, path.to_string()));
+    }
     // Lazy (reserve-then-commit-on-first-fault) group classification -- see
     // `crate::lazy_fork_commit`'s own module doc comment for the full design and correctness
     // argument. `lazy_eligible[i]` tells the group-copy loop below whether

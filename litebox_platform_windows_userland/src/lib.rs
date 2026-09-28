@@ -11,6 +11,7 @@ mod ctxwatch;
 mod fork_verify;
 mod lazy_file_map;
 pub mod lazy_fork_commit;
+pub use lazy_file_map::{adopt_from_file as adopt_inherited_lazy_file_maps, register_source as register_lazy_file_source};
 mod net;
 pub mod presentation;
 pub mod process_fork;
@@ -12990,7 +12991,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         identity: litebox::platform::ForkChildIdentity,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
-        crate::lazy_file_map::materialize_all();
+        let lazy_file_map_path = crate::lazy_file_map::export_for_fork();
         let group_relocations = relocations.group_relocations();
         let vma_layout = relocations.vma_layout();
         if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_some() {
@@ -13134,6 +13135,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             comm,
             sigreturn_trampoline,
             identity,
+            lazy_file_map_path.as_deref(),
         ) {
             Ok(Some((pid, process_handle, thread_handle))) => {
                 litebox_util_log::debug!(

@@ -36,6 +36,7 @@ pub(crate) const MIN_LAZY_LEN: usize = 4 * CHUNK_SIZE;
 static HAS_RANGES: AtomicBool = AtomicBool::new(false);
 static INSTALL_HANDLER: Once = Once::new();
 static TABLE: Mutex<BTreeMap<usize, LazyRange>> = Mutex::new(BTreeMap::new());
+static SOURCES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 struct LazyRange {
     end: usize,
@@ -44,6 +45,9 @@ struct LazyRange {
     protection: PAGE_PROTECTION_FLAGS,
     first_chunk: usize,
     filled: Vec<bool>,
+    /// Which registered source and where in it `source` points, so a fork child (which maps the
+    /// same layers at different addresses) can re-derive the pointer.
+    origin: Option<(usize, usize)>,
 }
 
 impl LazyRange {
@@ -142,6 +146,7 @@ fn split_at(map: &mut BTreeMap<usize, LazyRange>, addr: usize) {
         first_chunk: upper_first,
         filled: range.filled[upper_first - range.first_chunk..=last_chunk - range.first_chunk]
             .to_vec(),
+        origin: range.origin.map(|(index, offset)| (index, offset + consumed)),
     };
     range.end = addr;
     range
@@ -273,6 +278,7 @@ pub(crate) fn register(range: Range<usize>, source: &'static [u8]) -> bool {
             protection: PAGE_READWRITE,
             first_chunk,
             filled: vec![false; last_chunk - first_chunk + 1],
+            origin: locate_source(source),
         },
     );
     HAS_RANGES.store(true, Ordering::Release);
@@ -327,13 +333,117 @@ pub(crate) fn forget(range: Range<usize>) {
     }
 }
 
-/// Fills every still-unfilled chunk. Needed before anything reads this process's memory from
-/// outside (cross-process fork copy).
-pub(crate) fn materialize_all() {
+fn sources() -> MutexGuard<'static, Vec<(usize, usize)>> {
+    SOURCES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Declares that `data` is source number `index`. The numbering must be the same in every process
+/// of a fork tree (the layer order of the image), because fork children find their sources by it.
+pub fn register_source(index: usize, data: &'static [u8]) {
+    let mut all = sources();
+    if all.len() <= index {
+        all.resize(index + 1, (0, 0));
+    }
+    all[index] = (data.as_ptr() as usize, data.len());
+}
+
+fn locate_source(slice: &[u8]) -> Option<(usize, usize)> {
+    let start = slice.as_ptr() as usize;
+    sources().iter().enumerate().find_map(|(index, &(base, len))| {
+        (len != 0 && start >= base && start + slice.len() <= base + len)
+            .then_some((index, start - base))
+    })
+}
+
+/// Prepares this process's lazy ranges for a cross-process fork and returns the path of a
+/// descriptor file the child re-arms them from. Ranges whose source cannot be identified are
+/// filled now so the ordinary page copy carries them. Unfilled chunks are `PAGE_NOACCESS`, hence
+/// unreadable, hence skipped by that copy: the child gets zero pages it re-arms, not data.
+pub(crate) fn export_for_fork() -> Option<String> {
     if !HAS_RANGES.load(Ordering::Acquire) {
-        return;
+        return None;
     }
-    for (&start, lazy) in table().iter_mut() {
-        fill_all(start, lazy);
+    let mut map = table();
+    let mut lines = String::new();
+    for (&start, lazy) in map.iter_mut() {
+        if lazy.origin.is_none() {
+            fill_all(start, lazy);
+        }
+        let Some((index, offset)) = lazy.origin else {
+            continue;
+        };
+        if lazy.filled.iter().all(|&filled| filled) {
+            continue;
+        }
+        let bits: String = lazy.filled.iter().map(|&f| if f { '1' } else { '0' }).collect();
+        lines.push_str(&format!(
+            "{start:x} {:x} {index} {offset:x} {:x} {:x} {bits}
+",
+            lazy.end, lazy.source_len, lazy.protection
+        ));
     }
+    drop(map);
+    if lines.is_empty() {
+        return None;
+    }
+    static SEQUENCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "litebox-lazyfile-{}-{}.txt",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, lines).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Child side of [`export_for_fork`]: re-arms every described range against this process's own
+/// mapping of the same source, then deletes the file.
+pub fn adopt_from_file(path: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        panic!("lazy file map descriptor {path} unreadable");
+    };
+    let _ = std::fs::remove_file(path);
+    let hex = |field: &str| usize::from_str_radix(field, 16).expect("descriptor hex field");
+    INSTALL_HANDLER.call_once(|| {
+        // SAFETY: registering a process-wide handler; it only claims faults inside registered ranges.
+        unsafe { AddVectoredExceptionHandler(1, Some(lazy_file_veh)) };
+    });
+    let mut map = table();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let [start, end, index, offset, source_len, protection, bits] = fields[..] else {
+            panic!("malformed lazy file map descriptor line: {line}");
+        };
+        let (start, end) = (hex(start), hex(end));
+        let index: usize = index.parse().expect("descriptor source index");
+        let offset = hex(offset);
+        let (base, total) = sources()
+            .get(index)
+            .copied()
+            .filter(|&(_, total)| total != 0)
+            .unwrap_or_else(|| panic!("lazy file map source {index} not registered in fork child"));
+        assert!(offset + hex(source_len) <= total, "lazy file map source {index} shorter in child");
+        let mut lazy = LazyRange {
+            end,
+            source: base + offset,
+            source_len: hex(source_len),
+            protection: hex(protection) as PAGE_PROTECTION_FLAGS,
+            first_chunk: start >> CHUNK_SHIFT,
+            filled: bits.chars().map(|bit| bit == '1').collect(),
+            origin: Some((index, offset)),
+        };
+        for chunk in lazy.chunk_indices() {
+            if !lazy.is_filled(chunk) {
+                let span = chunk_span(start, &lazy, chunk);
+                let mut previous = 0;
+                // SAFETY: the parent's group copy committed this whole range in this process.
+                unsafe {
+                    VirtualProtect(span.start as *const _, span.len(), PAGE_NOACCESS, &mut previous);
+                }
+            }
+        }
+        lazy.filled.shrink_to_fit();
+        map.insert(start, lazy);
+    }
+    HAS_RANGES.store(true, Ordering::Release);
 }
