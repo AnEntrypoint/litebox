@@ -846,6 +846,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         let slot_ref = self.slot_ref();
         slot_ref.release(self.is_client, self.platform().current_host_pid());
         if slot_ref.side_gone(self.is_client, self.platform()) {
+            // 118th-pass investigation: root-causing a session-client death cascade (AGENTS.md
+            // "Where things stand") to a genuine EOF on each client's own unix-domain connection
+            // (confirmed via `litebox_diag::socket_read`'s new `recvmsg` coverage: `size=0` right
+            // before each client's Xlib-default-handler `exit(1)`) -- but WHY the last holder of
+            // this side goes away at all was still invisible. This is the exact moment a reader on
+            // the OTHER side starts seeing EOF (the write ring shuts down right below), so logging
+            // it unconditionally (this branch is rare -- real connection teardown, not per-message
+            // traffic) finally answers "which host process, holding which role, let go of this
+            // slot" for the next capture of this same investigation.
+            litebox_util_log::debug!(
+                slot:% = self.slot, is_client:% = self.is_client,
+                host_pid:% = self.platform().current_host_pid();
+                "DIAG unix shared conn: last holder of this side released, shutting down write ring \
+                 (peer will see EOF)"
+            );
             let (_, write_ring) = self.rings();
             write_ring.shutdown();
             self.poke_peer();
