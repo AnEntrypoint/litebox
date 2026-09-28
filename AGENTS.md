@@ -504,6 +504,72 @@ opening paragraph warns about).
   mechanism -- this pass's own repeated experience (four real, plausible-looking
   leads tried and refuted, cdb now a confirmed fifth dead end for this SPECIFIC crash) is itself
   strong evidence that guessing further without new evidence has hit diminishing returns.
+  - **(b) done, same pass: ROOT CAUSE FOUND AND CONFIRMED LIVE, via `cdb`, for the
+    STATUS_ACCESS_VIOLATION -- reduced sibling-process count (removed the unneeded `which`/`cat`
+    bash forks from the repro, piping the Python script directly into `python3 -` via a heredoc
+    instead) plus `-xd av -xd sse` as STARTUP command-line flags (NOT inside a `-c` script, which
+    only runs at the "first debugger prompt" -- an early, expected AV occurring before that point
+    was leaving the session stuck at a default interactive break, explaining every earlier cdb
+    attempt's own apparent "hang") finally reached the real target in under 10 seconds.**
+    `.wfgy/pass114_cdb_run6.log`/`run7.log`: `Last event: <tid>: Access violation - code c0000005
+    (!!! second chance !!!)`, `ExceptionAddress: 0x7feffa244064` (a GUEST address, disassembling
+    to `mov dword ptr [rsp+24h],eax` -- a completely ordinary, ineliminable stack-relative local-
+    variable spill), `Parameter[0]=1` (write), `Parameter[1]=0x7feffe492834` (`= rsp+0x24`, exactly
+    matching the instruction). **`!address @rsp` is the smoking gun**: the faulting thread's OWN
+    STACK region (`Base Address: 0x7feffe490000`, `Region Size: 320KB`) is `State: MEM_COMMIT`,
+    `Protect: PAGE_READONLY`, `Allocation Protect: PAGE_NOACCESS` -- a real, committed thread stack,
+    stuck read-only, so the very first ordinary write to it (by ANY guest thread, doing NOTHING
+    unusual) is an immediate, unrecoverable access violation. Two independent guest threads hit the
+    IDENTICAL `rip`/instruction in the SAME run, confirming this is systematic, not a one-off race.
+    **Mechanism**: this exact base address (`0x7feffe490000`) matches a region THIS SAME
+    investigation already saw `[lazy_fork_commit] guard-cow: batched region ... opened fresh` for,
+    earlier in this pass's own logs (109th-113th/114th pass-history entries) -- guard-cow's own
+    `VirtualProtect(..., PAGE_READONLY, ...)` call for an EARLIER fork's claim landed on this exact
+    address range, and when that claim's own generation later died (the fork child exited or was
+    never touched), NOTHING un-protected it: `guard_one_page`'s own "heal-then-remove a stale
+    empty-pending entry" logic (this module's "88th pass" Bug 5 fix, generalized "98th pass") only
+    ever RUNS when `guard_one_page`/`try_guard_region_batched` are THEMSELVES called AGAIN for that
+    SAME page -- i.e. only on a LATER FORK's own attempt to re-claim it. **An ordinary allocation
+    that has nothing to do with forking at all -- a brand-new thread's stack, created via `clone()`
+    when Python's `threading.Thread` spawns a new OS thread, going through litebox's own
+    `allocate_pages`/thread-creation path -- never goes through `guard_one_page` at all, so the
+    healing check never runs for it.** The new thread's stack allocator, or whatever underlying
+    Windows call reserves/commits its memory, receives this exact stale address (Windows itself
+    is free to hand back an address it considers "available" for a fresh allocation once nothing
+    else holds a live claim on it at the OS level, entirely unaware that litebox's OWN
+    `GUARD_PAGE_REGISTRY` still has a stale, un-healed bookkeeping entry pointing at it) and ends
+    up with a REAL COMMITTED PAGE that Windows-level protection still says is `PAGE_READONLY`,
+    because nothing ever called `VirtualProtect` to actually restore it -- the thread then crashes
+    on its own first ordinary stack write. **This is the SAME general bug class already
+    identified (with less certainty) for the sigreturn trampoline** earlier in this pass -- both
+    are "a fresh, unrelated allocation reuses an address `GUARD_PAGE_REGISTRY` still has a stale
+    claim on, and nothing outside guard-cow's own fork-claim path ever checks for or heals that" --
+    but THIS time confirmed with a live, unambiguous, `!address`-verified capture, not reasoning
+    alone. **Fix, not yet implemented**: the healing check needs to run from a SECOND place, not
+    just `guard_one_page`'s own per-page claim path -- the natural, single choke point is
+    `WindowsUserland::allocate_pages` itself (`litebox_platform_windows_userland/src/lib.rs`,
+    already the one place ALL new guest memory -- ordinary `mmap`, thread stacks, the trampoline --
+    gets its real Windows backing): before trusting a freshly reserved/committed region's
+    protection, check `GUARD_PAGE_REGISTRY` for a stale (empty-pending) entry covering it and heal
+    it the same way `guard_one_page` already does, closing the gap for every future allocation kind
+    at once rather than patching each call site (mmap, thread-stack creation, the trampoline)
+    individually as each is discovered. **Not implemented this pass** -- found very late in an
+    already long pass; needs a careful read of `allocate_pages`'s own full body (already partially
+    read in the 106th/107th passes' own investigation, `lib.rs:7785-8541`) to find the exact
+    insertion point without disturbing its existing, delicate collision-recovery logic, then a
+    live re-test of this EXACT repro (now reliably reproducible under `cdb` in under 10 seconds)
+    to confirm the crash is actually gone, not just theorized-away.
+  - **Next pickup, precise, supersedes everything above in this entry**: (a) read
+    `WindowsUserland::allocate_pages`'s full body, find where it commits/reserves a fresh region,
+    and add a `GUARD_PAGE_REGISTRY`-staleness check+heal there (reusing `guard_one_page`'s own
+    logic, factored into a shared helper if that's cleaner) before returning success for any
+    region; (b) rebuild, re-run `.wfgy/pass114_cdb_run.ps1` (now fast and reliable) to confirm the
+    `STATUS_ACCESS_VIOLATION` is gone; (c) once confirmed, re-run the torn-read probe WITHOUT cdb
+    several times to build confidence this wasn't a fluke; (d) only then, re-attempt the ORIGINAL
+    `xfce4-session` SIGABRT with this fix in place, since `xfce4-session`'s own real threads
+    (glib's worker pool) are exactly the kind of "new thread created after fork, needing a fresh
+    stack" shape this bug describes -- plausible this is the SAME root cause, but must be
+    re-verified live, not assumed.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
