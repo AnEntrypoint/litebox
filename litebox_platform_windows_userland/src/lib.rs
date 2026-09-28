@@ -3192,6 +3192,9 @@ impl WindowsUserland {
         // so going first cannot swallow a host-side exception that belongs to someone else.
         unsafe {
             let _ = AddVectoredExceptionHandler(1, Some(vectored_exception_handler_entry));
+            windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
+                last_chance_crash_dump_filter,
+            ));
         }
 
         // Register a console control handler to receive Ctrl+C / Ctrl+Break
@@ -10448,6 +10451,28 @@ static CRASH_DUMP_ATTEMPTED: core::sync::atomic::AtomicBool =
 /// so the dump attempt can never turn a crash into a hang. Every step is best-effort and silent on
 /// failure beyond one diagnostic line -- the process is dying either way, and the ring dump above
 /// has already been emitted.
+/// Last-chance filter: Windows calls this only for an exception every VEH and SEH frame declined,
+/// immediately before terminating the process. `write_crash_minidump`'s other call site only
+/// fires after the same `rip` faults 64 times in a row, so a one-shot unhandled fault got no dump
+/// at all before this existed. Not reached when a debugger is attached, or when the kernel cannot
+/// build the exception frame on the faulting thread's stack (e.g. that stack page is not
+/// writable) -- such a fault never reaches user mode and needs an out-of-process capture.
+unsafe extern "system" fn last_chance_crash_dump_filter(
+    exception_info: *const EXCEPTION_POINTERS,
+) -> i32 {
+    if !exception_info.is_null() {
+        let rec = unsafe { &*(*exception_info).ExceptionRecord };
+        diag_raw_print(
+            b"[diag-last-chance] code=0x",
+            rec.ExceptionCode as u32 as usize,
+            b" addr=0x",
+            rec.ExceptionAddress as usize,
+        );
+    }
+    write_crash_minidump(exception_info.cast_mut());
+    EXCEPTION_CONTINUE_SEARCH
+}
+
 fn write_crash_minidump(exception_info: *mut EXCEPTION_POINTERS) {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
