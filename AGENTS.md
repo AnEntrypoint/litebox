@@ -81,6 +81,21 @@ acceptance are untested.** The last five blockers are understood:
   resident; no desktop boot or release build was possible. A boot needs ~5 GB free for its whole
   length; never close the user's applications to get it.
 
+- **Cross-process unix-socket wake is now event-driven (117th, `dfdfd26`)**: it used to be NO wake at
+  all -- every blocked read/poll on a shared connection waited out `SHARED_UNIX_POLL_INTERVAL`
+  (15 ms), so an X11 round trip cost ~15-30 ms and `xfwm4`'s ~7,000 round trips alone took minutes.
+  A send/recv/close on a shared slot now sets the peer host's existing wake event
+  (`wake_signal_listener`, handle-cached), the listener (`drain_host`, `xproc.rs`) bumps
+  `litebox::event::polling::bump_external_wake_epoch` (a `wait_on_events` waiter treats a changed
+  epoch as "re-run `try_op`") and wakes waiting threads (`ThreadHandle::wake_if_waiting`; poll/ppoll
+  re-scan on any wake). Measured `.wfgy/pass117_pingpong.sh`-style socketpair ping-pong across a
+  cross-process fork: 19.9 ms -> 0.05 ms per round trip. Lesson: a bare `Waker::wake` does NOT
+  make a `wait_on_events` waiter retry (its ready-check is the observer flag) -- it needs the epoch.
+  Still to do: rendezvous (`accept`/`connect`) and pty waits still poll; cross-process PIPES hang
+  when the parent keeps both ends open (PRD `cross-process-pipes-not-shared`); a
+  `connect()`/`accept()`-made local pair carried over fork gives EPIPE (PRD
+  `shared-unix-bound-socket-fork-broken-pipe`). Full boot with this build: not yet run.
+
 **Next pickup, in order**: (1) with >=8 GB free run `de_only.sh` from the ready seed under eager fork
 and reach `DE_UP`; (2) decompose per-process memory (sample `PrivateMemorySize64` per runner against
 a `VirtualQuery` breakdown) and cut the biggest piece; (3) app acceptance from a real browser
