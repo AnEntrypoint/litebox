@@ -520,6 +520,31 @@ opening paragraph warns about).
     that branch, by some other part of this function's fault-classification logic, not yet
     identified. Do not add a minidump call to the `else` branch alone without first confirming
     that is actually where this crash's own dispatch goes -- it may need to go somewhere earlier.
+- **116th -- the STATUS_ACCESS_VIOLATION chased since the 114th pass is ROOT-CAUSED AND FIXED
+  (`702c735`); it supersedes every "mechanism unconfirmed" note above.** A lazy/guard-cow fork
+  write-protects lazy-eligible groups in the parent. The exclusion for running threads' stacks was
+  fed the SPAWNING thread's `rsp` (`spawn_thread`'s `ctx` still holds the caller's stack pointer;
+  clone's `child_stack` is applied later, on the new thread), so a new pthread's own stack became
+  `PAGE_READONLY` and its first push faulted with no usable stack. Windows cannot deliver such a
+  fault to any VEH/SEH/unhandled-exception filter, which is why no handler, dump or log ever ran and
+  the guest saw a bare SIGKILL. It happened BEFORE python called `fork()` (the claim was bash
+  forking python; python's threads then started in memory still guarded) -- the 114th/115th
+  "guard-cow claim for an earlier fork" and "which thread is it" theories were all downstream of
+  this. Fix: new platform hook `note_spawned_guest_thread_stack` (`litebox/src/platform/mod.rs`,
+  called from the shim's clone with the real stack top; Windows records it in
+  `ALL_THREAD_STACK_RSPS`), and `classify_lazy_eligible_groups` now excludes every group overlapping
+  the whole mapping containing a live `rsp`/`rsp-1`. Also added `SetUnhandledExceptionFilter`
+  (`last_chance_crash_dump_filter`) so one-shot unhandled faults write a minidump (correct the older
+  "dumps before it dies, ungated" claim: only the 64-repeat breaker did; undeliverable faults still
+  cannot dump). **Bisect on `.wfgy/pass114_torn_read_probe.sh` (`.wfgy/pass115_plain_repro.ps1`,
+  webtop:debian-xfce; no `cdb` needed)**: eager copy (`LITEBOX_PROCESS_FORK=1` only) passes end to
+  end in ~10s (`PARENT_DONE`, `RC=0`, 0 torn); lazy-only gives the known guest SIGSEGV; lazy+guard-cow
+  now has a correct child (0 torn) but the parent HANGS after the child exits (GIL futex handoffs,
+  likely a lost wakeup or a host-side touch of a page kept read-only) -- the structural limit of
+  user-mode COW. The plan (`.gm/prd.yml`: `native-kernel-cow-fork` and dependents; the shim already
+  has a platform-neutral `has_native_fork`/`native_fork` path that Linux and macOS use) replaces it;
+  that probe must print `PARENT_DONE torn=0` under the default fork with no flags. Both lazy flags
+  stay default OFF. `DE_UP` still not reached; non-lazy is correctness-clean but RAM-crater-limited.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
