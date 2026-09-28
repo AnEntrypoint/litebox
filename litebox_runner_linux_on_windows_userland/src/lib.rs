@@ -351,6 +351,28 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         )
         .unwrap();
         fs.close(&resolv_conf).unwrap();
+
+        // Likewise `/etc/hosts` comes from the container runtime, not the image. Without it
+        // `getaddrinfo("localhost")` fails with EAI_AGAIN (nsswitch is `hosts: files dns` and no
+        // resolver answers for `localhost`), which stops any server given `--addr=localhost`
+        // (selkies 2.0) from binding at all.
+        let hosts = fs
+            .open(
+                "/etc/hosts",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &hosts,
+            b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&hosts).unwrap();
     });
 }
 

@@ -2825,6 +2825,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => Err(Errno::EOPNOTSUPP),
             },
+            SocketOptionName::IPV6(_) => Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
                 SocketOption::RCVTIMEO
@@ -2882,6 +2883,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => return Err(Errno::EOPNOTSUPP),
             },
+            SocketOptionName::IPV6(_) => return Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO

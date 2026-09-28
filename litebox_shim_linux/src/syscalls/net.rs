@@ -571,6 +571,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     return Ok(());
                 }
             },
+            // An `AF_INET6` socket here is an IPv6-configured-but-unreachable model (see
+            // `do_socket`/`sys_bind`), so whether it also accepts v4 is unobservable; accept the
+            // option like a kernel would rather than failing servers that set it (selkies 2.0
+            // sets it on every v6 listener and treats ENOPROTOOPT as fatal).
+            SocketOptionName::IPV6(litebox_common_linux::Ipv6Option::V6ONLY) => {
+                litebox_util_log::debug!("accepting and ignoring setsockopt(IPV6_V6ONLY)");
+                return Ok(());
+            }
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
                 SocketOption::RCVTIMEO
@@ -731,6 +739,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
             },
+            SocketOptionName::IPV6(litebox_common_linux::Ipv6Option::V6ONLY) => 0,
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO
