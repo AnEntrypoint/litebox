@@ -488,16 +488,20 @@ opening paragraph warns about).
   now-refuted "main handler" correlation attempt for why that specific angle still needs its OWN
   pid-tagged re-test, not a repeat of the same mistake). Implementing an exclusion in the wrong
   function would cost nothing but also fix nothing; **not shipped without that confirmation**.
-  **Next pickup, precise**: (a) re-attempt the pid-tagged `vectored_exception_handler` correlation
-  from earlier in THIS pass (which was refuted for one specific run) with MULTIPLE repeats, since
-  the trampoline loop itself is now suspected to be highly reproducible -- if `vectored_exception_
-  handler`'s own entry marker, WITH pid tagging, EVER shows a trampoline-address hit belonging to
-  the SAME pid that goes on to loop/crash, that would be the missing confirmation; (b) if cdb must
-  be used again, investigate whether `.ignore_exceptions`/a narrower `sx` filter (or debugging only
-  the ONE specific known-crashing child process by pid, once identified via (a), rather than `-o`
-  attaching to every process in the tree) reduces the observer-effect enough to reach the real
-  target; (c) do not spend further effort on a blind fix for either bug until (a) or (b) yields a
-  live, confirmed mechanism -- this pass's own repeated experience (four real, plausible-looking
+  **(a) done, same pass, WITHOUT cdb -- repeated the pid-tagged (non-debugger) run once more
+  (`.wfgy/pass114_pidtag_run2.err.log`) and got a SECOND independent confirmation, not a
+  correlation**: the crashing process this run (`winpid=26440`=`0x6748`) again shows ZERO
+  trampoline-address hits in either handler -- only unrelated `addr=0x0` noise -- while EVERY
+  `addr=0x7feffffef000` hit in the whole log belongs to a separate, non-crashing process
+  (`pid=0x62c8`, alive and periodically looping throughout). Two independent runs now agree: the
+  trampoline-collision loop and the STATUS_ACCESS_VIOLATION are genuinely separate, unrelated bugs
+  that both tend to occur somewhere in this test shape, not one causing the other. This closes (a)
+  as a real question (answered: no) rather than leaving it open. **Next pickup, precise**: (b) if
+  cdb must be used again, investigate whether `.ignore_exceptions`/a narrower `sx` filter (or
+  debugging only the ONE specific known-crashing child process by pid, once identified via a
+  non-debugger pid-tagged run first) reduces the observer-effect enough to reach the real target;
+  (c) do not spend further effort on a blind fix for either bug until (b) yields a live, confirmed
+  mechanism -- this pass's own repeated experience (four real, plausible-looking
   leads tried and refuted, cdb now a confirmed fifth dead end for this SPECIFIC crash) is itself
   strong evidence that guessing further without new evidence has hit diminishing returns.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
