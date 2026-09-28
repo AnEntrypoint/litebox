@@ -569,6 +569,25 @@ opening paragraph warns about).
   native fork remains the plan. Next: re-test the `xfce4-session` SIGABRT (needs a desktop boot,
   ~4-5 GB free), audit `ThreadHandle::interrupt` vs `prepare_to_run_guest` and `LoanList` for the
   same store-then-load pattern, then app acceptance.
+- **116th, latest -- the `xfce4-session`/`ssh-agent` SIGABRT (guest pid 51) and the dbus SIGSEGVs are
+  ROOT-CAUSED: lazy fork cannot work for daemonizing programs.** A lazy child fills its memory on
+  demand by reading the PARENT process; a daemonizer (fork, then the parent exits) is gone before the
+  child has touched its pages, so `ReadProcessMemory` fails and `lazy_commit_veh` leaves the page
+  zero-filled (`lazy_fork_commit.rs`, the "unreadable in the parent" branch), and the child dies.
+  Cheap repro (`.wfgy/pass116_orphan.ps1`, `debian:stable-slim`, seconds): a subshell forks a
+  background child and exits; the child reads shell variables 0.7s later. Eager fork: child prints the
+  right lengths. Lazy+guard-cow: child dies with a fatal signal at 0.35s. Real boot on the fixed
+  build (`.wfgy/pass116_lazy_boot1.*`, seed `pass113_de_only_ready_seed.tar`): reached Xvfb, dbus-daemon,
+  xrdb, xfce4-session, xprop and `WM_POLL n=1`; the three fatal signals are dbus-daemon pids 40 and
+  46 (SIGSEGV) and pid 51 (SIGABRT) whose comm is `ssh-agent` (visible now that comm is inherited; the
+  113th pass mis-attributed it to xfce4-session's own fork), each dead within 0.2s of starting -- all
+  daemonizers. Also in that boot: free RAM fell 5.3 -> 0.6 GB in 50s with 8 processes (killed by my
+  0.7GB switch), so lazy is not delivering its RAM saving on this build -- unexplained, needs an A/B
+  against the pre-702c735 binary. **Consequence: guard-cow/lazy cannot be made correct; do not
+  spend more passes patching it.** The desktop path is eager fork (correct, RAM-crater-limited) until
+  native kernel-COW fork (`.gm/prd.yml` `native-kernel-cow-fork`) lands. Also fixed this pass and
+  worth keeping: the futex/wait StoreLoad barrier (`182819d`, 50/50 probe passes), the thread-stack
+  exclusion (`702c735`), the `allocate_pages` lock-order deadlock (`8b982f3`).
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
