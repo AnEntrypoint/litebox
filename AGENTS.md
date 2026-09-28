@@ -574,7 +574,7 @@ opening paragraph warns about).
   demand by reading the PARENT process; a daemonizer (fork, then the parent exits) is gone before the
   child has touched its pages, so `ReadProcessMemory` fails and `lazy_commit_veh` leaves the page
   zero-filled (`lazy_fork_commit.rs`, the "unreadable in the parent" branch), and the child dies.
-  Cheap repro (`.wfgy/pass116_orphan.ps1`, `debian:stable-slim`, seconds): a subshell forks a
+  Cheap repro (`.wfgy/pass116_orphan.ps1`, `debian:stable-slim`, seconds; repeated: lazy+guard-cow child dies 5/5 runs, eager child prints correctly 3/3): a subshell forks a
   background child and exits; the child reads shell variables 0.7s later. Eager fork: child prints the
   right lengths. Lazy+guard-cow: child dies with a fatal signal at 0.35s. Real boot on the fixed
   build (`.wfgy/pass116_lazy_boot1.*`, seed `pass113_de_only_ready_seed.tar`): reached Xvfb, dbus-daemon,
