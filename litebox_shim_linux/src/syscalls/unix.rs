@@ -980,6 +980,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if write_ring.is_shutdown() {
             return false;
         }
+        // 118th-pass investigation (see `release_holder`'s matching diagnostic, same
+        // `litebox_diag::unix_conn_teardown` target): this is the OTHER way a peer's write ring
+        // shuts down -- a deliberate `shutdown(fd, SHUT_WR)` call, not a process/holder exiting.
+        // Distinguishing the two matters: `release_holder` never fired for the X11 connection in
+        // the session-death-cascade investigation's first capture, so this is the next candidate.
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::unix_conn_teardown",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            slot = %self.slot,
+            is_client = %self.is_client,
+            host_pid = %self.platform().current_host_pid(),
+            "DIAG unix shared conn: explicit shutdown_write, shutting down write ring (peer will see EOF)"
+        );
         write_ring.shutdown();
         self.poke_peer();
         true
