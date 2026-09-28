@@ -1,4 +1,4 @@
-# litebox -- current state (2026-09-28, 117th pass)
+# litebox -- current state (2026-09-28, 118th pass)
 
 The authoritative CURRENT-STATE picture: what works, what is broken, what to do next. Every claim
 carries a commit sha or `file:line` so the next session re-verifies instead of re-deriving; a claim
@@ -9,7 +9,82 @@ Compacted through the 117th pass; the 4th-116th passes' full narrative, includin
 114th-116th investigation, is in `docs/AGENTS_ARCHIVE_2026-09-28.md` (older:
 `_2026-09-22.md`, `_2026-09-23.md`).
 
-## Where things stand (117th pass)
+## Where things stand (118th pass)
+
+**Full pipeline now reaches a real browser with zero page errors and live server-side frame
+delivery -- the first time ever. `DE_UP` + selkies serving concurrently, stable for 500+s.** Three
+real bugs fixed this pass, all committed:
+
+- **`LITEBOX_LAZY_FILE_MAP=1`** (`8760e2c`, `5a07225`, new `litebox_platform_windows_userland/src/
+  lazy_file_map.rs`): a private file-backed mapping above 256KB is committed but left
+  `PAGE_NOACCESS`; each 64KB chunk is filled from the layer's static backing bytes on first touch
+  (`AddVectoredExceptionHandler`), so resident memory follows pages actually touched instead of the
+  whole file. A cross-process fork child re-arms its parent's still-unfilled ranges from a small
+  descriptor file (source index + offset + fill bitmap) instead of receiving already-copied pages --
+  `export_for_fork`/`adopt_from_file`, keyed by layer index (`register_lazy_file_source`, called by
+  the runner for every `Cow::Borrowed` OCI layer). Guest-visible output verified byte-identical with
+  the flag on/off across plain execs, forks, and a fork tree with an orphaned background child.
+- **Every ELF in an OCI layer is now rewritten (pre-patched), not just executable-mode ones**
+  (`d90ad7d`, `litebox_packager/src/{lib,oci}.rs`, `rewrite_elf`/`rewrite_layer_elfs` now gate on
+  `is_elf(&data)` instead of the file's `0o111` mode bits): shared libraries ship as mode `0644` and
+  were silently falling through to the runtime syscall-patcher, which means every process's first
+  touch of a large `.so` (`libLLVM`, `libpython`, X11/GTK/pango libs) paid a full scan-and-patch AND
+  made the file ineligible for the lazy-file-map/CoW fast paths (`try_lazy_file_pages`/
+  `try_allocate_cow_pages` both require the pre-patched trampoline-magic tail). Merged-rootfs-index
+  cache key now folds in `REWRITER_CACHE_VERSION` (re-exported `litebox_packager::
+  REWRITER_CACHE_VERSION`) so a stale merged-index cache entry from before this fix can't mask
+  freshly-rewritten layers. Combined effect, measured live (`.wfgy/pass118_q.xvfb1.err.log`,
+  `LITEBOX_DIAG_MEM_BREAKDOWN=1`): Xvfb's private commit 576MB->442MB, resident 530MB->275MB;
+  selkies (a `debian-xfce` fork child) resident 264MB->167MB. Guest correctness re-verified
+  (`.wfgy/pass118_forks2.{0,1}.out`): identical output across a fork tree with libraries now
+  pre-patched, both with lazy maps off and on.
+- **`litebox::pipes::Pipes` no longer stores a process-relative `LiteBox` handle in shared memory**
+  (`5de3881`, `litebox/src/pipes.rs`, `litebox_shim_linux/src/lib.rs`'s new `PipesHandle`): the old
+  design cached one process's `LiteBox` (effectively an `Arc` pointer) in a `Mutex` inside `Pipes`
+  itself, a `GlobalState` field placed in the cross-process shared kernel arena -- every OTHER
+  process in a fork family had to "rebind" that field to its own `LiteBox` before each use
+  (`rebind_per_process_fields`), which is racy by construction: another process's own rebind (or
+  even just its concurrent `.clone()` of the still-foreign pointer) can interleave with this one.
+  Same defect class already fixed twice for `Network` (see "Shared-memory foundations" below), found
+  here via `llvm-symbolizer` against a live host `STATUS_ACCESS_VIOLATION` inside
+  `Descriptors::get_entry::<Pipes<...>>` (`0x203379`), reached from `with_iopollable` (epoll
+  registration on a pipe fd -- exactly what an asyncio/selectors event loop does on its self-pipe).
+  Fix: `Pipes` now holds no process-relative state at all; every method takes the CALLING process's
+  `&LiteBox` explicitly, threaded through the new `GlobalStateHandle::pipes() -> PipesHandle`
+  wrapper (mirrors `net_lock()`'s shape, without the lock -- there is nothing left to lock). Verified:
+  isolated pipe/asyncio/nested-fork-subprocess repros pass (`.wfgy/pass118_pipetest{,2}.sh`); `litebox`
+  crate tests updated and compiling (`cargo check -p litebox --tests`).
+
+**Full-stack live run (`.wfgy/pass118_full5.*`, seed-free -- a new transparent driver,
+`.wfgy/pass118_full.sh`/`.ps1`, adapted from `de_only.sh` with Xvfb/selkies/xfce4-session all
+writing straight to the runner's own inherited stdout instead of through a pipe, plus
+`xrdb -nocpp` and per-process exit-status markers)**: `DE_UP after 35s`, selkies serving on
+`:8081` with real frames flowing (`INFO:ws:...Capture started`, x264 CPU encoder,
+`Backpressure TRIGGERED`/`LIFTED` cycling on real server:client frame counts), both alive together
+for 500+s with free RAM oscillating 2-4GB, never crashing. A real Chrome session (gm `cdp`) loaded
+`http://127.0.0.1:8081/`, connected its WebSocket transport (`readyState=1`), and received the
+selkies UI with **zero page errors** -- confirmed via `window.stream_info`
+(`backend:x11, capture:XShm, codec:h264, encoder:x264, encoder_reason:'NVENC ... dlopen failed'`,
+all expected/correct for this guest) and `VideoDecoder.isConfigSupported({codec:'avc1.42E01E'})` ->
+`supported:true` in that real Chrome. **The one remaining gap is NOT a litebox bug**: the selkies
+client gates the video canvas (`id="videoCanvas"`, `display:none` until unlocked) behind a real
+"Play Stream" button -- standard Chrome autoplay-activation policy for any WebCodecs-driven canvas,
+identical to what any browser-based remote-desktop client needs. A script-dispatched `.click()`
+(via `Runtime.evaluate`, not a real trusted input event) does not satisfy it; gm's `cdp` verb has no
+documented native mouse-input primitive (`click=x,y` is parsed as bare JS, not a click), and
+`claude-in-chrome`'s extension was not connected this pass to supply a real trusted click. **Next
+session: get one real trusted mouse click on "Play Stream" (claude-in-chrome once its extension is
+connected, or any tool that dispatches CDP `Input.dispatchMouseEvent` rather than JS `.click()`)
+and confirm live pixels** -- everything upstream of that single click is now proven working end to
+end.
+
+**A real earlier concurrent-boot collision**: `acquire_boot_lock()`'s single host-wide lockfile
+(`litebox_runner_linux_on_windows_userland/src/lib.rs:495`) correctly refused a second boot while an
+orphaned prior run was still alive (`taskkill`/`Terminate` loop is now 6 retries with a 1s sleep in
+every driver script here, not a single best-effort call, to actually clear it before starting the
+next run).
+
+## Where things stood (117th pass)
 
 **`DE_UP` REACHED (117th pass, first ever): eager fork + `LANG=C` + event-driven cross-process wake
 (`dfdfd26`) -> `_NET_SUPPORTING_WM_CHECK` set 130 s into `.wfgy/pass117_evt_boot2` (window id
