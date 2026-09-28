@@ -35,10 +35,20 @@ acceptance are untested.** The last five blockers are understood:
   guest address `0x7feff05a0000` is present in EVERY child right after `Platform::new()`, even
   `rm`/`mkdir`. The same image with `sleep 1 & wait` as the script (with or without the seed and
   `GLIBC_TUNABLES`) gives only 72-76 MB per child, and `debian:stable-slim` 74 MB, so the 173 MB is
-  neither the rootfs index (+2 MB) nor the seed: it is specific to the real boot's parent. Next:
-  capture `fork-parent at spawn`'s VMA layout at the first forks of a real boot (the diag is in
-  place; boot4 could not run, host had 0.03 GB free with Chrome reopened) and find which parent
-  mapping is 173 MB.
+  neither the rootfs index (+2 MB) nor the seed.
+  **ROOT-CAUSED (117th)**: it is glibc's `/usr/lib/locale/locale-archive` (181,493,744 B = 173 MB,
+  webtop image), mapped whole by `setlocale` for ANY non-`C` locale -- even `C.UTF-8`, because glibc
+  looks the name up in the archive first. `de_only.sh` exports `LANG=en_US.UTF-8`; bash re-runs
+  `setlocale` on that assignment. The shim's file-mapping fast path (`try_cow_mmap_file`,
+  `LITEBOX_COW_MMAP`) is deliberately OFF (lossy partial-unmap zero-fill; `--oci-image` layer bytes
+  are heap-owned), so the mapping is a `memcpy` into 173 MB of private commit in every process, and
+  every fork child eagerly copies it again: ~430 MB/process of the ~600 MB. **Fix for the boot:
+  run with `--env LANG=C`** (and `export LANG=C` in `de_only.sh`/`webtop_stack.sh`; seed
+  `.wfgy/pass117_seed.tar`, driver `.wfgy/pass117_eager_boot.ps1`). Verified: root bash private
+  506 MB -> 76 MB, region gone. The general defect (any large read-only private file mapping is
+  committed per process and per fork) is tracked in `.gm/prd.yml` `file-backed-private-mmap-no-commit`
+  and needs lossless partial-unmap recovery plus 64 KiB-aligned or platform-placed views. Full boot
+  with `LANG=C` still to be run (host had 0.2 GB free).
 - **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
   a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
   daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`
