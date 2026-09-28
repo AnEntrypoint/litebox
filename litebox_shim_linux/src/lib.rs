@@ -1173,7 +1173,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net_lock().perform_platform_interaction()
+        let advice = self.0.net_lock().perform_platform_interaction();
+        if matches!(
+            advice,
+            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        ) {
+            self.0.xproc_poke_other_hosts();
+        }
+        advice
     }
 
     /// Force the exact same recovery [`GlobalStateHandle::net_lock`]'s own dead-holder path

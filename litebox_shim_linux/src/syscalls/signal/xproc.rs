@@ -464,6 +464,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         targets.iter().map(|v| v.pid).collect()
     }
 
+    /// Wakes every OTHER host process's blocked waiters. The network stack (`Network`) is shared
+    /// but readiness notification is per process (`Pollee` observers are local), so a socket state
+    /// change noticed by whichever process ran the poll -- an incoming connection, data, a close --
+    /// would otherwise leave a waiter in a different process asleep until its own next tick.
+    pub(crate) fn xproc_poke_other_hosts(&self) {
+        let me = self.platform.current_host_pid();
+        if me == 0 {
+            return;
+        }
+        let mut poked: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for view in self.process_table.members() {
+            if view.host_pid != me && !poked.contains(&view.host_pid) {
+                poked.push(view.host_pid);
+                self.platform.wake_signal_listener(view.host_pid);
+            }
+        }
+    }
+
     /// A process that was its whole host process is gone once that host process is. Such a slot
     /// is released here, since an orphan's slot is never released by a reap.
     fn xproc_alive_or_release(&self, view: SlotView, my_host: u32) -> bool {

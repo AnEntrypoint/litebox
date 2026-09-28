@@ -15,7 +15,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
 
 use bitflags::bitflags;
-use smoltcp::socket::{icmp, raw, tcp, udp};
+use smoltcp::socket::{raw, tcp, udp};
 
 pub mod errors;
 pub mod local_ports;
@@ -39,8 +39,9 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 // TODO: Make this configurable
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-/// Maximum size of rx/tx buffers for sockets
-pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
+/// Size of each socket rx/tx buffer. Buffers come from fixed slot pools in the shared kernel
+/// arena (see `socket_buffers`), so this is a pool slot size, not a per-socket allocation.
+pub const SOCKET_BUFFER_SIZE: usize = 65536;
 
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
@@ -90,6 +91,9 @@ const MAX_PACKET_COUNT: usize = 32;
 /// ever hitting that panic. 256 matches this codebase's other established fixed-slot caps
 /// (`SharedUnixAddrPresenceTable`'s 256, `RawMutex::WaiterQueue`'s 32).
 pub(crate) const MAX_SOCKETS: usize = 256;
+
+mod socket_buffers;
+use socket_buffers::SocketBuffers;
 
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
@@ -154,6 +158,9 @@ where
     /// `LocalPortAllocator::refcount` doc comment covers the identical bug class, found and fixed
     /// the same pass; `queued_for_closure` above got the same fix, twenty-eighth pass).
     closing_in_background: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
+    /// in the fork family can poll any socket (see `socket_buffers`).
+    buffers: SocketBuffers,
 }
 
 impl<Platform> Network<Platform>
@@ -215,6 +222,7 @@ where
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: core::array::from_fn(|_| None),
             closing_in_background: [None; MAX_SOCKETS],
+            buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
 }
@@ -387,7 +395,11 @@ struct TcpServerSpecific {
 }
 
 impl TcpServerSpecific {
-    fn refill_to_backlog(&mut self, socket_set: &mut smoltcp::iface::SocketSet) {
+    fn refill_to_backlog(
+        &mut self,
+        socket_set: &mut smoltcp::iface::SocketSet,
+        buffers: &mut SocketBuffers,
+    ) {
         let backlog = self.backlog.unwrap();
         for _ in self.socket_set_handles.len()..backlog.into() {
             // `socket_set` is fixed-capacity now (see `MAX_SOCKETS`'s own doc comment): stop
@@ -398,10 +410,10 @@ impl TcpServerSpecific {
             if socket_set.iter().count() >= MAX_SOCKETS {
                 break;
             }
-            let mut listening_socket = tcp::Socket::new(
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-            );
+            let Some((rx, tx, claim)) = buffers.tcp() else {
+                break;
+            };
+            let mut listening_socket = tcp::Socket::new(rx, tx);
             match listening_socket.listen(self.ip_listen_endpoint) {
                 Ok(()) => {}
                 Err(tcp::ListenError::InvalidState) => {
@@ -414,8 +426,9 @@ impl TcpServerSpecific {
                     unreachable!()
                 }
             }
-            self.socket_set_handles
-                .push(socket_set.add(listening_socket));
+            let handle = socket_set.add(listening_socket);
+            buffers.adopt(handle, claim);
+            self.socket_set_handles.push(handle);
         }
     }
 }
@@ -750,9 +763,10 @@ where
             // `Network` again after this loop, and because it was never THIS process's allocation
             // to free in the first place: Windows itself reclaims it in bulk, for free, whenever
             // the process that actually owns that address space exits.
-            core::mem::forget(self.socket_set.remove(handle));
+            core::mem::forget(Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle));
         }
         self.closing_in_background = [None; MAX_SOCKETS];
+        self.buffers.reset();
         // Plain reassignment (not `mem::forget`-guarded like `socket_set` above) is safe here:
         // `TypedFd`'s `OwnedFd` holds no heap allocation at all (a bare `u32` + `AtomicBool`), so
         // dropping a queued-but-not-yet-closed one costs nothing and frees nothing in any
@@ -879,6 +893,17 @@ where
         socket_set.iter().any(|(h, _)| h == handle)
     }
 
+    /// Removes `handle` from the socket table and returns its buffer slots to the shared pools.
+    fn remove_socket(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        buffers: &mut SocketBuffers,
+        handle: smoltcp::iface::SocketHandle,
+    ) -> smoltcp::socket::Socket<'static> {
+        let socket = socket_set.remove(handle);
+        buffers.release(handle);
+        socket
+    }
+
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
             let Some(handle) = *slot else { continue };
@@ -889,7 +914,7 @@ where
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
-                core::mem::forget(self.socket_set.remove(handle));
+                core::mem::forget(Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle));
                 *slot = None;
             }
         }
@@ -1130,30 +1155,21 @@ where
             return Err(SocketError::TooManySockets);
         }
         let handle = match protocol {
-            Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-            )),
-            Protocol::Udp => self.socket_set.add(udp::Socket::new(
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-            )),
-            Protocol::Icmp => self.socket_set.add(icmp::Socket::new(
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-            )),
+            Protocol::Tcp => {
+                let (rx, tx, claim) = self.buffers.tcp().ok_or(SocketError::TooManySockets)?;
+                let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
+                self.buffers.adopt(handle, claim);
+                handle
+            }
+            Protocol::Udp => {
+                let (rx, tx, claim) = self.buffers.udp().ok_or(SocketError::TooManySockets)?;
+                let handle = self.socket_set.add(udp::Socket::new(rx, tx));
+                self.buffers.adopt(handle, claim);
+                handle
+            }
+            // ICMP sockets were created and then hit `unimplemented!()` below; refuse them up
+            // front instead of panicking a guest-reachable path.
+            Protocol::Icmp => return Err(SocketError::UnsupportedProtocol(1)),
             Protocol::Raw { protocol } => {
                 // TODO: Should we maintain a specific allow-list of protocols for raw sockets?
                 // Should we allow everything except TCP/UDP/ICMP? Should we allow everything? These
@@ -1384,12 +1400,12 @@ where
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
                 if handle_is_live {
-                    let _ = self.socket_set.remove(handle);
+                    let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
                 }
             }
             Protocol::Udp => {
                 if handle_is_live {
-                    let smoltcp::socket::Socket::Udp(mut socket) = self.socket_set.remove(handle)
+                    let smoltcp::socket::Socket::Udp(mut socket) = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle)
                     else {
                         unreachable!()
                     };
@@ -1404,7 +1420,7 @@ where
                     // remove all listening sockets in the backlog
                     for handle in server_socket.socket_set_handles {
                         if Self::socket_set_contains(&self.socket_set, handle) {
-                            let _ = self.socket_set.remove(handle);
+                            let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
                         }
                     }
                 }
@@ -1881,7 +1897,7 @@ where
                             // a handle already wiped by a dead-holder `reset_after_poisoning()`
                             // elsewhere has nothing left to remove.
                             if Self::socket_set_contains(&self.socket_set, handle) {
-                                let _ = self.socket_set.remove(handle);
+                                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
                             }
                         }
                     }
@@ -1890,7 +1906,7 @@ where
                     server_socket.backlog = Some(backlog);
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
                 }
-                server_socket.refill_to_backlog(&mut self.socket_set);
+                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
@@ -1968,7 +1984,7 @@ where
                 // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
                 // Refill to the backlog, so that we can have more listening sockets again if needed
-                server_socket.refill_to_backlog(&mut self.socket_set);
+                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 // Grab the local port again, so we can put it into the new `TcpSpecific`
                 let local_port = handle
                     .local_port
