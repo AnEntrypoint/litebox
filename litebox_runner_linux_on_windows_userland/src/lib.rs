@@ -2202,7 +2202,7 @@ fn diag_process_fork_task_resume_probe(
         .expect("failed to spawn cross-process fork child's net_worker thread");
 
     eprintln!(
-        "[process_fork_diag] task-resume-probe (child, winpid={}): built Task, set fs_base={:#x}, calling \
+        "[process_fork_diag] task-resume-probe (child, winpid={} guest_pid={pid}): built Task, set fs_base={:#x}, calling \
          run_thread with rip={:#x} rsp={:#x} -- entering real guest execution",
         std::process::id(),
         gprs.fs_base,
