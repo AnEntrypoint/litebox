@@ -463,6 +463,63 @@ opening paragraph warns about).
   the `PAGE_READONLY` signature still NOT confirmed after ruling out every code-reading candidate;
   do NOT ship a blind fix; the trampoline-collision loop and this STATUS_ACCESS_VIOLATION remain
   two DIFFERENT, unresolved bugs; `xfce4-session`'s own original SIGABRT remains unre-attempted.
+- **115th -- compacted this file (78.8KB -> 53.1KB, full 114th-pass narrative drained to the
+  archive); tried a `cdb`-free repro (litebox's own always-reliable `eprintln!` diagnostics,
+  `LITEBOX_DIAG_MM=1` + `LITEBOX_DIAG_LAZY_FORK_COMMIT=1`, no debugger at all) to sidestep the
+  114th pass's cdb-scripting dead end -- found a new, real, but still-unconfirmed data point,
+  not a root cause.** 2/2 plain (non-cdb) runs of the exact same repro end in the guest-visible
+  process getting reported as killed by SIGKILL (bash's own `$?`=137 after the `python3 -`
+  heredoc) within ~7s, both with `LITEBOX_DIAG_NO_FAULT_WATCHDOG`/`_NO_EXTERNAL_FAULT_WATCHDOG`
+  set (ruling out both known internal watchdogs as the cause -- confirmed no third watchdog gate
+  exists by grepping every `WATCHDOG`-related env var in the codebase) and with
+  `killed_by_ram_switch: False` confirmed by the driving script itself (not an external kill from
+  this session's own tooling either). **No crash dump of any kind appears** -- `.wfgy/
+  pass115_plain_repro{2,3}.err.log` end abruptly on an ordinary `[lazy_fork_commit]` line with
+  nothing after, despite AGENTS.md's own standing claim that "a fatal host fault dumps before it
+  dies, ungated... no env var needed." Plausible explanation, not yet confirmed: the crashing
+  guest thread's own `%rsp` points at GUEST-mapped memory rather than its real host stack (per
+  the 114th pass's own finding), so whatever native stack-walking the crash-dump path relies on
+  may find a bogus/inaccessible stack and silently produce nothing for this specific fault class
+  -- if true, this is a second, independent bug (a real crash producing no diagnostic at all) worth
+  fixing on its own merits regardless of the STATUS_ACCESS_VIOLATION's own root cause, but NOT
+  confirmed this pass (declined to chase it further this session; see "Next pickup" below). The
+  burst of `[lazy_fork_commit] guard-cow: page=... INVALIDATED` lines immediately preceding each
+  SIGKILL report is for a DIFFERENT address range (`0x111148000..0x111168000`) than the cdb-
+  confirmed crash address (`0x7feffe490000`), so it is very likely unrelated ordinary teardown
+  activity, not the crash mechanism itself -- included here only because it is the last visible
+  activity before the process disappears both times, not because a causal link is established.
+  **Next pickup**: (a) confirm or refute the "no dump because %rsp is a guest address" theory by
+  code-reading the actual crash-dump/stack-walk implementation (search for "dumps before it
+  dies"/`RECENT_FAULTS`/`RECOVERY_LOG` in `litebox_platform_windows_userland/src/lib.rs`) --  if
+  confirmed, fixing the dump path itself (making it robust to a bogus `%rsp`, e.g. by capturing
+  registers/a minidump via `MiniDumpWriteDump` instead of relying on stack unwinding) would give
+  every future pass a working crash dump for this and any similar future fault, a durable
+  improvement independent of this specific bug; (b) this `cdb`-free repro path (2/2 reproduced,
+  ~7s, no RAM pressure, no debugger overhead) is a genuinely cheaper and more reliable repro loop
+  than any `cdb`-based one this session found -- prefer it for future iteration once (a) gives it
+  a working crash dump to read.
+  - **(a) partially done, same pass, by code reading only (not yet live-tested)**: found the real,
+    confirmed reason no dump appears, and it is NOT the `%rsp`-is-a-guest-address theory above --
+    `write_crash_minidump` (`lib.rs:10451`) has exactly ONE call site (`lib.rs:2246`), and it is
+    reached ONLY from the repeated-identical-fault circuit breaker (the same `rip` faulting more
+    than `MAX_REPEATED_UNRECOV_AV = 64` times in a row on one thread, `lib.rs:2184-2252`) -- a
+    genuinely UNHANDLED, ONE-SHOT access violation (exactly what every STATUS_ACCESS_VIOLATION
+    this whole 114th/115th-pass investigation has captured via `cdb` looks like: it happens once
+    per thread, never 64 times in a row) never reaches this call at all, regardless of AGENTS.md's
+    own older, now-corrected claim that "a fatal host fault dumps before it dies, ungated." This is
+    a REAL, general gap, independent of the STATUS_ACCESS_VIOLATION's own unconfirmed root cause: a
+    future pass adding a minidump write to the genuine one-shot-unhandled-AV path too (the
+    `[diag-unrecov-av]`-printing `else` branch at `lib.rs:2174`, reached when the host exception
+    table has no covering entry for the faulting `rip`) would give every future crash of this
+    shape a real dump automatically, with no `cdb` needed. **Not implemented this pass**: tracing
+    exactly which branch of this ~1300-line function (`lib.rs:876` onward) OUR specific crash
+    actually takes before reaching (or bypassing) that `else` branch needs more careful reading
+    than this pass had time for -- the plain (non-cdb) repro's own logs show NONE of
+    `[diag-unrecov-av]`/`[diag-extable]`'s output either (both described as "ungated,
+    allocation-free" in their own comments), meaning our crash is intercepted even EARLIER than
+    that branch, by some other part of this function's fault-classification logic, not yet
+    identified. Do not add a minidump call to the `else` branch alone without first confirming
+    that is actually where this crash's own dispatch goes -- it may need to go somewhere earlier.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
