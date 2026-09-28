@@ -636,7 +636,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         platform: self.platform,
                         _fs: core::marker::PhantomData,
                         bootstrap_process: once_cell::race::OnceBox::new(),
-                        pipes: Pipes::new(&self.litebox),
+                        pipes: Pipes::new(),
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
@@ -3265,16 +3265,95 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         guard
     }
 
-    /// Rebind the shared `Pipes`'s `litebox` handle to THIS process's own, always-locally-valid
-    /// state before handing out access -- same "rebind a stale-in-shared-memory pointer field
-    /// before every use" shape as [`Self::net_lock`], for `litebox::pipes::Pipes` instead of
-    /// `litebox::net::Network`. See [`litebox::pipes::Pipes`]'s own doc comment for the live crash
-    /// evidence (`STATUS_ACCESS_VIOLATION` inside a per-process descriptor table's own `Drop`,
-    /// reached while tearing down an inherited stdio pipe). Every call site that used to reach
-    /// `GlobalState.pipes` directly must go through this instead.
-    pub(crate) fn pipes(&self) -> &litebox::pipes::Pipes<Platform> {
-        self.pipes.rebind_per_process_fields(&self.litebox);
-        &self.pipes
+    /// The shared `Pipes`, paired with THIS process's own `LiteBox`. `Pipes` itself holds no
+    /// process-relative state (see [`litebox::pipes::Pipes`]), so nothing about the pairing can
+    /// be overwritten by another process between obtaining it and using it.
+    pub(crate) fn pipes(&self) -> PipesHandle<'_, Platform> {
+        PipesHandle {
+            pipes: &self.pipes,
+            litebox: &self.litebox,
+        }
+    }
+}
+
+/// The shared `Pipes` bound to the calling process's `LiteBox`; forwards each operation with it.
+pub(crate) struct PipesHandle<'a, Platform: ShimPlatform> {
+    pipes: &'a litebox::pipes::Pipes<Platform>,
+    litebox: &'a LiteBox<Platform>,
+}
+
+impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
+    pub(crate) fn create_pipe(
+        &self,
+        capacity: usize,
+        flags: litebox::pipes::Flags,
+        atomic_slice_guarantee_size: Option<core::num::NonZeroUsize>,
+    ) -> (litebox::pipes::PipeFd<Platform>, litebox::pipes::PipeFd<Platform>) {
+        self.pipes
+            .create_pipe(self.litebox, capacity, flags, atomic_slice_guarantee_size)
+    }
+
+    pub(crate) fn close(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<(), litebox::pipes::errors::CloseError> {
+        self.pipes.close(self.litebox, fd)
+    }
+
+    pub(crate) fn read(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox::pipes::errors::ReadError> {
+        self.pipes.read(self.litebox, cx, fd, buf)
+    }
+
+    pub(crate) fn write(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        buf: &[u8],
+    ) -> Result<usize, litebox::pipes::errors::WriteError> {
+        self.pipes.write(self.litebox, cx, fd, buf)
+    }
+
+    pub(crate) fn detach_end(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::DetachedPipeEnd<Platform>, litebox::pipes::errors::ClosedError> {
+        self.pipes.detach_end(self.litebox, fd)
+    }
+
+    pub(crate) fn half_pipe_type(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::HalfPipeType, litebox::pipes::errors::ClosedError> {
+        self.pipes.half_pipe_type(self.litebox, fd)
+    }
+
+    pub(crate) fn get_flags(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::Flags, litebox::pipes::errors::ClosedError> {
+        self.pipes.get_flags(self.litebox, fd)
+    }
+
+    pub(crate) fn update_flags(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        mask: litebox::pipes::Flags,
+        on: bool,
+    ) -> Result<(), litebox::pipes::errors::ClosedError> {
+        self.pipes.update_flags(self.litebox, fd, mask, on)
+    }
+
+    pub(crate) fn with_iopollable<R>(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        f: impl FnOnce(&dyn litebox::event::IOPollable) -> R,
+    ) -> Result<R, litebox::pipes::errors::ClosedError> {
+        self.pipes.with_iopollable(self.litebox, fd, f)
     }
 }
 
