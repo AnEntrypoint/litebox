@@ -97,24 +97,48 @@ launch successfully**: `xfwm4`, `xfsettingsd`, `xfce4-panel` (with two `wrapper-
 (`.wfgy/pass118_full7.err.log`, `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`). But `xfce4-session`
 itself (pid 28 in that run) later calls a plain `exit_group(status=1)` right after an ordinary
 `recvmsg` on its own fd 3 returns successfully -- no crash, no signal, no error logged anywhere in
-its own trace immediately before -- and every client it started (panel, both wrappers, Thunar,
-xfdesktop) is ALSO seen to exit with `status=1` at the same point, consistent with `xfce4-session`
-sending them all `SIGTERM` as part of its own shutdown. Timing is NOT fixed: 3 separate runs died at
-~170s, ~285s, and ~470-490s respectively. **Two plausible causes tested and ruled out**: the
-harness's own periodic `xprop -root` polling (a fresh X client connect/disconnect every 30s, tested
-by removing it entirely in a variant driver, `.wfgy/pass118_noxprop.sh` -- still died, just later)
-and RAM pressure (the run that died at ~470-490s had free RAM rock-stable at 4.4-4.5GB the entire
-time, no dip at all near the death). **One suggestive but unconfirmed lead**: in the no-xprop run, a
-SECOND `xfwm4` instance appears ~40-70s before the death (`xfwm4-WARNING: Another compositing
-manager is running on screen 0`, pid 84, distinct from the original) -- meaning the original xfwm4
-had already died and `xfce4-session` was respawning it, shortly before giving up entirely. Not seen
-in the run that died at ~285s (WM check property stayed valid on every `HOLD` tick right up to the
-sudden exit there), so this may be one symptom among several rather than the single root cause.
+its own trace immediately before. **Root mechanism narrowed further** (`.wfgy/pass118_full8.*`,
+`LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session,xfwm4,xfsettingsd,xfce4-panel,Thunar,thunar-real,
+xfdesktop,wrapper-2.0,dbus-daemon` -- traces every session client, not just the manager): the deaths
+are NOT simultaneous, they are a STAGGERED CASCADE, and `xfce4-session` itself dies LAST, not first --
+sorting every traced `exit_group` by its own numeric timestamp gives a clean, consistent order:
+`xfdesktop`(t=581s) -> `thunar-real`(592s) -> `xfce4-panel`(604s) -> `xfsettingsd`(613s) ->
+`xfwm4`(626s) -> `xfce4-session`(684s), each roughly 10-45s after the previous. Every single one of
+these six deaths shares the IDENTICAL immediate shape: an ordinary `recvmsg(sockfd=3, ...)` that
+returns successfully (`ok=true`), immediately followed by `exit_group(status=1)` -- no error, no
+signal, nothing else in that thread's own trace between the two. Traced `fd 3`'s origin for
+`xfdesktop` specifically: `socket(AF_UNIX)` + `connect()` (first attempt `addrlen=25` fails, second
+`addrlen=20` succeeds) right after its dynamic-linker phase -- this is each client's own X11 display
+connection, opened once at GTK/Xlib startup and read from for its whole life via `recvmsg`, not a
+per-request socket. **The shape (a normal-looking read that returns OK immediately followed by a
+clean `exit(1)`) matches Xlib's own default `_XIOError` handler** ("X connection ... broken", called
+when the X connection unexpectedly delivers EOF or a protocol violation) far better than a crash or
+an explicit kill -- if so, the real question is why each client's X11 connection independently goes
+bad, staggered over ~100s, roughly (but not exactly -- `xfce4-panel` before `xfsettingsd`, not launch
+order) in reverse-priority order. Timing is not fixed across runs (~170s/~285s/~470-490s/~581-684s
+seen); **ruled out**: the harness's own periodic `xprop -root` polling (removed entirely in
+`.wfgy/pass118_noxprop.sh` -- still died, just later), RAM pressure (rock-stable 4.4-4.5GB free
+through one death with zero dip), and `SharedUnixAddrPresenceTable` exhaustion (`unix.rs:2988`,
+`UNIX_ADDR_PRESENCE_CAPACITY = 256` -- only 68 traced `connect()`/73 `socket()` calls total across
+the whole run for these 9 comms, nowhere near 256, and that table indexes bound/listening addresses
+per RFC, not per-client connections, so ordinary GUI clients barely touch it). **One still-open,
+unconfirmed lead from an earlier (xprop-polling) run**: a SECOND `xfwm4` instance appeared
+~40-70s before ITS death (`xfwm4-WARNING: Another compositing manager is running on screen 0`, a
+distinct pid) -- i.e. `xfce4-session` had already respawned a client that died earlier still, meaning
+the visible cascade order above may itself be downstream of an even earlier, unlogged first death.
 Every guest app IS reachable and does launch given the real (untrimmed) session config -- the
-"apps must work" gap is this self-termination, not a launch failure. **Next session**: get a full,
-untraced syscall trace on EVERY client (not just `xfce4-session`) across the whole run, or attach
-`cdb` to a live boot around the death window, to see what actually triggers the first client's
-unexpected exit that starts the cascade.
+"apps must work" gap is entirely this later self-termination cascade, not a launch failure.
+**Next session, in order of expected signal**: (1) trace `litebox_diag::socket_read=debug` with
+`LITEBOX_DIAG_SOCKET_READ_TARGET=xfdesktop` (or whichever client is first to die that run) to see
+the ACTUAL bytes its X connection's `recvmsg` returns right before the fatal one -- a real X11 error
+event, a truncated reply, or literal zero bytes (EOF) each point to a different layer (guest
+protocol bug vs. litebox's own unix-socket relay dropping/truncating a message vs. Xvfb itself
+closing the connection); (2) if that shows EOF/truncation, look at Xvfb's own side of that same
+connection (does IT also see/cause it, or does litebox's relay diverge from what Xvfb actually
+sent) -- `try_cross_process_fork`'s unix-socket carrying and `SharedUnixConnectQueue`'s eviction
+paths (`unix.rs`) are the standing suspects for a shared connection silently losing or reordering
+bytes under sustained multi-client load, given every other AF_UNIX defect found so far in this
+project has been in exactly that layer.
 
 **A real earlier concurrent-boot collision**: `acquire_boot_lock()`'s single host-wide lockfile
 (`litebox_runner_linux_on_windows_userland/src/lib.rs:495`) correctly refused a second boot while an
