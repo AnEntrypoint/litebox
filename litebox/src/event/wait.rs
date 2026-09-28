@@ -132,6 +132,8 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        // Same aarch64 store->load hazard as `start_wait`: `f` reads pending interrupts next.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let ready_to_run_guest = f();
         if !ready_to_run_guest {
             self.waker
@@ -387,6 +389,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        // A SeqCst store does not order a later plain load before it on aarch64 (stlr/ldr);
+        // the wait/interrupt conditions read next must not be satisfied ahead of this store.
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.
