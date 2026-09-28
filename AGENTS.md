@@ -552,6 +552,23 @@ opening paragraph warns about).
   has a platform-neutral `has_native_fork`/`native_fork` path that Linux and macOS use) replaces it;
   that probe must print `PARENT_DONE torn=0` under the default fork with no flags. Both lazy flags
   stay default OFF. `DE_UP` still not reached; non-lazy is correctness-clean but RAM-crater-limited.
+- **116th, later -- the residual multi-threaded hang is ROOT-CAUSED AND FIXED (`182819d`); this
+  supersedes the "residual hang, mechanism unknown" notes above.** `WaitStateInner::wake`
+  (`litebox/src/event/wait.rs`) stores the wait condition (`done`, Release) and then reads the thread
+  state via `fetch_update`. When the state is not `WAITING` yet, the closure returns `None`, so NO
+  locked read-modify-write runs -- only a plain load -- and x86 TSO lets that load complete before the
+  preceding store is visible. The waiter meanwhile stores `WAITING` and reads `done == false`, so
+  both sides miss each other and the waiter sleeps forever: a Dekker-style lost wakeup on x86
+  itself (my first note that x86's locked RMW made it safe was wrong for this path). Fix:
+  `fence(SeqCst)` at the top of `wake()` and `interrupt()`. Evidence on the 4-thread fork probe
+  (`.wfgy/pass114_torn_read_probe.sh`): before, 13/20 then 4/20 hangs under lazy+guard-cow and
+  1/20-2/12 eager; after, **50 of 50 consecutive passes** under lazy+guard-cow (0.5% chance if the
+  rate were still 10%) and 7/7 eager. Method that found it: `cdb -pv` stack dumps symbolized with
+  `llvm-symbolizer --relative-address`, which first exposed the `allocate_pages` lock-order deadlock
+  (`8b982f3`), then the residual hang. Guard-cow is still the structural limit of user-mode COW;
+  native fork remains the plan. Next: re-test the `xfce4-session` SIGABRT (needs a desktop boot,
+  ~4-5 GB free), audit `ThreadHandle::interrupt` vs `prepare_to_run_guest` and `LoanList` for the
+  same store-then-load pattern, then app acceptance.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
