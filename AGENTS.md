@@ -25,7 +25,10 @@ acceptance are untested.** The last five blockers are understood:
   candidates: writable-layer import per child (`litebox_runner_linux_on_windows_userland/src/lib.rs`
   ~2600, copies the whole layer into each child's in-memory fs), rootfs index, guest-memory
   emulation. A 5-process `bash`+`sleep` test is only ~76 MB/process, so the big cost is specific to
-  real desktop processes -- measure it (Xvfb under eager fork) before guessing.
+  real desktop processes -- measure it (Xvfb under eager fork) before guessing. First data point
+  (117th, `.wfgy/pass117_xv.log`): merely starting the ROOT runner on `linuxserver/webtop:debian-xfce`
+  took free RAM from 711 MB to 219 MB within 0.5 s, before any guest fork, so the image load itself
+  (in-memory pull/merge/rewrite of a multi-GB image) costs several hundred MB; decompose that first.
 - **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
   a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
   daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`
