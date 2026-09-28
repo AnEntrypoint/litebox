@@ -11,8 +11,10 @@ Compacted through the 117th pass; the 4th-116th passes' full narrative, includin
 
 ## Where things stand (117th pass)
 
-**`DE_UP` (`_NET_SUPPORTING_WM_CHECK` set) has never been reached in any pass; browser access and app
-acceptance are untested.** The last five blockers are understood:
+**`DE_UP` REACHED (117th pass, first ever): eager fork + `LANG=C` + event-driven cross-process wake
+(`dfdfd26`) -> `_NET_SUPPORTING_WM_CHECK` set 130 s into `.wfgy/pass117_evt_boot2` (window id
+0x60008e), 20 processes, ~8 GB private, stable, HOLD loop ran on. Browser access (selkies) and app
+acceptance are still untested -- that is the next pickup.** Earlier blockers below are historical. The last five blockers are understood:
 
 - **Eager cross-process fork (`LITEBOX_PROCESS_FORK=1` alone) is correctness-clean end to end**
   (109th-113th: zero `not eligible` fallbacks, `xfce4-session` forks its clients with no crash; the
