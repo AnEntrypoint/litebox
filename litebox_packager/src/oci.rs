@@ -844,6 +844,10 @@ fn pull_layers_in_memory_impl(
                     })
                     .map(|e| e.digest.clone())
             })),
+            // Without these an unreachable registry address (a black-holed IPv6 or CDN address is
+            // enough) hangs the whole run for minutes with no output.
+            connect_timeout: Some(std::time::Duration::from_secs(10)),
+            read_timeout: Some(std::time::Duration::from_secs(60)),
             ..Default::default()
         };
         let client = Client::new(client_config);
@@ -869,10 +873,33 @@ fn pull_layers_in_memory_impl(
                 eprintln!("  Fetching manifest...");
             }
             let manifest_t0 = std::time::Instant::now();
-            let (manifest, _digest) = client
-                .pull_image_manifest(&reference, &auth)
-                .await
-                .with_context(|| format!("failed to pull manifest for {reference}"))?;
+            let mut last_err = None;
+            let mut fetched = None;
+            for attempt in 1..=3u32 {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    client.pull_image_manifest(&reference, &auth),
+                )
+                .await;
+                match result {
+                    Ok(Ok(found)) => {
+                        fetched = Some(found);
+                        break;
+                    }
+                    Ok(Err(e)) => last_err = Some(anyhow::Error::new(e)),
+                    Err(_) => {
+                        last_err = Some(anyhow::anyhow!("timed out after 45s"));
+                    }
+                }
+                if verbose {
+                    eprintln!("  Manifest fetch attempt {attempt}/3 failed, retrying");
+                }
+            }
+            let (manifest, _digest) = fetched.ok_or_else(|| {
+                last_err
+                    .unwrap_or_else(|| anyhow::anyhow!("no attempt made"))
+                    .context(format!("failed to pull manifest for {reference}"))
+            })?;
             if diag_timing {
                 eprintln!(
                     "[diag-fork-timing] pull_image_manifest returned at {:?}",

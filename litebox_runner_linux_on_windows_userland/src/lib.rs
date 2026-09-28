@@ -743,7 +743,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // avoid).
         let (pulled, resolved_layers_json) =
             litebox_packager::oci::pull_layers_in_memory_with_resolved_digests(image_ref, true)
-                .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e}"))?;
+                .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e:#}"))?;
         // Carry the REFERENCE across a cross-process `fork()`, the way the `--initial-files` path
         // carries its tar path. A child re-execs with no command line of its own, so without this
         // it arrives with no rootfs source at all and cannot `execve` anything. See
