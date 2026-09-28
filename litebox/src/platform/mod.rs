@@ -534,6 +534,19 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// Whether this process is the one that carries packets for the network interface.
+    ///
+    /// `Network` and its socket table are shared by every process of a cross-process-fork
+    /// family, but the packet path (the NAT gateway and its published ports) exists once, in a
+    /// single process. Only that process may drive the interface poll: a poll run by any other
+    /// process would transmit into that process's own, unconnected packet queue and the frames
+    /// would be lost. Processes that do not own the interface still service their own
+    /// descriptors and rely on the owner's poll for packet I/O. Single-process platforms are
+    /// always the owner.
+    fn owns_ip_interface(&self) -> bool {
+        true
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

@@ -7428,6 +7428,10 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     ) -> Result<usize, litebox::platform::ReceiveError> {
         net::receive_ip_packet(&self.net_gateway, packet)
     }
+
+    fn owns_ip_interface(&self) -> bool {
+        net::owns_ip_interface()
+    }
 }
 
 impl WindowsUserland {

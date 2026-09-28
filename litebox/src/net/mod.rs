@@ -844,6 +844,11 @@ where
 
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
+        if !platform::IPInterfaceProvider::owns_ip_interface(self.device.platform) {
+            // The owner process polls for everyone: this process's packet queue is not connected
+            // to the gateway, so a poll here would lose the frames it transmits.
+            return smoltcp::iface::PollResult::None;
+        }
         self.interface
             .poll(self.now(), &mut self.device, &mut self.socket_set)
     }

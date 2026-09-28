@@ -1009,6 +1009,17 @@ pub(crate) fn init_published_ports(slot: &OnceLock<NatGateway>) {
     }
 }
 
+/// Whether this host process carries the guest's packets (owns the NAT gateway and its published
+/// ports). Cross-process fork children do not: their `Network` is the root's shared one, and the
+/// gateway's queue exists only in the root process (see
+/// [`litebox::platform::IPInterfaceProvider::owns_ip_interface`]).
+pub(crate) fn owns_ip_interface() -> bool {
+    static OWNS: OnceLock<bool> = OnceLock::new();
+    *OWNS.get_or_init(|| {
+        std::env::var_os(crate::process_fork::FORK_CHILD_GPRS_ENV_VAR).is_none()
+    })
+}
+
 /// Send a raw IP packet from the guest into the NAT gateway.
 ///
 /// Always succeeds: the packet is simply enqueued for the gateway thread to process on its next
@@ -1063,6 +1074,12 @@ pub(crate) fn receive_ip_packet(
 /// Block the calling thread until either a packet is available to read from the gateway, or
 /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`'s role for the network-worker thread.
 pub(crate) fn wait_on_tun(slot: &OnceLock<NatGateway>, timeout: Option<core::time::Duration>) {
+    if !owns_ip_interface() {
+        // No gateway in this process to wait on (and none may be started: a second one would
+        // fight the owner for the published ports).
+        std::thread::sleep(timeout.unwrap_or(Duration::from_millis(50)));
+        return;
+    }
     let gw = gateway(slot);
     let has_packet = || !gw.queue.lock().unwrap().to_guest.is_empty();
     if has_packet() {
