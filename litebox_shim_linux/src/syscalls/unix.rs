@@ -3620,6 +3620,21 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             if host == me || platform.is_process_alive(host) {
                 any = true;
             } else {
+                // 118th-pass investigation (AGENTS.md "Where things stand"): this is the ONLY
+                // place a side can go "gone" without either `release_holder` or `shutdown_write`
+                // ever running -- a lazy, read-time liveness check, not a reaction to an event.
+                // Two earlier capture rounds with those two call sites logged found neither fired
+                // near a session client's death, so THIS is the real mechanism to observe: which
+                // host pid gets declared dead, and (checked independently against `Get-Process`
+                // on the host at capture time) whether it actually was.
+                litebox_util_log::__private::tracing::event!(
+                    target: "litebox_diag::unix_conn_teardown",
+                    litebox_util_log::__private::tracing::Level::DEBUG,
+                    is_client = %is_client,
+                    dead_host_pid = %host,
+                    checking_host_pid = %me,
+                    "DIAG unix shared conn: side_gone() declared a holder host dead on a lazy read-time check"
+                );
                 c.store(0, Ordering::Release);
             }
         }
