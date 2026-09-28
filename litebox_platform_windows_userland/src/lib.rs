@@ -11404,6 +11404,69 @@ pub(crate) fn shared_kernel_heap_probe_parent_write(base: usize) {
 /// raw read would fault the child's own startup -- logging a clean "not committed" line there is
 /// itself a meaningful, correct diagnostic result (proof the fallback path is genuinely NOT
 /// content-shared), not a condition to crash on.
+pub fn diag_private_memory_breakdown(tag: &str) {
+    if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_none() {
+        return;
+    }
+    let mut totals: std::collections::BTreeMap<(&'static str, u32), (u64, u64)> = Default::default();
+    let mut largest: Vec<(usize, usize, u32, &'static str)> = Vec::new();
+    let mut addr: usize = 0;
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    loop {
+        let q = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if q == 0 {
+            break;
+        }
+        if mbi.State == Win32_Memory::MEM_COMMIT {
+            let kind = match mbi.Type {
+                Win32_Memory::MEM_PRIVATE => "private",
+                Win32_Memory::MEM_MAPPED => "mapped",
+                Win32_Memory::MEM_IMAGE => "image",
+                _ => "other",
+            };
+            let e = totals.entry((kind, mbi.Protect)).or_default();
+            e.0 += 1;
+            e.1 += mbi.RegionSize as u64;
+            largest.push((mbi.BaseAddress as usize, mbi.RegionSize, mbi.Protect, kind));
+        }
+        let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if next <= addr {
+            break;
+        }
+        addr = next;
+    }
+    let mut sum = [0u64; 3];
+    for ((kind, _), (_, bytes)) in &totals {
+        match *kind {
+            "private" => sum[0] += bytes,
+            "mapped" => sum[1] += bytes,
+            _ => sum[2] += bytes,
+        }
+    }
+    eprintln!(
+        "[mem_breakdown] {tag} winpid={} committed private={}MB mapped={}MB image/other={}MB",
+        std::process::id(),
+        sum[0] >> 20,
+        sum[1] >> 20,
+        sum[2] >> 20
+    );
+    for ((kind, prot), (n, bytes)) in &totals {
+        if *bytes >= (1 << 20) {
+            eprintln!("[mem_breakdown]   {kind} prot={prot:#x} regions={n} {}MB", bytes >> 20);
+        }
+    }
+    largest.sort_by(|a, b| b.1.cmp(&a.1));
+    for (base, size, prot, kind) in largest.iter().take(14) {
+        eprintln!("[mem_breakdown]   top {kind} base={base:#x} size={}MB prot={prot:#x}", size >> 20);
+    }
+}
+
 pub(crate) fn shared_kernel_heap_probe_child_read(base: usize, inherited: bool) {
     if !raw_env_is_set(b"LITEBOX_DIAG_SHARED_HEAP_PROBE\0") {
         return;
@@ -12861,6 +12924,21 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
         let group_relocations = relocations.group_relocations();
         let vma_layout = relocations.vma_layout();
+        if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_some() {
+            diag_private_memory_breakdown("fork-parent at spawn");
+            let mut spans: std::vec::Vec<(usize, usize)> =
+                vma_layout.iter().map(|(r, _, _)| (r.start, r.end - r.start)).collect();
+            spans.sort_by_key(|s| core::cmp::Reverse(s.1));
+            let total: usize = spans.iter().map(|s| s.1).sum();
+            eprintln!(
+                "[mem_breakdown] fork-parent vma_layout entries={} total={}MB",
+                spans.len(),
+                total >> 20
+            );
+            for (start, len) in spans.iter().take(8) {
+                eprintln!("[mem_breakdown]   vma start={start:#x} size={}MB", len >> 20);
+            }
+        }
         // Read PAGE AT A TIME and refuse to touch a page that is not committed.
         //
         // `copy_one_group` already calls this once per page and treats `None` as "leave the

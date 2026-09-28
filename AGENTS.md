@@ -25,10 +25,20 @@ acceptance are untested.** The last five blockers are understood:
   candidates: writable-layer import per child (`litebox_runner_linux_on_windows_userland/src/lib.rs`
   ~2600, copies the whole layer into each child's in-memory fs), rootfs index, guest-memory
   emulation. A 5-process `bash`+`sleep` test is only ~76 MB/process, so the big cost is specific to
-  real desktop processes -- measure it (Xvfb under eager fork) before guessing. First data point
-  (117th, `.wfgy/pass117_xv.log`): merely starting the ROOT runner on `linuxserver/webtop:debian-xfce`
-  took free RAM from 711 MB to 219 MB within 0.5 s, before any guest fork, so the image load itself
-  (in-memory pull/merge/rewrite of a multi-GB image) costs several hundred MB; decompose that first.
+  real desktop processes -- measure it (Xvfb under eager fork) before guessing. Measured 117th pass (eager boot from the ready seed,
+  `.wfgy/pass117_eager_boot.ps1`, 8 GB free at start): the boot ran 152 s and hit the kill switch at 18
+  processes with ~11 GB private commit (~600 MB/process; `procs=5` -> 2 GB, `12` -> 6 GB, `17` ->
+  8.8 GB), reaching `WM_POLL n=5` again. `LITEBOX_DIAG_MEM_BREAKDOWN=1` (new, default off,
+  `diag_private_memory_breakdown`, `[mem_breakdown]` lines, called in the fork child at each boot
+  phase and in the parent at spawn) shows each child holds ~3.4 GB `MEM_MAPPED` read-only (the
+  layer tars, shared page cache, NOT commit) plus ~250 MB private, of which ONE 173 MB region at
+  guest address `0x7feff05a0000` is present in EVERY child right after `Platform::new()`, even
+  `rm`/`mkdir`. The same image with `sleep 1 & wait` as the script (with or without the seed and
+  `GLIBC_TUNABLES`) gives only 72-76 MB per child, and `debian:stable-slim` 74 MB, so the 173 MB is
+  neither the rootfs index (+2 MB) nor the seed: it is specific to the real boot's parent. Next:
+  capture `fork-parent at spawn`'s VMA layout at the first forks of a real boot (the diag is in
+  place; boot4 could not run, host had 0.03 GB free with Chrome reopened) and find which parent
+  mapping is 173 MB.
 - **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
   a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
   daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`

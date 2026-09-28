@@ -1423,6 +1423,7 @@ fn diag_process_fork_globalstate_probe_inner() {
 
     let platform = Platform::new();
     diag_elapsed!("Platform::new() returned");
+    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child after Platform::new");
     // Lazy (reserve-then-commit-on-first-fault) fork memory population -- see
     // `litebox_platform_windows_userland::lazy_fork_commit`'s own module doc comment for the full
     // design. MUST run AFTER `Platform::new()` (this line), never before: `Platform::new()`
@@ -1538,6 +1539,7 @@ fn diag_process_fork_globalstate_probe_inner() {
         None => shim_builder.default_fs_multi_layer(in_mem, tar_layers).0,
     };
     diag_elapsed!("default_fs_multi_layer returned (rootfs indexed/merged)");
+    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child after rootfs index");
     let fs = std::sync::Arc::new(fs);
 
     // This child is itself a fork parent for any child IT goes on to spawn, and it never reaches
@@ -1686,6 +1688,7 @@ fn diag_process_fork_vmem_adopt_probe(
         litebox, expected.iter().cloned(), heap_top, group_spans.into_iter()
     );
     diag_elapsed!("PageManager::new_adopting_existing_memory returned");
+    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child after vmem adopt");
 
     let (tracked_count, tracked_brk) = page_manager.tracked_region_summary();
     let tracked = page_manager.tracked_regions();
@@ -2206,6 +2209,7 @@ fn diag_process_fork_task_resume_probe(
         ctx.rip,
         ctx.rsp
     );
+    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child pre-guest");
     diag_elapsed!("fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification");
     // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
     // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
