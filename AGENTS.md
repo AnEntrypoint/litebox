@@ -163,12 +163,31 @@ disconnect/error/client-related output at any point in the run, and a broad keyw
 (`shutdown`, `ESHUTDOWN`, `queued_for_closure`, `SharedUnixConnectQueue`, `dead.?owner`, `reclaim`)
 across the WHOLE traced log turned up nothing -- the teardown is genuinely silent in the current
 code, meaning it is either an intentional-but-unlogged path or a real bug with no diagnostic
-covering it yet. **Next session**: add logging at every unix-stream connection-teardown/shutdown
-call site (`litebox_shim_linux/src/syscalls/unix.rs` -- `UnixConnectedStream`'s own shutdown/close
-paths, and whatever the CROSS-PROCESS carrying/dead-holder-recovery paths do when a peer process
-exits) so the NEXT capture of this exact moment shows WHO closed it and why, or attach `cdb` live to
-Xvfb around the predicted death window (the period varies 170s-880s across runs, so start a boot,
-watch `HOLD`, and attach once a HOLD tick has run for several minutes with no death yet).
+covering it yet. Added logging (`10b2636`/`ba4ff9d`, `litebox_diag::unix_conn_teardown`, `unix.rs`) at
+BOTH real teardown call sites -- `SharedView::release_holder` (a holding process's fd/table drop)
+and `SharedView::shutdown_write` (an explicit `shutdown(fd, SHUT_WR)`) -- and re-ran the full
+capture **three more times** (`.wfgy/pass118_full{11,12,13}.*`; the 12th ran the full 900s with NO
+death at all, confirming the death is genuinely intermittent/load-dependent, not a guaranteed
+per-boot event). **Neither hook fired at or before `xfdesktop`'s own death time in any of the three
+captures** -- the only `unix_conn_teardown` lines near each death are `xfdesktop`'s OWN process
+exiting a fraction of a second later and releasing ITS OWN held slots as ordinary cleanup, not
+something happening TO it beforehand. **Real remaining lead, from reading `recv()`'s own body**
+(`unix.rs`, `SharedView::recv`): the EOF is synthesized by `peer_gone()`, which checks
+`slot_ref.side_gone(!self.is_client, ...)` FRESH on every call, not by any event delivered at read
+time -- so the ACTUAL moment the peer side "went away" could have happened much EARLIER in the
+run and simply gone unnoticed (and unlogged by anything gated on the read/recv path) until this
+read finally happens to check again. Neither of the two teardown hooks would necessarily fire
+"close to" the observed death time at all if this is what's happening. **Next session, concretely**:
+(1) capture the SLOT NUMBER alongside the `recvmsg` payload trace (net.rs's `do_recvmsg` diagnostic
+does not currently have access to the underlying `UnixSocket`'s slot -- needs plumbing through, or
+a lower-level hook directly in `SharedView::recv`/`peer_gone` instead of `net.rs`) so a capture can
+directly correlate "this fd's connection is slot N" against "slot N's side went away at time T",
+however much earlier T is; (2) with that correlation, check whether the responsible slot's `side_gone`
+transition traces back to Xvfb's own process, or to some OTHER, unexpected host process ever having
+briefly held (and released) that slot -- a bug in how connections get attributed to holders would
+explain an early, silent, unnoticed release far better than anything actually wrong with Xvfb
+itself, which by every account (its own log, the periodic legitimate `PropertyNotify` traffic
+still flowing right up to 35s before the end) stays healthy and correct throughout.
 
 **A real earlier concurrent-boot collision**: `acquire_boot_lock()`'s single host-wide lockfile
 (`litebox_runner_linux_on_windows_userland/src/lib.rs:495`) correctly refused a second boot while an
