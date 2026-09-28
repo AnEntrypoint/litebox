@@ -5077,6 +5077,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // own, distinct guest process (`pid` freshly allocated above) from the moment it starts
         // running -- never a false "still the parent's own memory" merge in either direction.
         self.global.platform.set_next_spawned_thread_guest_pid(pid);
+        if !is_process_clone && let Some(stack_top) = sp {
+            self.global
+                .platform
+                .note_spawned_guest_thread_stack(stack_top);
+        }
 
         // Give a forked child its own `/proc/self` entry, copied from this process's. A thread
         // clone needs nothing: it shares `self.pid.get()` and therefore already resolves to the same

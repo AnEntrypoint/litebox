@@ -829,7 +829,18 @@ pub fn classify_lazy_eligible_groups(
             // DIFFERENT, already-running thread's stack getting marked lazy-eligible and
             // guard-cow-protected on the child's behalf, while it keeps running and writing to
             // that same stack normally in the parent.
-            let is_active_stack = active_rsps.iter().any(|&rsp| group.contains(&rsp));
+            // A stack can span several groups (a 64 KiB allocation-granule boundary splits it), and
+            // write-protecting any page a running thread will push to is fatal, not recoverable:
+            // Windows needs that same stack to deliver the fault, so no handler ever runs. Exclude
+            // every group overlapping the whole mapping that contains each stack pointer (`rsp - 1`
+            // too, since a clone() `child_stack` may equal the mapping's exclusive end).
+            let is_active_stack = active_rsps.iter().filter(|&&rsp| rsp != 0).any(|&rsp| {
+                group.contains(&rsp)
+                    || vma_layout.iter().any(|(range, _, _)| {
+                        (range.contains(&rsp) || range.contains(&(rsp - 1)))
+                            && ranges_overlap(range, group)
+                    })
+            });
             // Exclude the group containing the parent's own sigreturn trampoline page -- see this
             // function's own doc comment ("104th pass") for the full root-cause/correctness
             // argument. `0` means the parent never established one; never excludes anything then.

@@ -4590,18 +4590,6 @@ fn thread_start(
         .guest_context_top
         .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
 
-    // 114th pass -- see `ALL_THREAD_STACK_RSPS`'s own doc comment. `thread_start` (used for
-    // every ordinary `clone()`-spawned guest thread, via `spawn_thread` above) is a SEPARATE
-    // entry point from `run_thread_inner` (used for the bootstrap thread and cross-process fork
-    // children) -- this registration was originally placed ONLY in `run_thread_inner`, missing
-    // every `clone()`-spawned thread entirely (confirmed live: a fix relying solely on that
-    // registration did not change the crash this static exists to prevent). Both entry points
-    // need their own registration; there is no single choke point both pass through.
-    #[cfg(target_arch = "x86_64")]
-    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
-    #[cfg(target_arch = "aarch64")]
-    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
-
     if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
         eprintln!(
             "[diag-tls-addr] pid={} tid={:?} tls_state={:p} (thread_start)",
@@ -4663,22 +4651,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
-        // 114th pass -- register the NEW thread's own initial guest stack pointer HERE,
-        // synchronously, on the SPAWNING (calling) thread, before this function does anything
-        // else -- NOT inside `thread_start` (the corresponding registration this fix originally
-        // used) on the newly-spawned thread itself. `thread_start` only runs once the new OS
-        // thread actually gets scheduled, which is NOT guaranteed to happen before a subsequent
-        // `fork()` call on another thread, especially under host CPU/RAM contention -- confirmed
-        // live to matter: a fix relying solely on `thread_start`'s own registration did not
-        // change the crash `ALL_THREAD_STACK_RSPS` exists to prevent, exactly because of this
-        // race. `ctx.rsp` (the caller-computed initial stack pointer for the thread about to be
-        // spawned, already known BEFORE any actual OS thread creation happens) has no such race:
-        // it is available the instant this function is called, on the thread calling it, with no
-        // dependency on the new thread ever running at all.
-        #[cfg(target_arch = "x86_64")]
-        ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
-        #[cfg(target_arch = "aarch64")]
-        ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
 
         // Guest code (both a brand-new thread's entry point and a `fork()` child resuming via
         // `ThreadInitState::ForkedChild`) runs directly on this real Windows thread's own stack --
@@ -4793,6 +4765,13 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
     fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
         NEXT_SPAWNED_THREAD_GUEST_PID.set(Some(pid));
+    }
+
+    fn note_spawned_guest_thread_stack(&self, stack_top: usize) {
+        ALL_THREAD_STACK_RSPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stack_top);
     }
 
     fn current_guest_pid(&self) -> Option<i32> {

@@ -133,6 +133,16 @@ pub trait ThreadProvider: RawPointerProvider {
         let _ = pid;
     }
 
+    /// Declares the guest stack top a same-process thread clone is about to start on (clone's
+    /// `stack` + `stack_size`), called synchronously before [`spawn_thread`](Self::spawn_thread).
+    /// The context passed to `spawn_thread` still carries the CALLER's stack pointer at that
+    /// point -- the child's is only applied later, on the new thread -- so a platform that must
+    /// know every live thread's stack (to avoid write-protecting it) can only learn it here.
+    /// Default does nothing.
+    fn note_spawned_guest_thread_stack(&self, stack_top: usize) {
+        let _ = stack_top;
+    }
+
     /// The guest-space process id (`Task::pid`) that the CALLING host thread currently belongs to,
     /// or `None` if this platform does not track it.
     ///
