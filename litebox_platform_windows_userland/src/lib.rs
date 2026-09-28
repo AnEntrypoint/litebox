@@ -12832,18 +12832,56 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
     }
 
     fn wake_signal_listener(&self, host_pid: u32) -> bool {
-        let name = signal_wake_event_name(host_pid);
-        let event = unsafe {
-            Win32_Threading::OpenEventW(Win32_Threading::EVENT_MODIFY_STATE, 0, name.as_ptr())
-        };
-        if event.is_null() {
-            return false;
+        // Called on every write to a cross-process connection, so the opened handle is cached per
+        // target; a failed `SetEvent` (target gone, handle stale) drops the entry and reopens once.
+        static HANDLES: std::sync::Mutex<Option<std::collections::HashMap<u32, usize>>> =
+            std::sync::Mutex::new(None);
+        for _ in 0..2 {
+            let cached = HANDLES
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Default::default)
+                .get(&host_pid)
+                .copied();
+            let handle = match cached {
+                Some(h) => h,
+                None => {
+                    let name = signal_wake_event_name(host_pid);
+                    let event = unsafe {
+                        Win32_Threading::OpenEventW(
+                            Win32_Threading::EVENT_MODIFY_STATE,
+                            0,
+                            name.as_ptr(),
+                        )
+                    };
+                    if event.is_null() {
+                        return false;
+                    }
+                    let mut map = HANDLES.lock().unwrap();
+                    let map = map.get_or_insert_with(Default::default);
+                    if map.len() >= 256 {
+                        for (_, stale) in map.drain() {
+                            unsafe {
+                                Win32_Foundation::CloseHandle(stale as _);
+                            }
+                        }
+                    }
+                    map.insert(host_pid, event as usize);
+                    event as usize
+                }
+            };
+            if unsafe { Win32_Threading::SetEvent(handle as _) } != 0 {
+                return true;
+            }
+            if let Some(map) = HANDLES.lock().unwrap().as_mut()
+                && let Some(stale) = map.remove(&host_pid)
+            {
+                unsafe {
+                    Win32_Foundation::CloseHandle(stale as _);
+                }
+            }
         }
-        let ok = unsafe { Win32_Threading::SetEvent(event) } != 0;
-        unsafe {
-            Win32_Foundation::CloseHandle(event);
-        }
-        ok
+        false
     }
 
     fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {

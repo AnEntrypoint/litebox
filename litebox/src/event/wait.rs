@@ -212,6 +212,13 @@ pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform> {
+    /// Wakes the thread only if it is blocked in a wait, so it re-evaluates its wait condition.
+    /// Unlike [`Self::interrupt`], a thread running guest code is left alone (no forced exit
+    /// from the guest), which makes this cheap enough to call on every cross-process data event.
+    pub fn wake_if_waiting(&self) {
+        self.waker.wake();
+    }
+
     /// Interrupts the thread, whether it is waiting or running guest code.
     ///
     /// If it is waiting in [`WaitContext::wait_until`] or

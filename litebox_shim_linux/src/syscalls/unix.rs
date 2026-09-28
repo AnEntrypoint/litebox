@@ -828,6 +828,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             .hold(self.is_client, self.platform().current_host_pid());
     }
 
+    /// Wakes every host process holding the peer side so a thread blocked in a read/poll there
+    /// (data arrived, EOF) or a writer blocked on a full ring (space freed) re-checks readiness
+    /// now, instead of waiting out `SHARED_UNIX_POLL_INTERVAL`. Idempotent and coalescing: the
+    /// platform's wake is one auto-reset event per host process.
+    fn poke_peer(&self) {
+        let platform = self.platform();
+        self.slot_ref()
+            .for_each_holder_host(!self.is_client, |host| {
+                platform.wake_signal_listener(host);
+            });
+    }
+
     /// One holder of this side is gone. Once none remains, this side's write direction ends;
     /// once neither side is held, the slot returns to the pool.
     fn release_holder(&self) {
@@ -836,6 +848,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if slot_ref.side_gone(self.is_client, self.platform()) {
             let (_, write_ring) = self.rings();
             write_ring.shutdown();
+            self.poke_peer();
             if slot_ref.side_gone(!self.is_client, self.platform()) {
                 self.global.unix_shared_conn_table.free(self.slot);
             }
@@ -864,6 +877,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 return Err((msg, Errno::EMSGSIZE));
             }
             return if write_ring.try_write_record(&msg.data) {
+                self.poke_peer();
                 Ok(msg.data.len())
             } else {
                 Err((msg, Errno::EAGAIN))
@@ -877,6 +891,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             return if n == 0 {
                 Err((msg, Errno::EAGAIN))
             } else {
+                self.poke_peer();
                 Ok(n)
             };
         }
@@ -887,6 +902,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             slot:% = self.slot, is_client:% = self.is_client, len:% = msg.data.len();
             "DIAG shared unix send: wrote"
         );
+        self.poke_peer();
         Ok(msg.data.len())
     }
 
@@ -913,6 +929,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 prefix_hex:? = &buf[..n.min(4096)];
                 "diag-unix-shared-read-bytes"
             );
+            self.poke_peer();
             return Ok((n, Vec::new()));
         }
         if self.peer_gone() && read_ring.is_empty() {
@@ -947,6 +964,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             return false;
         }
         write_ring.shutdown();
+        self.poke_peer();
         true
     }
 }
@@ -3574,6 +3592,16 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             }
         }
         !any
+    }
+
+    /// Calls `f` with every distinct host process currently holding `is_client`'s side.
+    fn for_each_holder_host(&self, is_client: bool, mut f: impl FnMut(u32)) {
+        let side = conn_side(is_client);
+        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+            if c.load(Ordering::Acquire) > 0 {
+                f(h.load(Ordering::Acquire));
+            }
+        }
     }
 
     /// Marks a side as held once and already gone: its endpoint closed before the connection was

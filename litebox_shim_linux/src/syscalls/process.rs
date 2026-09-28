@@ -177,6 +177,12 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
             handle.interrupt();
         }
     }
+
+    fn wake_if_waiting(&self) {
+        if let Some(handle) = self.handle.get() {
+            handle.wake_if_waiting();
+        }
+    }
 }
 
 /// A `(pid, Process)` pair for one of a [`Process`]'s children (see [`Process::children`]).
@@ -688,6 +694,13 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// -- the pushed signal simply sits unconsumed in `shared_pending` until this `Process` is
     /// eventually dropped, matching real Linux's `kill()` on a zombie: it succeeds but delivers
     /// to nothing.
+    pub(crate) fn wake_waiting_threads(&self) {
+        let remotes: alloc::vec::Vec<_> = self.inner.lock().threads.values().cloned().collect();
+        for thread in remotes {
+            thread.wake_if_waiting();
+        }
+    }
+
     pub(crate) fn interrupt_all_threads(&self) {
         let remotes: alloc::vec::Vec<_> = self.inner.lock().threads.values().cloned().collect();
         for thread in remotes {

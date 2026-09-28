@@ -251,7 +251,7 @@ fn drain_host<Platform: ShimPlatform, FS: ShimFS>(global: &GlobalStateHandle<Pla
     let host = global.platform.current_host_pid();
     let table = &global.process_table;
     for view in table.members() {
-        if view.host_pid != host || !table.has_pending(view.index) {
+        if view.host_pid != host {
             continue;
         }
         let process = global
@@ -260,7 +260,14 @@ fn drain_host<Platform: ShimPlatform, FS: ShimFS>(global: &GlobalStateHandle<Pla
             .get(&view.pid)
             .and_then(Weak::upgrade);
         if let Some(process) = process {
-            deliver_bits(&process, table.take_pending(view.index, view.pid));
+            if table.has_pending(view.index) {
+                deliver_bits(&process, table.take_pending(view.index, view.pid));
+            }
+            // The listener also fires for cross-process data events (`wake_signal_listener` after
+            // a write to a shared connection): every thread blocked in a poll/read re-checks
+            // readiness now instead of at its next bounded repoll tick.
+            litebox::event::polling::bump_external_wake_epoch();
+            process.wake_waiting_threads();
         }
     }
 }

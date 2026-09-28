@@ -3,7 +3,7 @@
 
 //! Polling-related functionality
 
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use thiserror::Error;
@@ -17,6 +17,16 @@ use crate::{
     platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
+
+static EXTERNAL_WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Records that something outside this process's own observers changed state (a peer process
+/// wrote to or closed a shared connection). Every [`WaitContext::wait_on_events`] waiter in this
+/// process treats the bump as "re-run `try_op` now"; the caller must also wake the waiting
+/// threads ([`crate::event::wait::ThreadHandle::wake_if_waiting`]).
+pub fn bump_external_wake_epoch() {
+    EXTERNAL_WAKE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
 
 /// A pollable entity that can be observed for events.
 ///
@@ -70,11 +80,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
         )
         .map_err(TryOpError::Other)?;
         loop {
+            // Read before `try_op` so a bump landing between the two is seen as "changed" below
+            // rather than lost.
+            let seen_epoch = EXTERNAL_WAKE_EPOCH.load(Ordering::Acquire);
             match try_op() {
                 Err(TryOpError::TryAgain) => {}
                 ret => return ret,
             }
-            match self.wait_until(|| observer.is_ready()) {
+            match self.wait_until(|| {
+                observer.is_ready() || EXTERNAL_WAKE_EPOCH.load(Ordering::Acquire) != seen_epoch
+            }) {
                 Ok(()) => {}
                 Err(err) => return Err(TryOpError::WaitError(err)),
             }
