@@ -1874,10 +1874,30 @@ pub fn spawn_process_fork_child(
     // VEH, on first real access) instead of eagerly `copy_one_group`-copied. Always all-`false`
     // unless `LITEBOX_LAZY_FORK_COMMIT=1` is set -- see `lazy_fork_commit_enabled`'s doc comment
     // for why that makes this whole mechanism provably inert by default.
+    // 114th pass: every currently-live thread's own stack pointer, not just this fork-calling
+    // thread's -- see `ALL_THREAD_STACK_RSPS`'s own doc comment (`lib.rs`) for the live-`cdb`-
+    // confirmed bug this closes. `full_gprs.rsp` is included explicitly too, defensively, in case
+    // this exact thread's own registration (via `run_thread_inner`, which runs before any guest
+    // code including this syscall) is ever missing for some reason not yet anticipated -- a
+    // harmless, idempotent duplicate when it is already present, per `classify_lazy_eligible_
+    // groups`'s own `.any(...)` check.
+    let active_rsps: Vec<usize> = {
+        let mut v = crate::ALL_THREAD_STACK_RSPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        v.push(full_gprs.rsp);
+        v
+    };
+    if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+        eprintln!(
+            "[lazy_fork_commit] 114th-pass DIAG: active_rsps at fork = {active_rsps:x?}"
+        );
+    }
     let mut lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
         group_relocations,
         vma_layout,
-        full_gprs.rsp,
+        &active_rsps,
         sigreturn_trampoline,
     );
     let mut lazy_group_ranges: Vec<Range<usize>> = group_relocations

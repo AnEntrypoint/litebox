@@ -3539,6 +3539,16 @@ fn run_thread_inner(
         .guest_context_top
         .set(std::ptr::from_mut(ctx).wrapping_add(1));
 
+    // 114th pass -- see `ALL_THREAD_STACK_RSPS`'s own doc comment for the full, live-`cdb`-
+    // confirmed bug this closes. Registers THIS thread's own initial guest stack pointer,
+    // unconditionally, for every thread that ever starts running guest code (the bootstrap
+    // thread, every `clone()`-spawned one, every cross-process fork child) -- one shared
+    // registration point rather than needing a separate hook per thread-creation path.
+    #[cfg(target_arch = "x86_64")]
+    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
+    #[cfg(target_arch = "aarch64")]
+    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
+
     // Diagnostic only (LITEBOX_DIAG_TLS_ADDR): print this thread's own TlsState address to check
     // for cross-thread TlsState address collisions -- see AGENTS.md's "DEFINITIVE (4th pass)"
     // entry, which found the earlier watchpoint captures never actually observed a second thread.
@@ -4577,6 +4587,18 @@ fn thread_start(
         .guest_context_top
         .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
 
+    // 114th pass -- see `ALL_THREAD_STACK_RSPS`'s own doc comment. `thread_start` (used for
+    // every ordinary `clone()`-spawned guest thread, via `spawn_thread` above) is a SEPARATE
+    // entry point from `run_thread_inner` (used for the bootstrap thread and cross-process fork
+    // children) -- this registration was originally placed ONLY in `run_thread_inner`, missing
+    // every `clone()`-spawned thread entirely (confirmed live: a fix relying solely on that
+    // registration did not change the crash this static exists to prevent). Both entry points
+    // need their own registration; there is no single choke point both pass through.
+    #[cfg(target_arch = "x86_64")]
+    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
+    #[cfg(target_arch = "aarch64")]
+    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
+
     if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
         eprintln!(
             "[diag-tls-addr] pid={} tid={:?} tls_state={:p} (thread_start)",
@@ -4638,6 +4660,23 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
+        // 114th pass -- register the NEW thread's own initial guest stack pointer HERE,
+        // synchronously, on the SPAWNING (calling) thread, before this function does anything
+        // else -- NOT inside `thread_start` (the corresponding registration this fix originally
+        // used) on the newly-spawned thread itself. `thread_start` only runs once the new OS
+        // thread actually gets scheduled, which is NOT guaranteed to happen before a subsequent
+        // `fork()` call on another thread, especially under host CPU/RAM contention -- confirmed
+        // live to matter: a fix relying solely on `thread_start`'s own registration did not
+        // change the crash `ALL_THREAD_STACK_RSPS` exists to prevent, exactly because of this
+        // race. `ctx.rsp` (the caller-computed initial stack pointer for the thread about to be
+        // spawned, already known BEFORE any actual OS thread creation happens) has no such race:
+        // it is available the instant this function is called, on the thread calling it, with no
+        // dependency on the new thread ever running at all.
+        #[cfg(target_arch = "x86_64")]
+        ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
+        #[cfg(target_arch = "aarch64")]
+        ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
+
         // Guest code (both a brand-new thread's entry point and a `fork()` child resuming via
         // `ThreadInitState::ForkedChild`) runs directly on this real Windows thread's own stack --
         // there is no separate emulated guest-stack region (see `switch_to_guest`'s doc comment).
@@ -5244,6 +5283,52 @@ fn current_claim_owner() -> ClaimOwner {
 /// multi-process support, each process (or `WindowsUserland` instance) should
 /// track its own thread list.
 static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
+
+/// 114th pass -- every guest thread's own initial stack pointer, ever, for the lifetime of this
+/// process. Registered from THREE places, deliberately redundant rather than relying on one
+/// choke point: `run_thread_inner` (bootstrap and cross-process-fork-child threads); `spawn_thread`
+/// itself (every ordinary `clone()`-spawned thread's `ctx.rsp` -- already known to the SPAWNING
+/// thread before any actual OS thread creation happens, so this registration is fully
+/// synchronous and race-free); and `thread_start` (the same `clone()`-spawned thread, again, once
+/// it actually starts running, as a backup). Two earlier, narrower versions of this fix were each
+/// confirmed live NOT to change the crash this static exists to prevent: one registered only from
+/// `run_thread_inner`, missing every `clone()`-spawned thread entirely; the other added
+/// `thread_start`'s own registration, which is correct in principle but RACY in practice -- it
+/// only takes effect once the new OS thread is actually scheduled and runs far enough to reach
+/// it, which is NOT guaranteed to happen before a DIFFERENT thread's subsequent `fork()` call,
+/// especially under host CPU/RAM contention (this whole investigation's own standing condition).
+/// `spawn_thread`'s own registration has no such race, since `ctx.rsp` is a plain value already
+/// available to the calling thread with no dependency on the new thread ever running. Consulted at
+/// fork time by `classify_lazy_eligible_groups` to exclude every LIVE thread's own stack from
+/// lazy/guard-cow eligibility, not just the ONE thread calling `fork()` (`active_rsp`'s own,
+/// narrower, pre-
+/// 114th-pass exclusion).
+///
+/// # Why this exists (114th pass)
+///
+/// Live-confirmed via `cdb` (see `AGENTS.md`'s own 114th-pass entry for the full `!address`-
+/// verified capture): a genuinely multi-threaded parent process forking under
+/// `LITEBOX_LAZY_FORK_GUARD_COW=1` can have `classify_lazy_eligible_groups` mark ANOTHER,
+/// already-running thread's own stack (not the one calling `fork()`) as lazy-eligible, since the
+/// pre-existing `active_rsp` exclusion only ever knew about the ONE calling thread. That OTHER
+/// thread keeps running normally in the parent after `fork()` (only the calling thread survives
+/// into the child) and continues writing to its own stack via completely ordinary local-variable
+/// spills -- if guard-cow's own capture-and-restore cycle then gets stuck for that page (mechanism
+/// not yet root-caused; see AGENTS.md), the thread's own STACK stays stuck `PAGE_READONLY`
+/// forever, and its very next ordinary stack write is an immediate, unrecoverable
+/// `STATUS_ACCESS_VIOLATION` -- not a guest-level fault this process's own VEH ever gets a real
+/// chance to service, since nothing here is guest code doing anything unusual.
+///
+/// # Why never removing an exited thread's entry is safe
+///
+/// A stack address that belonged to a thread which has since exited is harmless to keep excluding
+/// from lazy treatment forever: the exclusion only ever makes an allocation EAGERLY (not lazily)
+/// copied at some FUTURE, unrelated fork -- a pure performance cost (one more group ineligible for
+/// the lazy fast path), never a correctness issue, since nothing is running on that dead thread's
+/// old stack address to be affected either way. Removing entries on thread exit would need a
+/// second hook (thread-exit notification) for a benefit that is not worth the added complexity or
+/// risk.
+static ALL_THREAD_STACK_RSPS: Mutex<alloc::vec::Vec<usize>> = Mutex::new(alloc::vec::Vec::new());
 
 /// The owner of a [`ClaimSlot`]: either a real host [`std::thread::ThreadId`] (a thread that
 /// never had a guest-pid propagated onto it, see [`CURRENT_GUEST_PID`]) or a guest-space process

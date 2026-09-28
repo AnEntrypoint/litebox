@@ -559,55 +559,56 @@ opening paragraph warns about).
     specific crash**, and the reason why is itself the real finding (below): kept in the tree
     regardless as real, correct hardening for the dead-claim case it does cover, which is a
     genuinely different scenario from what this exact repro turned out to be hitting.
-  - **REFINED, LIKELY-FINAL ROOT CAUSE, found by re-reading `classify_lazy_eligible_groups` against
-    this pass's own repro shape after the healing fix's own re-test came back unchanged
-    (`ExceptionAddress` byte-identical to before the fix, `.wfgy/pass114_cdb_run8.log`) -- the
-    collision here is against a LIVE guard-cow claim, not a dead/stale one, so the healing fix's own
-    precondition (`entry.pending.is_empty()`) correctly never fires for it.** This pass's own probe
-    spawns its 4 writer threads BEFORE calling `os.fork()` (`threading.Thread(...).start()`
-    precedes `pid = os.fork()` in the script) -- meaning these threads, and their stacks, already
-    exist at the moment of the fork that guard-cow protects on behalf of. `classify_lazy_eligible_
-    groups`'s own stack exclusion (`is_active_stack = group.contains(&active_rsp)`,
-    `lazy_fork_commit.rs:819`) takes a SINGLE `active_rsp: usize` -- the CALLING thread's own guest
-    `%rsp` at the instant of `fork()` -- and excludes ONLY the one group containing THAT address.
-    Its own doc comment (the 84th/85th-pass "Bug 3" fix this exclusion originated from) confirms
-    this was designed entirely around the CHILD's own post-fork exception-delivery `CONTEXT.Rsp`;
-    it was never extended to think about OTHER, already-running threads in a multi-threaded
-    PARENT. Those other threads (my 4 writer threads, real OS threads that keep running normally in
-    the PARENT after `fork()` -- only the calling thread survives into the child) continue writing
-    to their OWN stacks via completely ordinary local-variable spills, exactly like any running
-    thread does on every function call. If one of THEIR stack groups happens to satisfy
-    `classify_lazy_eligible_groups`'s OTHER criteria (anonymous, non-`VM_EXEC`, not the ONE
-    excluded `active_rsp` group) it gets marked lazy-eligible and guard-cow-protected
-    (`PAGE_READONLY`) on behalf of the fork child -- and this pass's own live `!address` capture
-    shows that protection getting stuck (a real, committed, still-`PAGE_READONLY` stack, `!address
-    @rsp` confirmed) rather than being correctly captured-and-restored on the writer thread's own
-    very next stack write, for a reason not yet pinned down (candidates: Windows' own internal
-    `PAGE_GUARD` stack-growth bookkeeping on the lowest committed stack page interacting badly with
-    an EXTERNAL `VirtualProtect(PAGE_READONLY)` call from an unrelated mechanism; or the sheer
-    frequency/page-crossing rate of ordinary stack writes hitting a real bug in the
-    capture-restore cycle under rapid repetition -- NEITHER confirmed live yet). **Fix, not
-    implemented**: `classify_lazy_eligible_groups` needs to exclude the stacks of EVERY
-    currently-live thread in the process at fork time, not just the calling thread's -- this needs
-    a way to enumerate every OS thread's own stack range (TEB-based, e.g. via
-    `NtQueryInformationThread`/`GetThreadContext` per thread, or `CreateToolhelp32Snapshot`'s
-    `Thread32First`/`Next` to enumerate thread IDs first) at the exact moment of `fork()`, a
-    materially larger and more invasive change than `active_rsp`'s own single-value check --
-    deliberately NOT attempted blind this late in an already very long pass. **Next pickup,
-    precise**: (a) confirm this theory directly rather than trust the reasoning alone -- a live
-    `cdb` session (now fast and reliable, `.wfgy/pass114_cdb_run.ps1`) breaking on
-    `guard_one_page`/`try_guard_region_batched` at the EXACT fork that protects this address range,
-    checking whether the group being claimed is genuinely one of the writer threads' own stacks
-    (cross-reference the claimed range against each writer thread's own TEB `StackBase`/
-    `StackLimit`, readable via `!teb` on each thread); (b) if confirmed, implement per-thread stack
-    enumeration and exclusion in `classify_lazy_eligible_groups`, matching `active_rsp`'s own
-    existing exclusion pattern but for N threads instead of one; (c) separately, root-cause WHY the
-    capture-restore cycle itself gets stuck for a stack page specifically (the `PAGE_GUARD`
-    interaction theory above) even if (b) makes it moot for THIS repro, since a similarly-shaped
-    bug could still exist for a stack that's excluded from LAZY treatment but still gets touched by
-    guard-cow's OWN separate protection scheme some other way; (d) only after (a)-(c), re-attempt
-    the ORIGINAL `xfce4-session` SIGABRT, since its own real worker threads (glib's thread pool)
-    are exactly this shape -- plausible same root cause, not yet re-verified live.
+  - **The "writer-thread stack" theory (this entry's own earlier draft) is REFUTED by direct
+    evidence, not merely unconfirmed -- implemented TWICE (a `run_thread_inner`-only registration,
+    then corrected to ALSO cover `spawn_thread`/`thread_start` after finding the first version
+    could never see `clone()`-spawned threads at all) and BOTH versions were live-retested via
+    `cdb` with NO change to the crash whatsoever (`ExceptionAddress` byte-identical across every
+    attempt: `.wfgy/pass114_multithread_fix_test{1,2,3}.log`,
+    `pass114_racefree_fix_test1.log`).** Kept `ALL_THREAD_STACK_RSPS` and its three registration
+    points in the tree regardless -- they are correct, real hardening for the scenario they
+    describe (a genuinely multi-threaded parent's OTHER stacks getting marked lazy-eligible), even
+    though this exact repro turned out not to be exercising that scenario the way this entry
+    originally believed.
+  - **New, more precise evidence found while investigating why the fix had no effect: the
+    crashing thread's own real Windows stack (via `!teb` on the exact thread `.lastevent` names,
+    `.wfgy/pass114_threadid_check1.log`) is a mere ~73 KiB (`StackBase - StackLimit = 0x12000`) and
+    carries no special litebox thread name (unlike `"main"`/`"litebox-nat-gateway"`, which DO show
+    up in the same `~` listing) -- NOT the 32 MiB `GUEST_THREAD_STACK_SIZE` `spawn_thread`
+    explicitly requests for every guest thread it creates.** This means the crashing thread is very
+    likely NOT one of the 4 Python writer threads at all (which, being real guest threads spawned
+    via `clone()`, should each have a real 32 MiB Windows stack) -- it is some OTHER, small-stack,
+    unnamed thread, most plausibly one of litebox's OWN internal background/worker threads (seen
+    named in other captures this pass: signal-wake-listener, `wait_on_tun`, pipe-pump threads for
+    cross-process fork's own fd-carrying machinery). Its `%rsp` AT THE MOMENT OF THE CRASH is a
+    `0x7fef...`-range GUEST address, nowhere near its own TEB-reported `StackBase`/`StackLimit` (a
+    low `0x66b8...`-range address) -- meaning this thread's OWN `%rsp` had already been pointed at
+    GUEST memory before the fault, for a reason not yet found. This is a GENUINELY DIFFERENT
+    finding than "a guest thread's stack got guard-protected and stuck": it now looks more like
+    "one of litebox's OWN internal threads is, for some reason, running with `%rsp` inside guest
+    address space instead of its own real host stack" -- a category of bug this whole investigation
+    had not previously considered, and the `!address`-confirmed `PAGE_READONLY` protection on that
+    GUEST address may be a real, but SEPARATE, contributing factor rather than the primary cause.
+  - **Where this leaves the investigation, stated plainly**: FOUR real, distinct root-cause
+    theories have now been tried and refuted or left unconfirmed by this pass alone (per-page
+    guard-install timing; `__chkstk` stack-overflow; sigreturn-trampoline collision/recognition, in
+    two forms; and now the writer-thread-stack theory, refuted by two independent fix attempts).
+    The crash remains real, reliably reproducible under `cdb` in under 10 seconds, and its true
+    mechanism is still not confirmed. **Next pickup, precise**: (a) identify WHICH litebox-internal
+    background thread this actually is -- `~` lists it unnamed among `main`/`litebox-nat-gateway`;
+    either give litebox's OWN background threads real names (a small, low-risk, generally useful
+    change -- `std::thread::Builder::name(...)`, which Windows surfaces to a debugger) so a future
+    capture identifies it immediately, or single-step/backtrace it directly in the SAME `cdb`
+    session before it crashes (break on thread CREATE for every NEW thread after the fork, examine
+    each one's own purpose) to catch it in the act; (b) once identified, find why ITS OWN `%rsp`
+    ends up pointing into guest address space at all -- this is the more fundamental question this
+    pass's own evidence now points at, more so than "which memory got guard-cow-protected"; (c) do
+    NOT re-attempt a NEW blind fix for the STATUS_ACCESS_VIOLATION until (a)/(b) yield a confirmed
+    mechanism -- four attempts without one is itself strong evidence that guessing further has hit
+    genuinely diminishing returns; (d) the trampoline-collision loop (confirmed real, separately,
+    earlier in this same pass) and the STATUS_ACCESS_VIOLATION remain two DIFFERENT, unresolved
+    bugs -- do not conflate them without evidence either way. `xfce4-session`'s own SIGABRT remains
+    unre-attempted; nothing in this pass's investigation should be assumed to transfer to it yet.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the

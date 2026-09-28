@@ -730,8 +730,15 @@ fn guard_install_artificial_delay_us() -> Option<u64> {
 /// on the eager path). Order matches `group_relocations`' own order; callers use this to decide,
 /// per group, whether to call [`reserve_group_lazy`] instead of `copy_one_group`.
 ///
-/// Also excludes whichever group contains `active_rsp` -- the child's OWN guest `%rsp` at the
-/// exact moment of this `fork()` call, i.e. the live stack the child's very first (and every
+/// Also excludes whichever group(s) contain any of `active_rsps` -- **114th pass: generalized
+/// from a single value to a slice**, one entry per currently-live thread in the process (see
+/// `ALL_THREAD_STACK_RSPS`'s own doc comment, `lib.rs`, for the live-`cdb`-confirmed bug this
+/// closes: a DIFFERENT, already-running thread's own stack -- not the one calling `fork()` --
+/// getting marked lazy-eligible and left guard-cow-protected while it keeps running and writing
+/// to it normally in the parent). The ORIGINAL, single-value form of this exclusion (85th pass,
+/// kept below verbatim since the underlying correctness argument is unchanged, just generalized
+/// to N threads instead of one) covers the fork-calling thread's OWN guest `%rsp` at the exact
+/// moment of this `fork()` call, i.e. the live stack the child's very first (and every
 /// subsequent) exception will be DELIVERED with as `CONTEXT.Rsp`, regardless of what the fault is
 /// actually about. Root-caused (85th pass) as Bug 3 (`AGENTS.md`'s 84th-pass entry): the subshell
 /// (fork-without-`execve`) repro's guest `%rsp` at fork time lands inside the SAME lazily-reserved
@@ -798,7 +805,7 @@ fn guard_install_artificial_delay_us() -> Option<u64> {
 pub fn classify_lazy_eligible_groups(
     group_relocations: &[(Range<usize>, usize)],
     vma_layout: &[(Range<usize>, u32, bool)],
-    active_rsp: usize,
+    active_rsps: &[usize],
     sigreturn_trampoline: usize,
 ) -> Vec<bool> {
     if !lazy_fork_commit_enabled() {
@@ -814,9 +821,15 @@ pub fn classify_lazy_eligible_groups(
             let has_exec = vma_layout
                 .iter()
                 .any(|(range, flags, _)| ranges_overlap(range, group) && flags & VM_EXEC != 0);
-            // Exclude the group anchoring the child's own live stack pointer at fork time -- see
-            // this function's own doc comment for the full root-cause/correctness argument.
-            let is_active_stack = group.contains(&active_rsp);
+            // Exclude the group anchoring ANY currently-live thread's own stack pointer at fork
+            // time -- generalized, 114th pass, from the original single-`active_rsp` exclusion
+            // (this function's own doc comment, "84th/85th pass") to every thread ever registered
+            // in `ALL_THREAD_STACK_RSPS`, not just the ONE thread calling `fork()`. See that
+            // static's own doc comment for the full, live-`cdb`-confirmed bug this closes: a
+            // DIFFERENT, already-running thread's stack getting marked lazy-eligible and
+            // guard-cow-protected on the child's behalf, while it keeps running and writing to
+            // that same stack normally in the parent.
+            let is_active_stack = active_rsps.iter().any(|&rsp| group.contains(&rsp));
             // Exclude the group containing the parent's own sigreturn trampoline page -- see this
             // function's own doc comment ("104th pass") for the full root-cause/correctness
             // argument. `0` means the parent never established one; never excludes anything then.
