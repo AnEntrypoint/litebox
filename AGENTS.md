@@ -66,17 +66,55 @@ for 500+s with free RAM oscillating 2-4GB, never crashing. A real Chrome session
 selkies UI with **zero page errors** -- confirmed via `window.stream_info`
 (`backend:x11, capture:XShm, codec:h264, encoder:x264, encoder_reason:'NVENC ... dlopen failed'`,
 all expected/correct for this guest) and `VideoDecoder.isConfigSupported({codec:'avc1.42E01E'})` ->
-`supported:true` in that real Chrome. **The one remaining gap is NOT a litebox bug**: the selkies
-client gates the video canvas (`id="videoCanvas"`, `display:none` until unlocked) behind a real
-"Play Stream" button -- standard Chrome autoplay-activation policy for any WebCodecs-driven canvas,
-identical to what any browser-based remote-desktop client needs. A script-dispatched `.click()`
-(via `Runtime.evaluate`, not a real trusted input event) does not satisfy it; gm's `cdp` verb has no
-documented native mouse-input primitive (`click=x,y` is parsed as bare JS, not a click), and
-`claude-in-chrome`'s extension was not connected this pass to supply a real trusted click. **Next
-session: get one real trusted mouse click on "Play Stream" (claude-in-chrome once its extension is
-connected, or any tool that dispatches CDP `Input.dispatchMouseEvent` rather than JS `.click()`)
-and confirm live pixels** -- everything upstream of that single click is now proven working end to
-end.
+`supported:true` in that real Chrome, plus real bidirectional input-channel state
+(`window.webrtcInput.inputAttached:true`, a real server-sent cursor image, `_pointerSeq` advancing).
+**One remaining browser-side gap, not yet root-caused**: the selkies client gates the video canvas
+(`id="videoCanvas"`, `display:none`) behind a `<button id="playButton">Play Stream</button>`.
+Clicking it via `Runtime.evaluate`-dispatched `.click()` DOES flip `playButton` to `class="hidden"`
+(its own handler ran) and DOES set `navigator.userActivation.isActive/hasBeenActive: true` -- so
+this is not a simple "needs a real trusted gesture" autoplay block, that hypothesis is REFUTED by
+this same evidence -- yet `videoCanvas` stays `display:none`, `window.stream_stats.open` stays
+`false`, and `window.stream_client.decoder` stays the string `"unknown"` indefinitely, and no new
+`START_VIDEO`/capture-restart line appears server-side after the click. The client bundle
+(`index-CPWh3fQ6.js`, fetched to `.wfgy/pass118_selkies_client.js`) is heavily minified; the
+`playButton`/`videoCanvas` elements are plain `getElementById`-managed (not React-owned, no
+`__reactProps$*` key), so their real click-handler logic could not be located by string search in
+the time available. **Next session**: either get a genuinely trusted click (claude-in-chrome once
+its extension is connected, or any tool using CDP `Input.dispatchMouseEvent` rather than JS
+`.click()` -- gm's `cdp` verb has no documented native mouse-input primitive, `click=x,y` parses as
+bare JS) to rule that out for certain, or set a breakpoint / read the unminified selkies-web source
+(likely vendored under the image's `/lsiopy/lib/python3.13/site-packages/selkies/selkies_web/` --
+not yet checked) for what condition actually gates `videoCanvas`'s `display` and why it doesn't
+flip after the click.
+
+**Bigger, better-evidenced finding this pass, NOT yet root-caused: `xfce4-session` self-terminates
+minutes into a stable run, cascading to kill every client it started.** The original driver
+(`de_only.sh`) trims the Failsafe session to just `xfwm4`+`xfsettingsd` (82nd-pass "Angle B", real
+and intentional for that narrower investigation) -- removing that trim in `pass118_full.sh` (no
+`xfce4-session.xml` override) makes the REAL 5-client Failsafe session run, and **all five clients
+launch successfully**: `xfwm4`, `xfsettingsd`, `xfce4-panel` (with two `wrapper-2.0` plugin hosts),
+`Thunar` (`thunar-real`), `xfdesktop` -- confirmed via `DIAG_TIMELINE execve` for every one of them
+(`.wfgy/pass118_full7.err.log`, `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`). But `xfce4-session`
+itself (pid 28 in that run) later calls a plain `exit_group(status=1)` right after an ordinary
+`recvmsg` on its own fd 3 returns successfully -- no crash, no signal, no error logged anywhere in
+its own trace immediately before -- and every client it started (panel, both wrappers, Thunar,
+xfdesktop) is ALSO seen to exit with `status=1` at the same point, consistent with `xfce4-session`
+sending them all `SIGTERM` as part of its own shutdown. Timing is NOT fixed: 3 separate runs died at
+~170s, ~285s, and ~470-490s respectively. **Two plausible causes tested and ruled out**: the
+harness's own periodic `xprop -root` polling (a fresh X client connect/disconnect every 30s, tested
+by removing it entirely in a variant driver, `.wfgy/pass118_noxprop.sh` -- still died, just later)
+and RAM pressure (the run that died at ~470-490s had free RAM rock-stable at 4.4-4.5GB the entire
+time, no dip at all near the death). **One suggestive but unconfirmed lead**: in the no-xprop run, a
+SECOND `xfwm4` instance appears ~40-70s before the death (`xfwm4-WARNING: Another compositing
+manager is running on screen 0`, pid 84, distinct from the original) -- meaning the original xfwm4
+had already died and `xfce4-session` was respawning it, shortly before giving up entirely. Not seen
+in the run that died at ~285s (WM check property stayed valid on every `HOLD` tick right up to the
+sudden exit there), so this may be one symptom among several rather than the single root cause.
+Every guest app IS reachable and does launch given the real (untrimmed) session config -- the
+"apps must work" gap is this self-termination, not a launch failure. **Next session**: get a full,
+untraced syscall trace on EVERY client (not just `xfce4-session`) across the whole run, or attach
+`cdb` to a live boot around the death window, to see what actually triggers the first client's
+unexpected exit that starts the cascade.
 
 **A real earlier concurrent-boot collision**: `acquire_boot_lock()`'s single host-wide lockfile
 (`litebox_runner_linux_on_windows_userland/src/lib.rs:495`) correctly refused a second boot while an
@@ -84,120 +122,14 @@ orphaned prior run was still alive (`taskkill`/`Terminate` loop is now 6 retries
 every driver script here, not a single best-effort call, to actually clear it before starting the
 next run).
 
-## Where things stood (117th pass)
+## 117th pass, condensed
 
-**`DE_UP` REACHED (117th pass, first ever): eager fork + `LANG=C` + event-driven cross-process wake
-(`dfdfd26`) -> `_NET_SUPPORTING_WM_CHECK` set 130 s into `.wfgy/pass117_evt_boot2` (window id
-0x60008e), 20 processes, ~8 GB private, stable, HOLD loop ran on. Browser access (selkies) and app
-acceptance are still untested -- that is the next pickup.** Earlier blockers below are historical. The last five blockers are understood:
-
-- **Eager cross-process fork (`LITEBOX_PROCESS_FORK=1` alone) is correctness-clean end to end**
-  (109th-113th: zero `not eligible` fallbacks, `xfce4-session` forks its clients with no crash; the
-  Xvfb `Cannot open display` was a harness race, fixed by a real connect probe and `xrdb -nocpp`).
-  Boot seed: `.wfgy/pass113_de_only_ready_seed.tar`. Its only blocker is RAM: every run reaches
-  `WM_POLL n=3..5` (~115-130s, 15-17 concurrent processes) before free RAM crosses the safety
-  kill-switch, just short of `xfwm4` setting the WM check property. Two runs from 6.1-6.4 GB free
-  cratered at the same point; it needs more like 8-10 GB free sustained or a real cut in per-process
-  cost (Track B item 1). **Per-process cost is not decomposed** (~350 MB-1.1 GB working set each);
-  candidates: writable-layer import per child (`litebox_runner_linux_on_windows_userland/src/lib.rs`
-  ~2600, copies the whole layer into each child's in-memory fs), rootfs index, guest-memory
-  emulation. A 5-process `bash`+`sleep` test is only ~76 MB/process, so the big cost is specific to
-  real desktop processes -- measure it (Xvfb under eager fork) before guessing. Measured 117th pass (eager boot from the ready seed,
-  `.wfgy/pass117_eager_boot.ps1`, 8 GB free at start): the boot ran 152 s and hit the kill switch at 18
-  processes with ~11 GB private commit (~600 MB/process; `procs=5` -> 2 GB, `12` -> 6 GB, `17` ->
-  8.8 GB), reaching `WM_POLL n=5` again. `LITEBOX_DIAG_MEM_BREAKDOWN=1` (new, default off,
-  `diag_private_memory_breakdown`, `[mem_breakdown]` lines, called in the fork child at each boot
-  phase and in the parent at spawn) shows each child holds ~3.4 GB `MEM_MAPPED` read-only (the
-  layer tars, shared page cache, NOT commit) plus ~250 MB private, of which ONE 173 MB region at
-  guest address `0x7feff05a0000` is present in EVERY child right after `Platform::new()`, even
-  `rm`/`mkdir`. The same image with `sleep 1 & wait` as the script (with or without the seed and
-  `GLIBC_TUNABLES`) gives only 72-76 MB per child, and `debian:stable-slim` 74 MB, so the 173 MB is
-  neither the rootfs index (+2 MB) nor the seed.
-  **ROOT-CAUSED (117th)**: it is glibc's `/usr/lib/locale/locale-archive` (181,493,744 B = 173 MB,
-  webtop image), mapped whole by `setlocale` for ANY non-`C` locale -- even `C.UTF-8`, because glibc
-  looks the name up in the archive first. `de_only.sh` exports `LANG=en_US.UTF-8`; bash re-runs
-  `setlocale` on that assignment. The shim's file-mapping fast path (`try_cow_mmap_file`,
-  `LITEBOX_COW_MMAP`) is deliberately OFF (lossy partial-unmap zero-fill; `--oci-image` layer bytes
-  are heap-owned), so the mapping is a `memcpy` into 173 MB of private commit in every process, and
-  every fork child eagerly copies it again: ~430 MB/process of the ~600 MB. **Fix for the boot:
-  run with `--env LANG=C`** (and `export LANG=C` in `de_only.sh`/`webtop_stack.sh`; seed
-  `.wfgy/pass117_seed.tar`, driver `.wfgy/pass117_eager_boot.ps1`). Verified: root bash private
-  506 MB -> 76 MB, region gone. The general defect (any large read-only private file mapping is
-  committed per process and per fork) is tracked in `.gm/prd.yml` `file-backed-private-mmap-no-commit`
-  and needs lossless partial-unmap recovery plus 64 KiB-aligned or platform-placed views. Full boot
-  with `LANG=C` (`.wfgy/pass117_lang_boot1`): **first non-lazy boot ever to run its whole 300 s window
-  with no RAM crater** -- 20 processes, ~8 GB private commit, 3.7-4.4 GB free throughout. Every
-  desktop client launched (`xfwm4`, `xfsettingsd`, `xfce4-panel`, `xfdesktop`, Thunar, at-spi,
-  `ssh-agent`, `gpg-agent`). `DE_UP` still NOT reached: `xfwm4` never set
-  `_NET_SUPPORTING_WM_CHECK` in 300 s. Its syscall trace (`LITEBOX_DIAG_SYSCALL_TIMELINE=xfwm4`,
-  `.wfgy/pass117_lang_boot2.err.log`, 121k syscalls, 4 threads) shows it ALIVE and busy, not
-  hung: synchronous X request/reply loops (`writev`, `ppoll`, `recvmsg`) plus ~2,900 small-file
-  opens (themes/pixmaps); it only exited (status 1) when the harness killed Xvfb at 312 s. So the
-  open question is SPEED, not a deadlock: ~400 syscalls/s (with tracing) is far below native.
-  Next: run untraced for >=15 min (driver's window is now 700 polls, the seed's guest poll loop
-  150) with >=6 GB free, then profile where xfwm4's wall time goes (X server under litebox,
-  per-syscall cost, per-request round trip). A 15-min run was cut at 130 s by host memory
-  pressure (free fell from 4.4 to <0.7 GB with other host apps resident).
-- **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
-  a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
-  daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`
-  unreadable-parent branch). Repro `.wfgy/pass116_orphan.ps1` (lazy dies 5/5, eager correct 3/3);
-  this is the real cause of the `ssh-agent` SIGABRT (guest pid 51, comm now visible after the 114th
-  comm-inheritance fix) and the dbus SIGSEGVs. Small A/B (`.wfgy/pass116_ramab.ps1`): 381 MB eager vs
-  380 MB lazy, no saving. The fix is native kernel-COW fork on Windows through the shim's existing
-  platform-neutral `has_native_fork`/`native_fork` path (Linux/macOS already use it) -- PRD row
-  `native-kernel-cow-fork`; the spike must be written by a human (my attempt was blocked by policy).
-- **Fixed in the 116th pass, all live-verified**: new-thread stack left `PAGE_READONLY` by guard-cow
-  (`702c735`, root of the 114th-115th `STATUS_ACCESS_VIOLATION`/bare SIGKILL); `allocate_pages`
-  lock-order deadlock (`8b982f3`); `FutexManager::wait` wasted-wake window (`8b982f3`); wait/wake
-  Dekker StoreLoad lost wakeup, present on x86 too (`182819d`, probe 50/50 vs 13/20 hung before);
-  last-chance minidump filter (`866ebcd`); SeqCst fences after the `WAITING`/`RUNNING_IN_GUEST`
-  stores (`7b4cba9`, type-checked only; `ThreadHandle::interrupt`/`LoanList` audited, futex side
-  already ordered).
-- **Environment limit, 2026-09-28**: this host (15.6 GB) had 0.3-1.7 GB free with Chrome/Discord
-  resident; no desktop boot or release build was possible. A boot needs ~5 GB free for its whole
-  length; never close the user's applications to get it.
-
-- **Cross-process unix-socket wake is now event-driven (117th, `dfdfd26`)**: it used to be NO wake at
-  all -- every blocked read/poll on a shared connection waited out `SHARED_UNIX_POLL_INTERVAL`
-  (15 ms), so an X11 round trip cost ~15-30 ms and `xfwm4`'s ~7,000 round trips alone took minutes.
-  A send/recv/close on a shared slot now sets the peer host's existing wake event
-  (`wake_signal_listener`, handle-cached), the listener (`drain_host`, `xproc.rs`) bumps
-  `litebox::event::polling::bump_external_wake_epoch` (a `wait_on_events` waiter treats a changed
-  epoch as "re-run `try_op`") and wakes waiting threads (`ThreadHandle::wake_if_waiting`; poll/ppoll
-  re-scan on any wake). Measured `.wfgy/pass117_pingpong.sh`-style socketpair ping-pong across a
-  cross-process fork: 19.9 ms -> 0.05 ms per round trip. Lesson: a bare `Waker::wake` does NOT
-  make a `wait_on_events` waiter retry (its ready-check is the observer flag) -- it needs the epoch.
-  Still to do: rendezvous (`accept`/`connect`) and pty waits still poll; cross-process PIPES hang
-  when the parent keeps both ends open (PRD `cross-process-pipes-not-shared`); a
-  `connect()`/`accept()`-made local pair carried over fork gives EPIPE (PRD
-  `shared-unix-bound-socket-fork-broken-pipe`). Full boot with this build: not yet run.
-
-- **Browser path reached (117th, later)**: real Chrome (gm `cdp`, session `p117-browser`) loads selkies'
-  own web UI from the guest over `--publish 8081:8081` and receives live video ("Stream started", first
-  stripe decoded ~18 s after connect; `.gm/witness/p117_stream_try5.png`, black because that probe ran
-  Xvfb only). Needed, all committed: socket buffers in shared-arena pools (`a596c03`), only the
-  gateway-owning process polls the interface (`92a2d0e`), `/etc/hosts` + `IPV6_V6ONLY` (`8d13f7d`),
-  `FIONCLEX` (`d9027c5`, `os.set_inheritable(True)` used to fail EINVAL and break every uvloop
-  subprocess incl. selkies' `pgrep`), registry timeouts/retries + cached layer list (`e35a36a`+next).
-  Harness facts (all in the untracked `.wfgy/`): selkies 2.0 needs `--enable-basic-auth=false` and
-  `--addr=0.0.0.0` (not `localhost`); pass `--env LC_ALL=C` (Python otherwise maps the 173 MB
-  locale archive: selkies 1,211 -> 626 MB); a child process's output only reaches a redirected stdout
-  when the child writes the inherited handle directly (no pipe): pipes deliver at writer EXIT
-  (PRD `cross-process-pipe-streaming-blocked-by-sibling-bridge`); use `cmd /c "runner ... < in > out"`
-  drivers, and `exec selkies` as the main guest process to read its log.
-  **Full stack (Xvfb+selkies+DE+nginx) still cannot finish under ~7 GB free**: ~600 MB Xvfb (117 MB
-  memcpy'd library mapping + heap arenas), ~626 MB selkies, ~100 MB per other process. The general
-  fix is file-backed mappings that are shared, not copied (PRD `file-backed-private-mmap-no-commit`).
-  `LITEBOX_DIAG_MEM_BREAKDOWN=1` + `LITEBOX_DIAG_MEM_BREAKDOWN_LATE=<secs>` prints each process's
-  regions at start and N s later.
-
-**Next pickup, in order**: (1) with >=8 GB free run `de_only.sh` from the ready seed under eager fork
-and reach `DE_UP`; (2) decompose per-process memory (sample `PrivateMemorySize64` per runner against
-a `VirtualQuery` breakdown) and cut the biggest piece; (3) app acceptance from a real browser
-(terminal, Thunar, Mousepad, settings, panel, Ristretto, a web browser; second client and reconnect)
-on Windows, then Linux/macOS builds; (4) native kernel-COW fork, then retire `lazy_fork_commit.rs`.
-The PRD (`.gm/prd.yml`, gitignored) carries the full task list.
+`DE_UP` first reached (eager fork + `LANG=C` + event-driven cross-process wake, `dfdfd26`); the
+173MB glibc locale-archive per-process memcpy root-caused and fixed (`--env LANG=C`); cross-process
+unix-socket wake made event-driven (19.9ms -> 0.05ms per round trip, `dfdfd26`); browser path first
+reached (real Chrome loaded selkies' UI, received live video). Full narrative, every measurement and
+the per-process memory breakdown investigation: `docs/AGENTS_ARCHIVE_2026-09-28.md`'s "117th pass
+full narrative" section.
 
 ## The cheap repro — start here
 
