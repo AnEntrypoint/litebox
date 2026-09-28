@@ -594,21 +594,87 @@ opening paragraph warns about).
     guard-install timing; `__chkstk` stack-overflow; sigreturn-trampoline collision/recognition, in
     two forms; and now the writer-thread-stack theory, refuted by two independent fix attempts).
     The crash remains real, reliably reproducible under `cdb` in under 10 seconds, and its true
-    mechanism is still not confirmed. **Next pickup, precise**: (a) identify WHICH litebox-internal
-    background thread this actually is -- `~` lists it unnamed among `main`/`litebox-nat-gateway`;
-    either give litebox's OWN background threads real names (a small, low-risk, generally useful
-    change -- `std::thread::Builder::name(...)`, which Windows surfaces to a debugger) so a future
-    capture identifies it immediately, or single-step/backtrace it directly in the SAME `cdb`
-    session before it crashes (break on thread CREATE for every NEW thread after the fork, examine
-    each one's own purpose) to catch it in the act; (b) once identified, find why ITS OWN `%rsp`
-    ends up pointing into guest address space at all -- this is the more fundamental question this
-    pass's own evidence now points at, more so than "which memory got guard-cow-protected"; (c) do
-    NOT re-attempt a NEW blind fix for the STATUS_ACCESS_VIOLATION until (a)/(b) yield a confirmed
-    mechanism -- four attempts without one is itself strong evidence that guessing further has hit
-    genuinely diminishing returns; (d) the trampoline-collision loop (confirmed real, separately,
-    earlier in this same pass) and the STATUS_ACCESS_VIOLATION remain two DIFFERENT, unresolved
-    bugs -- do not conflate them without evidence either way. `xfce4-session`'s own SIGABRT remains
-    unre-attempted; nothing in this pass's investigation should be assumed to transfer to it yet.
+    mechanism is still not confirmed.
+  - **(a) done, same pass, continuation: every litebox-internal background thread now has a real
+    name.** Named every remaining unnamed `std::thread::Builder::new()`/bare `std::thread::spawn`
+    call site found by a full repo grep: `ctxwatch.rs`'s DR1-arming helper
+    (`"litebox-ctxwatch-dr1-helper"`), `net.rs`'s per-flow outbound TCP connect helper
+    (`"litebox-tcp-flow-connect"`), `lib.rs`'s cross-process fork parent-side pipe pump
+    (`"litebox-fork-pipe-pump-parent"`), its cross-process exit-wait notifier
+    (`"litebox-xproc-exit-notifier"`), and its cross-process signal-wake listener
+    (`"litebox-signal-wake-listener"`) -- each Builder-spawn's previously-discarded `io::Result`
+    is now handled (logged and returned/skipped, never silently dropped). `spawn_thread` itself
+    (every GUEST thread, `lib.rs`, the function `ALL_THREAD_STACK_RSPS` already instruments) now
+    also names its own thread `"litebox-guest-pid<N>"` (or `"litebox-guest-thread"` if no guest pid
+    is set yet) specifically so a future `cdb` `~` listing can distinguish a guest thread from one
+    of litebox's own `litebox-*`-named internal ones on sight, with no inference needed. Rebuilt
+    clean (`cargo build -p litebox_runner_linux_on_windows_userland --release`, zero new warnings)
+    and RE-RAN the exact same `cdb` repro (`.wfgy/pass114_cdb_run.ps1`,
+    `.wfgy/pass114_threadnames_run1.log`). **Result: the crashing thread (id 25, `467c.4220`,
+    `.lastevent`'s own thread) now shows `"litebox-guest-pid2"`** -- this DEFINITIVELY ANSWERS (a):
+    it is an ORDINARY GUEST THREAD (one of the Python repro's 4 `threading.Thread` writers, all
+    sharing guest pid 2), not a mystery litebox-internal thread. This corrects the PREVIOUS framing
+    (the paragraph immediately above this one, and the "new, more precise evidence" bullet before
+    it) -- the thread's own tiny (~68 KiB) TEB-tracked stack was a red herring, not evidence of an
+    internal thread: litebox runs guest code with `%rsp` pointing at the GUEST's OWN mapped memory
+    (`0x7fef...`-range addresses), never at the host OS thread's native TEB-tracked stack, so a
+    guest thread's real TEB stack size says nothing about where its `%rsp` actually points during
+    guest execution -- entirely expected given this architecture, not a bug indicator. **(b):
+    still NOT answered.** The crash address's `!address` signature is unchanged and still precise:
+    `Allocation Protect: PAGE_NOACCESS` (this exact region's protection AT ITS ORIGINAL
+    `VirtualAlloc2(MEM_RESERVE)` reservation, Windows metadata that persists regardless of later
+    commits/protects) alongside a CURRENT `Protect: PAGE_READONLY`, `State: MEM_COMMIT` -- this
+    specific combination (reserved NOACCESS, now committed-but-READONLY) is the signature of a
+    lazily-reserved region that got committed by something OTHER than the ordinary
+    `lazy_commit_veh` path (which always commits `PAGE_READWRITE`, never `PAGE_READONLY` -- see
+    that function's own `VirtualAlloc(..., PAGE_READWRITE)` call, `lazy_fork_commit.rs`), so plain
+    Bug-4-class lazy-commit is not, by itself, sufficient to explain this exact protection value.
+    **New, important negative/methodological finding, not yet resolved**: this run's log
+    (`LITEBOX_DIAG_LAZY_FORK_COMMIT=1` was set, same as every prior capture) shows **zero**
+    `[lazy_fork_commit]`-prefixed diagnostic lines anywhere -- no "opened fresh interval", no
+    "batched region ... opened fresh", no "write-fault entry", no "INVALIDATED by guest-initiated"
+    -- despite the crash's own `!address` signature looking exactly like guard-cow's own
+    `PAGE_READONLY` marker. Verified this is NOT a stdio-inheritance gap for the cross-process fork
+    child (0x467c, "guest pid 2", is itself python3, cross-process-forked from the root bash): read
+    `spawn_process_fork_child`'s own stdio wiring (`process_fork.rs`, the `inherit_stdio=true`
+    branch used on this path) and confirmed it explicitly calls `GetStdHandle`+
+    `SetHandleInformation(HANDLE_FLAG_INHERIT)`+`STARTF_USESTDHANDLES`+`bInheritHandles=1` for
+    stdout/stderr/stdin before `CreateProcessW` -- correctly wired, not the gap. Also confirmed
+    `build_child_environment_block` copies the FULL current `std::env::vars_os()` (including
+    `LITEBOX_DIAG_LAZY_FORK_COMMIT`) into every cross-process child's own environment block --
+    also not the gap. And in any case the four crashing "litebox-guest-pid2" threads are all
+    ORDINARY `clone()`-spawned THREADS within the SAME already-forked python3 process, not a
+    further cross-process boundary at all, so cross-process stdio/env plumbing is moot for
+    explaining THEIR silence specifically. **This leaves genuinely open**: either (i) guard-cow's
+    own reservation/write-fault code truly never ran for this exact page in this run (meaning the
+    `PAGE_READONLY` protection has a DIFFERENT origin than guard-cow -- candidate not yet
+    checked: `allocate_pages`'s own fixed-address `Replace`-mode commit path, `lib.rs`'s
+    `reserve_and_commit` closure, which takes a caller-supplied `flags` protection value for its
+    `VirtualAlloc2(MEM_COMMIT, flags)` call -- confirm what `flags` actually resolves to for a
+    guest thread-stack `mmap` request reusing a `Replace`-mode fixed address, since a wrong value
+    there would exactly explain a freshly-committed-but-READONLY page with no guard-cow entry at
+    all), or (ii) the diagnostic-gated code DID run but its `eprintln!` output was lost for a
+    reason not yet found (both stdio and env were checked and ruled out above, so if this is still
+    the explanation the mechanism is something else again, not yet identified). **Do not repeat
+    the "zero diagnostic output means the code path never ran" inference without first confirming
+    the capture mechanism itself reaches that specific process/thread** -- this pass had to verify
+    stdio/env inheritance by direct code reading before it could even use the absence of output as
+    evidence, and still could not fully rule out (ii). **Checked and RULED OUT, same pass**:
+    `allocate_pages`'s own `reserve_and_commit` closure -- all four call sites (`lib.rs`) pass
+    `prot_flags(initial_permissions)` to `VirtualAlloc2(MEM_COMMIT, flags)`, and `prot_flags`
+    itself (`lib.rs:7723`) correctly maps `(READ,WRITE,_)=(true,true,false)` to `PAGE_READWRITE`
+    -- no bug in this mapping, so an ordinary guest `mmap(PROT_READ|PROT_WRITE)` thread-stack
+    request cannot resolve to `PAGE_READONLY` through this path. **Next pickup, precise**: code
+    reading alone has now ruled out every call site this pass could find by inspection
+    (`guard_one_page`, `try_guard_region_batched`, `invalidate_guarded_range`,
+    `heal_stale_guard_entries_in_range`, `lazy_commit_veh`, `reserve_and_commit`/`prot_flags`) --
+    the next step needs LIVE observation, not another code-reading guess: a `cdb` session with a
+    breakpoint on `VirtualProtect`/`VirtualAlloc2` calls targeting the exact crash address range
+    (or its containing 64 KiB granule) BEFORE the crash, to see which call last touched it and
+    with what protection value, is the concrete next action. (c) still holds: do NOT ship a fix
+    without a confirmed mechanism. (d)
+    still holds: the trampoline-collision loop and the STATUS_ACCESS_VIOLATION remain two
+    DIFFERENT, unresolved bugs. `xfce4-session`'s own SIGABRT remains unre-attempted.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the

@@ -477,7 +477,9 @@ impl GatewayState {
         let dest_addr = SocketAddr::V4(SocketAddrV4::new(dest_ip, listen_port));
 
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let spawn_result = std::thread::Builder::new()
+            .name("litebox-tcp-flow-connect".to_owned())
+            .spawn(move || {
             let result = (|| -> std::io::Result<std::net::TcpStream> {
                 let socket = socket2::Socket::new(
                     socket2::Domain::IPV4,
@@ -490,6 +492,10 @@ impl GatewayState {
             })();
             let _ = tx.send(result);
         });
+        if let Err(e) = spawn_result {
+            eprintln!("[net] failed to spawn tcp-flow-connect thread: {e}");
+            return;
+        }
 
         self.tcp_flows.insert(
             handle,

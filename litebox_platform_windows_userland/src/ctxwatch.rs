@@ -371,7 +371,9 @@ pub(super) fn arm_fixed_on_current_thread() {
         // to hand to a different OS thread (unlike the `GetCurrentThread()` pseudo-handle itself,
         // which is only meaningful when used BY the thread it names).
         let target = pseudo_handle as usize;
-        let joiner = std::thread::spawn(move || -> bool {
+        let joiner = std::thread::Builder::new()
+            .name("litebox-ctxwatch-dr1-helper".to_owned())
+            .spawn(move || -> bool {
             let handle = target as windows_sys::Win32::Foundation::HANDLE;
             if windows_sys::Win32::System::Threading::SuspendThread(handle) == u32::MAX {
                 eprintln!(
@@ -386,6 +388,13 @@ pub(super) fn arm_fixed_on_current_thread() {
             windows_sys::Win32::Foundation::CloseHandle(handle);
             ok
         });
+        let joiner = match joiner {
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("[ctxwatch-fixed] failed to spawn helper thread: {e}");
+                return;
+            }
+        };
         match joiner.join() {
             Ok(true) => {}
             Ok(false) => return,

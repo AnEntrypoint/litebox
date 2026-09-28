@@ -4735,8 +4735,19 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // construction (in particular `continue_context`'s `Box::default()` heap allocation) must
         // never run on the new thread before `install_tls` has had a chance to run.
         let tls_state = TlsState::new();
+        // Named so a debugger's thread listing immediately distinguishes a GUEST thread (32 MiB
+        // stack, runs guest code directly on this host thread per this function's own design) from
+        // litebox's own internal background threads (all named `litebox-*`, see `ctxwatch.rs`,
+        // `net.rs`, and the other `Builder::new().name(...)` call sites in this file) -- a thread
+        // with NEITHER kind of name observed live at a crash is evidence it was created by neither
+        // `spawn_thread` nor any of litebox's own explicit spawn sites (114th-pass investigation).
+        let thread_name = match guest_pid {
+            Some(pid) => alloc::format!("litebox-guest-pid{pid}"),
+            None => "litebox-guest-thread".to_owned(),
+        };
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::Builder::new()
+            .name(thread_name)
             .stack_size(GUEST_THREAD_STACK_SIZE)
             .spawn(move || {
                 if let Some(pid) = guest_pid {
@@ -12672,7 +12683,9 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // using `self.global.platform`-style access to anything guest-side here: this thread
         // exists specifically to reach into the GUEST's own notify machinery through `on_exit`,
         // never to touch guest memory or state directly itself.
-        std::thread::spawn(move || {
+        let spawn_result = std::thread::Builder::new()
+            .name("litebox-xproc-exit-notifier".to_owned())
+            .spawn(move || {
             // 53rd-pass diagnostic (AGENTS_ARCHIVE_2026-09-22.md pickup): bracket the blocking
             // wait with explicit start/end markers, keyed by the handle's raw pointer value, so a
             // trace can pair this thread's own timing against `try_wait_for_cross_process_exit`
@@ -12688,6 +12701,12 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             );
             on_exit(raw_exit_code);
         });
+        if let Err(e) = spawn_result {
+            litebox_util_log::warn!(
+                err:% = e;
+                "spawn_cross_process_exit_notifier: failed to spawn wait thread, exit notification for this child will never fire"
+            );
+        }
     }
 
     fn diagnostic_cross_process_wait4_probe(
@@ -12734,7 +12753,9 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 return false;
             }
             let event = event as usize;
-            std::thread::spawn(move || {
+            let spawn_result = std::thread::Builder::new()
+                .name("litebox-signal-wake-listener".to_owned())
+                .spawn(move || {
                 // The event exists before this first drain, so a sender that set a pending bit
                 // before the event existed is covered here and every later one wakes the loop.
                 on_wake();
@@ -12751,7 +12772,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                     on_wake();
                 }
             });
-            true
+            spawn_result.is_ok()
         })
     }
 
@@ -13385,6 +13406,7 @@ fn spawn_fork_child_pipe_pump(
     // consistent rather than leaving one fixed and its sibling still on a bare 1 MiB default.
     const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
     std::thread::Builder::new()
+        .name("litebox-fork-pipe-pump-parent".to_owned())
         .stack_size(GUEST_THREAD_STACK_SIZE)
         .spawn(move || {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
