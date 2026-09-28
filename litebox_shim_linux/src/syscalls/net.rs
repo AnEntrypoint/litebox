@@ -2387,6 +2387,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             preview:? = alloc::format!("{:02x?}", &recv_buf[..data_to_copy.min(4096)]);
             "DIAG sys_recvmsg: payload"
         );
+        // Mirrors the `litebox_diag::socket_read` hook `sys_read`/`sys_readv` already carry
+        // (`syscalls/file.rs`): a dedicated, comm-filterable, cheap-when-unset target so a caller
+        // investigating one process's wire bytes doesn't have to pay for the whole
+        // `syscalls::net` module's debug output (every socket, every process). `recvmsg` was
+        // never covered by this -- real X11/Xtrans/ICE clients (Xlib, GLib's GDBusConnection) use
+        // `recvmsg`, not plain `read`, so a caller who only enabled `litebox_diag::socket_read`
+        // expecting to see an X11 connection's bytes saw nothing at all.
+        if crate::diag::is_socket_read_target_comm(&self.comm.get()) {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::socket_read",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                tid = %self.tid.get(),
+                fd = %sockfd,
+                size = %size,
+                preview = ?alloc::format!("{:02x?}", &recv_buf[..data_to_copy.min(4096)]),
+                "DIAG sys_recvmsg: payload"
+            );
+        }
         let mut offset = 0usize;
         for iov in &iovs {
             if offset >= data_to_copy {
