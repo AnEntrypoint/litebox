@@ -11439,8 +11439,9 @@ pub fn diag_private_memory_breakdown(tag: &str) {
                 diag_private_memory_breakdown("late");
             });
     }
-    let mut totals: std::collections::BTreeMap<(&'static str, u32), (u64, u64)> = Default::default();
-    let mut largest: Vec<(usize, usize, u32, &'static str)> = Vec::new();
+    let mut totals: std::collections::BTreeMap<(&'static str, u32), (u64, u64, u64)> =
+        Default::default();
+    let mut largest: Vec<(usize, usize, u32, &'static str, u64)> = Vec::new();
     let mut addr: usize = 0;
     let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
     loop {
@@ -11461,10 +11462,18 @@ pub fn diag_private_memory_breakdown(tag: &str) {
                 Win32_Memory::MEM_IMAGE => "image",
                 _ => "other",
             };
+            let resident = diag_resident_bytes(mbi.BaseAddress as usize, mbi.RegionSize);
             let e = totals.entry((kind, mbi.Protect)).or_default();
             e.0 += 1;
             e.1 += mbi.RegionSize as u64;
-            largest.push((mbi.BaseAddress as usize, mbi.RegionSize, mbi.Protect, kind));
+            e.2 += resident;
+            largest.push((
+                mbi.BaseAddress as usize,
+                mbi.RegionSize,
+                mbi.Protect,
+                kind,
+                resident,
+            ));
         }
         let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
         if next <= addr {
@@ -11473,29 +11482,76 @@ pub fn diag_private_memory_breakdown(tag: &str) {
         addr = next;
     }
     let mut sum = [0u64; 3];
-    for ((kind, _), (_, bytes)) in &totals {
+    let mut resident_private = 0u64;
+    for ((kind, _), (_, bytes, resident)) in &totals {
         match *kind {
-            "private" => sum[0] += bytes,
+            "private" => {
+                sum[0] += bytes;
+                resident_private += resident;
+            }
             "mapped" => sum[1] += bytes,
             _ => sum[2] += bytes,
         }
     }
     eprintln!(
-        "[mem_breakdown] {tag} winpid={} committed private={}MB mapped={}MB image/other={}MB",
+        "[mem_breakdown] {tag} winpid={} committed private={}MB (resident {}MB) mapped={}MB image/other={}MB",
         std::process::id(),
         sum[0] >> 20,
+        resident_private >> 20,
         sum[1] >> 20,
         sum[2] >> 20
     );
-    for ((kind, prot), (n, bytes)) in &totals {
+    for ((kind, prot), (n, bytes, resident)) in &totals {
         if *bytes >= (1 << 20) {
-            eprintln!("[mem_breakdown]   {kind} prot={prot:#x} regions={n} {}MB", bytes >> 20);
+            eprintln!(
+                "[mem_breakdown]   {kind} prot={prot:#x} regions={n} {}MB resident {}MB",
+                bytes >> 20,
+                resident >> 20
+            );
         }
     }
     largest.sort_by(|a, b| b.1.cmp(&a.1));
-    for (base, size, prot, kind) in largest.iter().take(14) {
-        eprintln!("[mem_breakdown]   top {kind} base={base:#x} size={}MB prot={prot:#x}", size >> 20);
+    for (base, size, prot, kind, resident) in largest.iter().take(14) {
+        eprintln!(
+            "[mem_breakdown]   top {kind} base={base:#x} size={}MB resident={}MB prot={prot:#x}",
+            size >> 20,
+            resident >> 20
+        );
     }
+}
+
+fn diag_resident_bytes(base: usize, size: usize) -> u64 {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct WorkingSetEx {
+        virtual_address: usize,
+        attributes: usize,
+    }
+    const BATCH: usize = 8192;
+    let mut resident = 0u64;
+    let mut batch = std::vec::Vec::with_capacity(BATCH);
+    let mut page = base;
+    let end = base + size;
+    while page < end {
+        batch.clear();
+        while page < end && batch.len() < BATCH {
+            batch.push(WorkingSetEx { virtual_address: page, attributes: 0 });
+            page += 4096;
+        }
+        // SAFETY: `batch` is a valid array of the documented `PSAPI_WORKING_SET_EX_INFORMATION` layout.
+        let ok = unsafe {
+            windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                batch.as_mut_ptr().cast::<c_void>(),
+                (batch.len() * core::mem::size_of::<WorkingSetEx>()) as u32,
+            )
+        };
+        if ok == 0 {
+            return 0;
+        }
+        resident += batch.iter().filter(|entry| entry.attributes & 1 != 0).count() as u64 * 4096;
+    }
+    resident
 }
 
 pub(crate) fn shared_kernel_heap_probe_child_read(base: usize, inherited: bool) {

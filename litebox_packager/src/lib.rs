@@ -334,7 +334,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
             let data = std::fs::read(&entry.read_path)
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
-            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
+            let rewritten = if is_elf(&data) && !no_rewrite.contains(&entry.read_path) {
                 rewrite_elf(&data, &entry.read_path, verbose)
             } else {
                 data
@@ -590,6 +590,12 @@ fn discover_all_dependencies(
 
 /// ELF magic bytes: `\x7fELF`.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+pub use litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
+
+pub(crate) fn is_elf(data: &[u8]) -> bool {
+    data.starts_with(&ELF_MAGIC)
+}
 
 /// ELF e_machine value for x86_64.
 const EM_X86_64: u16 = 62;

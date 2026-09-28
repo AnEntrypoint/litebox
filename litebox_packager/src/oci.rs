@@ -1249,11 +1249,12 @@ pub fn rewrite_layer_elfs<W: Write>(layer_tar: &[u8], out: &mut W, verbose: bool
             continue;
         }
 
-        let is_executable = header.mode().is_ok_and(|m| m & 0o111 != 0);
         let mut data = Vec::new();
         entry.read_to_end(&mut data)?;
 
-        let out_data = if is_executable {
+        // Shared libraries are normally mode 0644: gating on the executable bit left them
+        // unpatched, so every process re-scanned and rewrote their whole text at mmap time.
+        let out_data = if crate::is_elf(&data) {
             crate::rewrite_elf(&data, &path, verbose)
         } else {
             data

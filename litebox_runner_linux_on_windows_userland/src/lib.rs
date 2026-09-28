@@ -2364,7 +2364,7 @@ fn diag_process_fork_task_resume_probe(
 /// Format version for the on-disk merged-rootfs-index cache this module reads/writes (bump
 /// whenever `litebox::fs::tar_ro::{encode,decode}_merged_live_entries`'s wire format -- or
 /// anything else about what this cache stores -- changes shape; mirrors
-/// `litebox_syscall_rewriter::REWRITER_CACHE_VERSION`'s own bump discipline one cache layer down
+/// `litebox_packager::REWRITER_CACHE_VERSION`'s own bump discipline one cache layer down
 /// the pipeline).
 ///
 /// # Why this cache exists
@@ -2411,7 +2411,8 @@ fn merged_rootfs_index_cache_key(resolved_layers_json: &str) -> String {
 
 fn merged_rootfs_index_cache_path(cache_key: &str) -> std::path::PathBuf {
     std::path::Path::new(".litebox-cache").join(format!(
-        "mergedidx_{cache_key}_v{MERGED_ROOTFS_INDEX_CACHE_VERSION}.bin"
+        "mergedidx_{cache_key}_v{MERGED_ROOTFS_INDEX_CACHE_VERSION}_r{}.bin",
+        litebox_packager::REWRITER_CACHE_VERSION
     ))
 }
 

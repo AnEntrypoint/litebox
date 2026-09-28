@@ -98,7 +98,7 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 /// trampoline layout changes, etc.) could make previously-cached rewritten output stale or wrong.
 /// A dependency-only bump, a comment/doc change, or a change that provably cannot alter emitted
 /// bytes for any input does NOT require bumping this.
-pub const REWRITER_CACHE_VERSION: u32 = 1;
+pub const REWRITER_CACHE_VERSION: u32 = 2;
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
