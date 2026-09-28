@@ -98,6 +98,25 @@ acceptance are still untested -- that is the next pickup.** Earlier blockers bel
   `connect()`/`accept()`-made local pair carried over fork gives EPIPE (PRD
   `shared-unix-bound-socket-fork-broken-pipe`). Full boot with this build: not yet run.
 
+- **Browser path reached (117th, later)**: real Chrome (gm `cdp`, session `p117-browser`) loads selkies'
+  own web UI from the guest over `--publish 8081:8081` and receives live video ("Stream started", first
+  stripe decoded ~18 s after connect; `.gm/witness/p117_stream_try5.png`, black because that probe ran
+  Xvfb only). Needed, all committed: socket buffers in shared-arena pools (`a596c03`), only the
+  gateway-owning process polls the interface (`92a2d0e`), `/etc/hosts` + `IPV6_V6ONLY` (`8d13f7d`),
+  `FIONCLEX` (`d9027c5`, `os.set_inheritable(True)` used to fail EINVAL and break every uvloop
+  subprocess incl. selkies' `pgrep`), registry timeouts/retries + cached layer list (`e35a36a`+next).
+  Harness facts (all in the untracked `.wfgy/`): selkies 2.0 needs `--enable-basic-auth=false` and
+  `--addr=0.0.0.0` (not `localhost`); pass `--env LC_ALL=C` (Python otherwise maps the 173 MB
+  locale archive: selkies 1,211 -> 626 MB); a child process's output only reaches a redirected stdout
+  when the child writes the inherited handle directly (no pipe): pipes deliver at writer EXIT
+  (PRD `cross-process-pipe-streaming-blocked-by-sibling-bridge`); use `cmd /c "runner ... < in > out"`
+  drivers, and `exec selkies` as the main guest process to read its log.
+  **Full stack (Xvfb+selkies+DE+nginx) still cannot finish under ~7 GB free**: ~600 MB Xvfb (117 MB
+  memcpy'd library mapping + heap arenas), ~626 MB selkies, ~100 MB per other process. The general
+  fix is file-backed mappings that are shared, not copied (PRD `file-backed-private-mmap-no-commit`).
+  `LITEBOX_DIAG_MEM_BREAKDOWN=1` + `LITEBOX_DIAG_MEM_BREAKDOWN_LATE=<secs>` prints each process's
+  regions at start and N s later.
+
 **Next pickup, in order**: (1) with >=8 GB free run `de_only.sh` from the ready seed under eager fork
 and reach `DE_UP`; (2) decompose per-process memory (sample `PrivateMemorySize64` per runner against
 a `VirtualQuery` breakdown) and cut the biggest piece; (3) app acceptance from a real browser

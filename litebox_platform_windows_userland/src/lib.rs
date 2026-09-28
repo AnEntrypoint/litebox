@@ -11412,6 +11412,20 @@ pub fn diag_private_memory_breakdown(tag: &str) {
     if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_none() {
         return;
     }
+    // `LITEBOX_DIAG_MEM_BREAKDOWN_LATE=<secs>` also reports each process again that many seconds
+    // after its guest started, when the program has actually allocated its working memory.
+    if tag == "fork-child pre-guest"
+        && let Some(secs) = std::env::var("LITEBOX_DIAG_MEM_BREAKDOWN_LATE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+    {
+        let _ = std::thread::Builder::new()
+            .name("litebox-diag-mem-late".to_owned())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                diag_private_memory_breakdown("late");
+            });
+    }
     let mut totals: std::collections::BTreeMap<(&'static str, u32), (u64, u64)> = Default::default();
     let mut largest: Vec<(usize, usize, u32, &'static str)> = Vec::new();
     let mut addr: usize = 0;
