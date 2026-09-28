@@ -397,6 +397,36 @@ pub mod cache {
         }
     }
 
+    /// Where the resolved layer list for an image reference is recorded (see
+    /// [`store_resolved_layers`]).
+    fn resolved_layers_path(image_ref: &str) -> PathBuf {
+        let safe: String = image_ref
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .collect();
+        Path::new(CACHE_DIR).join(format!("ref_{safe}.layers.json"))
+    }
+
+    /// Records the layer list `image_ref` resolved to, so a later run can start without the
+    /// registry. Best effort: a failure to write costs only the offline fallback.
+    pub fn store_resolved_layers(image_ref: &str, resolved_layers_json: &str) {
+        let path = resolved_layers_path(image_ref);
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::create_dir_all(CACHE_DIR).is_ok()
+            && std::fs::write(&tmp, resolved_layers_json).is_ok()
+        {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The layer list recorded by the last successful pull of `image_ref`, if any.
+    pub fn load_resolved_layers(image_ref: &str) -> Option<String> {
+        std::fs::read_to_string(resolved_layers_path(image_ref))
+            .ok()
+            .filter(|json| !json.trim().is_empty())
+    }
+
     /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
     /// version. The digest's `:` is replaced with `_` since `:` is a reserved character in
     /// Windows paths (valid only as the drive-letter separator) -- same constraint already
@@ -717,7 +747,31 @@ pub fn pull_layers_in_memory_with_resolved_digests(
     image_ref: &str,
     verbose: bool,
 ) -> anyhow::Result<(PulledLayers, String)> {
-    pull_layers_in_memory_impl(image_ref, None, verbose)
+    match pull_layers_in_memory_impl(image_ref, None, verbose) {
+        Ok((pulled, resolved_json)) => {
+            cache::store_resolved_layers(image_ref, &resolved_json);
+            Ok((pulled, resolved_json))
+        }
+        Err(err) => {
+            // The registry answered badly or not at all (rate limiting and transient network
+            // failures are routine for anonymous pulls), but a previous successful run recorded
+            // which layers this reference resolved to and those layers are cached on disk: use
+            // them rather than failing a run whose every byte is already local.
+            let Some(resolved_json) = cache::load_resolved_layers(image_ref) else {
+                return Err(err);
+            };
+            let Ok(known_layers) = serde_json::from_str(&resolved_json) else {
+                return Err(err);
+            };
+            eprintln!(
+                "warning: could not resolve {image_ref} from the registry ({err:#}); using the \
+                 layer list from the last successful pull"
+            );
+            pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
+                .map(|(pulled, _)| (pulled, resolved_json))
+                .map_err(|offline_err| err.context(format!("offline fallback also failed: {offline_err:#}")))
+        }
+    }
 }
 
 /// Like [`pull_layers_in_memory`], but skips the manifest fetch entirely -- a real, unconditional
