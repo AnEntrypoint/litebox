@@ -48,7 +48,19 @@ acceptance are untested.** The last five blockers are understood:
   506 MB -> 76 MB, region gone. The general defect (any large read-only private file mapping is
   committed per process and per fork) is tracked in `.gm/prd.yml` `file-backed-private-mmap-no-commit`
   and needs lossless partial-unmap recovery plus 64 KiB-aligned or platform-placed views. Full boot
-  with `LANG=C` still to be run (host had 0.2 GB free).
+  with `LANG=C` (`.wfgy/pass117_lang_boot1`): **first non-lazy boot ever to run its whole 300 s window
+  with no RAM crater** -- 20 processes, ~8 GB private commit, 3.7-4.4 GB free throughout. Every
+  desktop client launched (`xfwm4`, `xfsettingsd`, `xfce4-panel`, `xfdesktop`, Thunar, at-spi,
+  `ssh-agent`, `gpg-agent`). `DE_UP` still NOT reached: `xfwm4` never set
+  `_NET_SUPPORTING_WM_CHECK` in 300 s. Its syscall trace (`LITEBOX_DIAG_SYSCALL_TIMELINE=xfwm4`,
+  `.wfgy/pass117_lang_boot2.err.log`, 121k syscalls, 4 threads) shows it ALIVE and busy, not
+  hung: synchronous X request/reply loops (`writev`, `ppoll`, `recvmsg`) plus ~2,900 small-file
+  opens (themes/pixmaps); it only exited (status 1) when the harness killed Xvfb at 312 s. So the
+  open question is SPEED, not a deadlock: ~400 syscalls/s (with tracing) is far below native.
+  Next: run untraced for >=15 min (driver's window is now 700 polls, the seed's guest poll loop
+  150) with >=6 GB free, then profile where xfwm4's wall time goes (X server under litebox,
+  per-syscall cost, per-request round trip). A 15-min run was cut at 130 s by host memory
+  pressure (free fell from 4.4 to <0.7 GB with other host apps resident).
 - **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
   a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
   daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`
