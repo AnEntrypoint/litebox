@@ -109,13 +109,30 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // that we don't miss a wakeup.
         let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
         if value != expected_value {
+            // We were already visible to wakers, so a concurrent `wake` may have extracted this
+            // entry and spent one unit of its `num_to_wake` on a thread that is not going to sleep.
+            // Real Linux checks the value before the waiter is visible, so this can never happen
+            // there; here the wake must be passed on, or a genuinely sleeping waiter is never
+            // woken (a lost wakeup: the futex word is already changed, so no later wake follows).
+            if entry.get().done.load(Ordering::Acquire) {
+                let _ = self.wake(
+                    futex_addr,
+                    NonZeroU32::MIN,
+                    Some(NonZeroU32::new(bitset).unwrap_or(ALL_BITS)),
+                );
+            }
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
         // Only return when woken--don't reevaluate the futex word. This
         // ensures that the rate control mechanisms provided by the futex
         // interface are effective.
-        cx.wait_until(|| entry.get().done.load(Ordering::Acquire))
-            .map_err(FutexError::WaitError)
+        match cx.wait_until(|| entry.get().done.load(Ordering::Acquire)) {
+            Ok(()) => Ok(()),
+            // A wake that raced our timeout or interrupt has already consumed this entry: report
+            // success (as Linux does when the waker wins), otherwise the wake is silently lost.
+            Err(_) if entry.get().done.load(Ordering::Acquire) => Ok(()),
+            Err(e) => Err(FutexError::WaitError(e)),
+        }
     }
 
     /// Wakes waiters on the given futex word.
