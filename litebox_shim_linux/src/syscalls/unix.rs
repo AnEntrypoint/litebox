@@ -855,11 +855,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             // it unconditionally (this branch is rare -- real connection teardown, not per-message
             // traffic) finally answers "which host process, holding which role, let go of this
             // slot" for the next capture of this same investigation.
-            litebox_util_log::debug!(
-                slot:% = self.slot, is_client:% = self.is_client,
-                host_pid:% = self.platform().current_host_pid();
-                "DIAG unix shared conn: last holder of this side released, shutting down write ring \
-                 (peer will see EOF)"
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::unix_conn_teardown",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                slot = %self.slot,
+                is_client = %self.is_client,
+                host_pid = %self.platform().current_host_pid(),
+                "DIAG unix shared conn: last holder of this side released, shutting down write ring (peer will see EOF)"
             );
             let (_, write_ring) = self.rings();
             write_ring.shutdown();
