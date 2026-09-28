@@ -9,6 +9,7 @@
 
 mod ctxwatch;
 mod fork_verify;
+mod lazy_file_map;
 pub mod lazy_fork_commit;
 mod net;
 pub mod presentation;
@@ -7892,6 +7893,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
+        if suggested_range.start != 0 && matches!(fixed_address_behavior, FixedAddressBehavior::Replace) {
+            crate::lazy_file_map::forget(suggested_range.clone());
+        }
 
         // DIAG (AGENTS.md pass 227): unconditional print of the actual `fixed_address_behavior`
         // this call receives, plus the requested range -- pass 226 proved a `Replace`-mode
@@ -8808,6 +8812,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // `VIRTUAL_PROTECT_LOCK` (registry, then virtual-protect) -- calling this INSIDE that lock
         // would invert the order and risk a real AB-BA deadlock against those paths.
         crate::lazy_fork_commit::invalidate_guarded_range(&range);
+        crate::lazy_file_map::forget(range.clone());
         // Hold `ALLOCATE_PAGES_FIXED_ADDR_LOCK` across this entire query-then-decommit walk, for
         // the same reason `allocate_pages`'s fixed-address path holds it (see that call site's own
         // doc comment): `process_memory_range_by_regions`'s `VirtualQuery`-then-act loop has no
@@ -8898,6 +8903,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
+    fn try_lazy_file_pages(&self, range: core::ops::Range<usize>, source_data: &'static [u8]) -> bool {
+        crate::lazy_file_map::enabled() && crate::lazy_file_map::register(range, source_data)
+    }
+
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
@@ -8919,12 +8928,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // classic AB-BA deadlock risk against those paths. A cheap no-op when guard-cow was never
         // enabled or nothing is currently guarded.
         crate::lazy_fork_commit::invalidate_guarded_range(&range);
+        let protect_now = crate::lazy_file_map::permission_update_ranges(range, flags);
         // Hold `VIRTUAL_PROTECT_LOCK` for the whole region walk: see its doc comment for why an
         // unsynchronized `VirtualProtect` here can race `fork_verify`'s own temporary
         // protection-flip-and-restore on a page shared with an unrelated thread.
         let _guard = VIRTUAL_PROTECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for range in protect_now {
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
@@ -8955,6 +8966,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             },
         )
         .expect("update_permissions failed");
+        }
         Ok(())
     }
 
@@ -12978,6 +12990,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         identity: litebox::platform::ForkChildIdentity,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
+        crate::lazy_file_map::materialize_all();
         let group_relocations = relocations.group_relocations();
         let vma_layout = relocations.vma_layout();
         if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_some() {

@@ -245,6 +245,16 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 
+    /// Turns the freshly created read-write `range` into a demand-paged private mapping of
+    /// `source_data` (page `i` of the range is page `i` of the source, zero past its end): the
+    /// platform leaves it unfilled and copies each chunk in on first touch, so untouched parts of
+    /// a large file never become resident. Returns `false` when unsupported, leaving the range
+    /// untouched for the caller to fill eagerly.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn try_lazy_file_pages(&self, range: Range<usize>, source_data: &'static [u8]) -> bool {
+        false
+    }
+
     /// An opaque handle to a platform-level shared-memory object, e.g. a Windows file-mapping
     /// `HANDLE` or a Linux `memfd_create` file descriptor. Cheap to copy (a raw handle/fd, not
     /// the memory itself); [`Self::close_shared_memory`] releases the underlying object.

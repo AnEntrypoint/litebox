@@ -856,6 +856,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// The `len` bytes of `fd`'s static backing data starting at `offset` (clipped to the data's
+    /// end), if `fd` has any.
+    fn static_backing_slice(&self, fd: i32, offset: usize, len: usize) -> Option<&'static [u8]> {
+        let raw_fd = usize::try_from(u32::try_from(fd).ok()?).ok()?;
+        let files = self.files.borrow();
+        let data = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()??;
+        let start = offset.min(data.len());
+        let end = offset.saturating_add(len).min(data.len());
+        Some(&data[start..end])
+    }
+
     /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
     /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
     fn do_mmap_file_memcpy(
@@ -867,7 +892,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        let lazy_source = self.static_backing_slice(fd, offset, len);
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
+            if let Some(source) = lazy_source {
+                let start = ptr.as_usize();
+                let mapped_len = len.next_multiple_of(PAGE_SIZE);
+                if <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_lazy_file_pages(
+                    self.global.platform,
+                    start..start + mapped_len,
+                    source,
+                ) {
+                    return Ok(len);
+                }
+            }
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
