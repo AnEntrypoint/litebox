@@ -553,23 +553,61 @@ opening paragraph warns about).
     protection, check `GUARD_PAGE_REGISTRY` for a stale (empty-pending) entry covering it and heal
     it the same way `guard_one_page` already does, closing the gap for every future allocation kind
     at once rather than patching each call site (mmap, thread-stack creation, the trampoline)
-    individually as each is discovered. **Not implemented this pass** -- found very late in an
-    already long pass; needs a careful read of `allocate_pages`'s own full body (already partially
-    read in the 106th/107th passes' own investigation, `lib.rs:7785-8541`) to find the exact
-    insertion point without disturbing its existing, delicate collision-recovery logic, then a
-    live re-test of this EXACT repro (now reliably reproducible under `cdb` in under 10 seconds)
-    to confirm the crash is actually gone, not just theorized-away.
-  - **Next pickup, precise, supersedes everything above in this entry**: (a) read
-    `WindowsUserland::allocate_pages`'s full body, find where it commits/reserves a fresh region,
-    and add a `GUARD_PAGE_REGISTRY`-staleness check+heal there (reusing `guard_one_page`'s own
-    logic, factored into a shared helper if that's cleaner) before returning success for any
-    region; (b) rebuild, re-run `.wfgy/pass114_cdb_run.ps1` (now fast and reliable) to confirm the
-    `STATUS_ACCESS_VIOLATION` is gone; (c) once confirmed, re-run the torn-read probe WITHOUT cdb
-    several times to build confidence this wasn't a fluke; (d) only then, re-attempt the ORIGINAL
-    `xfce4-session` SIGABRT with this fix in place, since `xfce4-session`'s own real threads
-    (glib's worker pool) are exactly the kind of "new thread created after fork, needing a fresh
-    stack" shape this bug describes -- plausible this is the SAME root cause, but must be
-    re-verified live, not assumed.
+    individually as each is discovered. **Implemented and tested live, same pass
+    (`heal_stale_guard_entries_in_range`, `lazy_fork_commit.rs`, called from both
+    `allocate_pages` success paths) -- confirmed by direct re-test that it does NOT fix this
+    specific crash**, and the reason why is itself the real finding (below): kept in the tree
+    regardless as real, correct hardening for the dead-claim case it does cover, which is a
+    genuinely different scenario from what this exact repro turned out to be hitting.
+  - **REFINED, LIKELY-FINAL ROOT CAUSE, found by re-reading `classify_lazy_eligible_groups` against
+    this pass's own repro shape after the healing fix's own re-test came back unchanged
+    (`ExceptionAddress` byte-identical to before the fix, `.wfgy/pass114_cdb_run8.log`) -- the
+    collision here is against a LIVE guard-cow claim, not a dead/stale one, so the healing fix's own
+    precondition (`entry.pending.is_empty()`) correctly never fires for it.** This pass's own probe
+    spawns its 4 writer threads BEFORE calling `os.fork()` (`threading.Thread(...).start()`
+    precedes `pid = os.fork()` in the script) -- meaning these threads, and their stacks, already
+    exist at the moment of the fork that guard-cow protects on behalf of. `classify_lazy_eligible_
+    groups`'s own stack exclusion (`is_active_stack = group.contains(&active_rsp)`,
+    `lazy_fork_commit.rs:819`) takes a SINGLE `active_rsp: usize` -- the CALLING thread's own guest
+    `%rsp` at the instant of `fork()` -- and excludes ONLY the one group containing THAT address.
+    Its own doc comment (the 84th/85th-pass "Bug 3" fix this exclusion originated from) confirms
+    this was designed entirely around the CHILD's own post-fork exception-delivery `CONTEXT.Rsp`;
+    it was never extended to think about OTHER, already-running threads in a multi-threaded
+    PARENT. Those other threads (my 4 writer threads, real OS threads that keep running normally in
+    the PARENT after `fork()` -- only the calling thread survives into the child) continue writing
+    to their OWN stacks via completely ordinary local-variable spills, exactly like any running
+    thread does on every function call. If one of THEIR stack groups happens to satisfy
+    `classify_lazy_eligible_groups`'s OTHER criteria (anonymous, non-`VM_EXEC`, not the ONE
+    excluded `active_rsp` group) it gets marked lazy-eligible and guard-cow-protected
+    (`PAGE_READONLY`) on behalf of the fork child -- and this pass's own live `!address` capture
+    shows that protection getting stuck (a real, committed, still-`PAGE_READONLY` stack, `!address
+    @rsp` confirmed) rather than being correctly captured-and-restored on the writer thread's own
+    very next stack write, for a reason not yet pinned down (candidates: Windows' own internal
+    `PAGE_GUARD` stack-growth bookkeeping on the lowest committed stack page interacting badly with
+    an EXTERNAL `VirtualProtect(PAGE_READONLY)` call from an unrelated mechanism; or the sheer
+    frequency/page-crossing rate of ordinary stack writes hitting a real bug in the
+    capture-restore cycle under rapid repetition -- NEITHER confirmed live yet). **Fix, not
+    implemented**: `classify_lazy_eligible_groups` needs to exclude the stacks of EVERY
+    currently-live thread in the process at fork time, not just the calling thread's -- this needs
+    a way to enumerate every OS thread's own stack range (TEB-based, e.g. via
+    `NtQueryInformationThread`/`GetThreadContext` per thread, or `CreateToolhelp32Snapshot`'s
+    `Thread32First`/`Next` to enumerate thread IDs first) at the exact moment of `fork()`, a
+    materially larger and more invasive change than `active_rsp`'s own single-value check --
+    deliberately NOT attempted blind this late in an already very long pass. **Next pickup,
+    precise**: (a) confirm this theory directly rather than trust the reasoning alone -- a live
+    `cdb` session (now fast and reliable, `.wfgy/pass114_cdb_run.ps1`) breaking on
+    `guard_one_page`/`try_guard_region_batched` at the EXACT fork that protects this address range,
+    checking whether the group being claimed is genuinely one of the writer threads' own stacks
+    (cross-reference the claimed range against each writer thread's own TEB `StackBase`/
+    `StackLimit`, readable via `!teb` on each thread); (b) if confirmed, implement per-thread stack
+    enumeration and exclusion in `classify_lazy_eligible_groups`, matching `active_rsp`'s own
+    existing exclusion pattern but for N threads instead of one; (c) separately, root-cause WHY the
+    capture-restore cycle itself gets stuck for a stack page specifically (the `PAGE_GUARD`
+    interaction theory above) even if (b) makes it moot for THIS repro, since a similarly-shaped
+    bug could still exist for a stack that's excluded from LAZY treatment but still gets touched by
+    guard-cow's OWN separate protection scheme some other way; (d) only after (a)-(c), re-attempt
+    the ORIGINAL `xfce4-session` SIGABRT, since its own real worker threads (glib's thread pool)
+    are exactly this shape -- plausible same root cause, not yet re-verified live.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the

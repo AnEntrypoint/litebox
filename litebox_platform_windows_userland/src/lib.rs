@@ -8583,6 +8583,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 //
                 // `NoReplace` is claimed for the same reason: it commits real host memory too.
                 claim_range(base_addr as usize..(base_addr as usize + size));
+                // 114th pass: heal any stale guard-cow claim this fresh allocation's own address
+                // range might have inherited -- see `heal_stale_guard_entries_in_range`'s own doc
+                // comment for the full, live-confirmed (`!address`) bug this closes.
+                crate::lazy_fork_commit::heal_stale_guard_entries_in_range(
+                    base_addr as usize..(base_addr as usize + size),
+                );
                 // DIAG (AGENTS.md pass 223): allocation-free raw print of the actual returned
                 // base_addr vs. the originally-requested suggested_range.start, specifically for
                 // Replace-mode fixed calls -- to finally observe directly whether this success
@@ -8695,6 +8701,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             "allocate_pages: claiming fresh-address (start==0 path) range"
         );
         claim_range(ptr as usize..(ptr as usize + size));
+        // 114th pass: see the identical call above (fixed-address success path) for why this is
+        // needed -- this is the OS-picks-any-address path, which is what a brand-new thread's own
+        // stack allocation (and the sigreturn trampoline's lazy `mmap`) actually goes through.
+        crate::lazy_fork_commit::heal_stale_guard_entries_in_range(
+            ptr as usize..(ptr as usize + size),
+        );
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
