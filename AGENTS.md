@@ -539,9 +539,16 @@ opening paragraph warns about).
   cannot dump). **Bisect on `.wfgy/pass114_torn_read_probe.sh` (`.wfgy/pass115_plain_repro.ps1`,
   webtop:debian-xfce; no `cdb` needed)**: eager copy (`LITEBOX_PROCESS_FORK=1` only) passes end to
   end in ~10s (`PARENT_DONE`, `RC=0`, 0 torn); lazy-only gives the known guest SIGSEGV; lazy+guard-cow
-  now has a correct child (0 torn) but the parent HANGS after the child exits (GIL futex handoffs,
-  likely a lost wakeup or a host-side touch of a page kept read-only) -- the structural limit of
-  user-mode COW. The plan (`.gm/prd.yml`: `native-kernel-cow-fork` and dependents; the shim already
+  now has a correct child (0 torn). Its parent hang was mostly a LOCK-ORDER DEADLOCK I had added
+  (`heal_stale_guard_entries_in_range` under `VIRTUAL_PROTECT_LOCK` in `allocate_pages` vs the guard
+  VEH's registry-then-protect order; proven from a `cdb -pv` stack dump, symbolized with
+  `llvm-symbolizer --relative-address`; removed, `8b982f3`; 13/20 hung before, 1/10 and 4/20 after).
+  Also fixed a `FutexManager::wait` lost-wakeup window (enqueue-before-check let a wake be spent on a
+  thread that returned EAGAIN; a wake racing a timeout was discarded). A RESIDUAL hang of ~5-17%
+  remains on the EAGER path too (all guest threads parked in `FutexManager::wait`) -- a general
+  guest lost-wakeup bug independent of fork, tracked in `.gm/prd.yml`
+  (`guest-futex-lost-wakeup-residual-hang`), highest priority for app compatibility. Guard-cow itself
+  remains the structural limit of user-mode COW. The plan (`.gm/prd.yml`: `native-kernel-cow-fork` and dependents; the shim already
   has a platform-neutral `has_native_fork`/`native_fork` path that Linux and macOS use) replaces it;
   that probe must print `PARENT_DONE torn=0` under the default fork with no flags. Both lazy flags
   stay default OFF. `DE_UP` still not reached; non-lazy is correctness-clean but RAM-crater-limited.
