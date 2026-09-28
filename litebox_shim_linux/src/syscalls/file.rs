@@ -5267,14 +5267,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .flatten()?;
                 Ok(0)
             }
-            IoctlArg::FIOCLEX => files.run_on_raw_fd(
+            IoctlArg::FIOCLEX | IoctlArg::FIONCLEX => {
+                // Descriptor-table-level flag, identical for every fd kind. `FIONCLEX` clears it;
+                // Python's `os.set_inheritable(fd, True)` (uvloop's subprocess stdio redirect)
+                // uses it and only falls back to `fcntl` on ENOTTY, so EINVAL here broke every
+                // uvloop/asyncio subprocess spawn.
+                let flags = if matches!(arg, IoctlArg::FIOCLEX) {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                };
+                files.run_on_raw_fd(
                 desc,
                 |fd| {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5287,7 +5297,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5295,7 +5305,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5303,7 +5313,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5311,7 +5321,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5319,7 +5329,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5327,7 +5337,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5335,7 +5345,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5343,7 +5353,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -5351,9 +5361,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
-                })?,
+                })?
+            }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)

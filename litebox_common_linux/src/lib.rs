@@ -1893,6 +1893,7 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
+pub const FIONCLEX: u32 = 0x5450;
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
@@ -1974,6 +1975,8 @@ pub enum IoctlArg {
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Clear close on exec
+    FIONCLEX,
     /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
     /// object IDs (two-call size-probe pattern, see [`DrmModeCardRes`]'s doc comment).
     DrmModeGetResources(UserPtrMut<DrmModeCardRes>),
@@ -4427,6 +4430,7 @@ impl SyscallRequest {
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FIONCLEX => IoctlArg::FIONCLEX,
                         DRM_IOCTL_MODE_GETRESOURCES => {
                             IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
                         }
