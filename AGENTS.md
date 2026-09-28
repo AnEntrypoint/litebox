@@ -452,7 +452,54 @@ opening paragraph warns about).
   tried and refuted in a row this pass alone. All diagnostics added (`FAULT_SCRATCH_BUF`,
   `LITEBOX_DIAG_GUARD_INSTALL_DELAY_US`, `LITEBOX_DIAG_VEH_ENTRY_MARKERS`) are committed,
   default-off, zero-effect. No fix has landed for either the confirmed trampoline-collision loop or
-  the STATUS_ACCESS_VIOLATION's own real cause. `DE_UP` not attempted this pass.
+  the STATUS_ACCESS_VIOLATION's own real cause.
+- **114th, continued (same pass) -- installed `cdb` (Debugging Tools for Windows, via `winget
+  install Microsoft.WindowsSDK.10.0.22621 --override "/features OptionId.WindowsDesktopDebuggers"`,
+  with the user's explicit go-ahead) and attempted a live, scripted, non-interactive debugger
+  session against the exact repro above -- found a genuine, real methodological obstacle rather
+  than a root cause.** `cdb -o -g -G -c "sxd av; sxd sse; g; .lastevent; ~*kb; r; q"` (debug all
+  child processes, don't break on the first-chance access-violation/single-step events this
+  mechanism generates constantly and legitimately, but ALWAYS break on a genuine second-chance/
+  unhandled one) against the SAME `pass114_torn_read_probe.sh` repro. First two attempts (both a
+  debug build, for trustworthy stacks per this file's own standing guidance, and a release build)
+  each got stuck for 60+ seconds inside the SAME trampoline-address refault loop the un-throttled
+  entry marker already found (149,334+ `Access violation - code c0000005 (first chance)`
+  notifications for one thread, still climbing when force-killed) -- neither ever reached the
+  target `STATUS_ACCESS_VIOLATION`. **This strongly suggests the trampoline-collision loop is not
+  merely intermittent (as the throttled-marker run implied) but reliably provoked by the debugger's
+  own per-exception round-trip overhead** (Windows notifies the debugger process for EVERY first-
+  chance exception on EVERY thread of a debuggee, a real kernel-mediated round trip, regardless of
+  whether the debugger acts on it) -- exactly the SAME observer-effect class already documented for
+  `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER` ("confirmed live making the RAM crater arrive
+  faster, not revealing the bug... not safe for investigating lazy-fork-commit correctness bugs").
+  **A live debugger attach is therefore NOT currently a viable tool for reaching the
+  STATUS_ACCESS_VIOLATION specifically** (as opposed to the trampoline loop, which it reaches
+  immediately and reliably) -- the debugger's own presence changes which race resolves first.
+  Considered, but declined to implement without further confirmation, a speculative fix for the
+  trampoline loop (giving `guard_cow_write_fault_veh` its own address exclusion, mirroring
+  `lazy_commit_veh`'s 104th-pass one): re-reading the write-vs-execute-fault check at that
+  function's own entry (`rec.ExceptionInformation.first().copied().unwrap_or(0) != 1`) shows it
+  should ALREADY decline the x86_64 trampoline's own EXECUTE-type deliberate trap immediately, on
+  entry, before any capture logic runs -- meaning the 149,334-entry count could be `guard_cow_
+  write_fault_veh` being invoked and correctly declining every single time, with the ACTUAL
+  redelivery loop happening in a part of the chain this function has no control over (most likely
+  the `sys_rt_sigreturn` recognition path itself, `LinuxShimEntrypoints::exception`'s x86_64
+  branch, cited in `ensure_sigreturn_trampoline`'s own doc comment -- see this same file's earlier,
+  now-refuted "main handler" correlation attempt for why that specific angle still needs its OWN
+  pid-tagged re-test, not a repeat of the same mistake). Implementing an exclusion in the wrong
+  function would cost nothing but also fix nothing; **not shipped without that confirmation**.
+  **Next pickup, precise**: (a) re-attempt the pid-tagged `vectored_exception_handler` correlation
+  from earlier in THIS pass (which was refuted for one specific run) with MULTIPLE repeats, since
+  the trampoline loop itself is now suspected to be highly reproducible -- if `vectored_exception_
+  handler`'s own entry marker, WITH pid tagging, EVER shows a trampoline-address hit belonging to
+  the SAME pid that goes on to loop/crash, that would be the missing confirmation; (b) if cdb must
+  be used again, investigate whether `.ignore_exceptions`/a narrower `sx` filter (or debugging only
+  the ONE specific known-crashing child process by pid, once identified via (a), rather than `-o`
+  attaching to every process in the tree) reduces the observer-effect enough to reach the real
+  target; (c) do not spend further effort on a blind fix for either bug until (a) or (b) yields a
+  live, confirmed mechanism -- this pass's own repeated experience (four real, plausible-looking
+  leads tried and refuted, cdb now a confirmed fifth dead end for this SPECIFIC crash) is itself
+  strong evidence that guessing further without new evidence has hit diminishing returns.
 Fully DONE (kept only as a marker so a future pass doesn't re-attempt): the minimal isolated
 cross-process AF_UNIX repro; the `Network` shared-arena redesign's `socket_set`/
 `LocalPortAllocator`/`closing_in_background`/`queued_for_closure` slice; DISPLAY/`getenv()` as the
