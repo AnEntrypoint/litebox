@@ -456,3 +456,223 @@ as more current than that paragraph):
    (`/tmp/de.log` etc.) needs its own chunked-publish design, not a widened `SharedFilePublishTable`
    cap. All three lower-urgency, not on the Xvfb/selkies boot path.
 
+## 117th pass full narrative (drained from AGENTS.md by the 118th pass)
+
+## Where things stood (117th pass)
+
+**`DE_UP` REACHED (117th pass, first ever): eager fork + `LANG=C` + event-driven cross-process wake
+(`dfdfd26`) -> `_NET_SUPPORTING_WM_CHECK` set 130 s into `.wfgy/pass117_evt_boot2` (window id
+0x60008e), 20 processes, ~8 GB private, stable, HOLD loop ran on. Browser access (selkies) and app
+acceptance are still untested -- that is the next pickup.** Earlier blockers below are historical. The last five blockers are understood:
+
+- **Eager cross-process fork (`LITEBOX_PROCESS_FORK=1` alone) is correctness-clean end to end**
+  (109th-113th: zero `not eligible` fallbacks, `xfce4-session` forks its clients with no crash; the
+  Xvfb `Cannot open display` was a harness race, fixed by a real connect probe and `xrdb -nocpp`).
+  Boot seed: `.wfgy/pass113_de_only_ready_seed.tar`. Its only blocker is RAM: every run reaches
+  `WM_POLL n=3..5` (~115-130s, 15-17 concurrent processes) before free RAM crosses the safety
+  kill-switch, just short of `xfwm4` setting the WM check property. Two runs from 6.1-6.4 GB free
+  cratered at the same point; it needs more like 8-10 GB free sustained or a real cut in per-process
+  cost (Track B item 1). **Per-process cost is not decomposed** (~350 MB-1.1 GB working set each);
+  candidates: writable-layer import per child (`litebox_runner_linux_on_windows_userland/src/lib.rs`
+  ~2600, copies the whole layer into each child's in-memory fs), rootfs index, guest-memory
+  emulation. A 5-process `bash`+`sleep` test is only ~76 MB/process, so the big cost is specific to
+  real desktop processes -- measure it (Xvfb under eager fork) before guessing. Measured 117th pass (eager boot from the ready seed,
+  `.wfgy/pass117_eager_boot.ps1`, 8 GB free at start): the boot ran 152 s and hit the kill switch at 18
+  processes with ~11 GB private commit (~600 MB/process; `procs=5` -> 2 GB, `12` -> 6 GB, `17` ->
+  8.8 GB), reaching `WM_POLL n=5` again. `LITEBOX_DIAG_MEM_BREAKDOWN=1` (new, default off,
+  `diag_private_memory_breakdown`, `[mem_breakdown]` lines, called in the fork child at each boot
+  phase and in the parent at spawn) shows each child holds ~3.4 GB `MEM_MAPPED` read-only (the
+  layer tars, shared page cache, NOT commit) plus ~250 MB private, of which ONE 173 MB region at
+  guest address `0x7feff05a0000` is present in EVERY child right after `Platform::new()`, even
+  `rm`/`mkdir`. The same image with `sleep 1 & wait` as the script (with or without the seed and
+  `GLIBC_TUNABLES`) gives only 72-76 MB per child, and `debian:stable-slim` 74 MB, so the 173 MB is
+  neither the rootfs index (+2 MB) nor the seed.
+  **ROOT-CAUSED (117th)**: it is glibc's `/usr/lib/locale/locale-archive` (181,493,744 B = 173 MB,
+  webtop image), mapped whole by `setlocale` for ANY non-`C` locale -- even `C.UTF-8`, because glibc
+  looks the name up in the archive first. `de_only.sh` exports `LANG=en_US.UTF-8`; bash re-runs
+  `setlocale` on that assignment. The shim's file-mapping fast path (`try_cow_mmap_file`,
+  `LITEBOX_COW_MMAP`) is deliberately OFF (lossy partial-unmap zero-fill; `--oci-image` layer bytes
+  are heap-owned), so the mapping is a `memcpy` into 173 MB of private commit in every process, and
+  every fork child eagerly copies it again: ~430 MB/process of the ~600 MB. **Fix for the boot:
+  run with `--env LANG=C`** (and `export LANG=C` in `de_only.sh`/`webtop_stack.sh`; seed
+  `.wfgy/pass117_seed.tar`, driver `.wfgy/pass117_eager_boot.ps1`). Verified: root bash private
+  506 MB -> 76 MB, region gone. The general defect (any large read-only private file mapping is
+  committed per process and per fork) is tracked in `.gm/prd.yml` `file-backed-private-mmap-no-commit`
+  and needs lossless partial-unmap recovery plus 64 KiB-aligned or platform-placed views. Full boot
+  with `LANG=C` (`.wfgy/pass117_lang_boot1`): **first non-lazy boot ever to run its whole 300 s window
+  with no RAM crater** -- 20 processes, ~8 GB private commit, 3.7-4.4 GB free throughout. Every
+  desktop client launched (`xfwm4`, `xfsettingsd`, `xfce4-panel`, `xfdesktop`, Thunar, at-spi,
+  `ssh-agent`, `gpg-agent`). `DE_UP` still NOT reached: `xfwm4` never set
+  `_NET_SUPPORTING_WM_CHECK` in 300 s. Its syscall trace (`LITEBOX_DIAG_SYSCALL_TIMELINE=xfwm4`,
+  `.wfgy/pass117_lang_boot2.err.log`, 121k syscalls, 4 threads) shows it ALIVE and busy, not
+  hung: synchronous X request/reply loops (`writev`, `ppoll`, `recvmsg`) plus ~2,900 small-file
+  opens (themes/pixmaps); it only exited (status 1) when the harness killed Xvfb at 312 s. So the
+  open question is SPEED, not a deadlock: ~400 syscalls/s (with tracing) is far below native.
+  Next: run untraced for >=15 min (driver's window is now 700 polls, the seed's guest poll loop
+  150) with >=6 GB free, then profile where xfwm4's wall time goes (X server under litebox,
+  per-syscall cost, per-request round trip). A 15-min run was cut at 130 s by host memory
+  pressure (free fell from 4.4 to <0.7 GB with other host apps resident).
+- **Lazy fork (`LITEBOX_LAZY_FORK_COMMIT`/`_GUARD_COW`, default OFF) cannot be made correct and is not
+  a RAM win: do not patch it further.** A lazy child faults its memory in from the PARENT process; a
+  daemonizer (fork, parent exits) leaves the child with zero-filled pages (`lazy_fork_commit.rs`
+  unreadable-parent branch). Repro `.wfgy/pass116_orphan.ps1` (lazy dies 5/5, eager correct 3/3);
+  this is the real cause of the `ssh-agent` SIGABRT (guest pid 51, comm now visible after the 114th
+  comm-inheritance fix) and the dbus SIGSEGVs. Small A/B (`.wfgy/pass116_ramab.ps1`): 381 MB eager vs
+  380 MB lazy, no saving. The fix is native kernel-COW fork on Windows through the shim's existing
+  platform-neutral `has_native_fork`/`native_fork` path (Linux/macOS already use it) -- PRD row
+  `native-kernel-cow-fork`; the spike must be written by a human (my attempt was blocked by policy).
+- **Fixed in the 116th pass, all live-verified**: new-thread stack left `PAGE_READONLY` by guard-cow
+  (`702c735`, root of the 114th-115th `STATUS_ACCESS_VIOLATION`/bare SIGKILL); `allocate_pages`
+  lock-order deadlock (`8b982f3`); `FutexManager::wait` wasted-wake window (`8b982f3`); wait/wake
+  Dekker StoreLoad lost wakeup, present on x86 too (`182819d`, probe 50/50 vs 13/20 hung before);
+  last-chance minidump filter (`866ebcd`); SeqCst fences after the `WAITING`/`RUNNING_IN_GUEST`
+  stores (`7b4cba9`, type-checked only; `ThreadHandle::interrupt`/`LoanList` audited, futex side
+  already ordered).
+- **Environment limit, 2026-09-28**: this host (15.6 GB) had 0.3-1.7 GB free with Chrome/Discord
+  resident; no desktop boot or release build was possible. A boot needs ~5 GB free for its whole
+  length; never close the user's applications to get it.
+
+- **Cross-process unix-socket wake is now event-driven (117th, `dfdfd26`)**: it used to be NO wake at
+  all -- every blocked read/poll on a shared connection waited out `SHARED_UNIX_POLL_INTERVAL`
+  (15 ms), so an X11 round trip cost ~15-30 ms and `xfwm4`'s ~7,000 round trips alone took minutes.
+  A send/recv/close on a shared slot now sets the peer host's existing wake event
+  (`wake_signal_listener`, handle-cached), the listener (`drain_host`, `xproc.rs`) bumps
+  `litebox::event::polling::bump_external_wake_epoch` (a `wait_on_events` waiter treats a changed
+  epoch as "re-run `try_op`") and wakes waiting threads (`ThreadHandle::wake_if_waiting`; poll/ppoll
+  re-scan on any wake). Measured `.wfgy/pass117_pingpong.sh`-style socketpair ping-pong across a
+  cross-process fork: 19.9 ms -> 0.05 ms per round trip. Lesson: a bare `Waker::wake` does NOT
+  make a `wait_on_events` waiter retry (its ready-check is the observer flag) -- it needs the epoch.
+  Still to do: rendezvous (`accept`/`connect`) and pty waits still poll; cross-process PIPES hang
+  when the parent keeps both ends open (PRD `cross-process-pipes-not-shared`); a
+  `connect()`/`accept()`-made local pair carried over fork gives EPIPE (PRD
+  `shared-unix-bound-socket-fork-broken-pipe`). Full boot with this build: not yet run.
+
+- **Browser path reached (117th, later)**: real Chrome (gm `cdp`, session `p117-browser`) loads selkies'
+  own web UI from the guest over `--publish 8081:8081` and receives live video ("Stream started", first
+  stripe decoded ~18 s after connect; `.gm/witness/p117_stream_try5.png`, black because that probe ran
+  Xvfb only). Needed, all committed: socket buffers in shared-arena pools (`a596c03`), only the
+  gateway-owning process polls the interface (`92a2d0e`), `/etc/hosts` + `IPV6_V6ONLY` (`8d13f7d`),
+  `FIONCLEX` (`d9027c5`, `os.set_inheritable(True)` used to fail EINVAL and break every uvloop
+  subprocess incl. selkies' `pgrep`), registry timeouts/retries + cached layer list (`e35a36a`+next).
+  Harness facts (all in the untracked `.wfgy/`): selkies 2.0 needs `--enable-basic-auth=false` and
+  `--addr=0.0.0.0` (not `localhost`); pass `--env LC_ALL=C` (Python otherwise maps the 173 MB
+  locale archive: selkies 1,211 -> 626 MB); a child process's output only reaches a redirected stdout
+  when the child writes the inherited handle directly (no pipe): pipes deliver at writer EXIT
+  (PRD `cross-process-pipe-streaming-blocked-by-sibling-bridge`); use `cmd /c "runner ... < in > out"`
+  drivers, and `exec selkies` as the main guest process to read its log.
+  **Full stack (Xvfb+selkies+DE+nginx) still cannot finish under ~7 GB free**: ~600 MB Xvfb (117 MB
+  memcpy'd library mapping + heap arenas), ~626 MB selkies, ~100 MB per other process. The general
+  fix is file-backed mappings that are shared, not copied (PRD `file-backed-private-mmap-no-commit`).
+  `LITEBOX_DIAG_MEM_BREAKDOWN=1` + `LITEBOX_DIAG_MEM_BREAKDOWN_LATE=<secs>` prints each process's
+  regions at start and N s later.
+
+**Next pickup, in order**: (1) with >=8 GB free run `de_only.sh` from the ready seed under eager fork
+and reach `DE_UP`; (2) decompose per-process memory (sample `PrivateMemorySize64` per runner against
+a `VirtualQuery` breakdown) and cut the biggest piece; (3) app acceptance from a real browser
+(terminal, Thunar, Mousepad, settings, panel, Ristretto, a web browser; second client and reconnect)
+on Windows, then Linux/macOS builds; (4) native kernel-COW fork, then retire `lazy_fork_commit.rs`.
+The PRD (`.gm/prd.yml`, gitignored) carries the full task list.
+
+## 118th pass -- session-client death cascade, full iterative narrative
+
+**Bigger, better-evidenced finding this pass, NOT yet root-caused: `xfce4-session` self-terminates
+minutes into a stable run, cascading to kill every client it started.** The original driver
+(`de_only.sh`) trims the Failsafe session to just `xfwm4`+`xfsettingsd` (82nd-pass "Angle B", real
+and intentional for that narrower investigation) -- removing that trim in `pass118_full.sh` (no
+`xfce4-session.xml` override) makes the REAL 5-client Failsafe session run, and **all five clients
+launch successfully**: `xfwm4`, `xfsettingsd`, `xfce4-panel` (with two `wrapper-2.0` plugin hosts),
+`Thunar` (`thunar-real`), `xfdesktop` -- confirmed via `DIAG_TIMELINE execve` for every one of them
+(`.wfgy/pass118_full7.err.log`, `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`). But `xfce4-session`
+itself (pid 28 in that run) later calls a plain `exit_group(status=1)` right after an ordinary
+`recvmsg` on its own fd 3 returns successfully -- no crash, no signal, no error logged anywhere in
+its own trace immediately before. **Root mechanism narrowed further** (`.wfgy/pass118_full8.*`,
+`LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session,xfwm4,xfsettingsd,xfce4-panel,Thunar,thunar-real,
+xfdesktop,wrapper-2.0,dbus-daemon` -- traces every session client, not just the manager): the deaths
+are NOT simultaneous, they are a STAGGERED CASCADE, and `xfce4-session` itself dies LAST, not first --
+sorting every traced `exit_group` by its own numeric timestamp gives a clean, consistent order:
+`xfdesktop`(t=581s) -> `thunar-real`(592s) -> `xfce4-panel`(604s) -> `xfsettingsd`(613s) ->
+`xfwm4`(626s) -> `xfce4-session`(684s), each roughly 10-45s after the previous. Every single one of
+these six deaths shares the IDENTICAL immediate shape: an ordinary `recvmsg(sockfd=3, ...)` that
+returns successfully (`ok=true`), immediately followed by `exit_group(status=1)` -- no error, no
+signal, nothing else in that thread's own trace between the two. Traced `fd 3`'s origin for
+`xfdesktop` specifically: `socket(AF_UNIX)` + `connect()` (first attempt `addrlen=25` fails, second
+`addrlen=20` succeeds) right after its dynamic-linker phase -- this is each client's own X11 display
+connection, opened once at GTK/Xlib startup and read from for its whole life via `recvmsg`, not a
+per-request socket. **The shape (a normal-looking read that returns OK immediately followed by a
+clean `exit(1)`) matches Xlib's own default `_XIOError` handler** ("X connection ... broken", called
+when the X connection unexpectedly delivers EOF or a protocol violation) far better than a crash or
+an explicit kill -- if so, the real question is why each client's X11 connection independently goes
+bad, staggered over ~100s, roughly (but not exactly -- `xfce4-panel` before `xfsettingsd`, not launch
+order) in reverse-priority order. Timing is not fixed across runs (~170s/~285s/~470-490s/~581-684s
+seen); **ruled out**: the harness's own periodic `xprop -root` polling (removed entirely in
+`.wfgy/pass118_noxprop.sh` -- still died, just later), RAM pressure (rock-stable 4.4-4.5GB free
+through one death with zero dip), and `SharedUnixAddrPresenceTable` exhaustion (`unix.rs:2988`,
+`UNIX_ADDR_PRESENCE_CAPACITY = 256` -- only 68 traced `connect()`/73 `socket()` calls total across
+the whole run for these 9 comms, nowhere near 256, and that table indexes bound/listening addresses
+per RFC, not per-client connections, so ordinary GUI clients barely touch it). **One still-open,
+unconfirmed lead from an earlier (xprop-polling) run**: a SECOND `xfwm4` instance appeared
+~40-70s before ITS death (`xfwm4-WARNING: Another compositing manager is running on screen 0`, a
+distinct pid) -- i.e. `xfce4-session` had already respawned a client that died earlier still, meaning
+the visible cascade order above may itself be downstream of an even earlier, unlogged first death.
+Every guest app IS reachable and does launch given the real (untrimmed) session config -- the
+"apps must work" gap is entirely this later self-termination cascade, not a launch failure.
+**The death order is deterministic, not racy, and reproduces across every run** (3/3 traced runs,
+`.wfgy/pass118_full{8,9}.*`): always `xfdesktop` -> `thunar-real` -> `xfce4-panel` -> `xfsettingsd`
+-> `xfwm4` -> `xfce4-session` -- the EXACT REVERSE of their launch order (xfwm4=Client0 launches
+first, xfdesktop=Client4 launches last). `xfce4-session` itself is confirmed to send NO explicit
+`kill`/`tgkill`/`tkill` syscall to any of them (grepped its whole traced syscall stream, zero hits)
+-- so this is not xfce4-session deliberately terminating its own session in reverse-priority order;
+each client is independently reaching the same fate on its own. Combined with the reverse-launch
+ordering, this fits "each client independently dies after being idle/alive for very close to the
+SAME duration since ITS OWN startup" (they all launch within ~0.3s of each other in real time, so
+comparing their own per-process-relative elapsed-time clocks -- which each reset to ~0 at that
+client's own start, the standing `init_logging()` caveat -- is valid to within that same ~0.3s
+slop). But the actual duration is NOT a fixed constant: 3 traced runs died at respectively ~170s,
+~580-684s, and ~773-882s since session start, more than a 4x spread, so if there IS a shared
+per-client "idle timeout" mechanism, its effective duration is load/real-time dependent, not a
+compiled-in constant -- consistent with a litebox scheduling/timing artifact (e.g. a guest
+timerfd/nanosleep-based watchdog whose real wall-clock firing time depends on host CPU contention)
+more than a real GLib/Xlib application-level timeout, which would fire far more consistently.
+**RESOLVED to a genuine EOF on the X11 socket** (`.wfgy/pass118_full10.*`): `litebox_diag::socket_read`
+did not cover `recvmsg` at all (only `read`/`readv`, `syscalls/file.rs`) -- FIXED this pass
+(`25c2453`, `litebox_shim_linux/src/syscalls/net.rs`'s `do_recvmsg`, mirrors the existing
+`file.rs` hook exactly), and with it working, `xfdesktop`'s (pid 156, this run) very last `recvmsg`
+on its X connection (fd 3) is `size=0 preview="[]"` -- a real, clean EOF -- immediately before its
+`exit_group(1)`. This is EXACTLY Xlib's own default `_XIOError` behavior ("X connection ... broken")
+firing on unexpected connection loss, not a corrupted/truncated message or a guest protocol bug.
+Every OTHER `recvmsg` in the preceding ~750s is a size=32, byte-identical payload
+(`96 00 cf 02 03 00 80 00 03 00 80 00 ...` -- `0x96 & 0x7f = 0x16 = 22` decimal = X11 core event
+code `PropertyNotify`) arriving at an exact, fixed 60-second period -- a real but UNRELATED periodic
+event (very likely a clock/taskbar-widget touching a root-window property once a minute), ruled out
+as the trigger since the final EOF lands ~35s after the last one of these, not on its own 60s
+boundary. **So the open question is now precisely**: why does Xvfb (or litebox's own AF_UNIX
+relay/connection-carrying layer) close THIS client's connection. Xvfb's own guest stdout has zero
+disconnect/error/client-related output at any point in the run, and a broad keyword search
+(`shutdown`, `ESHUTDOWN`, `queued_for_closure`, `SharedUnixConnectQueue`, `dead.?owner`, `reclaim`)
+across the WHOLE traced log turned up nothing -- the teardown is genuinely silent in the current
+code, meaning it is either an intentional-but-unlogged path or a real bug with no diagnostic
+covering it yet. Added logging (`10b2636`/`ba4ff9d`, `litebox_diag::unix_conn_teardown`, `unix.rs`) at
+BOTH real teardown call sites -- `SharedView::release_holder` (a holding process's fd/table drop)
+and `SharedView::shutdown_write` (an explicit `shutdown(fd, SHUT_WR)`) -- and re-ran the full
+capture **three more times** (`.wfgy/pass118_full{11,12,13}.*`; the 12th ran the full 900s with NO
+death at all, confirming the death is genuinely intermittent/load-dependent, not a guaranteed
+per-boot event). **Neither hook fired at or before `xfdesktop`'s own death time in any of the three
+captures** -- the only `unix_conn_teardown` lines near each death are `xfdesktop`'s OWN process
+exiting a fraction of a second later and releasing ITS OWN held slots as ordinary cleanup, not
+something happening TO it beforehand. **Real remaining lead, from reading `recv()`'s own body**
+(`unix.rs`, `SharedView::recv`): the EOF is synthesized by `peer_gone()`, which checks
+`slot_ref.side_gone(!self.is_client, ...)` FRESH on every call, not by any event delivered at read
+time -- so the ACTUAL moment the peer side "went away" could have happened much EARLIER in the
+run and simply gone unnoticed (and unlogged by anything gated on the read/recv path) until this
+read finally happens to check again. Neither of the two teardown hooks would necessarily fire
+"close to" the observed death time at all if this is what's happening. **Next session, concretely**:
+(1) capture the SLOT NUMBER alongside the `recvmsg` payload trace (net.rs's `do_recvmsg` diagnostic
+does not currently have access to the underlying `UnixSocket`'s slot -- needs plumbing through, or
+a lower-level hook directly in `SharedView::recv`/`peer_gone` instead of `net.rs`) so a capture can
+directly correlate "this fd's connection is slot N" against "slot N's side went away at time T",
+however much earlier T is; (2) with that correlation, check whether the responsible slot's `side_gone`
+transition traces back to Xvfb's own process, or to some OTHER, unexpected host process ever having
+briefly held (and released) that slot -- a bug in how connections get attributed to holders would
+explain an early, silent, unnoticed release far better than anything actually wrong with Xvfb
+itself, which by every account (its own log, the periodic legitimate `PropertyNotify` traffic
+still flowing right up to 35s before the end) stays healthy and correct throughout.

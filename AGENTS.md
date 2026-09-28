@@ -87,107 +87,46 @@ bare JS) to rule that out for certain, or set a breakpoint / read the unminified
 not yet checked) for what condition actually gates `videoCanvas`'s `display` and why it doesn't
 flip after the click.
 
-**Bigger, better-evidenced finding this pass, NOT yet root-caused: `xfce4-session` self-terminates
-minutes into a stable run, cascading to kill every client it started.** The original driver
-(`de_only.sh`) trims the Failsafe session to just `xfwm4`+`xfsettingsd` (82nd-pass "Angle B", real
-and intentional for that narrower investigation) -- removing that trim in `pass118_full.sh` (no
-`xfce4-session.xml` override) makes the REAL 5-client Failsafe session run, and **all five clients
-launch successfully**: `xfwm4`, `xfsettingsd`, `xfce4-panel` (with two `wrapper-2.0` plugin hosts),
-`Thunar` (`thunar-real`), `xfdesktop` -- confirmed via `DIAG_TIMELINE execve` for every one of them
-(`.wfgy/pass118_full7.err.log`, `LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session`). But `xfce4-session`
-itself (pid 28 in that run) later calls a plain `exit_group(status=1)` right after an ordinary
-`recvmsg` on its own fd 3 returns successfully -- no crash, no signal, no error logged anywhere in
-its own trace immediately before. **Root mechanism narrowed further** (`.wfgy/pass118_full8.*`,
-`LITEBOX_DIAG_SYSCALL_TIMELINE=xfce4-session,xfwm4,xfsettingsd,xfce4-panel,Thunar,thunar-real,
-xfdesktop,wrapper-2.0,dbus-daemon` -- traces every session client, not just the manager): the deaths
-are NOT simultaneous, they are a STAGGERED CASCADE, and `xfce4-session` itself dies LAST, not first --
-sorting every traced `exit_group` by its own numeric timestamp gives a clean, consistent order:
-`xfdesktop`(t=581s) -> `thunar-real`(592s) -> `xfce4-panel`(604s) -> `xfsettingsd`(613s) ->
-`xfwm4`(626s) -> `xfce4-session`(684s), each roughly 10-45s after the previous. Every single one of
-these six deaths shares the IDENTICAL immediate shape: an ordinary `recvmsg(sockfd=3, ...)` that
-returns successfully (`ok=true`), immediately followed by `exit_group(status=1)` -- no error, no
-signal, nothing else in that thread's own trace between the two. Traced `fd 3`'s origin for
-`xfdesktop` specifically: `socket(AF_UNIX)` + `connect()` (first attempt `addrlen=25` fails, second
-`addrlen=20` succeeds) right after its dynamic-linker phase -- this is each client's own X11 display
-connection, opened once at GTK/Xlib startup and read from for its whole life via `recvmsg`, not a
-per-request socket. **The shape (a normal-looking read that returns OK immediately followed by a
-clean `exit(1)`) matches Xlib's own default `_XIOError` handler** ("X connection ... broken", called
-when the X connection unexpectedly delivers EOF or a protocol violation) far better than a crash or
-an explicit kill -- if so, the real question is why each client's X11 connection independently goes
-bad, staggered over ~100s, roughly (but not exactly -- `xfce4-panel` before `xfsettingsd`, not launch
-order) in reverse-priority order. Timing is not fixed across runs (~170s/~285s/~470-490s/~581-684s
-seen); **ruled out**: the harness's own periodic `xprop -root` polling (removed entirely in
-`.wfgy/pass118_noxprop.sh` -- still died, just later), RAM pressure (rock-stable 4.4-4.5GB free
-through one death with zero dip), and `SharedUnixAddrPresenceTable` exhaustion (`unix.rs:2988`,
-`UNIX_ADDR_PRESENCE_CAPACITY = 256` -- only 68 traced `connect()`/73 `socket()` calls total across
-the whole run for these 9 comms, nowhere near 256, and that table indexes bound/listening addresses
-per RFC, not per-client connections, so ordinary GUI clients barely touch it). **One still-open,
-unconfirmed lead from an earlier (xprop-polling) run**: a SECOND `xfwm4` instance appeared
-~40-70s before ITS death (`xfwm4-WARNING: Another compositing manager is running on screen 0`, a
-distinct pid) -- i.e. `xfce4-session` had already respawned a client that died earlier still, meaning
-the visible cascade order above may itself be downstream of an even earlier, unlogged first death.
-Every guest app IS reachable and does launch given the real (untrimmed) session config -- the
-"apps must work" gap is entirely this later self-termination cascade, not a launch failure.
-**The death order is deterministic, not racy, and reproduces across every run** (3/3 traced runs,
-`.wfgy/pass118_full{8,9}.*`): always `xfdesktop` -> `thunar-real` -> `xfce4-panel` -> `xfsettingsd`
--> `xfwm4` -> `xfce4-session` -- the EXACT REVERSE of their launch order (xfwm4=Client0 launches
-first, xfdesktop=Client4 launches last). `xfce4-session` itself is confirmed to send NO explicit
-`kill`/`tgkill`/`tkill` syscall to any of them (grepped its whole traced syscall stream, zero hits)
--- so this is not xfce4-session deliberately terminating its own session in reverse-priority order;
-each client is independently reaching the same fate on its own. Combined with the reverse-launch
-ordering, this fits "each client independently dies after being idle/alive for very close to the
-SAME duration since ITS OWN startup" (they all launch within ~0.3s of each other in real time, so
-comparing their own per-process-relative elapsed-time clocks -- which each reset to ~0 at that
-client's own start, the standing `init_logging()` caveat -- is valid to within that same ~0.3s
-slop). But the actual duration is NOT a fixed constant: 3 traced runs died at respectively ~170s,
-~580-684s, and ~773-882s since session start, more than a 4x spread, so if there IS a shared
-per-client "idle timeout" mechanism, its effective duration is load/real-time dependent, not a
-compiled-in constant -- consistent with a litebox scheduling/timing artifact (e.g. a guest
-timerfd/nanosleep-based watchdog whose real wall-clock firing time depends on host CPU contention)
-more than a real GLib/Xlib application-level timeout, which would fire far more consistently.
-**RESOLVED to a genuine EOF on the X11 socket** (`.wfgy/pass118_full10.*`): `litebox_diag::socket_read`
-did not cover `recvmsg` at all (only `read`/`readv`, `syscalls/file.rs`) -- FIXED this pass
-(`25c2453`, `litebox_shim_linux/src/syscalls/net.rs`'s `do_recvmsg`, mirrors the existing
-`file.rs` hook exactly), and with it working, `xfdesktop`'s (pid 156, this run) very last `recvmsg`
-on its X connection (fd 3) is `size=0 preview="[]"` -- a real, clean EOF -- immediately before its
-`exit_group(1)`. This is EXACTLY Xlib's own default `_XIOError` behavior ("X connection ... broken")
-firing on unexpected connection loss, not a corrupted/truncated message or a guest protocol bug.
-Every OTHER `recvmsg` in the preceding ~750s is a size=32, byte-identical payload
-(`96 00 cf 02 03 00 80 00 03 00 80 00 ...` -- `0x96 & 0x7f = 0x16 = 22` decimal = X11 core event
-code `PropertyNotify`) arriving at an exact, fixed 60-second period -- a real but UNRELATED periodic
-event (very likely a clock/taskbar-widget touching a root-window property once a minute), ruled out
-as the trigger since the final EOF lands ~35s after the last one of these, not on its own 60s
-boundary. **So the open question is now precisely**: why does Xvfb (or litebox's own AF_UNIX
-relay/connection-carrying layer) close THIS client's connection. Xvfb's own guest stdout has zero
-disconnect/error/client-related output at any point in the run, and a broad keyword search
-(`shutdown`, `ESHUTDOWN`, `queued_for_closure`, `SharedUnixConnectQueue`, `dead.?owner`, `reclaim`)
-across the WHOLE traced log turned up nothing -- the teardown is genuinely silent in the current
-code, meaning it is either an intentional-but-unlogged path or a real bug with no diagnostic
-covering it yet. Added logging (`10b2636`/`ba4ff9d`, `litebox_diag::unix_conn_teardown`, `unix.rs`) at
-BOTH real teardown call sites -- `SharedView::release_holder` (a holding process's fd/table drop)
-and `SharedView::shutdown_write` (an explicit `shutdown(fd, SHUT_WR)`) -- and re-ran the full
-capture **three more times** (`.wfgy/pass118_full{11,12,13}.*`; the 12th ran the full 900s with NO
-death at all, confirming the death is genuinely intermittent/load-dependent, not a guaranteed
-per-boot event). **Neither hook fired at or before `xfdesktop`'s own death time in any of the three
-captures** -- the only `unix_conn_teardown` lines near each death are `xfdesktop`'s OWN process
-exiting a fraction of a second later and releasing ITS OWN held slots as ordinary cleanup, not
-something happening TO it beforehand. **Real remaining lead, from reading `recv()`'s own body**
-(`unix.rs`, `SharedView::recv`): the EOF is synthesized by `peer_gone()`, which checks
-`slot_ref.side_gone(!self.is_client, ...)` FRESH on every call, not by any event delivered at read
-time -- so the ACTUAL moment the peer side "went away" could have happened much EARLIER in the
-run and simply gone unnoticed (and unlogged by anything gated on the read/recv path) until this
-read finally happens to check again. Neither of the two teardown hooks would necessarily fire
-"close to" the observed death time at all if this is what's happening. **Next session, concretely**:
-(1) capture the SLOT NUMBER alongside the `recvmsg` payload trace (net.rs's `do_recvmsg` diagnostic
-does not currently have access to the underlying `UnixSocket`'s slot -- needs plumbing through, or
-a lower-level hook directly in `SharedView::recv`/`peer_gone` instead of `net.rs`) so a capture can
-directly correlate "this fd's connection is slot N" against "slot N's side went away at time T",
-however much earlier T is; (2) with that correlation, check whether the responsible slot's `side_gone`
-transition traces back to Xvfb's own process, or to some OTHER, unexpected host process ever having
-briefly held (and released) that slot -- a bug in how connections get attributed to holders would
-explain an early, silent, unnoticed release far better than anything actually wrong with Xvfb
-itself, which by every account (its own log, the periodic legitimate `PropertyNotify` traffic
-still flowing right up to 35s before the end) stays healthy and correct throughout.
+**Real, unresolved bug found this pass: every session client's X11 connection eventually gets a
+genuine EOF and dies via Xlib's default `_XIOError` handler, in a reproducible-but-intermittent
+cascade.** With `de_only.sh`'s 82nd-pass session-client trim removed (`pass118_full.sh`, no
+`xfce4-session.xml` override), the real 5-client Failsafe session runs and **every client launches
+successfully** -- `xfwm4`, `xfsettingsd`, `xfce4-panel` (+2 `wrapper-2.0` plugin hosts), `Thunar`
+(`thunar-real`), `xfdesktop`, all confirmed via `DIAG_TIMELINE execve`. So "apps must work" is a
+launch success; the gap is what happens next. Across 6 traced full-stack captures
+(`.wfgy/pass118_full{7,8,9,10,11,12,13}.*`), clients later die in a REPRODUCIBLE order -- always
+`xfdesktop` first, then `thunar-real`, `xfce4-panel`, `xfsettingsd`, `xfwm4`, `xfce4-session` last
+(the exact reverse of launch order) -- but at a wildly variable TIME (~170s to ~1525s since session
+start across runs; one 900s run had zero deaths at all, confirming this is intermittent, not a
+guaranteed per-boot event). Root-caused as far as: (1) `litebox_diag::socket_read` never covered
+`recvmsg` (only `read`/`readv`) -- fixed (`25c2453`, `net.rs`'s `do_recvmsg`); with it working,
+`xfdesktop`'s very last `recvmsg` on its X11 connection (fd 3) is a genuine `size=0` EOF immediately
+before its own `exit_group(1)` -- exactly Xlib's default `_XIOError` behavior on an unexpectedly
+lost connection, not a truncated/corrupted message. A periodic, byte-identical `size=32` payload
+(X11 `PropertyNotify`, event code 0x16) arriving every exact 60s throughout the run is real but
+unrelated traffic, ruled out as the trigger. (2) Added `litebox_diag::unix_conn_teardown` logging
+at BOTH real connection-teardown call sites in `unix.rs` (`SharedView::release_holder` -- a holding
+process's fd/table drop -- and `SharedView::shutdown_write` -- an explicit `shutdown(SHUT_WR)`)
+(`10b2636`, `ba4ff9d`); across 3 more captures, NEITHER fires at or before the death -- the only
+teardown lines near each death are the dying process's own cleanup a fraction of a second AFTER
+its own exit, not a cause. **Real lead, unexercised**: `SharedView::recv` synthesizes EOF via
+`peer_gone()`, which checks `slot_ref.side_gone(...)` freshly on every call rather than reacting to
+a delivered event -- so the actual moment the peer side "went away" could have happened much
+earlier in the run and gone completely unnoticed (and unlogged, since both existing hooks gate on
+the write-ring-shutdown action itself, not on `side_gone` becoming true) until a read finally
+happens to check again. **Next session, concretely**: capture the SLOT NUMBER alongside the
+`recvmsg` payload trace (`net.rs`'s `do_recvmsg` has no access to the underlying `UnixSocket`'s
+slot today -- needs plumbing through, or a lower-level hook directly in `SharedView::recv`/
+`peer_gone`) so a capture can correlate "this fd is slot N" against "slot N's side went away at
+time T", however much earlier T turns out to be; then check whether that transition traces back to
+Xvfb's own process exiting/erroring, or to some OTHER, unexpected host process ever briefly holding
+(and releasing) that slot -- the latter would point at a real holder-attribution bug in the
+cross-process AF_UNIX carrying machinery, not anything wrong with Xvfb itself (which stays healthy
+throughout by every account: its own log is silent, and legitimate `PropertyNotify` traffic keeps
+flowing right up to ~35s before each death). Full iterative narrative (every intermediate hypothesis
+tried, tested and ruled out in order -- xprop-polling churn, RAM pressure, `SharedUnixAddrPresence
+Table` exhaustion, an explicit-kill/reverse-priority-shutdown theory, a fixed idle-timeout theory):
+`docs/AGENTS_ARCHIVE_2026-09-28.md`'s "118th pass -- session-client death cascade" section.
 
 **A real earlier concurrent-boot collision**: `acquire_boot_lock()`'s single host-wide lockfile
 (`litebox_runner_linux_on_windows_userland/src/lib.rs:495`) correctly refused a second boot while an
