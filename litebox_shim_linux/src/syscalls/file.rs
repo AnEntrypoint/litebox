@@ -1060,6 +1060,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             DupFdRequest::LowestAtOrAbove(0),
                         )
                         .map_err(|_| Errno::EMFILE)?;
+                    let access = flags & ACCESS_MODE_MASK;
+                    if access != OFlags::RDWR {
+                        let files = self.files.borrow();
+                        let _ = files.run_on_raw_fd(
+                            new_fd,
+                            |typed| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .set_fd_metadata(typed, ReopenedAccess(access));
+                            },
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                        );
+                    }
                     Ok(u32::try_from(new_fd).unwrap())
                 }
                 // Sockets, epoll and other descriptors with no filesystem name cannot be reopened.
@@ -2095,6 +2117,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    if let Ok(narrowed) = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |ReopenedAccess(a)| *a)
+                        && narrowed == OFlags::empty()
+                    {
+                        return Err(Errno::EBADF);
+                    }
                     let r = files.fs.write(fd, buf, offset).map_err(Errno::from);
                     if let Ok(n) = r
                         && n > 0
@@ -2395,6 +2426,17 @@ pub(crate) struct DriFd;
 /// must never register a `memfds` entry -- this tag is what keeps the two cases apart.
 #[derive(Clone, Copy)]
 pub(crate) struct MemfdMarker;
+
+/// Per-fd metadata: the access mode (`O_RDONLY`/`O_WRONLY`, as [`OFlags`]) a descriptor was
+/// REOPENED with via `open("/proc/self/fd/N", ...)` on a file that has no name to reopen by (a
+/// `memfd`). The reopen shares the underlying file, so this records the narrower access the new
+/// descriptor was promised: `F_GETFL` reports it, and `write`/`mmap(PROT_WRITE, MAP_SHARED)` honor
+/// it. Chromium's read-only shared-memory regions depend on exactly this (it verifies the
+/// read-only fd cannot be mapped writable, and aborts if it can).
+#[derive(Clone, Copy)]
+pub(crate) struct ReopenedAccess(pub OFlags);
+
+const ACCESS_MODE_MASK: OFlags = OFlags::WRONLY.union(OFlags::RDWR);
 
 /// Per-fd metadata (see [`litebox::fd::Descriptors::set_fd_metadata`]'s fd-vs-entry distinction)
 /// tagged onto a fd freshly opened by `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- carries the fake
@@ -4119,7 +4161,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // blocking. `stdio::tests::test_stdio_flags_with_dup` asserts exactly
                             // this round-trip and had been failing it invisibly -- the test binary
                             // was crashing before the failure could be reported.
-                            let open_flags = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                            let mut open_flags = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                            if let Ok(narrowed) = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |ReopenedAccess(a)| *a)
+                            {
+                                open_flags = (open_flags & ACCESS_MODE_MASK.complement()) | narrowed;
+                            }
                             let set = self
                                 .global
                                 .litebox

@@ -1513,6 +1513,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
+        // A descriptor reopened read-only (`open("/proc/self/fd/N", O_RDONLY)` on a memfd) must
+        // not yield a writable shared mapping -- the whole point of such a reopen.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && flags.contains(MapFlags::MAP_SHARED)
+            && prot.contains(ProtFlags::PROT_WRITE)
+            && let Ok(raw) = usize::try_from(fd)
+        {
+            let files = self.files.borrow();
+            let readonly = files
+                .run_on_raw_fd(
+                    raw,
+                    |typed| {
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed, |super::file::ReopenedAccess(a)| {
+                                *a == litebox::fs::OFlags::empty()
+                            })
+                            .unwrap_or(false)
+                    },
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            if readonly {
+                return Err(Errno::EACCES);
+            }
+        }
+
         // A DRM dumb-buffer `mmap()` (real clients always use `MAP_SHARED | PROT_WRITE` here --
         // they need their pixel writes to reach the buffer the kernel/scanout also reads) is
         // checked and resolved BEFORE the generic `MAP_SHARED|PROT_WRITE`-on-a-file rejection
