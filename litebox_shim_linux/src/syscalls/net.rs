@@ -5,7 +5,7 @@
 
 use core::{
     mem::{offset_of, size_of},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
 use alloc::string::ToString;
@@ -265,6 +265,21 @@ struct CSockInet6Addr {
     flowinfo: u32,
     addr: [u8; 16],
     scope_id: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Inet6Socket;
+
+fn presented_as_inet6(address: SocketAddress) -> SocketAddress {
+    let SocketAddress::Inet(SocketAddr::V4(v4)) = address else {
+        return address;
+    };
+    let ip = if v4.ip().is_unspecified() {
+        Ipv6Addr::UNSPECIFIED
+    } else {
+        v4.ip().to_ipv6_mapped()
+    };
+    SocketAddress::Inet(SocketAddr::V6(SocketAddrV6::new(ip, v4.port(), 0, 0)))
 }
 
 impl From<CSockInetAddr> for SocketAddrV4 {
@@ -1226,6 +1241,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net_lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
+                if matches!(domain, AddressFamily::INET6) {
+                    let _ = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_entry_metadata(&socket, Inet6Socket);
+                }
                 files.insert_raw_fd(socket).map_err(|socket| {
                     // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
                     // means the fd table is at its `RLIMIT_NOFILE`/shim-wide limit -- an
@@ -1267,7 +1289,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })?
             }
             AddressFamily::NETLINK => {
-                let socket = crate::syscalls::netlink::NetlinkSocket::new(flags);
+                let socket =
+                    crate::syscalls::netlink::NetlinkSocket::new_for_protocol(flags, protocol);
                 let typed = self
                     .global
                     .litebox
@@ -1538,7 +1561,20 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
+        SocketAddress::Inet(SocketAddr::V6(v6_addr)) => {
+            let c_addr = CSockInet6Addr {
+                family: AddressFamily::INET6 as i16,
+                port: v6_addr.port().to_be(),
+                flowinfo: 0,
+                addr: v6_addr.ip().octets(),
+                scope_id: 0,
+            };
+            let bytes: &[u8] = c_addr.as_bytes();
+            let copied = bytes.len().min(addrlen_val as usize);
+            addr.write_slice_at_offset::<Platform>(0, &bytes[..copied])
+                .ok_or(Errno::EFAULT)?;
+            size_of::<CSockInet6Addr>()
+        }
         SocketAddress::Netlink { pid, groups } => {
             let addrlen_val = size_of::<CSockNetlinkAddr>().min(addrlen_val as usize);
             let c_addr = CSockNetlinkAddr {
@@ -1602,6 +1638,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let fd = self.do_accept(sockfd, remote_addr.as_mut(), flags)?;
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
+            let remote_addr = self.address_in_socket_family(sockfd, remote_addr);
             if let Err(err) = write_sockaddr_to_user::<Platform>(remote_addr, addr, addrlen) {
                 // If we fail to write the address back to user, we need to close the accepted socket.
                 self.sys_close(i32::try_from(fd).unwrap())
@@ -1823,7 +1860,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let res = self.files.borrow().with_socket(
+        let res = self.files.borrow().with_socket_netlink(
             &self.global,
             sockfd,
             |fd| {
@@ -1840,6 +1877,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 file.sendto(self, buf, flags, addr)
+            },
+            |netlink| {
+                netlink.acknowledge(buf);
+                netlink.send(buf.len())
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -2055,6 +2096,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             |netlink| {
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
+                netlink.acknowledge(&data);
                 netlink.send(data.len())
             },
         );
@@ -2175,6 +2217,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
+            let src_addr = self.address_in_socket_family(sockfd, src_addr);
             write_sockaddr_to_user::<Platform>(src_addr, sock_ptr, addrlen)?;
         }
 
@@ -2206,7 +2249,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-            files.with_socket(
+            files.with_socket_netlink(
                 &self.global,
                 raw_fd.trunc(),
                 |fd| {
@@ -2231,6 +2274,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
                     Ok((size, src_addr))
+                },
+                |netlink| {
+                    let size = netlink.receive(&mut buf.borrow_mut(), flags)?;
+                    Ok((size, Some(SocketAddress::Netlink { pid: 0, groups: 0 })))
                 },
             )?
         };
@@ -2282,8 +2329,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Ok((size, src_addr, fds))
                 },
                 |netlink| {
-                    let size = netlink.recv()?;
-                    Ok((size, None, alloc::vec::Vec::new()))
+                    let size = netlink.receive(&mut buf.borrow_mut(), flags)?;
+                    let kernel_address = SocketAddress::Netlink { pid: 0, groups: 0 };
+                    Ok((size, Some(kernel_address), alloc::vec::Vec::new()))
                 },
             )?
         };
@@ -2448,6 +2496,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     + core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_namelen),
             );
             if let Some(src_addr) = source_addr {
+                let src_addr = self.address_in_socket_family(sockfd, src_addr);
                 write_sockaddr_to_user::<Platform>(src_addr, msg_name, addrlen_ptr)?;
             } else {
                 // No source address (e.g. connected stream socket) — zero out msg_namelen.
@@ -2732,6 +2781,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    fn socket_is_inet6(&self, sockfd: u32) -> bool {
+        self.files
+            .borrow()
+            .with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    Ok(self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &Inet6Socket| ())
+                        .is_ok())
+                },
+                |_unix| Ok(false),
+            )
+            .unwrap_or(false)
+    }
+
+    fn address_in_socket_family(&self, sockfd: u32, address: SocketAddress) -> SocketAddress {
+        if self.socket_is_inet6(sockfd) {
+            presented_as_inet6(address)
+        } else {
+            address
+        }
+    }
+
     /// Handle syscall `getsockname`
     pub(crate) fn sys_getsockname(
         &self,
@@ -2743,6 +2819,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let sockaddr = self.do_getsockname(sockfd)?;
+        let sockaddr = self.address_in_socket_family(sockfd, sockaddr);
         write_sockaddr_to_user::<Platform>(sockaddr, addr, addrlen)
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
@@ -2775,6 +2852,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let sockaddr = self.do_getpeername(sockfd)?;
+        let sockaddr = self.address_in_socket_family(sockfd, sockaddr);
         write_sockaddr_to_user::<Platform>(sockaddr, addr, addrlen)
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {

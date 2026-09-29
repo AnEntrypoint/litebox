@@ -1661,10 +1661,19 @@ where
                     Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => {
                         Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, local_endpoint.port)))
                     }
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::UNSPECIFIED,
-                        local_endpoint.port,
-                    ))),
+                    None => {
+                        let source_address = socket_handle
+                            .udp()
+                            .remote_endpoint
+                            .map_or(Ipv4Addr::UNSPECIFIED, |remote| match remote.addr {
+                                smoltcp::wire::IpAddress::Ipv4(ip) if ip.is_loopback() => ip,
+                                smoltcp::wire::IpAddress::Ipv4(_) => INTERFACE_IP_ADDR,
+                            });
+                        Ok(SocketAddr::V4(SocketAddrV4::new(
+                            source_address,
+                            local_endpoint.port,
+                        )))
+                    }
                 }
             }
             Protocol::Icmp => unimplemented!(),

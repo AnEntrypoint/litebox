@@ -13,6 +13,7 @@
 //! kernel-side event source; `sendmsg()`/`write()` accept and discard, matching a socket with no
 //! peer to fail against.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::{
@@ -41,10 +42,21 @@ pub(crate) struct NetlinkSocket {
     bound_pid: AtomicU32,
     /// `nl_groups` as bound by the guest, or 0 if never explicitly bound.
     bound_groups: AtomicU32,
+    protocol: u8,
+    replies: spin::Mutex<Vec<u8>>,
 }
+
+const NETLINK_AUDIT: u8 = 9;
+const NLM_F_ACK: u16 = 0x4;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_HEADER_BYTES: usize = 16;
 
 impl NetlinkSocket {
     pub(crate) fn new(flags: litebox_common_linux::SockFlags) -> Self {
+        Self::new_for_protocol(flags, 0)
+    }
+
+    pub(crate) fn new_for_protocol(flags: litebox_common_linux::SockFlags, protocol: u8) -> Self {
         let mut status = OFlags::RDWR;
         status.set(
             OFlags::NONBLOCK,
@@ -54,6 +66,8 @@ impl NetlinkSocket {
             status: core::sync::atomic::AtomicU32::new(status.bits()),
             bound_pid: AtomicU32::new(0),
             bound_groups: AtomicU32::new(0),
+            protocol,
+            replies: spin::Mutex::new(Vec::new()),
         }
     }
 
@@ -87,6 +101,47 @@ impl NetlinkSocket {
         Ok(len)
     }
 
+    pub(crate) fn acknowledge(&self, message: &[u8]) {
+        if self.protocol != NETLINK_AUDIT || message.len() < NLMSG_HEADER_BYTES {
+            return;
+        }
+        let flags = u16::from_le_bytes([message[6], message[7]]);
+        if flags & NLM_F_ACK == 0 {
+            return;
+        }
+        let acknowledgement_len = (NLMSG_HEADER_BYTES + 4 + NLMSG_HEADER_BYTES) as u32;
+        let mut reply = Vec::with_capacity(acknowledgement_len as usize);
+        reply.extend_from_slice(&acknowledgement_len.to_le_bytes());
+        reply.extend_from_slice(&NLMSG_ERROR.to_le_bytes());
+        reply.extend_from_slice(&0u16.to_le_bytes());
+        reply.extend_from_slice(&message[8..12]);
+        reply.extend_from_slice(&self.bound_pid.load(Ordering::Relaxed).to_le_bytes());
+        reply.extend_from_slice(&0i32.to_le_bytes());
+        reply.extend_from_slice(&message[..NLMSG_HEADER_BYTES]);
+        self.replies.lock().extend_from_slice(&reply);
+    }
+
+    pub(crate) fn receive(
+        &self,
+        buf: &mut [u8],
+        flags: litebox_common_linux::ReceiveFlags,
+    ) -> Result<usize, Errno> {
+        let mut replies = self.replies.lock();
+        if replies.is_empty() {
+            drop(replies);
+            if flags.contains(litebox_common_linux::ReceiveFlags::DONTWAIT) {
+                return Err(Errno::EAGAIN);
+            }
+            return self.recv();
+        }
+        let copied = replies.len().min(buf.len());
+        buf[..copied].copy_from_slice(&replies[..copied]);
+        if !flags.contains(litebox_common_linux::ReceiveFlags::PEEK) {
+            replies.clear();
+        }
+        Ok(copied)
+    }
+
     /// `recvmsg`/`read`-family: never has data, matching a `NETLINK_KOBJECT_UEVENT` monitor in an
     /// environment where no real hardware ever changes while the guest process runs.
     pub(crate) fn recv(&self) -> Result<usize, Errno> {
@@ -105,7 +160,11 @@ impl IOPollable for NetlinkSocket {
         // Always writable (sends are discarded, never block), never readable (no real event
         // source ever produces data) -- matches this module's own documented static-device-set
         // rationale.
-        Events::OUT
+        if self.replies.lock().is_empty() {
+            Events::OUT
+        } else {
+            Events::OUT | Events::IN
+        }
     }
 
     fn register_observer(&self, _observer: alloc::sync::Weak<dyn Observer<Events>>, _mask: Events) {
