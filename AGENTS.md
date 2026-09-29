@@ -16,6 +16,23 @@ xfce4-terminal with a working bash (prompt, echo, `tty`, job control, colours), 
 the Settings manager (live search, tooltips), Thunar preferences dialogs. `DE_UP` in 25-40s.
 
 Fixed this pass (all committed, newest first):
+- `2b7d7df` **TCP teardown**: smoltcp keeps a socket whose peer sent FIN "open" (CloseWait), so `recv()`
+  never returned 0 and every guest connection the peer closed first hung its reader (Python `urlopen` of a
+  guest `http.server` timed out; sockets leaked until the 256-slot `MAX_SOCKETS` table filled = the
+  "selkies HTTP freezes after ~130 connections" symptom). `drain_socket_channel_buffers` now calls
+  `mark_peer_closed()` (data first, then EOF; half-close writes still work); `shutdown(SHUT_WR)` sends its FIN
+  only after queued data left (was dropped). TCP `accept/connect/send/recv` also wait with the bounded
+  re-poll (`wait_on_events_polling`) since the owner process advances socket state. Repro:
+  `.wfgy/leak2.sh` (four teardown cases) and `.wfgy/leak.sh` (HTTP loop; TIME_WAIT limits a burst to ~170).
+- `88f632f` layered fs: writing `/dev/null` (any device) via a cached read-only lower fd tried to migrate the
+  device up -> `EISDIR`; bash opens `/dev/null` read-only for a background job's stdin and then again for the
+  redirect, so EVERY `cmd > /dev/null &` failed (daemons crashed, e.g. `python3 -m http.server > /dev/null 2>&1 &`).
+- `f0ecbb0` `getsockname()` of a bound/listening TCP socket returned `0.0.0.0:0` (smoltcp has no
+  `local_endpoint` until connected); now the bound address/port. `290d4d4` `mprotect` rounds length up to a
+  page (`file` failed). `3ee1ce7`/`bff1d0b`: lazy-map table lock hardened (thread-id reuse, re-entry from the
+  fault handler, uncommitted pages) -- a hang inside it stalled `at-spi2-registryd` in `mmap`, and every GTK
+  client then waited 25-30s on AT-SPI (`dbus-daemon: Failed to activate ... org.a11y.atspi.Registry: timed
+  out`), which made session start slow and flaky.
 - `bff1d0b` `RawMutex` dead-holder recovery CASes from the lock word's CURRENT value and forgets the
   holder only if it really released (was: stale `val` CAS failed, holder cleared anyway = permanent orphan).
 - `0cda0ec` **lazy file map**: fill a lazy range before a partial remap cuts it (ld.so maps a whole lib
@@ -56,6 +73,9 @@ Fixed this pass (all committed, newest first):
    copy per process; then fewer/lighter processes. `MAX_TIMEOUT` of a fork child's `net_worker` was raised
    1ms -> 25ms (25 processes polling the one cross-process network lock at 1kHz was a lock convoy);
    root stays 1ms. Re-verify the effect on a quiet host.
+1b. Chrome (the user's own, ~6GB) and other host apps leave 0.3-2GB free, which makes full-stack runs die on
+   the driver's `KILL low memory` guard (`avail<120`) before `DE_UP`; check `Get-Counter '\Memory\Available MBytes'`
+   first. The gate in `pass118_full_err.ps1` is 1000MB.
 2. Thunar: launching `thunar &` from the terminal printed `The connection is closed` then `Terminated`
    (D-Bus client to the already-running session Thunar); not root-caused. Run it alone and read stderr.
 3. `at-spi` still warns `GetRegisteredEvents ... unknown signature` in GTK apps (registryd itself now
