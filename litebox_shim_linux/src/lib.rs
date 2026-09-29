@@ -2064,9 +2064,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let mut debug_str = alloc::format!("{request:?}");
             // Path-carrying requests hold a raw user pointer; show the string it names.
             let path_ptr = match &request {
-                SyscallRequest::Openat { pathname, .. } | SyscallRequest::Readlink { pathname, .. } => {
-                    Some(*pathname)
-                }
+                SyscallRequest::Openat { pathname, .. }
+                | SyscallRequest::Readlink { pathname, .. }
+                | SyscallRequest::Mkdirat { pathname, .. }
+                | SyscallRequest::Newfstatat { pathname, .. }
+                | SyscallRequest::Faccessat { pathname, .. }
+                | SyscallRequest::Fchmodat { pathname, .. } => Some(*pathname),
                 _ => None,
             };
             if let Some(p) = path_ptr
