@@ -13769,6 +13769,15 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
             Win32_Threading::OpenProcess(Win32_Threading::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
         };
         if handle.is_null() {
+            // SAFETY: reads the calling thread's last-error slot, nothing else.
+            let error = unsafe { Win32_Foundation::GetLastError() };
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::unix_conn_teardown",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                pid = %pid,
+                win32_error = %error,
+                "DIAG is_process_alive: OpenProcess failed (87 = no such pid, 5 = access denied, 8 = out of memory)"
+            );
             return false;
         }
         let mut exit_code: u32 = 0;
@@ -13778,7 +13787,18 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         unsafe {
             Win32_Foundation::CloseHandle(handle);
         }
-        ok != 0 && exit_code == STILL_ACTIVE
+        let alive = ok != 0 && exit_code == STILL_ACTIVE;
+        if !alive {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::unix_conn_teardown",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                pid = %pid,
+                get_exit_code_ok = %ok,
+                exit_code = %exit_code,
+                "DIAG is_process_alive: OpenProcess succeeded but the process reports not-STILL_ACTIVE"
+            );
+        }
+        alive
     }
 
     /// Real host memory via `GlobalMemoryStatusEx`, with the AVAILABLE figure deliberately
