@@ -1011,6 +1011,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // pool) or to get a fresh handle on a file they hold open.
         if let Some(fd_str) = path_str
             .strip_prefix("/proc/self/fd/")
+            .or_else(|| path_str.strip_prefix("/dev/fd/"))
             .or_else(|| {
                 path_str
                     .strip_prefix("/proc/")
@@ -1224,6 +1225,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
+        }
+        // `open(.., O_NONBLOCK)` (vte opens its master this way) must start the description
+        // non-blocking, not only fcntl(F_SETFL).
+        if flags.contains(OFlags::NONBLOCK)
+            && let Some(h) = self.global.litebox.descriptor_table().entry_handle(&fd)
+        {
+            h.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                end.set_status(OFlags::NONBLOCK, true);
+            });
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(fd).map_err(|fd| {
@@ -2139,7 +2149,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.write(&self.wait_cx(), buf, &self.global.shared_pty))
+                    {
+                        let mut signals = alloc::vec::Vec::new();
+                        let r = handle.with_entry(|end| {
+                            end.write(&self.wait_cx(), buf, &self.global.shared_pty, &mut signals)
+                        });
+                        if !signals.is_empty() {
+                            let pgid = handle.with_entry(|end| {
+                                end.pty_state(&self.global.shared_pty).get_fg_pgid()
+                            });
+                            if pgid > 0 {
+                                for sig in signals {
+                                    let _ = self.sys_kill(-pgid, sig);
+                                }
+                            }
+                        }
+                        r
+                    }
                 },
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),

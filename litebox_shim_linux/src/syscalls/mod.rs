@@ -21,6 +21,7 @@ pub(crate) mod netlink;
 pub(crate) mod pipe;
 pub mod process;
 pub(crate) mod pty;
+mod pty_ldisc;
 pub(crate) mod signalfd;
 pub(crate) mod timerfd;
 pub(crate) mod unix;

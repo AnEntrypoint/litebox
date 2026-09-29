@@ -1019,7 +1019,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let cx = wait_state.context();
         match handle {
             Some(handle) => handle
-                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf, &self.0.shared_pty)),
+                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf, &self.0.shared_pty, &mut alloc::vec::Vec::new())),
             None => syscalls::pty::poll_shared(&cx, false, || {
                 self.0.shared_pty.try_write_side(pty_id, true, buf)
             }),

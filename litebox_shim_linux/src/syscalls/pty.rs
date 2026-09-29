@@ -79,6 +79,8 @@ pub(crate) struct PtyPair<Platform: ShimPlatform> {
     /// codebase's terminal-emulation path reads via packet mode's control-byte-prefixed
     /// protocol, so there is nothing to change about `read()`'s behavior here.
     packet_mode: AtomicBool,
+    /// `VEOF` typed on an empty canonical line: each pending count makes one slave `read` return 0.
+    eof_pending: AtomicU32,
 }
 
 impl<Platform: ShimPlatform> PtyPair<Platform> {
@@ -141,10 +143,84 @@ pub(crate) struct PtyHalf<Platform: ShimPlatform> {
     /// master side, which never receives a DSR query to answer (real terminal emulators, not
     /// this shim, are the ones expected to answer a master-side reader's own `\x1b[6n`).
     dsr_reply_write: Option<WriteEnd<Platform, u8>>,
+    /// Master side only: input line discipline state (canonical line buffer).
+    ldisc: Mutex<Platform, super::pty_ldisc::LineDiscipline>,
+    /// Master side only: the slave's pollee, woken when an EOF marker is queued.
+    peer_pollee: Option<Arc<Pollee<Platform>>>,
 }
 
 impl<Platform: ShimPlatform> PtyHalf<Platform> {
     super::common_functions_for_file_status!();
+
+    /// Run `buf` through the input line discipline, delivering to the slave and echoing to the
+    /// master. Returns `(bytes consumed, bytes delivered to the slave)`; signals to raise on the
+    /// foreground group are appended to `signals`. Never blocks mid-byte: a byte is consumed only
+    /// once fully processed, and a full slave channel stops the batch (backpressure).
+    fn try_ldisc_write(
+        &self,
+        buf: &[u8],
+        t: &Termios,
+        signals: &mut alloc::vec::Vec<i32>,
+        delivered: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, TryOpError<Errno>> {
+        use super::pty_ldisc::Action;
+        let mut n = 0;
+        while n < buf.len() {
+            if self.write.is_full() {
+                break;
+            }
+            let actions = self.ldisc.lock().input(buf[n], t);
+            for a in actions {
+                match a {
+                    Action::Deliver(bytes) => {
+                        for b in bytes {
+                            if self.write.try_write_one(b).is_ok() {
+                                delivered.push(b);
+                            }
+                        }
+                    }
+                    Action::Echo(bytes) => {
+                        if let Some(w) = &self.echo_write {
+                            for b in bytes {
+                                let _ = w.try_write_one(b);
+                            }
+                        }
+                    }
+                    Action::Signal(sig) => signals.push(sig),
+                    Action::Eof => {
+                        self.pair.eof_pending.fetch_add(1, Ordering::AcqRel);
+                        if let Some(p) = &self.peer_pollee {
+                            p.notify_observers(Events::IN);
+                        }
+                    }
+                }
+            }
+            n += 1;
+        }
+        if n == 0 && !buf.is_empty() {
+            Err(TryOpError::TryAgain)
+        } else {
+            Ok(n)
+        }
+    }
+
+    fn write_ldisc(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+        t: &Termios,
+        signals: &mut alloc::vec::Vec<i32>,
+        delivered: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, Errno> {
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::OUT,
+                || self.try_ldisc_write(buf, t, signals, delivered),
+            )
+            .map_err(Errno::from)
+    }
 
     fn try_read_into(&self, buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
         let mut n = 0;
@@ -159,6 +235,15 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
             }
         }
         if n == 0 {
+            if self.echo_write.is_none()
+                && self
+                    .pair
+                    .eof_pending
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                    .is_ok()
+            {
+                return Ok(0);
+            }
             Err(TryOpError::TryAgain)
         } else {
             Ok(n)
@@ -338,7 +423,9 @@ impl<Platform: ShimPlatform> IOPollable for PtyHalf<Platform> {
         if self.read.is_shutdown() || self.read.is_peer_shutdown() {
             events |= Events::HUP;
         }
-        if !self.read.is_empty() {
+        if !self.read.is_empty()
+            || (self.echo_write.is_none() && self.pair.eof_pending.load(Ordering::Acquire) > 0)
+        {
             events |= Events::IN;
         }
         if !self.write.is_full() {
@@ -503,10 +590,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
                 .is_ok()
             {
                 slot.id.store(id, Ordering::Relaxed);
-                *slot.termios.lock() = Termios {
-                    c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
-                    ..Termios::default()
-                };
+                *slot.termios.lock() = super::pty_ldisc::default_termios();
                 *slot.winsize.lock() = Winsize::default();
                 slot.fg_pgid.store(0, Ordering::Relaxed);
                 slot.locked.store(locked, Ordering::Relaxed);
@@ -982,10 +1066,11 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
             *head = 0;
             return Ok(n + 1);
         }
-        match self {
+        let r = match self {
             PtyEnd::Master(h) | PtyEnd::Slave(h) => h.read(cx, buf),
             PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => h.read(cx, buf, shared),
-        }
+        };
+        r
     }
 
     /// Write `buf` to this side of the pty, mirroring the result into `shared` (see this module's
@@ -1015,27 +1100,30 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
         cx: &WaitContext<'_, Platform>,
         buf: &[u8],
         shared: &SharedPtyTable<Platform>,
+        signals: &mut alloc::vec::Vec<i32>,
     ) -> Result<usize, Errno> {
         let state = self.pty_state(shared);
         let termios = state.get_termios();
         let oflags = litebox_common_linux::OFlagBits::from_bits_retain(termios.c_oflag);
-        let lflags = litebox_common_linux::LFlagBits::from_bits_retain(termios.c_lflag);
         let onlcr_wanted = oflags.contains(
             litebox_common_linux::OFlagBits::OPOST | litebox_common_linux::OFlagBits::ONLCR,
         );
         let onlcr = !self.is_master() && onlcr_wanted;
+        let mut delivered = alloc::vec::Vec::new();
         let n = match self {
-            PtyEnd::Master(h) | PtyEnd::Slave(h) => h.write(cx, buf, onlcr)?,
+            // Keyboard input passes through the line discipline (echo, canonical editing,
+            // signal characters).
+            PtyEnd::Master(h) => h.write_ldisc(cx, buf, &termios, signals, &mut delivered)?,
+            PtyEnd::Slave(h) => h.write(cx, buf, onlcr)?,
             PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => h.write(cx, buf, shared)?,
         };
         // Best-effort mirror into the shared cross-process data plane -- never fails the primary
         // write: a full/never-published shared slot only degrades cross-process visibility for
         // this one write, exactly like `SharedUnixAddrPresenceTable::insert`'s own contract.
-        let _ = shared.try_write_side(state.id(), self.is_master(), &buf[..n]);
-        if let PtyEnd::Master(h) = self
-            && lflags.contains(litebox_common_linux::LFlagBits::ECHO)
-        {
-            h.echo(&buf[..n], onlcr_wanted);
+        if matches!(self, PtyEnd::Master(_)) {
+            let _ = shared.try_write_side(state.id(), true, &delivered);
+        } else {
+            let _ = shared.try_write_side(state.id(), self.is_master(), &buf[..n]);
         }
         if let PtyEnd::Slave(h) = self {
             h.maybe_reply_to_dsr(&buf[..n]);
@@ -1059,21 +1147,12 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
 ) -> (PtyFd<Platform>, PtyFd<Platform>) {
     let pair = Arc::new(PtyPair {
         id,
-        // `c_oflag` defaults to `OPOST | ONLCR` -- matching a real, freshly allocated Linux
-        // pty's cooked-mode default -- because that's the one piece of output-side line
-        // discipline this module actually implements (see `PtyEnd::write`'s doc comment).
-        // Every other flag (input processing, canonical-mode input buffering/echo, ISIG special
-        // characters) stays at zero: this module doesn't implement any of those, so claiming
-        // otherwise via TCGETS would be actively misleading to a guest program deciding its own
-        // behavior based on what it reads back.
-        termios: Mutex::new(Termios {
-            c_oflag: litebox_common_linux::OPOST | litebox_common_linux::ONLCR,
-            ..Termios::default()
-        }),
+        termios: Mutex::new(super::pty_ldisc::default_termios()),
         winsize: Mutex::new(Winsize::default()),
         fg_pgid: AtomicI32::new(0),
         locked: AtomicBool::new(true),
         packet_mode: AtomicBool::new(false),
+        eof_pending: AtomicU32::new(0),
     });
     let master_pollee = Arc::new(Pollee::new());
     let slave_pollee = Arc::new(Pollee::new());
@@ -1092,6 +1171,8 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         pair: pair.clone(),
         echo_write: Some(s2m_write.clone()),
         dsr_reply_write: None,
+        ldisc: Mutex::new(super::pty_ldisc::LineDiscipline::new()),
+        peer_pollee: Some(slave_pollee.clone()),
     });
     let slave = PtyEnd::Slave(PtyHalf {
         read: m2s_read,
@@ -1101,6 +1182,8 @@ pub(crate) fn new_pty_pair<Platform: ShimPlatform>(
         pair,
         echo_write: None,
         dsr_reply_write: Some(m2s_write),
+        ldisc: Mutex::new(super::pty_ldisc::LineDiscipline::new()),
+        peer_pollee: None,
     });
 
     let mut dt = litebox.descriptor_table_mut();
