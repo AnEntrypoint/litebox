@@ -135,6 +135,7 @@ const TTY_NODE_INFO: NodeInfo = NodeInfo {
 #[must_use]
 pub fn devpts_dir_status() -> FileStatus {
     FileStatus {
+        nlink: 1,
         file_type: FileType::Directory,
         mode: Mode::RWXU
             .union(Mode::RGRP)
@@ -161,6 +162,7 @@ pub fn devpts_dir_status() -> FileStatus {
 #[must_use]
 pub fn devpts_slave_status(id: u32) -> FileStatus {
     FileStatus {
+        nlink: 1,
         file_type: FileType::CharacterDevice,
         // `rw-rw-rw-`. A slave is opened by whoever holds its id, and this crate models no tty
         // group ownership to restrict it with.
@@ -218,6 +220,7 @@ pub fn cross_process_bound_unix_socket_status(path: &str) -> FileStatus {
         ino = ino.wrapping_mul(0x0000_0100_0000_01B3);
     }
     FileStatus {
+        nlink: 1,
         file_type: FileType::RegularFile,
         // Matches `UnixSocketAddr::bind`'s own server-side creation mode exactly
         // (`Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH`).
@@ -306,6 +309,7 @@ impl Device {
     fn file_status(self) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
@@ -316,6 +320,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Null => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -326,6 +331,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::URandom => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -336,6 +342,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Tty0 | Device::Tty1 => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 // Real VT nodes are `crw--w----` group `tty`; litebox's guest identity is
                 // always root, so group-writable suffices. See gm mutable mut-1789043627523.
@@ -352,6 +359,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Zero | Device::Full => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -370,6 +378,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Random => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -380,6 +389,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Console => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 // Real /dev/console is `crw-------` (mode 0600), owner root -- matches the
                 // real webtop image's own tar entry for this path (major:minor 5:1).
@@ -393,6 +403,7 @@ impl Device {
             },
             // `rw-rw-rw-`, matching real Linux: any user may open the multiplexer.
             Device::Ptmx => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR
                     .union(Mode::WUSR)
@@ -408,6 +419,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Tty => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 // Real /dev/tty is `crw-rw-rw-` (mode 0666) -- world-writable/readable since
                 // any process's own controlling terminal is meant to always be reachable via
@@ -727,6 +739,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -823,6 +836,7 @@ impl DriDevice {
             DriDevice::RenderD128 => DRI_RENDERD128_NODE_INFO,
         };
         FileStatus {
+            nlink: 1,
             file_type: FileType::CharacterDevice,
             // Real DRM nodes are `crw-rw----` group `video`; litebox's guest identity is
             // always root, so group-readable suffices. See gm mutable mut-1789043627523.
@@ -997,6 +1011,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -1082,6 +1097,7 @@ impl InputDevice {
     fn file_status(self) -> FileStatus {
         let InputDevice::Event0 = self;
         FileStatus {
+            nlink: 1,
             file_type: FileType::CharacterDevice,
             // Real evdev nodes are `crw-r-----` group `input`; litebox's guest identity is
             // always root, so group-readable suffices. See gm mutable mut-1789043627523.
@@ -1480,6 +1496,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -2103,6 +2120,7 @@ where
             SysDrmFile::DeviceUevent => "DRIVER=litebox\n".len(),
         };
         Ok(FileStatus {
+            nlink: 1,
             // Real sysfs attribute files report as regular files (`lstat` on the
             // `subsystem` symlink itself is handled by the resolver via `read_link_at`,
             // never reaching here for a plain, symlink-following `open()`/`stat()`).
@@ -2139,6 +2157,7 @@ where
             SysDrmDirHandle::DeviceDrmOf(device) => device.sys_device_drm_dir_node_info(),
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -2364,6 +2383,7 @@ where
 
     fn file_status(&self, _h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: UDEV_DB_EVENT0_CONTENT.len(),
@@ -2377,6 +2397,7 @@ where
 
     fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -2709,6 +2730,7 @@ where
             SysInputFile::Subsystem => 0,
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size,
@@ -2735,6 +2757,7 @@ where
             SysInputDirHandle::Device => SYS_INPUT_EVENT0_DIR_NODE_INFO,
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -3016,6 +3039,7 @@ where
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: 0,
@@ -3033,6 +3057,7 @@ where
 
     fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

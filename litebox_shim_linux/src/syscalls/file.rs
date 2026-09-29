@@ -2507,43 +2507,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    fn chown_errno(e: litebox::fs::errors::ChownError) -> Errno {
+        use litebox::fs::errors::ChownError;
+        match e {
+            ChownError::NotTheOwner => Errno::EPERM,
+            ChownError::Io => Errno::EIO,
+            ChownError::ReadOnlyFileSystem => Errno::EROFS,
+            ChownError::PathError(p) => Errno::from(p),
+            _ => Errno::EPERM,
+        }
+    }
+
+    fn do_chown_path(&self, path: alloc::string::String, owner: u32, group: u32) -> Result<(), Errno> {
+        // `-1` means "leave unchanged"; ids beyond the file system's 16-bit range are clamped.
+        let clamp = |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX));
+        self.files
+            .borrow()
+            .fs
+            .chown(path, clamp(owner), clamp(group))
+            .map_err(Self::chown_errno)
+    }
+
     /// Handle syscall `chown`/`lchown`/`fchownat`.
-    ///
-    /// litebox has no real multi-user model -- every guest process runs as a single simulated
-    /// uid/gid that already "owns" everything, exactly the way `chown(path, geteuid(), -1)` on
-    /// real Linux trivially succeeds as a no-op for a process chowning its own file. There is no
-    /// second user identity a real litebox layer could observe ownership actually changing for,
-    /// so genuinely tracking per-file owner/group (a new stat field, persisted across the tar-ro
-    /// and in-memory-writable backends, threaded through every existing `FileStatus` call site)
-    /// would be real, non-trivial plumbing purely to answer a question no caller in this
-    /// environment can meaningfully ask. Real callers (apk's `.apk` staging-file install,
-    /// observed live: `chown(".apk.<hash>", 0, 0)` while already running as uid 0) only care that
-    /// the call succeeds, not that a distinct ownership concept is tracked -- so validate the
-    /// path/fd resolves to a real file (so a genuinely missing target still reports `ENOENT`
-    /// correctly) and succeed, matching this project's established `fadvise64`/`membarrier`
-    /// pattern of an honest no-op over either a fake enforcement or a wrong `ENOSYS`/`EPERM`.
     pub(crate) fn sys_fchownat(
         &self,
         dirfd: i32,
         pathname: impl path::Arg,
-        _owner: u32,
-        _group: u32,
+        owner: u32,
+        group: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.files.borrow().fs.file_status(pathname)?;
-        Ok(())
+        let pathname = self.resolve_final_symlinks(alloc::string::String::from(pathname.to_str().map_err(|_| Errno::EINVAL)?))?;
+        self.do_chown_path(pathname, owner, group)
     }
 
-    /// Handle syscall `fchown`. See [`Self::sys_fchownat`]'s doc comment for why this is a no-op.
-    pub(crate) fn sys_fchown(&self, fd: u32, _owner: u32, _group: u32) -> Result<(), Errno> {
+    /// Handle syscall `fchown`.
+    pub(crate) fn sys_fchown(&self, fd: u32, owner: u32, group: u32) -> Result<(), Errno> {
         let Ok(raw_fd) = usize::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        let path = self.files.borrow().lookup_fd_path(raw_fd);
         let files = self.files.borrow();
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.fd_file_status(fd).map(|_| ()).map_err(Errno::from),
+                |fd| {
+                    files.fs.fd_file_status(fd).map_err(Errno::from)?;
+                    match &path {
+                        Some(path) => self.do_chown_path(
+                            alloc::string::String::from(path.to_str().map_err(|_| Errno::EINVAL)?),
+                            owner,
+                            group,
+                        ),
+                        None => Ok(()),
+                    }
+                },
                 |_fd| Ok(()),
                 |_fd| Ok(()),
                 |_fd| Ok(()),

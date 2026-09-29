@@ -462,6 +462,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         if attr.valid.contains(fcall::GetattrMask::BASIC) {
             Ok(super::FileStatus {
+                nlink: 1,
                 file_type,
                 mode: super::Mode::from_bits_truncate(attr.stat.mode),
                 size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
@@ -482,6 +483,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             })
         } else {
             Ok(super::FileStatus {
+                nlink: 1,
                 file_type,
                 mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
                     super::Mode::from_bits_truncate(attr.stat.mode)

@@ -101,10 +101,21 @@ impl Context {
         Ok(ResolvedPath { components })
     }
 
+    /// The identity to check against: the shim's per-process one when set.
+    fn acting_user(&self) -> UserInfo {
+        super::ident::get().unwrap_or(self.user_info)
+    }
+
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return permissions
+                .mode
+                .intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::XGRP)
         } else {
             permissions.mode.contains(Mode::XOTH)
@@ -112,9 +123,13 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::RGRP)
         } else {
             permissions.mode.contains(Mode::ROTH)
@@ -122,9 +137,13 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::WGRP)
         } else {
             permissions.mode.contains(Mode::WOTH)

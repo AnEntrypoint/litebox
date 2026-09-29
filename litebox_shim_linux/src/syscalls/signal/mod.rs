@@ -1069,13 +1069,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let blocked = self.signals.borrow().blocked.get();
-        let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
-        if !thread_pending.is_empty() {
-            return true;
+        loop {
+            let blocked = self.signals.borrow().blocked.get();
+            let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
+            let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
+            let Some(signal) = (thread_pending | shared_pending).lowest_set() else {
+                return false;
+            };
+            // A signal whose disposition is "ignore" (SIGCHLD by default) interrupts nothing: drop
+            // it here so it cannot wake a wait that then has to report `EINTR`.
+            if !self.is_signal_ignored(signal) {
+                return true;
+            }
+            if thread_pending.contains(signal) {
+                let _ = self.signals.borrow().pending.borrow_mut().remove(signal);
+            }
+            if shared_pending.contains(signal) {
+                let _ = self.signals.borrow().shared_pending.lock().remove(signal);
+            }
         }
-        let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
-        !shared_pending.is_empty()
     }
 
     /// Returns the set of all pending (deliverable) signals.

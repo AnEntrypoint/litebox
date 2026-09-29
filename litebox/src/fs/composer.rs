@@ -273,6 +273,7 @@ impl Composer {
             .map(|dir| dir.node_info.clone())
             .expect("virtual directory is precomputed");
         FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             // rwxr-xr-x for virtual dirs
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,

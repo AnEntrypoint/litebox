@@ -587,6 +587,7 @@ where
             },
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: h.content.len(),
@@ -608,6 +609,7 @@ where
             },
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -1043,6 +1045,7 @@ where
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: h.content.len(),
@@ -1067,6 +1070,7 @@ where
 
     fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

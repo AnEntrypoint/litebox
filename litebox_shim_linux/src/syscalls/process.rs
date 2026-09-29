@@ -1078,6 +1078,7 @@ pub(crate) struct Credentials {
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
+        litebox::fs::ident::set(euid, egid);
         Self {
             uid,
             euid,
@@ -6072,6 +6073,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn set_creds(&self, c: Credentials) {
+        litebox::fs::ident::set(c.euid, c.egid);
         *self.credentials.borrow_mut() = Arc::new(c);
     }
 

@@ -398,6 +398,8 @@ pub struct FileStatus {
     pub atime: Timestamp,
     /// Last modification time
     pub mtime: Timestamp,
+    /// Number of hard links to this node.
+    pub nlink: usize,
 }
 
 impl FileStatus {
@@ -423,6 +425,7 @@ impl FileStatus {
             blksize,
             atime,
             mtime,
+            nlink: 1,
         }
     }
 }
@@ -440,6 +443,59 @@ pub struct Timestamp {
     pub sec: i64,
     /// Nanosecond remainder, in `[0, 1_000_000_000)`.
     pub nsec: u32,
+}
+
+/// The identity every file-system permission check acts as, per host process.
+///
+/// A `static` is deliberate: each native-`fork()`ed guest process has its own copy of this
+/// memory, so every process checks (and creates files as) its own credentials, while the file
+/// system objects themselves are shared. The shim updates it whenever a task's credentials change.
+pub mod ident {
+    use super::UserInfo;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static USER: AtomicU32 = AtomicU32::new(u32::MAX);
+    static GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// Sets the acting uid/gid (ids above `u16::MAX` are clamped).
+    pub fn set(user: u32, group: u32) {
+        USER.store(user.min(u32::from(u16::MAX)), Ordering::Relaxed);
+        GROUP.store(group.min(u32::from(u16::MAX)), Ordering::Relaxed);
+    }
+
+    static ROOT_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+    /// While alive, permission checks act as root: the layered file system's internal copy-up
+    /// (creating ancestors and the upper copy of a lower file) is done by the "kernel", not as the
+    /// calling user.
+    pub struct RootGuard(());
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            ROOT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Acts as root until the returned guard drops.
+    #[must_use]
+    pub fn root_guard() -> RootGuard {
+        ROOT_DEPTH.fetch_add(1, Ordering::Relaxed);
+        RootGuard(())
+    }
+
+    /// The acting identity, if the shim has set one.
+    #[must_use]
+    pub fn get() -> Option<UserInfo> {
+        if ROOT_DEPTH.load(Ordering::Relaxed) > 0 {
+            return Some(UserInfo::ROOT);
+        }
+        let user = USER.load(Ordering::Relaxed);
+        let group = GROUP.load(Ordering::Relaxed);
+        (user != u32::MAX && group != u32::MAX).then(|| UserInfo {
+            user: user as u16,
+            group: group as u16,
+        })
+    }
 }
 
 /// User information

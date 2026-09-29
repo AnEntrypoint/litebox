@@ -106,6 +106,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// the lower layer. It does NOT set up `path` itself on the upper layer -- that is the caller's
     /// job -- and is NOT equivalent to `mkdir -p {path}` or `mkdir {path}`.
     fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
+        let _root = super::ident::root_guard();
         let path = self.absolute_path(path)?;
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
             if dir == path {
@@ -115,12 +116,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 Ok(FileType::Directory) => {
                     // The dir does in fact exist; we just need to confirm that the upper layer also
                     // has it.
-                    match self
-                        .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
-                    {
+                    let lower_status = self.lower.file_status(dir).unwrap();
+                    match self.upper.mkdir(dir, lower_status.mode) {
                         Ok(()) => {
-                            // fallthrough to next increasing ancestor
+                            // The copied-up directory keeps the lower directory's owner.
+                            let _ = self.upper.chown(
+                                dir,
+                                Some(lower_status.owner.user),
+                                Some(lower_status.owner.group),
+                            );
                         }
                         Err(e) => match e {
                             MkdirError::AlreadyExists => {
@@ -180,6 +184,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // Held for the whole call, not just the swap -- gm mutable
         // `layered-migrate-lock-serializes-whole-migration`.
         let _migrate_guard = self.migrate_lock.lock();
+        let _root = super::ident::root_guard();
 
         // Only a REGULAR file (or symlink) has byte contents whose copy is the same object:
         // migrating a character device fabricates an empty regular file shadowing it, which is how
@@ -227,14 +232,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             }
                             Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
                         }
+                        let lower_status = self.lower.fd_file_status(&lower_fd).unwrap();
                         upper_fd = Some(
                             self.upper
-                                .open(
-                                    path,
-                                    OFlags::CREAT | OFlags::WRONLY,
-                                    self.lower.fd_file_status(&lower_fd).unwrap().mode,
-                                )
+                                .open(path, OFlags::CREAT | OFlags::WRONLY, lower_status.mode)
                                 .unwrap(),
+                        );
+                        // The upper copy keeps the lower file's owner.
+                        let _ = self.upper.chown(
+                            path,
+                            Some(lower_status.owner.user),
+                            Some(lower_status.owner.group),
                         );
                     }
                     let upper_fd = upper_fd.as_ref().unwrap();
@@ -1426,8 +1434,18 @@ impl<
         // `oldpath` must already live purely in the upper layer (Xorg-style lock-file acquisition
         // links a temp file it just wrote); a lower-only source is real Linux `EXDEV` -- gm mutable
         // `layered-rename-link-exdev-and-invalidation`.
-        if self.ensure_lower_contains(&oldpath).is_ok() {
-            return Err(LinkError::CrossDevice);
+        // A source that so far lives only in the lower layer is copied up first, as overlayfs does
+        // for `link(2)`; once it has an upper copy the two names share that one file.
+        if self.upper.file_status(oldpath.as_str()).is_err()
+            && self.ensure_lower_contains(&oldpath).is_ok()
+        {
+            self.migrate_file_up(&oldpath, true).map_err(|e| match e {
+                MigrationError::NotAFile => LinkError::IsADirectory,
+                MigrationError::NoReadPerms => LinkError::NoWritePerms,
+                MigrationError::Io => LinkError::Io,
+                MigrationError::PathError(p) => LinkError::PathError(p),
+                MigrationError::UpperCannotHoldPath => LinkError::CrossDevice,
+            })?;
         }
         // Anything already at `newpath` in EITHER layer is `link(2)`'s `EEXIST`, since creation only
         // ever targets the upper layer -- gm mutable
@@ -1748,6 +1766,7 @@ impl<
         let path = self.absolute_path(path)?;
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1764,6 +1783,7 @@ impl<
                 }
             };
             return Ok(FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1777,6 +1797,7 @@ impl<
         // The file is not open, we must look at the levels themselves.
         match self.upper.file_status(&*path) {
             Ok(FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1787,6 +1808,7 @@ impl<
                 mtime,
             }) => {
                 return Ok(FileStatus {
+                    nlink,
                     file_type,
                     mode,
                     size,
@@ -1817,6 +1839,7 @@ impl<
             },
         }
         let FileStatus {
+                nlink,
             file_type,
             mode,
             size,
@@ -1827,6 +1850,7 @@ impl<
             mtime,
         } = self.lower.file_status(path)?;
         Ok(FileStatus {
+            nlink,
             file_type,
             mode,
             size,
@@ -1846,6 +1870,7 @@ impl<
         let path = self.absolute_path(path)?;
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1862,6 +1887,7 @@ impl<
                 }
             };
             return Ok(FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1874,6 +1900,7 @@ impl<
         }
         match self.upper.symlink_metadata(&*path) {
             Ok(FileStatus {
+                nlink,
                 file_type,
                 mode,
                 size,
@@ -1884,6 +1911,7 @@ impl<
                 mtime,
             }) => {
                 return Ok(FileStatus {
+                    nlink,
                     file_type,
                     mode,
                     size,
@@ -1911,6 +1939,7 @@ impl<
             },
         }
         let FileStatus {
+                nlink,
             file_type,
             mode,
             size,
@@ -1921,6 +1950,7 @@ impl<
             mtime,
         } = self.lower.symlink_metadata(path)?;
         Ok(FileStatus {
+            nlink,
             file_type,
             mode,
             size,
@@ -1942,6 +1972,7 @@ impl<
             .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
             .ok_or(FileStatusError::ClosedFd)?;
         let FileStatus {
+                nlink,
             file_type,
             mode,
             size,
@@ -1956,6 +1987,7 @@ impl<
             EntryX::Tombstone => unreachable!(),
         };
         Ok(FileStatus {
+            nlink,
             file_type,
             mode,
             size,

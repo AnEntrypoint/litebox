@@ -276,6 +276,7 @@ where
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let idx = h.get_typed::<Self>().0;
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: self.files[idx].1.len(),
@@ -290,6 +291,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let idx = h.get_typed::<Self>().0;
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

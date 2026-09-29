@@ -493,6 +493,7 @@ impl super::backend::Backend for TarRo {
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let file = &self.tar_index.files[h.get_typed::<Self>().idx];
         Ok(super::FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: file.mode,
             size: file.data_range.len(),
@@ -510,6 +511,7 @@ impl super::backend::Backend for TarRo {
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
         Ok(super::FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: DEFAULT_DIR_MODE,
             size: super::DEFAULT_DIRECTORY_SIZE,

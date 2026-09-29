@@ -401,6 +401,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let atime_nsec = i64::from(atime.nsec);
@@ -408,7 +409,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
         Self {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
-            st_nlink: 1,
+            st_nlink: <_>::try_from(nlink).unwrap_or(1),
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
@@ -590,6 +591,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let dev = dev as u64;
@@ -609,7 +611,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             // this call path.
             stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
-            stx_nlink: 1,
+            stx_nlink: u32::try_from(nlink).unwrap_or(1),
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
             stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
