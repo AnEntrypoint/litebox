@@ -79,13 +79,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
         let now = self.global.platform.now();
+        // The same figures `/proc/meminfo` reports, so `sysconf(_SC_PHYS_PAGES)` and a read of
+        // meminfo agree.
+        let (total_kb, avail_kb) = self.global.platform.memory_info_kb();
+        let total = usize::try_from(total_kb.saturating_mul(1024)).unwrap_or(usize::MAX);
+        let avail = usize::try_from(avail_kb.min(total_kb).saturating_mul(1024)).unwrap_or(usize::MAX);
         litebox_common_linux::Sysinfo {
             uptime: now.duration_since(&self.global.boot_time).as_secs().trunc(),
             // TODO: Populate these fields with actual values
             loads: [0; 3],
             #[cfg(target_arch = "x86_64")]
-            totalram: 4 * 1024 * 1024 * 1024,
-            freeram: 2 * 1024 * 1024 * 1024,
+            totalram: total,
+            freeram: avail,
             sharedram: 0, // We don't support shared memory
             bufferram: 0,
             totalswap: 0,

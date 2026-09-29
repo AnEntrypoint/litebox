@@ -744,6 +744,10 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
     /// Real credentials (pid/uid/gid) of the *peer* task, as of connection
     /// establishment -- what `getsockopt(SO_PEERCRED)` reports to this side.
     peer_cred: Ucred,
+    /// Latest sender in the direction this side writes / reads (pid, uid, gid; pid 0 = unset),
+    /// shared with the peer's opposite fields -- see `SharedConnSlot::last_writer_c2s`.
+    send_cred: Arc<[AtomicU32; 3]>,
+    recv_cred: Arc<[AtomicU32; 3]>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for ConnTransport<Platform, FS> {
@@ -797,6 +801,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         second_cred: Ucred,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
+        let cred_a: Arc<[AtomicU32; 3]> = Arc::new([const { AtomicU32::new(0) }; 3]);
+        let cred_b: Arc<[AtomicU32; 3]> = Arc::new([const { AtomicU32::new(0) }; 3]);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
         let pollee2 = Arc::new(Pollee::new());
         let (send_channel, recv_channel) =
@@ -811,6 +817,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: pollee1,
             peer_cred: second_cred,
+            send_cred: cred_a.clone(),
+            recv_cred: cred_b.clone(),
         };
         let second = UnixConnectedStream {
             transport: ConnTransport::Local {
@@ -820,6 +828,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: pollee2,
             peer_cred: first_cred,
+            send_cred: cred_b,
+            recv_cred: cred_a,
         };
         let ConnTransport::Local {
             recv_channel,
@@ -860,6 +870,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: Arc::new(Pollee::new()),
             peer_cred,
+            // Unused for `Shared` (the slot carries these); present to keep one struct shape.
+            send_cred: Arc::new([const { AtomicU32::new(0) }; 3]),
+            recv_cred: Arc::new([const { AtomicU32::new(0) }; 3]),
         }
     }
 
@@ -1335,6 +1348,26 @@ struct UnixStream<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
+    /// Records `cred` as the latest sender on a cross-process connection (see
+    /// `SharedConnSlot::last_writer_c2s`); a no-op for anything else.
+    fn note_sender(&self, cred: &Ucred) {
+        self.with_state_ref(|state| {
+            if let Some(conn) = state.connected() {
+                match &conn.transport {
+                    ConnTransport::Shared { global, slot, is_client, .. } => global
+                        .unix_shared_conn_table
+                        .get(*slot)
+                        .set_last_writer(*is_client, *cred),
+                    ConnTransport::Local { .. } => {
+                        conn.send_cred[0].store(cred.pid as u32, Ordering::Relaxed);
+                        conn.send_cred[1].store(cred.uid, Ordering::Relaxed);
+                        conn.send_cred[2].store(cred.gid, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
     fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
         Self {
             state: litebox::sync::RwLock::new(Some(state)),
@@ -2471,6 +2504,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
+                stream.note_sender(&task.peer_cred());
                 stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr, fds)
             }
             UnixSocketInner::Datagram(datagram) => {
@@ -2499,7 +2533,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
-                UnixStreamState::Connected(conn) => Some(conn.peer_cred),
+                UnixStreamState::Connected(conn) => Some(match &conn.transport {
+                    // The peer that last SENT, not the one that connected.
+                    ConnTransport::Shared { global, slot, is_client, .. } => global
+                        .unix_shared_conn_table
+                        .get(*slot)
+                        .last_writer(!*is_client)
+                        .unwrap_or(conn.peer_cred),
+                    ConnTransport::Local { .. } => {
+                        let pid = conn.recv_cred[0].load(Ordering::Relaxed);
+                        if pid == 0 {
+                            conn.peer_cred
+                        } else {
+                            Ucred {
+                                pid: pid as _,
+                                uid: conn.recv_cred[1].load(Ordering::Relaxed),
+                                gid: conn.recv_cred[2].load(Ordering::Relaxed),
+                            }
+                        }
+                    }
+                }),
                 _ => None,
             }),
             UnixSocketInner::Datagram(_) => None,
@@ -3301,6 +3354,11 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     server_pid: AtomicU32,
     server_uid: AtomicU32,
     server_gid: AtomicU32,
+    /// Credentials of whichever process most recently sent in each direction -- what
+    /// `SCM_CREDENTIALS` reports (a forked or `SCM_RIGHTS`-passed endpoint sends from a process
+    /// other than the one that connected, and the receiver must see the sender).
+    last_writer_c2s: [AtomicU32; 3],
+    last_writer_s2c: [AtomicU32; 3],
 }
 
 impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
@@ -3315,7 +3373,26 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             server_pid: AtomicU32::new(0),
             server_uid: AtomicU32::new(0),
             server_gid: AtomicU32::new(0),
+            last_writer_c2s: [const { AtomicU32::new(0) }; 3],
+            last_writer_s2c: [const { AtomicU32::new(0) }; 3],
         }
+    }
+
+    fn set_last_writer(&self, from_client: bool, cred: Ucred) {
+        let w = if from_client { &self.last_writer_c2s } else { &self.last_writer_s2c };
+        w[0].store(cred.pid as u32, Ordering::Relaxed);
+        w[1].store(cred.uid, Ordering::Relaxed);
+        w[2].store(cred.gid, Ordering::Relaxed);
+    }
+
+    fn last_writer(&self, from_client: bool) -> Option<Ucred> {
+        let w = if from_client { &self.last_writer_c2s } else { &self.last_writer_s2c };
+        let pid = w[0].load(Ordering::Relaxed);
+        (pid != 0).then(|| Ucred {
+            pid: pid as _,
+            uid: w[1].load(Ordering::Relaxed),
+            gid: w[2].load(Ordering::Relaxed),
+        })
     }
 
     fn server_cred(&self) -> Ucred {

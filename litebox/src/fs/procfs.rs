@@ -788,6 +788,11 @@ impl ProcSelfTable {
 
     /// The entry for a SPECIFIC pid, regardless of caller identity -- backs `/proc/<pid>/*`, unlike
     /// [`Self::resolve`] which answers `/proc/self` for whichever process is asking.
+    /// The `exe` path recorded for `pid`, if that process is known.
+    pub fn get_exe_path(&self, pid: i32) -> Option<String> {
+        self.get(pid).map(|i| i.exe_path.clone()).filter(|p| !p.is_empty())
+    }
+
     fn get(&self, pid: i32) -> Option<&ProcSelfInfo> {
         self.by_pid.get(&pid)
     }

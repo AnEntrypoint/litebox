@@ -3254,6 +3254,28 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         syscall_callback as *const () as usize
     }
 
+    fn memory_info_kb(&self) -> (u64, u64) {
+        // The host's real figures: guest code runs natively, so what it can allocate is what the
+        // host has. Read once, at first use (before the seccomp filter goes up -- a later
+        // `open` from here would be refused and silently fall back to the defaults).
+        static INFO: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        *INFO.get_or_init(|| {
+            let default = (1024 * 1024, 512 * 1024);
+            let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+                return default;
+            };
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            };
+            match (field("MemTotal:"), field("MemAvailable:")) {
+                (Some(t), Some(a)) => (t, a),
+                _ => default,
+            }
+        })
+    }
+
     fn env_flag(&self, name: &str) -> bool {
         std::env::var_os(name).is_some_and(|v| !v.is_empty())
     }

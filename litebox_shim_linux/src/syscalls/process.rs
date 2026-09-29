@@ -6995,6 +6995,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
         // `/proc/self/exe` must be an absolute path even for `./prog` (programs locate their own
         // resources from it), so resolve against the cwd before the loader records it.
+        // `execve("/proc/self/exe")` (Chromium re-executes itself this way) means "the binary I am
+        // running", not a file named that: substitute its real path so the new image records the
+        // right `/proc/self/exe` and finds its resources next to it.
+        let path = if path == "/proc/self/exe"
+            || path == alloc::format!("/proc/{}/exe", self.pid.get())
+        {
+            self.global
+                .proc_self_info
+                .read()
+                .get_exe_path(self.pid.get())
+                .unwrap_or(path)
+        } else {
+            path
+        };
         let path = self
             .resolve_path(path.as_str())
             .ok()
