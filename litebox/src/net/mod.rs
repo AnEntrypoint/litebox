@@ -1600,6 +1600,18 @@ where
         }
         match socket_handle.protocol() {
             Protocol::Tcp => {
+                // A bound or listening socket has no smoltcp `local_endpoint()` (it is only set
+                // once a connection exists), so `getsockname()` used to report `0.0.0.0:0` for
+                // every server: Python's `http.server` and Selkies both logged "port 0", and any
+                // program that binds port 0 to learn its ephemeral port got the wrong answer.
+                if let Some(server) = socket_handle.tcp().server_socket.as_ref() {
+                    let endpoint = server.ip_listen_endpoint;
+                    let ip = match endpoint.addr {
+                        Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                        None => Ipv4Addr::UNSPECIFIED,
+                    };
+                    return Ok(SocketAddr::V4(SocketAddrV4::new(ip, endpoint.port)));
+                }
                 let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
                 match socket.local_endpoint() {
                     Some(endpoint) => match endpoint.addr {

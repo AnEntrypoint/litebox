@@ -6993,7 +6993,9 @@ impl RawMutex {
                     // holder so its stack can be inspected. Holder 0 (futex-style waits) stays quiet.
                     idle_chunks += 1;
                     let holder = self.holder_pid.load(Ordering::Relaxed);
-                    if holder != 0 && idle_chunks % 15 == 0 {
+                    // `val == 2` is the contended state of a `litebox::sync::Mutex` (futex-style
+                    // waits pass other values), so holder 0 there means an orphaned lock.
+                    if (holder != 0 || val == 2) && idle_chunks % 15 == 0 {
                         litebox_util_log::warn!(
                             lock:% = (self as *const Self as usize), val:% = val, holder_pid:% = holder,
                             waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
