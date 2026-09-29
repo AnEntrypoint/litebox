@@ -14,6 +14,9 @@ pub mod lazy_fork_commit;
 pub use lazy_file_map::{adopt_from_file as adopt_inherited_lazy_file_maps, register_source as register_lazy_file_source};
 mod net;
 pub mod presentation;
+mod spill;
+pub use spill::prepare_spill_directory;
+use spill::{open_spill_file, spill_directory, write_all_at};
 pub mod process_fork;
 pub mod xproc_sync;
 
@@ -2240,6 +2243,7 @@ unsafe extern "system" fn vectored_exception_handler(
                         // its own -- arm the watchdog first as a backstop, same as the sibling
                         // unconditional-terminate path below.
                         FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
+                        process_fork::mark_fault_terminate_armed();
             // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
             // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
             // block, so if it never returns the watchdog still terminates -- the dump attempt
@@ -2543,6 +2547,7 @@ unsafe extern "system" fn vectored_exception_handler(
             // (rather than a bare `1`) so a future diagnostic can distinguish which of possibly
             // several arm events the watchdog eventually acted on.
             FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
+            process_fork::mark_fault_terminate_armed();
             // A self-`TerminateProcess` from inside the VEH was confirmed NOT to reliably
             // terminate the process on this host (the thread can be stuck behind the same
             // kernel-mode exception protocol it's trying to escape). `RaiseFailFastException`
@@ -13781,6 +13786,27 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
             c.borrow_mut().push((name.into(), v.clone()));
             v
         })
+    }
+
+    fn spill_available(&self) -> bool {
+        spill_directory().is_some()
+    }
+
+    fn spill_write(&self, slot: u32, offset: u64, bytes: &[u8]) -> bool {
+        open_spill_file(slot)
+            .and_then(|file| write_all_at(&file, offset, bytes))
+            .is_some()
+    }
+
+    fn spill_set_len(&self, slot: u32, length: u64) -> bool {
+        open_spill_file(slot).and_then(|file| file.set_len(length).ok()).is_some()
+    }
+
+    fn spill_read_at(&self, slot: u32, offset: u64, buf: &mut [u8]) -> usize {
+        use std::os::windows::fs::FileExt as _;
+        open_spill_file(slot)
+            .and_then(|file| file.seek_read(buf, offset).ok())
+            .unwrap_or(0)
     }
 
     fn cpu_count(&self) -> usize {

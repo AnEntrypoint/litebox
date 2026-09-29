@@ -40,6 +40,10 @@ pub enum ImportError {
 /// error is returned at the end. (A cross-process fork child re-exports everything it adopted, so
 /// one stale unwritable file used to discard all of the child's real writes.)
 pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), ImportError> {
+    super::with_root_identity(|| import_all_as_root(fs, tar_data))
+}
+
+fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), ImportError> {
     let mut first_error: Option<ImportError> = None;
     let mut record = |r: Result<(), ImportError>| {
         if let Err(e) = r
@@ -83,6 +87,8 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 .to_flags()
                 .unwrap_or(tar_no_std::ModeFlags::empty()),
         );
+        let owner_user = header.uid.as_number::<u32>().ok().and_then(|id| u16::try_from(id).ok());
+        let owner_group = header.gid.as_number::<u32>().ok().and_then(|id| u16::try_from(id).ok());
 
         match typeflag {
             tar_no_std::TypeFlag::DIRTYPE => match fs.mkdir(&*path, mode) {
@@ -125,7 +131,12 @@ pub fn import_all<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Import
                 // Character devices and hardlinks: not produced by `export_all`, skipped.
                 let payload_blocks = header.payload_block_count().unwrap_or(0);
                 block_index += payload_blocks;
+                continue;
             }
+        }
+        if !matches!(typeflag, tar_no_std::TypeFlag::SYMTYPE) {
+            let _ = fs.chown(&*path, owner_user, owner_group);
+            let _ = fs.chmod(&*path, mode);
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -192,6 +203,9 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     mode.set(Mode::ROTH, perms.contains(ModeFlags::OthersRead));
     mode.set(Mode::WOTH, perms.contains(ModeFlags::OthersWrite));
     mode.set(Mode::XOTH, perms.contains(ModeFlags::OthersExec));
+    mode.set(Mode::SUID, perms.contains(ModeFlags::SetUID));
+    mode.set(Mode::SGID, perms.contains(ModeFlags::SetGID));
+    mode.set(Mode::SVTX, perms.contains(ModeFlags::TSVTX));
     if mode.is_empty() {
         mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH;
     }

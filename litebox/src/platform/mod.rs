@@ -1736,6 +1736,22 @@ pub trait SystemInfoProvider {
         None
     }
 
+    fn spill_available(&self) -> bool {
+        false
+    }
+
+    fn spill_write(&self, _slot: u32, _offset: u64, _bytes: &[u8]) -> bool {
+        false
+    }
+
+    fn spill_set_len(&self, _slot: u32, _length: u64) -> bool {
+        false
+    }
+
+    fn spill_read_at(&self, _slot: u32, _offset: u64, _buf: &mut [u8]) -> usize {
+        0
+    }
+
     /// Returns the number of logical CPUs the host makes available to this process.
     ///
     /// Backs the guest-visible `/proc/cpuinfo` synthesis (see `litebox::fs::procfs::Procfs`):

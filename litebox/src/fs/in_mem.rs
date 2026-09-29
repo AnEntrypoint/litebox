@@ -40,6 +40,7 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     // sync-primitives platform, as well as cost of mutexes and such?
     root: sync::RwLock<Platform, RootDir<Platform>>,
     current_user: UserInfo,
+    identity_forced: bool,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     // a source of freshness for providing unique IDs
@@ -63,9 +64,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
                 user: 1000,
                 group: 1000,
             },
+            identity_forced: false,
             current_working_dir: "/".into(),
             unique_id_freshness: 1.into(), // the root dir gets unique ID of 0
         }
+    }
+
+    fn user(&self) -> UserInfo {
+        if self.identity_forced {
+            return self.current_user;
+        }
+        super::effective_identity().unwrap_or(self.current_user)
     }
 
     /// Permanently change the fixed uid/gid used for every subsequent permission check against
@@ -85,7 +94,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         F: FnOnce(&mut Self),
     {
         let original_user = core::mem::replace(&mut self.current_user, UserInfo::ROOT);
+        self.identity_forced = true;
         f(self);
+        self.identity_forced = false;
         let root_again = core::mem::replace(&mut self.current_user, original_user);
         if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
             unreachable!()
@@ -196,7 +207,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         let mut current = path;
         for _ in 0..MAX_SYMLINK_HOPS {
             let root = self.root.read();
-            let (_, entry) = root.parent_and_entry(&current, self.current_user)?;
+            let (_, entry) = root.parent_and_entry(&current, self.user())?;
             let Some(Entry::Symlink(symlink)) = entry else {
                 return Ok(current);
             };
@@ -287,7 +298,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         let (entry, created) = if flags.contains(OFlags::CREAT) {
             let mut root = self.root.write();
-            let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (parent, entry) = root.parent_and_entry(&path, self.user())?;
             if let Some(entry) = entry {
                 if flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
@@ -301,7 +312,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     unreachable!()
                 };
                 let mut parent = parent.write();
-                if !self.current_user.can_write(&parent.perms) {
+                if !self.user().can_write(&parent.perms) {
                     return Err(OpenError::NoWritePerms);
                 }
                 // When both O_CREAT and O_DIRECTORY are specified in flags and the
@@ -316,7 +327,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
                     perms: Permissions {
                         mode,
-                        userinfo: self.current_user,
+                        userinfo: self.user(),
                         atime: super::Timestamp::default(),
                         mtime: super::Timestamp::default(),
                     },
@@ -330,7 +341,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
         } else {
             let root = self.root.read();
-            let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (_, entry) = root.parent_and_entry(&path, self.user())?;
             let Some(entry) = entry else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
@@ -344,7 +355,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let read_allowed = if path_only {
             false
         } else if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_read(&entry.perms()) {
+            if !created && !self.user().can_read(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true
@@ -354,7 +365,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let write_allowed = if path_only {
             false
         } else if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_write(&entry.perms()) {
+            if !created && !self.user().can_write(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true
@@ -591,14 +602,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.user())?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -606,7 +617,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -617,7 +628,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 // recurse, and a symlink's own mode bits are never consulted, so writing them is
                 // harmless where erroring would not be. See gm mutable mut-1789044090865.
                 let perms = &mut symlink.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -639,7 +650,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match entry {
             Descriptor::File { file, .. } => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -647,7 +658,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Descriptor::Dir { dir } => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -664,14 +675,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.user())?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -684,7 +695,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -697,7 +708,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Symlink(symlink) => {
                 let perms = &mut symlink.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(self.user().user == 0 || self.user().user == perms.userinfo.user) {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -719,17 +730,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     ) -> Result<(), SetTimesError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.user())?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         match entry {
             Entry::File(file) => {
-                apply_times(&mut file.write().perms, self.current_user, atime, mtime)
+                apply_times(&mut file.write().perms, self.user(), atime, mtime)
             }
-            Entry::Dir(dir) => apply_times(&mut dir.write().perms, self.current_user, atime, mtime),
+            Entry::Dir(dir) => apply_times(&mut dir.write().perms, self.user(), atime, mtime),
             Entry::Symlink(symlink) => {
-                apply_times(&mut symlink.write().perms, self.current_user, atime, mtime)
+                apply_times(&mut symlink.write().perms, self.user(), atime, mtime)
             }
         }
     }
@@ -737,7 +748,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.user())?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(UnlinkError::IsADirectory);
@@ -749,7 +760,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(UnlinkError::IsADirectory);
         }
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !self.user().can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
         }
         let removed = parent
@@ -780,7 +791,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             // Renaming a path onto itself is always a (redundant) success on Linux, provided the
             // path actually exists.
             let root = self.root.write();
-            let (_, entry) = root.parent_and_entry(&from, self.current_user)?;
+            let (_, entry) = root.parent_and_entry(&from, self.user())?;
             return if entry.is_some() {
                 Ok(())
             } else {
@@ -790,7 +801,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
         let mut root = self.root.write();
 
-        let (from_parent, from_entry) = root.parent_and_entry(&from, self.current_user)?;
+        let (from_parent, from_entry) = root.parent_and_entry(&from, self.user())?;
         let Some((from_parent_path, from_parent)) = from_parent else {
             // Attempted to rename `/` itself.
             return Err(RenameError::IsADirectory);
@@ -813,7 +824,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
         }
 
-        let (to_parent, to_entry) = root.parent_and_entry(&to, self.current_user)?;
+        let (to_parent, to_entry) = root.parent_and_entry(&to, self.user())?;
         let Some((to_parent_path, to_parent)) = to_parent else {
             // Attempted to rename onto `/` itself.
             return Err(RenameError::DestinationIsADirectory);
@@ -835,7 +846,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // locking it twice here would deadlock).
         if same_parent {
             let mut parent = from_parent.write();
-            if !self.current_user.can_write(&parent.perms) {
+            if !self.user().can_write(&parent.perms) {
                 return Err(RenameError::NoWritePerms);
             }
             let Some(ft) = parent.children.remove(&from_name) else {
@@ -843,8 +854,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             };
             parent.children.insert(to_name, ft);
         } else {
-            if !self.current_user.can_write(&from_parent.read().perms)
-                || !self.current_user.can_write(&to_parent.read().perms)
+            if !self.user().can_write(&from_parent.read().perms)
+                || !self.user().can_write(&to_parent.read().perms)
             {
                 return Err(RenameError::NoWritePerms);
             }
@@ -895,7 +906,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
         // Resolve `oldpath` first: it must name an existing regular file (never a directory,
         // matching Linux's own `EPERM` restriction here -- kept acyclic filesystem trees).
-        let (_, old_entry) = root.parent_and_entry(&oldpath, self.current_user)?;
+        let (_, old_entry) = root.parent_and_entry(&oldpath, self.user())?;
         let Some(old_entry) = old_entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -906,7 +917,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // share one `FileX` and `unique_id` (`stat`'s `ino`) -- a real hard link, and unlinking
         // one name leaves the other's content alive. See gm mutable mut-1789044267194.
 
-        let (new_parent, new_entry) = root.parent_and_entry(&newpath, self.current_user)?;
+        let (new_parent, new_entry) = root.parent_and_entry(&newpath, self.user())?;
         if new_entry.is_some() {
             return Err(LinkError::AlreadyExists);
         }
@@ -916,7 +927,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             unreachable!()
         };
         let mut new_parent = new_parent.write();
-        if !self.current_user.can_write(&new_parent.perms) {
+        if !self.user().can_write(&new_parent.perms) {
             return Err(LinkError::NoWritePerms);
         }
         let old = new_parent.children.insert(
@@ -932,7 +943,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn make_fifo(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.user())?;
         if entry.is_some() {
             return Err(MkdirError::AlreadyExists);
         }
@@ -942,7 +953,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             unreachable!()
         };
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !self.user().can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
         let old = parent.children.insert(
@@ -953,7 +964,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
             perms: Permissions {
                 mode,
-                userinfo: self.current_user,
+                userinfo: self.user(),
                 atime: super::Timestamp::default(),
                 mtime: super::Timestamp::default(),
             },
@@ -974,7 +985,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let target = target.as_rust_str().map_err(PathError::from)?.to_owned();
         let linkpath = self.absolute_path(linkpath)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&linkpath, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&linkpath, self.user())?;
         if entry.is_some() {
             return Err(SymlinkError::AlreadyExists);
         }
@@ -984,7 +995,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             unreachable!()
         };
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !self.user().can_write(&parent.perms) {
             return Err(SymlinkError::NoWritePerms);
         }
         let old = parent.children.insert(
@@ -997,7 +1008,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Entry::Symlink(Arc::new(sync::RwLock::new(SymlinkX {
                 perms: Permissions {
                     mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    userinfo: self.current_user,
+                    userinfo: self.user(),
                     atime: super::Timestamp::default(),
                     mtime: super::Timestamp::default(),
                 },
@@ -1012,7 +1023,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn read_link(&self, path: impl crate::path::Arg) -> Result<String, ReadLinkError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.user())?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -1025,7 +1036,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.user())?;
         let Some((_parent_path, parent)) = parent else {
             // Attempted to make `/`
             return Err(MkdirError::AlreadyExists);
@@ -1034,7 +1045,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(MkdirError::AlreadyExists);
         };
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !self.user().can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
         let old = parent.children.insert(
@@ -1047,7 +1058,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Entry::Dir(Arc::new(sync::RwLock::new(DirX {
                 perms: Permissions {
                     mode,
-                    userinfo: self.current_user,
+                    userinfo: self.user(),
                     atime: super::Timestamp::default(),
                     mtime: super::Timestamp::default(),
                 },
@@ -1062,7 +1073,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.user())?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(RmdirError::Busy);
@@ -1077,7 +1088,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(RmdirError::NotEmpty);
         }
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !self.user().can_write(&parent.perms) {
             return Err(RmdirError::NoWritePerms);
         }
         let removed = parent
@@ -1169,7 +1180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.user())?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -1484,7 +1495,9 @@ impl UserInfo {
 
 impl Permissions {
     fn can_read_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
+        if current.user == 0 {
+            true
+        } else if self.userinfo.user == current.user {
             self.mode.contains(Mode::RUSR)
         } else if self.userinfo.group == current.group {
             self.mode.contains(Mode::RGRP)
@@ -1493,7 +1506,9 @@ impl Permissions {
         }
     }
     fn can_write_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
+        if current.user == 0 {
+            true
+        } else if self.userinfo.user == current.user {
             self.mode.contains(Mode::WUSR)
         } else if self.userinfo.group == current.group {
             self.mode.contains(Mode::WGRP)
@@ -1502,7 +1517,9 @@ impl Permissions {
         }
     }
     fn can_execute_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
+        if current.user == 0 {
+            true
+        } else if self.userinfo.user == current.user {
             self.mode.contains(Mode::XUSR)
         } else if self.userinfo.group == current.group {
             self.mode.contains(Mode::XGRP)

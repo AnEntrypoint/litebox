@@ -4152,6 +4152,15 @@ pub enum SyscallRequest {
         rgid: u32,
         egid: u32,
     },
+    Getpriority {
+        which: i32,
+        who: i32,
+    },
+    Setpriority {
+        which: i32,
+        who: i32,
+        prio: i32,
+    },
     Setfsuid {
         uid: u32,
     },
@@ -4789,6 +4798,8 @@ impl SyscallRequest {
             Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
             Sysno::setreuid => sys_req!(Setreuid { ruid, euid }),
             Sysno::setregid => sys_req!(Setregid { rgid, egid }),
+            Sysno::getpriority => sys_req!(Getpriority { which, who }),
+            Sysno::setpriority => sys_req!(Setpriority { which, who, prio }),
             Sysno::setfsuid => sys_req!(Setfsuid { uid }),
             Sysno::setfsgid => sys_req!(Setfsgid { gid }),
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),

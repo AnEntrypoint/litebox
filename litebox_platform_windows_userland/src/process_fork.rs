@@ -4926,6 +4926,21 @@ fn guest_started_event_name(target_pid: u32) -> Vec<u16> {
     name
 }
 
+static FAULT_ARMED_EVENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+
+fn fault_armed_event_name(target_pid: u32) -> Vec<u16> {
+    let mut name: Vec<u16> = format!(r"Local\litebox-fault-armed-{target_pid}").encode_utf16().collect();
+    name.push(0);
+    name
+}
+
+pub fn mark_fault_terminate_armed() {
+    let handle = FAULT_ARMED_EVENT.load(core::sync::atomic::Ordering::Acquire);
+    if handle != 0 {
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as HANDLE) };
+    }
+}
+
 /// Tells this process's external fault watchdog that guest code is now running. Until then the
 /// watchdog does not count idle time as a wedge: everything before the guest starts (the OCI
 /// manifest fetch and layer download, decompression, rootfs indexing) is legitimately idle on the
@@ -4976,6 +4991,18 @@ pub fn spawn_external_fault_watchdog() {
     };
     if !started_event.is_null() {
         GUEST_STARTED_EVENT.store(started_event as isize, core::sync::atomic::Ordering::Release);
+    }
+    let armed_name = fault_armed_event_name(parent_pid);
+    let armed_event = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            core::ptr::null(),
+            1,
+            0,
+            armed_name.as_ptr(),
+        )
+    };
+    if !armed_event.is_null() {
+        FAULT_ARMED_EVENT.store(armed_event as isize, core::sync::atomic::Ordering::Release);
     }
     unsafe {
         std::env::set_var(FAULT_WATCHDOG_CHILD_ENV_VAR, "1");
@@ -5112,8 +5139,25 @@ pub fn run_external_fault_watchdog_child() -> ! {
     let started_event = unsafe {
         windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, started_name.as_ptr())
     };
+    let armed_name = fault_armed_event_name(target_pid);
+    let armed_event = unsafe {
+        windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, armed_name.as_ptr())
+    };
     loop {
         std::thread::sleep(POLL_INTERVAL);
+        if !armed_event.is_null()
+            && unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0) }
+                != 0
+        {
+            let mut code: u32 = STILL_ACTIVE;
+            if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {
+                unsafe { CloseHandle(handle) };
+                std::process::exit(0);
+            }
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = None;
+            continue;
+        }
         if !started_event.is_null()
             && unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(started_event, 0) }
                 != 0

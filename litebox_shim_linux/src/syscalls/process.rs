@@ -1090,6 +1090,7 @@ pub(crate) struct Credentials {
     secure_bits: AtomicU32,
     fsuid: AtomicU32,
     fsgid: AtomicU32,
+    nice: core::sync::atomic::AtomicI32,
 }
 
 impl Credentials {
@@ -1108,6 +1109,7 @@ impl Credentials {
             secure_bits: 0.into(),
             fsuid: euid.into(),
             fsgid: egid.into(),
+            nice: 0.into(),
         }
     }
 
@@ -1135,6 +1137,14 @@ impl Credentials {
         self.sgid.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn fsuid(&self) -> u32 {
+        self.fsuid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn fsgid(&self) -> u32 {
+        self.fsgid.load(Ordering::Relaxed)
+    }
+
     /// Whether the effective user may change ids and groups freely (this shim has no capability
     /// model: root is the only privileged user).
     fn is_privileged(&self) -> bool {
@@ -1153,6 +1163,8 @@ impl Credentials {
             .store(self.retained_caps.load(Ordering::Relaxed), Ordering::Relaxed);
         copy.fsuid.store(self.fsuid.load(Ordering::Relaxed), Ordering::Relaxed);
         copy.fsgid.store(self.fsgid.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.nice.store(self.nice.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.nice.store(self.nice.load(Ordering::Relaxed), Ordering::Relaxed);
         copy.group_count
             .store(self.group_count.load(Ordering::Relaxed), Ordering::Relaxed);
         copy
@@ -1172,6 +1184,9 @@ impl Credentials {
                 slot.store(v, Ordering::Relaxed);
             }
         }
+        if euid != u32::MAX {
+            self.fsuid.store(euid, Ordering::Relaxed);
+        }
         if keeps_caps && self.euid() != 0 {
             self.retained_caps.store(true, Ordering::Relaxed);
         }
@@ -1189,6 +1204,9 @@ impl Credentials {
             if v != u32::MAX {
                 slot.store(v, Ordering::Relaxed);
             }
+        }
+        if egid != u32::MAX {
+            self.fsgid.store(egid, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -6239,6 +6257,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.credentials.set_re_gid(rgid, egid)
     }
 
+    fn priority_target_is_self(&self, which: i32, who: i32) -> Result<(), Errno> {
+        const PRIO_PROCESS: i32 = 0;
+        const PRIO_PGRP: i32 = 1;
+        const PRIO_USER: i32 = 2;
+        let is_self = match which {
+            PRIO_PROCESS => who == 0 || who == self.pid.get(),
+            PRIO_PGRP => {
+                who == 0
+                    || self
+                        .xproc_pgid_of(self.pid.get())
+                        .is_some_and(|group| group == who)
+            }
+            PRIO_USER => {
+                who == 0 || u32::try_from(who).is_ok_and(|user| user == self.credentials.uid())
+            }
+            _ => return Err(Errno::EINVAL),
+        };
+        if is_self { Ok(()) } else { Err(Errno::ESRCH) }
+    }
+
+    pub(crate) fn sys_getpriority(&self, which: i32, who: i32) -> Result<usize, Errno> {
+        self.priority_target_is_self(which, who)?;
+        let raw_priority = 20 - self.credentials.nice.load(Ordering::Relaxed);
+        Ok(usize::try_from(raw_priority).unwrap_or(0))
+    }
+
+    pub(crate) fn sys_setpriority(&self, which: i32, who: i32, prio: i32) -> Result<(), Errno> {
+        self.priority_target_is_self(which, who)?;
+        let requested = prio.clamp(-20, 19);
+        let lowers_nice = requested < self.credentials.nice.load(Ordering::Relaxed);
+        if lowers_nice && self.credentials.euid() != 0 {
+            return Err(Errno::EACCES);
+        }
+        self.credentials.nice.store(requested, Ordering::Relaxed);
+        Ok(())
+    }
     /// Handle syscall `setfsuid`: returns the previous value and never reports failure (the
     /// kernel ignores a refused change too). File permission checks use the effective ids.
     pub(crate) fn sys_setfsuid(&self, uid: u32) -> u32 {

@@ -287,7 +287,7 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
         // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
         // root-owned matches real Linux's own `/dev`.
-        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH)
+        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::XGRP | litebox::fs::Mode::ROTH | litebox::fs::Mode::XOTH)
             .unwrap();
         fs.mkdir(
             "/dev/shm",
@@ -344,7 +344,7 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // above.
         fs.mkdir(
             "/etc",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::XGRP | litebox::fs::Mode::ROTH | litebox::fs::Mode::XOTH,
         )
         .unwrap();
         let resolv_conf = fs
@@ -658,6 +658,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
         }
     }
+
+    litebox_platform_windows_userland::prepare_spill_directory();
 
     // `litebox` is `#![no_std]` and cannot read an environment variable itself, so the runner
     // forwards this one on its behalf, here -- before any guest mapping is placed. It disables the
@@ -2576,7 +2578,7 @@ where
     Upper: litebox::fs::FileSystem,
     Lower: litebox::fs::FileSystem,
 {
-    let entries = litebox::fs::export::export_all(fs.upper())
+    let entries = litebox::fs::with_root_identity(|| litebox::fs::export::export_all(fs.upper()))
         .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
 
     if std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some() {
@@ -2602,9 +2604,9 @@ where
             continue;
         }
         let mut header = tar::Header::new_ustar();
-        header.set_mode(entry.mode.bits() & 0o777);
-        header.set_uid(1000);
-        header.set_gid(1000);
+        header.set_mode(entry.mode.bits() & 0o7777);
+        header.set_uid(u64::from(entry.owner.user));
+        header.set_gid(u64::from(entry.owner.group));
         match entry.file_type {
             litebox::fs::FileType::Directory => {
                 header.set_entry_type(tar::EntryType::Directory);
@@ -2685,7 +2687,9 @@ fn import_writable_layer(
             .into_owned();
         let path = alloc::format!("/{header_path}");
         let mode_bits = entry.header().mode().unwrap_or(0o644);
-        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);
+        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o7777);
+        let owner_user = u16::try_from(entry.header().uid().unwrap_or(0)).unwrap_or(0);
+        let owner_group = u16::try_from(entry.header().gid().unwrap_or(0)).unwrap_or(0);
 
         if diag {
             diag_total += 1;
@@ -2776,6 +2780,8 @@ fn import_writable_layer(
                     .map_err(|e| anyhow!("failed to close {path} while resuming: {e:?}"))?;
             }
         }
+        let _ = fs.chmod(&*path, mode);
+        let _ = fs.chown(&*path, Some(owner_user), Some(owner_group));
     }
     if diag {
         eprintln!(

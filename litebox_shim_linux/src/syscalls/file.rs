@@ -29,7 +29,7 @@ use thiserror::Error;
 
 use crate::{
     GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
-    syscalls::signal,
+    syscalls::{file_spill::SpillEdit, signal},
 };
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -998,6 +998,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return self.open_fifo(status.node_info, flags, path);
         }
+        self.refresh_from_spill(path_str);
+        let creating_spilled_file = flags.contains(OFlags::CREAT)
+            && self.spill_enabled_for(path_str)
+            && self.files.borrow().fs.file_status(path.as_c_str()).is_err();
         let file = match self.do_open(path.clone(), flags, mode) {
             Ok(file) => file,
             // A real local `ENOENT` on a path a sibling has published content for (see
@@ -1019,6 +1023,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(errno);
             }
         };
+        let truncating = flags.contains(OFlags::TRUNC)
+            && flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        if creating_spilled_file || truncating {
+            self.publish_spilled(path_str, SpillEdit::Reset);
+        }
         self.insert_raw_file_fd_with_path(file, flags, Some(path))
     }
 
@@ -1152,8 +1161,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        let spilled_path = self.spilled_path_of_fd(raw_fd);
         let files = self.files.borrow();
-        files
+        let truncated = files
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
@@ -1185,7 +1195,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL))
-            .flatten()
+            .flatten();
+        drop(files);
+        if truncated.is_ok()
+            && let Some(path) = spilled_path
+        {
+            self.publish_spilled(&path, SpillEdit::Truncate(length));
+        }
+        truncated
     }
 
     /// Handle syscall `fallocate` -- ensure `[offset, offset+len)` is allocated in `fd`.
@@ -1445,11 +1462,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok()
                 .filter(|status| status.file_type == litebox::fs::FileType::RegularFile)
                 .map(|status| status.node_info);
+            self.refresh_from_spill(path.to_str().unwrap_or_default());
             let result = self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from);
             if result.is_ok()
                 && let Some(node_info) = node_info
             {
                 self.tag_unlinked_regular_file_as_shm_like(node_info);
+            }
+            if result.is_ok() {
+                self.publish_spilled(path.to_str().unwrap_or_default(), SpillEdit::Remove);
             }
             result
         };
@@ -1557,12 +1578,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
+        self.refresh_from_spill(old_path.to_str().unwrap_or_default());
         let result = self
             .files
             .borrow()
             .fs
             .rename(old_path.clone(), new_path.clone())
             .map_err(Errno::from);
+        if result.is_ok() {
+            self.publish_spilled_rename(
+                old_path.to_str().unwrap_or_default(),
+                new_path.to_str().unwrap_or_default(),
+            );
+        }
         litebox_util_log::debug!(
             tid:% = self.tid.get(),
             from:% = old_path.to_string_lossy(),
@@ -1988,6 +2016,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
                 .ok(),
         };
+        let spilled_path = self.spilled_path_of_fd(raw_fd);
         let files = self.files.borrow();
         let res = files
             .run_on_raw_fd(
@@ -2059,6 +2088,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL))
             .flatten();
         drop(files);
+        if let (Ok(n), Some(path)) = (&res, &spilled_path)
+            && n > &0
+        {
+            let start = match offset {
+                Some(explicit) => Some(explicit),
+                None => self
+                    .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .ok()
+                    .and_then(|end| end.checked_sub(*n)),
+            };
+            if let Some(start) = start {
+                self.publish_spilled(path, SpillEdit::Write { start, bytes: &buf[..*n] });
+            }
+        }
         if let Ok(n) = res
             && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
         {
@@ -2479,56 +2522,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
-    /// Handle syscall `chown`/`lchown`/`fchownat`.
-    ///
-    /// litebox has no real multi-user model -- every guest process runs as a single simulated
-    /// uid/gid that already "owns" everything, exactly the way `chown(path, geteuid(), -1)` on
-    /// real Linux trivially succeeds as a no-op for a process chowning its own file. There is no
-    /// second user identity a real litebox layer could observe ownership actually changing for,
-    /// so genuinely tracking per-file owner/group (a new stat field, persisted across the tar-ro
-    /// and in-memory-writable backends, threaded through every existing `FileStatus` call site)
-    /// would be real, non-trivial plumbing purely to answer a question no caller in this
-    /// environment can meaningfully ask. Real callers (apk's `.apk` staging-file install,
-    /// observed live: `chown(".apk.<hash>", 0, 0)` while already running as uid 0) only care that
-    /// the call succeeds, not that a distinct ownership concept is tracked -- so validate the
-    /// path/fd resolves to a real file (so a genuinely missing target still reports `ENOENT`
-    /// correctly) and succeed, matching this project's established `fadvise64`/`membarrier`
-    /// pattern of an honest no-op over either a fake enforcement or a wrong `ENOSYS`/`EPERM`.
     pub(crate) fn sys_fchownat(
         &self,
         dirfd: i32,
         pathname: impl path::Arg,
-        _owner: u32,
-        _group: u32,
+        owner: u32,
+        group: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.files.borrow().fs.file_status(pathname)?;
-        Ok(())
+        self.do_chown(pathname.to_str().map_err(|_| Errno::EINVAL)?, owner, group)
     }
 
-    /// Handle syscall `fchown`. See [`Self::sys_fchownat`]'s doc comment for why this is a no-op.
-    pub(crate) fn sys_fchown(&self, fd: u32, _owner: u32, _group: u32) -> Result<(), Errno> {
+    fn do_chown(&self, path: &str, owner: u32, group: u32) -> Result<(), Errno> {
+        let narrowed = |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX - 1));
+        let (user, group) = (narrowed(owner), narrowed(group));
+        self.refresh_from_spill(path);
+        let files = self.files.borrow();
+        let status = files.fs.file_status(path)?;
+        let unprivileged_owner_change =
+            self.credentials.euid() != 0 && user.is_some_and(|user| user != status.owner.user);
+        if unprivileged_owner_change {
+            return Err(Errno::EPERM);
+        }
+        if user.is_none() && group.is_none() {
+            return Ok(());
+        }
+        files.fs.chown(path, user, group).map_err(Errno::from)
+    }
+
+    pub(crate) fn sys_fchown(&self, fd: u32, owner: u32, group: u32) -> Result<(), Errno> {
         let Ok(raw_fd) = usize::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let files = self.files.borrow();
-        files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| files.fs.fd_file_status(fd).map(|_| ()).map_err(Errno::from),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-                |_fd| Ok(()),
-            )
-            .flatten()
+        let path = self
+            .files
+            .borrow()
+            .lookup_fd_path(raw_fd)
+            .and_then(|path| path.into_string().ok());
+        let is_file_fd = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        files
+                            .fs
+                            .fd_file_status(fd)
+                            .map(|_| true)
+                            .map_err(Errno::from)
+                    },
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                )
+                .flatten()?
+        };
+        match path {
+            Some(path) if is_file_fd => self.do_chown(&path, owner, group),
+            _ => Ok(()),
+        }
     }
-
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         self.do_close_and_replace::<FS>(raw_fd, None)
     }
@@ -3144,6 +3203,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
+        if let Ok(path_str) = pathname.as_rust_str() {
+            self.refresh_from_spill(path_str);
+        }
         let status = match self.files.borrow().fs.file_status(&pathname) {
             Ok(status) => status,
             Err(litebox::fs::errors::FileStatusError::PathError(
@@ -3559,6 +3621,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
             return Ok(T::from(status));
         }
+        self.refresh_from_spill(normalized_path.as_str());
         let lookup_path = if follow_symlink {
             self.resolve_final_symlinks(normalized_path)?
         } else {
@@ -7091,6 +7154,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        let listed_directory = self
+            .files
+            .borrow()
+            .lookup_fd_path(fd)
+            .and_then(|path| path.into_string().ok());
+        if let Some(directory) = listed_directory {
+            self.refresh_spilled_directory(&directory);
+        }
         let files = self.files.borrow();
         files.run_on_raw_fd(
             fd,

@@ -648,6 +648,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
                         shared_file_publish: syscalls::file::SharedFilePublishTable::new(),
+                        shared_file_spill: syscalls::file_spill::SharedFileSpill::new(),
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
                         flock_registry: litebox::sync::Mutex::new(
@@ -1947,6 +1948,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let start = timed.then(|| self.global.platform.now());
+        litebox::fs::set_effective_identity(self.credentials.fsuid(), self.credentials.fsgid());
 
         // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`: log syscall ENTRY (before dispatch, so a syscall
         // that blocks forever still shows up -- `LITEBOX_STRACE_SUMMARY`'s aggregate-only
@@ -2009,12 +2011,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             crate::diag::emit_timeline_line(
                 self.global.platform,
                 &alloc::format!(
-                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={}",
+                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={} result={:?}",
                     self.pid.get(),
                     self.tid.get(),
                     alloc::string::String::from_utf8_lossy(&comm_bytes),
                     crate::diag::syscall_name_pub(syscall_number),
                     result.is_ok(),
+                    result,
                 ),
             );
         }
@@ -2041,6 +2044,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             ctx.regs[0] = return_value;
         }
+    }
+
+    fn decode_path_arguments(request_debug: &str) -> alloc::string::String {
+        const PATH_FIELDS: [&str; 3] = ["pathname: UserPtr(", "oldpath: UserPtr(", "newpath: UserPtr("];
+        let mut decoded = alloc::string::String::new();
+        for field in PATH_FIELDS {
+            let Some(start) = request_debug.find(field) else {
+                continue;
+            };
+            let digits = &request_debug[start + field.len()..];
+            let Some(address) = digits
+                .split(')')
+                .next()
+                .and_then(|text| text.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let path = UserPtr::<core::ffi::c_char>::from_usize(address)
+                .to_cstring::<Platform>()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|| alloc::string::String::from("<unreadable>"));
+            decoded.push_str(&alloc::format!("{}={path:?} ", field.split(':').next().unwrap_or("")));
+        }
+        decoded
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -2081,8 +2108,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let truncated = if debug_str.len() > 200 {
                 alloc::format!("{}...", &debug_str[..200])
             } else {
-                debug_str
+                debug_str.clone()
             };
+            let truncated = alloc::format!("{truncated} {}", Self::decode_path_arguments(&debug_str));
             crate::diag::emit_timeline_line(
                 self.global.platform,
                 &alloc::format!(
@@ -2873,6 +2901,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Setreuid { ruid, euid } => syscall!(sys_setreuid(ruid, euid)),
             SyscallRequest::Setregid { rgid, egid } => syscall!(sys_setregid(rgid, egid)),
+            SyscallRequest::Getpriority { which, who } => syscall!(sys_getpriority(which, who)),
+            SyscallRequest::Setpriority { which, who, prio } => {
+                syscall!(sys_setpriority(which, who, prio))
+            }
             SyscallRequest::Setfsuid { uid } => Ok(self.sys_setfsuid(uid) as usize),
             SyscallRequest::Setfsgid { gid } => Ok(self.sys_setfsgid(gid) as usize),
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
@@ -3445,6 +3477,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// the full mechanism and scope boundary. Same free-riding-on-`GlobalState`'s-own-sharing
     /// rationale as `unix_addr_presence` above: a plain, pointer-free field of this same struct.
     shared_file_publish: syscalls::file::SharedFilePublishTable,
+    shared_file_spill: syscalls::file_spill::SharedFileSpill,
     // NOTE: this struct deliberately has NO `elf_patch_cache` field -- THIRD instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment (`litebox`/`proc_self_info`/`pts_registry`), live-diagnosed 2026-09-17: an attaching

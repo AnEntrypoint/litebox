@@ -69,11 +69,15 @@ impl Context {
     pub fn new() -> Context {
         Self {
             cwd: vec![],
-            user_info: UserInfo {
+            user_info: super::effective_identity().unwrap_or(UserInfo {
                 user: 1000,
                 group: 1000,
-            },
+            }),
         }
+    }
+
+    fn is_root(&self) -> bool {
+        self.user_info.user == 0
     }
 
     /// Resolve `path` against the current context.
@@ -102,7 +106,9 @@ impl Context {
     }
 
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.is_root() {
+            true
+        } else if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
         } else if self.user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::XGRP)
@@ -112,7 +118,9 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.is_root() {
+            true
+        } else if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
         } else if self.user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::RGRP)
@@ -122,7 +130,9 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        if self.is_root() {
+            true
+        } else if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
         } else if self.user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::WGRP)

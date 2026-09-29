@@ -14,6 +14,7 @@ pub(crate) mod evdev;
 /// `no_std` crate) can turn evdev `SYN_REPORT` tracing on without widening the module.
 pub use evdev::set_input_trace;
 pub mod file;
+pub(crate) mod file_spill;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;

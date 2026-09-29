@@ -476,5 +476,48 @@ impl UserInfo {
     pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
+static EFFECTIVE_IDENTITY_ASSIGNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static EFFECTIVE_IDENTITY_USER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EFFECTIVE_IDENTITY_GROUP: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn narrowed_id(id: u32) -> u16 {
+    u16::try_from(id).unwrap_or(u16::MAX - 1)
+}
+
+/// Declares the credentials of the running guest process: every permission check made by the file
+/// systems of this host process uses them, and root bypasses read and write permission bits.
+pub fn set_effective_identity(user: u32, group: u32) {
+    EFFECTIVE_IDENTITY_USER.store(user, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_GROUP.store(group, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_ASSIGNED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn effective_identity() -> Option<UserInfo> {
+    EFFECTIVE_IDENTITY_ASSIGNED
+        .load(core::sync::atomic::Ordering::Acquire)
+        .then(|| UserInfo {
+            user: narrowed_id(EFFECTIVE_IDENTITY_USER.load(core::sync::atomic::Ordering::Relaxed)),
+            group: narrowed_id(EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed)),
+        })
+}
+
+/// Runs `body` with root credentials, for bookkeeping that must see every file regardless of the
+/// guest process that happens to be running it.
+pub fn with_root_identity<R>(body: impl FnOnce() -> R) -> R {
+    let previous = (
+        EFFECTIVE_IDENTITY_ASSIGNED.load(core::sync::atomic::Ordering::Acquire),
+        EFFECTIVE_IDENTITY_USER.load(core::sync::atomic::Ordering::Relaxed),
+        EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed),
+    );
+    set_effective_identity(0, 0);
+    let result = body();
+    EFFECTIVE_IDENTITY_USER.store(previous.1, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_GROUP.store(previous.2, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_ASSIGNED.store(previous.0, core::sync::atomic::Ordering::Release);
+    result
+}
+
 /// The size reported as the size of a directory.
 const DEFAULT_DIRECTORY_SIZE: usize = 4096;

@@ -234,6 +234,18 @@ impl From<litebox::fs::errors::ChmodError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::ChownError> for Errno {
+    fn from(value: litebox::fs::errors::ChownError) -> Self {
+        match value {
+            litebox::fs::errors::ChownError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::ChownError::Io => Errno::EIO,
+            litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::SetTimesError> for Errno {
     fn from(value: litebox::fs::errors::SetTimesError) -> Self {
         match value {

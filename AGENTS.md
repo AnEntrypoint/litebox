@@ -160,6 +160,23 @@ tables); `SLAB_ALLOC` stays per-process. `SharedArc::new` shares only `T`'s inli
 private-heap nodes, so shared registries are fixed-slot, lock-free, atomic tables. Still per-process:
 `flock_registry`, `SafeZoneAllocator`'s `SpinMutex` (no dead-holder recovery, theoretical).
 
+## Cross-process file visibility, identity, apt (2026-09-30)
+
+- A file written by one host process is invisible to siblings until it exits (per-process writable layer).
+  `syscalls/file_spill.rs` write-through-spills paths under `SPILLED_PREFIXES` (`/var/lib/apt/`,
+  `/var/cache/apt/`) to `%TEMP%\litebox-spill-<rootpid>\<slot>.bin` (platform `spill_*`, index in
+  `GlobalState.shared_file_spill`, per-slot generation); open/stat/access/getdents/unlink/rename refresh the
+  local copy. Fixes `apt-get update` (http method writes InRelease, sqv/apt-get read it). Extend the prefix list,
+  not the mechanism, for the next such directory.
+- The fs layers check permissions against the calling task's fsuid/fsgid (`litebox::fs::set_effective_identity`,
+  set at every syscall entry); root bypasses rwx bits. `chown` is real, export/import carry owner and full mode.
+  Anything that walks the fs outside a syscall (export/import) must run inside `litebox::fs::with_root_identity`.
+- The external fault watchdog only counts stalls after the VEH sets the `litebox-fault-armed-<pid>` event; before,
+  it killed any idle method process (apt's sqv, exit code 1 = "signal 9").
+- `NETLINK_AUDIT` sockets ack every `NLM_F_ACK` message (libaudit/PAM need the ack); `getpriority`/`setpriority`
+  exist (pam_limits aborts on ENOSYS); AF_INET6 sockets answer `getsockname` etc. as v4-mapped `sockaddr_in6`.
+- Open: `apt-get install` hangs in dpkg-deb's pipe pair (cross-process pipe, `Unpacking ...`).
+
 ## Containers and OCI
 
 `litebox_packager --oci-image <ref> --output <tar>` pulls, merges, rewrites every ELF; the runner does the
