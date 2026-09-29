@@ -396,6 +396,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
     /// Rebuild a carried shim-level fd (a unix socket) at exactly `target_fd` from the spec its
     /// cross-process fork parent wrote. Same thread requirement as the other installers.
     pub fn install_shim_fd_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        if let Some(pty) = spec.strip_prefix("pty-master:") {
+            return self.task.install_pty_master_at_fd(target_fd, pty);
+        }
         self.task.install_unix_at_fd(target_fd, spec)
     }
 

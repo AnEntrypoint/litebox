@@ -404,8 +404,13 @@ struct SharedPtySlot<Platform: ShimPlatform> {
     master_to_slave: crate::syscalls::unix::SharedByteRing<Platform>,
     /// What the slave writes (guest program output); the master side reads this.
     slave_to_master: crate::syscalls::unix::SharedByteRing<Platform>,
-    /// Host process that holds the master. Once it is gone, slave reads see EOF.
-    master_host: AtomicU32,
+    /// Open master file descriptions, counted per host process exactly like the slaves below: the
+    /// master is held by the process that opened `/dev/ptmx`, and also by a cross-process fork
+    /// child that inherited it (VTE/GLib's child setup issues `TIOCGPTPEER` on the inherited
+    /// master before `exec`). The pty lives until the last live holder closes; slave reads see EOF
+    /// once none remains.
+    master_hosts: [AtomicU32; PTY_MASTER_HOLDER_SLOTS],
+    master_counts: [AtomicU32; PTY_MASTER_HOLDER_SLOTS],
     /// Open slave file descriptions, counted per host process (`slave_hosts[i]` holds
     /// `slave_counts[i]` of them), so a host process that died without closing its fds stops
     /// counting. Master reads return `EIO` once a slave was opened and none remains.
@@ -416,6 +421,9 @@ struct SharedPtySlot<Platform: ShimPlatform> {
 
 /// Distinct host processes that can hold a pty's slave open at once.
 const PTY_SLAVE_HOLDER_SLOTS: usize = 16;
+
+/// Distinct host processes that can hold a pty's master open at once.
+const PTY_MASTER_HOLDER_SLOTS: usize = 4;
 
 impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
     fn slave_opened(&self, host: u32) {
@@ -464,8 +472,47 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
         !any
     }
 
+    fn master_held(&self, host: u32) {
+        for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
+            if h.load(Ordering::Acquire) == host && c.load(Ordering::Acquire) > 0 {
+                c.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
+        }
+        for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
+            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                h.store(host, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    fn master_released(&self, host: u32) {
+        for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
+            if h.load(Ordering::Acquire) == host
+                && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// No live host process holds the master any more (a holder whose process died without
+    /// closing it stops counting).
     fn master_gone(&self, io: &PtyIo<'_, Platform>) -> bool {
-        !io.host_alive(self.master_host.load(Ordering::Acquire))
+        let mut any = false;
+        for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
+            if c.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            if io.host_alive(h.load(Ordering::Acquire)) {
+                any = true;
+            } else {
+                c.store(0, Ordering::Release);
+            }
+        }
+        !any
     }
 
     fn new_empty() -> Self {
@@ -479,7 +526,8 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
             packet_mode: AtomicBool::new(false),
             master_to_slave: crate::syscalls::unix::SharedByteRing::new_empty(),
             slave_to_master: crate::syscalls::unix::SharedByteRing::new_empty(),
-            master_host: AtomicU32::new(0),
+            master_hosts: core::array::from_fn(|_| AtomicU32::new(0)),
+            master_counts: core::array::from_fn(|_| AtomicU32::new(0)),
             slave_hosts: core::array::from_fn(|_| AtomicU32::new(0)),
             slave_counts: core::array::from_fn(|_| AtomicU32::new(0)),
             slave_ever_opened: AtomicBool::new(false),
@@ -567,7 +615,11 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
                 slot.packet_mode.store(false, Ordering::Relaxed);
                 slot.master_to_slave.reset();
                 slot.slave_to_master.reset();
-                slot.master_host.store(master_host, Ordering::Release);
+                for c in &slot.master_counts {
+                    c.store(0, Ordering::Release);
+                }
+                slot.master_hosts[0].store(master_host, Ordering::Release);
+                slot.master_counts[0].store(1, Ordering::Release);
                 for c in &slot.slave_counts {
                     c.store(0, Ordering::Release);
                 }
@@ -611,11 +663,29 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     /// both-sides-must-drop discipline) is the right one here: real devpts already keeps a pty
     /// alive past every slave close, so "the master's owning process is done with this id" is the
     /// one unambiguous release trigger, and it already exists as `ptmx_closed`.
-    pub(crate) fn release(&self, id: u32) {
+    /// Records another master file description of published pty `id` held by this host process
+    /// (a cross-process fork child re-attaching the master it inherited). `false` if the pty is
+    /// gone.
+    pub(crate) fn master_acquire(&self, id: u32, io: &PtyIo<'_, Platform>) -> bool {
+        match self.find(id) {
+            Some(slot) => {
+                slot.master_held(io.me());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The last close of one master file description held by this host process. The pty itself
+    /// is only torn down once no live host process holds a master any more.
+    pub(crate) fn master_closed(&self, id: u32, io: &PtyIo<'_, Platform>) {
         if let Some(slot) = self.find(id) {
-            slot.master_to_slave.shutdown();
-            slot.slave_to_master.shutdown();
-            slot.state.store(SHARED_PTY_SLOT_EMPTY, Ordering::Release);
+            slot.master_released(io.me());
+            if slot.master_gone(io) {
+                slot.master_to_slave.shutdown();
+                slot.slave_to_master.shutdown();
+                slot.state.store(SHARED_PTY_SLOT_EMPTY, Ordering::Release);
+            }
         }
     }
 
@@ -1461,7 +1531,20 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalStateHandle<Platfor
             drop(self.litebox.descriptor_table_mut().remove(&slave));
         }
         self.pts_registry.write().remove(&id);
-        self.shared_pty.release(id);
+        self.shared_pty.master_closed(id, &self.pty_io());
+    }
+
+    /// Re-attaches, in a cross-process fork child, the master of published pty `id` that the
+    /// parent held at fork time: a new master file description counted as one more holder.
+    pub(crate) fn pty_master_attach(&self, id: u32) -> Option<PtyFd<Platform>> {
+        if !self.shared_pty.master_acquire(id, &self.pty_io()) {
+            return None;
+        }
+        Some(
+            self.litebox
+                .descriptor_table_mut()
+                .insert(PtyEnd::SharedMaster(PtySharedHalf::new(id, true))),
+        )
     }
 
     /// Wakes a thread blocked reading `pair`'s master, matching real Linux's behavior of

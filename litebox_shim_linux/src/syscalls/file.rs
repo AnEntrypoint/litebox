@@ -6666,6 +6666,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
+    /// The pty id of `raw_fd` when it is a MASTER of a published (cross-process-visible) pty, else
+    /// `None`. Such a master carries nothing process-private -- it is just the id -- so a
+    /// cross-process fork child can re-attach it; see [`Self::install_pty_master_at_fd`].
+    pub(crate) fn carriable_pty_master_for_raw_fd(&self, raw_fd: usize) -> Option<u32> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::pty::PtySubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    handle.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                        (end.is_master() && end.shared_id().is_some())
+                            .then(|| end.shared_id())
+                            .flatten()
+                    })
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Child side of carrying a published pty's master across a cross-process `fork()`: re-attaches
+    /// master `id` at exactly `target_fd`. `spec` is `<cloexec 0|1>|<id>`.
+    ///
+    /// Without this the master is simply absent in the child, but GLib/VTE's child setup (every GTK
+    /// terminal) uses the INHERITED master before `exec` -- `ioctl(master, TIOCGPTPEER)` to get its
+    /// slave -- and failed with "Failed to open PTY peer: Bad file descriptor".
+    pub(crate) fn install_pty_master_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, id) = spec.split_once('|')?;
+        let id: u32 = id.parse().ok()?;
+        let master = self.global.pty_master_attach(id)?;
+        let flags = if cloexec == "1" { OFlags::CLOEXEC } else { OFlags::empty() };
+        let raw = i32::try_from(
+            self.insert_raw_pty_fd(master, flags, CString::new("/dev/ptmx").ok()?)
+                .ok()?,
+        )
+        .ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), (cloexec == "1").then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
+    }
+
     /// Recreate an eventfd at exactly `target_fd` with `count` and `flags`.
     ///
     /// How a cross-process `fork()` child restores an inherited eventfd, mirroring

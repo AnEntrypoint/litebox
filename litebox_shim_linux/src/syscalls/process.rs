@@ -2945,6 +2945,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut dropped_cloexec = 0usize;
         // pty fds deliberately left behind rather than refused. See the arm below.
         let mut dropped_pty = 0usize;
+        let mut pty_masters_to_carry: alloc::vec::Vec<(usize, u32, bool)> = alloc::vec::Vec::new();
         for raw_fd in &beyond_stdio_fds {
             let carried = i32::try_from(*raw_fd)
                 .ok()
@@ -3073,6 +3074,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             flags,
                             offset: 0,
                         });
+                    }
+                    // A published pty's MASTER is carried too: it is only an id (no process-private
+                    // pointer), and a child that never got it cannot run GLib/VTE's child setup,
+                    // which uses the inherited master before `exec` (`ioctl(master, TIOCGPTPEER)`).
+                    // Dropping it is only right for the `forkpty()` shape, where the child opens the
+                    // slave by path and never touches the master.
+                    None if let Some(id) = self.carriable_pty_master_for_raw_fd(*raw_fd) => {
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = raw_fd, pty:% = id;
+                            "clone: carrying a published pty master into the cross-process child"
+                        );
+                        pty_masters_to_carry.push((*raw_fd, id, self.raw_fd_is_cloexec(*raw_fd)));
                     }
                     None if self.raw_fd_subsystem_name(*raw_fd) == "pty" => {
                         dropped_pty += 1;
@@ -3479,6 +3492,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut inherited_shim_fds: alloc::vec::Vec<litebox::platform::ForkInheritedShimFd> =
             alloc::vec::Vec::new();
         let mut unix_holds = alloc::vec::Vec::new();
+        for (raw_fd, id, cloexec) in pty_masters_to_carry {
+            inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                spec: alloc::format!("pty-master:{}|{id}", u8::from(cloexec)),
+            });
+        }
         for raw_fd in unix_to_carry {
             match self.raw_fd_unix_carry(raw_fd, child_tid) {
                 Ok((spec, hold)) => {
