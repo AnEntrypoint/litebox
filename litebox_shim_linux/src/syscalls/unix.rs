@@ -2596,7 +2596,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => Err(Errno::EOPNOTSUPP),
+                _ => Err(Errno::ENOPROTOOPT),
             },
+            SocketOptionName::IPV6(_) => Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
                 SocketOption::RCVTIMEO
@@ -2620,6 +2622,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     );
                     Ok(())
                 }
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => Ok(()),
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -2653,7 +2656,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
             },
+            SocketOptionName::IPV6(_) => return Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO
@@ -2674,6 +2679,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {

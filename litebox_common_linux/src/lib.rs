@@ -696,6 +696,13 @@ pub enum FcntlArg {
     GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
+    /// `F_SETOWN`: name the process to receive `SIGIO`/`SIGURG`. Accepted; those signals are
+    /// never generated.
+    SETOWN(i32),
+    /// `F_GETOWN`.
+    GETOWN,
+    /// `F_SETPIPE_SZ` / `F_GETPIPE_SZ`: pipe capacity is fixed, so both report it.
+    PIPE_SZ,
 }
 
 #[repr(i16)]
@@ -743,6 +750,10 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_SETOWN: i32 = 8;
+const F_GETOWN: i32 = 9;
+const F_SETPIPE_SZ: i32 = 1031;
+const F_GETPIPE_SZ: i32 = 1032;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -781,6 +792,9 @@ impl FcntlArg {
             // only on the calls succeeding.
             F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
             F_GET_SEALS => Self::GET_SEALS,
+            F_SETOWN => Self::SETOWN(arg as i32),
+            F_GETOWN => Self::GETOWN,
+            F_SETPIPE_SZ | F_GETPIPE_SZ => Self::PIPE_SZ,
             _ => return None,
         })
     }
@@ -1868,6 +1882,8 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
+pub const FIONCLEX: u32 = 0x5450;
+pub const FIOASYNC: u32 = 0x5452;
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
@@ -1949,6 +1965,10 @@ pub enum IoctlArg {
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Clear close on exec
+    FIONCLEX,
+    /// Enable or disable `O_ASYNC` (`SIGIO` delivery), which is never generated here
+    FIOASYNC(UserPtr<i32>),
     /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
     /// object IDs (two-call size-probe pattern, see [`DrmModeCardRes`]'s doc comment).
     DrmModeGetResources(UserPtrMut<DrmModeCardRes>),
@@ -2230,6 +2250,21 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    TTL = 2,
+    PKTINFO = 8,
+    MTU_DISCOVER = 10,
+    RECVERR = 11,
+}
+
+/// `IPPROTO_IPV6`-level options.
+#[repr(u32)]
+#[derive(Debug, IntEnum, Clone, Copy)]
+pub enum Ipv6Option {
+    UNICAST_HOPS = 16,
+    MULTICAST_HOPS = 18,
+    RECVERR = 25,
+    V6ONLY = 26,
+    RECVPKTINFO = 49,
 }
 
 #[repr(u32)]
@@ -2242,6 +2277,8 @@ pub enum SocketOption {
     SNDBUF = 7,
     RCVBUF = 8,
     KEEPALIVE = 9,
+    PRIORITY = 12,
+    REUSEPORT = 15,
     /// This option controls the action taken when unsent messages queue on
     /// a socket and close() is performed. If SO_LINGER is set, the system
     /// shall block the process during close() until it can transmit the data
@@ -2272,6 +2309,7 @@ pub enum SocketOptionName {
     IP(IpOption),
     Socket(SocketOption),
     TCP(TcpOption),
+    IPV6(Ipv6Option),
 }
 
 #[repr(u32)]
@@ -2281,6 +2319,7 @@ pub enum SocketOptionLevel {
     SOCKET = 1,
     TCP = 6,
     UDP = 17,
+    IPV6 = 41,
     RAW = 255,
 }
 
@@ -2291,6 +2330,7 @@ impl SocketOptionName {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
+            SocketOptionLevel::IPV6 => Some(Self::IPV6(Ipv6Option::try_from(optname).ok()?)),
             _ => None,
         }
     }
@@ -4406,6 +4446,8 @@ impl SyscallRequest {
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FIONCLEX => IoctlArg::FIONCLEX,
+                        FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETRESOURCES => {
                             IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
                         }

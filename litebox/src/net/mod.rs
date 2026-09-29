@@ -273,6 +273,9 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
     /// it lingers for a bit to allow pending data to be sent).
     consider_closed: bool,
+    /// `shutdown(SHUT_WR)` was requested while written data had not yet reached the wire: the
+    /// FIN is sent once it has, never ahead of it.
+    shutdown_wr_pending: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -900,6 +903,31 @@ where
         let table = self.litebox.descriptor_table();
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
+            if socket_handle.shutdown_wr_pending {
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    socket_handle.shutdown_wr_pending = false;
+                } else if !socket_handle
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|proxy| proxy.has_pending_tx())
+                {
+                    let sent_fin = socket_handle.with_socket_mut(
+                        &mut self.socket_set,
+                        |tcp_socket| {
+                            let has_pending_data =
+                                tcp_socket.may_send() && tcp_socket.send_queue() > 0;
+                            if !has_pending_data {
+                                tcp_socket.close();
+                            }
+                            !has_pending_data
+                        },
+                        |_| true,
+                    );
+                    if sent_fin {
+                        socket_handle.shutdown_wr_pending = false;
+                    }
+                }
+            }
             if socket_handle.consider_closed {
                 // See `socket_set_contains`'s doc comment: a stale handle (this descriptor's own
                 // socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
@@ -1181,6 +1209,7 @@ where
 
         Ok(self.new_socket_fd_for(SocketHandle {
             consider_closed: false,
+            shutdown_wr_pending: false,
             handle,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
@@ -1363,6 +1392,7 @@ where
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
             consider_closed: _,
+            shutdown_wr_pending: _,
             handle,
             mut specific,
             proxy,
@@ -1586,7 +1616,29 @@ where
                             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
                         }
                     },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                    // Bound but not connected (a listener, or a socket that only called
+                    // `bind`): smoltcp has no local endpoint yet, but the address the guest bound
+                    // is recorded on our side and is what `getsockname` must report.
+                    None => {
+                        let specific = socket_handle.tcp();
+                        if let Some(server) = &specific.server_socket {
+                            let ip = match server.ip_listen_endpoint.addr {
+                                Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                                None => Ipv4Addr::UNSPECIFIED,
+                            };
+                            Ok(SocketAddr::V4(SocketAddrV4::new(
+                                ip,
+                                server.ip_listen_endpoint.port,
+                            )))
+                        } else if let Some(local_port) = &specific.local_port {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(
+                                Ipv4Addr::UNSPECIFIED,
+                                local_port.port(),
+                            )))
+                        } else {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+                        }
+                    }
                 }
             }
             Protocol::Udp => {
@@ -1771,10 +1823,10 @@ where
         write_half: bool,
     ) -> Result<(), ShutdownError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table
-            .get_entry(fd)
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
             .ok_or(ShutdownError::InvalidFd)?;
-        let socket_handle = &table_entry.entry;
+        let socket_handle = &mut table_entry.entry;
         if !write_half {
             // `SHUT_RD` alone: nothing to emit on the wire (see this function's doc comment).
             return Ok(());
@@ -1785,12 +1837,24 @@ where
                 // to send a FIN on, so this is a harmless no-op instead of panicking deep in
                 // smoltcp's own `get_mut`.
                 if Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    // Data the guest already wrote may still be queued in the socket channel or
+                    // in smoltcp's send buffer: the FIN must follow it on the wire, so with data
+                    // outstanding it is deferred to `close_pending_sockets`.
+                    let pending_in_channel = socket_handle
+                        .proxy
+                        .as_ref()
+                        .is_some_and(|proxy| proxy.has_pending_tx());
                     let tcp_socket: &mut tcp::Socket =
                         self.socket_set.get_mut(socket_handle.handle);
-                    // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the
-                    // socket stays in the set and the read half keeps delivering until the peer
-                    // closes too. Releasing the fd remains `close_handle`'s job, unchanged.
-                    tcp_socket.close();
+                    if pending_in_channel || (tcp_socket.may_send() && tcp_socket.send_queue() > 0)
+                    {
+                        socket_handle.shutdown_wr_pending = true;
+                    } else {
+                        // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the
+                        // socket stays in the set and the read half keeps delivering until the
+                        // peer closes too. Releasing the fd remains `close_handle`'s job.
+                        tcp_socket.close();
+                    }
                 }
                 Ok(())
             }
@@ -1980,6 +2044,7 @@ where
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: false,
+            shutdown_wr_pending: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,

@@ -102,6 +102,41 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
+    /// (private-only) If the final component of `path` is a symlink in the layered view (the upper
+    /// layer's entry wins over the lower's, a tombstone hides the lower's), returns the fully
+    /// resolved absolute path it leads to. Each layer only sees links within itself, so a lower
+    /// symlink whose target has an upper copy (or an upper symlink into lower content) must be
+    /// followed HERE, against the whole layered view, never inside one layer.
+    fn resolve_symlink_chain(&self, path: &str) -> Result<Option<String>, PathError> {
+        let mut current = String::from(path);
+        let mut followed = false;
+        for _ in 0..40 {
+            if matches!(
+                self.root.read().entries.get(current.as_str()).map(|e| &**e),
+                Some(EntryX::Tombstone)
+            ) {
+                return Ok(followed.then_some(current));
+            }
+            let target = if self.upper.symlink_metadata(current.as_str()).is_ok() {
+                self.upper.read_link(current.as_str()).ok()
+            } else {
+                self.lower.read_link(current.as_str()).ok()
+            };
+            let Some(target) = target else {
+                return Ok(followed.then_some(current));
+            };
+            let joined = if target.starts_with('/') {
+                target
+            } else {
+                let dir = current.rsplit_once('/').map_or("", |(dir, _)| dir);
+                alloc::format!("{dir}/{target}")
+            };
+            current = joined.normalized().map_err(|_| PathError::InvalidPathname)?;
+            followed = true;
+        }
+        Err(PathError::TooManySymlinkHops)
+    }
+
     /// (private-only) Create all parent/ancestor directories for `path`, making sure each exists in
     /// the lower layer. It does NOT set up `path` itself on the upper layer -- that is the caller's
     /// job -- and is NOT equivalent to `mkdir -p {path}` or `mkdir {path}`.
@@ -737,16 +772,8 @@ impl<
         // re-queried on the lower layer under the symlink's own name, which only exists on the
         // upper layer. `O_NOFOLLOW` skips the retry entirely -- gm mutable
         // `layered-open-upper-symlink-resolve-retry`.
-        if !flags.contains(OFlags::NOFOLLOW)
-            && let Ok(target) = self.upper.read_link(path.as_str())
-        {
-            let resolved = if target.starts_with('/') {
-                target
-            } else {
-                let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-                alloc::format!("{dir}/{target}")
-            };
-            if let Ok(resolved) = resolved.normalized() {
+        if !flags.contains(OFlags::NOFOLLOW) {
+            if let Some(resolved) = self.resolve_symlink_chain(path.as_str())? {
                 return self.open(resolved, flags, mode);
             }
         }
@@ -1837,6 +1864,9 @@ impl<
                 }
                 FileStatusError::ClosedFd => unreachable!(),
             },
+        }
+        if let Some(resolved) = self.resolve_symlink_chain(&path)? {
+            return self.file_status(resolved);
         }
         let FileStatus {
                 nlink,

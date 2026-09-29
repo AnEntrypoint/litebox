@@ -296,6 +296,8 @@ pub(super) struct SocketOptions {
     /// back to the guest (`getsockname`, `accept`, `recvfrom`, ...) must be `sockaddr_in6`, as
     /// glibc's `getaddrinfo` asserts.
     pub(super) is_v6: bool,
+    /// `IPV6_V6ONLY`, as last set by the guest.
+    pub(super) v6_only: bool,
 }
 
 #[derive(Clone)]
@@ -334,7 +336,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        // Entry-scoped, not fd-scoped: a socket's type belongs to the open socket, so every
+        // descriptor `dup()`ed or `fork()`ed from it must see it too.
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
@@ -536,6 +540,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     litebox_util_log::debug!("accepting and ignoring setsockopt(IP_TOS)");
                     return Ok(());
                 }
+                // Advisory or error-reporting knobs with no effect on this stack.
+                litebox_common_linux::IpOption::TTL
+                | litebox_common_linux::IpOption::PKTINFO
+                | litebox_common_linux::IpOption::MTU_DISCOVER
+                | litebox_common_linux::IpOption::RECVERR => return Ok(()),
+            },
+            SocketOptionName::IPV6(v6opt) => match v6opt {
+                litebox_common_linux::Ipv6Option::V6ONLY => {
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    self.with_socket_options_mut(fd, |opt| opt.v6_only = val != 0);
+                    return Ok(());
+                }
+                litebox_common_linux::Ipv6Option::UNICAST_HOPS
+                | litebox_common_linux::Ipv6Option::MULTICAST_HOPS
+                | litebox_common_linux::Ipv6Option::RECVERR
+                | litebox_common_linux::Ipv6Option::RECVPKTINFO => return Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -556,6 +576,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     );
                     return Ok(());
                 }
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => return Ok(()),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
@@ -696,6 +717,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
+            },
+            SocketOptionName::IPV6(v6opt) => match v6opt {
+                litebox_common_linux::Ipv6Option::V6ONLY => {
+                    u32::from(self.with_socket_options(fd, |opt| opt.v6_only))
+                }
+                _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -723,6 +751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     litebox::net::SOCKET_BUFFER_SIZE.trunc()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
             },
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {

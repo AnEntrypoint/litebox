@@ -4287,6 +4287,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EBADF))
                     .flatten()
             }
+            FcntlArg::SETOWN(_) | FcntlArg::GETOWN => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                Ok(0)
+            }
+            FcntlArg::PIPE_SZ => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                Ok(65536)
+            }
             FcntlArg::DUPFD { cloexec, min_fd } => {
                 let new_file = self
                     .do_dup_inner(
@@ -5489,6 +5497,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Ok(())
                         })
                     .flatten()?;
+                Ok(0)
+            }
+            IoctlArg::FIONCLEX => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                set_file_descriptor_flags(
+                    desc,
+                    &self.global,
+                    &files,
+                    litebox_common_linux::FileDescriptorFlags::empty(),
+                )
+                .map(|()| 0)
+            }
+            IoctlArg::FIOASYNC(_) => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
                 Ok(0)
             }
             IoctlArg::FIOCLEX => files.run_on_raw_fd(

@@ -1963,12 +1963,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             crate::diag::emit_timeline_line(
                 self.global.platform,
                 &alloc::format!(
-                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={}",
+                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={} result={:?}",
                     self.pid.get(),
                     self.tid.get(),
                     alloc::string::String::from_utf8_lossy(&comm_bytes),
                     crate::diag::syscall_name_pub(syscall_number),
                     result.is_ok(),
+                    result,
                 ),
             );
         }
