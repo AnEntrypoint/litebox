@@ -7,7 +7,7 @@
 //! in shared memory makes that state genuinely shared; per-process state (the `Task` itself, the
 //! guest's own mappings, thread stacks) never touches the Rust heap's arena and stays private.
 //!
-//! Opt-in (`LITEBOX_SHARED_HEAP=1`): with it unset every call forwards to the system allocator.
+//! On by default; `LITEBOX_SHARED_HEAP=0` forwards every call to the system allocator instead.
 //! Blocks are power-of-two size classes with per-class free lists, all guarded by one spin lock
 //! that itself lives in the arena, so it is honoured across processes.
 
@@ -69,8 +69,12 @@ impl SharedHeap {
                 core::hint::spin_loop();
             }
         }
+        // On by default: it is what lets native-fork children share kernel state. Set
+        // `LITEBOX_SHARED_HEAP=0` to fall back to the private system heap.
         // SAFETY: getenv on a NUL-terminated literal; no allocation involved.
-        let enabled = unsafe { !libc::getenv(c"LITEBOX_SHARED_HEAP".as_ptr()).is_null() };
+        let v = unsafe { libc::getenv(c"LITEBOX_SHARED_HEAP".as_ptr()) };
+        // SAFETY: a non-null getenv result is a valid NUL-terminated string.
+        let enabled = v.is_null() || unsafe { *v.cast::<u8>() } != b'0';
         let mut result = DISABLED;
         if enabled {
             // SAFETY: fixed-address anonymous shared mapping; NOREPLACE refuses to clobber.

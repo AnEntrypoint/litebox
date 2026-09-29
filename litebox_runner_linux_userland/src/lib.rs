@@ -33,6 +33,14 @@ pub struct CliArgs {
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Guest user id (default 1000). Use `--uid 0 --gid 0` for an OCI-style root guest: it also
+    /// sets up the root-owned filesystem scaffolding (`/tmp`, `/dev/shm`, `/run`, `/var/*`,
+    /// `/etc/resolv.conf`) an OCI image's own init expects.
+    #[arg(long = "uid", default_value_t = DEFAULT_GUEST_UID)]
+    pub uid: u16,
+    /// Guest group id (default 1000); see `--uid`.
+    #[arg(long = "gid", default_value_t = DEFAULT_GUEST_GID)]
+    pub gid: u16,
     /// Forward the existing environment variables
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
@@ -127,6 +135,140 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
+/// Set up the root-owned identity and FHS scaffolding every fresh in-mem upper layer needs before
+/// it can back a real guest process's filesystem -- shared by `run()`'s own bootstrap (copied from
+/// `litebox_runner_linux_on_windows_userland`, which owns the reasoning behind each entry) (see `layered.rs:243`'s
+/// `unimplemented!` and this function's own inline comments for why each step here matters).
+fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvider>(
+    in_mem: &mut litebox::fs::in_mem::FileSystem<Platform>,
+) {
+    // The guest's persistent identity is root, matching `Platform::init_task`'s credentials (for
+    // `run()`) or `task_params`'s credentials (for the process-fork child's adopted `Task`) and
+    // matching how a real container's initial process runs (a fresh OCI rootfs's `/`, `/etc`,
+    // `/lib`, etc. are root-owned at mode 0755, not world-writable). Without this, `getuid()`
+    // would report root while the file system's own permission checks still enforced a
+    // mismatched non-root identity, breaking any program (e.g. `apk`) that needs to write into
+    // the rootfs's root-owned directories -- for the process-fork child specifically, this
+    // mismatch is what previously hit `unimplemented!("{e} when setting up ancestor dirs")` at
+    // `litebox/src/fs/layered.rs:243` (a `MkdirError::NoWritePerms` this in-mem layer's own
+    // `mkdir` returns once `apk`'s file-migration-from-the-read-only-tar-layer path reaches a
+    // root-owned ancestor directory).
+    in_mem.set_default_user(0, 0);
+    in_mem.with_root_privileges(|fs| {
+        use litebox::fs::FileSystem as _;
+        fs.mkdir(
+            "/tmp",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+        )
+        .unwrap();
+        fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+
+        // `/dev/shm` on real Linux is its own tmpfs mount, not part of devtmpfs (the fixed,
+        // read-only-shaped `{stdin,stdout,null,urandom,...}` set `litebox::fs::devices::Devices`
+        // provides at `/dev` -- see that module's own doc comment): a plain writable directory
+        // whose files are always real shared memory, which is exactly what a `/tmp`-shaped
+        // in-mem directory already gives every OTHER file created under it except for the
+        // `MAP_SHARED|PROT_WRITE` real-backing part (see `syscalls::file::MemfdMarker` and
+        // `syscalls::mm::try_memfd_mmap`'s own doc comments for why an ordinary in-mem file can't
+        // support that directly). Mode 1777 (world-writable + sticky bit) matches real Linux's
+        // `/dev/shm` exactly -- multiple unrelated users/processes must be able to create files
+        // here, but only the owner of a given file (or root) may unlink someone else's. Without
+        // this directory existing at all, glibc's `shm_open("/name", ...)` (which opens
+        // `/dev/shm/name` under the hood -- there is no real `shm_open` syscall) fails at the
+        // very first `open()` with `ENOENT`, before ever reaching the `MAP_SHARED` gap: confirmed
+        // via `advisor/probes/shm_probe.c`, which reproduced exactly this `ENOENT` against the
+        // canonical XFCE layer (no `/dev/shm` tar entry, no synthesized directory here either) --
+        // this is the blocker AGENTS.md documents as labwc's shm-keymap-allocation crash under
+        // the stock `linuxserver/webtop:alpine-mate` image's real Wayland/DRM (labwc) path.
+        //
+        // `/dev` itself must exist as a real ancestor directory IN THIS SAME in-mem layer before
+        // `/dev/shm` can be created under it -- the `/dev` a guest normally sees is synthesized
+        // entirely by the separate `Devices` composer mount in `default_fs` below (this
+        // function's own in-mem layer knows nothing about that), so without this the `mkdir`
+        // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
+        // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
+        // root-owned matches real Linux's own `/dev`.
+        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH)
+            .unwrap();
+        fs.mkdir(
+            "/dev/shm",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RWXG
+                | litebox::fs::Mode::RWXO
+                | litebox::fs::Mode::SVTX,
+        )
+        .unwrap();
+
+        // Standard FHS directories that tools like `apk` expect to already exist
+        // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
+        // as empty-directory entries when an OCI image's rootfs is scanned into a
+        // file-based tar (an empty directory has no file contents, so it produces
+        // no tar entry, and `TarRo`'s directory tree is inferred purely from file
+        // paths -- see litebox/src/fs/tar_ro.rs).
+        // `/var/lib` and `/var/lib/xkb` are added to this same list for the identical reason:
+        // `/var/lib/xkb` exists in the read-only tar layer (it ships a `README.compiled`), but a
+        // NEW file inside a directory that exists ONLY in the read-only layer has nowhere to
+        // land -- `TarRo::open_file_at` (litebox/src/fs/tar_ro.rs) refuses a writable open of a
+        // tar-layer directory, so `xkbcomp` (spawned by `Xorg` to compile the keyboard keymap)
+        // fails to create `/var/lib/xkb/server-0.xkm`, which `Xorg` treats as fatal ("Failed to
+        // activate virtual core keyboard"). Confirmed live: this was the concrete blocker after
+        // the DRM_CAP_CURSOR_WIDTH/HEIGHT and legacy ADDFB fixes let `Xorg` boot against
+        // `linuxserver/webtop:debian-xfce`. `/var/lib` must precede `/var/lib/xkb` in this list
+        // (same ancestor-ordering requirement as `/dev` before `/dev/shm` above) or `mkdir`
+        // panics with `PathError::MissingComponent`.
+        for dir in [
+            "/run",
+            "/var",
+            "/var/log",
+            "/var/cache",
+            "/var/tmp",
+            "/var/lib",
+            "/var/lib/xkb",
+        ] {
+            fs.mkdir(
+                dir,
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
+        }
+
+        // A container's `/etc/resolv.conf` normally comes from the *host* runtime at
+        // container-start (e.g. Docker bind-mounts the host's own resolver config in), not
+        // from the image itself -- a plain OCI rootfs like this one has no such file. Without
+        // it, DNS-using tools (`apk`, `wget`, ...) have no configured nameserver at all and
+        // fail immediately rather than reaching the network. Point at a public resolver
+        // reachable through the platform's NAT gateway, mirroring what a real container
+        // runtime would inject.
+        //
+        // `/etc` itself isn't created here (it comes from the tar layer composed in later),
+        // so create it in this in-mem layer too, matching the `/tmp`, `/run`, etc. pattern
+        // above.
+        fs.mkdir(
+            "/etc",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+        )
+        .unwrap();
+        let resolv_conf = fs
+            .open(
+                "/etc/resolv.conf",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &resolv_conf,
+            b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&resolv_conf).unwrap();
+    });
+}
+
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_util_log::init_env_filtered_subscriber("LITEBOX_LOG");
 
@@ -220,13 +362,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let task_params = litebox_common_linux::TaskParams {
         pid: tid,
         ppid,
-        uid: u32::from(DEFAULT_GUEST_UID),
-        euid: u32::from(DEFAULT_GUEST_UID),
-        gid: u32::from(DEFAULT_GUEST_GID),
-        egid: u32::from(DEFAULT_GUEST_GID),
+        uid: u32::from(cli_args.uid),
+        euid: u32::from(cli_args.uid),
+        gid: u32::from(cli_args.gid),
+        egid: u32::from(cli_args.gid),
     };
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        if cli_args.uid == 0 {
+            initialize_root_in_mem_layer(&mut in_mem);
+        }
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -238,8 +383,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                                          path: &Path| {
                 fs.chown(
                     path.to_str().unwrap(),
-                    Some(DEFAULT_GUEST_UID),
-                    Some(DEFAULT_GUEST_GID),
+                    Some(cli_args.uid),
+                    Some(cli_args.gid),
                 )
                 .unwrap();
             };
