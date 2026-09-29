@@ -45,6 +45,8 @@ const SOL_SOCKET: i32 = 1;
 /// `SCM_RIGHTS`: "access rights (array of int)" (verified against the real kernel
 /// `include/linux/socket.h`).
 const SCM_RIGHTS: i32 = 0x01;
+/// `SCM_CREDENTIALS`: `struct ucred` (pid, uid, gid).
+const SCM_CREDENTIALS: i32 = 0x02;
 
 /// Linux's `struct cmsghdr` (verified against the real kernel `include/linux/socket.h`):
 /// `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }`, 16 bytes on a 64-bit target with no
@@ -298,6 +300,8 @@ pub(super) struct SocketOptions {
     pub(super) is_v6: bool,
     /// `IPV6_V6ONLY`, as last set by the guest.
     pub(super) v6_only: bool,
+    /// `SO_PASSCRED` (unix sockets): deliver `SCM_CREDENTIALS` with received data.
+    pub(super) passcred: bool,
 }
 
 #[derive(Clone)]
@@ -2305,10 +2309,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
-    ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
+    ) -> Result<(usize, AnyDupFds<Platform, FS>, Option<litebox_common_linux::Ucred>), Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+        let creds_cell: core::cell::Cell<Option<litebox_common_linux::Ucred>> =
+            core::cell::Cell::new(None);
         let (size, addr, fds) = {
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             files.with_socket_netlink(
@@ -2335,6 +2341,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
+                    creds_cell.set(entry.passcred_ucred());
                     Ok((size, src_addr, fds))
                 },
                 |netlink| {
@@ -2347,7 +2354,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
         }
-        Ok((size, fds))
+        Ok((size, fds, creds_cell.get()))
     }
 
     /// Handle syscall `recvmsg`
@@ -2425,7 +2432,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
-        let (size, fds) = self.do_recvfrom_with_fds(
+        let (size, fds, creds) = self.do_recvfrom_with_fds(
             sockfd,
             recv_buf,
             flags,
@@ -2520,23 +2527,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
         let controllen_ptr =
             UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
-        if written_fds.is_empty() {
-            controllen_ptr
-                .write_at_offset::<Platform>(0, 0)
-                .ok_or(Errno::EFAULT)?;
-        } else {
+        // Ancillary data: SCM_RIGHTS fds, then SCM_CREDENTIALS if SO_PASSCRED is on.
+        let mut out = alloc::vec::Vec::new();
+        if !written_fds.is_empty() {
             let payload_len = written_fds.len() * size_of::<i32>();
-            let cmsg_len = size_of::<CmsgHdr>() + payload_len;
             let hdr = CmsgHdr {
-                cmsg_len,
+                cmsg_len: size_of::<CmsgHdr>() + payload_len,
                 cmsg_level: SOL_SOCKET,
                 cmsg_type: SCM_RIGHTS,
             };
-            let mut out = alloc::vec::Vec::with_capacity(cmsg_len);
             out.extend_from_slice(hdr.as_bytes());
             for raw_fd in &written_fds {
                 out.extend_from_slice(&i32::try_from(*raw_fd).unwrap_or(-1).to_ne_bytes());
             }
+        }
+        if let Some(cred) = creds {
+            let pad = cmsg_align(out.len()) - out.len();
+            out.resize(out.len() + pad, 0);
+            let hdr = CmsgHdr {
+                cmsg_len: size_of::<CmsgHdr>() + 12,
+                cmsg_level: SOL_SOCKET,
+                cmsg_type: SCM_CREDENTIALS,
+            };
+            out.extend_from_slice(hdr.as_bytes());
+            out.extend_from_slice(&cred.pid.to_ne_bytes());
+            out.extend_from_slice(&cred.uid.to_ne_bytes());
+            out.extend_from_slice(&cred.gid.to_ne_bytes());
+        }
+        if out.is_empty() {
+            controllen_ptr
+                .write_at_offset::<Platform>(0, 0)
+                .ok_or(Errno::EFAULT)?;
+        } else {
             let written = out.len().min(msg_controllen);
             if written < out.len() {
                 ret_flags.insert(ReceiveFlags::CTRUNC);

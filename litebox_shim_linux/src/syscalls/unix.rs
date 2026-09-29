@@ -2491,6 +2491,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
     /// read (always empty for a datagram socket or a message with no attached fds).
+    /// The credentials to attach as `SCM_CREDENTIALS` to data this socket receives: the peer's,
+    /// when `SO_PASSCRED` is on and the socket is a connected stream.
+    pub(super) fn passcred_ucred(&self) -> Option<Ucred> {
+        if !self.options.lock().passcred {
+            return None;
+        }
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
+                UnixStreamState::Connected(conn) => Some(conn.peer_cred),
+                _ => None,
+            }),
+            UnixSocketInner::Datagram(_) => None,
+        }
+    }
+
     pub(super) fn recvmsg(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -2642,7 +2657,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     );
                     Ok(())
                 }
-                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => Ok(()),
+                SocketOption::PASSCRED => {
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    self.options.lock().passcred = val != 0;
+                    Ok(())
+                }
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => Ok(()),
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -2699,7 +2719,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
-                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => 0,
+                SocketOption::PASSCRED => u32::from(self.options.lock().passcred),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {

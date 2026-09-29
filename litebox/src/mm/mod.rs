@@ -770,6 +770,30 @@ where
         )
     }
 
+    /// [`Self::new_adopting_existing_memory`] for a child that inherited the parent's address
+    /// space natively: every region, `PROT_NONE` reservations and shared mappings included, is
+    /// tracked because each really exists in the child.
+    pub fn new_adopting_inherited_memory(
+        litebox: &LiteBox<Platform>,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        let (vmem, adopted, shared) = linux::Vmem::new_adopting_inherited_memory(
+            litebox.x.platform,
+            regions,
+            brk,
+            group_spans,
+        );
+        (
+            Self {
+                vmem: RwLock::new(vmem),
+            },
+            adopted,
+            shared,
+        )
+    }
+
     /// The number of guest regions currently tracked, and the current program break -- a cheap
     /// read-only summary for a caller that needs to verify a reconstructed address-space
     /// description matches the one it was built from (see

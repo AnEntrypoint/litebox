@@ -978,6 +978,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         brk: usize,
         group_spans: impl Iterator<Item = Range<usize>>,
     ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, false)
+    }
+
+    /// Like [`Self::new_adopting_existing_memory`], but for a child that INHERITED the parent's
+    /// address space natively (a Linux `fork()`): `PROT_NONE` reservations and shared mappings
+    /// exist for real in such a child, so they are tracked too. Dropping them (right for a
+    /// Windows child, which has nothing behind them) made `mprotect` on an allocator's reserved
+    /// range fail with `ENOMEM` and left shared mappings un-`munmap`-able.
+    pub(super) fn new_adopting_inherited_memory(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, true)
+    }
+
+    fn adopt(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+        keep_all: bool,
+    ) -> (Self, usize, usize) {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk,
@@ -1038,8 +1062,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
-            if flags.contains(VmFlags::VM_SHARED)
-                || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty()
+            if !keep_all
+                && (flags.contains(VmFlags::VM_SHARED)
+                    || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty())
             {
                 // See this function's own doc comment (both the `VM_SHARED` paragraph and the
                 // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into `vmas`

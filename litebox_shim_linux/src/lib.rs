@@ -1372,6 +1372,24 @@ fn default_fs<Platform: ShimPlatform>(
                         // committing until touched.
                         litebox::fs::static_files::file("vm/overcommit_memory", b"0
 "),
+                        litebox::fs::static_files::file("vm/max_map_count", b"1048576
+"),
+                        // Limits programs read to size their own tables or loops (inotify
+                        // watch budgets, supplementary-group arrays, fd ceilings, pid space).
+                        litebox::fs::static_files::file("fs/inotify/max_user_watches", b"524288
+"),
+                        litebox::fs::static_files::file("fs/inotify/max_user_instances", b"128
+"),
+                        litebox::fs::static_files::file("fs/inotify/max_queued_events", b"16384
+"),
+                        litebox::fs::static_files::file("fs/nr_open", b"1048576
+"),
+                        litebox::fs::static_files::file("kernel/ngroups_max", b"65536
+"),
+                        litebox::fs::static_files::file("kernel/pid_max", b"4194304
+"),
+                        litebox::fs::static_files::file("kernel/threads-max", b"1048576
+"),
                     ],
                 )
             })

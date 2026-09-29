@@ -3819,7 +3819,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rounding to account for -- see `PageManager::new_adopting_existing_memory`'s own doc
         // comment on `group_spans` for why the Windows cross-process-fork caller passes a
         // non-empty set here and this one correctly passes none.
-        let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_existing_memory(
+        let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_inherited_memory(
             &self.global.litebox,
             regions.into_iter(),
             brk,
