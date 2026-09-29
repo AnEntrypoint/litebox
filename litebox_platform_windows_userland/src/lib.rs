@@ -6913,6 +6913,7 @@ impl RawMutex {
         // `SetEvent`, regardless of chunk size -- chunking only matters once a whole
         // `LIVENESS_CHECK_INTERVAL` has passed with no wake at all.
         let overall_deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut idle_chunks = 0u32;
         let result = loop {
             let remaining = overall_deadline
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
@@ -6986,6 +6987,19 @@ impl RawMutex {
                     // as an infinite wait always did before this change.
                     if self.try_recover_from_dead_holder(val, record) {
                         break Ok(UnblockedOrTimedOut::Unblocked);
+                    }
+                    // A recorded, live holder that never lets go is the signature of a cross-process
+                    // lock stall (the shared network lock froze every process this way); name the
+                    // holder so its stack can be inspected. Holder 0 (futex-style waits) stays quiet.
+                    idle_chunks += 1;
+                    let holder = self.holder_pid.load(Ordering::Relaxed);
+                    if holder != 0 && idle_chunks % 15 == 0 {
+                        litebox_util_log::warn!(
+                            lock:% = (self as *const Self as usize), val:% = val, holder_pid:% = holder,
+                            waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
+                            my_pid:% = std::process::id();
+                            "RawMutex held by a live process for a long time"
+                        );
                     }
                 }
                 Win32_Foundation::WAIT_FAILED => {

@@ -14,15 +14,17 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::cell::UnsafeCell;
 use std::sync::{Mutex, MutexGuard, Once, OnceLock};
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThreadId, OpenThread, WaitForSingleObject, THREAD_SYNCHRONIZE,
+    GetCurrentThread, GetCurrentThreadId, GetThreadTimes, OpenThread, WaitForSingleObject,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -85,6 +87,11 @@ fn diagnostics_enabled() -> bool {
 /// allocation-only operations, so a taken-over table stays usable.
 struct DeadHolderLock {
     owner: AtomicU32,
+    /// Creation time of the owning thread. Windows recycles thread ids quickly, so an id alone
+    /// cannot prove the owner is still the thread that took the lock: `exit_group`/`execve`
+    /// terminate threads, and a new thread of the re-exec'd image can inherit the dead owner's id
+    /// (seen as `at-spi2-registryd` hanging in `mmap` forever). `0` = not yet recorded.
+    owner_start: AtomicU64,
     table: UnsafeCell<BTreeMap<usize, LazyRange>>,
 }
 
@@ -97,13 +104,25 @@ impl DeadHolderLock {
     const fn new() -> Self {
         Self {
             owner: AtomicU32::new(0),
+            owner_start: AtomicU64::new(0),
             table: UnsafeCell::new(BTreeMap::new()),
         }
+    }
+
+    /// Whether the calling thread currently holds the lock. A fault raised while a thread is filling
+    /// a chunk under the lock must not re-enter it from the exception handler: that used to spin
+    /// forever (the process looked hung mid-`mmap`) instead of reporting the fault.
+    fn held_by_current_thread(&self) -> bool {
+        // SAFETY: plain query of the calling thread's id.
+        let me = unsafe { GetCurrentThreadId() };
+        self.owner.load(Ordering::Acquire) == me
+            && self.owner_start.load(Ordering::Acquire) == current_thread_start()
     }
 
     fn lock(&'static self) -> TableGuard {
         // SAFETY: plain query of the calling thread's id.
         let me = unsafe { GetCurrentThreadId() };
+        let my_start = current_thread_start();
         let mut spins = 0u32;
         loop {
             if self
@@ -111,18 +130,29 @@ impl DeadHolderLock {
                 .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                self.owner_start.store(my_start, Ordering::Release);
                 return TableGuard(self);
             }
             spins += 1;
             if spins % 64 == 0 {
                 let holder = self.owner.load(Ordering::Relaxed);
-                if holder != 0
-                    && !thread_alive(holder)
+                let holder_start = self.owner_start.load(Ordering::Acquire);
+                // Same id but a different creation time means the recorded owner is gone and its
+                // id was recycled (possibly by this very thread). Same id AND same start as ours is
+                // a genuine re-entrant acquisition, which can never make progress either.
+                let stale = holder != 0
+                    && if holder == me {
+                        holder_start != 0 && holder_start != my_start
+                    } else {
+                        !thread_alive(holder, holder_start)
+                    };
+                if stale
                     && self
                         .owner
                         .compare_exchange(holder, me, Ordering::Acquire, Ordering::Relaxed)
                         .is_ok()
                 {
+                    self.owner_start.store(my_start, Ordering::Release);
                     return TableGuard(self);
                 }
                 std::thread::sleep(core::time::Duration::from_micros(200));
@@ -133,14 +163,41 @@ impl DeadHolderLock {
     }
 }
 
-fn thread_alive(tid: u32) -> bool {
+fn filetime_to_u64(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+/// Creation time of the calling thread, cached per thread (a syscall per thread, not per lock).
+fn current_thread_start() -> u64 {
+    thread_local! {
+        static START: u64 = {
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            // SAFETY: querying the calling thread's own times.
+            unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+            filetime_to_u64(created)
+        };
+    }
+    START.with(|start| *start)
+}
+
+/// Whether `tid` is still the thread that took the lock: it must exist, be running, and (when the
+/// owner's creation time was recorded) have that same creation time.
+fn thread_alive(tid: u32, expected_start: u64) -> bool {
     // SAFETY: the handle is closed before returning; a thread that cannot be opened is gone.
     unsafe {
-        let handle = OpenThread(THREAD_SYNCHRONIZE, 0, tid);
+        let handle = OpenThread(THREAD_SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
         if handle.is_null() {
             return false;
         }
-        let alive = WaitForSingleObject(handle, 0) != 0;
+        let mut alive = WaitForSingleObject(handle, 0) != 0;
+        if alive && expected_start != 0 {
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            if GetThreadTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+                alive = filetime_to_u64(created) == expected_start;
+            }
+        }
         CloseHandle(handle);
         alive
     }
@@ -163,6 +220,7 @@ impl core::ops::DerefMut for TableGuard {
 
 impl Drop for TableGuard {
     fn drop(&mut self) {
+        self.0.owner_start.store(0, Ordering::Release);
         self.0.owner.store(0, Ordering::Release);
     }
 }
@@ -186,12 +244,20 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
     // SAFETY: `span` lies inside a committed region this module registered; `source` is a
     // `'static` slice that outlives the process.
     unsafe {
-        VirtualProtect(
+        // Fails when any page of the span is no longer committed: a stale entry (its memory was
+        // freed or replaced without this table hearing of it, e.g. an image torn down by
+        // `execve`). Copying anyway faulted inside the table lock and hung the process, so treat
+        // the chunk as done and leave the memory alone.
+        if VirtualProtect(
             span.start as *const _,
             span.len(),
             PAGE_READWRITE,
             &mut previous,
-        );
+        ) == 0
+        {
+            range.filled[chunk - range.first_chunk] = true;
+            return;
+        }
         core::ptr::copy_nonoverlapping(
             (range.source + offset) as *const u8,
             span.start as *mut u8,
@@ -327,6 +393,12 @@ unsafe extern "system" fn lazy_file_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     let kind = record.ExceptionInformation[0];
     let addr = record.ExceptionInformation[1];
+    if TABLE.held_by_current_thread() {
+        eprintln!(
+            "[lazy_file_map] access violation at {addr:#x} (kind {kind}) raised while this thread holds the table lock; not handling it"
+        );
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     let mut map = table();
     let Some((&start, range)) = map.range_mut(..=addr).next_back() else {
         return EXCEPTION_CONTINUE_SEARCH;
