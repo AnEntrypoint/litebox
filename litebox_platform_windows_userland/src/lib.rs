@@ -7178,14 +7178,30 @@ impl RawMutex {
         // waiter, or the (extremely unlikely, but not impossible) case that the real holder's
         // process id was reused by an unrelated new process between the read above and here,
         // cannot clobber a value someone else has already legitimately changed.
-        let _ = self
-            .inner
-            .compare_exchange(val, 0, Ordering::AcqRel, Ordering::Relaxed);
-        // Only clear `holder_pid` if it is still the same dead pid just confirmed -- never clobber
-        // a DIFFERENT holder that may have legitimately acquired the lock in the interim.
-        let _ =
-            self.holder_pid
-                .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
+        //
+        // The word is CASed from its CURRENT value, not from the `val` this waiter blocked on: the
+        // lock word is 1 (locked) or 2 (locked, contended) and other waiters flip it between them,
+        // so a waiter holding a stale `val` would fail the CAS here. Clearing `holder_pid` anyway
+        // (as this used to) then left the lock word set with no recorded holder, which no later
+        // waiter treats as recoverable -- a permanent orphan, seen as `val=1 holder_pid=0` for
+        // minutes while every process in the fork family queued behind it.
+        let current = self.inner.load(Ordering::Acquire);
+        let released = current != 0
+            && self
+                .inner
+                .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok();
+        // Only clear `holder_pid` if it is still the same dead pid just confirmed AND the word was
+        // really released -- never clobber a DIFFERENT holder that may have legitimately acquired
+        // the lock in the interim, and never forget an owner whose lock is still stuck.
+        if released {
+            let _ = self.holder_pid.compare_exchange(
+                holder,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
         // Unconditional `store`, not a CAS: unlike `inner`/`holder_pid` above (which must not
         // clobber a legitimate new holder/value), poisoning is monotonic within one recovery
         // event -- once this recovery happened, the protected data really may be torn, and that
@@ -7193,8 +7209,10 @@ impl RawMutex {
         // unlikely, but see the comments above) already cleared/reset `holder_pid` first. Losing a
         // poison signal would let a caller trust torn state; a spurious extra one only costs a
         // single unnecessary safe reset.
-        self.poisoned.store(true, Ordering::Release);
-        true
+        if released {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        released
     }
 
     /// Atomically reads and clears the poison flag [`Self::try_recover_from_dead_holder_unregistered`]
