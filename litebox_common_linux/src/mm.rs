@@ -167,6 +167,12 @@ pub fn sys_mprotect<
     if len == 0 {
         return Ok(());
     }
+    // Linux rounds the length up to a whole page: libmagic maps a 10353312-byte file and then
+    // `mprotect`s exactly that length, which used to fail with ENOMEM (`PageRange` rejects an
+    // unaligned end) and made `file` unusable.
+    let len = len
+        .checked_next_multiple_of(litebox::mm::linux::PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
 
     let addr = addr.to_platform_ptr::<Platform>();
     // Real Linux `mprotect(2)` accepts ANY combination of PROT_READ/PROT_WRITE/PROT_EXEC (8
