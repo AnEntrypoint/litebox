@@ -3539,6 +3539,7 @@ fn run_thread_inner(
     ctx: &mut litebox_common_linux::PtRegs,
     fork_verify_relocations: Option<(Arc<litebox::mm::AddressRelocations>, usize)>,
 ) {
+    process_fork::mark_guest_started();
     let tls_state = TlsState::new();
     tls_state
         .guest_context_top

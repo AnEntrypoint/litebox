@@ -4916,6 +4916,31 @@ pub fn is_fault_watchdog_child() -> bool {
     std::env::var_os(FAULT_WATCHDOG_CHILD_ENV_VAR).is_some()
 }
 
+/// Raw handle of this process's own "guest has started running" event (0 = none), created by
+/// [`spawn_external_fault_watchdog`] and signalled by [`mark_guest_started`].
+static GUEST_STARTED_EVENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+
+fn guest_started_event_name(target_pid: u32) -> Vec<u16> {
+    let mut name: Vec<u16> = format!(r"Local\litebox-guest-started-{target_pid}").encode_utf16().collect();
+    name.push(0);
+    name
+}
+
+/// Tells this process's external fault watchdog that guest code is now running. Until then the
+/// watchdog does not count idle time as a wedge: everything before the guest starts (the OCI
+/// manifest fetch and layer download, decompression, rootfs indexing) is legitimately idle on the
+/// network or disk, and treating that as a freeze got the whole runner `TerminateProcess`'d with
+/// exit code 1 and no message after ~15s of a slow layer download. The freeze this watchdog exists
+/// for happens only during guest execution (a fault inside the VEH's recovered-AV resume).
+pub fn mark_guest_started() {
+    let handle = GUEST_STARTED_EVENT.load(core::sync::atomic::Ordering::Acquire);
+    if handle != 0 {
+        // SAFETY: `handle` is the event this process created in `spawn_external_fault_watchdog`
+        // and never closes.
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as HANDLE) };
+    }
+}
+
 /// Spawns the external fault-terminate watchdog child described by
 /// [`FAULT_WATCHDOG_CHILD_ENV_VAR`]'s doc comment. Called once, early in the real runner's own
 /// `main()` (before any guest work begins), from the SAME process the child will go on to watch.
@@ -4938,6 +4963,20 @@ pub fn spawn_external_fault_watchdog() {
         .collect();
 
     let parent_pid = std::process::id();
+    let started_name = guest_started_event_name(parent_pid);
+    // Manual-reset, initially non-signalled. Deliberately never closed: it must outlive the spawn.
+    // SAFETY: `started_name` is a valid NUL-terminated UTF-16 string.
+    let started_event = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            core::ptr::null(),
+            1,
+            0,
+            started_name.as_ptr(),
+        )
+    };
+    if !started_event.is_null() {
+        GUEST_STARTED_EVENT.store(started_event as isize, core::sync::atomic::Ordering::Release);
+    }
     unsafe {
         std::env::set_var(FAULT_WATCHDOG_CHILD_ENV_VAR, "1");
         std::env::set_var(WATCHDOG_TARGET_PID_ENV_VAR, parent_pid.to_string());
@@ -5067,8 +5106,29 @@ pub fn run_external_fault_watchdog_child() -> ! {
     let mut stalled_ticks: u32 = 0;
     let mut cpu_time_at_stall_start: Option<u64> = None;
     let diag_enabled = std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some();
+    // `SYNCHRONIZE` access. If the parent could not create the event, fall back to the old
+    // behaviour (always armed) rather than leaving the process unsupervised.
+    let started_name = guest_started_event_name(target_pid);
+    let started_event = unsafe {
+        windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, started_name.as_ptr())
+    };
     loop {
         std::thread::sleep(POLL_INTERVAL);
+        if !started_event.is_null()
+            && unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(started_event, 0) }
+                != 0
+        {
+            // Guest has not started: the parent is still preparing its rootfs. Only bail out if
+            // the parent itself is gone.
+            let mut code: u32 = STILL_ACTIVE;
+            if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {
+                unsafe { CloseHandle(handle) };
+                std::process::exit(0);
+            }
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = None;
+            continue;
+        }
         let mut exit_code: u32 = STILL_ACTIVE;
         let alive = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } != 0
             && exit_code == STILL_ACTIVE;
