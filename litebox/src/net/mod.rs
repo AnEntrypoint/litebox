@@ -1012,6 +1012,13 @@ where
                     }
                 }
 
+                // A local `shutdown(SHUT_WR)` owes the peer a FIN, but only after every byte the
+                // application wrote before it has left the TX buffer (sending the FIN straight
+                // away dropped the reply of servers that `sendall(); shutdown(WR)`).
+                if proxy.is_write_shutdown() && !proxy.has_pending_tx() && tcp_socket.may_send() {
+                    tcp_socket.close();
+                }
+
                 // Drain RX buffer: from smoltcp directly to ring buffer
                 while tcp_socket.can_recv() {
                     let received = proxy
@@ -1026,6 +1033,23 @@ where
                     proxy.clear_async_error();
                 }
                 let tcp_specific = socket_handle.specific.tcp();
+                // The peer's FIN leaves smoltcp's socket "open" (CloseWait/LastAck/Closing) until
+                // this side closes too, so the channel never saw the connection end and a reader
+                // blocked forever instead of getting EOF (every guest-loopback HTTP response that
+                // ends with the server closing hung its client). Report it once the data the peer
+                // sent has all been delivered.
+                if tcp_specific.server_socket.is_none()
+                    && !tcp_socket.can_recv()
+                    && matches!(
+                        tcp_socket.state(),
+                        tcp::State::CloseWait
+                            | tcp::State::LastAck
+                            | tcp::State::Closing
+                            | tcp::State::TimeWait
+                    )
+                {
+                    proxy.mark_peer_closed();
+                }
                 // Update socket state in the channel
                 // server socket that is listening also has closed state
                 if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
@@ -1818,12 +1842,22 @@ where
                 // to send a FIN on, so this is a harmless no-op instead of panicking deep in
                 // smoltcp's own `get_mut`.
                 if Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
-                    let tcp_socket: &mut tcp::Socket =
-                        self.socket_set.get_mut(socket_handle.handle);
-                    // `close()` here is smoltcp's *send a FIN* operation, NOT a teardown: the
-                    // socket stays in the set and the read half keeps delivering until the peer
-                    // closes too. Releasing the fd remains `close_handle`'s job, unchanged.
-                    tcp_socket.close();
+                    // Mark the write side shut down and let the drain step send the FIN once the
+                    // bytes still queued in the TX buffer have gone out; `close()` here (smoltcp's
+                    // *send a FIN* operation, NOT a teardown: the socket stays in the set and the
+                    // read half keeps delivering until the peer closes too) discarded them.
+                    // Releasing the fd remains `close_handle`'s job, unchanged.
+                    if let Some(socket_channel::NetworkProxy::Stream(channel)) =
+                        socket_handle.proxy.as_deref()
+                    {
+                        channel.shutdown_write();
+                        let now = self.now();
+                        Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
+                    } else {
+                        let tcp_socket: &mut tcp::Socket =
+                            self.socket_set.get_mut(socket_handle.handle);
+                        tcp_socket.close();
+                    }
                 }
                 Ok(())
             }

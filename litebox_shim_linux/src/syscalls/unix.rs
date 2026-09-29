@@ -3290,7 +3290,7 @@ pub(crate) const SHARED_UNIX_CROSS_CONNECT_TIMEOUT: Duration = Duration::from_se
 /// `cx`'s deadline (`WaitContext::with_timeout` only ever narrows it), and the final iteration
 /// before a real deadline uses the real remaining duration verbatim, so that iteration's own
 /// `TimedOut` is genuine rather than one of this function's own synthetic sub-waits.
-fn wait_on_events_polling<Platform, R, E>(
+pub(crate) fn wait_on_events_polling<Platform, R, E>(
     cx: &WaitContext<'_, Platform>,
     nonblock: bool,
     events: Events,

@@ -2219,7 +2219,12 @@ fn diag_process_fork_task_resume_probe(
         // to advance shared socket timers, and every process polling `Network` at 1 kHz under the
         // ONE cross-process network lock turns each guest socket operation into a lock convoy
         // (25 processes queued on `net_lock`, input and ACKs stalling for seconds).
-        const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(25);
+        let max_timeout = core::time::Duration::from_millis(
+            std::env::var("LITEBOX_CHILD_NET_POLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25),
+        );
         loop {
             let timeout = loop {
                 // Same panic-recovery discipline as `run()`'s own `net_worker` -- see its doc
@@ -2247,7 +2252,7 @@ fn diag_process_fork_task_resume_probe(
                     }
                 }
             };
-            platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
+            platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(max_timeout)));
         }
     })
         .expect("failed to spawn cross-process fork child's net_worker thread");

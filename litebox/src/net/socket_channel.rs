@@ -328,6 +328,9 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     read_shutdown: AtomicBool,
     /// Whether the write side is shut down (SHUT_WR)
     write_shutdown: AtomicBool,
+    /// Whether the peer sent its FIN: once the RX buffer is drained a read reports end-of-file,
+    /// while writes stay possible (half-close).
+    peer_closed: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
     /// Space available in TX buffer (for quick poll checks)
@@ -358,6 +361,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             state: AtomicU32::new(SocketState::Initial as u32),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
 
@@ -441,6 +445,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if n > 0 {
             return Ok(n);
         }
+        // Everything the peer sent has been delivered and it has closed its side: end-of-file.
+        if self.inner.peer_closed.load(Ordering::Acquire) {
+            return Err(ChannelReadError::ReadShutdown);
+        }
         match self.inner.state() {
             SocketState::Connected => Ok(0),
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
@@ -493,6 +501,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Shutdown the write side of the socket.
     pub fn shutdown_write(&self) {
         self.inner.write_shutdown.store(true, Ordering::Release);
+    }
+
+    /// Whether the write side has been shut down (the FIN is owed once the TX buffer is empty).
+    pub(super) fn is_write_shutdown(&self) -> bool {
+        self.inner.write_shutdown.load(Ordering::Acquire)
     }
 }
 
@@ -624,9 +637,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         total
     }
 
-    /// Check if the socket has data available for reading.
+    /// Check if the socket has data available for reading (or an end-of-file to report).
     pub(super) fn is_readable(&self) -> bool {
         self.inner.rx_available.load(Ordering::Acquire) > 0
+            || self.inner.peer_closed.load(Ordering::Acquire)
+    }
+
+    /// Record that the peer closed its side of the connection (its FIN arrived and all data it
+    /// sent has already been pushed into the RX buffer). Wakes readers so they observe the EOF.
+    pub(super) fn mark_peer_closed(&self) {
+        if !self.inner.peer_closed.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(Events::IN | Events::HUP);
+        }
     }
 
     /// Manually set the readable state.

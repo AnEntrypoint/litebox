@@ -838,7 +838,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         fd: &SocketFd<Platform>,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd<Platform>, Errno> {
-        cx.wait_on_events(
+        // Bounded polling instead of a bare observer wait: the socket's state is advanced by the
+        // fork family's owner process (`Network::internal_perform_platform_interaction`), whose
+        // notifications only reach observers living in ITS address space, so a wake for a socket
+        // this process waits on is otherwise lost.
+        super::unix::wait_on_events_polling(
+            cx,
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
@@ -865,7 +870,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             return Err(Errno::ECONNREFUSED);
         }
         let mut check_progress = false;
-        cx.wait_on_events::<_, Errno>(
+        super::unix::wait_on_events_polling::<_, _, Errno>(
+            cx,
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
@@ -963,8 +969,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
         let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
-        cx.with_timeout(timeout)
-            .wait_on_events(
+        super::unix::wait_on_events_polling(
+                &cx.with_timeout(timeout),
                 is_nonblock,
                 Events::OUT,
                 |observer, filter| {
@@ -1022,8 +1028,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         }
 
         let proxy = self.get_proxy(fd)?;
-        cx.with_timeout(timeout)
-            .wait_on_events(
+        super::unix::wait_on_events_polling(
+                &cx.with_timeout(timeout),
                 is_nonblock,
                 Events::IN,
                 |observer, filter| {
