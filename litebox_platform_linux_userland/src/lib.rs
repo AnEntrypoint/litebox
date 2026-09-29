@@ -599,6 +599,11 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
+            // Host-side reaping of a native-fork child (`native_fork_waitpid`,
+            // `spawn_cross_process_exit_notifier`). A guest `wait4` is rewritten and emulated by
+            // the shim, never issued raw, so allowing these only serves the platform's own calls.
+            (libc::SYS_wait4, vec![]),
+            (libc::SYS_waitid, vec![]),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
             //
             // `open` does not exist as a syscall number on aarch64 (glibc always emits
@@ -2954,6 +2959,32 @@ impl ThreadContext<'_> {
     }
 }
 
+/// `waitpid(2)` on a native-fork child (see `ForkChildVerificationProvider::native_fork`),
+/// returning the status re-encoded into the shim's cross-process exit layout. `None` means "still
+/// running" (`WNOHANG`) or a retriable `EINTR`.
+fn native_fork_waitpid(
+    handle: litebox::platform::CrossProcessChildHandle,
+    options: libc::c_int,
+) -> Option<u32> {
+    const MARKER: u32 = 0xC0DE_0000;
+    const SIGNAL_FLAG: u32 = 0x0000_8000;
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(handle.0 as libc::pid_t, &raw mut status, options) };
+    if r <= 0 {
+        // `0` = WNOHANG-not-yet; `-1` = EINTR (retry) or ECHILD (someone else reaped it: report
+        // as killed so a waiter does not spin forever).
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            return Some(MARKER | SIGNAL_FLAG | 9);
+        }
+        return None;
+    }
+    Some(if libc::WIFEXITED(status) {
+        MARKER | (libc::WEXITSTATUS(status) as u32 & 0xff)
+    } else {
+        MARKER | SIGNAL_FLAG | (libc::WTERMSIG(status) as u32 & 0xff)
+    })
+}
+
 impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
     // "Think rust, not windows": this trait's default `spawn_cross_process_fork_child` contract
     // (a relocation map to translate, a register snapshot to inject, pipes/files/eventfds to
@@ -2994,6 +3025,59 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
         // lock-quiescing contract (see above) -- nothing here can misuse it further.
         let pid = unsafe { libc::fork() };
         if pid < 0 { None } else { Some(pid) }
+    }
+
+    fn exit_native_fork_child(&self, status: i32) {
+        // SAFETY: `_exit` takes no pointers and never returns; the child's guest process is
+        // already fully torn down, and running Rust/libc exit handlers here would only touch
+        // state the parent still owns a COW view of.
+        unsafe { libc::_exit(status) }
+    }
+
+    // A native-fork child's `CrossProcessChildHandle` is its real host pid, so the "wait for a
+    // cross-process child" hooks are plain `waitpid(2)` on it. The status is re-encoded into the
+    // marker layout `decode_cross_process_wait_status` reads (high 16 bits `0xC0DE`, bit 15 =
+    // signalled, low 8 bits = exit code or signal number) so the shim's one decoder serves both
+    // this and the Windows path.
+    fn wait_for_cross_process_exit(&self, handle: litebox::platform::CrossProcessChildHandle) -> u32 {
+        loop {
+            if let Some(code) = native_fork_waitpid(handle, 0) {
+                return code;
+            }
+        }
+    }
+
+    fn try_wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<u32> {
+        native_fork_waitpid(handle, libc::WNOHANG)
+    }
+
+    fn spawn_cross_process_exit_notifier(
+        &'static self,
+        handle: litebox::platform::CrossProcessChildHandle,
+        on_exit: alloc::boxed::Box<dyn FnOnce() + Send>,
+    ) {
+        // `WNOWAIT` leaves the zombie in place: `sys_wait4` must still be able to reap the child
+        // and read its status itself.
+        std::thread::spawn(move || {
+            let pid = handle.0 as libc::id_t;
+            loop {
+                let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+                let r = unsafe {
+                    libc::waitid(libc::P_PID, pid, &raw mut info, libc::WEXITED | libc::WNOWAIT)
+                };
+                if r == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    // ECHILD: already reaped by `sys_wait4`, which needs no wake from us.
+                    return;
+                }
+            }
+            on_exit();
+        });
     }
 }
 

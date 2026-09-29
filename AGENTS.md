@@ -35,6 +35,26 @@ did not find the actual creation site. **Both lazy-fork flags remain default OFF
 reached by any of the 106 passes to date.** See "Cross-process fork"'s own "Open, in rough priority
 order" item 1 for the precise next pickup.
 
+## Linux runner (`litebox_runner_linux_userland`) native fork -- 108th pass
+
+Cloud sessions are Linux, so the Windows runner is unavailable there; the Linux runner runs the
+extracted `linuxserver/webtop:debian-xfce` rootfs (`--initial-files rootfs.tar --rewrite-syscalls`,
+guest `bash` from the host path). Its `has_native_fork()==true` path (host `fork()`) was half
+wired: the wait/notify hooks panicked (`spawn_cross_process_exit_notifier` unreachable). Now:
+`wait_for_cross_process_exit`/`try_wait_...`/`spawn_cross_process_exit_notifier` are `waitpid`/
+`waitid(WNOWAIT)` on the child pid, `SYS_wait4`/`SYS_waitid` are seccomp-allowed (a blocked
+host syscall answers `EINVAL`, which looked like a hang), and `exit_native_fork_child` ends the
+child host process with the guest exit status (signals read back as `128+sig`). Verified:
+`(exit 7); echo $?` -> 7, `/bin/true` -> 0, no hang.
+
+**Still broken, architectural**: a native-fork child gets a COW copy of every litebox kernel
+structure, so pipes (`ls / | head` loses the pipe, SIGPIPE), the in-memory fs layer (`touch /tmp/x`
+in a child is invisible to the parent) and sockets are not shared across guest processes. The
+thread-based fork is NOT a substitute on Linux: it corrupts guest memory (stale pointers, "invalid
+stdio handle", tcache aborts). A shared global heap is wrong too: per-process `Task` state is
+reinitialized in place by `reinit_as_native_fork_child` and would alias. Needs selective shared
+kernel state (the Windows `SharedKernelStateProvider` design) or a state daemon.
+
 ## The cheap repro — start here
 
 ```

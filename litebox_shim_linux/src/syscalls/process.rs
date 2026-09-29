@@ -389,6 +389,12 @@ pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
 /// as `WIFSIGNALED(SIGKILL)`: the child is definitely gone, and "killed" is a safe, conservative
 /// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
 /// code.
+/// Set (per host process) once this process has become a native-`fork()` child, so its guest
+/// process's exit can end the host process with the right status; see
+/// `ForkChildVerificationProvider::exit_native_fork_child`.
+static IS_NATIVE_FORK_CHILD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
     const SIGKILL: i32 = 9;
     if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
@@ -2002,6 +2008,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: exiting fn");
+        if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
+            // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
+            let code = match self.process().wait_for_exit() {
+                ExitStatus::Exit(code) => i32::from(code) & 0xff,
+                ExitStatus::Signal(sig) => 128 + sig.as_i32(),
+            };
+            self.global.platform.exit_native_fork_child(code);
+        }
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
@@ -3604,6 +3619,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// for this function to do), and `wait_state` describes this HOST THREAD's own park/wake
     /// primitives, untouched by which guest process it now belongs to.
     fn reinit_as_native_fork_child(&self, new_pid: i32, exit_signal: u64) {
+        IS_NATIVE_FORK_CHILD.store(true, Ordering::Relaxed);
         let old_pid = self.pid.get();
         let old_process = self.process();
 

@@ -1293,6 +1293,18 @@ pub trait ForkChildVerificationProvider {
         None
     }
 
+    /// Ends the calling host process, a native-`fork()` child (see [`Self::native_fork`]), with
+    /// `status` as its raw host exit code once its guest process has fully exited.
+    ///
+    /// A native child is the forking guest thread and nothing else: the runner's `main` thread,
+    /// which is what normally turns the guest's exit status into the host process's, exists only
+    /// in the parent. Without this the child's last thread just returns and the host reports exit
+    /// code `0` to the parent's `waitpid`, losing every non-zero guest status. The default is a
+    /// no-op: only a platform that returns `true` from [`Self::has_native_fork`] is ever asked.
+    fn exit_native_fork_child(&self, status: i32) {
+        let _ = status;
+    }
+
     /// On a host with no real `fork()`, litebox maps every guest process into ONE shared host
     /// address space (see [`Self::has_native_fork`]'s doc comment). A fixed-address (`ET_EXEC`)
     /// ELF image occasionally needs the EXACT SAME address a still-live ancestor or sibling
