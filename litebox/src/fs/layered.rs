@@ -1015,7 +1015,23 @@ impl<
             // Not `NotForWriting`: that is this function's "migrate through an outer fs's upper
             // instead" signal, and an outer fs retrying would fail reading the same lower copy.
             Err(MigrationError::NoReadPerms) => return Err(WriteError::Io),
-            Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
+            // A device or other special node cannot be copied up. Its lower fd is CACHED per path
+            // with the flags of whoever opened it first, so a writer arriving after a read-only
+            // opener (bash opens `/dev/null` read-only for a background job's stdin, then again
+            // write-only for the redirect) shares a fd that refuses writes. Write through a fresh,
+            // write-capable lower fd instead of failing every `> /dev/null` in a background job
+            // with EISDIR.
+            Err(MigrationError::NotAFile) => {
+                let Ok(lower_fd) = self
+                    .lower
+                    .open(path.as_str(), OFlags::WRONLY, Mode::empty())
+                else {
+                    return Err(WriteError::NotAFile);
+                };
+                let written = self.lower.write(&lower_fd, buf, offset);
+                let _ = self.lower.close(&lower_fd);
+                return written;
+            }
             Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
             // `NotForWriting` is imprecise but is exactly the signal an outer fs composing this one
