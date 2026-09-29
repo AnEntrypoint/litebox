@@ -183,6 +183,20 @@ unsafe impl GlobalAlloc for SharedHeap {
         let _g = Guard::lock(h);
         let head = h.free[class].load(Ordering::Relaxed);
         if head != 0 {
+            if POISON.load(Ordering::Relaxed) && size >= 32 {
+                // SAFETY: the block is free and `size` bytes; debug-only read.
+                let s = unsafe { core::slice::from_raw_parts((head + 16) as *const u8, size - 16) };
+                if s.iter().any(|&b| b != 0xDD) {
+                    drop(_g);
+                    panic!("shared heap: write to freed block {head:#x} (size class {size})");
+                }
+            }
+            if POISON.load(Ordering::Relaxed) && size >= 32 {
+                // Clear the double-free marker so a block handed out and freed again untouched
+                // is not mistaken for one freed twice.
+                // SAFETY: the block is `size >= 32` bytes and owned by this call now.
+                unsafe { core::ptr::write_bytes((head + 16) as *mut u8, 0, 8) };
+            }
             // SAFETY: a free block's first word stores the next free block.
             let next = unsafe { *(head as *const usize) };
             h.free[class].store(next, Ordering::Relaxed);
@@ -206,8 +220,20 @@ unsafe impl GlobalAlloc for SharedHeap {
         let h = Self::header();
         let _g = Guard::lock(h);
         if POISON.load(Ordering::Relaxed) {
+            let size = Self::class_of(layout).unwrap().1;
+            // A block already carrying the poison pattern past its free-list link was freed
+            // before: this is a double free, caught at the second `dealloc`.
+            // SAFETY: the block is `size` bytes; reading it here is a debug-only check.
+            let already = size >= 32
+                && unsafe { core::slice::from_raw_parts(ptr.add(16), 8) }
+                    .iter()
+                    .all(|&b| b == 0xDD);
+            if already {
+                drop(_g);
+                panic!("shared heap: double free of {ptr:p} (size class {size})");
+            }
             // SAFETY: the block is `size` bytes and no longer in use.
-            unsafe { core::ptr::write_bytes(ptr, 0xDD, Self::class_of(layout).unwrap().1) };
+            unsafe { core::ptr::write_bytes(ptr, 0xDD, size) };
         }
         // SAFETY: the block is at least 16 bytes and no longer in use.
         unsafe { *(ptr as *mut usize) = h.free[class].load(Ordering::Relaxed) };

@@ -3705,6 +3705,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         core::mem::forget(self.thread.replace(new_thread));
         core::mem::forget(self.signals.replace(new_signals));
         if let Some((files, fs)) = shared_state {
+            if self.files.try_borrow_mut().is_err() || self.fs.try_borrow_mut().is_err() {
+                litebox_util_log::error!(
+                    tid:% = self.tid.get(),
+                    files_free:% = self.files.try_borrow_mut().is_ok(),
+                    fs_free:% = self.fs.try_borrow_mut().is_ok();
+                    "DIAG native fork child: files/fs RefCell still borrowed"
+                );
+            }
             // Adopt the tables the parent duplicated before the `fork()` (see
             // `try_native_cross_process_fork`); without shared kernel memory the kernel's own
             // copy-on-write already gave this process independent ones.

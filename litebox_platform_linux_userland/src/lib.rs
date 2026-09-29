@@ -1854,6 +1854,39 @@ where
     })
 }
 
+/// Moves a new thread's shim state (its `Task`) out of the Rust heap into private memory.
+///
+/// With the shared-arena heap, everything `Box`ed is visible to every process in a native-fork
+/// family. A thread's `Task` is per-process, per-thread state that a `fork()` child reinitialises
+/// IN PLACE (see `reinit_as_native_fork_child`), so it must live in memory the fork copies rather
+/// than shares -- as the initial thread's does on its stack. The moved value is not dropped or
+/// re-created, only relocated; a later `Drop` frees it through the global allocator, which routes
+/// any pointer outside the arena to the system allocator.
+#[allow(unused_imports)]
+use std::alloc::GlobalAlloc as _;
+
+fn privatize_thread_state<T: ?Sized>(state: Box<T>) -> Box<T> {
+    if !shared_heap::is_active() {
+        return state;
+    }
+    let raw = Box::into_raw(state);
+    // SAFETY: `raw` came from `Box::into_raw`, so it is valid and uniquely owned.
+    let layout = std::alloc::Layout::for_value(unsafe { &*raw });
+    if layout.size() == 0 {
+        // SAFETY: zero-sized: nothing was allocated.
+        return unsafe { Box::from_raw(raw) };
+    }
+    // SAFETY: non-zero layout; the copy is a bitwise move of a value that is never used again
+    // at its old address, whose block is then released without running its destructor.
+    unsafe {
+        let private = std::alloc::System.alloc(layout);
+        assert!(!private.is_null(), "out of memory privatizing thread state");
+        core::ptr::copy_nonoverlapping(raw.cast::<u8>(), private, layout.size());
+        std::alloc::dealloc(raw.cast::<u8>(), layout);
+        Box::from_raw(raw.with_addr(private as usize))
+    }
+}
+
 fn thread_start(
     init_thread: Box<
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
@@ -1861,7 +1894,7 @@ fn thread_start(
     mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
-    let shim = init_thread.init();
+    let shim = privatize_thread_state(init_thread.init());
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
     // TODO: have syscall_callback return if we need to terminate the process.
@@ -2960,6 +2993,32 @@ impl ThreadContext<'_> {
     }
 }
 
+/// Clears this thread's registered-waker TLS slot WITHOUT dropping what it points to; see
+/// [`LinuxUserland::native_fork`]'s caller for why a forked child must not release it.
+fn forget_inherited_waker() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut waker_ptr: *mut litebox::event::wait::Waker<LinuxUserland> = std::ptr::null_mut();
+        // SAFETY: swaps this thread's own TLS slot with null; the old value is deliberately leaked.
+        unsafe {
+            core::arch::asm!(
+                concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
+                inout(reg) waker_ptr,
+                options(nostack),
+            );
+        }
+        let _ = waker_ptr;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let scratch_ptr = aarch64_scratch_or_host_only();
+        // SAFETY: same-thread access, as in `update_waker`; the old value is deliberately leaked.
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*scratch_ptr).wait_waker_addr, 0);
+        }
+    }
+}
+
 /// `waitpid(2)` on a native-fork child (see `ForkChildVerificationProvider::native_fork`),
 /// returning the status re-encoded into the shim's cross-process exit layout. `None` means "still
 /// running" (`WNOHANG`) or a retriable `EINTR`.
@@ -3025,6 +3084,13 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
         // SAFETY: `fork()` has no arguments and no precondition of its own beyond the caller's
         // lock-quiescing contract (see above) -- nothing here can misuse it further.
         let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // The child's copy of this thread's TLS still points at the PARENT's registered
+            // `Waker` box (kernel state, and so that box, is shared across the fork). The next
+            // `update_waker` would drop it -- releasing a reference the parent still holds --
+            // so abandon it here instead.
+            forget_inherited_waker();
+        }
         if pid < 0 { None } else { Some(pid) }
     }
 

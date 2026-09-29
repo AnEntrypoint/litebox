@@ -269,7 +269,52 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
 }
 
 
+/// Prints the return addresses on the panicking thread's frame-pointer chain after the normal
+/// panic message. Unlike `RUST_BACKTRACE`, this works on guest-running threads (whose unwind info
+/// stops at the guest entry) and needs no file access, which the seccomp filter forbids. Only
+/// useful for binaries built with `-C force-frame-pointers=yes`; resolve with `addr2line` after
+/// subtracting the `litebox-exe-base` line printed at startup.
+#[cfg(target_arch = "x86_64")]
+fn install_frame_pointer_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(std::boxed::Box::new(move |info| {
+        previous(info);
+        let mut rbp: usize;
+        // SAFETY: reads the frame-pointer register only.
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+        let mut out = std::string::String::from("litebox-panic-frames:");
+        for _ in 0..48 {
+            if rbp < 0x1000 || rbp % 8 != 0 {
+                break;
+            }
+            // SAFETY: best-effort walk; the chain is validated only by alignment, which is
+            // acceptable for a crash diagnostic that already runs on a panicking thread.
+            let (next, ret) = unsafe { (*(rbp as *const usize), *((rbp + 8) as *const usize)) };
+            out.push_str(&std::format!(" {ret:#x}"));
+            if next <= rbp {
+                break;
+            }
+            rbp = next;
+        }
+        eprintln!("{out}");
+    }));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_frame_pointer_panic_hook() {}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some() {
+        install_frame_pointer_panic_hook();
+    }
+    if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some()
+        && let Ok(maps) = std::fs::read_to_string("/proc/self/maps")
+        && let Some(line) = maps.lines().next()
+    {
+        // The seccomp filter forbids the file reads backtrace symbolization needs, so a panic
+        // backtrace shows raw addresses; subtract this base and feed them to `addr2line -e`.
+        eprintln!("litebox-exe-base: {}", line.split('-').next().unwrap_or(""));
+    }
     litebox_util_log::init_env_filtered_subscriber("LITEBOX_LOG");
 
     if !cli_args.insert_files.is_empty() {
