@@ -255,11 +255,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if seen.load(Ordering::Acquire) == view.generation {
             return;
         }
-        if view.deleted {
-            let _ = self.files.borrow().fs.unlink(path);
-        } else {
-            self.install_spilled_content(path, &view);
-        }
+        litebox::fs::with_root_identity(|| {
+            if view.deleted {
+                let _ = self.files.borrow().fs.unlink(path);
+            } else {
+                self.install_spilled_content(path, &view);
+            }
+        });
         seen.store(view.generation, Ordering::Release);
     }
 
@@ -313,7 +315,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn copier_of_local_file<'a>(&'a self, path: &'a str) -> impl FnOnce(u32) -> Option<u64> + 'a {
-        move |slot| {
+        move |slot| litebox::fs::with_root_identity(|| {
             let files = self.files.borrow();
             let file = files.fs.open(path, OFlags::RDONLY, Mode::empty()).ok()?;
             let platform = self.global.platform;
@@ -333,7 +335,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             let _ = files.fs.close(&file);
             complete.then_some(offset)
-        }
+        })
     }
 
     pub(crate) fn publish_spilled(&self, path: &str, edit: SpillEdit<'_>) {
