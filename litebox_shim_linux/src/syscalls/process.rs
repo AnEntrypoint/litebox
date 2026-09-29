@@ -3191,6 +3191,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let end = alloc::sync::Arc::new(end);
                     let counted = alloc::sync::Arc::clone(&end);
                     let owners = move || counted.strong_count();
+                    let eof_probe = alloc::sync::Arc::clone(&end);
                     let bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
                             litebox::platform::ForkPipeBridge::Sink(
@@ -3201,6 +3202,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                         end.write(&wait_state.context(), buf).ok()
                                     }),
                                     owners,
+                                    || false,
                                 ),
                             )
                         }
@@ -3213,6 +3215,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                         end.read(&wait_state.context(), buf).ok()
                                     }),
                                     owners,
+                                    move || eof_probe.at_eof(),
                                 ),
                             )
                         }

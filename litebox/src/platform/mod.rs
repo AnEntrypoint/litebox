@@ -1512,6 +1512,19 @@ pub enum ForkPipeBridge {
 }
 
 impl ForkPipeBridge {
+    /// Whether the parent-side pipe has no writer left and nothing buffered, so the only thing any
+    /// reader can still get from it is end-of-file. A [`Self::Source`] may deliver that at once,
+    /// however many sibling bridges still hold the end: it steals no bytes, and waiting for the
+    /// siblings instead deadlocks a shell's job-control sync pipe, whose read end both pipeline
+    /// children carry and neither closes until the other has read EOF.
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        match self {
+            Self::Sink(_) => false,
+            Self::Source(e) => e.at_eof(),
+        }
+    }
+
     /// How many references to the parent-side pipe end are alive, this bridge included.
     ///
     /// `1` means this bridge is the sole owner. For a [`Self::Sink`] that says dropping it will
@@ -1541,17 +1554,30 @@ impl core::fmt::Debug for ForkPipeBridge {
 pub struct ForkPipeEnd<F> {
     transfer: F,
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+    at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
 }
 
 impl<F> ForkPipeEnd<F> {
     /// Wrap a transfer closure and a probe reporting how many references to the underlying pipe
     /// end are alive.
     #[must_use]
-    pub fn new(transfer: F, owners: impl Fn() -> usize + Send + 'static) -> Self {
+    pub fn new(
+        transfer: F,
+        owners: impl Fn() -> usize + Send + 'static,
+        at_eof: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
         Self {
             transfer,
             owners: alloc::boxed::Box::new(owners),
+            at_eof: alloc::boxed::Box::new(at_eof),
         }
+    }
+
+    /// Whether the parent-side pipe can only ever yield end-of-file (see
+    /// [`ForkPipeBridge::at_eof`]).
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        (self.at_eof)()
     }
 
     /// See [`ForkPipeBridge::owners`].

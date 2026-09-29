@@ -262,6 +262,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platfor
         }
     }
 
+    /// Whether a read on this end can only ever return end-of-file: it is a receiver half with
+    /// every writer gone and nothing left buffered. Delivering that EOF to a second reader steals
+    /// no bytes, which is what lets a bridge release a child's copy of the end without waiting for
+    /// its sibling bridges.
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.is_peer_shutdown() && p.endpoint.rb.lock().is_empty(),
+            PipeEnd::Sender(_) => false,
+        }
+    }
+
     /// Whether this is the sender half or the receiver half.
     #[must_use]
     pub fn half_pipe_type(&self) -> HalfPipeType {

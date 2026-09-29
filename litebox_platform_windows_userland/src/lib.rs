@@ -6993,6 +6993,11 @@ impl RawMutex {
                     if self.try_recover_from_dead_holder(val, record) {
                         break Ok(UnblockedOrTimedOut::Unblocked);
                     }
+                    if self.inner.load(Ordering::SeqCst) != val {
+                        break self
+                            .finish_real_timeout(record, event)
+                            .map(|_| UnblockedOrTimedOut::Unblocked);
+                    }
                     // A recorded, live holder that never lets go is the signature of a cross-process
                     // lock stall (the shared network lock froze every process this way); name the
                     // holder so its stack can be inspected. Holder 0 (futex-style waits) stays quiet.
@@ -7002,7 +7007,7 @@ impl RawMutex {
                     // waits pass other values), so holder 0 there means an orphaned lock.
                     if (holder != 0 || val == 2) && idle_chunks % 15 == 0 {
                         litebox_util_log::warn!(
-                            lock:% = (self as *const Self as usize), val:% = val, holder_pid:% = holder,
+                            lock:% = (self as *const Self as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
                             waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
                             my_pid:% = std::process::id();
                             "RawMutex held by a live process for a long time"
@@ -13690,6 +13695,9 @@ fn spawn_fork_child_pipe_pump(
             litebox::platform::ForkPipeBridge::Source(mut end) => {
                 const POLL: core::time::Duration = core::time::Duration::from_millis(2);
                 while end.owners() > 1 {
+                    if end.at_eof() {
+                        break;
+                    }
                     if process_fork::process_has_exited(child_process) {
                         litebox_util_log::debug!(
                             handle:% = local;
