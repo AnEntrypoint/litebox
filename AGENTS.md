@@ -16,6 +16,15 @@ xfce4-terminal with a working bash (prompt, echo, `tty`, job control, colours), 
 the Settings manager (live search, tooltips), Thunar preferences dialogs. `DE_UP` in 25-40s.
 
 Fixed this pass (all committed, newest first):
+- `f594693` **guest identity and DNS**: `setuid`/`setgid`/`setresuid`/`setresgid`/`setreuid`/`setregid`/
+  `setfsuid`/`setfsgid`/`setgroups`/`getgroups` were fixed-credential stubs that refused every change with
+  EPERM (apt's `_apt` sandbox, `su`, `sudo`, `setpriv` all died); `Credentials` is now interior-mutable
+  (real/effective/saved ids, groups, keep-caps retention; root changes freely, non-root only to ids it holds;
+  a `fork()` child gets `fork_copy`, threads share). Cross-process fork children still restart as root
+  (`lib.rs` builds them from the env ids). `capset` is accepted (capabilities are not modelled), `PR_SET/GET_
+  KEEPCAPS`, `SECUREBITS`, `CAP_AMBIENT` accepted. **`IP_RECVERR` setsockopt was unsupported, and glibc's
+  resolver treats that as fatal: `getaddrinfo` never worked** (raw UDP DNS did) -- found by tracing `getent`.
+  Remaining apt/su problems: see Open.
 - `2b7d7df` **TCP teardown**: smoltcp keeps a socket whose peer sent FIN "open" (CloseWait), so `recv()`
   never returned 0 and every guest connection the peer closed first hung its reader (Python `urlopen` of a
   guest `http.server` timed out; sockets leaked until the 256-slot `MAX_SOCKETS` table filled = the
