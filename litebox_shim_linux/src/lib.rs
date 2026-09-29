@@ -906,13 +906,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials: syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1123,13 +1117,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials: syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
                 comm: comm.into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -2883,6 +2871,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Setresgid { rgid, egid, sgid } => {
                 syscall!(sys_setresgid(rgid, egid, sgid))
             }
+            SyscallRequest::Setreuid { ruid, euid } => syscall!(sys_setreuid(ruid, euid)),
+            SyscallRequest::Setregid { rgid, egid } => syscall!(sys_setregid(rgid, egid)),
+            SyscallRequest::Setfsuid { uid } => Ok(self.sys_setfsuid(uid) as usize),
+            SyscallRequest::Setfsgid { gid } => Ok(self.sys_setfsgid(gid) as usize),
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
             SyscallRequest::Setgroups { size, list } => syscall!(sys_setgroups(size, list)),
             SyscallRequest::Sysinfo { buf } => {
@@ -2892,6 +2884,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|()| 0)
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }
@@ -3795,12 +3788,7 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(0),
                 tid: Cell::new(pid),
-                credentials: Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                }),
+                credentials: Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0)),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -3871,7 +3859,7 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(self.pid.get()),
                 tid: Cell::new(pid),
-                credentials: self.credentials.clone(),
+                credentials: Arc::new(self.credentials.fork_copy()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),

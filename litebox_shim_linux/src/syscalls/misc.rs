@@ -104,6 +104,36 @@ const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Handle syscall `capset`.
+    ///
+    /// Capabilities are not modelled (see [`Self::sys_capget`]), so a well-formed request is
+    /// accepted and forgotten: privilege-dropping tools (`setpriv`, `su`, `gosu`) treat a failing
+    /// `capset` as fatal, and nothing here consults a capability set that could be stale.
+    pub(crate) fn sys_capset(
+        &self,
+        header: UserPtrMut<litebox_common_linux::CapHeader>,
+        _data: Option<litebox_common_linux::user_pointers::UserPtr<litebox_common_linux::CapData>>,
+    ) -> Result<(), Errno> {
+        let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        match hdr.version {
+            _LINUX_CAPABILITY_VERSION_1
+            | _LINUX_CAPABILITY_VERSION_2
+            | _LINUX_CAPABILITY_VERSION_3 => Ok(()),
+            _ => {
+                header
+                    .write_at_offset::<Platform>(
+                        0,
+                        litebox_common_linux::CapHeader {
+                            version: _LINUX_CAPABILITY_VERSION_3,
+                            pid: hdr.pid,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
     /// Handle syscall `capget`.
     ///
     /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.

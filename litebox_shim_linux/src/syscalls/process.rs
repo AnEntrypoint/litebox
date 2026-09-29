@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
@@ -1064,13 +1064,197 @@ enum ThreadInitState {
     ),
 }
 
-/// Credentials of a process
-#[derive(Clone)]
+/// Most supplementary groups a task can hold (Linux's `NGROUPS_MAX` is 65536; nothing in a
+/// container image needs more than a handful).
+const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
+
+/// Credentials of a process: real/effective/saved user and group ids plus supplementary groups.
+///
+/// Interior-mutable because `setuid(2)`-family calls change them through a shared `&Task`, and
+/// shared between the threads of one process (glibc broadcasts an id change to every thread, so
+/// one shared set is what they all end up with); a `fork()` child gets its own copy via
+/// [`Credentials::fork_copy`].
 pub(crate) struct Credentials {
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
+    uid: AtomicU32,
+    euid: AtomicU32,
+    suid: AtomicU32,
+    gid: AtomicU32,
+    egid: AtomicU32,
+    sgid: AtomicU32,
+    groups: [AtomicU32; MAX_SUPPLEMENTARY_GROUPS],
+    group_count: AtomicU32,
+    keep_caps: AtomicU32,
+    /// Set when root changed its uid with `PR_SET_KEEPCAPS` on: capabilities (and so the right to
+    /// keep changing ids) survive the drop, as `setpriv` and `gosu`-style tools rely on.
+    retained_caps: core::sync::atomic::AtomicBool,
+    secure_bits: AtomicU32,
+    fsuid: AtomicU32,
+    fsgid: AtomicU32,
+}
+
+impl Credentials {
+    pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
+        Self {
+            uid: uid.into(),
+            euid: euid.into(),
+            suid: euid.into(),
+            gid: gid.into(),
+            egid: egid.into(),
+            sgid: egid.into(),
+            groups: core::array::from_fn(|i| AtomicU32::new(if i == 0 { gid } else { 0 })),
+            group_count: 1.into(),
+            keep_caps: 0.into(),
+            retained_caps: false.into(),
+            secure_bits: 0.into(),
+            fsuid: euid.into(),
+            fsgid: egid.into(),
+        }
+    }
+
+    pub(crate) fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn euid(&self) -> u32 {
+        self.euid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn suid(&self) -> u32 {
+        self.suid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn egid(&self) -> u32 {
+        self.egid.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn sgid(&self) -> u32 {
+        self.sgid.load(Ordering::Relaxed)
+    }
+
+    /// Whether the effective user may change ids and groups freely (this shim has no capability
+    /// model: root is the only privileged user).
+    fn is_privileged(&self) -> bool {
+        self.euid() == 0 || self.retained_caps.load(Ordering::Relaxed)
+    }
+
+    /// A `fork()` child's own copy: later id changes in either process stay private to it.
+    pub(crate) fn fork_copy(&self) -> Self {
+        let copy = Self::new(self.uid(), self.euid(), self.gid(), self.egid());
+        copy.suid.store(self.suid(), Ordering::Relaxed);
+        copy.sgid.store(self.sgid(), Ordering::Relaxed);
+        for (dst, src) in copy.groups.iter().zip(&self.groups) {
+            dst.store(src.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        copy.retained_caps
+            .store(self.retained_caps.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.fsuid.store(self.fsuid.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.fsgid.store(self.fsgid.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.group_count
+            .store(self.group_count.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy
+    }
+
+    /// `setresuid(2)`: `u32::MAX` leaves an id unchanged; an unprivileged caller may only pick
+    /// values it already holds as real, effective or saved id.
+    fn set_res_uid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
+        let holds = |v: u32| v == self.uid() || v == self.euid() || v == self.suid();
+        let allowed = |v: u32| v == u32::MAX || holds(v);
+        if !self.is_privileged() && !(allowed(ruid) && allowed(euid) && allowed(suid)) {
+            return Err(Errno::EPERM);
+        }
+        let keeps_caps = self.is_privileged() && self.keep_caps.load(Ordering::Relaxed) == 1;
+        for (slot, v) in [(&self.uid, ruid), (&self.euid, euid), (&self.suid, suid)] {
+            if v != u32::MAX {
+                slot.store(v, Ordering::Relaxed);
+            }
+        }
+        if keeps_caps && self.euid() != 0 {
+            self.retained_caps.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// `setresgid(2)`; see [`Self::set_res_uid`].
+    fn set_res_gid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
+        let holds = |v: u32| v == self.gid() || v == self.egid() || v == self.sgid();
+        let allowed = |v: u32| v == u32::MAX || holds(v);
+        if !self.is_privileged() && !(allowed(rgid) && allowed(egid) && allowed(sgid)) {
+            return Err(Errno::EPERM);
+        }
+        for (slot, v) in [(&self.gid, rgid), (&self.egid, egid), (&self.sgid, sgid)] {
+            if v != u32::MAX {
+                slot.store(v, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// `setreuid(2)`: `u32::MAX` leaves an id unchanged; the saved id follows the new effective
+    /// id when the real id is set or the effective id differs from the old real id.
+    fn set_re_uid(&self, ruid: u32, euid: u32) -> Result<(), Errno> {
+        let old_real = self.uid();
+        let old_effective = self.euid();
+        let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
+        let allowed_effective =
+            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.suid();
+        if !self.is_privileged() && !(allowed_real(ruid) && allowed_effective(euid)) {
+            return Err(Errno::EPERM);
+        }
+        let new_suid = if ruid != u32::MAX || (euid != u32::MAX && euid != old_real) {
+            if euid != u32::MAX { euid } else { old_effective }
+        } else {
+            self.suid()
+        };
+        self.set_res_uid(ruid, euid, new_suid)
+    }
+
+    /// `setregid(2)`; see [`Self::set_re_uid`].
+    fn set_re_gid(&self, rgid: u32, egid: u32) -> Result<(), Errno> {
+        let old_real = self.gid();
+        let old_effective = self.egid();
+        let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
+        let allowed_effective =
+            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.sgid();
+        if !self.is_privileged() && !(allowed_real(rgid) && allowed_effective(egid)) {
+            return Err(Errno::EPERM);
+        }
+        let new_sgid = if rgid != u32::MAX || (egid != u32::MAX && egid != old_real) {
+            if egid != u32::MAX { egid } else { old_effective }
+        } else {
+            self.sgid()
+        };
+        self.set_res_gid(rgid, egid, new_sgid)
+    }
+
+    /// `setuid(2)`: privileged sets all three ids, unprivileged sets only the effective one.
+    fn set_uid(&self, uid: u32) -> Result<(), Errno> {
+        if self.is_privileged() {
+            return self.set_res_uid(uid, uid, uid);
+        }
+        if uid == self.uid() || uid == self.suid() {
+            self.euid.store(uid, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
+
+    /// `setgid(2)`; see [`Self::set_uid`].
+    fn set_gid(&self, gid: u32) -> Result<(), Errno> {
+        if self.is_privileged() {
+            return self.set_res_gid(gid, gid, gid);
+        }
+        if gid == self.gid() || gid == self.sgid() {
+            self.egid.store(gid, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(Errno::EPERM)
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -1162,6 +1346,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
             // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
             PrctlArg::SetPDeathSig(_) => Ok(0),
+            PrctlArg::SetKeepCaps(value) => {
+                if value > 1 {
+                    return Err(Errno::EINVAL);
+                }
+                self.credentials.keep_caps.store(value as u32, Ordering::Relaxed);
+                Ok(0)
+            }
+            PrctlArg::GetKeepCaps => {
+                Ok(self.credentials.keep_caps.load(Ordering::Relaxed) as usize)
+            }
+            PrctlArg::GetSecureBits => {
+                Ok(self.credentials.secure_bits.load(Ordering::Relaxed) as usize)
+            }
+            PrctlArg::SetSecureBits(bits) => {
+                self.credentials
+                    .secure_bits
+                    .store(u32::try_from(bits).map_err(|_| Errno::EINVAL)?, Ordering::Relaxed);
+                Ok(0)
+            }
+            // Capabilities are not modelled (see `CapBSetRead`): no ambient capability is ever
+            // set, and lowering/clearing one is trivially satisfied.
+            PrctlArg::CapAmbient(_) => Ok(0),
             _ => unimplemented!(),
         }
     }
@@ -1946,7 +2152,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     super::signal::siginfo_child(
                         signal,
                         self.pid.get(),
-                        self.credentials.uid,
+                        self.credentials.uid(),
                         status,
                     ),
                 );
@@ -3809,7 +4015,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) {
         let Some(signal) = signal else { return };
         let process = self.process();
-        let uid = self.credentials.uid;
+        let uid = self.credentials.uid();
         self.global.platform.spawn_cross_process_exit_notifier(
             handle,
             alloc::boxed::Box::new(move |raw_exit_code| {
@@ -5138,7 +5344,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
                         ppid: Cell::new(ppid),
-                        credentials: self.credentials.clone(),
+                        credentials: Arc::new(self.credentials.fork_copy()),
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
@@ -5938,7 +6144,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        self.credentials.uid()
     }
 
     /// Handle syscall `getresuid`.
@@ -5954,11 +6160,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         euid: UserPtrMut<u32>,
         suid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        let effective = self.credentials.euid;
         for (ptr, value) in [
-            (ruid, self.credentials.uid),
-            (euid, effective),
-            (suid, effective),
+            (ruid, self.credentials.uid()),
+            (euid, self.credentials.euid()),
+            (suid, self.credentials.suid()),
         ] {
             ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
         }
@@ -5973,11 +6178,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         egid: UserPtrMut<u32>,
         sgid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        let effective = self.credentials.egid;
         for (ptr, value) in [
-            (rgid, self.credentials.gid),
-            (egid, effective),
-            (sgid, effective),
+            (rgid, self.credentials.gid()),
+            (egid, self.credentials.egid()),
+            (sgid, self.credentials.sgid()),
         ] {
             ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
         }
@@ -5986,17 +6190,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.credentials.euid()
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        self.credentials.gid()
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.credentials.egid()
     }
 
     /// This task's own real credentials, as reported to a peer via `SO_PEERCRED` on a
@@ -6005,102 +6209,107 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
         litebox_common_linux::Ucred {
             pid: self.pid.get() as u32,
-            uid: self.credentials.euid,
-            gid: self.credentials.egid,
+            uid: self.credentials.euid(),
+            gid: self.credentials.egid(),
         }
     }
 
     /// Handle syscall `setuid`.
-    ///
-    /// LiteBox does not support real privilege separation (there is exactly one, fixed set of
-    /// credentials for the whole sandboxed guest), so this succeeds as a no-op when `uid`
-    /// matches the caller's current real/effective uid -- the common case of a program
-    /// idempotently dropping to the uid it is already running as -- and fails otherwise, rather
-    /// than silently pretending to change privileges.
     pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
-        if uid == self.credentials.uid && uid == self.credentials.euid {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
-        }
+        self.credentials.set_uid(uid)
     }
 
-    /// Handle syscall `setgid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale.
+    /// Handle syscall `setgid`.
     pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
-        if gid == self.credentials.gid && gid == self.credentials.egid {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
-        }
+        self.credentials.set_gid(gid)
     }
 
-    /// Handle syscall `setresuid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale -- `u32::MAX` (real Linux's `-1` passed as `uid_t`) means "leave this one
-    /// unchanged", matching real `setresuid(2)` semantics.
+    /// Handle syscall `setresuid`.
     pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
-        let keep_or_matches = |requested: u32, current: u32| {
-            requested == u32::MAX || requested == current
-        };
-        if keep_or_matches(ruid, self.credentials.uid)
-            && keep_or_matches(euid, self.credentials.euid)
-            && keep_or_matches(suid, self.credentials.uid)
-        {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
-        }
+        self.credentials.set_res_uid(ruid, euid, suid)
     }
 
-    /// Handle syscall `setresgid`. See [`Self::sys_setresuid`] for the same no-op-if-unchanged
-    /// rationale.
+    /// Handle syscall `setreuid`.
+    pub(crate) fn sys_setreuid(&self, ruid: u32, euid: u32) -> Result<(), Errno> {
+        self.credentials.set_re_uid(ruid, euid)
+    }
+
+    /// Handle syscall `setregid`.
+    pub(crate) fn sys_setregid(&self, rgid: u32, egid: u32) -> Result<(), Errno> {
+        self.credentials.set_re_gid(rgid, egid)
+    }
+
+    /// Handle syscall `setfsuid`: returns the previous value and never reports failure (the
+    /// kernel ignores a refused change too). File permission checks use the effective ids.
+    pub(crate) fn sys_setfsuid(&self, uid: u32) -> u32 {
+        let previous = self.credentials.fsuid.load(Ordering::Relaxed);
+        let holds = uid == self.credentials.uid()
+            || uid == self.credentials.euid()
+            || uid == self.credentials.suid()
+            || uid == previous;
+        if self.credentials.is_privileged() || holds {
+            self.credentials.fsuid.store(uid, Ordering::Relaxed);
+        }
+        previous
+    }
+
+    /// Handle syscall `setfsgid`; see [`Self::sys_setfsuid`].
+    pub(crate) fn sys_setfsgid(&self, gid: u32) -> u32 {
+        let previous = self.credentials.fsgid.load(Ordering::Relaxed);
+        let holds = gid == self.credentials.gid()
+            || gid == self.credentials.egid()
+            || gid == self.credentials.sgid()
+            || gid == previous;
+        if self.credentials.is_privileged() || holds {
+            self.credentials.fsgid.store(gid, Ordering::Relaxed);
+        }
+        previous
+    }
+
+    /// Handle syscall `setresgid`.
     pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
-        let keep_or_matches = |requested: u32, current: u32| {
-            requested == u32::MAX || requested == current
-        };
-        if keep_or_matches(rgid, self.credentials.gid)
-            && keep_or_matches(egid, self.credentials.egid)
-            && keep_or_matches(sgid, self.credentials.gid)
-        {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
-        }
+        self.credentials.set_res_gid(rgid, egid, sgid)
     }
 
-    /// Handle syscall `getgroups`.
-    ///
-    /// LiteBox has no real supplementary-group model (see [`Self::sys_setuid`]'s single-fixed-
-    /// credentials rationale), so the guest's supplementary group list is always exactly its own
-    /// primary gid -- matching a real Linux process that was never granted any extra groups.
-    /// `size == 0` is the standard "just tell me the count" query and never touches `list`.
+    /// Handle syscall `getgroups`. `size == 0` is the standard "just tell me the count" query
+    /// and never touches `list`.
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<u32, Errno> {
+        let count = self.credentials.group_count.load(Ordering::Relaxed);
         if size == 0 {
-            return Ok(1);
+            return Ok(count);
         }
-        if size < 1 {
+        let capacity = u32::try_from(size).map_err(|_| Errno::EINVAL)?;
+        if capacity < count {
             return Err(Errno::EINVAL);
         }
-        list.copy_from_slice::<Platform>(0, &[self.credentials.gid])
+        let groups: alloc::vec::Vec<u32> = self.credentials.groups[..count as usize]
+            .iter()
+            .map(|g| g.load(Ordering::Relaxed))
+            .collect();
+        list.copy_from_slice::<Platform>(0, &groups)
             .ok_or(Errno::EFAULT)?;
-        Ok(1)
+        Ok(count)
     }
 
-    /// Handle syscall `setgroups`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale: succeeds only when the requested list is exactly the guest's current
-    /// (sole) supplementary group, i.e. its own primary gid.
+    /// Handle syscall `setgroups`: only a privileged caller may replace the group list.
     pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
-        if size != 1 {
+        if !self.credentials.is_privileged() {
             return Err(Errno::EPERM);
         }
-        let Some(gid) = list.read_at_offset::<Platform>(0) else {
-            return Err(Errno::EFAULT);
-        };
-        if gid == self.credentials.gid {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
+        if size > MAX_SUPPLEMENTARY_GROUPS {
+            return Err(Errno::EINVAL);
         }
+        for (i, slot) in self.credentials.groups[..size].iter().enumerate() {
+            let gid = list
+                .read_at_offset::<Platform>(isize::try_from(i).map_err(|_| Errno::EINVAL)?)
+                .ok_or(Errno::EFAULT)?;
+            slot.store(gid, Ordering::Relaxed);
+        }
+        self.credentials.group_count.store(
+            u32::try_from(size).map_err(|_| Errno::EINVAL)?,
+            Ordering::Relaxed,
+        );
+        Ok(())
     }
 }
 

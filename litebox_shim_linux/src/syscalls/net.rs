@@ -570,7 +570,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     litebox_util_log::debug!("accepting and ignoring setsockopt(IP_TOS)");
                     return Ok(());
                 }
+                // No ICMP errors are ever queued for a datagram socket here, so an empty error
+                // queue is what enabling the option would show anyway.
+                litebox_common_linux::IpOption::RECVERR => return Ok(()),
             },
+            SocketOptionName::IPV6(litebox_common_linux::Ipv6Option::RECVERR) => return Ok(()),
             // An `AF_INET6` socket here is an IPv6-configured-but-unreachable model (see
             // `do_socket`/`sys_bind`), so whether it also accepts v4 is unobservable; accept the
             // option like a kernel would rather than failing servers that set it (selkies 2.0
@@ -738,8 +742,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::RECVERR => 0,
             },
-            SocketOptionName::IPV6(litebox_common_linux::Ipv6Option::V6ONLY) => 0,
+            SocketOptionName::IPV6(
+                litebox_common_linux::Ipv6Option::V6ONLY | litebox_common_linux::Ipv6Option::RECVERR,
+            ) => 0,
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO

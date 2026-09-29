@@ -2258,11 +2258,15 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    /// `IP_RECVERR`: queue ICMP errors on the socket error queue. glibc's resolver sets it on
+    /// every DNS socket and treats failure as fatal.
+    RECVERR = 11,
 }
 
 #[repr(u32)]
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum Ipv6Option {
+    RECVERR = 25,
     V6ONLY = 26,
 }
 
@@ -3300,6 +3304,16 @@ pub enum PrctlArg {
     SetDumpable(usize),
     /// `PR_GET_DUMPABLE`: read back what [`PrctlArg::SetDumpable`] last set.
     GetDumpable,
+    /// `PR_SET_KEEPCAPS`: keep permitted capabilities across a uid change.
+    SetKeepCaps(usize),
+    /// `PR_GET_KEEPCAPS`.
+    GetKeepCaps,
+    /// `PR_GET_SECUREBITS`.
+    GetSecureBits,
+    /// `PR_SET_SECUREBITS`.
+    SetSecureBits(usize),
+    /// `PR_CAP_AMBIENT` with its sub-operation (`PR_CAP_AMBIENT_IS_SET`/`RAISE`/`LOWER`/`CLEAR_ALL`).
+    CapAmbient(usize),
 }
 
 #[repr(i32)]
@@ -4130,6 +4144,20 @@ pub enum SyscallRequest {
         egid: u32,
         sgid: u32,
     },
+    Setreuid {
+        ruid: u32,
+        euid: u32,
+    },
+    Setregid {
+        rgid: u32,
+        egid: u32,
+    },
+    Setfsuid {
+        uid: u32,
+    },
+    Setfsgid {
+        gid: u32,
+    },
     Getgroups {
         size: i32,
         list: UserPtrMut<u32>,
@@ -4144,6 +4172,10 @@ pub enum SyscallRequest {
     CapGet {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
+    },
+    CapSet {
+        header: UserPtrMut<CapHeader>,
+        data: Option<UserPtr<CapData>>,
     },
     GetDirent64 {
         fd: i32,
@@ -4755,6 +4787,10 @@ impl SyscallRequest {
             Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
             Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
+            Sysno::setreuid => sys_req!(Setreuid { ruid, euid }),
+            Sysno::setregid => sys_req!(Setregid { rgid, egid }),
+            Sysno::setfsuid => sys_req!(Setfsuid { uid }),
+            Sysno::setfsgid => sys_req!(Setfsgid { gid }),
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
             Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
@@ -4828,6 +4864,21 @@ impl SyscallRequest {
                         },
                         PrctlOption::GetDumpable => SyscallRequest::Prctl {
                             args: PrctlArg::GetDumpable,
+                        },
+                        PrctlOption::SetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::SetKeepCaps(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::GetKeepCaps,
+                        },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
                         },
                         // `PR_SET_PDEATHSIG` asks for a signal when the PARENT dies. GLib's
                         // `g_spawn_*` sets it in the child between fork and exec, and treats a
@@ -5109,6 +5160,7 @@ impl SyscallRequest {
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);

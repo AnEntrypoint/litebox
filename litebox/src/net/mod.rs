@@ -408,9 +408,17 @@ impl TcpServerSpecific {
             // resource pressure, not a crash, matches ordinary OS behavior under fd/socket
             // exhaustion.
             if socket_set.iter().count() >= MAX_SOCKETS {
+                litebox_util_log::warn!(
+                    port = self.ip_listen_endpoint.port;
+                    "listen backlog cannot be refilled: the socket table is full"
+                );
                 break;
             }
             let Some((rx, tx, claim)) = buffers.tcp() else {
+                litebox_util_log::warn!(
+                    port = self.ip_listen_endpoint.port;
+                    "listen backlog cannot be refilled: the socket buffer pool is exhausted"
+                );
                 break;
             };
             let mut listening_socket = tcp::Socket::new(rx, tx);

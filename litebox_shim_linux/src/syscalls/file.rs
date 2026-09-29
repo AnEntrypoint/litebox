@@ -3127,13 +3127,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
         if flags.contains(AtFlags::AT_EACCESS) {
             AccessUserInfo {
-                user: self.credentials.euid,
-                group: self.credentials.egid,
+                user: self.credentials.euid(),
+                group: self.credentials.egid(),
             }
         } else {
             AccessUserInfo {
-                user: self.credentials.uid,
-                group: self.credentials.gid,
+                user: self.credentials.uid(),
+                group: self.credentials.gid(),
             }
         }
     }
