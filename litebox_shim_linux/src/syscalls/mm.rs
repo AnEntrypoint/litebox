@@ -1075,6 +1075,88 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// Keeps a `MAP_SHARED` file mapping coherent with `write()`/`pwrite()` to the same file.
+    ///
+    /// The shared object behind a mapping is a separate allocation seeded from the file once (see
+    /// `try_shared_file_mmap`); without this, bytes written to the file afterwards never reach
+    /// mappers. That is exactly how SQLite (Chromium's every database) works: it maps the file
+    /// read-only and writes it with `pwrite`, so it read back stale zeros, decided the database
+    /// was corrupt, and the browser aborted on a `CHECK`. A no-op unless the file has a mapping.
+    pub(crate) fn propagate_write_to_shared_mapping(
+        &self,
+        raw_fd: usize,
+        explicit_offset: Option<usize>,
+        written: &[u8],
+    ) {
+        if written.is_empty() || self.global.shared_files.lock().is_empty() {
+            return;
+        }
+        let files = self.files.borrow();
+        let Some(key) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    Some((status.node_info.dev, status.node_info.ino))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        drop(files);
+        let (handle, size) = {
+            let shared = self.global.shared_files.lock();
+            match shared.get(&key) {
+                Some(e) => (e.handle, e.size),
+                None => return,
+            }
+        };
+        // Where the write landed: the explicit offset, else the position now that it advanced.
+        let offset = match explicit_offset {
+            Some(o) => o,
+            None => match self.sys_lseek(
+                i32::try_from(raw_fd).unwrap_or(-1),
+                0,
+                litebox::fs::SeekWhence::RelativeToCurrentOffset,
+            ) {
+                Ok(pos) => pos.saturating_sub(written.len()),
+                Err(_) => return,
+            },
+        };
+        if offset >= size {
+            return;
+        }
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(size) else {
+            return;
+        };
+        // SAFETY: a fresh private mapping of `handle`, written and unmapped here; `handle` is
+        // owned by `shared_files` and outlives it.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let n = written.len().min(size - offset);
+            let _ = ptr.write_slice_at_offset(offset as isize, &written[..n]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, size);
+        }
+    }
+
     /// If `fd` is an ordinary file and the guest asked for a `MAP_SHARED` mapping, back it with a
     /// real shared-memory object -- keyed by the file's `(dev, ino)`, so every process mapping the
     /// same file binds to the SAME object and sees the others' writes -- and return `Some(result)`.

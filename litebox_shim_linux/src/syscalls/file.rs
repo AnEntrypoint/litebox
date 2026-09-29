@@ -2089,11 +2089,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
                 .ok(),
         };
+        let mut wrote_file: Option<usize> = None;
         let files = self.files.borrow();
         let res = files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
+                |fd| {
+                    let r = files.fs.write(fd, buf, offset).map_err(Errno::from);
+                    if let Ok(n) = r
+                        && n > 0
+                    {
+                        wrote_file = Some(n);
+                    }
+                    r
+                },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
                     self.global.sendto(
@@ -2172,6 +2181,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL))
             .flatten();
         drop(files);
+        if let Some(n) = wrote_file {
+            self.propagate_write_to_shared_mapping(raw_fd, offset, &buf[..n.min(buf.len())]);
+        }
         if let Ok(n) = res
             && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
         {

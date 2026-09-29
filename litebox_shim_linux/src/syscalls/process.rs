@@ -7299,6 +7299,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let load_info = loader.load(argv, envp, self.init_auxv())?;
+        if self.global.platform.env_flag("LITEBOX_DIAG_FAULT") {
+            // Where this image landed (`AT_ENTRY`), so a fault's absolute `rip` can be turned
+            // into a file offset: offset = rip - AT_ENTRY + e_entry.
+            let at_entry = load_info
+                .auxv
+                .chunks_exact(16)
+                .find(|c| usize::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])) == 9)
+                .map(|c| usize::from_ne_bytes(c[8..16].try_into().unwrap_or([0; 8])));
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-exec] pid={} at_entry={:#x} path={}",
+                    self.pid.get(),
+                    at_entry.unwrap_or(0),
+                    loader.path()
+                ),
+            );
+        }
         // Completes the snapshot above. Deliberately after `load`, because the full auxiliary
         // vector does not exist until the image has been placed (`AT_PHDR`/`AT_ENTRY`/`AT_BASE`)
         // and the stack written (`AT_RANDOM`), and deliberately not reconstructed here -- these

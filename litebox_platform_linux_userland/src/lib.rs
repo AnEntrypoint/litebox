@@ -227,6 +227,10 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        DIAG_FAULT.store(
+            std::env::var_os("LITEBOX_DIAG_FAULT").is_some_and(|v| !v.is_empty()),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -3898,6 +3902,9 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
     true
 }
 
+/// Whether `LITEBOX_DIAG_FAULT` was set at startup (see [`exception_signal_handler`]).
+static DIAG_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 #[allow(
     clippy::cast_possible_truncation,
@@ -3908,6 +3915,69 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // `LITEBOX_DIAG_FAULT=1`: name every hardware exception the guest takes (which signal, at
+    // which instruction, touching which address) on stderr. Async-signal-safe: no allocation.
+    #[cfg(target_arch = "x86_64")]
+    if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+        let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let addr = unsafe { info.si_addr() } as u64;
+        let mut buf = [0u8; 96];
+        let mut n = 0;
+        let mut put = |b: &[u8]| {
+            for &c in b {
+                if n < buf.len() {
+                    buf[n] = c;
+                    n += 1;
+                }
+            }
+        };
+        let hex = |mut v: u64, out: &mut [u8; 16]| {
+            for i in (0..16).rev() {
+                out[i] = b"0123456789abcdef"[(v & 0xf) as usize];
+                v >>= 4;
+            }
+        };
+        let mut h = [0u8; 16];
+        put(b"[diag-fault] sig=");
+        put(&[b'0' + (signum / 10) as u8, b'0' + (signum % 10) as u8]);
+        put(b" rip=0x");
+        hex(rip, &mut h);
+        put(&h);
+        put(b" addr=0x");
+        hex(addr, &mut h);
+        put(&h);
+        put(b"\n");
+        unsafe { libc::write(2, buf.as_ptr().cast(), n) };
+        // Frame-pointer walk (Chromium and most distro binaries keep frame pointers): the
+        // return addresses name the callers, which is usually enough to identify the site.
+        let rsp = context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
+        let mut rbp = context.uc_mcontext.gregs[libc::REG_RBP as usize] as u64;
+        for _ in 0..14 {
+            if rbp % 8 != 0 || rbp < rsp || rbp > rsp + (1 << 22) {
+                break;
+            }
+            let ret = unsafe { *((rbp + 8) as *const u64) };
+            let next = unsafe { *(rbp as *const u64) };
+            let mut b2 = [0u8; 40];
+            let mut m = 0;
+            for &c in b"  ret=0x" {
+                b2[m] = c;
+                m += 1;
+            }
+            hex(ret, &mut h);
+            for &c in &h {
+                b2[m] = c;
+                m += 1;
+            }
+            b2[m] = b'\n';
+            m += 1;
+            unsafe { libc::write(2, b2.as_ptr().cast(), m) };
+            if next <= rbp {
+                break;
+            }
+            rbp = next;
+        }
+    }
     // On aarch64 there is no fast-path syscall-rewriting trampoline (unlike x86_64's patched
     // `syscall`->`call` rewrite): every guest `svc #0` is unpatched and always reaches the
     // kernel directly, so this SIGSYS handler is the ONLY guest-syscall interception point on
