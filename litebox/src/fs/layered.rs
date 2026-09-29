@@ -857,12 +857,11 @@ impl<
                 }
                 // Either only this fd and the root point at it, or the root was tombstoned out after
                 // the fds were opened.
-                match **root_entries.get(&path).unwrap() {
-                    EntryX::Upper { .. } => unreachable!(),
-                    EntryX::Lower { .. } => {
+                match root_entries.get(&path).map(|root_entry| &**root_entry) {
+                    Some(EntryX::Lower { .. }) => {
                         // We are going to have to deal with it at the entry too, fallthrough
                     }
-                    EntryX::Tombstone => {
+                    Some(EntryX::Upper { .. } | EntryX::Tombstone) | None => {
                         // Other fds may have been opened before the tombstone, so close the
                         // underlying fd only when this is the sole remaining holder.
                         match Arc::into_inner(entry) {

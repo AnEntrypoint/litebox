@@ -2048,15 +2048,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             core::cmp::Ordering::Greater => {}
         }
 
-        // grow
-        if range.end > cur_range.end {
-            // we can't remap across vm area boundaries
-            return Err(VmemResizeError::InvalidAddr {
-                range: cur_range.clone(),
-                addr: range.end,
-            });
-        }
+        let (cur_range, cur_vma) = if range.end > cur_range.end {
+            let mut position = cur_range.end;
+            loop {
+                let (next_range, next_vma) =
+                    self.vmas
+                        .get_key_value(&position)
+                        .ok_or(VmemResizeError::InvalidAddr {
+                            range: cur_range.clone(),
+                            addr: position,
+                        })?;
+                if next_range.end >= range.end {
+                    break (next_range, next_vma);
+                }
+                position = next_range.end;
+            }
+        } else {
+            (cur_range, cur_vma)
+        };
 
+        let (tail_start, tail_vma) = (cur_range.start, *cur_vma);
         if range.end == cur_range.end {
             // expand the current range
             let r = range.end..new_end;
@@ -2086,7 +2097,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             match unsafe {
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
-                Ok(_) => {}
+                Ok(_) => {
+                    if tail_vma.shared_handle.is_none() && !tail_vma.is_file_backed() {
+                        self.vmas.insert(tail_start..new_end, tail_vma);
+                    }
+                }
                 Err(AllocationError::OutOfMemory) => {
                     litebox_util_log::debug!(
                         expand_start:% = range.start, expand_end:% = new_end,
@@ -2132,6 +2147,29 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         Err(VmemResizeError::RangeOccupied(range.end..cur_range.end))
     }
 
+    fn coalesce_private_span(&mut self, span: &PageRange<ALIGN>) {
+        let pieces: alloc::vec::Vec<(core::ops::Range<usize>, VmArea<Platform, ALIGN>)> = self
+            .vmas
+            .overlapping(span.start..span.end)
+            .map(|(range, vma)| (range.clone(), *vma))
+            .collect();
+        let Some((first_range, first_vma)) = pieces.first().cloned() else {
+            return;
+        };
+        let mergeable = pieces.len() > 1
+            && first_range.start <= span.start
+            && pieces.iter().all(|(_, vma)| {
+                vma.shared_handle.is_none()
+                    && !vma.is_file_backed()
+                    && vma.flags == first_vma.flags
+            })
+            && pieces.windows(2).all(|pair| pair[0].0.end == pair[1].0.start)
+            && pieces.last().is_some_and(|(range, _)| range.end >= span.end);
+        if mergeable {
+            self.vmas.insert(span.start..span.end, first_vma);
+        }
+    }
+
     /// Move a range from `old_range` to `suggested_new_range`.
     /// Use it together with [`Vmem::resize_mapping`] to achieve `mremap`.
     ///
@@ -2156,6 +2194,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         new_size: NonZeroPageSize<ALIGN>,
     ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
         assert!(new_size.as_usize() >= old_range.len());
+
+        self.coalesce_private_span(&old_range);
 
         // Check if the given range is covered by exactly one mapping.
         //
