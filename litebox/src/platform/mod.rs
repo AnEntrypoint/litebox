@@ -1304,6 +1304,13 @@ pub trait ForkChildVerificationProvider {
     /// Whether the kernel state a native-`fork()` child inherits is memory it SHARES with its
     /// parent (rather than a private copy-on-write duplicate). When it is, a lock the parent held
     /// across the `fork()` is one lock seen by both processes, so the child must not release it.
+    /// Non-consuming check of whether the native-fork child `handle` has already exited (it is
+    /// left un-reaped so `wait4` can still collect its status). `false` when unknown.
+    fn cross_process_child_has_exited(&self, handle: CrossProcessChildHandle) -> bool {
+        let _ = handle;
+        false
+    }
+
     fn native_fork_shares_kernel_state(&self) -> bool {
         false
     }

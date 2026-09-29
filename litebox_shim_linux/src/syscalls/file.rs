@@ -682,6 +682,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockFile<Platform> {
     }
 }
 
+/// One POSIX record lock: `pid`'s claim on bytes `start..end` of the file `key`.
+#[derive(Clone)]
+pub(crate) struct RecordLock {
+    key: (usize, usize),
+    pid: i32,
+    write: bool,
+    start: u64,
+    /// Exclusive; `u64::MAX` means "to end of file".
+    end: u64,
+}
+
+impl RecordLock {
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start < end && start < self.end
+    }
+}
+
 /// Path in the file system
 #[derive(Debug)]
 enum FsPath {
@@ -1065,6 +1082,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .duplicate(end)
                     .ok_or(Errno::ENXIO)?;
                 drop(registry);
+                self.apply_fifo_open_status(&dup, flags)?;
                 return self.insert_raw_fifo_fd(dup, flags, path);
             }
         }
@@ -1084,7 +1102,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .duplicate(end)
             .ok_or(Errno::ENXIO)?;
         drop(registry);
+        self.apply_fifo_open_status(&dup, flags)?;
         self.insert_raw_fifo_fd(dup, flags, path)
+    }
+
+    /// Applies an `open()`'s `O_NONBLOCK` to the FIFO end it was handed.
+    ///
+    /// Blocking mode belongs to an open file description on Linux, so every `open()` of a FIFO gets
+    /// its own. This implementation hands each opener a duplicate of ONE registry-held pipe end,
+    /// which is a single description: the mode is therefore shared, and the most recent `open()`
+    /// wins. That is exact for the usual pattern (a daemon opens its control FIFO `O_NONBLOCK`
+    /// and clients write to a different end) and wrong only when two openers of the SAME end ask
+    /// for different modes. Without this the flag was dropped entirely, so a non-blocking reader
+    /// (`s6-svscan` draining its control FIFO until `EAGAIN`) blocked forever in `read`.
+    fn apply_fifo_open_status(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        flags: OFlags,
+    ) -> Result<(), Errno> {
+        self.global
+            .set_linux_pipe_status_flags(fd, flags & OFlags::NONBLOCK, OFlags::NONBLOCK)
     }
 
     /// Install a FIFO's pipe end into this process's raw fd table, mirroring
@@ -3122,13 +3159,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
         if flags.contains(AtFlags::AT_EACCESS) {
             AccessUserInfo {
-                user: self.credentials.euid,
-                group: self.credentials.egid,
+                user: self.creds().euid,
+                group: self.creds().egid,
             }
         } else {
             AccessUserInfo {
-                user: self.credentials.uid,
-                group: self.credentials.gid,
+                user: self.creds().uid,
+                group: self.creds().gid,
             }
         }
     }
@@ -3603,6 +3640,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
         }
         Err(Errno::ELOOP)
+    }
+
+    /// `path` (absolute) with EVERY symlink expanded, intermediate components and the final one
+    /// alike -- `realpath` without the existence check. Components that do not exist are kept
+    /// as written (a socket about to be `bind`ed has no file yet).
+    pub(crate) fn canonical_path_all_symlinks(&self, path: String) -> Result<String, Errno> {
+        const MAX_SYMLINK_HOPS: u32 = 40;
+        let mut hops = 0;
+        let mut pending: alloc::vec::Vec<String> = path
+            .normalized()?
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .rev()
+            .collect();
+        let mut current = String::new();
+        while let Some(component) = pending.pop() {
+            let candidate = alloc::format!("{current}/{component}");
+            match self.do_readlink(candidate.as_str()) {
+                Ok(target) => {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(Errno::ELOOP);
+                    }
+                    if target.starts_with('/') {
+                        current.clear();
+                    }
+                    for c in target.split('/').filter(|c| !c.is_empty()).rev() {
+                        pending.push(String::from(c));
+                    }
+                }
+                Err(_) => match component.as_str() {
+                    "." => {}
+                    ".." => {
+                        current = current.rsplit_once('/').map_or(String::new(), |(d, _)| String::from(d));
+                    }
+                    _ => current = candidate,
+                },
+            }
+        }
+        Ok(if current.is_empty() { String::from("/") } else { current })
     }
 
     /// Handle syscall `stat`
@@ -4101,7 +4179,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_fd| {
+                        |fd| {
                             let mut flock =
                                 lock.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                             let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
@@ -4109,10 +4187,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             if let litebox_common_linux::FlockType::Unlock = lock_type {
                                 return Err(Errno::EINVAL);
                             }
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so return `Unlock` unconditionally.
-                            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+                            let key = self.record_lock_key(fd)?;
+                            let (start, end) = Self::record_lock_range(&flock)?;
+                            let me = self.pid.get();
+                            let want_write =
+                                lock_type == litebox_common_linux::FlockType::WriteLock;
+                            let conflict = self
+                                .global
+                                .record_locks
+                                .lock()
+                                .iter()
+                                .find(|l| {
+                                    l.key == key
+                                        && l.pid != me
+                                        && l.overlaps(start, end)
+                                        && (want_write || l.write)
+                                })
+                                .cloned();
+                            match conflict {
+                                None => {
+                                    flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+                                }
+                                Some(l) => {
+                                    flock.type_ = if l.write {
+                                        litebox_common_linux::FlockType::WriteLock
+                                    } else {
+                                        litebox_common_linux::FlockType::ReadLock
+                                    } as i16;
+                                    flock.whence = 0;
+                                    flock.start = l.start as usize;
+                                    flock.len = if l.end == u64::MAX {
+                                        0
+                                    } else {
+                                        (l.end - l.start) as isize
+                                    };
+                                    flock.pid = l.pid;
+                                }
+                            }
                             lock.write_at_offset::<Platform>(0, flock)
                                 .ok_or(Errno::EFAULT)?;
                             Ok(0)
@@ -4133,17 +4244,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .flatten()
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
+                let blocking = matches!(arg, FcntlArg::SETLKW(_));
                 self.files
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_fd| {
+                        |fd| {
                             let flock = lock.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
+                            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so we don't need to maintain anything.
+                            let key = self.record_lock_key(fd)?;
+                            let (start, end) = Self::record_lock_range(&flock)?;
+                            self.do_record_lock(key, lock_type, start, end, blocking)?;
                             Ok(0)
                         },
                         |_fd| Err(Errno::EINVAL),
@@ -4190,6 +4302,97 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
+        }
+    }
+
+    fn record_lock_key(&self, fd: &TypedFd<FS>) -> Result<(usize, usize), Errno> {
+        let node_info = self
+            .files
+            .borrow()
+            .fs
+            .fd_file_status(fd)
+            .map_err(Errno::from)?
+            .node_info;
+        Ok((node_info.dev, node_info.ino))
+    }
+
+    /// The `[start, end)` byte range an `fcntl` `struct flock` names (`SEEK_SET` semantics;
+    /// `len == 0` means "to end of file").
+    fn record_lock_range(flock: &litebox_common_linux::Flock) -> Result<(u64, u64), Errno> {
+        let start = flock.start as u64;
+        if flock.len == 0 {
+            Ok((start, u64::MAX))
+        } else if flock.len > 0 {
+            Ok((start, start.saturating_add(flock.len as u64)))
+        } else {
+            let len = flock.len.unsigned_abs() as u64;
+            start.checked_sub(len).map(|s| (s, start)).ok_or(Errno::EINVAL)
+        }
+    }
+
+    /// Applies (or, for `Unlock`, removes) this process's record lock over `start..end`.
+    fn do_record_lock(
+        &self,
+        key: (usize, usize),
+        lock_type: litebox_common_linux::FlockType,
+        start: u64,
+        end: u64,
+        blocking: bool,
+    ) -> Result<(), Errno> {
+        let me = self.pid.get();
+        let try_apply = || -> Result<(), litebox::event::polling::TryOpError<Errno>> {
+            let mut locks = self.global.record_locks.lock();
+            let write = lock_type == litebox_common_linux::FlockType::WriteLock;
+            let unlock = lock_type == litebox_common_linux::FlockType::Unlock;
+            if !unlock
+                && locks.iter().any(|l| {
+                    l.key == key && l.pid != me && l.overlaps(start, end) && (write || l.write)
+                })
+            {
+                return Err(litebox::event::polling::TryOpError::TryAgain);
+            }
+            let mut next = alloc::vec::Vec::with_capacity(locks.len() + 2);
+            for l in locks.iter() {
+                if l.key == key && l.pid == me && l.overlaps(start, end) {
+                    if l.start < start {
+                        next.push(RecordLock { end: start, ..l.clone() });
+                    }
+                    if l.end > end {
+                        next.push(RecordLock { start: end, ..l.clone() });
+                    }
+                } else {
+                    next.push(l.clone());
+                }
+            }
+            if !unlock {
+                next.push(RecordLock { key, pid: me, write, start, end });
+            }
+            *locks = next;
+            Ok(())
+        };
+        let r = self
+            .global
+            .record_lock_pollee
+            .wait(&self.wait_cx(), !blocking, Events::IN, try_apply)
+            .map_err(|e| match e {
+                litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
+                other => Errno::from(other),
+            });
+        // Any change may unblock a waiter (unlock, downgrade, or a shrunken range).
+        self.global.record_lock_pollee.notify_observers(Events::IN);
+        r
+    }
+
+    /// Drops every record lock this process holds; called when it exits.
+    pub(crate) fn release_record_locks(&self) {
+        let me = self.pid.get();
+        let mut locks = self.global.record_locks.lock();
+        let before = locks.len();
+        locks.retain(|l| l.pid != me);
+        let changed = locks.len() != before;
+        drop(locks);
+        if changed {
+            self.global.record_lock_pollee.notify_observers(Events::IN);
         }
     }
 
@@ -4324,6 +4527,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
         let resolved = self.resolve_path(pathname)?;
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        // `chdir` follows a symlink in the final component (`chdir link-to-dir` is how
+        // `s6-supervise` enters each `/run/service/<name> -> servicedir`); `file_status` does not.
+        let abs_path = self.resolve_final_symlinks(abs_path)?;
 
         // Verify the path exists and is a directory.
         match self.files.borrow().fs.file_status(abs_path.as_str()) {

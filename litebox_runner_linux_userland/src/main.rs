@@ -9,5 +9,6 @@ static ALLOC: litebox_platform_linux_userland::shared_heap::SharedHeap =
     litebox_platform_linux_userland::shared_heap::SharedHeap::new();
 
 fn main() -> anyhow::Result<()> {
+    litebox_platform_linux_userland::shared_heap::mark_shared_thread(true);
     litebox_runner_linux_userland::run(CliArgs::parse())
 }

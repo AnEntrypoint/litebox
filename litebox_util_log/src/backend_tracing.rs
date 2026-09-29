@@ -24,7 +24,7 @@ extern crate std;
 #[cfg(feature = "tracing_subscriber_init")]
 pub fn init_env_filtered_subscriber(env_var_name: &str) {
     use std::io::IsTerminal as _;
-    tracing_subscriber::fmt()
+    let inner = tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_ansi(std::io::stderr().is_terminal())
@@ -34,7 +34,66 @@ pub fn init_env_filtered_subscriber(env_var_name: &str) {
                 .with_env_var(env_var_name)
                 .from_env_lossy(),
         )
-        .init();
+        .finish();
+    tracing::subscriber::set_global_default(PrivateAlloc(inner))
+        .expect("a global tracing subscriber was already installed");
+}
+
+/// Wraps the fmt subscriber so every call that can touch its per-thread heap state (line buffer,
+/// filter scope stack) runs inside a private-allocation scope. See [`set_private_alloc_hook`].
+#[cfg(feature = "tracing_subscriber_init")]
+struct PrivateAlloc<S>(S);
+
+#[cfg(feature = "tracing_subscriber_init")]
+impl<S: tracing::Subscriber + 'static> tracing::Subscriber for PrivateAlloc<S> {
+    fn register_callsite(
+        &self,
+        m: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.register_callsite(m)
+    }
+    fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.enabled(m)
+    }
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        self.0.max_level_hint()
+    }
+    fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.new_span(a)
+    }
+    fn record(&self, s: &tracing::span::Id, v: &tracing::span::Record<'_>) {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.record(s, v);
+    }
+    fn record_follows_from(&self, s: &tracing::span::Id, f: &tracing::span::Id) {
+        self.0.record_follows_from(s, f);
+    }
+    fn event(&self, e: &tracing::Event<'_>) {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.event(e);
+    }
+    fn enter(&self, s: &tracing::span::Id) {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.enter(s);
+    }
+    fn exit(&self, s: &tracing::span::Id) {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.exit(s);
+    }
+    fn clone_span(&self, s: &tracing::span::Id) -> tracing::span::Id {
+        self.0.clone_span(s)
+    }
+    fn try_close(&self, s: tracing::span::Id) -> bool {
+        let _g = crate::PrivateAllocGuard::new();
+        self.0.try_close(s)
+    }
+    unsafe fn downcast_raw(&self, id: core::any::TypeId) -> Option<*const ()> {
+        // SAFETY: forwards the same contract to the wrapped subscriber.
+        unsafe { self.0.downcast_raw(id) }
+    }
 }
 
 /// A stderr writer that buffers one formatted log event and emits it as a single `write`.
@@ -64,7 +123,14 @@ impl Drop for EventStderr {
     fn drop(&mut self) {
         if !self.0.is_empty() {
             use std::io::Write as _;
-            let _ = std::io::stderr().write_all(&self.0);
+            use std::os::fd::FromRawFd as _;
+            // Straight to fd 2 rather than through `std::io::stderr()`: that goes through a
+            // process-local lock, which a native-`fork()` child inherits still held whenever a
+            // sibling thread of the parent was logging at that instant -- the child then hangs on
+            // its first log line. A raw `write` takes no lock and is atomic per event.
+            // SAFETY: fd 2 stays open for the whole process; `ManuallyDrop` keeps it that way.
+            let mut fd2 = core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(2) });
+            let _ = fd2.write_all(&self.0);
         }
     }
 }

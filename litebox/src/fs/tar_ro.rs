@@ -162,13 +162,18 @@ pub enum MergedLiveEntryKind {
         /// Owning uid/gid.
         owner: UserInfo,
     },
+    /// An explicit (typically empty) directory: one no file/symlink path implies.
+    Dir {
+        /// Owning uid/gid.
+        owner: UserInfo,
+    },
 }
 
 /// 4-byte tag identifying [`encode_merged_live_entries`]'s output, bumped whenever the wire
 /// format changes shape (never whenever the semantics it captures change -- that is what a
 /// caller's own cache KEY, e.g. the OCI layer digest list, is for). [`decode_merged_live_entries`]
 /// refuses anything not starting with the CURRENT tag rather than guess at an old layout.
-const MERGED_LIVE_ENTRIES_MAGIC: [u8; 4] = *b"MLE1";
+const MERGED_LIVE_ENTRIES_MAGIC: [u8; 4] = *b"MLE2";
 
 /// Serialize `entries` into a compact binary format `TarRo::from_merged_live_entries`'s caller
 /// can write to a cache file and later hand to [`decode_merged_live_entries`] -- a deliberately
@@ -199,6 +204,11 @@ pub fn encode_merged_live_entries(entries: &[MergedLiveEntry]) -> Vec<u8> {
             MergedLiveEntryKind::Symlink { target, owner } => {
                 out.push(1);
                 write_len_prefixed_str(&mut out, target);
+                out.extend_from_slice(&owner.user.to_le_bytes());
+                out.extend_from_slice(&owner.group.to_le_bytes());
+            }
+            MergedLiveEntryKind::Dir { owner } => {
+                out.push(2);
                 out.extend_from_slice(&owner.user.to_le_bytes());
                 out.extend_from_slice(&owner.group.to_le_bytes());
             }
@@ -273,6 +283,13 @@ pub fn decode_merged_live_entries(bytes: &[u8]) -> Option<Vec<MergedLiveEntry>> 
                 let group = read_u16(&mut pos)?;
                 MergedLiveEntryKind::Symlink {
                     target,
+                    owner: UserInfo { user, group },
+                }
+            }
+            2 => {
+                let user = read_u16(&mut pos)?;
+                let group = read_u16(&mut pos)?;
+                MergedLiveEntryKind::Dir {
                     owner: UserInfo { user, group },
                 }
             }
@@ -638,6 +655,8 @@ struct TarIndex {
 /// entries an earlier layer contributed (and nothing from a still-later layer that re-created
 /// the same path).
 enum RawEntry {
+    /// An explicit directory entry (`DIRTYPE`), kept so empty directories exist.
+    Dir { path: String, owner: UserInfo },
     File {
         path: String,
         file_idx: usize,
@@ -833,9 +852,17 @@ impl TarIndex {
                         link_target: normalize_tar_filename(link_target).into(),
                     });
                 }
+                tar_no_std::TypeFlag::DIRTYPE => {
+                    let payload_blocks = header.payload_block_count().unwrap_or(0);
+                    block_index += payload_blocks;
+                    raw_entries.push(RawEntry::Dir {
+                        path: path.trim_end_matches('/').into(),
+                        owner: owner_from_posix_header(header),
+                    });
+                }
                 _ => {
-                    // Directories are implied by file/symlink paths below; device nodes and FIFOs
-                    // are not needed for the base-image use case this backend supports.
+                    // Device nodes and FIFOs are not needed for the base-image use case this
+                    // backend supports.
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
                     block_index += payload_blocks;
                 }
@@ -881,6 +908,16 @@ impl TarIndex {
 
         for raw_entry in raw_entries {
             match raw_entry {
+                RawEntry::Dir { path, owner } => {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    // Only this node is replaced: earlier layers' children stay.
+                    if !matches!(live.get(path.as_str()), Some(RawLiveEntry::Dir(_))) {
+                        live.remove(path.as_str());
+                    }
+                    live.insert(path, RawLiveEntry::Dir(owner));
+                }
                 RawEntry::File { path, file_idx } => {
                     remove_path_and_descendants(&mut live, &path);
                     live.insert(path, RawLiveEntry::File(file_idx));
@@ -918,6 +955,14 @@ impl TarIndex {
 
         for (path, entry) in live {
             match entry {
+                RawLiveEntry::Dir(owner) => {
+                    let mut probe = path.clone();
+                    probe.push_str("/x");
+                    ensure_ancestors(&mut dirs, &mut dirs_by_path, &probe, owner, &inode_allocator);
+                    if let Some(&idx) = dirs_by_path.get(path.as_str()) {
+                        dirs[idx].owner = Some(owner);
+                    }
+                }
                 RawLiveEntry::File(file_idx) => {
                     let owner = files[file_idx].owner;
                     let (parent_dir_idx, name) = ensure_ancestors(
@@ -995,6 +1040,14 @@ impl TarIndex {
                     });
                 }
                 IndexedChild::Dir(idx) => {
+                    if self.dirs[idx].children.is_empty() {
+                        out.push(MergedLiveEntry {
+                            path: path.clone(),
+                            kind: MergedLiveEntryKind::Dir {
+                                owner: self.dirs[idx].owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                            },
+                        });
+                    }
                     self.walk_live_entries(idx, &path, out);
                 }
             }
@@ -1083,6 +1136,15 @@ impl TarIndex {
                         .children
                         .insert(name.into(), IndexedChild::File(file_idx));
                 }
+                MergedLiveEntryKind::Dir { owner } => {
+                    let mut probe = entry.path.clone();
+                    probe.push_str("/x");
+                    ensure_ancestors(&mut dirs, &mut dirs_by_path, &probe, owner, &inode_allocator);
+                    if let Some(&idx) = dirs_by_path.get(entry.path.as_str()) {
+                        dirs[idx].owner = Some(owner);
+                    }
+                    last_parent = None;
+                }
                 MergedLiveEntryKind::Symlink { target, owner } => {
                     let symlink_idx = symlinks.len();
                     symlinks.push(IndexedSymlink {
@@ -1126,6 +1188,7 @@ impl TarIndex {
 /// fold, exactly as the pre-multi-layer single-tar builder already worked.
 #[derive(Clone, Copy)]
 enum RawLiveEntry {
+    Dir(UserInfo),
     File(usize),
     Symlink(usize),
 }

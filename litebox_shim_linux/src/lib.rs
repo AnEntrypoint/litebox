@@ -634,6 +634,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
                         live_cross_process_fork_children: core::sync::atomic::AtomicU32::new(0),
+                        native_vfork_gates: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        process_registry: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
@@ -644,6 +650,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+                        record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                        record_lock_pollee: litebox::event::polling::Pollee::new(),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
@@ -894,13 +902,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -919,6 +921,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             .0
             .bootstrap_process
             .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
+        self.0
+            .process_registry
+            .lock()
+            .insert(entrypoints.task.pid.get(), entrypoints.task.process());
 
         let (path, argv) = entrypoints
             .task
@@ -1090,13 +1096,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1990,6 +1990,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
+            if let Some(sp) = syscalls::process::take_native_child_sp() {
+                ctx.rsp = sp;
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -3281,6 +3284,24 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// fix (share the parsed rootfs itself instead of re-deriving it per child) remains open, see
     /// AGENTS.md.
     live_cross_process_fork_children: core::sync::atomic::AtomicU32,
+    /// One gate per native-`fork()` child that was created by `vfork()`/`clone(CLONE_VFORK)`,
+    /// keyed by the child's pid. The parent blocks on it (`vfork()` suspends the caller until the
+    /// child execs or exits); the child opens it. Lives in the shared kernel heap so the two
+    /// processes see the same futex word.
+    native_vfork_gates: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            i32,
+            Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>,
+        >,
+    >,
+    /// Every live guest process that is not a thread-based child of its parent -- the bootstrap
+    /// process and each native-`fork()` child -- by pid. `getpgid`/`setpgid`/`kill` use it to
+    /// reach a process that is not a direct child of the caller. Lives in the shared kernel heap.
+    process_registry: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<i32, Arc<syscalls::process::Process<Platform>>>,
+    >,
     // NOTE: this struct deliberately has NO `unix_addr_table` field -- NINTH instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment, found in the 2026-09-18 systematic audit. See `GlobalStateHandle::unix_addr_table`'s
@@ -3382,6 +3403,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
+    /// POSIX (`fcntl`) record locks held by any guest process, owned by pid.
+    record_locks: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>,
+    /// Woken whenever a record lock is released, so `F_SETLKW` waiters retry.
+    record_lock_pollee: litebox::event::polling::Pollee<Platform>,
     // NOTE: this struct deliberately has NO `pty_registry`/`daemon_pty_masters` fields --
     // ELEVENTH instance of the SAME cross-process-garbage-pointer defect class documented on
     // `GlobalStateHandle`'s own doc comment. Unlike `fifo_registry` (whose own doc comment
@@ -3629,7 +3654,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    credentials: RefCell<Arc<syscalls::process::Credentials>>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` state, per process.
@@ -3695,12 +3720,7 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(0),
                 tid: Cell::new(pid),
-                credentials: Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                }),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -3726,7 +3746,7 @@ mod test_utils {
                 pid: Cell::new(self.pid.get()),
                 ppid: Cell::new(self.ppid.get()),
                 tid: Cell::new(tid),
-                credentials: self.credentials.clone(),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
@@ -3771,7 +3791,7 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(self.pid.get()),
                 tid: Cell::new(pid),
-                credentials: self.credentials.clone(),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),

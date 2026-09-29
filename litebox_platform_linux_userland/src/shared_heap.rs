@@ -26,7 +26,26 @@ struct Header {
     lock: AtomicUsize,
     bump: AtomicUsize,
     free: [AtomicUsize; CLASSES],
+    /// Host fd of the inherited shared-memory pool (`-1` when there is none).
+    pool_fd: AtomicUsize,
+    pool_bump: AtomicUsize,
+    pool_lock: AtomicUsize,
+    pool_table: [PoolEntry; POOL_ENTRIES],
 }
+
+/// One named segment of the pool: `key` 0 marks an unused slot.
+#[repr(C)]
+struct PoolEntry {
+    key: AtomicUsize,
+    offset: AtomicUsize,
+    size: AtomicUsize,
+}
+
+const POOL_ENTRIES: usize = 128;
+const POOL_SIZE: usize = 64 << 30;
+/// Tag on a pool handle: the low bits are the segment's byte offset in the pool memfd.
+pub const POOL_HANDLE_TAG: usize = 1 << 62;
+const POOL_OFFSET_MASK: usize = (1 << 48) - 1;
 
 const HEADER_SIZE: usize = 4096;
 
@@ -34,6 +53,104 @@ const UNINIT: u8 = 0;
 const BUSY: u8 = 1;
 const READY: u8 = 2;
 const DISABLED: u8 = 3;
+
+thread_local! {
+    /// Nesting depth of "allocate privately" scopes on this thread; see [`private_scope`].
+    static PRIVATE_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// Whether this thread may allocate from the shared arena. Threads that std spawns start
+    /// out `false`: std keeps per-thread bookkeeping in process-wide statics (the stack-overflow
+    /// handler registry, for one) that are created and torn down by std code before and after
+    /// ours runs, and blocks a native-fork child inherits through such a static would be mutated
+    /// by both processes. Guest-visible threads opt in with [`mark_shared_thread`].
+    static SHARED_OK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Lets (`true`) or stops (`false`) the current thread allocating from the shared arena.
+pub fn mark_shared_thread(on: bool) {
+    let _ = SHARED_OK.try_with(|s| s.set(on));
+}
+
+/// The inherited pool memfd, when the shared heap is active and it could be created.
+#[must_use]
+pub fn pool_fd() -> Option<usize> {
+    if !is_active() {
+        return None;
+    }
+    // SAFETY: `is_active()` implies the arena (and so its header) is mapped.
+    let fd = unsafe { &*(ARENA_BASE as *const Header) }.pool_fd.load(Ordering::Acquire);
+    (fd != usize::MAX).then_some(fd)
+}
+
+/// Finds (`key != 0`) or reserves a `size`-byte pool segment, returning its pool handle.
+/// `key == 0` always reserves a fresh anonymous segment.
+#[must_use]
+pub fn pool_segment(key: usize, size: usize) -> Option<usize> {
+    pool_fd()?;
+    let size = size.checked_add(4095)? & !4095;
+    // SAFETY: as in `pool_fd`.
+    let h = unsafe { &*(ARENA_BASE as *const Header) };
+    while h
+        .pool_lock
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let mut found = None;
+    if key != 0 {
+        found = h
+            .pool_table
+            .iter()
+            .find(|e| e.key.load(Ordering::Relaxed) == key)
+            .map(|e| e.offset.load(Ordering::Relaxed));
+    }
+    if found.is_none() {
+        let off = h.pool_bump.load(Ordering::Relaxed);
+        if off + size <= POOL_SIZE {
+            let slot = if key == 0 {
+                None
+            } else {
+                h.pool_table.iter().find(|e| e.key.load(Ordering::Relaxed) == 0)
+            };
+            if key == 0 || slot.is_some() {
+                if let Some(e) = slot {
+                    e.offset.store(off, Ordering::Relaxed);
+                    e.size.store(size, Ordering::Relaxed);
+                    e.key.store(key, Ordering::Relaxed);
+                }
+                h.pool_bump.store(off + size, Ordering::Relaxed);
+                found = Some(off);
+            }
+        }
+    }
+    h.pool_lock.store(0, Ordering::Release);
+    found.map(|off| POOL_HANDLE_TAG | off)
+}
+
+/// The byte offset a pool handle names.
+#[must_use]
+pub fn pool_offset(handle: usize) -> usize {
+    handle & POOL_OFFSET_MASK
+}
+
+/// Enters (`true`) or leaves (`false`) a scope in which this thread's allocations come from the
+/// system heap instead of the shared arena.
+///
+/// Rust `thread_local!` values (the tracing formatter's line buffer, for one) are heap-allocated
+/// lazily by the thread that first touches them. If that block is in the shared arena, a forked
+/// child's copy of the thread's TLS points at the PARENT thread's block and both then write into
+/// it. Code that keeps per-thread heap state -- logging -- runs inside a private scope so that
+/// state is ordinary per-process memory that `fork()` duplicates.
+pub fn private_scope(enter: bool) {
+    let _ = PRIVATE_DEPTH.try_with(|d| {
+        d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) });
+    });
+}
+
+fn is_private() -> bool {
+    PRIVATE_DEPTH.try_with(|d| d.get() > 0).unwrap_or(false)
+        || !SHARED_OK.try_with(core::cell::Cell::get).unwrap_or(true)
+}
 
 /// The shared-arena allocator; see the module documentation.
 pub struct SharedHeap {
@@ -95,6 +212,16 @@ impl SharedHeap {
                 Self::header()
                     .bump
                     .store(ARENA_BASE + HEADER_SIZE, Ordering::Release);
+                // SAFETY: plain memfd_create/ftruncate on a NUL-terminated literal. A sparse
+                // memfd is this family's SysV-shm backing: every process inherits the fd, and
+                // segments are page-aligned ranges of it, found by key in the arena header.
+                let fd = unsafe { libc::memfd_create(c"litebox-shm-pool".as_ptr(), libc::MFD_CLOEXEC) };
+                let pool_fd = if fd >= 0 && unsafe { libc::ftruncate(fd, POOL_SIZE as libc::off_t) } == 0 {
+                    fd as usize
+                } else {
+                    usize::MAX
+                };
+                Self::header().pool_fd.store(pool_fd, Ordering::Release);
                 result = READY;
                 ACTIVE.store(true, Ordering::Release);
                 // SAFETY: getenv on a NUL-terminated literal.
@@ -173,7 +300,7 @@ impl Drop for Guard<'_> {
 // SAFETY: blocks handed out are disjoint, suitably aligned, and stay valid until `dealloc`.
 unsafe impl GlobalAlloc for SharedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !self.ready() {
+        if !self.ready() || is_private() {
             return unsafe { System.alloc(layout) };
         }
         let Some((class, size)) = Self::class_of(layout) else {
@@ -242,7 +369,8 @@ unsafe impl GlobalAlloc for SharedHeap {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        if !Self::in_arena(ptr) && !self.ready_for(new_layout) {
+        // A private block stays private however it grows: it was made private on purpose.
+        if !Self::in_arena(ptr) {
             return unsafe { System.realloc(ptr, layout, new_size) };
         }
         if Self::in_arena(ptr)

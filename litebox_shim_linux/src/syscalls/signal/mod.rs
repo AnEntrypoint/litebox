@@ -921,6 +921,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // signal at all.
         if let Some(target_tid) = tid
             && target_tid != self.tid.get()
+            && !self.process().has_thread(target_tid)
+            && let Some(remote) = self.global.process_registry.lock().get(&target_tid).cloned()
+        {
+            // A thread of ANOTHER process in this native-`fork()` family (only its main thread's
+            // tid is known here, which is its pid).
+            if let Some(signal) = signal {
+                remote
+                    .shared_pending
+                    .lock()
+                    .push(&remote.limits, signal, siginfo_kill(signal));
+                remote.interrupt_all_threads();
+            }
+            return Ok(0);
+        }
+        if let Some(target_tid) = tid
+            && target_tid != self.tid.get()
         {
             // Push the signal into `shared_pending` BEFORE checking whether the target thread is
             // still live: a thread that exits between this check and the push could otherwise
@@ -991,8 +1007,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 p if p < 0 => p.checked_neg(),
                 _ => None,
             });
+        if pid == Some(-1) && tid.is_none() {
+            let me = self.process();
+            let all: alloc::vec::Vec<_> = self
+                .global
+                .process_registry
+                .lock()
+                .iter()
+                .filter(|(p, q)| **p > 1 && !Arc::ptr_eq(q, &me))
+                .map(|(_, q)| q.clone())
+                .collect();
+            for p in &all {
+                deliver_to_child(p);
+                delivered = true;
+            }
+        }
         if let Some(group) = target_group {
-            for child in &self.process().children_in_group(group) {
+            for child in &self.processes_in_group(group) {
                 deliver_to_child(child);
                 delivered = true;
             }
@@ -1010,7 +1041,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // common real-world case, a supervisor/process-manager signaling a worker it spawned.
         if let Some(pid) = pid
             && pid > 0
-            && let Some(child) = self.process().find_child(pid)
+            && let Some(child) = self.lookup_process(pid)
         {
             deliver_to_child(&child);
             return Ok(0);

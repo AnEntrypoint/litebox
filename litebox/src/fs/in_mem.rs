@@ -287,6 +287,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         let (entry, created) = if flags.contains(OFlags::CREAT) {
             let mut root = self.root.write();
+            let path = root.resolved_path(&path, self.current_user)?;
             let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
             if let Some(entry) = entry {
                 if flags.contains(OFlags::EXCL) {
@@ -737,6 +738,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
+        let path = root.resolved_path(&path, self.current_user)?;
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
@@ -789,6 +791,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
 
         let mut root = self.root.write();
+        let from = root.resolved_path(&from, self.current_user)?;
+        let to = root.resolved_path(&to, self.current_user)?;
 
         let (from_parent, from_entry) = root.parent_and_entry(&from, self.current_user)?;
         let Some((from_parent_path, from_parent)) = from_parent else {
@@ -906,6 +910,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // share one `FileX` and `unique_id` (`stat`'s `ino`) -- a real hard link, and unlinking
         // one name leaves the other's content alive. See gm mutable mut-1789044267194.
 
+        let newpath = root.resolved_path(&newpath, self.current_user)?;
         let (new_parent, new_entry) = root.parent_and_entry(&newpath, self.current_user)?;
         if new_entry.is_some() {
             return Err(LinkError::AlreadyExists);
@@ -932,6 +937,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn make_fifo(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
+        let path = root.resolved_path(&path, self.current_user)?;
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         if entry.is_some() {
             return Err(MkdirError::AlreadyExists);
@@ -974,6 +980,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let target = target.as_rust_str().map_err(PathError::from)?.to_owned();
         let linkpath = self.absolute_path(linkpath)?;
         let mut root = self.root.write();
+        let linkpath = root.resolved_path(&linkpath, self.current_user)?;
         let (parent, entry) = root.parent_and_entry(&linkpath, self.current_user)?;
         if entry.is_some() {
             return Err(SymlinkError::AlreadyExists);
@@ -1025,6 +1032,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
+        let path = root.resolved_path(&path, self.current_user)?;
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((_parent_path, parent)) = parent else {
             // Attempted to make `/`
@@ -1062,6 +1070,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
+        let path = root.resolved_path(&path, self.current_user)?;
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
@@ -1315,6 +1324,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
             .into_iter()
             .collect(),
         }
+    }
+
+    /// `path` with every INTERMEDIATE symlink expanded, the final component left as named.
+    ///
+    /// `entries` is keyed by full path, so an operation that inserts or removes a key has to use
+    /// the path the entry really lives at. `parent_and_entry` already walks through symlinked
+    /// directories to find the parent and entry; creating `/run/s6-rc/servicedirs/x` through a
+    /// `/run/s6-rc -> /run/s6-rc:tmp` link used to record the new entry under the LITERAL path
+    /// while adding it to the resolved parent's `children`, leaving a listed entry that no lookup
+    /// could find.
+    fn resolved_path(&self, path: &str, current_user: UserInfo) -> Result<String, PathError> {
+        let (parent, _) = self.parent_and_entry(path, current_user)?;
+        let Some((parent_path, _)) = parent else {
+            // Only `/` has no parent.
+            return Ok(String::from(path));
+        };
+        let name = path
+            .normalized_components()?
+            .filter(|c| !c.is_empty() && *c != "..")
+            .last();
+        Ok(match name {
+            Some(name) => {
+                let mut resolved = String::from(parent_path);
+                resolved.push('/');
+                resolved.push_str(name);
+                resolved
+            }
+            None => String::from(path),
+        })
     }
 
     /// Resolve `path` to its parent directory and its final entry, FOLLOWING any symlink that

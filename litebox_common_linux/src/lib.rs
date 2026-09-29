@@ -697,7 +697,7 @@ pub enum FcntlArg {
 }
 
 #[repr(i16)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
 pub enum FlockType {
     /// Shared or read lock
     ReadLock = 0,

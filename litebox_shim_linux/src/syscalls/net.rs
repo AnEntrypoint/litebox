@@ -1632,9 +1632,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
+        let sockaddr = self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
         self.do_connect(fd, sockaddr)
     }
+    /// Gives a filesystem-path `AF_UNIX` address its canonical spelling: made absolute against the
+    /// caller's working directory, with every symlink expanded.
+    ///
+    /// The address table is keyed by the path string, so `bind("s")` from inside a service
+    /// directory and `connect("/run/service/x/s")` (reached through a symlink) must produce the
+    /// same key. Without this a daemon that `chdir`s and binds a relative name (`s6-ipcserver`) is
+    /// unreachable by anyone who spells the path differently: `ECONNREFUSED`.
+    fn canonicalize_unix_addr(&self, addr: SocketAddress) -> Result<SocketAddress, Errno> {
+        match addr {
+            SocketAddress::Unix(UnixSocketAddr::Path(path)) => {
+                let resolved = self.resolve_path(path.as_str())?;
+                let resolved = resolved.to_str().map_err(|_| Errno::EINVAL)?.to_string();
+                let canonical = self.canonical_path_all_symlinks(resolved)?;
+                Ok(SocketAddress::Unix(UnixSocketAddr::Path(canonical)))
+            }
+            other => Ok(other),
+        }
+    }
+
     fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             &self.global,
@@ -1687,7 +1706,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Ok(());
             }
         }
-        let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
+        let sockaddr = self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
         self.do_bind(sockfd, sockaddr)
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
@@ -1741,7 +1760,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let sockaddr = addr
-            .map(|addr| read_sockaddr_from_user::<Platform>(addr, addrlen as usize))
+            .map(|addr| {
+                self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(
+                    addr,
+                    addrlen as usize,
+                )?)
+            })
             .transpose()?;
         let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
         let result = self.do_sendto(fd, &buf, flags, sockaddr);
@@ -1941,10 +1965,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
-            Some(read_sockaddr_from_user::<Platform>(
+            Some(self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(
                 UserPtr::from_usize(msg_name.as_usize()),
                 msg.msg_namelen as usize,
-            )?)
+            )?)?)
         } else {
             None
         };

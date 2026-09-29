@@ -38,6 +38,10 @@ pub struct CliArgs {
     /// `/etc/resolv.conf`) an OCI image's own init expects.
     #[arg(long = "uid", default_value_t = DEFAULT_GUEST_UID)]
     pub uid: u16,
+    /// Present the initial guest process as pid 1, the way a container's init sees itself
+    /// (`s6-overlay`'s `/init` refuses to run otherwise). Later processes get sequential ids.
+    #[arg(long = "pid1")]
+    pub pid1: bool,
     /// Guest group id (default 1000); see `--uid`.
     #[arg(long = "gid", default_value_t = DEFAULT_GUEST_GID)]
     pub gid: u16,
@@ -315,6 +319,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // backtrace shows raw addresses; subtract this base and feed them to `addr2line -e`.
         eprintln!("litebox-exe-base: {}", line.split('-').next().unwrap_or(""));
     }
+    litebox_util_log::set_private_alloc_hook(
+        litebox_platform_linux_userland::shared_heap::private_scope,
+    );
     litebox_util_log::init_env_filtered_subscriber("LITEBOX_LOG");
 
     if !cli_args.insert_files.is_empty() {
@@ -405,8 +412,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
     let ppid = unsafe { libc::getppid() };
     let task_params = litebox_common_linux::TaskParams {
-        pid: tid,
-        ppid,
+        pid: if cli_args.pid1 { 1 } else { tid },
+        ppid: if cli_args.pid1 { 0 } else { ppid },
         uid: u32::from(cli_args.uid),
         euid: u32::from(cli_args.uid),
         gid: u32::from(cli_args.gid),

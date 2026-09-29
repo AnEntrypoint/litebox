@@ -395,6 +395,18 @@ pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
 static IS_NATIVE_FORK_CHILD: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// The stack pointer a native-`fork()` child must resume with, when the guest passed a `stack` to
+/// `clone()` (glibc's `posix_spawn` does: the child runs a function on a fresh stack). Set in the
+/// child by `reinit_as_native_fork_child`, consumed once by the syscall-return path.
+static NATIVE_CHILD_SP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn take_native_child_sp() -> Option<usize> {
+    match NATIVE_CHILD_SP.swap(0, Ordering::Relaxed) {
+        0 => None,
+        sp => Some(sp),
+    }
+}
+
 pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
     const SIGKILL: i32 = 9;
     if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
@@ -689,6 +701,11 @@ impl<Platform: ShimPlatform> Process<Platform> {
         for thread in remotes {
             thread.interrupt();
         }
+    }
+
+    /// Whether `tid` is a live thread of this process.
+    pub(crate) fn has_thread(&self, tid: i32) -> bool {
+        self.inner.lock().threads.contains_key(&tid)
     }
 
     /// Interrupts exactly one live thread of this process by `tid` (a no-op if that `tid` isn't a
@@ -1052,8 +1069,25 @@ enum ThreadInitState {
 pub(crate) struct Credentials {
     pub uid: u32,
     pub euid: u32,
+    pub suid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub sgid: u32,
+    pub groups: alloc::vec::Vec<u32>,
+}
+
+impl Credentials {
+    pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
+        Self {
+            uid,
+            euid,
+            suid: euid,
+            gid,
+            egid,
+            sgid: egid,
+            groups: alloc::vec![gid],
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -2008,6 +2042,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: exiting fn");
+        if process_exited {
+            self.signal_native_vfork_gate();
+        }
+        if process_exited {
+            self.release_record_locks();
+            self.global.process_registry.lock().remove(&self.pid.get());
+        }
         if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
             // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
             // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
@@ -2813,6 +2854,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // A platform with a REAL `fork()` needs none of what follows below in this function: no
         // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
@@ -2822,7 +2865,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // branch exists solely to reconstruct, by hand and imperfectly, what a real `fork()`
         // syscall already does completely.
         if self.global.platform.has_native_fork() {
-            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
+            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal, vfork, child_sp);
         }
 
         // Xvfb/dbus-daemon used to be excluded here by name, unconditionally, before the
@@ -3521,6 +3564,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // The Windows-shaped reconstruction path above (GPR injection, VMA relocation) is only
         // wired up for x86_64 -- but native `fork()` needs none of that machinery at all (see
@@ -3550,6 +3595,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         _ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_native_cross_process_fork entry");
         // SAFETY: no `RefCell`/lock guard local to this function is held across the call. Every
@@ -3567,6 +3614,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Arc::new((**self.fs.borrow()).clone()),
             )
         });
+        // `vfork()` suspends the caller until the child execs or exits; a real `fork()` child runs
+        // concurrently, so hold the parent on a gate the child opens (see `native_vfork_gates`).
+        let vfork_gate = vfork.then(|| {
+            let gate = Arc::new(
+                <<Platform as litebox::platform::RawMutexProvider>::RawMutex as litebox::platform::RawMutex>::INIT,
+            );
+            gate.underlying_atomic().store(0, Ordering::Release);
+            self.global
+                .native_vfork_gates
+                .lock()
+                .insert(child_tid, gate.clone());
+            gate
+        });
         let result = self
             .global
             .with_shimwide_locks_held(
@@ -3580,6 +3640,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     "clone: native fork() failed (EAGAIN/ENOMEM) -- falling back to the thread-based relocating fork"
                 );
                 drop(child_state);
+                if vfork_gate.is_some() {
+                    self.global.native_vfork_gates.lock().remove(&child_tid);
+                }
                 None
             }
             Some(0) => {
@@ -3594,7 +3657,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // here on. Nothing about it (pid, `Process`, pending signals, `/proc/self`) is
                 // correct for that identity yet; `reinit_as_native_fork_child` makes it so, in
                 // place, before anything else runs on this thread again.
-                self.reinit_as_native_fork_child(child_tid, exit_signal, child_state);
+                // This frame's copy of the gate `Arc` is the parent's reference, not the child's.
+                core::mem::forget(vfork_gate);
+                self.reinit_as_native_fork_child(child_tid, exit_signal, child_state, child_sp);
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() succeeded -- this thread is now the child, resuming in place"
@@ -3609,6 +3674,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tid:% = self.tid.get(), child_pid:% = child_pid;
                     "clone: native fork() succeeded -- spawned real child pid"
                 );
+                if let Some(gate) = vfork_gate {
+                    let handle = litebox::platform::CrossProcessChildHandle(
+                        usize::try_from(child_pid)
+                            .expect("a real fork() child pid is always positive"),
+                    );
+                    // Bounded repoll, not a single unbounded wait: a child that dies before it
+                    // ever reaches `execve` (host-level crash) never opens the gate.
+                    loop {
+                        if gate.underlying_atomic().load(Ordering::Acquire) != 0
+                            || self.global.platform.cross_process_child_has_exited(handle)
+                        {
+                            break;
+                        }
+                        let _ = self
+                            .wait_cx()
+                            .with_timeout(core::time::Duration::from_millis(15))
+                            .wait_until(|| gate.underlying_atomic().load(Ordering::Acquire) != 0);
+                    }
+                    self.global.native_vfork_gates.lock().remove(&child_tid);
+                }
                 // A real pid from a real `fork()` is always > 0 here (the `Some(0)` arm above
                 // already took the only case that isn't), so this always fits.
                 Some(litebox::platform::CrossProcessChildHandle(
@@ -3644,8 +3729,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Arc<super::file::FilesState<Platform, FS>>,
             Arc<super::file::FsState<Platform>>,
         )>,
+        child_sp: Option<usize>,
     ) {
+        if let Some(sp) = child_sp {
+            NATIVE_CHILD_SP.store(sp, Ordering::Relaxed);
+        }
         IS_NATIVE_FORK_CHILD.store(true, Ordering::Relaxed);
+        // The child's copy of `credentials` points at the same `Arc` as the parent's without
+        // owning a reference count of its own; take one so that replacing or dropping it here
+        // never frees memory the parent still uses.
+        core::mem::forget(self.creds());
         let old_pid = self.pid.get();
         let old_process = self.process();
 
@@ -3743,6 +3836,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid.set(old_pid);
         self.pid.set(new_pid);
         self.tid.set(new_pid);
+        // A forked child inherits its parent's process group.
+        self.process()
+            .pgid
+            .store(old_process.pgid.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.global
+            .process_registry
+            .lock()
+            .insert(new_pid, self.process());
         // A forked child starts attached to no pty of its own -- see this field's own doc
         // comment ("`None` for every ordinary (non-`--pty-mode`) process"); the PARENT's
         // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
@@ -4069,8 +4170,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `PageManager` for the window until its own `execve`/`_exit`, which is both correct
             // Linux semantics and already litebox's own answer to the fixed-address collision the
             // cross-process path exists to solve. It has nothing to hand a separate address space.
-            if !vforked
-                && let Some(handle) = self.try_cross_process_fork(ctx, child_tid, exit_signal)
+            if (!vforked || self.global.platform.has_native_fork())
+                && let Some(handle) =
+                    self.try_cross_process_fork(ctx, child_tid, exit_signal, vforked, sp)
             {
                 // `handle.0 == 0` is the reserved sentinel `try_native_cross_process_fork`
                 // documents: this very call is returning in the CHILD's own copy of this exact
@@ -5083,7 +5185,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
                         ppid: Cell::new(ppid),
-                        credentials: self.credentials.clone(),
+                        credentials: RefCell::new(self.creds()),
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
@@ -5197,6 +5299,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `set_tid_address`.
+    /// Opens this process's `vfork()` gate, releasing a parent blocked in
+    /// `try_native_cross_process_fork`. Idempotent, and a no-op for every process that was not
+    /// created by a native `vfork()`.
+    fn signal_native_vfork_gate(&self) {
+        let gate = self.global.native_vfork_gates.lock().remove(&self.pid.get());
+        if let Some(gate) = gate {
+            gate.underlying_atomic().store(1, Ordering::Release);
+            gate.wake_all();
+        }
+    }
+
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.borrow().clear_child_tid.set(Some(tidptr));
         self.tid.get()
@@ -5807,13 +5920,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if pid == 0 || pid == self.pid.get() {
             Ok(self.process().pgid.load(Ordering::Relaxed))
         } else if pid > 0 {
-            self.process()
-                .find_child(pid)
-                .map(|child| child.pgid.load(Ordering::Relaxed))
+            self.lookup_process(pid)
+                .map(|p| p.pgid.load(Ordering::Relaxed))
                 .ok_or(Errno::ESRCH)
         } else {
             Err(Errno::ESRCH)
         }
+    }
+
+    /// Finds a live process by pid: the caller itself, a direct child, or any process in the
+    /// shim-wide registry (the bootstrap process and native-`fork()` children).
+    pub(crate) fn lookup_process(&self, pid: i32) -> Option<Arc<Process<Platform>>> {
+        if pid == self.pid.get() {
+            return Some(self.process());
+        }
+        self.process()
+            .find_child(pid)
+            .or_else(|| self.global.process_registry.lock().get(&pid).cloned())
+    }
+
+    /// Every live process (other than the caller's own) in process group `group`.
+    pub(crate) fn processes_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
+        let me = self.process();
+        let mut out = self.process().children_in_group(group);
+        for p in self.global.process_registry.lock().values() {
+            if !Arc::ptr_eq(p, &me)
+                && p.pgid.load(Ordering::Relaxed) == group
+                && !out.iter().any(|o| Arc::ptr_eq(o, p))
+            {
+                out.push(p.clone());
+            }
+        }
+        out
     }
 
     /// Handle syscall `setpgid`.
@@ -5832,7 +5970,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (target_process, target_own_pid) = if pid == 0 || pid == self.pid.get() {
             (self.process().clone(), self.pid.get())
         } else if pid > 0 {
-            let child = self.process().find_child(pid).ok_or(Errno::ESRCH)?;
+            let child = self.lookup_process(pid).ok_or(Errno::ESRCH)?;
             (child, pid)
         } else {
             return Err(Errno::ESRCH);
@@ -5872,47 +6010,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        self.creds().uid
     }
 
     /// Handle syscall `getresuid`.
-    ///
-    /// Real Linux reports the real, effective and saved user ids. This shim models one real and one
-    /// effective id (`Credentials`) and no saved id, so the saved id is reported as the effective
-    /// one -- which is what a real kernel reports for any process that has not performed a
-    /// set-user-ID transition away from it, and is the honest answer here rather than inventing a
-    /// third value.
     pub(crate) fn sys_getresuid(
         &self,
         ruid: UserPtrMut<u32>,
         euid: UserPtrMut<u32>,
         suid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        let effective = self.credentials.euid;
-        for (ptr, value) in [
-            (ruid, self.credentials.uid),
-            (euid, effective),
-            (suid, effective),
-        ] {
+        let c = self.creds();
+        for (ptr, value) in [(ruid, c.uid), (euid, c.euid), (suid, c.suid)] {
             ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
 
-    /// Handle syscall `getresgid`. See [`Self::sys_getresuid`] for why the saved id mirrors the
-    /// effective one.
+    /// Handle syscall `getresgid`.
     pub(crate) fn sys_getresgid(
         &self,
         rgid: UserPtrMut<u32>,
         egid: UserPtrMut<u32>,
         sgid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        let effective = self.credentials.egid;
-        for (ptr, value) in [
-            (rgid, self.credentials.gid),
-            (egid, effective),
-            (sgid, effective),
-        ] {
+        let c = self.creds();
+        for (ptr, value) in [(rgid, c.gid), (egid, c.egid), (sgid, c.sgid)] {
             ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
         }
         Ok(0)
@@ -5920,121 +6043,151 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.creds().euid
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        self.creds().gid
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.creds().egid
     }
 
-    /// This task's own real credentials, as reported to a peer via `SO_PEERCRED` on a
-    /// connected Unix socket -- matches real Linux, which reports the *effective* uid/gid
-    /// (not the real uid/gid) of the connecting/listening process, plus its pid.
+    /// This task's own credentials, as reported to a peer via `SO_PEERCRED`.
     pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
+        let c = self.creds();
         litebox_common_linux::Ucred {
             pid: self.pid.get() as u32,
-            uid: self.credentials.euid,
-            gid: self.credentials.egid,
+            uid: c.euid,
+            gid: c.egid,
         }
     }
 
-    /// Handle syscall `setuid`.
-    ///
-    /// LiteBox does not support real privilege separation (there is exactly one, fixed set of
-    /// credentials for the whole sandboxed guest), so this succeeds as a no-op when `uid`
-    /// matches the caller's current real/effective uid -- the common case of a program
-    /// idempotently dropping to the uid it is already running as -- and fails otherwise, rather
-    /// than silently pretending to change privileges.
+    /// The task's current credentials snapshot (immutable `Arc`; a change replaces it).
+    pub(crate) fn creds(&self) -> Arc<Credentials> {
+        self.credentials.borrow().clone()
+    }
+
+    fn set_creds(&self, c: Credentials) {
+        *self.credentials.borrow_mut() = Arc::new(c);
+    }
+
+    /// Handle syscall `setuid`: privileged (euid 0) sets real/effective/saved; otherwise the
+    /// effective uid may only be set to the real or saved uid.
     pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
-        if uid == self.credentials.uid && uid == self.credentials.euid {
-            Ok(())
+        let mut c = (*self.creds()).clone();
+        litebox_util_log::warn!(pid = self.pid.get(), from = c.euid, to = uid; "setuid");
+        if c.euid == 0 {
+            c.uid = uid;
+            c.euid = uid;
+            c.suid = uid;
+        } else if uid == c.uid || uid == c.suid {
+            c.euid = uid;
         } else {
-            Err(Errno::EPERM)
+            return Err(Errno::EPERM);
         }
+        self.set_creds(c);
+        Ok(())
     }
 
-    /// Handle syscall `setgid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale.
+    /// Handle syscall `setgid`, mirroring [`Self::sys_setuid`].
     pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
-        if gid == self.credentials.gid && gid == self.credentials.egid {
-            Ok(())
+        let mut c = (*self.creds()).clone();
+        if c.euid == 0 {
+            c.gid = gid;
+            c.egid = gid;
+            c.sgid = gid;
+        } else if gid == c.gid || gid == c.sgid {
+            c.egid = gid;
         } else {
-            Err(Errno::EPERM)
+            return Err(Errno::EPERM);
         }
+        self.set_creds(c);
+        Ok(())
     }
 
-    /// Handle syscall `setresuid`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale -- `u32::MAX` (real Linux's `-1` passed as `uid_t`) means "leave this one
-    /// unchanged", matching real `setresuid(2)` semantics.
+    /// Handle syscall `setresuid` (`u32::MAX` = leave unchanged).
     pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
-        let keep_or_matches = |requested: u32, current: u32| {
-            requested == u32::MAX || requested == current
+        let mut c = (*self.creds()).clone();
+        let privileged = c.euid == 0;
+        let allowed = |v: u32, c: &Credentials| {
+            v == u32::MAX || privileged || v == c.uid || v == c.euid || v == c.suid
         };
-        if keep_or_matches(ruid, self.credentials.uid)
-            && keep_or_matches(euid, self.credentials.euid)
-            && keep_or_matches(suid, self.credentials.uid)
-        {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
+        if !(allowed(ruid, &c) && allowed(euid, &c) && allowed(suid, &c)) {
+            return Err(Errno::EPERM);
         }
+        if ruid != u32::MAX {
+            c.uid = ruid;
+        }
+        if euid != u32::MAX {
+            c.euid = euid;
+        }
+        if suid != u32::MAX {
+            c.suid = suid;
+        }
+        self.set_creds(c);
+        Ok(())
     }
 
-    /// Handle syscall `setresgid`. See [`Self::sys_setresuid`] for the same no-op-if-unchanged
-    /// rationale.
+    /// Handle syscall `setresgid`, mirroring [`Self::sys_setresuid`].
     pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
-        let keep_or_matches = |requested: u32, current: u32| {
-            requested == u32::MAX || requested == current
+        let mut c = (*self.creds()).clone();
+        let privileged = c.euid == 0;
+        let allowed = |v: u32, c: &Credentials| {
+            v == u32::MAX || privileged || v == c.gid || v == c.egid || v == c.sgid
         };
-        if keep_or_matches(rgid, self.credentials.gid)
-            && keep_or_matches(egid, self.credentials.egid)
-            && keep_or_matches(sgid, self.credentials.gid)
-        {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
+        if !(allowed(rgid, &c) && allowed(egid, &c) && allowed(sgid, &c)) {
+            return Err(Errno::EPERM);
         }
+        if rgid != u32::MAX {
+            c.gid = rgid;
+        }
+        if egid != u32::MAX {
+            c.egid = egid;
+        }
+        if sgid != u32::MAX {
+            c.sgid = sgid;
+        }
+        self.set_creds(c);
+        Ok(())
     }
 
     /// Handle syscall `getgroups`.
-    ///
-    /// LiteBox has no real supplementary-group model (see [`Self::sys_setuid`]'s single-fixed-
-    /// credentials rationale), so the guest's supplementary group list is always exactly its own
-    /// primary gid -- matching a real Linux process that was never granted any extra groups.
-    /// `size == 0` is the standard "just tell me the count" query and never touches `list`.
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<u32, Errno> {
+        let c = self.creds();
         if size == 0 {
-            return Ok(1);
+            return Ok(c.groups.len() as u32);
         }
-        if size < 1 {
+        if size < 0 || (size as usize) < c.groups.len() {
             return Err(Errno::EINVAL);
         }
-        list.copy_from_slice::<Platform>(0, &[self.credentials.gid])
-            .ok_or(Errno::EFAULT)?;
-        Ok(1)
+        if !c.groups.is_empty() {
+            list.copy_from_slice::<Platform>(0, &c.groups)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(c.groups.len() as u32)
     }
 
-    /// Handle syscall `setgroups`. See [`Self::sys_setuid`] for the same no-op-if-unchanged
-    /// rationale: succeeds only when the requested list is exactly the guest's current
-    /// (sole) supplementary group, i.e. its own primary gid.
+    /// Handle syscall `setgroups` (privileged only).
     pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
-        if size != 1 {
+        let mut c = (*self.creds()).clone();
+        if c.euid != 0 {
+            litebox_util_log::warn!(pid = self.pid.get(), euid = c.euid; "setgroups denied: not privileged");
             return Err(Errno::EPERM);
         }
-        let Some(gid) = list.read_at_offset::<Platform>(0) else {
-            return Err(Errno::EFAULT);
-        };
-        if gid == self.credentials.gid {
-            Ok(())
-        } else {
-            Err(Errno::EPERM)
+        if size > 65536 {
+            return Err(Errno::EINVAL);
         }
+        let mut groups = alloc::vec::Vec::with_capacity(size);
+        for i in 0..size {
+            groups.push(list.read_at_offset::<Platform>(i as isize).ok_or(Errno::EFAULT)?);
+        }
+        c.groups = groups;
+        self.set_creds(c);
+        Ok(())
     }
 }
 
@@ -6841,7 +6994,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.exit_group(ExitStatus::Signal(
                 litebox_common_linux::signal::Signal::SIGSEGV,
             ));
-            self.process().signal_vfork_done();
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
             return Ok(0);
         }
 
@@ -6902,7 +7058,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
                 self.exit_group(ExitStatus::Exit(result.raw_status.clamp(0, 255) as u8 as i8));
+                {
                 self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
                 return Ok(0);
             }
             // The old program image is already torn down (memory released, other threads killed,
@@ -6931,7 +7090,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // matching every other in-guest process-termination path in this module (see
             // `exit_thread`'s doc comment) -- no register/stack setup for a new program is needed
             // or possible, since there is no new program.
-            self.process().signal_vfork_done();
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
             return Ok(0);
         }
 
@@ -6949,7 +7111,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `init_thread_context()`, never reaching the final "returning from sys_execve" point,
         // because waking the suspended grandparent let it resume concurrently on its own real OS
         // thread while this thread's own new-program register/stack state was still mid-setup.
-        self.process().signal_vfork_done();
+        {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
         Ok(0)
     }
 
