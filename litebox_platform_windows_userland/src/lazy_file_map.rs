@@ -12,11 +12,17 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::cell::UnsafeCell;
 use std::sync::{Mutex, MutexGuard, Once, OnceLock};
+use core::sync::atomic::AtomicU32;
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS,
+};
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThreadId, OpenThread, WaitForSingleObject, THREAD_SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -35,7 +41,7 @@ pub(crate) const MIN_LAZY_LEN: usize = 4 * CHUNK_SIZE;
 
 static HAS_RANGES: AtomicBool = AtomicBool::new(false);
 static INSTALL_HANDLER: Once = Once::new();
-static TABLE: Mutex<BTreeMap<usize, LazyRange>> = Mutex::new(BTreeMap::new());
+static TABLE: DeadHolderLock = DeadHolderLock::new();
 static SOURCES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 struct LazyRange {
@@ -72,8 +78,97 @@ fn diagnostics_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("LITEBOX_DIAG_LAZY_FILE_MAP").is_some())
 }
 
-fn table() -> MutexGuard<'static, BTreeMap<usize, LazyRange>> {
-    TABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// The lazy table is touched from the access-violation handler, and `exit_group` terminates sibling
+/// threads outright, so a thread can die while holding it. A `std` mutex would then block every
+/// later `forget` (process exit) forever; this lock records its owner thread and lets a waiter
+/// take it over once the owner is provably gone. The guarded map is only ever mutated by short,
+/// allocation-only operations, so a taken-over table stays usable.
+struct DeadHolderLock {
+    owner: AtomicU32,
+    table: UnsafeCell<BTreeMap<usize, LazyRange>>,
+}
+
+// SAFETY: access to `table` is serialized by `owner`.
+unsafe impl Sync for DeadHolderLock {}
+
+struct TableGuard(&'static DeadHolderLock);
+
+impl DeadHolderLock {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicU32::new(0),
+            table: UnsafeCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock(&'static self) -> TableGuard {
+        // SAFETY: plain query of the calling thread's id.
+        let me = unsafe { GetCurrentThreadId() };
+        let mut spins = 0u32;
+        loop {
+            if self
+                .owner
+                .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return TableGuard(self);
+            }
+            spins += 1;
+            if spins % 64 == 0 {
+                let holder = self.owner.load(Ordering::Relaxed);
+                if holder != 0
+                    && !thread_alive(holder)
+                    && self
+                        .owner
+                        .compare_exchange(holder, me, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return TableGuard(self);
+                }
+                std::thread::sleep(core::time::Duration::from_micros(200));
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+fn thread_alive(tid: u32) -> bool {
+    // SAFETY: the handle is closed before returning; a thread that cannot be opened is gone.
+    unsafe {
+        let handle = OpenThread(THREAD_SYNCHRONIZE, 0, tid);
+        if handle.is_null() {
+            return false;
+        }
+        let alive = WaitForSingleObject(handle, 0) != 0;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+impl core::ops::Deref for TableGuard {
+    type Target = BTreeMap<usize, LazyRange>;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: this guard owns the lock.
+        unsafe { &*self.0.table.get() }
+    }
+}
+
+impl core::ops::DerefMut for TableGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: this guard owns the lock.
+        unsafe { &mut *self.0.table.get() }
+    }
+}
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        self.0.owner.store(0, Ordering::Release);
+    }
+}
+
+fn table() -> TableGuard {
+    TABLE.lock()
 }
 
 fn chunk_span(start: usize, range: &LazyRange, chunk: usize) -> Range<usize> {
