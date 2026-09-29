@@ -2837,6 +2837,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|()| 0)
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
+            SyscallRequest::Personality { persona } => Ok(self.sys_personality(persona) as usize),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }

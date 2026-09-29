@@ -1074,7 +1074,14 @@ pub(crate) struct Credentials {
     pub egid: u32,
     pub sgid: u32,
     pub groups: alloc::vec::Vec<u32>,
+    /// Effective, permitted and inheritable capability sets (bit N = capability N).
+    pub cap_eff: u64,
+    pub cap_perm: u64,
+    pub cap_inh: u64,
 }
+
+/// Every capability the kernel defines (0..=40).
+const CAP_FULL: u64 = (1 << 41) - 1;
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
@@ -1087,6 +1094,21 @@ impl Credentials {
             egid,
             sgid: egid,
             groups: alloc::vec![gid],
+            cap_eff: if euid == 0 { CAP_FULL } else { 0 },
+            cap_perm: if euid == 0 { CAP_FULL } else { 0 },
+            cap_inh: 0,
+        }
+    }
+
+    /// Applies the kernel's capability changes that follow a uid transition.
+    fn fixup_caps(&mut self, old_euid: u32) {
+        if self.uid != 0 && self.euid != 0 && self.suid != 0 {
+            self.cap_perm = 0;
+            self.cap_eff = 0;
+        } else if self.euid != 0 {
+            self.cap_eff = 0;
+        } else if old_euid != 0 {
+            self.cap_eff = self.cap_perm;
         }
     }
 }
@@ -1133,6 +1155,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.set_task_comm(&name_buf);
                 Ok(0)
             }
+            PrctlArg::GetSecureBits => Ok(0),
+            PrctlArg::SetSecureBits(_) => Ok(0),
+            // Ambient capabilities: none are ever raised, so IS_SET reads 0 and the rest succeed.
+            PrctlArg::CapAmbient(op) => match op {
+                1 | 2 | 4 => Ok(0), // PR_CAP_AMBIENT_IS_SET | LOWER | CLEAR_ALL: nothing raised
+                _ => Err(Errno::EPERM),
+            },
             PrctlArg::CapBSetRead(cap) => {
                 // Return 1 if the capability specified in cap is in the calling
                 // thread's capability bounding set, or 0 if it is not.
@@ -1143,8 +1172,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     return Err(Errno::EINVAL);
                 }
-                // Note we don't support capabilities in LiteBox, so we always return 0.
-                Ok(0)
+                // The bounding set is the kernel default: every capability.
+                Ok(1)
             }
             PrctlArg::SetNoNewPrivs(value) => {
                 // PR_SET_NO_NEW_PRIVS: once set, the calling thread and its descendants can
@@ -6072,7 +6101,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.credentials.borrow().clone()
     }
 
-    fn set_creds(&self, c: Credentials) {
+    pub(crate) fn set_creds(&self, c: Credentials) {
         litebox::fs::ident::set(c.euid, c.egid);
         *self.credentials.borrow_mut() = Arc::new(c);
     }
@@ -6081,7 +6110,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// effective uid may only be set to the real or saved uid.
     pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
         let mut c = (*self.creds()).clone();
-        litebox_util_log::warn!(pid = self.pid.get(), from = c.euid, to = uid; "setuid");
+        let old_euid = c.euid;
         if c.euid == 0 {
             c.uid = uid;
             c.euid = uid;
@@ -6091,6 +6120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             return Err(Errno::EPERM);
         }
+        c.fixup_caps(old_euid);
         self.set_creds(c);
         Ok(())
     }
@@ -6114,6 +6144,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `setresuid` (`u32::MAX` = leave unchanged).
     pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
         let mut c = (*self.creds()).clone();
+        let old_euid = c.euid;
         let privileged = c.euid == 0;
         let allowed = |v: u32, c: &Credentials| {
             v == u32::MAX || privileged || v == c.uid || v == c.euid || v == c.suid
@@ -6130,6 +6161,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if suid != u32::MAX {
             c.suid = suid;
         }
+        c.fixup_caps(old_euid);
         self.set_creds(c);
         Ok(())
     }

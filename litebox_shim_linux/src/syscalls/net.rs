@@ -292,6 +292,10 @@ pub(super) struct SocketOptions {
     /// until all queued messages for the socket have been
     /// successfully sent or the timeout has been reached.
     pub(super) linger_timeout: Option<core::time::Duration>,
+    /// Created with `AF_INET6`. The socket runs on the IPv4 machinery, but addresses reported
+    /// back to the guest (`getsockname`, `accept`, `recvfrom`, ...) must be `sockaddr_in6`, as
+    /// glibc's `getaddrinfo` asserts.
+    pub(super) is_v6: bool,
 }
 
 #[derive(Clone)]
@@ -1166,6 +1170,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net_lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
+                if matches!(domain, AddressFamily::INET6) {
+                    self.global
+                        .with_socket_options_mut(&socket, |options| options.is_v6 = true);
+                }
                 files.insert_raw_fd(socket).map_err(|socket| {
                     // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
                     // means the fd table is at its `RLIMIT_NOFILE`/shim-wide limit -- an
@@ -1438,6 +1446,19 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 .ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()
         }
+        SocketAddress::Inet(SocketAddr::V6(v6_addr)) => {
+            let addrlen_val = size_of::<CSockInet6Addr>().min(addrlen_val as usize);
+            let c_addr = CSockInet6Addr {
+                family: AddressFamily::INET6 as i16,
+                port: v6_addr.port().to_be(),
+                flowinfo: 0,
+                addr: v6_addr.ip().octets(),
+                scope_id: 0,
+            };
+            addr.write_slice_at_offset::<Platform>(0, &c_addr.as_bytes()[..addrlen_val])
+                .ok_or(Errno::EFAULT)?;
+            size_of::<CSockInet6Addr>()
+        }
         SocketAddress::Unix(v) => {
             let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
             family_ptr
@@ -1526,7 +1547,36 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
     Ok(data)
 }
 
+/// Presents an address of an `AF_INET6` socket (served by the IPv4 stack) as the `sockaddr_in6` a
+/// guest expects: the wildcard becomes `::`, anything else its v4-mapped form.
+fn as_v6_view(addr: SocketAddress) -> SocketAddress {
+    match addr {
+        SocketAddress::Inet(SocketAddr::V4(v4)) => {
+            let ip = if v4.ip().is_unspecified() {
+                core::net::Ipv6Addr::UNSPECIFIED
+            } else {
+                v4.ip().to_ipv6_mapped()
+            };
+            SocketAddress::Inet(SocketAddr::V6(core::net::SocketAddrV6::new(ip, v4.port(), 0, 0)))
+        }
+        other => other,
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Whether `sockfd` is an `AF_INET6` socket.
+    fn socket_is_v6(&self, sockfd: u32) -> bool {
+        self.files
+            .borrow()
+            .with_socket(
+                &self.global,
+                sockfd,
+                |fd| Ok(self.global.with_socket_options(fd, |options| options.is_v6)),
+                |_| Ok(false),
+            )
+            .unwrap_or(false)
+    }
+
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
         &self,
@@ -1540,6 +1590,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let mut remote_addr = addr.is_some().then(SocketAddress::default);
         let fd = self.do_accept(sockfd, remote_addr.as_mut(), flags)?;
+        if self.socket_is_v6(sockfd) {
+            remote_addr = remote_addr.map(as_v6_view);
+        }
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
             if let Err(err) = write_sockaddr_to_user::<Platform>(remote_addr, addr, addrlen) {
@@ -1574,6 +1627,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let proxy = self
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
+                if self.global.with_socket_options(fd, |options| options.is_v6) {
+                    self.global
+                        .with_socket_options_mut(&accepted_file, |options| options.is_v6 = true);
+                }
                 proxy.set_state(SocketState::Connected);
                 let raw_fd = files
                     .insert_raw_fd(accepted_file)
@@ -2139,6 +2196,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
+            let src_addr = if self.socket_is_v6(sockfd) {
+                as_v6_view(src_addr)
+            } else {
+                src_addr
+            };
             write_sockaddr_to_user::<Platform>(src_addr, sock_ptr, addrlen)?;
         }
 
@@ -2394,6 +2456,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     + core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_namelen),
             );
             if let Some(src_addr) = source_addr {
+                let src_addr = if self.socket_is_v6(sockfd) {
+                    as_v6_view(src_addr)
+                } else {
+                    src_addr
+                };
                 write_sockaddr_to_user::<Platform>(src_addr, msg_name, addrlen_ptr)?;
             } else {
                 // No source address (e.g. connected stream socket) — zero out msg_namelen.
@@ -2688,7 +2755,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = self.do_getsockname(sockfd)?;
+        let mut sockaddr = self.do_getsockname(sockfd)?;
+        if self.socket_is_v6(sockfd) {
+            sockaddr = as_v6_view(sockaddr);
+        }
         write_sockaddr_to_user::<Platform>(sockaddr, addr, addrlen)
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
@@ -2720,7 +2790,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = self.do_getpeername(sockfd)?;
+        let mut sockaddr = self.do_getpeername(sockfd)?;
+        if self.socket_is_v6(sockfd) {
+            sockaddr = as_v6_view(sockaddr);
+        }
         write_sockaddr_to_user::<Platform>(sockaddr, addr, addrlen)
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {

@@ -165,7 +165,6 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
             litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
         )
         .unwrap();
-        fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
 
         // `/dev/shm` on real Linux is its own tmpfs mount, not part of devtmpfs (the fixed,
         // read-only-shaped `{stdin,stdout,null,urandom,...}` set `litebox::fs::devices::Devices`
@@ -192,7 +191,14 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
         // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
         // root-owned matches real Linux's own `/dev`.
-        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH)
+        fs.mkdir(
+            "/dev",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
+        )
             .unwrap();
         fs.mkdir(
             "/dev/shm",
@@ -249,7 +255,11 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // above.
         fs.mkdir(
             "/etc",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
         )
         .unwrap();
         let resolv_conf = fs
@@ -269,6 +279,25 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         )
         .unwrap();
         fs.close(&resolv_conf).unwrap();
+        // Likewise `/etc/hosts`: a container runtime injects it, an image does not carry one, and
+        // without a `localhost` entry every `getaddrinfo("localhost")` falls through to DNS.
+        let hosts = fs
+            .open(
+                "/etc/hosts",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &hosts,
+            b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\tlitebox\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&hosts).unwrap();
     });
 }
 

@@ -104,45 +104,16 @@ const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `capget`.
-    ///
-    /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
+    /// Handle syscall `capget`: reports this process's capability sets.
     pub(crate) fn sys_capget(
         &self,
         header: UserPtrMut<litebox_common_linux::CapHeader>,
         data: Option<UserPtrMut<litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
         let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        match hdr.version {
-            _LINUX_CAPABILITY_VERSION_1 => {
-                if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
-                    };
-                    data_ptr
-                        .write_at_offset::<Platform>(0, cap)
-                        .ok_or(Errno::EFAULT)?;
-                }
-                Ok(())
-            }
-            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
-                if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
-                    };
-                    data_ptr
-                        .write_at_offset::<Platform>(0, cap.clone())
-                        .ok_or(Errno::EFAULT)?;
-                    data_ptr
-                        .write_at_offset::<Platform>(1, cap)
-                        .ok_or(Errno::EFAULT)?;
-                }
-                Ok(())
-            }
+        let words = match hdr.version {
+            _LINUX_CAPABILITY_VERSION_1 => 1,
+            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => 2,
             _ => {
                 header
                     .write_at_offset::<Platform>(
@@ -153,13 +124,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
-                if data.is_none() {
-                    Ok(())
-                } else {
-                    Err(Errno::EINVAL)
-                }
+                return if data.is_none() { Ok(()) } else { Err(Errno::EINVAL) };
             }
+        };
+        let Some(data_ptr) = data else { return Ok(()) };
+        let c = self.creds();
+        for i in 0..words {
+            let shift = 32 * i;
+            let cap = litebox_common_linux::CapData {
+                effective: (c.cap_eff >> shift) as u32,
+                permitted: (c.cap_perm >> shift) as u32,
+                inheritable: (c.cap_inh >> shift) as u32,
+            };
+            data_ptr
+                .write_at_offset::<Platform>(i as isize, cap)
+                .ok_or(Errno::EFAULT)?;
         }
+        Ok(())
+    }
+
+    /// Handle syscall `capset`: a process may only shrink its permitted set, keep effective
+    /// within permitted, and keep the inheritable set within the old permitted+inheritable.
+    pub(crate) fn sys_capset(
+        &self,
+        header: UserPtrMut<litebox_common_linux::CapHeader>,
+        data: Option<litebox_common_linux::user_pointers::UserPtr<litebox_common_linux::CapData>>,
+    ) -> Result<(), Errno> {
+        let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let words = match hdr.version {
+            _LINUX_CAPABILITY_VERSION_1 => 1,
+            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => 2,
+            _ => return Err(Errno::EINVAL),
+        };
+        let data = data.ok_or(Errno::EFAULT)?;
+        let (mut eff, mut perm, mut inh) = (0u64, 0u64, 0u64);
+        for i in 0..words {
+            let d = data.read_at_offset::<Platform>(i as isize).ok_or(Errno::EFAULT)?;
+            let shift = 32 * i;
+            eff |= u64::from(d.effective) << shift;
+            perm |= u64::from(d.permitted) << shift;
+            inh |= u64::from(d.inheritable) << shift;
+        }
+        let mut c = (*self.creds()).clone();
+        if perm & !c.cap_perm != 0 || eff & !perm != 0 || inh & !(c.cap_perm | c.cap_inh) != 0 {
+            return Err(Errno::EPERM);
+        }
+        c.cap_eff = eff;
+        c.cap_perm = perm;
+        c.cap_inh = inh;
+        self.set_creds(c);
+        Ok(())
+    }
+
+    /// Handle syscall `personality`: only `PER_LINUX` exists; queries report it.
+    #[expect(clippy::unused_self, reason = "syscall handler shape")]
+    pub(crate) fn sys_personality(&self, _persona: u32) -> u32 {
+        0
     }
 }
 

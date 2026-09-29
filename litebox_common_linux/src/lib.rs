@@ -3263,6 +3263,12 @@ pub enum PrctlArg {
     SetDumpable(usize),
     /// `PR_GET_DUMPABLE`: read back what [`PrctlArg::SetDumpable`] last set.
     GetDumpable,
+    /// `PR_GET_SECUREBITS`.
+    GetSecureBits,
+    /// `PR_SET_SECUREBITS`.
+    SetSecureBits(usize),
+    /// `PR_CAP_AMBIENT` with its sub-operation.
+    CapAmbient(usize),
 }
 
 #[repr(i32)]
@@ -4108,6 +4114,13 @@ pub enum SyscallRequest {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
     },
+    CapSet {
+        header: UserPtrMut<CapHeader>,
+        data: Option<UserPtr<CapData>>,
+    },
+    Personality {
+        persona: u32,
+    },
     GetDirent64 {
         fd: i32,
         dirp: UserPtrMut<u8>,
@@ -4806,6 +4819,15 @@ impl SyscallRequest {
                         PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
                             args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
                         },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
+                        },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -5071,6 +5093,8 @@ impl SyscallRequest {
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
+            Sysno::personality => sys_req!(Personality { persona }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
