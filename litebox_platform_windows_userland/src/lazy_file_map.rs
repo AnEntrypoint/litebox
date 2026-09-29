@@ -155,6 +155,12 @@ impl DeadHolderLock {
                     self.owner_start.store(my_start, Ordering::Release);
                     return TableGuard(self);
                 }
+                if spins % (64 * 5000) == 0 {
+                    eprintln!(
+                        "[lazy_file_map] lock wait: me={me} holder={holder} holder_start={holder_start} my_start={my_start} holder_alive={}",
+                        holder != 0 && thread_alive(holder, holder_start)
+                    );
+                }
                 std::thread::sleep(core::time::Duration::from_micros(200));
             } else {
                 core::hint::spin_loop();
