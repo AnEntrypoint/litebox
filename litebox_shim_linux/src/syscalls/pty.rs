@@ -120,6 +120,10 @@ impl<Platform: ShimPlatform> PtyPair<Platform> {
     pub(crate) fn set_packet_mode(&self, enabled: bool) {
         self.packet_mode.store(enabled, Ordering::Relaxed);
     }
+
+    pub(crate) fn packet_mode(&self) -> bool {
+        self.packet_mode.load(Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct PtyHalf<Platform: ShimPlatform> {
@@ -737,6 +741,11 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
         }
     }
 
+    pub(crate) fn packet_mode(&self, id: u32) -> bool {
+        self.find(id)
+            .is_some_and(|s| s.packet_mode.load(Ordering::Relaxed))
+    }
+
     /// Non-blocking read. The master reads what the slave wrote and gets `EIO` once every slave
     /// is closed and the data is drained (what terminal emulators such as VTE use to notice the
     /// session ended). The slave reads what the master wrote and gets EOF once the master is
@@ -1143,6 +1152,28 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
     }
 
     pub(crate) fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+        io: &PtyIo<'_, Platform>,
+    ) -> Result<usize, Errno> {
+        // Packet mode (`TIOCPKT`): every master read starts with a status byte, `TIOCPKT_DATA`
+        // (0) for ordinary output. VTE enables it and treats a nonzero first byte as a control
+        // packet, so without the prefix the first character of every read swallows its output.
+        let packet_mode = match self {
+            PtyEnd::Master(h) => h.pair.packet_mode(),
+            PtyEnd::SharedMaster(h) => io.table.packet_mode(h.id),
+            PtyEnd::Slave(_) | PtyEnd::SharedSlave(_) => false,
+        };
+        if packet_mode && buf.len() >= 2 {
+            let n = self.read_data(cx, &mut buf[1..], io)?;
+            buf[0] = 0;
+            return Ok(n + 1);
+        }
+        self.read_data(cx, buf, io)
+    }
+
+    fn read_data(
         &self,
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],

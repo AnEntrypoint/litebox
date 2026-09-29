@@ -1129,6 +1129,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
+        if flags.contains(OFlags::NONBLOCK)
+            && let Some(handle) = self.global.litebox.descriptor_table().entry_handle(&fd)
+        {
+            handle.with_entry(|end| end.set_status(OFlags::NONBLOCK, true));
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(fd).map_err(|fd| {
             drop(self.global.litebox.descriptor_table_mut().remove(&fd));
