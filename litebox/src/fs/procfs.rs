@@ -54,6 +54,11 @@ pub struct ProcSelfInfo {
     /// `dlopen`, and a closure is the only shape that can name the shim's per-process memory
     /// manager from this crate. Load-bearing for Rust std -- gm mutable `mut-1789043907427`.
     pub maps: Option<alloc::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>>,
+    /// Lists this process's live thread ids, for `/proc/self/task`. A callback for the same
+    /// reason as `maps`: the set changes with every `clone` and thread exit.
+    pub tids: Option<alloc::sync::Arc<dyn Fn() -> Vec<i32> + Send + Sync>>,
+    /// Lists this process's open raw file descriptors, for `/proc/self/fd`.
+    pub fds: Option<alloc::sync::Arc<dyn Fn() -> Vec<(i32, String)> + Send + Sync>>,
 }
 
 /// Real `/proc/[pid]/stat`: 52 whitespace-separated fields, `comm` parenthesized so readers split
@@ -88,11 +93,61 @@ fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
 /// Real `/proc/cpuinfo`: one blank-line-terminated `key\t: value` stanza per logical CPU, and the
 /// stanza count must match the real host core count -- GLib's `g_get_num_processors()` counts
 /// `processor\t:` lines. See gm mutable `mut-1789043826779`.
+/// The `flags` line, from CPUID: guest code runs natively on the host CPU, so what CPUID says is
+/// what the guest can execute (Chromium's launcher, for one, refuses to start without `pni`).
+#[cfg(target_arch = "x86_64")]
+fn cpu_flags() -> String {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let mut out: Vec<&str> = Vec::new();
+    let mut add = |reg: u32, table: &[(u32, &'static str)]| {
+        for &(bit, name) in table {
+            if reg & (1 << bit) != 0 {
+                out.push(name);
+            }
+        }
+    };
+    // SAFETY: CPUID is available on every x86_64 CPU.
+    let (l1, l7, e1) = (__cpuid(1), __cpuid_count(7, 0), __cpuid(0x8000_0001));
+    add(
+        l1.edx,
+        &[
+            (0, "fpu"), (1, "vme"), (2, "de"), (3, "pse"), (4, "tsc"), (5, "msr"), (6, "pae"),
+            (7, "mce"), (8, "cx8"), (9, "apic"), (11, "sep"), (12, "mtrr"), (13, "pge"),
+            (14, "mca"), (15, "cmov"), (16, "pat"), (17, "pse36"), (19, "clflush"), (23, "mmx"),
+            (24, "fxsr"), (25, "sse"), (26, "sse2"), (28, "ht"),
+        ],
+    );
+    add(e1.edx, &[(11, "syscall"), (20, "nx"), (26, "pdpe1gb"), (27, "rdtscp"), (29, "lm")]);
+    add(
+        l1.ecx,
+        &[
+            (0, "pni"), (1, "pclmulqdq"), (9, "ssse3"), (12, "fma"), (13, "cx16"), (17, "pcid"),
+            (19, "sse4_1"), (20, "sse4_2"), (21, "x2apic"), (22, "movbe"), (23, "popcnt"),
+            (25, "aes"), (26, "xsave"), (28, "avx"), (29, "f16c"), (30, "rdrand"),
+        ],
+    );
+    add(e1.ecx, &[(0, "lahf_lm"), (5, "abm")]);
+    add(
+        l7.ebx,
+        &[
+            (3, "bmi1"), (5, "avx2"), (8, "bmi2"), (9, "erms"), (16, "avx512f"), (18, "rdseed"),
+            (19, "adx"), (29, "sha_ni"),
+        ],
+    );
+    out.join(" ")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_flags() -> String {
+    String::new()
+}
+
 fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
+    let flags = cpu_flags();
     let mut s = String::new();
     for i in 0..cpu_count.max(1) {
         s.push_str(&format!(
-            "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t: 158\nmodel name\t: LiteBox Virtual CPU\nstepping\t: 0\ncpu MHz\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: {cpu_count}\ncore id\t: {i}\ncpu cores\t: {cpu_count}\nfpu\t: yes\nflags\t:\nbogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n"
+            "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t: 158\nmodel name\t: LiteBox Virtual CPU\nstepping\t: 0\ncpu MHz\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: {cpu_count}\ncore id\t: {i}\ncpu cores\t: {cpu_count}\nfpu\t: yes\nflags\t: {flags}\nbogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n"
         ));
     }
     s.into_bytes()
@@ -789,8 +844,15 @@ where
 }
 
 /// Directory handle: only the backend's mount root exists (a flat namespace).
-#[derive(Debug, Clone, Copy)]
-pub struct ProcSelfDirHandle;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSelfDirHandle {
+    /// `/proc/self` itself (also what `/proc/self/task/<tid>` resolves to).
+    Root,
+    /// `/proc/self/task`: one directory per live thread.
+    Task,
+    /// `/proc/self/fd`: one symlink per open descriptor.
+    Fd,
+}
 
 /// Which of the flat files this handle names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -904,7 +966,7 @@ where
     Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(ProcSelfDirHandle)
+        WalkingDirHandle::from_typed::<Self>(ProcSelfDirHandle::Root)
     }
 
     fn walk_directories<'a>(
@@ -912,20 +974,55 @@ where
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let from = from.into_typed::<Self>();
-        if let Some(&component) = components.first() {
-            if ProcSelfEntry::from_name(component).is_none() {
+        let mut current = from.into_typed::<Self>();
+        let mut walked = Vec::with_capacity(components.len());
+        for &component in components {
+            let next = match current {
+                ProcSelfDirHandle::Root => match component {
+                    "task" => Some(ProcSelfDirHandle::Task),
+                    "fd" => Some(ProcSelfDirHandle::Fd),
+                    _ => None,
+                },
+                ProcSelfDirHandle::Task => {
+                    let tid: i32 = component
+                        .parse()
+                        .map_err(|_| WalkError::PathError(PathError::NoSuchFileOrDirectory))?;
+                    let live = self
+                        .current()
+                        .and_then(|i| i.tids.map(|f| f()))
+                        .is_some_and(|t| t.contains(&tid));
+                    if !live {
+                        return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                    }
+                    Some(ProcSelfDirHandle::Root)
+                }
+                ProcSelfDirHandle::Fd => None,
+            };
+            if let Some(next) = next {
+                walked.push(super::backend::WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                });
+                current = next;
+                continue;
+            }
+            // Not a subdirectory: it must name a file of this directory (or not exist).
+            let exists = match current {
+                ProcSelfDirHandle::Root => ProcSelfEntry::from_name(component).is_some(),
+                ProcSelfDirHandle::Fd => component.parse::<i32>().is_ok(),
+                ProcSelfDirHandle::Task => false,
+            };
+            if !exists {
                 return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
             }
             return Ok(WalkOutcome {
-                components: vec![],
-                last: WalkingDirHandle::from_typed::<Self>(from),
+                components: walked,
+                last: WalkingDirHandle::from_typed::<Self>(current),
                 stop_reason: WalkStopReason::StoppedAtNonDirectory,
             });
         }
         Ok(WalkOutcome {
-            components: vec![],
-            last: WalkingDirHandle::from_typed::<Self>(from),
+            components: walked,
+            last: WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
@@ -952,7 +1049,9 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
+        if dir.into_typed::<Self>() != ProcSelfDirHandle::Root {
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        }
         let entry = ProcSelfEntry::from_name(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
         if flags.contains(OFlags::DIRECTORY) {
@@ -989,7 +1088,20 @@ where
         dir: WalkingDirHandle<'_>,
         name: &str,
     ) -> Result<Option<String>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
+        if dir.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+            let fd: i32 = name
+                .parse()
+                .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+            return self
+                .current()
+                .and_then(|i| i.fds.map(|f| f()))
+                .and_then(|l| l.into_iter().find(|(n, _)| *n == fd))
+                .map(|(_, target)| Some(target))
+                .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        if matches!(name, "task" | "fd") {
+            return Ok(None);
+        }
         match ProcSelfEntry::from_name(name) {
             Some(ProcSelfEntry::Exe) => Ok(self.current().map(|info| info.exe_path)),
             Some(_) => Ok(None),
@@ -998,20 +1110,55 @@ where
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let _handle = handle.into_typed::<Self>();
-        Ok(ProcSelfEntry::ALL
-            .iter()
-            .map(|(n, e)| DirEntry {
-                name: String::from(*n),
-                // `exe`'s `d_type` must say `Symlink`: a caller trusting `getdents64`'s `d_type`
-                // instead of re-`lstat`ing would never follow it. gm mutable `mut-1789043942984`.
-                file_type: match e {
-                    ProcSelfEntry::Exe => FileType::Symlink,
-                    _ => FileType::RegularFile,
-                },
-                ino_info: None,
-            })
-            .collect())
+        let info = self.current().unwrap_or_default();
+        match handle.into_typed::<Self>() {
+            ProcSelfDirHandle::Root => {
+                let mut entries: Vec<DirEntry> = ProcSelfEntry::ALL
+                    .iter()
+                    .map(|(n, e)| DirEntry {
+                        name: String::from(*n),
+                        // `exe`'s `d_type` must say `Symlink`: a caller trusting `getdents64`'s
+                        // `d_type` instead of re-`lstat`ing would never follow it. gm mutable
+                        // `mut-1789043942984`.
+                        file_type: match e {
+                            ProcSelfEntry::Exe => FileType::Symlink,
+                            _ => FileType::RegularFile,
+                        },
+                        ino_info: None,
+                    })
+                    .collect();
+                for dir in ["task", "fd"] {
+                    entries.push(DirEntry {
+                        name: String::from(dir),
+                        file_type: FileType::Directory,
+                        ino_info: None,
+                    });
+                }
+                Ok(entries)
+            }
+            ProcSelfDirHandle::Task => Ok(info
+                .tids
+                .map(|f| f())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| DirEntry {
+                    name: alloc::format!("{t}"),
+                    file_type: FileType::Directory,
+                    ino_info: None,
+                })
+                .collect()),
+            ProcSelfDirHandle::Fd => Ok(info
+                .fds
+                .map(|f| f())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(fd, _)| DirEntry {
+                    name: alloc::format!("{fd}"),
+                    file_type: FileType::Symlink,
+                    ino_info: None,
+                })
+                .collect()),
+        }
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -1068,9 +1215,22 @@ where
         })
     }
 
-    fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let h = *h.get_typed::<Self>();
+        // `nlink` of `/proc/self/task` is `2 + threads`; Chromium's sandbox uses `== 3` as its
+        // "single-threaded" test, so it has to be honest.
+        let nlink = match h {
+            ProcSelfDirHandle::Task => {
+                2 + self
+                    .current()
+                    .and_then(|i| i.tids.map(|f| f().len()))
+                    .unwrap_or(1)
+            }
+            ProcSelfDirHandle::Root => 4,
+            ProcSelfDirHandle::Fd => 2,
+        };
         Ok(FileStatus {
-            nlink: 1,
+            nlink: nlink as _,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

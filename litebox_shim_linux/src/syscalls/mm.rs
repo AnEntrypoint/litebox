@@ -1205,7 +1205,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 (handle, false)
             }
         };
-        drop(shared);
+        // `shared` stays locked until the first mapper has seeded the object, so a concurrent
+        // second mapper cannot see it half-initialised.
 
         // Seed the object from the file's current bytes on the FIRST mapping only. After that the
         // shared object is the sole source of truth, and re-copying the (now stale) file bytes
@@ -1233,6 +1234,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
             }
         }
+
+        drop(shared);
 
         let create_flags = {
             let mut f = litebox::mm::linux::CreatePagesFlags::empty();

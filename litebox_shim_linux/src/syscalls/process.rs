@@ -707,6 +707,11 @@ impl<Platform: ShimPlatform> Process<Platform> {
         }
     }
 
+    /// The ids of this process's live threads, ascending.
+    pub(crate) fn tids(&self) -> alloc::vec::Vec<i32> {
+        self.inner.lock().threads.keys().copied().collect()
+    }
+
     /// Whether `tid` is a live thread of this process.
     pub(crate) fn has_thread(&self, tid: i32) -> bool {
         self.inner.lock().threads.contains_key(&tid)
@@ -6988,6 +6993,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+        // `/proc/self/exe` must be an absolute path even for `./prog` (programs locate their own
+        // resources from it), so resolve against the cwd before the loader records it.
+        let path = self
+            .resolve_path(path.as_str())
+            .ok()
+            .and_then(|c| c.into_string().ok())
+            .map(|p| {
+                let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+                for comp in p.split('/') {
+                    match comp {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        c => parts.push(c),
+                    }
+                }
+                alloc::format!("/{}", parts.join("/"))
+            })
+            .unwrap_or(path);
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 
@@ -7217,6 +7242,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // installed against this process's page manager once it exists.
                     auxv: alloc::vec::Vec::new(),
                     maps: None,
+                    tids: None,
+                    fds: None,
                 },
             );
         }
@@ -7232,6 +7259,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .write()
                 .with_mut(self.pid.get(), |info| {
                     info.maps = Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
+                });
+            let process = self.process();
+            let files = self.files.borrow().clone();
+            self.global
+                .proc_self_info
+                .write()
+                .with_mut(self.pid.get(), |info| {
+                    info.tids = Some(alloc::sync::Arc::new(move || process.tids()));
+                    info.fds = Some(alloc::sync::Arc::new(move || {
+                        let alive: alloc::vec::Vec<usize> =
+                            files.raw_descriptor_store.read().iter_alive().collect();
+                        alive
+                            .into_iter()
+                            .filter_map(|fd| {
+                                let target = files.lookup_fd_path(fd).map_or_else(
+                                    || alloc::format!("anon_inode:[{fd}]"),
+                                    |c| c.to_string_lossy().into_owned(),
+                                );
+                                Some((i32::try_from(fd).ok()?, target))
+                            })
+                            .collect()
+                    }));
                 });
         }
 

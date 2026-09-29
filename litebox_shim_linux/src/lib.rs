@@ -2043,9 +2043,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // that some `open` happened. Truncated: some variants (e.g. a `write` with a large
         // buffer) could otherwise produce a huge line.
         if crate::diag::is_syscall_timeline_target_comm(&self.comm.get()) {
-            let debug_str = alloc::format!("{request:?}");
-            let truncated = if debug_str.len() > 200 {
-                alloc::format!("{}...", &debug_str[..200])
+            let mut debug_str = alloc::format!("{request:?}");
+            // Path-carrying requests hold a raw user pointer; show the string it names.
+            let path_ptr = match &request {
+                SyscallRequest::Openat { pathname, .. } | SyscallRequest::Readlink { pathname, .. } => {
+                    Some(*pathname)
+                }
+                _ => None,
+            };
+            if let Some(p) = path_ptr
+                && let Some(c) = p.to_cstring::<Platform>()
+            {
+                debug_str = alloc::format!("{debug_str} path={c:?}");
+            }
+            if let SyscallRequest::Prctl {
+                args: litebox_common_linux::PrctlArg::SetName(ptr),
+            } = &request
+                && let Some(c) = ptr.to_owned_slice::<Platform>(16)
+            {
+                debug_str = alloc::format!("{debug_str} name={:?}", alloc::string::String::from_utf8_lossy(&c));
+            }
+            let truncated = if debug_str.len() > 320 {
+                alloc::format!("{}...", &debug_str[..320])
             } else {
                 debug_str
             };

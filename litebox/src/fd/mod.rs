@@ -757,15 +757,10 @@ impl RawDescriptorStorage {
         fd: TypedFd<Subsystem>,
         raw_fd: usize,
     ) -> bool {
-        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
-        // be too expensive if someone tries to store into a large raw FD?
-        //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 256,
-            "explicit upper bound restriction for now; see implementation details"
-        );
+        // A dense table is fine for realistic workloads; callers enforce RLIMIT_NOFILE before
+        // reaching here (e.g. `fcntl(F_DUPFD, 1000)` or a spawner parking fds high), so growing to
+        // the requested slot is bounded by that limit rather than by an arbitrary constant that
+        // turned a legal request into a panic.
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
             // There's already something at this slot.
             return false;

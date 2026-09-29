@@ -6771,10 +6771,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             let mut dt = task.global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
-            if close_on_exec {
-                let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-            }
+            // FD_CLOEXEC belongs to the descriptor, not the open file description: a duplicate
+            // starts with it clear unless the caller asked for it (dup3/F_DUPFD_CLOEXEC),
+            // whatever the source had.
+            let _ = dt.set_fd_metadata(
+                &fd,
+                if close_on_exec {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                },
+            );
             drop(dt);
 
             let new_fd = match target {

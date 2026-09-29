@@ -2759,6 +2759,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // Handles are recorded in cross-process tables (memfds, shared file mappings), so they
+        // must name something every process can reach: a segment of the inherited pool. A plain
+        // memfd number is only meaningful in the process that created it, and a sibling that
+        // was forked earlier would map whatever unrelated descriptor has that number.
+        if let Some(h) = shared_heap::pool_segment(0, size) {
+            return Ok(h);
+        }
         let name = c"litebox-shared-mem";
         let fd =
             unsafe { syscalls::syscall2(syscalls::Sysno::memfd_create, name.as_ptr() as usize, 0) }
@@ -3554,12 +3561,15 @@ fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
         );
     }
     let _restore_guard = litebox::utils::defer(|| unsafe {
+        // Runs from a drop guard, possibly while unwinding from another panic: a second panic
+        // here aborts in an unbounded backtrace loop, so a failure is reported, not asserted.
         let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
-        assert!(
-            r >= 0,
-            "failed to restore original signal stack: {}",
-            std::io::Error::last_os_error()
-        );
+        if r < 0 {
+            eprintln!(
+                "failed to restore original signal stack: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     });
     f(mapping_base.cast::<u8>())
 }
