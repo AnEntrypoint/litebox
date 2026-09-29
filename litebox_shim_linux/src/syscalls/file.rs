@@ -3719,7 +3719,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         true
     }
 
-    fn do_stat<T: From<litebox::fs::FileStatus>>(
+    fn do_stat<T: From<litebox::fs::FileStatus> + From<FileStat>>(
         &self,
         pathname: impl path::Arg,
         follow_symlink: bool,
@@ -3727,6 +3727,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let normalized_path = pathname.normalized()?;
         if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
             return Ok(T::from(status));
+        }
+        // `stat("/proc/self/fd/N")` follows the magic link to the open file itself -- whatever
+        // it names, including files with no path at all (a memfd, a pipe, a socket).
+        if follow_symlink
+            && let Some(rest) = normalized_path
+                .as_str()
+                .strip_prefix("/proc/self/fd/")
+                .or_else(|| {
+                    normalized_path
+                        .as_str()
+                        .strip_prefix("/proc/")
+                        .and_then(|r| r.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str()))
+                })
+            && let Ok(n) = rest.parse::<usize>()
+        {
+            return descriptor_stat(n, self).map_err(|_| Errno::ENOENT);
         }
         let lookup_path = if follow_symlink {
             self.resolve_final_symlinks(normalized_path)?
