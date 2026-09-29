@@ -1879,6 +1879,11 @@ fn diag_process_fork_task_resume_probe(
     // `sigreturn_trampoline` is, via `process_fork::FORK_CHILD_COMM_ENV_VAR`.
     if let Ok(path) = std::env::var(pf::FORK_CHILD_LAZY_FILE_ENV_VAR) {
         litebox_platform_windows_userland::adopt_inherited_lazy_file_maps(&path);
+        // The descriptor file is deleted once read, and this process's own environment is copied
+        // into every host process it later spawns (an exec-collision replacement, a further fork
+        // child): left in place, each of those would try to adopt a file that no longer exists.
+        // SAFETY: still on the bootstrap thread, before any guest thread exists.
+        unsafe { std::env::remove_var(pf::FORK_CHILD_LAZY_FILE_ENV_VAR) };
     }
     let comm: [u8; 16] = std::env::var(pf::FORK_CHILD_COMM_ENV_VAR)
         .ok()
