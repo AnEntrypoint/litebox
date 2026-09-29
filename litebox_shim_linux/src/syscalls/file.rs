@@ -3231,11 +3231,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => {
+            let stdio_default = match fd {
+                0 => Some("/dev/stdin"),
+                1 => Some("/dev/stdout"),
+                2 => Some("/dev/stderr"),
+                _ => None,
+            };
+            match stdio_default {
+                // A stdio fd `dup2`'d over by a real file or pty slave (a terminal emulator's
+                // child) names that target, which is what `ttyname()`/`tty` read back.
+                Some(default) => {
+                    return Ok(self
+                        .files
+                        .borrow()
+                        .lookup_fd_path(fd as usize)
+                        .and_then(|p| p.into_string().ok())
+                        .unwrap_or_else(|| default.to_string()));
+                }
+                None => {
                     // Any other fd: this used to unconditionally panic, crashing the whole
                     // runner on something as ordinary as Python's
                     // `os.readlink(f"/proc/self/fd/{fd}")` (used by e.g. introspection/sandboxing
@@ -3345,11 +3358,22 @@ where
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
-            |_fd| {
-                Ok(T::from(synthetic(
-                    litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
-                    0,
-                )))
+            |fd| {
+                // A pty slave stats exactly like its `/dev/pts/<id>` path does, so glibc's
+                // `ttyname()` (fstat(fd) vs stat(readlink(/proc/self/fd/N))) recognizes it.
+                let slave_id = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .and_then(|h| h.with_entry(|end| end.is_slave().then(|| end.pty_id())));
+                Ok(match slave_id {
+                    Some(id) => T::from(litebox::fs::devices::devpts_slave_status(id)),
+                    None => T::from(synthetic(
+                        litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
+                        0,
+                    )),
+                })
             },
             |_fd| {
                 Ok(T::from(synthetic(

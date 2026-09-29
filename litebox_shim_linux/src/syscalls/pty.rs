@@ -1185,6 +1185,14 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
         }
     }
 
+    /// The pty id this end belongs to, whichever transport carries it.
+    pub(crate) fn pty_id(&self) -> u32 {
+        match self {
+            PtyEnd::Master(h) | PtyEnd::Slave(h) => h.pair.id,
+            PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => h.id,
+        }
+    }
+
     /// The pty id of a shared-transport end.
     pub(crate) fn shared_id(&self) -> Option<u32> {
         match self {

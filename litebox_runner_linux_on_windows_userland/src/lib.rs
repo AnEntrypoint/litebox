@@ -187,6 +187,19 @@ struct MmappedFile {
 /// `Box<dyn Any + Send>` as handed back by `std::panic::catch_unwind`), for logging -- used by
 /// the `net_worker` loops' own panic recovery (see their doc comments for why a panic there must
 /// be caught rather than allowed to kill the thread).
+/// Reads a per-fork inheritance spec and removes it from this process's environment: the variable
+/// describes only THIS child's carried fds, and a later `CreateProcessW` inherits the whole
+/// environment, so a leftover spec would be replayed over the grandchild's real fds (a pty stdin
+/// replaced by the parent's stale stdin pipe).
+fn take_fork_env(name: &str) -> Option<std::ffi::OsString> {
+    let value = std::env::var_os(name);
+    if value.is_some() {
+        // SAFETY: called during single-threaded child bootstrap, before guest threads exist.
+        unsafe { std::env::remove_var(name) };
+    }
+    value
+}
+
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -1910,7 +1923,7 @@ fn diag_process_fork_task_resume_probe(
     // an eventfd is a counter and two behaviour bits. See `litebox::platform::ForkInheritedEventfd`
     // for what a recreate preserves (everything a wakeup fd needs) and what it does not (a counter
     // genuinely SHARED with the parent).
-    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_EVENTFDS_ENV_VAR)
+    if let Some(spec) = take_fork_env(pf::FORK_CHILD_EVENTFDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
         for item in spec.split(',').filter(|s| !s.is_empty()) {
@@ -1939,7 +1952,7 @@ fn diag_process_fork_task_resume_probe(
     }
 
     // Rebuild the unix sockets the parent carried (`litebox::platform::ForkInheritedShimFd`).
-    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_SHIM_FDS_ENV_VAR)
+    if let Some(spec) = take_fork_env(pf::FORK_CHILD_SHIM_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
         for item in spec.split(',').filter(|s| !s.is_empty()) {
@@ -1962,7 +1975,7 @@ fn diag_process_fork_task_resume_probe(
         }
     }
 
-    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_FILE_FDS_ENV_VAR)
+    if let Some(spec) = take_fork_env(pf::FORK_CHILD_FILE_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
         for item in spec.split(',').filter(|s| !s.is_empty()) {
@@ -2003,7 +2016,7 @@ fn diag_process_fork_task_resume_probe(
     //
     // Must happen HERE: before `run_thread_with_fork_verification` consumes `entrypoints`, and on
     // this thread, because `LinuxShimEntrypoints` is deliberately `!Send`.
-    if let Some(spec) = std::env::var_os(pf::FORK_CHILD_PIPE_FDS_ENV_VAR)
+    if let Some(spec) = take_fork_env(pf::FORK_CHILD_PIPE_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
         for item in spec.split(',').filter(|s| !s.is_empty()) {
