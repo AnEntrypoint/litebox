@@ -436,6 +436,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 ),
                 Some(EpollDescriptor::Timerfd(_)) => true,
                 Some(EpollDescriptor::Unix(_)) => true,
+                // TCP readiness changes made by another process's network poll (the host publish
+                // proxy runs in the root process) notify only observers local to that process, so
+                // a listener or connection owned by a fork child needs the bounded re-check too.
+                Some(EpollDescriptor::Socket(_)) => true,
                 Some(EpollDescriptor::Pty(pty)) => pty_needs_repoll(global, &pty),
                 _ => false,
             }
@@ -471,6 +475,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                         Some(EpollDescriptor::File(_))
                             | Some(EpollDescriptor::Timerfd(_))
                             | Some(EpollDescriptor::Unix(_))
+                            | Some(EpollDescriptor::Socket(_))
                             | Some(EpollDescriptor::Pty(_))
                     )
             })
@@ -1069,6 +1074,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
                     .is_ok_and(|desc| {
                         matches!(&desc, EpollDescriptor::Unix(_))
+                            || matches!(&desc, EpollDescriptor::Socket(_))
                             || matches!(&desc, EpollDescriptor::Pty(pty) if pty_needs_repoll(global, pty))
                             || matches!(&desc, EpollDescriptor::File(file)
                         if global.litebox.descriptor_table().with_metadata(

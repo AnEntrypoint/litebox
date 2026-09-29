@@ -250,6 +250,24 @@ fn split_at(map: &mut BTreeMap<usize, LazyRange>, addr: usize) {
     map.insert(addr, upper);
 }
 
+/// Fills every lazy range that `range` cuts through (starts before it or ends after it). A dynamic
+/// loader maps a whole library and then `MAP_FIXED`-remaps its segments over it, so partial
+/// overlaps are the norm; the remnants left on either side become ordinary, fully populated memory
+/// instead of half-lazy pieces whose boundaries share allocation-granularity chunks with the new
+/// mappings.
+fn fill_partial_overlaps(map: &mut BTreeMap<usize, LazyRange>, range: &Range<usize>) {
+    let cut: Vec<usize> = map
+        .range(..range.end)
+        .filter(|entry| entry.1.end > range.start && (*entry.0 < range.start || entry.1.end > range.end))
+        .map(|(&start, _)| start)
+        .collect();
+    for start in cut {
+        if let Some(lazy) = map.get_mut(&start) {
+            fill_all(start, lazy);
+        }
+    }
+}
+
 fn push_merged(out: &mut Vec<Range<usize>>, next: Range<usize>) {
     if next.is_empty() {
         return;
@@ -391,6 +409,7 @@ pub(crate) fn permission_update_ranges(
         return vec![range];
     }
     let mut map = table();
+    fill_partial_overlaps(&mut map, &range);
     split_at(&mut map, range.start);
     split_at(&mut map, range.end);
     let starts: Vec<usize> = map.range(range.clone()).map(|(&s, _)| s).collect();
@@ -420,6 +439,7 @@ pub(crate) fn forget(range: Range<usize>) {
         return;
     }
     let mut map = table();
+    fill_partial_overlaps(&mut map, &range);
     split_at(&mut map, range.start);
     split_at(&mut map, range.end);
     let inside: Vec<usize> = map.range(range).map(|(&s, _)| s).collect();
