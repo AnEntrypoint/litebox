@@ -747,6 +747,20 @@ pub fn pull_layers_in_memory_with_resolved_digests(
     image_ref: &str,
     verbose: bool,
 ) -> anyhow::Result<(PulledLayers, String)> {
+    // Pin mode: use the layer list recorded by the last successful pull and never contact the
+    // registry. A tag can be re-pointed upstream at any time, which silently turns a fully cached
+    // image into a multi-gigabyte download; on a slow or unreachable link that is the difference
+    // between a working run and none. The recorded list is never overwritten in this mode.
+    if std::env::var_os("LITEBOX_OCI_USE_LAST_RESOLVED").is_some_and(|v| v != "0") {
+        let resolved_json = cache::load_resolved_layers(image_ref).with_context(|| {
+            format!("LITEBOX_OCI_USE_LAST_RESOLVED is set but no resolved layer list is recorded for {image_ref}")
+        })?;
+        let known_layers = serde_json::from_str(&resolved_json)
+            .context("failed to parse the recorded OCI layer list")?;
+        eprintln!("  LITEBOX_OCI_USE_LAST_RESOLVED: using the recorded layer list for {image_ref}, not contacting the registry");
+        return pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
+            .map(|(pulled, _)| (pulled, resolved_json));
+    }
     match pull_layers_in_memory_impl(image_ref, None, verbose) {
         Ok((pulled, resolved_json)) => {
             cache::store_resolved_layers(image_ref, &resolved_json);
