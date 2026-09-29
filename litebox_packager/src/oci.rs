@@ -988,16 +988,10 @@ fn pull_layers_in_memory_impl(
                             compressed_tmp_path.display()
                         )
                     })?;
-                let mut compressed_writer = tokio::io::BufWriter::new(compressed_tmp_file);
-                client
-                    .pull_blob(&reference, layer_desc, &mut compressed_writer)
+                drop(compressed_tmp_file);
+                pull_layer_resumable(&client, &reference, layer_desc, &compressed_tmp_path, verbose)
                     .await
                     .with_context(|| format!("failed to pull layer {}", i + 1))?;
-                use tokio::io::AsyncWriteExt as _;
-                compressed_writer
-                    .flush()
-                    .await
-                    .with_context(|| format!("failed to flush pulled layer {}", i + 1))?;
             }
 
             // Sniff gzip-ness from the first few bytes on disk rather than needing the whole
@@ -2200,4 +2194,134 @@ mod tests {
         let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
         assert_eq!(r, Some(rootfs.join("hello.txt")));
     }
+}
+
+/// Downloads one layer blob to `path`, surviving a stalled or dropped connection.
+///
+/// A single `pull_blob` call has no notion of progress: on a slow or flaky link it can trickle
+/// bytes forever (or hang with no output), and the runner just sat there. This instead reads the
+/// body in chunks with a per-chunk stall timeout, reports progress, and on any stall or network
+/// error re-requests the remainder with an HTTP `Range` header (`pull_blob_stream_partial`),
+/// appending to the same file. Because a partial response cannot be digest-checked by the client
+/// library, the finished file is hashed and compared to the layer's digest here.
+async fn pull_layer_resumable(
+    client: &Client,
+    reference: &Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    path: &Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+    use sha2::Digest as _;
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_ATTEMPTS: u32 = 60;
+
+    let total = u64::try_from(layer.size).unwrap_or(0);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut offset: u64 = 0;
+    let started = std::time::Instant::now();
+    let mut last_report = std::time::Instant::now();
+    let mut complete = false;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let requested = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            client.pull_blob_stream_partial(reference, layer, offset, None),
+        )
+        .await;
+        let response = match requested {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} failed at {offset} bytes: {e}; retrying");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS}: no response in {CONNECT_TIMEOUT:?} at {offset} bytes; retrying");
+                continue;
+            }
+        };
+        let mut stream = match response {
+            oci_client::client::BlobResponse::Partial(stream) => stream,
+            oci_client::client::BlobResponse::Full(stream) => {
+                if offset != 0 {
+                    file.set_len(0).await?;
+                    file.seek(std::io::SeekFrom::Start(0)).await?;
+                    offset = 0;
+                }
+                stream
+            }
+        };
+        loop {
+            match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    file.write_all(&chunk).await?;
+                    offset += chunk.len() as u64;
+                    if verbose && last_report.elapsed() >= std::time::Duration::from_secs(10) {
+                        last_report = std::time::Instant::now();
+                        let secs = started.elapsed().as_secs_f64().max(0.001);
+                        eprintln!(
+                            "  layer download: {} / {} MB ({:.0} KB/s avg)",
+                            offset >> 20,
+                            total >> 20,
+                            offset as f64 / 1024.0 / secs
+                        );
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} interrupted at {offset} bytes: {e}; resuming");
+                    break;
+                }
+                Ok(None) => {
+                    if total == 0 || offset >= total {
+                        complete = true;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} stalled {STALL_TIMEOUT:?} at {offset} bytes; resuming");
+                    break;
+                }
+            }
+        }
+        if complete || (total != 0 && offset >= total) {
+            complete = true;
+            break;
+        }
+    }
+    file.flush().await?;
+    drop(file);
+    anyhow::ensure!(
+        complete,
+        "layer download did not complete after {MAX_ATTEMPTS} attempts ({offset} of {total} bytes)"
+    );
+    if total != 0 {
+        anyhow::ensure!(offset == total, "layer download size mismatch: got {offset} bytes, expected {total}");
+    }
+    if let Some(expected) = layer.digest.strip_prefix("sha256:") {
+        let mut hasher = sha2::Sha256::new();
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        anyhow::ensure!(
+            actual == expected,
+            "layer digest mismatch after download: expected sha256:{expected}, got sha256:{actual}"
+        );
+    }
+    Ok(())
 }

@@ -23,7 +23,9 @@ oci-client = { version = "0.16", default-features = false, features = ["native-t
 oci-spec = { version = "0.9", features = ["image"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
+futures-util = "0.3"
+sha2 = "0.10"
 walkdir = "2.0"
 
 [lints]
