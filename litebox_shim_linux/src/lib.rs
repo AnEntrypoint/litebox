@@ -890,7 +890,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     bootstrap_shared_pending.clone(),
                     None,
                 )),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
@@ -1086,7 +1086,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             task: Task {
                 global: self.0.clone(),
                 thread: RefCell::new(thread_state),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
@@ -3541,20 +3541,67 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// normally, inside the `libc::fork()` call this wraps -- nothing here replaces those, only
     /// adds to them, narrowly, for the one thing this crate owns that they don't: its own
     /// shim-wide locks.
-    fn with_shimwide_locks_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _net = self.net_lock();
-        let _unix_addr_table = self.unix_addr_table.write();
-        let _elf_patch_cache = self.elf_patch_cache.lock();
-        let _segment_scan_cache = self.segment_scan_cache.lock();
-        let _exec_ranges_cache = self.exec_ranges_cache.lock();
-        let _sysv_shm = self.sysv_shm.lock();
-        let _flock_registry = self.flock_registry.lock();
-        let _pty_registry = self.pty_registry.write();
-        let _daemon_pty_masters = self.daemon_pty_masters.write();
-        let _memfds = self.memfds.lock();
-        let _shared_files = self.shared_files.lock();
-        let _proc_self_info = self.proc_self_info.write();
-        f()
+    fn with_shimwide_locks_held<R>(
+        &self,
+        f: impl FnOnce() -> R,
+        is_forked_child: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let guards = (
+            self.net_lock(),
+            self.unix_addr_table.write(),
+            self.elf_patch_cache.lock(),
+            self.segment_scan_cache.lock(),
+            self.exec_ranges_cache.lock(),
+            self.sysv_shm.lock(),
+            self.flock_registry.lock(),
+            self.pty_registry.write(),
+            self.daemon_pty_masters.write(),
+            self.memfds.lock(),
+            self.shared_files.lock(),
+            self.proc_self_info.write(),
+        );
+        let result = f();
+        if is_forked_child(&result) && self.platform.native_fork_shares_kernel_state() {
+            // The kernel state these guards protect lives in memory the parent and child share,
+            // so the parent's own drop of its guards is the one and only unlock. Dropping them
+            // here as well would release a lock the parent may since have re-taken.
+            core::mem::forget(guards);
+        }
+        result
+    }
+}
+
+/// A [`wait::WaitState`] that the one native-`fork()` child path can swap for a fresh one.
+///
+/// The wait state's inner `Arc` is what other threads use to wake this host thread. When the
+/// kernel heap is shared across a `fork()`, the child's copy of the `Task` points at the SAME
+/// inner state as the parent's, so a wake meant for one would land on the other; the child gives
+/// itself a new one. Dereferences like a plain `WaitState`.
+struct ReplaceableWaitState<Platform: ShimPlatform>(
+    core::cell::UnsafeCell<wait::WaitState<Platform>>,
+);
+
+impl<Platform: ShimPlatform> ReplaceableWaitState<Platform> {
+    fn new(inner: wait::WaitState<Platform>) -> Self {
+        Self(core::cell::UnsafeCell::new(inner))
+    }
+
+    /// Replaces the wait state and forgets the old one without dropping it (its `Arc` is shared
+    /// with the parent process, which still owns that reference).
+    ///
+    /// # Safety
+    /// No reference obtained through `Deref` may be live across this call.
+    unsafe fn replace_forgetting_old(&self, new: wait::WaitState<Platform>) {
+        // SAFETY: the caller guarantees no outstanding borrow.
+        core::mem::forget(unsafe { core::ptr::replace(self.0.get(), new) });
+    }
+}
+
+impl<Platform: ShimPlatform> core::ops::Deref for ReplaceableWaitState<Platform> {
+    type Target = wait::WaitState<Platform>;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: only `replace_forgetting_old` mutates, under its own contract.
+        unsafe { &*self.0.get() }
     }
 }
 
@@ -3565,7 +3612,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     /// primitives, which a real `fork()` leaves completely unaffected -- only which GUEST
     /// PROCESS the thread belongs to changes, never its own interruptibility. The existing
     /// value stays exactly as correct for the child as it was for the parent.
-    wait_state: wait::WaitState<Platform>,
+    wait_state: ReplaceableWaitState<Platform>,
     /// `RefCell` for the same reason as [`Self::pid`]: a native fork() child needs its own
     /// [`syscalls::process::Process`] (fresh children list, parent pointing at the process that
     /// forked it, its own adopted [`litebox::mm::PageManager`]) in place of the one it continues
@@ -3636,7 +3683,7 @@ mod test_utils {
                 syscalls::signal::PendingSignals::new(),
             ));
             Task {
-                wait_state: wait::WaitState::new(self.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.platform)),
                 thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.litebox)),
@@ -3673,7 +3720,7 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
                 thread: RefCell::new(self.thread.borrow().new_thread(tid)?),
                 pid: Cell::new(self.pid.get()),
@@ -3718,7 +3765,7 @@ mod test_utils {
                 Some(litebox_common_linux::signal::Signal::SIGCHLD.as_i32()),
             );
             let child = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
                 thread: RefCell::new(thread),
                 pid: Cell::new(pid),

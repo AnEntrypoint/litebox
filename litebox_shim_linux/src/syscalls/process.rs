@@ -3556,15 +3556,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // SHIM-WIDE lock that could otherwise be caught mid-hold by a sibling host thread at the
         // instant `fork()` runs is quiesced by `with_shimwide_locks_held` itself -- see its own
         // doc comment for what that covers and, explicitly, what it does not.
+        // With kernel state shared across the `fork()`, the child's fd table and fs state must be
+        // duplicated NOW, by the parent: the parent goes on to close the pipe ends the child was
+        // meant to inherit (`dup2` then `close`) and a table duplicated later, by the child, would
+        // already be missing them.
+        let shared = self.global.platform.native_fork_shares_kernel_state();
+        let child_state = shared.then(|| {
+            (
+                Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox)),
+                Arc::new((**self.fs.borrow()).clone()),
+            )
+        });
         let result = self
             .global
-            .with_shimwide_locks_held(|| unsafe { self.global.platform.native_fork() });
+            .with_shimwide_locks_held(
+                || unsafe { self.global.platform.native_fork() },
+                |forked| *forked == Some(0),
+            );
         match result {
             None => {
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() failed (EAGAIN/ENOMEM) -- falling back to the thread-based relocating fork"
                 );
+                drop(child_state);
                 None
             }
             Some(0) => {
@@ -3579,7 +3594,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // here on. Nothing about it (pid, `Process`, pending signals, `/proc/self`) is
                 // correct for that identity yet; `reinit_as_native_fork_child` makes it so, in
                 // place, before anything else runs on this thread again.
-                self.reinit_as_native_fork_child(child_tid, exit_signal);
+                self.reinit_as_native_fork_child(child_tid, exit_signal, child_state);
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() succeeded -- this thread is now the child, resuming in place"
@@ -3587,6 +3602,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(litebox::platform::CrossProcessChildHandle(0))
             }
             Some(child_pid) => {
+                // The child owns the duplicated tables now; this frame's copy of the references
+                // is not a second owner.
+                core::mem::forget(child_state);
                 litebox_util_log::debug!(
                     tid:% = self.tid.get(), child_pid:% = child_pid;
                     "clone: native fork() succeeded -- spawned real child pid"
@@ -3618,7 +3636,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// kernel's copy-on-write already produced in this process's own memory, with nothing further
     /// for this function to do), and `wait_state` describes this HOST THREAD's own park/wake
     /// primitives, untouched by which guest process it now belongs to.
-    fn reinit_as_native_fork_child(&self, new_pid: i32, exit_signal: u64) {
+    fn reinit_as_native_fork_child(
+        &self,
+        new_pid: i32,
+        exit_signal: u64,
+        shared_state: Option<(
+            Arc<super::file::FilesState<Platform, FS>>,
+            Arc<super::file::FsState<Platform>>,
+        )>,
+    ) {
         IS_NATIVE_FORK_CHILD.store(true, Ordering::Relaxed);
         let old_pid = self.pid.get();
         let old_process = self.process();
@@ -3673,8 +3699,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // time `do_clone` reaches either path.
             (exit_signal != 0).then_some(i32::try_from(exit_signal).unwrap_or(0)),
         );
-        self.thread.replace(new_thread);
-        self.signals.replace(new_signals);
+        // The values being replaced are this process's copy of references the PARENT still owns
+        // when the kernel heap is shared across the `fork()`: dropping them would release a
+        // reference count the parent never gave up. Forget them instead.
+        core::mem::forget(self.thread.replace(new_thread));
+        core::mem::forget(self.signals.replace(new_signals));
+        if let Some((files, fs)) = shared_state {
+            // Adopt the tables the parent duplicated before the `fork()` (see
+            // `try_native_cross_process_fork`); without shared kernel memory the kernel's own
+            // copy-on-write already gave this process independent ones.
+            core::mem::forget(self.files.replace(files));
+            core::mem::forget(self.fs.replace(fs));
+            // SAFETY: no wait context is live on this thread at this point in `do_clone`.
+            unsafe {
+                self.wait_state
+                    .replace_forgetting_old(crate::wait::WaitState::new(self.global.platform));
+            }
+        }
+
+        // The child's `ThreadRemote` has no interrupt handle until one is attached (a normal new
+        // thread gets it in `handle_init_request`, which a native-fork child never goes through);
+        // without it nothing can interrupt this thread's waits, e.g. a `kill()` or `exit_group`.
+        self.thread
+            .borrow()
+            .remote
+            .handle
+            .set(Box::new(self.wait_state.thread_handle()))
+            .ok();
 
         // Give this child its own `/proc/self` entry, copied from the parent's, exactly as
         // `do_clone`'s thread-based path does for ITS new `Task` -- BEFORE overwriting `pid`
@@ -5014,7 +5065,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        wait_state: crate::wait::WaitState::new(self.global.platform),
+                        wait_state: crate::ReplaceableWaitState::new(crate::wait::WaitState::new(self.global.platform)),
                         thread: RefCell::new(thread),
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),

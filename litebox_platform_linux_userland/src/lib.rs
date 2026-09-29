@@ -37,6 +37,7 @@ extern crate alloc;
 /// GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer). See the
 /// module's own doc comment for the full design and how it differs from `litebox_platform_windows_
 /// userland::presentation`, the reference implementation this was ported from.
+pub mod shared_heap;
 pub mod presentation;
 
 // ---------------------------------------------------------------------------
@@ -2164,7 +2165,7 @@ impl RawMutex {
             Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
             Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
             Err(e) => {
-                panic!("Unexpected errno={e} for FUTEX_WAIT")
+                panic!("Unexpected errno={e} for FUTEX_WAIT addr={:p} val={val} timeout={timeout:?}", &self.inner)
             }
             _ => unreachable!(),
         }
@@ -3025,6 +3026,10 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
         // lock-quiescing contract (see above) -- nothing here can misuse it further.
         let pid = unsafe { libc::fork() };
         if pid < 0 { None } else { Some(pid) }
+    }
+
+    fn native_fork_shares_kernel_state(&self) -> bool {
+        shared_heap::is_active()
     }
 
     fn exit_native_fork_child(&self, status: i32) {

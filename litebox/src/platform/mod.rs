@@ -1301,6 +1301,13 @@ pub trait ForkChildVerificationProvider {
     /// in the parent. Without this the child's last thread just returns and the host reports exit
     /// code `0` to the parent's `waitpid`, losing every non-zero guest status. The default is a
     /// no-op: only a platform that returns `true` from [`Self::has_native_fork`] is ever asked.
+    /// Whether the kernel state a native-`fork()` child inherits is memory it SHARES with its
+    /// parent (rather than a private copy-on-write duplicate). When it is, a lock the parent held
+    /// across the `fork()` is one lock seen by both processes, so the child must not release it.
+    fn native_fork_shares_kernel_state(&self) -> bool {
+        false
+    }
+
     fn exit_native_fork_child(&self, status: i32) {
         let _ = status;
     }

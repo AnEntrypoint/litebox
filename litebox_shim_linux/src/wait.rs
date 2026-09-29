@@ -24,19 +24,19 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns a wait context to use to perform interruptible waits.
     pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
-        self.wait_state.0.context().with_check_for_interrupt(self)
+        (*self.wait_state).0.context().with_check_for_interrupt(self)
     }
 
     /// Marks that the task has just returned from running guest code.
     pub(crate) fn enter_from_guest(&self) {
-        self.wait_state.0.finish_running_guest();
+        (*self.wait_state).0.finish_running_guest();
     }
 
     /// Prepares to return to run guest code. Returns `false` if the task should
     /// exit instead.
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
-        self.wait_state.0.prepare_to_run_guest(|| {
+        (*self.wait_state).0.prepare_to_run_guest(|| {
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
