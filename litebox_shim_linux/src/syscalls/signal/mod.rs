@@ -300,6 +300,12 @@ impl PendingSignals {
         !(self.pending & mask).is_empty()
     }
 
+    /// Drops every queued instance of `signal` and clears its pending bit.
+    pub(crate) fn discard(&mut self, signal: Signal) {
+        self.queue.retain(|info| info.signo != signal.as_i32());
+        self.pending.remove(signal);
+    }
+
     pub(crate) fn remove(&mut self, signal: Signal) -> Siginfo {
         // Find the entry.
         let pos = self
@@ -1082,10 +1088,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return true;
             }
             if thread_pending.contains(signal) {
-                let _ = self.signals.borrow().pending.borrow_mut().remove(signal);
+                self.signals.borrow().pending.borrow_mut().discard(signal);
             }
             if shared_pending.contains(signal) {
-                let _ = self.signals.borrow().shared_pending.lock().remove(signal);
+                self.signals.borrow().shared_pending.lock().discard(signal);
             }
         }
     }

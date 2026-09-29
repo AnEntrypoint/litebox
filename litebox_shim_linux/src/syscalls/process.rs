@@ -260,6 +260,9 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// ever target the calling process itself -- there is nowhere to look up another process by
     /// pid to move it into a different group.
     pgid: core::sync::atomic::AtomicI32,
+    /// Session id: own pid until `setsid()`; a forked child inherits its parent's. A process is a
+    /// session leader (the one whose exit hangs up its controlling pty) iff `sid == pid`.
+    sid: core::sync::atomic::AtomicI32,
     /// This process's process-directed pending-signal queue -- the exact same `Arc` as this
     /// process's own live `Task`'s `SignalState::shared_pending` (see that field's doc comment
     /// on why they must be identical). Reachable from a `Process` handle alone (e.g. via
@@ -462,6 +465,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             cross_process_children: Mutex::new(alloc::vec::Vec::new()),
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
+            sid: core::sync::atomic::AtomicI32::new(pid),
             shared_pending,
             exit_signal,
         }
@@ -3881,6 +3885,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process()
             .pgid
             .store(old_process.pgid.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.process()
+            .sid
+            .store(old_process.sid.load(Ordering::Relaxed), Ordering::Relaxed);
         self.global
             .process_registry
             .lock()
@@ -6046,7 +6053,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     )]
     pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
         self.process().pgid.store(self.pid.get(), Ordering::Relaxed);
+        self.process().sid.store(self.pid.get(), Ordering::Relaxed);
         Ok(self.pid.get())
+    }
+
+    /// Whether this process is a session leader (its exit hangs up its controlling terminal).
+    pub(crate) fn is_session_leader(&self) -> bool {
+        self.process().sid.load(Ordering::Relaxed) == self.pid.get()
     }
 
     /// Handle syscall `getuid`.

@@ -1714,7 +1714,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 let _ = self.do_close(raw_fd);
             }
-            if let Ok(Some(pair)) = slave_pair {
+            if let Ok(Some(pair)) = slave_pair
+                && self.is_session_leader()
+            {
                 self.global.hangup_slave(&pair);
             }
         }
