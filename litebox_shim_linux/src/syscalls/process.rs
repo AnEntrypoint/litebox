@@ -3769,6 +3769,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // owning a reference count of its own; take one so that replacing or dropping it here
         // never frees memory the parent still uses.
         core::mem::forget(self.creds());
+        // Futex waiters are pinned on their own thread's stack; whatever the parent's threads had
+        // queued in this (private, copy-on-write) manager means nothing in this process. Start
+        // it empty.
+        {
+            let _private = litebox_util_log::PrivateAllocGuard::new();
+            let fresh = litebox::sync::futex::FutexManager::new();
+            let manager = Arc::as_ptr(&self.global.futex_manager).cast_mut();
+            // SAFETY: the manager lives in this process's private memory, and this process has
+            // exactly one thread here (the forked child), so nothing else can be using it.
+            core::mem::forget(unsafe { core::ptr::replace(manager, fresh) });
+        }
         let old_pid = self.pid.get();
         let old_process = self.process();
 

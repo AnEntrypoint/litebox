@@ -1006,6 +1006,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let slave = self.global.pts_open(id)?;
             return self.insert_raw_pty_fd(slave, flags, path);
         }
+        // `open("/proc/self/fd/N")` re-opens whatever `N` names, as a new open file description.
+        // Programs use it to reopen a memfd with different access (PulseAudio's shared memory
+        // pool) or to get a fresh handle on a file they hold open.
+        if let Some(fd_str) = path_str
+            .strip_prefix("/proc/self/fd/")
+            .or_else(|| {
+                path_str
+                    .strip_prefix("/proc/")
+                    .and_then(|rest| rest.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str()))
+            })
+            && let Ok(fd) = fd_str.parse::<usize>()
+        {
+            self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::ENOENT)?)
+                .map_err(|_| Errno::ENOENT)?;
+            let target = self.files.borrow().lookup_fd_path(fd);
+            return match target {
+                Some(target) if target != path => {
+                    self.do_open_resolved(target, flags & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC), mode)
+                }
+                // An unnamed file (a memfd, or an unlinked file) or a pipe end: the new descriptor
+                // shares the underlying object, which is all a reopen means for these.
+                None => {
+                    let reopenable = self
+                        .files
+                        .borrow()
+                        .run_on_raw_fd(
+                            fd,
+                            |_fd| true,
+                            |_fd| false,
+                            |_fd| true,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                        )
+                        .unwrap_or(false);
+                    if !reopenable {
+                        return Err(Errno::ENXIO);
+                    }
+                    let new_fd = self
+                        .do_dup_inner(
+                            fd,
+                            if flags.contains(OFlags::CLOEXEC) {
+                                OFlags::CLOEXEC
+                            } else {
+                                OFlags::empty()
+                            },
+                            DupFdRequest::LowestAtOrAbove(0),
+                        )
+                        .map_err(|_| Errno::EMFILE)?;
+                    Ok(u32::try_from(new_fd).unwrap())
+                }
+                // Sockets, epoll and other descriptors with no filesystem name cannot be reopened.
+                _ => Err(Errno::ENXIO),
+            };
+        }
         // A FIFO is a filesystem entry, but opening one has to produce a PIPE. Checked here,
         // alongside `/dev/ptmx` and `/dev/pts/<id>` above and for the same reason: the underlying
         // `FileSystem` has no live per-open state to hand back, so these paths never reach
@@ -4983,6 +5042,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rootfs -- the path is unlinked immediately below regardless, so where it briefly lives
         // is never guest-observable.
         let path = alloc::format!("/.memfd:{id}");
+        // Creating and unlinking the backing name is the kernel's own bookkeeping, never subject
+        // to the caller's permissions on `/`: an unprivileged `memfd_create` must work.
+        let _root = litebox::fs::ident::root_guard();
         let file = self
             .do_open(
                 path.as_str(),
@@ -6272,7 +6334,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
+        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event, self.pid.get()))
     }
 
     /// Handle syscall `epoll_pwait`
@@ -6336,6 +6398,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         let do_wait = || {
             handle.with_entry(|epoll_file| {
+                epoll_file.rebind_inherited(&self.global, &self.files.borrow(), self.pid.get());
                 match epoll_file.wait(
                     &self.global,
                     &self.wait_cx().with_timeout(timeout),

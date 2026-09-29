@@ -534,9 +534,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: Option<EpollEvent>,
+        pid: i32,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap(), pid),
             EpollOp::EpollCtlMod => self.mod_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
@@ -548,12 +549,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
     }
 
+    /// Re-targets interests that another process registered (this epoll set was inherited across
+    /// `fork()`) at this process's own descriptor for the same fd number, once the registering
+    /// process's descriptor is gone. Real epoll ties an interest to the open file description,
+    /// which the inheriting process still holds; here it is tied to a descriptor handle, so the
+    /// handle has to be looked up again.
+    pub(crate) fn rebind_inherited(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        files: &FilesState<Platform, FS>,
+        pid: i32,
+    ) {
+        let stale: alloc::vec::Vec<(u32, usize)> = {
+            let interests = self.interests.lock();
+            interests
+                .iter()
+                .filter(|(_, entry)| entry.owner_pid != pid && entry.desc.upgrade().is_none())
+                .map(|(key, _)| (key.0, key.1))
+                .collect()
+        };
+        for (fd, ptr) in stale {
+            let Ok(file) = EpollDescriptor::try_from(files, fd as usize) else {
+                continue;
+            };
+            let mut interests = self.interests.lock();
+            let Some(old) = interests.remove(&EpollEntryKey(fd, ptr)) else {
+                continue;
+            };
+            let (mask, flags, data) = {
+                let inner = old.inner.lock();
+                (inner.mask, EpollFlags::from_bits_truncate(inner.flags.bits()), inner.data)
+            };
+            let entry = EpollEntry::new(
+                DescriptorRef::from(&file),
+                mask,
+                flags,
+                data,
+                self.ready.clone(),
+                pid,
+            );
+            if let Some(events) = file.poll(global, mask, Some(entry.weak_self.clone() as _)) {
+                if !events.is_empty() {
+                    self.ready.push(&entry);
+                }
+                interests.insert(EpollEntryKey::new(fd, &file), entry);
+            }
+        }
+    }
+
     fn add_interest(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
+        pid: i32,
     ) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
@@ -583,6 +633,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             flags,
             event.data,
             self.ready.clone(),
+            pid,
         );
         let events = file
             .poll(global, mask, Some(entry.weak_self.clone() as _))
@@ -738,6 +789,10 @@ struct EpollEntry<Platform: ShimPlatform, FS: ShimFS> {
     is_ready: AtomicBool,
     is_enabled: AtomicBool,
     weak_self: Weak<Self>,
+    /// The guest pid that registered this interest. An interest registered by another process
+    /// (the epoll set was inherited across `fork()`) names that process's descriptor, which dies
+    /// when it exits even though the open file description lives on in this process.
+    owner_pid: i32,
 }
 
 struct EpollEntryInner {
@@ -753,8 +808,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         flags: EpollFlags,
         data: u64,
         ready: Arc<ReadySet<Platform, FS>>,
+        owner_pid: i32,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
+            owner_pid,
             desc,
             inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
             ready,

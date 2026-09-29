@@ -576,7 +576,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     );
                     return Ok(());
                 }
-                SocketOption::PRIORITY | SocketOption::REUSEPORT => return Ok(()),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => return Ok(()),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
@@ -751,7 +751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     litebox::net::SOCKET_BUFFER_SIZE.trunc()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
-                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
+                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => 0,
             },
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {

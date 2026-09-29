@@ -1477,7 +1477,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         let backlog = match self.lookup(task, &addr) {
             Ok(b) => b,
             Err(Errno::ECONNREFUSED) => {
-                return self.connect_cross_process(task, &addr, is_nonblocking);
+                return match self.connect_cross_process(task, &addr, is_nonblocking) {
+                    // `ECONNREFUSED` means something is at that path but nobody listens; a path
+                    // that does not exist at all is `ENOENT`, which callers such as PulseAudio's
+                    // stale-socket cleanup depend on to tell the two apart.
+                    Err(Errno::ECONNREFUSED) => Err(Self::refused_or_missing(task, &addr)),
+                    other => other,
+                };
             }
             Err(e) => {
                 litebox_util_log::debug!(addr:? = addr, err:? = e; "TRACE unix_connect: lookup failed");
@@ -1512,6 +1518,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         });
         litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result");
         result
+    }
+
+    /// `ENOENT` when `addr` is a filesystem path with nothing at it, else `ECONNREFUSED`.
+    fn refused_or_missing(task: &Task<Platform, FS>, addr: &UnixSocketAddr) -> Errno {
+        if let UnixSocketAddr::Path(path) = addr {
+            if let Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory
+                | litebox::fs::errors::PathError::MissingComponent,
+            )) = task.files.borrow().fs.symlink_metadata(path.as_str())
+            {
+                return Errno::ENOENT;
+            }
+        }
+        Errno::ECONNREFUSED
     }
 
     /// The genuinely-cross-process half of [`Self::connect`]: reached only once the ordinary
@@ -2622,7 +2642,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     );
                     Ok(())
                 }
-                SocketOption::PRIORITY | SocketOption::REUSEPORT => Ok(()),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => Ok(()),
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -2679,7 +2699,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
-                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
+                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => 0,
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {

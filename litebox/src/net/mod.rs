@@ -650,7 +650,9 @@ where
     /// levels deeper because these particular stale pointers live inside a struct that is itself
     /// correctly, genuinely shared rather than at `GlobalState`'s own top level.
     pub fn rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>) {
+        let loopback = core::mem::take(&mut self.device.loopback);
         self.device = phy::Device::new(litebox.x.platform);
+        self.device.loopback = loopback;
         // 49th pass (2026-09-22), root-caused live via RUST_BACKTRACE=full on a reproducible
         // `buddy_system_allocator-0.11.0/src/lib.rs:165` "index out of bounds: the len is 34 but
         // the index is 53" panic, 3/3 independent occurrences with the BIT-IDENTICAL backtrace:

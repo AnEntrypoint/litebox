@@ -593,7 +593,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // relocated into cross-process-shared memory or referenced from a different process at all
         // -- unlike a `BTreeMap`, there is no "move the collection into the shared arena" fix
         // available here even in principle.
-        let my_futex_manager = Arc::new(FutexManager::new());
+        // Allocated privately (never in the shared arena): a native-fork child gets its own
+        // copy-on-write duplicate, and `reinit_as_native_fork_child` empties it, so waiters
+        // pinned on one process's stacks are never reachable from another process.
+        let my_futex_manager = {
+            let _private = litebox_util_log::PrivateAllocGuard::new();
+            Arc::new(FutexManager::new())
+        };
         // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
         // comment's "Seventh and eighth instances of the SAME defect" section.
         let my_memfds = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));

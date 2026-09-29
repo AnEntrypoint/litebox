@@ -2279,6 +2279,7 @@ pub enum SocketOption {
     KEEPALIVE = 9,
     PRIORITY = 12,
     REUSEPORT = 15,
+    PASSCRED = 16,
     /// This option controls the action taken when unsent messages queue on
     /// a socket and close() is performed. If SO_LINGER is set, the system
     /// shall block the process during close() until it can transmit the data
