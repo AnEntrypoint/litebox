@@ -408,9 +408,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC)
                 })
                 .unwrap_or(false);
+            let narrowed = dt.with_metadata(fd, |ReopenedAccess(a)| *a).ok();
             let new_fd = dt.duplicate(fd)?;
             if cloexec {
                 dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            if let Some(a) = narrowed {
+                dt.set_fd_metadata(&new_fd, ReopenedAccess(a));
             }
             Some(new_fd)
         }
@@ -6832,7 +6836,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
 
             let mut dt = task.global.litebox.descriptor_table_mut();
+            let narrowed = dt.with_metadata(fd, |ReopenedAccess(a)| *a).ok();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
+            // A read-only/write-only reopen stays that way through `dup` (Chromium duplicates
+            // the read-only fd and re-checks its access mode).
+            if let Some(a) = narrowed {
+                let _ = dt.set_fd_metadata(&fd, ReopenedAccess(a));
+            }
             // FD_CLOEXEC belongs to the descriptor, not the open file description: a duplicate
             // starts with it clear unless the caller asked for it (dup3/F_DUPFD_CLOEXEC),
             // whatever the source had.

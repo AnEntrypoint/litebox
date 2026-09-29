@@ -1968,11 +1968,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .run_on_raw_fd(
                             raw_fd,
                             |fd| {
-                                self.global
-                                    .litebox
-                                    .descriptor_table_mut()
-                                    .duplicate(fd)
-                                    .map(AnyDupFd::Fs)
+                                let mut dt = self.global.litebox.descriptor_table_mut();
+                                let narrowed = dt
+                                    .with_metadata(fd, |super::file::ReopenedAccess(a)| *a)
+                                    .ok();
+                                let dup = dt.duplicate(fd);
+                                if let (Some(d), Some(a)) = (&dup, narrowed) {
+                                    let _ = dt.set_fd_metadata(d, super::file::ReopenedAccess(a));
+                                }
+                                dup.map(AnyDupFd::Fs)
                             },
                             |fd| {
                                 self.global
