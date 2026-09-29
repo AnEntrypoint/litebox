@@ -3983,10 +3983,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let fs = if flags.contains(CloneFlags::FS) {
-            self.fs.borrow().clone()
-        } else {
-            alloc::sync::Arc::new((**self.fs.borrow()).clone())
+        // Deferred like `make_files`: with kernel state shared across a native `fork()`, an `Arc`
+        // built here is a local of BOTH the parent's and the child's copy of this frame, and each
+        // would drop it on the early-return path -- a double free.
+        let make_fs = || {
+            if flags.contains(CloneFlags::FS) {
+                self.fs.borrow().clone()
+            } else {
+                alloc::sync::Arc::new((**self.fs.borrow()).clone())
+            }
         };
         // DEFERRED, not computed here: `fork_duplicate` has a side effect on shared state, and the
         // cross-process `fork()` path below returns before ever needing the result.
@@ -5074,7 +5079,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
-                        fs: fs.into(),
+                        fs: make_fs().into(),
                         files: make_files().into(),
                         signals: RefCell::new({
                             let signals = self.signals.borrow().clone_for_new_task(child_shared_pending);

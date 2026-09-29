@@ -3950,6 +3950,24 @@ unsafe fn next_signal_handler(
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
             libc::SIG_DFL => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // Name the fault site before dying: a host-side fault here is a litebox bug,
+                    // and the default disposition below otherwise reports only an abort.
+                    let mut buf = [0u8; 160];
+                    let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize];
+                    let sp = context.uc_mcontext.gregs[libc::REG_RSP as usize];
+                    let n = libc::snprintf(
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        c"litebox host fault: sig=%d ip=0x%llx sp=0x%llx addr=0x%llx\n".as_ptr(),
+                        signum,
+                        ip as libc::c_ulonglong,
+                        sp as libc::c_ulonglong,
+                        info.si_addr() as libc::c_ulonglong,
+                    );
+                    libc::write(2, buf.as_ptr().cast(), usize::try_from(n).unwrap_or(0));
+                }
                 // Block this signal and raise.
                 let mut set: libc::sigset_t = core::mem::zeroed();
                 libc::sigemptyset(&raw mut set);
