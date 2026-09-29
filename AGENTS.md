@@ -118,6 +118,36 @@ orphaned prior run was still alive (`taskkill`/`Terminate` loop is now 6 retries
 every driver script here, not a single best-effort call, to actually clear it before starting the
 next run).
 
+## 118th pass, later fixes (all committed; browser Terminal, Mousepad and the XFCE menu now work)
+
+- **Selkies stall** (`a61ed74`, `lazy_file_map.rs`): `exit_group` terminates sibling threads; one died inside the
+  fault handler holding the `std` Mutex, so the exiting process hung in `forget()` and the parent's `wait4`
+  never returned. The table lock now records its owner thread and is taken over once that thread is gone.
+  10/10 selkies starts (was a stall by attempt 2). Found by `cdb -pv` stacks of a stalled run
+  (`.wfgy/pass118_selloop2.ps1`), symbolized with `llvm-symbolizer`.
+- **pty for VTE/xfce4-terminal** (`d1dae93`, `d383f90`, `bb518ca`): master carried across cross-process fork;
+  `O_NONBLOCK`/`O_NDELAY` given at `open("/dev/ptmx")` is now honoured (a blocking master read froze the
+  terminal); `TIOCPKT` packet mode prefixes every master read with status byte 0 (VTE treated the unprefixed
+  first byte as a control packet and dropped all output); fstat of a pty slave matches `stat("/dev/pts/N")`
+  so `ttyname()`/`tty` work; `readlink /proc/self/fd/N` reports the recorded path for fds 0-2.
+- **Per-fork inheritance env vars must be consumed** (`bb518ca`, `take_fork_env`): `LITEBOX_INTERNAL_FORK_CHILD_
+  {PIPE,FILE,EVENTFD,SHIM}_FDS` were inherited by grandchildren, replaying the parent's stdin pipe over the pty
+  slave at fd 0 (no tty for any foreground command run from a shell). Same class as the lazy-map descriptor
+  var (`ff10543`). Any new per-child env var needs a matching remove after adoption.
+- **Driver artifact, again**: an older `pass118_full*.ps1` driver still alive kills every `litebox_runner` when
+  its `-MaxSeconds` cap hits, including a newer run's. Kill leftover driver powershells before each run
+  (`Get-CimInstance Win32_Process | ? CommandLine -like '*pass118_*'`), and give the driver a cap longer than
+  the time you will need. The driver also waits for 2.5GB free before starting (log file appears late).
+- **Browser driving**: `mcp__chrome-devtools__click` needs a uid, so inject an invisible click-through probe
+  button (`pointer-events:none`, fixed at the wanted x,y) and click it: the real CDP mouse event lands on the
+  video below. `Control+Alt+t` opens the terminal; give it 30s+.
+- **Open**: after a minute or so GTK apps (Mousepad, dialogs) stop reacting to keys and clicks while the panel
+  clock keeps updating; selkies logs `Input X connection was unresponsive; reconnected`. `at-spi2-registryd`
+  exits 127 on every D-Bus activation and `atk-bridge` warns `unknown signature`, suspected to block GTK
+  apps. Separately selkies' host process once died with rc=137 (no marker exit code = killed/crashed at the
+  Windows level); `xproc.rs` now logs `xproc SIGKILL` with target/host pids to tell a guest kill from a crash.
+  `/proc/self/fd/` lists as empty.
+
 ## 117th pass, condensed
 
 `DE_UP` first reached (eager fork + `LANG=C` + event-driven cross-process wake, `dfdfd26`); the

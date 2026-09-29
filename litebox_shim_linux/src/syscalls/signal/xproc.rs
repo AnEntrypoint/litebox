@@ -510,6 +510,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             self.process_table.post(view.index, view.pid, signal);
             return;
         }
+        if signal == Signal::SIGKILL && view.owns_host {
+            litebox_util_log::warn!(
+                target_pid:% = view.pid, target_host:% = view.host_pid, sender_host:% = my_host;
+                "xproc SIGKILL: terminating the target's host process"
+            );
+        }
         if signal == Signal::SIGKILL
             && view.owns_host
             && self.platform.terminate_host_process(
