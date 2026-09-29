@@ -2215,7 +2215,11 @@ fn diag_process_fork_task_resume_probe(
         .stack_size(INITIAL_GUEST_THREAD_STACK_SIZE)
         .spawn(move || {
         const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
-        const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
+        // The root process's worker keeps the 1 ms cadence that drives the device; a child only needs
+        // to advance shared socket timers, and every process polling `Network` at 1 kHz under the
+        // ONE cross-process network lock turns each guest socket operation into a lock convoy
+        // (25 processes queued on `net_lock`, input and ACKs stalling for seconds).
+        const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(25);
         loop {
             let timeout = loop {
                 // Same panic-recovery discipline as `run()`'s own `net_worker` -- see its doc
