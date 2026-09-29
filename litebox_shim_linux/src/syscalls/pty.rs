@@ -117,6 +117,10 @@ impl<Platform: ShimPlatform> PtyPair<Platform> {
     pub(crate) fn set_packet_mode(&self, enabled: bool) {
         self.packet_mode.store(enabled, Ordering::Relaxed);
     }
+
+    pub(crate) fn packet_mode(&self) -> bool {
+        self.packet_mode.load(Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct PtyHalf<Platform: ShimPlatform> {
@@ -583,6 +587,11 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
         }
     }
 
+    pub(crate) fn packet_mode(&self, id: u32) -> bool {
+        self.find(id)
+            .is_some_and(|s| s.packet_mode.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn set_packet_mode(&self, id: u32, v: bool) {
         if let Some(s) = self.find(id) {
             s.packet_mode.store(v, Ordering::Relaxed);
@@ -729,6 +738,13 @@ impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
                 shared.set_locked(p.id, v);
             }
             Self::Shared(id, t) => t.set_locked(*id, v),
+        }
+    }
+
+    pub(crate) fn packet_mode(&self) -> bool {
+        match self {
+            Self::Local(p, _) => p.packet_mode(),
+            Self::Shared(id, t) => t.packet_mode(*id),
         }
     }
 
@@ -948,6 +964,24 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
         buf: &mut [u8],
         shared: &SharedPtyTable<Platform>,
     ) -> Result<usize, Errno> {
+        // TIOCPKT: every master read is prefixed with a status byte (TIOCPKT_DATA = 0 for plain
+        // data). vte enables this and discards the first byte of each read, so omitting it eats
+        // the first byte of every chunk of terminal output.
+        let packet = self.is_master() && self.pty_state(shared).packet_mode();
+        if packet {
+            let Some((head, rest)) = buf.split_first_mut() else {
+                return Ok(0);
+            };
+            let n = match self {
+                PtyEnd::Master(h) | PtyEnd::Slave(h) => h.read(cx, rest)?,
+                PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => h.read(cx, rest, shared)?,
+            };
+            if n == 0 {
+                return Ok(0);
+            }
+            *head = 0;
+            return Ok(n + 1);
+        }
         match self {
             PtyEnd::Master(h) | PtyEnd::Slave(h) => h.read(cx, buf),
             PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => h.read(cx, buf, shared),

@@ -640,9 +640,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // but that would require more invasive changes.
                 platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
             }
-            // Final flush
-            // TODO: keep running until all sockets are closed?
-            while shim.perform_network_interaction().call_again_immediately() {}
+            // Final flush: give in-flight data (a server that wrote its response and exited)
+            // up to two seconds to drain and be acknowledged, like a real kernel that keeps
+            // sending after the owning process is gone.
+            for _ in 0..200 {
+                while shim.perform_network_interaction().call_again_immediately() {}
+                platform.wait_on_tun(Some(core::time::Duration::from_millis(10)));
+            }
         });
         Some(child)
     } else {

@@ -1709,7 +1709,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = self
                         .global
                         .net_lock()
-                        .close(&fd, litebox::net::CloseBehavior::Immediate);
+                        .close(&fd, litebox::net::CloseBehavior::Graceful);
                 }
             } else {
                 let _ = self.do_close(raw_fd);

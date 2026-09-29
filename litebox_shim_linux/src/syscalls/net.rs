@@ -962,6 +962,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
+                    Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
