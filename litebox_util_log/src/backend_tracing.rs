@@ -10,6 +10,9 @@
 //! The macros in this module transform our unified key-value syntax into
 //! tracing's native field syntax using a tt-muncher pattern.
 
+#[cfg(feature = "tracing_subscriber_init")]
+extern crate std;
+
 /// Installs the standard `tracing-subscriber` bootstrap shared by LiteBox's runner binaries:
 /// uptime timestamps, level names, and an `env_var_name`-driven [`tracing_subscriber::EnvFilter`]
 /// (`from_env_lossy`, so a missing/invalid value falls back rather than panicking).
@@ -20,15 +23,50 @@
 /// `tracing_subscriber::fmt().init()`'s own panic behavior).
 #[cfg(feature = "tracing_subscriber_init")]
 pub fn init_env_filtered_subscriber(env_var_name: &str) {
+    use std::io::IsTerminal as _;
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(EventStderr::default)
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
                 .with_env_var(env_var_name)
                 .from_env_lossy(),
         )
         .init();
+}
+
+/// A stderr writer that buffers one formatted log event and emits it as a single `write`.
+///
+/// `tracing_subscriber::fmt` issues several `Write` calls per event (timestamp, level, target,
+/// fields, newline). With guests running as separate host processes sharing one stderr, those
+/// pieces from different processes interleave mid-line and a trace becomes unreadable. One
+/// `write_all` per event (at most `PIPE_BUF` bytes is atomic on a pipe, and `O_APPEND` files are
+/// atomic per call) keeps each event whole.
+#[cfg(feature = "tracing_subscriber_init")]
+#[derive(Default)]
+struct EventStderr(std::vec::Vec<u8>);
+
+#[cfg(feature = "tracing_subscriber_init")]
+impl std::io::Write for EventStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tracing_subscriber_init")]
+impl Drop for EventStderr {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            use std::io::Write as _;
+            let _ = std::io::stderr().write_all(&self.0);
+        }
+    }
 }
 
 impl crate::Level {

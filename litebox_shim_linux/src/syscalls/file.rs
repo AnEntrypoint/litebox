@@ -6216,7 +6216,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         litebox_util_log::debug!(
             tid:% = self.tid.get(),
-            ready_count:% = ready_count;
+            ready_count:% = ready_count,
+            revents:? = set
+                .revents_with_fds()
+                .map(|(fd, e)| {
+                    let kind = super::epoll::EpollDescriptor::try_from(
+                        &self.files.borrow(),
+                        fd.reinterpret_as_unsigned() as usize,
+                    )
+                    .map_or("none", |d| d.kind());
+                    (fd, kind, e.bits())
+                })
+                .collect::<alloc::vec::Vec<_>>();
             "sys_ppoll: returning"
         );
         Ok(ready_count)

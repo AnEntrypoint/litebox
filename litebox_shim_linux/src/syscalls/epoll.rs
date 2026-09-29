@@ -56,6 +56,22 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
+    /// The variant's name, for diagnostics.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Eventfd(_) => "eventfd",
+            Self::Epoll(_) => "epoll",
+            Self::File(_) => "file",
+            Self::Socket(_) => "socket",
+            Self::Pipe(_) => "pipe",
+            Self::Unix(_) => "unix",
+            Self::Pty(_) => "pty",
+            Self::Signalfd(_) => "signalfd",
+            Self::Timerfd(_) => "timerfd",
+            Self::Netlink(_) => "netlink",
+        }
+    }
+
     pub fn try_from(files: &FilesState<Platform, FS>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
@@ -967,9 +983,17 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 // above. `Self::wait` detects a stdin fd up front (via `has_stdin_fd`) and falls
                 // back to bounded periodic re-polling for the whole set whenever one is present,
                 // rather than relying on an observer this arm can never actually register.
-                poll_descriptor
+                let polled = poll_descriptor
                     .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    .unwrap_or(Events::NVAL);
+                litebox_util_log::trace!(
+                    fd:% = entry.fd,
+                    kind:% = poll_descriptor.kind(),
+                    mask:? = entry.mask.bits(),
+                    revents:? = polled.bits();
+                    "poll scan"
+                );
+                polled
             } else {
                 Events::NVAL
             };

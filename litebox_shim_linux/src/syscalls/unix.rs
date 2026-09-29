@@ -1187,9 +1187,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let is_read_shutdown = recv_channel.is_shutdown();
         let is_peer_write_shutdown = recv_channel.is_peer_shutdown();
         let is_write_shutdown = connected_send_channel.is_shutdown();
+        // Linux reports `POLLHUP` once the socket is shut down in BOTH directions, which is also
+        // what happens to the survivor when its peer is closed (`unix_release_sock` sets the
+        // peer's `sk_shutdown` to `SHUTDOWN_MASK`). Code such as D-Bus's babysitter watches its
+        // parent socket for exactly that and ignores plain `POLLIN`; without `HUP` it never
+        // notices the parent went away and re-polls a permanently-readable fd forever.
+        let peer_closed = is_peer_write_shutdown && connected_send_channel.is_peer_shutdown();
         if is_read_shutdown || is_peer_write_shutdown {
             events |= Events::RDHUP | Events::IN;
-            if is_write_shutdown {
+            if is_write_shutdown || peer_closed {
                 events |= Events::HUP;
             }
         }

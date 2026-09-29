@@ -3091,6 +3091,14 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         syscall_callback as *const () as usize
     }
 
+    fn env_flag(&self, name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+    }
+
+    fn env_value(&self, name: &str) -> Option<std::string::String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    }
+
     fn get_vdso_address(&self) -> Option<usize> {
         // Enabling VDSO on x86 causes glibc to not set a restorer in signal
         // handlers, which we do not currently support. Disable VDSO for
