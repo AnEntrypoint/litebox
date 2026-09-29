@@ -107,6 +107,11 @@ pub(crate) struct SysvShmSegment {
     /// Set by `shmctl(IPC_RMID)`. Real Linux keeps a removed segment alive until the last
     /// detach, and so does this.
     removed: bool,
+    /// Creator's uid/gid and the permission bits from `shmget`, reported by `IPC_STAT` (the X
+    /// server's MIT-SHM `ShmAttach` checks them against the client).
+    uid: u32,
+    gid: u32,
+    mode: u32,
 }
 
 /// Realistic upper bound on simultaneously live SysV shm segments in one guest session (X11's
@@ -247,6 +252,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     key,
                     attaches: 0,
                     removed: false,
+                    uid: self.creds().euid,
+                    gid: self.creds().egid,
+                    mode: u32::try_from(shmflg & 0o777).unwrap_or(0o600),
                 },
             )
             .map_err(|_| Errno::ENOMEM)?;
@@ -398,6 +406,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let size = seg.size;
                 for i in 0..48isize {
                     let _ = buf.write_at_offset::<Platform>(i, 0u8);
+                }
+                // `struct ipc64_perm`: key, uid, gid, cuid, cgid (i32/u32 each), then mode.
+                for (off, v) in [
+                    (0isize, seg.key as u32),
+                    (4, seg.uid),
+                    (8, seg.gid),
+                    (12, seg.uid),
+                    (16, seg.gid),
+                    (20, seg.mode),
+                ] {
+                    for (i, b) in v.to_le_bytes().iter().enumerate() {
+                        let _ = buf.write_at_offset::<Platform>(off + i as isize, *b);
+                    }
                 }
                 for (i, b) in size.to_le_bytes().iter().enumerate() {
                     let off = 48isize + isize::try_from(i).unwrap();

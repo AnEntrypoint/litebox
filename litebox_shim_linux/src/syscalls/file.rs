@@ -5561,6 +5561,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .flatten()?;
                 Ok(0)
             }
+            IoctlArg::FIONREAD(out) => {
+                let n = files
+                    .with_socket(&self.global, u32::try_from(desc).map_err(|_| Errno::EBADF)?, |fd| {
+                        let proxy = self.global.get_proxy(fd)?;
+                        Ok(proxy.pending_rx_bytes())
+                    }, |_unix| Err(Errno::EINVAL))?;
+                out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             IoctlArg::FIONCLEX => {
                 self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
                 set_file_descriptor_flags(

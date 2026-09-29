@@ -292,6 +292,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
+    /// Bytes received and not yet read (`FIONREAD`): the queued stream bytes, or the size of the
+    /// next datagram.
+    #[must_use]
+    pub fn pending_rx_bytes(&self) -> usize {
+        match self {
+            NetworkProxy::Stream(channel) => channel.inner.rx_cons.lock().occupied_len(),
+            NetworkProxy::Datagram(channel) => channel
+                .inner
+                .rx_cons
+                .lock()
+                .iter()
+                .next()
+                .map_or(0, |m| m.data.len()),
+            NetworkProxy::Raw => 0,
+        }
+    }
+
     /// Check if there is data pending in the TX buffer to be sent.
     pub(super) fn has_pending_tx(&self) -> bool {
         match self {

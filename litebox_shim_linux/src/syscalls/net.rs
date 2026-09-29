@@ -93,7 +93,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     ///
     /// For `LiteBoxRawFd` sockets, the `inet_op` closure is called with the socket fd.
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
-    fn with_socket<R>(
+    pub(super) fn with_socket<R>(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         sockfd: u32,

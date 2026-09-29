@@ -1883,6 +1883,7 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const FIONCLEX: u32 = 0x5450;
+pub const FIONREAD: u32 = 0x541B;
 pub const FIOASYNC: u32 = 0x5452;
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
@@ -1967,6 +1968,8 @@ pub enum IoctlArg {
     FIOCLEX,
     /// Clear close on exec
     FIONCLEX,
+    /// Bytes waiting to be read
+    FIONREAD(UserPtrMut<i32>),
     /// Enable or disable `O_ASYNC` (`SIGIO` delivery), which is never generated here
     FIOASYNC(UserPtr<i32>),
     /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
@@ -4448,6 +4451,7 @@ impl SyscallRequest {
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         FIONCLEX => IoctlArg::FIONCLEX,
+                        FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
                         FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETRESOURCES => {
                             IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
