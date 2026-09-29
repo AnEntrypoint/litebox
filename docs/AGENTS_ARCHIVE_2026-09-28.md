@@ -573,7 +573,7 @@ a `VirtualQuery` breakdown) and cut the biggest piece; (3) app acceptance from a
 on Windows, then Linux/macOS builds; (4) native kernel-COW fork, then retire `lazy_fork_commit.rs`.
 The PRD (`.gm/prd.yml`, gitignored) carries the full task list.
 
-## 118th pass -- session-client death cascade, full iterative narrative
+## 118th pass -- session-client death cascade, full iterative narrative (SUPERSEDED: it was the driver's own MaxSeconds Terminate loop, see AGENTS.md)
 
 **Bigger, better-evidenced finding this pass, NOT yet root-caused: `xfce4-session` self-terminates
 minutes into a stable run, cascading to kill every client it started.** The original driver
