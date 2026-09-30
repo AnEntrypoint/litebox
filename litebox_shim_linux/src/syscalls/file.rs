@@ -6766,12 +6766,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if sigsetpack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 return Err(Errno::EINVAL);
             }
-            Some(
-                sigsetpack
-                    .sigset
-                    .read_at_offset::<Platform>(0)
-                    .ok_or(Errno::EFAULT)?,
-            )
+            // glibc's `pselect` always passes the pack, with a NULL `sigset` when the caller gave
+            // no mask: the kernel treats that as "leave the mask alone".
+            if sigsetpack.sigset.as_usize() == 0 {
+                None
+            } else {
+                Some(
+                    sigsetpack
+                        .sigset
+                        .read_at_offset::<Platform>(0)
+                        .ok_or(Errno::EFAULT)?,
+                )
+            }
         } else {
             None
         };
