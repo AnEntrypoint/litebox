@@ -506,6 +506,8 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         je      .Lours
         cmp     edx, {EXCEPTION_PRIV_INSTRUCTION}
         je      .Lours
+        cmp     edx, {EXCEPTION_BREAKPOINT}
+        je      .Lours
         // Not one of ours. No TLS read, no stack swap, no Rust.
         mov     eax, {EXCEPTION_CONTINUE_SEARCH}
         ret
@@ -667,6 +669,7 @@ unsafe extern "system" fn vectored_exception_handler_entry(
         EXCEPTION_SINGLE_STEP = const Win32_Foundation::EXCEPTION_SINGLE_STEP,
         EXCEPTION_ILLEGAL_INSTRUCTION = const Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION,
         EXCEPTION_PRIV_INSTRUCTION = const 0xC000_0096_u32.cast_signed(),
+        EXCEPTION_BREAKPOINT = const Win32_Foundation::EXCEPTION_BREAKPOINT,
         EXCEPTION_CONTINUE_EXECUTION = const EXCEPTION_CONTINUE_EXECUTION,
         EXCEPTION_CONTINUE_SEARCH = const EXCEPTION_CONTINUE_SEARCH,
         CONTEXT_RIP = const core::mem::offset_of!(
@@ -1073,6 +1076,15 @@ unsafe extern "system" fn vectored_exception_handler(
         // print every occurrence without flooding, and this fires BEFORE the `this_is_in_guest`
         // gate below so it can independently confirm whether that gate itself is the reason the
         // main diagnostic below stays silent for this exception class.
+        if raw_exception_code == Win32_Foundation::EXCEPTION_BREAKPOINT {
+            diag_raw_print(b"[diag-bp-entry] rip=0x", rip as usize, b" rsp=0x", rsp as usize);
+            for slot in 0..192usize {
+                let value = unsafe { core::ptr::read_unaligned((rsp as usize + slot * 8) as *const usize) };
+                if (0x1_0000_0000..0x1_4000_0000).contains(&value) {
+                    diag_raw_print(b"[diag-bp-stack] slot=0x", slot, b" value=0x", value);
+                }
+            }
+        }
         if is_ud_fault {
             let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
             diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
@@ -5496,7 +5508,7 @@ fn find_foreign_claim(
     // `execve` on it, unlike `ClaimOwner`, which can legitimately change mid-lifetime.
     let this_thread = std::thread::current().id();
     let claims = CLAIMED_RANGES.lock().unwrap();
-    claims.iter().find_map(|slot| {
+    let foreign = claims.iter().find_map(|slot| {
         slot.as_ref().and_then(|(claimed, owner, tid, _seq)| {
             (*owner != exclude_owner
                 && *tid != this_thread
@@ -5504,7 +5516,23 @@ fn find_foreign_claim(
                 && claimed.end > range.start)
                 .then(|| (claimed.clone(), *owner))
         })
-    })
+    })?;
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let covering_end = claims.iter().find_map(|slot| {
+            slot.as_ref().and_then(|(claimed, owner, tid, _seq)| {
+                ((*owner == exclude_owner || *tid == this_thread)
+                    && claimed.start <= cursor
+                    && claimed.end > cursor)
+                    .then_some(claimed.end)
+            })
+        });
+        match covering_end {
+            Some(end) => cursor = end,
+            None => return Some(foreign),
+        }
+    }
+    None
 }
 
 /// Real host address ranges backing a live guest OS thread's own Windows stack reservation
@@ -9497,6 +9525,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 Pointer: (&raw mut addr_req).cast::<c_void>(),
             },
         };
+        let requested_protection = prot_flags(initial_permissions);
+        let map_protection = if requested_protection == Win32_Memory::PAGE_NOACCESS {
+            Win32_Memory::PAGE_READONLY
+        } else {
+            requested_protection
+        };
         let mut try_map = |base_addr: *const c_void, constrained: bool| unsafe {
             if constrained {
                 MapViewOfFile3(
@@ -9506,7 +9540,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     0,
                     suggested_range.len(),
                     0,
-                    prot_flags(initial_permissions),
+                    map_protection,
                     &raw mut ext_param,
                     1,
                 )
@@ -9518,7 +9552,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     0,
                     suggested_range.len(),
                     0,
-                    prot_flags(initial_permissions),
+                    map_protection,
                     core::ptr::null_mut(),
                     0,
                 )
@@ -9543,7 +9577,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             let err = unsafe { GetLastError() };
             litebox_util_log::debug!(
                 base_addr:% = base_addr as usize, len:% = suggested_range.len(),
-                fixed_address_behavior:? = fixed_address_behavior, win32_err:% = err;
+                fixed_address_behavior:? = fixed_address_behavior, win32_err:% = err,
+                protection:% = map_protection, permissions:? = initial_permissions;
                 "map_shared_memory: DIAG MapViewOfFile3 failed"
             );
             litebox_util_log::error!(
@@ -9565,6 +9600,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 return Err(SharedMemoryError::AddressInUse);
             }
             return Err(SharedMemoryError::OutOfMemory);
+        }
+        if map_protection != requested_protection {
+            let mut previous: u32 = 0;
+            let protected = unsafe {
+                VirtualProtect(view.Value, suggested_range.len(), requested_protection, &raw mut previous)
+            } != 0;
+            if !protected {
+                unsafe { UnmapViewOfFileEx(view, 0) };
+                return Err(SharedMemoryError::OutOfMemory);
+            }
         }
         // Sample the mapped content. The scanout path is already instrumented; this
         // covers the CLIENT surface buffers, which is what decides whether weston
