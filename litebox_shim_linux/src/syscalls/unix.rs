@@ -1042,7 +1042,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if !read_ring.is_empty() {
             events |= Events::IN;
         }
-        if !write_ring.is_full() {
+        if write_ring.writable() {
             events |= Events::OUT;
         }
         events
@@ -3631,7 +3631,7 @@ pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 64;
 /// its call site in `SharedView::send`): it degrades to a real short write
 /// of the first `SHARED_UNIX_CONN_BUF` bytes, matching a real kernel socket's own short-write
 /// behavior on an over-sized single `write(2)`, rather than looping on `EAGAIN` forever.
-const SHARED_UNIX_CONN_BUF: usize = 2048;
+const SHARED_UNIX_CONN_BUF: usize = 4096;
 
 const CONN_SLOT_EMPTY: u32 = 0;
 const CONN_SLOT_OCCUPIED: u32 = 1;
@@ -3661,6 +3661,8 @@ struct RingCursor {
     /// EOF once `write_pos == read_pos` as well.
     write_shutdown: bool,
     fd_mail: [RingFdMail; RING_FD_MAIL_ENTRIES],
+    blocked_need: usize,
+    blocked_fd: bool,
 }
 
 impl Default for RingCursor {
@@ -3670,12 +3672,14 @@ impl Default for RingCursor {
             read_pos: 0,
             write_shutdown: false,
             fd_mail: [RingFdMail::EMPTY; RING_FD_MAIL_ENTRIES],
+            blocked_need: 0,
+            blocked_fd: false,
         }
     }
 }
 
 const RING_FD_MAIL_ENTRIES: usize = 4;
-const RING_FD_MAIL_SPEC_BYTES: usize = 160;
+const RING_FD_MAIL_SPEC_BYTES: usize = 640;
 
 /// Separates the per-descriptor specs inside one [`RingFdMail`]; never occurs in a path.
 pub(crate) const RING_FD_SPEC_SEPARATOR: char = '\u{1e}';
@@ -3771,11 +3775,15 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let free = SHARED_UNIX_CONN_BUF - used;
         if data.len() > free {
+            cursor.blocked_need = data.len();
+            cursor.blocked_fd = fd_specs.is_some();
             return false;
         }
         if let Some(specs) = fd_specs {
             let at = cursor.write_pos;
             if !cursor.post_fds(at, specs) {
+                cursor.blocked_need = data.len();
+                cursor.blocked_fd = true;
                 return false;
             }
         }
@@ -3784,7 +3792,17 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
                 .store(*b, Ordering::Relaxed);
         }
         cursor.write_pos = cursor.write_pos.wrapping_add(data.len());
+        cursor.blocked_need = 0;
+        cursor.blocked_fd = false;
         true
+    }
+
+    pub(crate) fn writable(&self) -> bool {
+        let cursor = self.cursor.lock();
+        let free = SHARED_UNIX_CONN_BUF - cursor.write_pos.wrapping_sub(cursor.read_pos);
+        free > 0
+            && free >= cursor.blocked_need
+            && (!cursor.blocked_fd || cursor.fd_mail.iter().any(|m| !m.used))
     }
 
     /// Partial write: writes as many LEADING bytes of `data` as currently fit, returning the
