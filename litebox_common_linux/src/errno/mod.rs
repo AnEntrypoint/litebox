@@ -407,6 +407,7 @@ impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
             litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
             litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
             litebox::platform::page_mgmt::PermissionUpdateError::Denied => Errno::EACCES,
+            litebox::platform::page_mgmt::PermissionUpdateError::OutOfMemory => Errno::ENOMEM,
             _ => unimplemented!(),
         }
     }

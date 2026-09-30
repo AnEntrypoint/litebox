@@ -2703,6 +2703,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         // `ENOPROTOOPT`, not `EINVAL` -- same contract as `sys_getsockopt`, whose own comment
         // records the failure that exposed it.
+        const SOL_SOCKET: u32 = 1;
+        const SO_PASSCRED: u32 = 16;
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            return Ok(());
+        }
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::ENOPROTOOPT

@@ -477,6 +477,8 @@ pub enum PermissionUpdateError {
     /// comment).
     #[error("platform refused this permission transition")]
     Denied,
+    #[error("out of memory while committing pages")]
+    OutOfMemory,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

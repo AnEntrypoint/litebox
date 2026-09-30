@@ -1076,6 +1076,8 @@ unsafe extern "system" fn vectored_exception_handler(
         if is_ud_fault {
             let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
             diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
+            let insn_bytes = unsafe { core::ptr::read_unaligned(rip as *const u64) };
+            diag_raw_print(b"[diag-ud-entry]   insn_bytes=0x", insn_bytes as usize, b" rip=0x", rip as usize);
             // Encode the tri-state as 0/1/2 (not `this_is_in_guest as usize`'s collapsed 0/1):
             // 2 means "no TLS slot -- could not determine", never conflated with a confirmed 0.
             diag_raw_print(
@@ -7962,6 +7964,8 @@ macro_rules! debug_assert_alignment {
 /// collision unrepresentable rather than merely unlikely.
 const HOST_ALLOCATOR_REGION_MIN: usize = 0x7FF0_0000_0000;
 
+const RESERVE_ONLY_THRESHOLD: usize = 64 << 20;
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
@@ -8035,6 +8039,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // be relocated to the very bottom of the guest range -- see the `hint_foreign_claim`
         // fallback below for the packing that causes. Passing the discarded hint as `floor`
         // keeps the retry in the same neighbourhood instead.
+        let reserve_only = initial_permissions.is_empty()
+            && suggested_range.len() >= RESERVE_ONLY_THRESHOLD;
         let reserve_and_commit = |r: core::ops::Range<usize>,
                                   flags: Win32_Memory::PAGE_PROTECTION_FLAGS,
                                   floor: usize|
@@ -8125,6 +8131,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 core::ptr::null_mut()
             } else {
                 let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
+                if reserve_only {
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    let queried = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            commit_addr,
+                            &raw mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        )
+                    } != 0;
+                    return if queried && mbi.State != Win32_Memory::MEM_FREE {
+                        commit_addr
+                    } else {
+                        core::ptr::null_mut()
+                    };
+                }
                 if diag_mm_enabled() {
                     litebox_util_log::debug!(
                         start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
@@ -8371,6 +8392,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 }
             } else {
                 let diag_requested_start = suggested_range.start;
+                let mut out_of_commit = false;
                 process_memory_range_by_regions(
                     suggested_range,
                     |r, state| -> Result<bool, std::convert::Infallible> {
@@ -8704,16 +8726,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                             "diag-commit: VirtualAlloc2(MEM_COMMIT) over reserved range"
                                         );
                                     }
-                                    unsafe {
-                                        VirtualAlloc2(
-                                            GetCurrentProcess(),
-                                            r.start as *mut c_void,
-                                            r.len(),
-                                            Win32_Memory::MEM_COMMIT,
-                                            prot_flags(initial_permissions),
-                                            core::ptr::null_mut(),
-                                            0,
-                                        )
+                                    if reserve_only {
+                                        r.start as *mut c_void
+                                    } else {
+                                        unsafe {
+                                            VirtualAlloc2(
+                                                GetCurrentProcess(),
+                                                r.start as *mut c_void,
+                                                r.len(),
+                                                Win32_Memory::MEM_COMMIT,
+                                                prot_flags(initial_permissions),
+                                                core::ptr::null_mut(),
+                                                0,
+                                            )
+                                        }
                                     }
                                 };
                                 !ptr.is_null()
@@ -8729,7 +8755,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 state
                             ),
                         };
-                        // Prefetch the memory range if requested
+                        if !ok {
+                            let err = unsafe { GetLastError() };
+                            if err == windows_sys::Win32::Foundation::ERROR_COMMITMENT_LIMIT
+                                || err == windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY
+                                || err == windows_sys::Win32::Foundation::ERROR_COMMITMENT_MINIMUM
+                            {
+                                out_of_commit = true;
+                                return Ok(true);
+                            }
+                        }
                         if ok && populate_pages_immediately {
                             do_prefetch_on_range(r.start, r.len());
                         }
@@ -8737,6 +8772,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
+                if out_of_commit {
+                    litebox_util_log::error!(
+                        start:% = diag_requested_start, size:% = size;
+                        "allocate_pages: commit charge exhausted on fixed range, reporting OutOfMemory"
+                    );
+                    return Err(AllocationError::OutOfMemory);
+                }
                 // Claimed for EVERY behavior, not just `Replace`.
                 //
                 // `claim_range`'s own doc comment already states that `Hint`-mode allocations
@@ -9024,37 +9066,54 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let _guard = VIRTUAL_PROTECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut denied = false;
         for range in protect_now {
-        process_memory_range_by_regions(
-            range,
-            |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_eq!(
-                    state,
-                    Win32_Memory::MEM_COMMIT,
-                    "Trying to change permissions on a non-committed region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                let mut old_protect: u32 = 0;
-                let ok = unsafe {
-                    VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
-                } != 0;
-                if diag_mm_enabled() {
-                    litebox_util_log::debug!(
-                        pid:% = std::process::id(),
-                        tid:? = std::thread::current().id(),
-                        start:% = r.start,
-                        end:% = r.end,
-                        new_flags:% = flags,
-                        old_protect:% = old_protect,
-                        ok:% = ok;
-                        "diag-vprotect: update_permissions VirtualProtect"
-                    );
-                }
-                Ok(ok)
-            },
-        )
-        .expect("update_permissions failed");
+            process_memory_range_by_regions(
+                range,
+                |r, state| -> Result<bool, std::convert::Infallible> {
+                    if state == Win32_Memory::MEM_RESERVE {
+                        if flags == Win32_Memory::PAGE_NOACCESS {
+                            return Ok(true);
+                        }
+                        let committed = unsafe {
+                            VirtualAlloc2(
+                                GetCurrentProcess(),
+                                r.start as *mut c_void,
+                                r.len(),
+                                Win32_Memory::MEM_COMMIT,
+                                flags,
+                                core::ptr::null_mut(),
+                                0,
+                            )
+                        };
+                        if committed.is_null() {
+                            denied = true;
+                        }
+                        return Ok(true);
+                    }
+                    let mut old_protect: u32 = 0;
+                    let ok = unsafe {
+                        VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
+                    } != 0;
+                    if diag_mm_enabled() {
+                        litebox_util_log::debug!(
+                            pid:% = std::process::id(),
+                            tid:? = std::thread::current().id(),
+                            start:% = r.start,
+                            end:% = r.end,
+                            new_flags:% = flags,
+                            old_protect:% = old_protect,
+                            ok:% = ok;
+                            "diag-vprotect: update_permissions VirtualProtect"
+                        );
+                    }
+                    Ok(ok)
+                },
+            )
+            .expect("update_permissions failed");
+        }
+        if denied {
+            return Err(litebox::platform::page_mgmt::PermissionUpdateError::OutOfMemory);
         }
         Ok(())
     }
