@@ -1041,6 +1041,24 @@ impl<
                         }
                     }
                 }
+                // The cached lower fd was opened by whoever touched the path first -- often
+                // read-only -- and a device (`/dev/null`) can never migrate into the upper layer, so
+                // a later writer would fail with `EISDIR`. Write through a fresh write-capable
+                // lower fd instead; only regular files migrate.
+                if !matches!(self.ensure_lower_contains(path.as_str()), Ok(FileType::RegularFile)) {
+                    let write_fd = self
+                        .lower
+                        .open(path.as_str(), OFlags::WRONLY, Mode::empty())
+                        .map_err(|_| WriteError::NotForWriting)?;
+                    let result = self.lower.write(&write_fd, buf, offset);
+                    let _ = self.lower.close(&write_fd);
+                    if let Ok(n) = result
+                        && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
+                    {
+                        e.entry.position.fetch_add(n, SeqCst);
+                    }
+                    return result;
+                }
             }
             EntryX::Tombstone => unreachable!(),
         }
