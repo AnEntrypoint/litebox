@@ -641,7 +641,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                     GlobalState {
                         platform: self.platform,
                         _fs: core::marker::PhantomData,
-                        bootstrap_process: once_cell::race::OnceBox::new(),
                         pipes: Pipes::new(),
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
@@ -684,6 +683,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             pty_registry: my_pty_registry,
             daemon_pty_masters: my_daemon_pty_masters,
             xproc_local: my_xproc_local,
+            bootstrap_process: Arc::new(once_cell::race::OnceBox::new()),
         })
     }
 }
@@ -3223,6 +3223,7 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// holds `Weak` pointers into this process's heap); the cross-process view is
     /// `GlobalState::process_table`.
     pub(crate) xproc_local: Arc<syscalls::signal::xproc::LocalProcessMap<Platform>>,
+    bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
@@ -3243,6 +3244,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             pty_registry: self.pty_registry.clone(),
             daemon_pty_masters: self.daemon_pty_masters.clone(),
             xproc_local: self.xproc_local.clone(),
+            bootstrap_process: self.bootstrap_process.clone(),
         }
     }
 }
@@ -3615,16 +3617,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// (see `Task::sys_memfd_create`) -- guarantees two concurrent calls never collide on the
     /// same path even with an identical (or empty) guest-supplied name.
     next_memfd_id: core::sync::atomic::AtomicU64,
-    /// The first process created by [`LinuxShim::load_program`], set once and kept for the
-    /// lifetime of the shim.
-    ///
-    /// Since real `fork()` (see [`syscalls::process::Process`]) gives each process its own
-    /// [`litebox::mm::PageManager`], there is no longer a single shim-wide page manager -- code
-    /// with a [`Task`]/[`syscalls::process::Process`] in scope reaches its own via
-    /// `task.process().pm`. This field exists solely for the narrow single-process callers (e.g.
-    /// `litebox_runner_snp`'s kernel-context page-fault handler) that have no `Task` in scope and
-    /// only ever run a single bootstrap process, exposed via [`LinuxShim::page_manager`].
-    bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
     /// The one virtual DRM/KMS device's state (`/dev/dri/card0`). Shim-wide, not per-process,
     /// since real DRM device state (allocated buffers, current mode/framebuffer) is genuinely
     /// global -- any process holding a fd to the card sees the same connector/CRTC/buffers, just
