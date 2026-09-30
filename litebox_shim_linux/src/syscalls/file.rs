@@ -6878,6 +6878,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         moved.then_some(())
     }
 
+    /// Text spec another process can rebuild `raw_fd` from, for `SCM_RIGHTS` over a cross-process
+    /// connection: `F|<open flags>|<offset>|<path>` for a regular file, pty slave or plain stdio
+    /// device, `E|<count>|<efd flags>` for an eventfd; `None` for anything that needs shared
+    /// state (pipes, sockets, epoll, pty masters).
+    pub(crate) fn scm_carry_spec(&self, raw_fd: usize) -> Option<alloc::string::String> {
+        if let Some((path, flags, offset)) = self.carriable_file_for_raw_fd(raw_fd) {
+            return Some(alloc::format!("F|{flags}|{offset}|{path}"));
+        }
+        if let Some((path, flags)) = self.carriable_pty_slave_for_raw_fd(raw_fd) {
+            return Some(alloc::format!("F|{flags}|0|{path}"));
+        }
+        if let Some((count, flags)) = self.carriable_eventfd_for_raw_fd(raw_fd) {
+            return Some(alloc::format!("E|{count}|{flags}"));
+        }
+        if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
+            let (path, flags) = match raw_fd {
+                0 => ("/dev/stdin", OFlags::RDONLY),
+                1 => ("/dev/stdout", OFlags::WRONLY),
+                _ => ("/dev/stderr", OFlags::WRONLY),
+            };
+            return Some(alloc::format!("F|{}|0|{path}", flags.bits()));
+        }
+        None
+    }
+
+    /// Receiving half of [`Self::scm_carry_spec`]: builds the descriptor in this process and
+    /// returns its raw fd number.
+    pub(crate) fn rebuild_carried_fd(&self, spec: &str, cloexec: bool) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        let mut parts = spec.splitn(4, '|');
+        let kind = parts.next().ok_or(Errno::EINVAL)?;
+        let first: u64 = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or(Errno::EINVAL)?;
+        let raw = match kind {
+            "F" => {
+                let offset: u64 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let path = parts.next().ok_or(Errno::EINVAL)?;
+                let mut flags = OFlags::from_bits_truncate(u32::try_from(first).map_err(|_| Errno::EINVAL)?)
+                    & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+                if cloexec {
+                    flags |= OFlags::CLOEXEC;
+                }
+                let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty())?;
+                if offset != 0 {
+                    let offset = isize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+                    self.sys_lseek(
+                        i32::try_from(raw).map_err(|_| Errno::EINVAL)?,
+                        offset,
+                        litebox::fs::SeekWhence::RelativeToBeginning,
+                    )?;
+                }
+                raw
+            }
+            "E" => {
+                let flags: u32 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let mut flags = litebox_common_linux::EfdFlags::from_bits_truncate(flags);
+                if cloexec {
+                    flags |= litebox_common_linux::EfdFlags::CLOEXEC;
+                }
+                self.sys_eventfd2(u32::try_from(first).map_err(|_| Errno::EINVAL)?, flags)?
+            }
+            _ => return Err(Errno::EINVAL),
+        };
+        usize::try_from(raw).map_err(|_| Errno::EINVAL)
+    }
+
     /// Reopen `path` at exactly `target_fd`, positioned at `offset`.
     ///
     /// How a cross-process `fork()` child restores an inherited regular-file fd. Creation flags

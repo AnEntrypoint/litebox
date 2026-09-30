@@ -1935,8 +1935,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// real Linux `SCM_RIGHTS` semantics. Any cmsg that isn't `SOL_SOCKET`/`SCM_RIGHTS` is
     /// ignored (Linux itself only interprets a handful of `SOL_SOCKET`-level cmsg types; none of
     /// the others litebox doesn't otherwise support are safety-relevant to reject outright).
-    fn resolve_scm_rights_fds(&self, control: &[u8]) -> Result<AnyDupFds<Platform, FS>, Errno> {
+    fn resolve_scm_rights_fds(
+        &self,
+        control: &[u8],
+    ) -> Result<(AnyDupFds<Platform, FS>, alloc::vec::Vec<Option<alloc::string::String>>), Errno>
+    {
         let mut fds = alloc::vec::Vec::new();
+        let mut specs = alloc::vec::Vec::new();
         let mut offset = 0usize;
         while offset + size_of::<CmsgHdr>() <= control.len() {
             let hdr = CmsgHdr::read_from_bytes(&control[offset..offset + size_of::<CmsgHdr>()])
@@ -2026,12 +2031,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         )
                         .map_err(|_| Errno::EBADF)?
                         .ok_or(Errno::EBADF)?;
+                    drop(files);
+                    specs.push(self.scm_carry_spec(raw_fd));
                     fds.push(any);
                 }
             }
             offset += cmsg_align(hdr.cmsg_len);
         }
-        Ok(fds)
+        Ok((fds, specs))
     }
 
     fn do_sendmsg(
@@ -2091,8 +2098,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                let fds = self.resolve_scm_rights_fds(&control)?;
-                file.sendmsg(self, &data, flags, unix_addr, fds)
+                let (fds, fd_specs) = self.resolve_scm_rights_fds(&control)?;
+                file.sendmsg(self, &data, flags, unix_addr, fds, fd_specs)
             },
             |netlink| {
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
@@ -2515,7 +2522,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
         let mut written_fds = alloc::vec::Vec::new();
         for fd in fds {
-            match fd.insert_into(&self.global.litebox, &self.files.borrow(), cloexec) {
+            let inserted = match fd {
+                AnyDupFd::Carried(spec) => self.rebuild_carried_fd(&spec, cloexec),
+                other => other.insert_into(&self.global.litebox, &self.files.borrow(), cloexec),
+            };
+            match inserted {
                 Ok(raw_fd) => written_fds.push(raw_fd),
                 Err(Errno::EMFILE) => {}
                 Err(e) => return Err(e),

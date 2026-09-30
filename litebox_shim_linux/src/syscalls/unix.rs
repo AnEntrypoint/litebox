@@ -658,6 +658,9 @@ pub(super) enum AnyDupFd<Platform: ShimPlatform, FS: ShimFS> {
     Signalfd(litebox::fd::TypedFd<crate::syscalls::signalfd::SignalfdSubsystem<Platform>>),
     Timerfd(litebox::fd::TypedFd<crate::syscalls::timerfd::TimerfdSubsystem<Platform>>),
     Netlink(litebox::fd::TypedFd<crate::syscalls::netlink::NetlinkSocketSubsystem>),
+    /// A descriptor that crossed a process boundary as a text spec (see `RingFdMail`); the
+    /// receiving task rebuilds it by name instead of `insert_into`.
+    Carried(String),
 }
 
 /// A batch of `SCM_RIGHTS`-donated fds, as returned alongside a message's byte payload.
@@ -702,6 +705,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
             AnyDupFd::Signalfd(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Timerfd(fd) => go(litebox, files, fd, cloexec),
             AnyDupFd::Netlink(fd) => go(litebox, files, fd, cloexec),
+            AnyDupFd::Carried(_) => return Err(Errno::EINVAL),
         };
         // `insert_raw_fd` only fails once the *receiver's* own `RLIMIT_NOFILE` is exceeded --
         // matches real Linux's `recvmsg` behavior of closing an over-limit donated fd and
@@ -719,6 +723,9 @@ struct Message<Platform: ShimPlatform, FS: ShimFS> {
     /// message's data never sees these fds at all -- see `do_recvmsg`'s own delivery-on-first-
     /// byte logic in `net.rs`).
     fds: Vec<AnyDupFd<Platform, FS>>,
+    /// One text spec per entry of `fds` that a process other than the sender's can rebuild, or
+    /// `None` when that descriptor cannot cross a process boundary.
+    fd_specs: Vec<Option<String>>,
 }
 
 /// The two ways a [`UnixConnectedStream`] moves bytes to/from its peer.
@@ -876,14 +883,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// `EAGAIN`-then-retry path); a byte stream degrades to a genuine short write only for a
     /// single message bigger than the whole ring, a record-framed slot refuses one (`EMSGSIZE`).
     fn send(&self, msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
-        if !msg.fds.is_empty() {
-            litebox_util_log::warn!(
-                slot:% = self.slot, n_fds:% = msg.fds.len();
-                "unix socket: SCM_RIGHTS over a cross-process connection is not supported; \
-                 refusing the send with EOPNOTSUPP rather than dropping the fds"
-            );
-            return Err((msg, Errno::EOPNOTSUPP));
-        }
+        let fd_specs = if msg.fds.is_empty() {
+            None
+        } else {
+            let specs: Option<Vec<&str>> = msg.fd_specs.iter().map(|s| s.as_deref()).collect();
+            let joined = specs
+                .filter(|s| s.len() == msg.fds.len())
+                .map(|s| s.join("\u{1e}"))
+                .filter(|s| s.len() <= RING_FD_MAIL_SPEC_BYTES);
+            let Some(joined) = joined else {
+                litebox_util_log::warn!(
+                    slot:% = self.slot, n_fds:% = msg.fds.len();
+                    "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
+                     files, pty slaves and eventfds; refusing the send with EOPNOTSUPP rather \
+                     than dropping the fds"
+                );
+                return Err((msg, Errno::EOPNOTSUPP));
+            };
+            Some(joined)
+        };
+        let fd_specs = fd_specs.as_deref();
         let (_, write_ring) = self.rings();
         if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
         {
@@ -893,7 +912,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
                 return Err((msg, Errno::EMSGSIZE));
             }
-            return if write_ring.try_write_record(&msg.data) {
+            return if write_ring.try_write_record_with_fds(&msg.data, fd_specs) {
                 self.poke_peer();
                 Ok(msg.data.len())
             } else {
@@ -904,7 +923,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             return Ok(0);
         }
         if msg.data.len() > SHARED_UNIX_CONN_BUF {
-            let n = write_ring.try_write(&msg.data[..SHARED_UNIX_CONN_BUF]);
+            let n = write_ring.try_write_with_fds(&msg.data[..SHARED_UNIX_CONN_BUF], fd_specs);
             return if n == 0 {
                 Err((msg, Errno::EAGAIN))
             } else {
@@ -912,7 +931,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 Ok(n)
             };
         }
-        if !write_ring.try_write_all(&msg.data) {
+        if !write_ring.try_write_all_with_fds(&msg.data, fd_specs) {
             return Err((msg, Errno::EAGAIN));
         }
         litebox_util_log::debug!(
@@ -935,19 +954,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         }
         let (read_ring, _) = self.rings();
         let got = if self.slot_ref().framed.load(Ordering::Acquire) {
-            read_ring.try_read_record(buf)
+            read_ring.try_read_record_with_fds(buf)
         } else {
-            let n = read_ring.try_read(buf);
-            (n > 0).then_some(n)
+            let (n, specs) = read_ring.try_read_with_fds(buf);
+            (n > 0).then_some((n, specs))
         };
-        if let Some(n) = got {
+        if let Some((n, specs)) = got {
             litebox_util_log::debug!(
                 slot:% = self.slot, is_client:% = self.is_client, total_read:% = n,
                 prefix_hex:? = &buf[..n.min(4096)];
                 "diag-unix-shared-read-bytes"
             );
             self.poke_peer();
-            return Ok((n, Vec::new()));
+            return Ok((n, specs.into_iter().map(AnyDupFd::Carried).collect()));
         }
         if self.peer_gone() && read_ring.is_empty() {
             return Err(TryOpError::Other(Errno::ESHUTDOWN));
@@ -1996,10 +2015,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
         fds: Vec<AnyDupFd<Platform, FS>>,
+        fd_specs: Vec<Option<String>>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message {
             data: buf.to_vec(),
             fds,
+            fd_specs,
         });
         wait_on_events_polling(
             &cx.with_timeout(timeout),
@@ -2682,7 +2703,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        self.sendmsg(task, buf, flags, addr, Vec::new())
+        self.sendmsg(task, buf, flags, addr, Vec::new(), Vec::new())
     }
 
     /// `sendto`'s own superset: also carries `SCM_RIGHTS` fds (empty for the plain `sendto`/
@@ -2698,6 +2719,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
         fds: Vec<AnyDupFd<Platform, FS>>,
+        fd_specs: Vec<Option<String>>,
     ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
@@ -2709,7 +2731,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr, fds)
+                stream.sendto(
+                    &task.wait_cx(),
+                    timeout,
+                    buf,
+                    is_nonblocking,
+                    addr,
+                    fds,
+                    fd_specs,
+                )
             }
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr)
@@ -3389,7 +3419,7 @@ pub(crate) struct SharedByteRing<Platform: ShimPlatform> {
     buf: [AtomicU8; SHARED_UNIX_CONN_BUF],
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct RingCursor {
     write_pos: usize,
     read_pos: usize,
@@ -3397,6 +3427,85 @@ struct RingCursor {
     /// `is_shutdown` -- queued bytes remain readable after this is set; a reader only observes
     /// EOF once `write_pos == read_pos` as well.
     write_shutdown: bool,
+    fd_mail: [RingFdMail; RING_FD_MAIL_ENTRIES],
+}
+
+impl Default for RingCursor {
+    fn default() -> Self {
+        Self {
+            write_pos: 0,
+            read_pos: 0,
+            write_shutdown: false,
+            fd_mail: [RingFdMail::EMPTY; RING_FD_MAIL_ENTRIES],
+        }
+    }
+}
+
+const RING_FD_MAIL_ENTRIES: usize = 4;
+const RING_FD_MAIL_SPEC_BYTES: usize = 160;
+
+/// Separates the per-descriptor specs inside one [`RingFdMail`]; never occurs in a path.
+pub(crate) const RING_FD_SPEC_SEPARATOR: char = '\u{1e}';
+
+/// Descriptors sent with the message whose first byte sits at stream position `offset`, described
+/// as text specs the receiving process rebuilds by name (file path, eventfd state) because a
+/// descriptor-table handle cannot cross a process boundary.
+#[derive(Clone, Copy)]
+struct RingFdMail {
+    used: bool,
+    offset: usize,
+    len: usize,
+    spec: [u8; RING_FD_MAIL_SPEC_BYTES],
+}
+
+impl RingFdMail {
+    const EMPTY: Self = Self {
+        used: false,
+        offset: 0,
+        len: 0,
+        spec: [0; RING_FD_MAIL_SPEC_BYTES],
+    };
+}
+
+impl RingCursor {
+    fn post_fds(&mut self, offset: usize, specs: &str) -> bool {
+        if specs.len() > RING_FD_MAIL_SPEC_BYTES {
+            return false;
+        }
+        let Some(slot) = self.fd_mail.iter_mut().find(|m| !m.used) else {
+            return false;
+        };
+        slot.used = true;
+        slot.offset = offset;
+        slot.len = specs.len();
+        slot.spec[..specs.len()].copy_from_slice(specs.as_bytes());
+        true
+    }
+
+    /// Bytes readable before the next descriptor-bearing message starts, so one read never
+    /// swallows the start of a second message that carries descriptors.
+    fn readable_before_next_fd_mail(&self, avail: usize) -> usize {
+        self.fd_mail
+            .iter()
+            .filter(|m| m.used)
+            .map(|m| m.offset.wrapping_sub(self.read_pos))
+            .filter(|distance| *distance > 0 && *distance < avail)
+            .min()
+            .unwrap_or(avail)
+    }
+
+    fn take_fds_in(&mut self, start: usize, consumed: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for mail in self.fd_mail.iter_mut().filter(|m| m.used) {
+            if mail.offset.wrapping_sub(start) < consumed {
+                mail.used = false;
+                if let Ok(text) = core::str::from_utf8(&mail.spec[..mail.len]) {
+                    out.extend(text.split(RING_FD_SPEC_SEPARATOR).map(String::from));
+                }
+            }
+        }
+        out
+    }
 }
 
 impl<Platform: ShimPlatform> SharedByteRing<Platform> {
@@ -3417,6 +3526,11 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// and is written, or NONE of it is and the buffer is left exactly as it was. Never blocks,
     /// never panics.
     pub(crate) fn try_write_all(&self, data: &[u8]) -> bool {
+        self.try_write_all_with_fds(data, None)
+    }
+
+    /// [`Self::try_write_all`], posting `fd_specs` (see [`RingFdMail`]) against the first byte.
+    pub(crate) fn try_write_all_with_fds(&self, data: &[u8], fd_specs: Option<&str>) -> bool {
         let mut cursor = self.cursor.lock();
         if cursor.write_shutdown {
             return false;
@@ -3425,6 +3539,12 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         let free = SHARED_UNIX_CONN_BUF - used;
         if data.len() > free {
             return false;
+        }
+        if let Some(specs) = fd_specs {
+            let at = cursor.write_pos;
+            if !cursor.post_fds(at, specs) {
+                return false;
+            }
         }
         for (i, b) in data.iter().enumerate() {
             self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
@@ -3440,6 +3560,11 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// the ring is -- a single message bigger than the whole ring -- see
     /// [`SHARED_UNIX_CONN_BUF`]'s doc comment.
     pub(crate) fn try_write(&self, data: &[u8]) -> usize {
+        self.try_write_with_fds(data, None)
+    }
+
+    /// [`Self::try_write`], posting `fd_specs` against the first byte written.
+    pub(crate) fn try_write_with_fds(&self, data: &[u8], fd_specs: Option<&str>) -> usize {
         if data.is_empty() {
             return 0;
         }
@@ -3450,6 +3575,15 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let free = SHARED_UNIX_CONN_BUF - used;
         let n = data.len().min(free);
+        if n == 0 {
+            return 0;
+        }
+        if let Some(specs) = fd_specs {
+            let at = cursor.write_pos;
+            if !cursor.post_fds(at, specs) {
+                return 0;
+            }
+        }
         for (i, b) in data.iter().take(n).enumerate() {
             self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
                 .store(*b, Ordering::Relaxed);
@@ -3463,15 +3597,27 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// [`Self::is_shutdown`]/[`Self::is_empty`], mirroring `channel::ReadEnd::peek_and_consume_one`'s
     /// own EAGAIN-vs-ESHUTDOWN split.
     pub(crate) fn try_read(&self, out: &mut [u8]) -> usize {
+        self.try_read_with_fds(out).0
+    }
+
+    /// [`Self::try_read`], also returning the descriptor specs posted against the bytes read. A
+    /// read stops short of the start of a later descriptor-bearing message.
+    pub(crate) fn try_read_with_fds(&self, out: &mut [u8]) -> (usize, Vec<String>) {
         let mut cursor = self.cursor.lock();
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
-        let n = out.len().min(avail);
+        let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
         for (i, slot) in out.iter_mut().take(n).enumerate() {
             *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
                 .load(Ordering::Relaxed);
         }
+        let start = cursor.read_pos;
         cursor.read_pos = cursor.read_pos.wrapping_add(n);
-        n
+        let specs = if n > 0 {
+            cursor.take_fds_in(start, n)
+        } else {
+            Vec::new()
+        };
+        (n, specs)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -3487,19 +3633,27 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// Writes `data` as one record -- a 4-byte little-endian length, then the bytes -- all or
     /// nothing. The message-boundary-preserving form a promoted `SOCK_SEQPACKET` connection uses.
     pub(crate) fn try_write_record(&self, data: &[u8]) -> bool {
+        self.try_write_record_with_fds(data, None)
+    }
+
+    pub(crate) fn try_write_record_with_fds(&self, data: &[u8], fd_specs: Option<&str>) -> bool {
         let Ok(len) = u32::try_from(data.len()) else {
             return false;
         };
         let mut framed = Vec::with_capacity(4 + data.len());
         framed.extend_from_slice(&len.to_le_bytes());
         framed.extend_from_slice(data);
-        self.try_write_all(&framed)
+        self.try_write_all_with_fds(&framed, fd_specs)
     }
 
     /// Consumes one whole record written by [`Self::try_write_record`], copying at most
     /// `out.len()` bytes of it (the rest is discarded, as a datagram read truncates). `None` when
     /// no complete record is queued.
     pub(crate) fn try_read_record(&self, out: &mut [u8]) -> Option<usize> {
+        self.try_read_record_with_fds(out).map(|(n, _)| n)
+    }
+
+    pub(crate) fn try_read_record_with_fds(&self, out: &mut [u8]) -> Option<(usize, Vec<String>)> {
         let mut cursor = self.cursor.lock();
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         if avail < 4 {
@@ -3517,8 +3671,10 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         for (i, b) in out.iter_mut().take(n).enumerate() {
             *b = at(&cursor, 4 + i);
         }
+        let start = cursor.read_pos;
         cursor.read_pos = cursor.read_pos.wrapping_add(4 + len);
-        Some(n)
+        let specs = cursor.take_fds_in(start, 4 + len);
+        Some((n, specs))
     }
 
     pub(crate) fn is_full(&self) -> bool {
