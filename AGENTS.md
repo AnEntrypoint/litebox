@@ -77,6 +77,7 @@ and reopens the lock if the holder is gone (`litebox::fs::ident::set_thread_id_f
 tid is cached per thread and reset in a forked child by `set_process_guest_pid`). Unit tests in
 `litebox/src/sync/rwlock.rs` prove both recovery and that a live holder is never stolen from.
 `pidfd_open` works for children this process forked (pipe read end readable at exit, `waitid(P_PIDFD)`); `waitid` now also reaps cross-process fork children (it used to answer ECHILD for them).
+`/proc/<pid>/fd` works for other processes (listing + readlink; the earlier belief that the fd tables were private was wrong, they live in the shared heap).
 Known gaps (not yet fixed): `ptrace` answers EPERM, IPv6 is served by the IPv4 machinery only,
 `/dev/shm`
 statfs, `/proc/<pid>/fd` for other processes (the per-pid `fds` closures live in that process's private memory),

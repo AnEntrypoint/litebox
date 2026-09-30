@@ -369,6 +369,8 @@ pub enum ProcfsDirHandle {
     Pid(i32),
     /// `/proc/<pid>/task`: one subdirectory per live thread id.
     PidTask(i32),
+    /// `/proc/<pid>/fd`: one symlink per open descriptor of that process.
+    PidFd(i32),
 }
 
 /// Parses a `/proc` path component as a pid directory name -- real Linux's own rule: an unsigned
@@ -528,6 +530,13 @@ where
         let mut walked = Vec::with_capacity(components.len());
         for &component in components {
             match current {
+                ProcfsDirHandle::Pid(pid) if component == "fd" => {
+                    walked.push(super::backend::WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    current = ProcfsDirHandle::PidFd(pid);
+                    continue;
+                }
                 ProcfsDirHandle::Pid(pid) if component == "task" => {
                     walked.push(super::backend::WalkedComponent {
                         permissions: PermissionCheck::ByBackend,
@@ -647,7 +656,7 @@ where
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
             }
-            ProcfsDirHandle::PidTask(_) => {
+            ProcfsDirHandle::PidTask(_) | ProcfsDirHandle::PidFd(_) => {
                 return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
         };
@@ -655,6 +664,27 @@ where
             item: FileHandle::from_typed::<Self>(ProcfsFileHandle { kind, content }),
             permissions: PermissionCheck::ByBackend,
         })
+    }
+
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        let ProcfsDirHandle::PidFd(pid) = dir.into_typed::<Self>() else {
+            return Ok(None);
+        };
+        let fd: i32 = name
+            .parse()
+            .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        self.proc_self_info
+            .read()
+            .get(pid)
+            .and_then(|info| info.fds.clone())
+            .map(|f| f())
+            .and_then(|l| l.into_iter().find(|(n, _)| *n == fd))
+            .map(|(_, target)| Some(target))
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -691,13 +721,29 @@ where
                         ino_info: None,
                     })
                     .collect();
-                entries.push(DirEntry {
-                    name: String::from("task"),
-                    file_type: FileType::Directory,
-                    ino_info: None,
-                });
+                for dir in ["task", "fd"] {
+                    entries.push(DirEntry {
+                        name: String::from(dir),
+                        file_type: FileType::Directory,
+                        ino_info: None,
+                    });
+                }
                 Ok(entries)
             }
+            ProcfsDirHandle::PidFd(pid) => Ok(self
+                .proc_self_info
+                .read()
+                .get(pid)
+                .and_then(|info| info.fds.clone())
+                .map(|f| f())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(fd, _)| DirEntry {
+                    name: format!("{fd}"),
+                    file_type: FileType::Symlink,
+                    ino_info: None,
+                })
+                .collect()),
             ProcfsDirHandle::PidTask(pid) => Ok(self
                 .proc_self_info
                 .read()
@@ -799,6 +845,11 @@ where
             ProcfsDirHandle::PidTask(pid) => NodeInfo {
                 dev: 8,
                 ino: (pid as i64).unsigned_abs() as usize * 8 + 101,
+                rdev: None,
+            },
+            ProcfsDirHandle::PidFd(pid) => NodeInfo {
+                dev: 8,
+                ino: (pid as i64).unsigned_abs() as usize * 8 + 102,
                 rdev: None,
             },
         };
