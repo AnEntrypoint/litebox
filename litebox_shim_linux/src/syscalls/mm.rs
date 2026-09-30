@@ -1507,9 +1507,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         const MIN_SHARED_LEN: usize = 256 * 1024;
-        if self.global.platform.env_flag("LITEBOX_BISECT_NO_RORMAP") {
-            return None;
-        }
         if flags.contains(MapFlags::MAP_ANONYMOUS)
             || flags.contains(MapFlags::MAP_SHARED)
             || prot.intersects(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC)
