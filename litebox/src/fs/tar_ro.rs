@@ -524,8 +524,14 @@ impl super::backend::Backend for TarRo {
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
             node_info: dir.node_info.clone(),
             blksize: BLOCK_SIZE,
-            atime: Timestamp::default(),
-            mtime: Timestamp::default(),
+            atime: Timestamp {
+                sec: dir.mtime,
+                nsec: 0,
+            },
+            mtime: Timestamp {
+                sec: dir.mtime,
+                nsec: 0,
+            },
         })
     }
 
@@ -637,6 +643,8 @@ struct IndexedFile {
 
 struct IndexedDir {
     owner: Option<UserInfo>,
+    /// Modification time from the directory's own tar entry; 0 for implied directories.
+    mtime: i64,
     node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
@@ -670,6 +678,7 @@ enum RawEntry {
     Dir {
         path: String,
         owner: UserInfo,
+        mtime: i64,
     },
     File {
         path: String,
@@ -844,7 +853,7 @@ impl TarIndex {
                             .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
-                        mtime: header.mtime.as_number::<u64>().map_or(0, |t| t as i64),
+                        mtime: tar_mtime_seconds(header),
                     });
                     raw_entries.push(RawEntry::File { path, file_idx });
                 }
@@ -875,6 +884,7 @@ impl TarIndex {
                     raw_entries.push(RawEntry::Dir {
                         path: path.trim_end_matches('/').into(),
                         owner: owner_from_posix_header(header),
+                        mtime: tar_mtime_seconds(header),
                     });
                 }
                 _ => {
@@ -925,15 +935,15 @@ impl TarIndex {
 
         for raw_entry in raw_entries {
             match raw_entry {
-                RawEntry::Dir { path, owner } => {
+                RawEntry::Dir { path, owner, mtime } => {
                     if path.is_empty() {
                         continue;
                     }
                     // Only this node is replaced: earlier layers' children stay.
-                    if !matches!(live.get(path.as_str()), Some(RawLiveEntry::Dir(_))) {
+                    if !matches!(live.get(path.as_str()), Some(RawLiveEntry::Dir(..))) {
                         live.remove(path.as_str());
                     }
-                    live.insert(path, RawLiveEntry::Dir(owner));
+                    live.insert(path, RawLiveEntry::Dir(owner, mtime));
                 }
                 RawEntry::File { path, file_idx } => {
                     remove_path_and_descendants(&mut live, &path);
@@ -965,6 +975,7 @@ impl TarIndex {
 
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
+            mtime: 0,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
@@ -972,7 +983,7 @@ impl TarIndex {
 
         for (path, entry) in live {
             match entry {
-                RawLiveEntry::Dir(owner) => {
+                RawLiveEntry::Dir(owner, mtime) => {
                     let mut probe = path.clone();
                     probe.push_str("/x");
                     ensure_ancestors(
@@ -984,6 +995,7 @@ impl TarIndex {
                     );
                     if let Some(&idx) = dirs_by_path.get(path.as_str()) {
                         dirs[idx].owner = Some(owner);
+                        dirs[idx].mtime = mtime;
                     }
                 }
                 RawLiveEntry::File(file_idx) => {
@@ -1090,6 +1102,7 @@ impl TarIndex {
         let mut symlinks = Vec::new();
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
+            mtime: 0,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
@@ -1218,7 +1231,7 @@ impl TarIndex {
 /// fold, exactly as the pre-multi-layer single-tar builder already worked.
 #[derive(Clone, Copy)]
 enum RawLiveEntry {
-    Dir(UserInfo),
+    Dir(UserInfo, i64),
     File(usize),
     Symlink(usize),
 }
@@ -1335,6 +1348,7 @@ fn ensure_ancestors(
         let child_dir_idx = *dirs_by_path.entry(parent.clone()).or_insert_with(|| {
             dirs.push(IndexedDir {
                 owner: Some(owner),
+                mtime: 0,
                 node_info: inode_allocator.next(),
                 children: HashMap::new(),
             });
@@ -1371,6 +1385,18 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     mode.set(Mode::WOTH, perms.contains(ModeFlags::OthersWrite));
     mode.set(Mode::XOTH, perms.contains(ModeFlags::OthersExec));
     mode
+}
+
+/// The header's modification time in seconds. `tar_no_std` declares this field decimal, but ustar
+/// stores every numeric field in octal, so it is parsed here from the raw field text.
+fn tar_mtime_seconds(header: &tar_no_std::PosixHeader) -> i64 {
+    header
+        .mtime
+        .as_inner()
+        .as_str_until_first_space()
+        .ok()
+        .and_then(|t| i64::from_str_radix(t.trim_matches('\0'), 8).ok())
+        .unwrap_or(0)
 }
 
 fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
