@@ -71,11 +71,16 @@ directory timestamps (platform clock; tar layers carry their octal header mtime)
 A layered-fs panic while holding the root write lock hangs every later `open` in every process (the panic hook
 `_exit`s without releasing it) -- that is how a single stray panic turned into a "Connecting" desktop; the specific
 panic (closing a lower fd whose cached entry a `rename` had dropped) is fixed.
-Known gaps (not yet fixed): `ptrace`, `pidfd_open`, `getrusage`, `mlock`, IPv6 is served by the IPv4 machinery only,
+Locks in shared memory recover from a dead WRITE holder: `RwLock` records the write owner's thread token and
+the platform `RawMutex` records the mutex holder (`note_locked`); a waiter blocked for 2 s checks `tkill(tid, 0)`
+and reopens the lock if the holder is gone (`litebox::fs::ident::set_thread_id_fn` / `set_thread_alive_fn`; the
+tid is cached per thread and reset in a forked child by `set_process_guest_pid`). Unit tests in
+`litebox/src/sync/rwlock.rs` prove both recovery and that a live holder is never stolen from.
+Known gaps (not yet fixed): `ptrace`, `pidfd_open` (glib falls back), IPv6 is served by the IPv4 machinery only,
 directory modes in tar layers are still the permissive default (only owner + mtime come from the tar), `/dev/shm`
-statfs, `/proc/<pid>/fd` for other processes, an unrelated process dying while it holds a shared `RwLock` guard
-still wedges that lock (the root cause of the panic class above; only the network worker and the shared-heap lock
-recover from a dead owner).
+statfs, `/proc/<pid>/fd` for other processes (the per-pid `fds` closures live in that process's private memory),
+a dead READ holder of a shared `RwLock` still blocks that lock's writers (readers are not tracked individually),
+`getrusage` reports zeroed counters.
 
 ## Linux runner (`litebox_runner_linux_userland`) native fork -- 108th pass
 
