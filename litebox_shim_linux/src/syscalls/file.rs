@@ -5047,7 +5047,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 lock_type == litebox_common_linux::FlockType::WriteLock;
                             let conflict = self
                                 .global
-                                .record_locks
+                                .record_locks()
                                 .lock()
                                 .iter()
                                 .find(|l| {
@@ -5206,7 +5206,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         let me = self.pid.get();
         let try_apply = || -> Result<(), litebox::event::polling::TryOpError<Errno>> {
-            let mut locks = self.global.record_locks.lock();
+            let mut locks = self.global.record_locks().lock();
             let write = lock_type == litebox_common_linux::FlockType::WriteLock;
             let unlock = lock_type == litebox_common_linux::FlockType::Unlock;
             if !unlock
@@ -5249,27 +5249,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let r = self
             .global
-            .record_lock_pollee
+            .record_lock_pollee()
             .wait(&self.wait_cx(), !blocking, Events::IN, try_apply)
             .map_err(|e| match e {
                 litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
                 other => Errno::from(other),
             });
         // Any change may unblock a waiter (unlock, downgrade, or a shrunken range).
-        self.global.record_lock_pollee.notify_observers(Events::IN);
+        self.global.record_lock_pollee().notify_observers(Events::IN);
         r
     }
 
     /// Drops every record lock this process holds; called when it exits.
     pub(crate) fn release_record_locks(&self) {
         let me = self.pid.get();
-        let mut locks = self.global.record_locks.lock();
+        let mut locks = self.global.record_locks().lock();
         let before = locks.len();
         locks.retain(|l| l.pid != me);
         let changed = locks.len() != before;
         drop(locks);
         if changed {
-            self.global.record_lock_pollee.notify_observers(Events::IN);
+            self.global.record_lock_pollee().notify_observers(Events::IN);
         }
     }
 

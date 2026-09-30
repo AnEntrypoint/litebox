@@ -1023,12 +1023,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(target_tid) = tid
             && target_tid != self.tid.get()
             && !self.process().has_thread(target_tid)
-            && let Some(remote) = self
-                .global
-                .process_registry
-                .lock()
-                .get(&target_tid)
-                .cloned()
+            && let Some(remote) = self.global.registry_get(target_tid)
         {
             // A thread of ANOTHER process in this native-`fork()` family (only its main thread's
             // tid is known here, which is its pid).
@@ -1114,11 +1109,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let me = self.process();
             let all: alloc::vec::Vec<_> = self
                 .global
-                .process_registry
-                .lock()
-                .iter()
-                .filter(|(p, q)| **p > 1 && !Arc::ptr_eq(q, &me))
-                .map(|(_, q)| q.clone())
+                .registry_entries()
+                .into_iter()
+                .filter(|(p, q)| *p > 1 && !Arc::ptr_eq(q, &me))
+                .map(|(_, q)| q)
                 .collect();
             for p in &all {
                 deliver_to_child(p);
@@ -1142,16 +1136,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let me = self.process();
             let registered: alloc::vec::Vec<_> = self
                 .global
-                .process_registry
-                .lock()
-                .iter()
+                .registry_entries()
+                .into_iter()
                 .filter(|(p, q)| {
                     !reached.contains(p)
                         && !Arc::ptr_eq(q, &me)
                         && q.pgid.load(core::sync::atomic::Ordering::Relaxed) == group
                         && !local_children.iter().any(|(_, c)| Arc::ptr_eq(c, q))
                 })
-                .map(|(_, q)| q.clone())
+                .map(|(_, q)| q)
                 .collect();
             for q in &registered {
                 deliver_to_child(q);

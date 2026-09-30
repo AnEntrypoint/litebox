@@ -2382,7 +2382,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if process_exited {
             self.release_record_locks();
-            self.global.process_registry.lock().remove(&self.pid.get());
+            self.global.registry_remove(self.pid.get());
         }
         if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
             // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
@@ -4354,10 +4354,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process()
             .sid
             .store(old_process.sid.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.global
-            .process_registry
-            .lock()
-            .insert(new_pid, self.process());
+        self.global.registry_insert(new_pid, self.process());
         // A forked child starts attached to no pty of its own -- see this field's own doc
         // comment ("`None` for every ordinary (non-`--pty-mode`) process"); the PARENT's
         // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
@@ -6553,7 +6550,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         self.process()
             .find_child(pid)
-            .or_else(|| self.global.process_registry.lock().get(&pid).cloned())
+            .or_else(|| self.global.registry_get(pid))
     }
 
     /// Every live process (other than the caller's own) in process group `group`.
@@ -6565,7 +6562,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .into_iter()
             .map(|(_, child)| child)
             .collect();
-        for p in self.global.process_registry.lock().values() {
+        for (_, p) in &self.global.registry_entries() {
             if !Arc::ptr_eq(p, &me)
                 && p.pgid.load(Ordering::Relaxed) == group
                 && !out.iter().any(|o| Arc::ptr_eq(o, p))

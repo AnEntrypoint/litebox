@@ -709,6 +709,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             pty_registry: my_pty_registry,
             daemon_pty_masters: my_daemon_pty_masters,
             xproc_local: my_xproc_local,
+            record_locks_local: Arc::new(litebox::sync::Mutex::new(alloc::vec::Vec::new())),
+            record_lock_pollee_local: Arc::new(litebox::event::polling::Pollee::new()),
             bootstrap_process: Arc::new(once_cell::race::OnceBox::new()),
         })
     }
@@ -957,9 +959,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
         entrypoints.task.xproc_register_self(false);
         self.0
-            .process_registry
-            .lock()
-            .insert(entrypoints.task.pid.get(), entrypoints.task.process());
+            .registry_insert(entrypoints.task.pid.get(), entrypoints.task.process());
 
         let (path, argv) = entrypoints
             .task
@@ -3428,6 +3428,11 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// holds `Weak` pointers into this process's heap); the cross-process view is
     /// `GlobalState::process_table`.
     pub(crate) xproc_local: Arc<syscalls::signal::xproc::LocalProcessMap<Platform>>,
+    /// This process's own record-lock table and waiter list, used where processes do not share one
+    /// kernel heap (a `Vec` buffer and a `Pollee`'s observers live on the private heap of the
+    /// process that touched them, so they cannot sit in `GlobalState` there).
+    record_locks_local: Arc<litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>>,
+    record_lock_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
     bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
 
@@ -3451,6 +3456,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             pty_registry: self.pty_registry.clone(),
             daemon_pty_masters: self.daemon_pty_masters.clone(),
             xproc_local: self.xproc_local.clone(),
+            record_locks_local: self.record_locks_local.clone(),
+            record_lock_pollee_local: self.record_lock_pollee_local.clone(),
             bootstrap_process: self.bootstrap_process.clone(),
         }
     }
@@ -3465,6 +3472,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> core::ops::Deref for GlobalStateHandle<
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
+    pub(crate) fn record_locks(
+        &self,
+    ) -> &litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>> {
+        if self.platform.has_native_fork() {
+            &self.inner.record_locks
+        } else {
+            &self.record_locks_local
+        }
+    }
+
+    pub(crate) fn record_lock_pollee(&self) -> &litebox::event::polling::Pollee<Platform> {
+        if self.platform.has_native_fork() {
+            &self.inner.record_lock_pollee
+        } else {
+            &self.record_lock_pollee_local
+        }
+    }
+
     /// Lock the shared `Network` and rebind its process-relative fields (`litebox`, `device`) to
     /// THIS process's own, always-locally-valid state before handing out the guard -- sixth and
     /// seventh instances of the SAME cross-process-stale-pointer defect class documented on this
@@ -3503,6 +3528,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         }
         guard.rebind_per_process_fields(&self.litebox);
         guard
+    }
+
+    /// The process registry is a `BTreeMap` of `Arc<Process>` whose nodes live on the private heap
+    /// of the process that inserted them, so it is only sound where every process shares one kernel
+    /// heap (a native-`fork()` platform). Elsewhere the cross-process registry (`xproc`) is
+    /// authoritative and these helpers see an empty registry.
+    pub(crate) fn registry_insert(&self, pid: i32, process: Arc<syscalls::process::Process<Platform>>) {
+        if self.platform.has_native_fork() {
+            self.process_registry.lock().insert(pid, process);
+        }
+    }
+
+    pub(crate) fn registry_remove(&self, pid: i32) {
+        if self.platform.has_native_fork() {
+            self.process_registry.lock().remove(&pid);
+        }
+    }
+
+    pub(crate) fn registry_get(&self, pid: i32) -> Option<Arc<syscalls::process::Process<Platform>>> {
+        if !self.platform.has_native_fork() {
+            return None;
+        }
+        self.process_registry.lock().get(&pid).cloned()
+    }
+
+    pub(crate) fn registry_entries(&self) -> alloc::vec::Vec<(i32, Arc<syscalls::process::Process<Platform>>)> {
+        if !self.platform.has_native_fork() {
+            return alloc::vec::Vec::new();
+        }
+        self.process_registry.lock().iter().map(|(p, q)| (*p, q.clone())).collect()
     }
 
     /// The shared `Pipes`, paired with THIS process's own `LiteBox`. `Pipes` itself holds no
