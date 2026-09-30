@@ -1062,6 +1062,31 @@ where
         unsafe { vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle) }
     }
 
+    /// Map a shared-memory object read-only, never able to become writable (see
+    /// [`Self::map_existing_shared_pages`] for the writable counterpart). Used to let every
+    /// process that maps the same large read-only file share one copy of its pages.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::map_existing_shared_pages`].
+    pub unsafe fn map_existing_shared_pages_file_readonly(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.map_existing_shared_pages_file_readonly(
+                suggested_address,
+                length,
+                flags,
+                shared_handle,
+            )
+        }
+    }
+
     /// Create read-only pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.

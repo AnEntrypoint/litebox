@@ -2600,6 +2600,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map_err(MappingError::MapError)
     }
 
+    /// Maps `shared_handle` READ-ONLY as if it were a private, read-only view of a file: the
+    /// mapping can never gain write permission (`VM_MAYWRITE` is clear, like any shared
+    /// file-backed mapping), so every process mapping the same object sees identical pages.
+    pub(super) unsafe fn map_existing_shared_pages_file_readonly(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let vm_flags =
+            VmFlags::from(MemoryRegionPermissions::READ) | VmFlags::may_flags_for_mapping(true, true);
+        let vma = VmArea::new_shared(vm_flags, true, shared_handle);
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `page_range` specifies the range of pages to check the memory permissions.

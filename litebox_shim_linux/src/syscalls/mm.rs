@@ -1348,6 +1348,188 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// A large, read-only, private mapping of an ordinary file (locale archives, icon and font
+    /// caches, ...) is served from ONE shared object instead of a per-process copy.
+    ///
+    /// Copying such a file into every mapper's private memory multiplies it by the process count:
+    /// every glibc program maps the multi-hundred-megabyte locale archive, so a desktop of sixty
+    /// processes spent gigabytes on sixty identical copies. A read-only private mapping can never
+    /// observe a difference from a shared one -- the mapping is created without the right to ever
+    /// become writable, so `mprotect(PROT_WRITE)` on it is refused, and the pages are never
+    /// patched (executable mappings and ELF files are excluded and keep their private copies).
+    ///
+    /// Returns `None` whenever the mapping does not qualify, leaving the ordinary path untouched.
+    fn try_shared_readonly_file_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        const MIN_SHARED_LEN: usize = 256 * 1024;
+        if flags.contains(MapFlags::MAP_ANONYMOUS)
+            || flags.contains(MapFlags::MAP_SHARED)
+            || prot.intersects(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC)
+            || offset != 0
+            || align_up(len, PAGE_SIZE) < MIN_SHARED_LEN
+        {
+            return None;
+        }
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let aligned_len = align_up(len, PAGE_SIZE);
+
+        // Identity and size of the file, plus whether it is an ELF image (those keep their
+        // private, patchable copies).
+        let (key, file_size) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let status = files.fs.fd_file_status(typed_fd).ok()?;
+                        if status.file_type != litebox::fs::FileType::RegularFile {
+                            return None;
+                        }
+                        let mut magic = [0u8; 4];
+                        let n = files.fs.read(typed_fd, &mut magic, Some(0)).unwrap_or(0);
+                        if n == 4 && magic == *b"\x7fELF" {
+                            return None;
+                        }
+                        Some(((status.node_info.dev, status.node_info.ino), status.size))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()?
+        };
+        let object_len = align_up(file_size, PAGE_SIZE);
+        // A mapping longer than the file would expose pages past its end.
+        if object_len == 0 || aligned_len > object_len {
+            return None;
+        }
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned_len)?;
+
+        let read_chunk = |at: usize, buf: &mut [u8]| -> usize {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| files.fs.read(typed_fd, buf, Some(at)).unwrap_or(0),
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                )
+                .unwrap_or(0)
+        };
+
+        let mut shared = self.global.shared_files.lock();
+        let (handle, needs_seed) = match shared.get_mut(&key) {
+            Some(entry) if entry.size == object_len => (entry.handle, !entry.mapped),
+            _ => {
+                let handle = self.global.platform.create_shared_memory(object_len).ok()?;
+                shared.insert(
+                    key,
+                    MemfdEntry {
+                        handle,
+                        size: object_len,
+                        mapped: false,
+                    },
+                );
+                (handle, true)
+            }
+        };
+        if needs_seed {
+            // Fill the object from the file once, a chunk at a time, through a transient
+            // writable mapping in this process. `shared` stays locked so nobody maps it half
+            // filled.
+            let full = litebox::mm::linux::NonZeroPageSize::new(object_len)?;
+            // SAFETY: a fresh, non-fixed mapping of `handle` that no guest code has seen; it is
+            // unmapped again before returning.
+            let ptr = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    full,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            }
+            .ok()?;
+            let mut chunk = alloc::vec![0u8; 1 << 20];
+            let mut at = 0usize;
+            let mut ok = true;
+            while at < file_size {
+                let want = (file_size - at).min(chunk.len());
+                let n = read_chunk(at, &mut chunk[..want]);
+                if n == 0 {
+                    ok = false;
+                    break;
+                }
+                if ptr.write_slice_at_offset(at as isize, &chunk[..n]).is_none() {
+                    ok = false;
+                    break;
+                }
+                at += n;
+            }
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, object_len);
+            if !ok {
+                shared.remove(&key);
+                return None;
+            }
+            if let Some(entry) = shared.get_mut(&key) {
+                entry.mapped = true;
+            }
+        }
+        drop(shared);
+
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match if addr == 0 { None } else { Some(addr) } {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        Some(
+            unsafe {
+                self.process().pm().map_existing_shared_pages_file_readonly(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
     /// If `fd` is a DRM device fd and `offset` is a fake offset a prior `DRM_IOCTL_MODE_MAP_DUMB`
     /// call handed out, map the guest's requested range directly onto that dumb buffer's real
     /// (host-backed) storage and return `Some(result)`. Returns `None` for any other `fd` (not a
@@ -1630,6 +1812,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if offset.checked_add(aligned_len).is_none() {
             return Err(Errno::EOVERFLOW);
+        }
+
+        if let Some(result) =
+            self.try_shared_readonly_file_mmap(addr, aligned_len, &prot, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
