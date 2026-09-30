@@ -676,6 +676,7 @@ pub fn with_root_identity<R>(body: impl FnOnce() -> R) -> R {
         EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed),
     );
     set_effective_identity(0, 0);
+    let _root = ident::root_guard();
     let result = body();
     EFFECTIVE_IDENTITY_USER.store(previous.1, core::sync::atomic::Ordering::Relaxed);
     EFFECTIVE_IDENTITY_GROUP.store(previous.2, core::sync::atomic::Ordering::Relaxed);
