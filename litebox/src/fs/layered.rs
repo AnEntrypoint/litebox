@@ -899,6 +899,19 @@ impl<
                 self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
+                // The root may no longer hold THIS entry: a `rename` over the path invalidates the
+                // cached entry by plain removal, and a later `open` may have cached a different one.
+                // A detached entry has only fds pointing at it, so the last fd closes it.
+                let attached = root_entries
+                    .get(&path)
+                    .is_some_and(|root_entry| Arc::ptr_eq(root_entry, &entry));
+                if !attached {
+                    return match Arc::into_inner(entry) {
+                        Some(EntryX::Lower { fd }) => self.lower.close(&fd),
+                        Some(EntryX::Upper { .. } | EntryX::Tombstone) => unreachable!(),
+                        None => Ok(()),
+                    };
+                }
                 if Arc::strong_count(&entry) > 2 {
                     // Other fds definitely still point at this file; leave it alone.
                     return Ok(());
