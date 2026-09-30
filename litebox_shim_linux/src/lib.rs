@@ -2353,6 +2353,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
+            SyscallRequest::CopyFileRange {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_copy_file_range(
+                fd_in, off_in, fd_out, off_out, len, flags
+            )),
+            SyscallRequest::Splice {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_splice(fd_in, off_in, fd_out, off_out, len, flags)),
             SyscallRequest::Sendfile {
                 out_fd,
                 in_fd,

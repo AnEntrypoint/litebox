@@ -3736,6 +3736,22 @@ pub enum SyscallRequest {
         count: usize,
         offset: i64,
     },
+    CopyFileRange {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    },
+    Splice {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    },
     Sendfile {
         out_fd: i32,
         in_fd: i32,
@@ -4630,6 +4646,10 @@ impl SyscallRequest {
                 count,
                 offset
             }),
+            Sysno::copy_file_range => {
+                sys_req!(CopyFileRange { fd_in, off_in:*, fd_out, off_out:*, len, flags })
+            }
+            Sysno::splice => sys_req!(Splice { fd_in, off_in:*, fd_out, off_out:*, len, flags }),
             Sysno::sendfile => sys_req!(Sendfile { out_fd, in_fd, offset:*, count }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),

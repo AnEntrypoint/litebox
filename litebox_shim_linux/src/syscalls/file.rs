@@ -2471,6 +2471,99 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// `copy_file_range(2)` (`loop_until_done`) and `splice(2)` (one chunk): both are a read from
+    /// `fd_in` followed by a write of the same bytes to `fd_out`, with optional explicit offsets
+    /// on either side that are advanced in the caller's memory rather than in the fd.
+    fn copy_between_fds(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        loop_until_done: bool,
+    ) -> Result<usize, Errno> {
+        self.check_raw_fd_exists(fd_in)?;
+        self.check_raw_fd_exists(fd_out)?;
+        let read_off = |p: Option<UserPtrMut<i64>>| -> Result<Option<usize>, Errno> {
+            p.map(|p| {
+                let off = p.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                usize::try_from(off).map_err(|_| Errno::EINVAL)
+            })
+            .transpose()
+        };
+        let mut in_off = read_off(off_in)?;
+        let mut out_off = read_off(off_out)?;
+        let mut buf = vec![0u8; len.min(64 * 1024)];
+        let mut total = 0usize;
+        while total < len {
+            let want = (len - total).min(buf.len());
+            let n = match self.sys_read(fd_in, &mut buf[..want], in_off) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => break,
+            };
+            let mut written = 0;
+            while written < n {
+                match self.sys_write(fd_out, &buf[written..n], out_off.map(|o| o + written)) {
+                    Ok(0) => break,
+                    Ok(w) => written += w,
+                    Err(e) if total == 0 && written == 0 => return Err(e),
+                    Err(_) => break,
+                }
+            }
+            total += written;
+            if let Some(o) = in_off.as_mut() {
+                *o += written;
+            }
+            if let Some(o) = out_off.as_mut() {
+                *o += written;
+            }
+            if written < n || !loop_until_done {
+                break;
+            }
+        }
+        if let (Some(p), Some(o)) = (off_in, in_off) {
+            p.write_at_offset::<Platform>(0, i64::try_from(o).map_err(|_| Errno::EOVERFLOW)?)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if let (Some(p), Some(o)) = (off_out, out_off) {
+            p.write_at_offset::<Platform>(0, i64::try_from(o).map_err(|_| Errno::EOVERFLOW)?)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn sys_copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.copy_between_fds(fd_in, off_in, fd_out, off_out, len, true)
+    }
+
+    pub(crate) fn sys_splice(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        _flags: u32,
+    ) -> Result<usize, Errno> {
+        self.copy_between_fds(fd_in, off_in, fd_out, off_out, len, false)
+    }
+}
+
 fn espipe_for_non_seekable_offset(offset: Option<usize>) -> Result<(), Errno> {
     if offset.is_some() {
         Err(Errno::ESPIPE)
