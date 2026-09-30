@@ -9,6 +9,13 @@ standing rules: a future "remember this" is one line plus its pointer here. The 
 
 ## Where things stand
 
+**2026-09-30 verification (`.wfgy/pass118_fin11.*`, HEAD ccdcd2b+)**: `DE_UP` 90s (host busy), then in real Chrome: xfce4-terminal
+(pipelines, `su`, DNS, `apt-get update` 29MB + `apt-get install figlet` all work), Thunar (`thunar &` opens `/`), Mousepad,
+`ls /proc/self/fd`; 12+ min soak with 30s-interval HTTP probes all 200, zero `resetting Network`, 24 host processes,
+3.3GB total working set (was ~4.5GB), witness `.gm/witness/stack118_thunar_mousepad.png`. Typing into the page still
+drops characters when the host is starved (keep strings short); the chrome-devtools `click` tool cannot hit injected
+overlay buttons reliably now -- use `Alt+Tab`/keyboard to focus windows.
+
 **A real XFCE desktop runs in a real browser and is usable**: `Xvfb` + `xfce4-session` (5 clients) +
 `selkies` (x264, MIT-SHM) inside litebox, host reverse proxy `--publish 8081:8081`. Verified through
 real Chrome CDP mouse/keyboard input (screenshots `.gm/witness/stack118_t*.png`): Applications menu,
