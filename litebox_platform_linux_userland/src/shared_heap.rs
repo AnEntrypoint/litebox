@@ -152,6 +152,22 @@ fn is_private() -> bool {
         || !SHARED_OK.try_with(core::cell::Cell::get).unwrap_or(true)
 }
 
+/// Releases the heap lock if the calling thread holds it: only for a thread that is about to
+/// die from a panic raised inside an allocator critical section, so the panic message itself can
+/// still allocate.
+pub fn release_lock_if_held_by_current_thread() {
+    if !is_active() {
+        return;
+    }
+    // SAFETY: `is_active()` implies the arena (and so its header) is mapped.
+    let h = unsafe { &*(ARENA_BASE as *const Header) };
+    // SAFETY: gettid has no arguments and cannot fail.
+    let me = unsafe { libc::syscall(libc::SYS_gettid) } as usize;
+    let _ = h
+        .lock
+        .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed);
+}
+
 /// The shared-arena allocator; see the module documentation.
 pub struct SharedHeap {
     state: AtomicU8,
@@ -275,6 +291,24 @@ impl<'a> Guard<'a> {
             .is_err()
         {
             spins += 1;
+            if spins % 200_000 == 0 {
+                // A holder that died (killed, or crashed mid-allocation) can never release. The
+                // heap's critical sections are single pointer pushes/pops, so taking the lock
+                // over from a vanished owner leaves the free lists consistent.
+                let owner = h.lock.load(Ordering::Relaxed);
+                if owner != 0 && owner != me {
+                    // SAFETY: tkill with signal 0 only probes for the thread's existence.
+                    let gone = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                    if gone
+                        && h.lock
+                            .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        return Self(h);
+                    }
+                }
+            }
             if spins == 200_000_000 {
                 let owner = h.lock.load(Ordering::Relaxed);
                 let msg = std::format!(

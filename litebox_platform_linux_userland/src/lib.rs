@@ -548,6 +548,7 @@ impl LinuxUserland {
             // tgkill/rt_sigaction calls (e.g. glibc's pthread_create signal setup) instead.
             #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_tgkill, vec![]),
+            (libc::SYS_tkill, vec![]),
             (libc::SYS_timer_create, vec![]),
             (libc::SYS_timer_settime, vec![]),
             (libc::SYS_timer_delete, vec![]),

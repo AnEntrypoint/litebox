@@ -343,6 +343,9 @@ fn install_frame_pointer_panic_hook() {}
 fn install_terminate_on_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(std::boxed::Box::new(move |info| {
+        // A panic raised inside an allocator critical section still holds the shared-heap lock,
+        // and reporting it allocates.
+        litebox_platform_linux_userland::shared_heap::release_lock_if_held_by_current_thread();
         previous(info);
         // SAFETY: `_exit` never returns and touches no runtime state.
         unsafe { libc::_exit(134) };
