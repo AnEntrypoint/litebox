@@ -452,7 +452,7 @@ pub struct Timestamp {
 /// system objects themselves are shared. The shim updates it whenever a task's credentials change.
 pub mod ident {
     use super::UserInfo;
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     static USER: AtomicU32 = AtomicU32::new(u32::MAX);
     static GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -463,30 +463,82 @@ pub mod ident {
         GROUP.store(group.min(u32::from(u16::MAX)), Ordering::Relaxed);
     }
 
+    /// Identity of the calling thread, registered by the platform. A root guard is scoped to the
+    /// thread that took it: a process-wide flag made every OTHER thread act as root while one
+    /// thread copied a file up, so a concurrent `mkdir` came out root-owned and its own creator
+    /// then failed to search it.
+    static THREAD_ID_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to name the calling thread (any stable non-zero-distinguishing id).
+    pub fn set_thread_id_fn(f: fn() -> usize) {
+        THREAD_ID_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    fn current_thread() -> Option<usize> {
+        let raw = THREAD_ID_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return None;
+        }
+        // SAFETY: only `set_thread_id_fn` stores here, and it stores a `fn() -> usize`.
+        let f: fn() -> usize = unsafe { core::mem::transmute(raw) };
+        Some(f().wrapping_add(1))
+    }
+
+    const ROOT_SLOTS: usize = 64;
+    /// Threads currently inside a root guard (thread id + 1; 0 = free slot), one entry per guard.
+    static ROOT_TIDS: [AtomicUsize; ROOT_SLOTS] = [const { AtomicUsize::new(0) }; ROOT_SLOTS];
+    /// Fallback when no thread-id function is registered or every slot is taken: process-wide.
     static ROOT_DEPTH: AtomicU32 = AtomicU32::new(0);
 
-    /// While alive, permission checks act as root: the layered file system's internal copy-up
-    /// (creating ancestors and the upper copy of a lower file) is done by the "kernel", not as the
-    /// calling user.
-    pub struct RootGuard(());
+    /// While alive, permission checks on the creating thread act as root: the layered file
+    /// system's internal copy-up (creating ancestors and the upper copy of a lower file) is done
+    /// by the "kernel", not as the calling user.
+    pub struct RootGuard {
+        slot: Option<usize>,
+    }
 
     impl Drop for RootGuard {
         fn drop(&mut self) {
-            ROOT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            match self.slot {
+                Some(slot) => ROOT_TIDS[slot].store(0, Ordering::Release),
+                None => {
+                    ROOT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
-    /// Acts as root until the returned guard drops.
+    /// Acts as root on this thread until the returned guard drops.
     #[must_use]
     pub fn root_guard() -> RootGuard {
+        if let Some(tid) = current_thread() {
+            for (slot, cell) in ROOT_TIDS.iter().enumerate() {
+                if cell
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return RootGuard { slot: Some(slot) };
+                }
+            }
+        }
         ROOT_DEPTH.fetch_add(1, Ordering::Relaxed);
-        RootGuard(())
+        RootGuard { slot: None }
+    }
+
+    fn thread_is_root() -> bool {
+        if ROOT_DEPTH.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        match current_thread() {
+            Some(tid) => ROOT_TIDS.iter().any(|c| c.load(Ordering::Acquire) == tid),
+            None => false,
+        }
     }
 
     /// The acting identity, if the shim has set one.
     #[must_use]
     pub fn get() -> Option<UserInfo> {
-        if ROOT_DEPTH.load(Ordering::Relaxed) > 0 {
+        if thread_is_root() {
             return Some(UserInfo::ROOT);
         }
         let user = USER.load(Ordering::Relaxed);

@@ -232,6 +232,10 @@ impl LinuxUserland {
             core::sync::atomic::Ordering::Relaxed,
         );
         register_exception_handlers();
+        litebox::fs::ident::set_thread_id_fn(|| {
+            // SAFETY: gettid takes no arguments and cannot fail.
+            (unsafe { libc::syscall(libc::SYS_gettid) }) as usize
+        });
 
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {

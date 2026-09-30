@@ -310,6 +310,8 @@ where
 pub enum ProcfsDirHandle {
     Root,
     Pid(i32),
+    /// `/proc/<pid>/task`: one subdirectory per live thread id.
+    PidTask(i32),
 }
 
 /// Parses a `/proc` path component as a pid directory name -- real Linux's own rule: an unsigned
@@ -363,6 +365,8 @@ enum ProcPidEntry {
     Status,
     Cmdline,
     Comm,
+    OomScoreAdj,
+    OomAdj,
 }
 
 impl ProcPidEntry {
@@ -371,6 +375,8 @@ impl ProcPidEntry {
         ("status", ProcPidEntry::Status),
         ("cmdline", ProcPidEntry::Cmdline),
         ("comm", ProcPidEntry::Comm),
+        ("oom_score_adj", ProcPidEntry::OomScoreAdj),
+        ("oom_adj", ProcPidEntry::OomAdj),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -462,9 +468,35 @@ where
         let mut current = from.into_typed::<Self>();
         let mut walked = Vec::with_capacity(components.len());
         for &component in components {
+            match current {
+                ProcfsDirHandle::Pid(pid) if component == "task" => {
+                    walked.push(super::backend::WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    current = ProcfsDirHandle::PidTask(pid);
+                    continue;
+                }
+                ProcfsDirHandle::PidTask(pid) => {
+                    let known = parse_pid_component(component).is_some_and(|tid| {
+                        self.proc_self_info
+                            .read()
+                            .thread_ids(pid)
+                            .is_some_and(|t| t.contains(&tid))
+                    });
+                    if !known {
+                        return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                    }
+                    // A thread's own directory answers with its process's files.
+                    walked.push(super::backend::WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    current = ProcfsDirHandle::Pid(pid);
+                    continue;
+                }
+                _ => {}
+            }
             if current != ProcfsDirHandle::Root {
-                // A pid directory is itself flat: `stat`/`status`/etc. are files, never a further
-                // subdirectory, matching real Linux.
+                // A pid directory holds files plus `task`; anything else ends the walk.
                 return Ok(WalkOutcome {
                     components: walked,
                     last: WalkingDirHandle::from_typed::<Self>(current),
@@ -551,8 +583,12 @@ where
                     ProcPidEntry::Status => format_status(&info),
                     ProcPidEntry::Cmdline => info.cmdline.clone(),
                     ProcPidEntry::Comm => format!("{}\n", info.comm).into_bytes(),
+                    ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj => b"0\n".to_vec(),
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
+            }
+            ProcfsDirHandle::PidTask(_) => {
+                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
         };
         Ok(Permissioned {
@@ -582,11 +618,31 @@ where
                 }));
                 Ok(entries)
             }
-            ProcfsDirHandle::Pid(_) => Ok(ProcPidEntry::ALL
-                .iter()
-                .map(|(n, _)| DirEntry {
-                    name: String::from(*n),
-                    file_type: FileType::RegularFile,
+            ProcfsDirHandle::Pid(_) => {
+                let mut entries: Vec<DirEntry> = ProcPidEntry::ALL
+                    .iter()
+                    .map(|(n, _)| DirEntry {
+                        name: String::from(*n),
+                        file_type: FileType::RegularFile,
+                        ino_info: None,
+                    })
+                    .collect();
+                entries.push(DirEntry {
+                    name: String::from("task"),
+                    file_type: FileType::Directory,
+                    ino_info: None,
+                });
+                Ok(entries)
+            }
+            ProcfsDirHandle::PidTask(pid) => Ok(self
+                .proc_self_info
+                .read()
+                .thread_ids(pid)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tid| DirEntry {
+                    name: format!("{tid}"),
+                    file_type: FileType::Directory,
                     ino_info: None,
                 })
                 .collect()),
@@ -605,8 +661,13 @@ where
         Ok(n)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
-        Err(WriteError::NotForWriting)
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        // The OOM-killer knobs are accepted and ignored: nothing here ever OOM-kills, and the
+        // callers (Chromium's zygote host) only log a failure to set them.
+        match h.get_typed::<Self>().kind {
+            ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj) => Ok(buf.len()),
+            _ => Err(WriteError::NotForWriting),
+        }
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -644,7 +705,14 @@ where
         Ok(FileStatus {
             nlink: 1,
             file_type: FileType::RegularFile,
-            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            mode: if matches!(
+                h.kind,
+                ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj)
+            ) {
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
+            } else {
+                Mode::RUSR | Mode::RGRP | Mode::ROTH
+            },
             size: h.content.len(),
             owner: UserInfo::ROOT,
             node_info,
@@ -660,6 +728,11 @@ where
             ProcfsDirHandle::Pid(pid) => NodeInfo {
                 dev: 8,
                 ino: (pid as i64).unsigned_abs() as usize * 8 + 100,
+                rdev: None,
+            },
+            ProcfsDirHandle::PidTask(pid) => NodeInfo {
+                dev: 8,
+                ino: (pid as i64).unsigned_abs() as usize * 8 + 101,
                 rdev: None,
             },
         };
@@ -764,6 +837,12 @@ impl ProcSelfTable {
         info.tids = None;
         info.fds = None;
         self.by_pid.insert(child, info);
+    }
+
+    /// The live thread ids of `pid`, ascending, when that process is known and publishes them.
+    pub fn thread_ids(&self, pid: i32) -> Option<Vec<i32>> {
+        let info = self.by_pid.get(&pid)?;
+        Some(info.tids.as_ref().map_or_else(|| alloc::vec![pid], |f| f()))
     }
 
     /// Drops `pid`'s entry, on process exit.
