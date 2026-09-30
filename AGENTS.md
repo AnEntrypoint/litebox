@@ -35,6 +35,39 @@ did not find the actual creation site. **Both lazy-fork flags remain default OFF
 reached by any of the 106 passes to date.** See "Cross-process fork"'s own "Open, in rough priority
 order" item 1 for the precise next pickup.
 
+## Linux runner: webtop in a browser -- CURRENT STATE (verified live, branch `claude/modest-feynman-3zpzop`)
+
+The `linuxserver/webtop:debian-xfce` rootfs boots under `litebox_runner_linux_userland` (`-Z --initial-files
+rootfs.tar --rewrite-syscalls --uid 0 --gid 0 --pid1 --tun-device-name tun0 ... /bin/sh /init`), s6 brings up
+Xvfb, xfwm4/xfce4-panel/xfdesktop, nginx, pulseaudio, dbus and Selkies; a host browser at `http://10.0.0.2:3000`
+(TUN, host 10.0.0.1) shows and drives the desktop. Verified in the browser: xterm/uxterm/st, xfce4-terminal,
+Thunar (+ bulk rename), Mousepad, Task Manager, Settings Manager/Editor and the individual settings panels,
+App Finder/Run, About, Chromium (renders pages, runs Selkies' own JS inside it).
+
+What made it work (each is a root-cause fix, commit subjects in `git log`): shared-arena native fork with pool-backed
+shared memory; per-process `/proc/self` identity and `/proc/<pid>/{task,oom_score_adj,environ}`; `/proc/self/fd`
+listing/stat; real pty line discipline; SCM_CREDENTIALS; read-only reopen of memfds; shared-mapping coherence;
+`mprotect` length rounding; `pselect` NULL sigmask; EFAULT (not EINVAL) for bad rlimit pointers; the fs "act as root"
+guard is per thread (a process-wide flag made concurrent `mkdir` root-owned); the network worker never blocks on a
+per-descriptor lock (`iter_mut_nowait`/`iter_nowait`); the shared-heap lock is taken over from a dead owner and released
+before a panic reports; a runner panic terminates the process (`_exit(134)`); large read-only private file mappings
+(locale archive, caches) are ONE shared object instead of a copy per process, and freed heap blocks >= 1 MiB return their
+pages (`MADV_REMOVE`). Before these the desktop reached ~14 GB and was OOM-killed within minutes; it now plateaus near 9 GB.
+
+Debugging kit (host-side, not in the repo): boot with `LITEBOX_DIAG_FAULT=1 LITEBOX_PRINT_EXE_BASE=1` and a
+frame-pointer build (`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"`);
+`[diag-fault]` prints signal, rip, guest pid and a return-address chain (resolve with `addr2line` after subtracting the
+`litebox-exe-base` line); `[diag-hostpid]` maps host to guest pids; `LITEBOX_DIAG_SYSCALL_TIMELINE=<comm,...>` traces
+named processes/threads (path arguments decoded); `LITEBOX_DIAG_BIGALLOC=1` names allocations >= 32 MiB. A stalled boot:
+`gdb -p <root runner> -batch -ex "thread apply all bt"` and read the futex word a waiter sleeps on (`/proc/<pid>/task/<tid>/syscall`).
+The cgroup memory limit of the dev container is ~14 GB; watch `memory.usage_in_bytes` while booting.
+
+Known gaps (not yet fixed): `inotify_init` (ENOSYS), netlink `RTM_GETLINK/GETADDR` (Chromium's address tracker),
+`ptrace`/`rt_sigtimedwait`/`rt_tgsigqueueinfo`, `MSG_PEEK` on AF_UNIX `recv*`, `O_TMPFILE` and `O_DIRECT` pipes,
+IPv6, `/dev/shm` statfs, `/proc/<pid>/fd` for other processes, HTTPS :3001, dconf-service, a leaked per-descriptor
+`RwLock` reader still blocks that descriptor's writers (only the network worker is protected), lib unit tests of
+`litebox_shim_linux` do not compile (pre-existing `add_interest` signature drift).
+
 ## Linux runner (`litebox_runner_linux_userland`) native fork -- 108th pass
 
 Cloud sessions are Linux, so the Windows runner is unavailable there; the Linux runner runs the
