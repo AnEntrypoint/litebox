@@ -1978,6 +1978,13 @@ impl ThreadHandle {
 impl litebox::platform::ThreadProvider for LinuxUserland {
     fn set_process_guest_pid(&self, pid: i32) {
         GUEST_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: getpid/gettid take no arguments and cannot fail.
+            let (host_pid, host_tid) = unsafe {
+                (libc::getpid(), libc::syscall(libc::SYS_gettid))
+            };
+            eprintln!("[diag-hostpid] host_pid={host_pid} host_tid={host_tid} guest_pid={pid}");
+        }
     }
 
     fn current_guest_pid(&self) -> Option<i32> {

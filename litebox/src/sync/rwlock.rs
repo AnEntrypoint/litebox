@@ -30,6 +30,8 @@ struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
     // The 'condition variable' to notify writers through.
     // Incremented on every signal.
     writer_notify: Platform::RawMutex,
+    // DIAG (temporary): thread id (+1) that took the lock from unlocked to read-locked.
+    diag_first_reader: Platform::RawMutex,
 }
 
 const READ_LOCKED: u32 = 1;
@@ -81,10 +83,17 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         Self {
             state: <Platform::RawMutex as RawMutex>::INIT,
             writer_notify: <Platform::RawMutex as RawMutex>::INIT,
+            diag_first_reader: <Platform::RawMutex as RawMutex>::INIT,
         }
     }
 
-    #[expect(dead_code, reason = "we may need this eventually for RwLock::try_read")]
+    #[inline]
+    fn diag_note_first_reader(&self) {
+        self.diag_first_reader
+            .underlying_atomic()
+            .store(crate::fs::ident::diag_thread_id(), Relaxed);
+    }
+
     #[inline]
     fn try_read(&self) -> bool {
         self.state
@@ -106,6 +115,8 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                 .is_err()
         {
             self.read_contended();
+        } else if is_unlocked(state) {
+            self.diag_note_first_reader();
         }
     }
 
@@ -140,7 +151,12 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                     Acquire,
                     Relaxed,
                 ) {
-                    Ok(_) => return, // Locked!
+                    Ok(_) => {
+                        if is_unlocked(state) {
+                            self.diag_note_first_reader();
+                        }
+                        return; // Locked!
+                    }
                     Err(s) => {
                         state = s;
                         continue;
@@ -176,10 +192,6 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "we may need this eventually for RwLock::try_write"
-    )]
     #[inline]
     fn try_write(&self) -> bool {
         self.state
@@ -649,6 +661,41 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }
+    }
+
+    /// Takes a read lock only if that can be done without waiting; `None` when a writer holds
+    /// (or is queued for) the lock.
+    #[inline]
+    #[track_caller]
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, Platform, T>> {
+        #[cfg(feature = "lock_tracing")]
+        self.creation
+            .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
+        if !self.raw.try_read() {
+            return None;
+        }
+        Some(RwLockReadGuard {
+            rwlock: self,
+            #[cfg(feature = "lock_tracing")]
+            locked_witness: None,
+        })
+    }
+
+    /// Takes the write lock only if that can be done without waiting.
+    #[inline]
+    #[track_caller]
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, Platform, T>> {
+        #[cfg(feature = "lock_tracing")]
+        self.creation
+            .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
+        if !self.raw.try_write() {
+            return None;
+        }
+        Some(RwLockWriteGuard {
+            rwlock: self,
+            #[cfg(feature = "lock_tracing")]
+            locked_witness: None,
+        })
     }
 
     /// Consumes this `RwLock`, returning the underlying data.

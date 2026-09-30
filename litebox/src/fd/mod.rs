@@ -298,6 +298,28 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         })
     }
 
+    /// Like [`Self::iter`], but skips any entry that cannot be read-locked without waiting (see
+    /// [`Self::iter_mut_nowait`]).
+    pub(crate) fn iter_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                let entry = e.try_read()?;
+                if entry.matches_subsystem::<Subsystem>() {
+                    Some((
+                        InternalFd {
+                            raw: i.try_into().unwrap(),
+                        },
+                        crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     /// An iterator of descriptors and (mutable) entries for a subsystem
     ///
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order
@@ -316,6 +338,37 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     return None;
                 }
                 let entry = e.write();
+                assert!(entry.matches_subsystem::<Subsystem>());
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockWriteGuard::map(entry, |e| {
+                        e.as_subsystem_mut::<Subsystem>()
+                    }),
+                ))
+            })
+        })
+    }
+
+    /// Like [`Self::iter_mut`], but skips any entry whose lock cannot be taken without waiting.
+    ///
+    /// For a single shared worker that must never stall behind a guest thread that holds one
+    /// descriptor across a blocking call: the skipped entry is simply visited on the next pass.
+    pub(crate) fn iter_mut_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            InternalFd,
+            impl core::ops::DerefMut<Target = Subsystem::Entry>,
+        ),
+    > {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                if !e.try_read()?.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
+                let entry = e.try_write()?;
                 assert!(entry.matches_subsystem::<Subsystem>());
                 Some((
                     InternalFd {

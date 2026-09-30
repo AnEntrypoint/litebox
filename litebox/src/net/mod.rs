@@ -903,7 +903,7 @@ where
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
         let table = self.litebox.descriptor_table();
-        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
+        for (_, mut handle) in table.iter_mut_nowait::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.shutdown_wr_pending {
                 if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
@@ -973,7 +973,7 @@ where
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
         let table = self.litebox.descriptor_table();
-        for (_, entry) in table.iter::<Network<Platform>>() {
+        for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
         }
     }
