@@ -228,3 +228,23 @@ stdio-handle bug, presenter-process split, ACK-stall-kill and port-8081 watchdog
 - `docs/diag-timeline-field-semantics.md`, `docs/premade-library-research.md`,
   `docs/drm-dumb-buffer-ioctl-reference.md`; `docs/macos.md` (stub); `advisor/probes/` (decode_frame.py,
   symbolize_litebox_crash.py, MEASUREMENT-PITFALLS.md, DISK-HYGIENE.md); `.gm/memories/` (superseded).
+
+## Chromium (2026-09-30) -- runs multi-process, does not yet finish a page
+
+`chromium --headless --no-sandbox --dump-dom` (webtop image, `LITEBOX_PROCESS_FORK=1`) now starts the browser,
+network/storage/renderer children over Mojo, and reaches the network; no page is produced yet. Fixed: huge
+`PROT_NONE` mmaps reserve address space only (`RESERVE_ONLY_THRESHOLD`, commit at mprotect, ENOMEM not panic);
+`Sysinfo` `repr(C)`; guest `int3` reaches the VEH (`EXCEPTION_BREAKPOINT` in the asm whitelist); `getrlimit`
+EFAULT; cross-process fork: `/dev/shm`+memfd travel by named section (`MemfdEntry::name`, `S|` SCM spec, `shm:`
+fork spec), epoll/netlink dropped, child inherits `/proc/self` exe/cmdline (`task-state`), `/proc/self/task`,
+dir nlink 3, `stat(/proc/self/fd/N)`; unix sockets over SCM_RIGHTS (`U|`); `promote_for_fork` only folds
+peer-shutdown on the FIRST promotion; tar dir/file mtimes preserved (fontconfig caches were rescanned every
+process; `MLE3`); a fork child's adopted claims no longer look foreign (`mark_fork_child_host`).
+Open, in order: (1) every cross-process fork costs 3-5s in the parent (`spawn_cross_process_fork_child`
+warn line; pristine file-backed chunks are skipped, the rest of the 328MB image group still copies) and the
+launcher thread serialises them, so children hit the 15s "no connection" self-termination -- native COW fork
+or lazier copy is the lever; (2) `--single-process` dies on a Chromium CHECK in
+`RenderProcessHostImpl::GetProcessHostForSiteInstance`; (3) GWP-ASan `MapRegion` EEXIST still shows up
+occasionally (`--disable-features=GwpAsan*` avoids); (4) SCM_RIGHTS of file fds whose path no longer resolves;
+(5) the desktop-typed `chromium --no-sandbox &` was not verified (typing dropped on the starved host).
+Repro scripts: `.wfgy/chromium_headless.ps1 -Run <n> -Secs N -Extra "<flags>"`.

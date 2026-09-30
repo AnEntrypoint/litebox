@@ -1841,6 +1841,7 @@ fn diag_process_fork_task_resume_probe(
     if !pf::diag_process_fork_task_resume_enabled() {
         return;
     }
+    litebox_platform_windows_userland::mark_fork_child_host();
     let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
     macro_rules! diag_elapsed {
         ($label:expr) => {

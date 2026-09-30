@@ -53,6 +53,10 @@ struct LazyRange {
     protection: PAGE_PROTECTION_FLAGS,
     first_chunk: usize,
     filled: Vec<bool>,
+    /// Per chunk: the chunk was filled while, or has since been made, writable. A filled chunk that
+    /// was never writable still equals its source, so a fork child can refill it from the file
+    /// instead of receiving a copy of it.
+    dirty: Vec<bool>,
     /// Which registered source and where in it `source` points, so a fork child (which maps the
     /// same layers at different addresses) can re-derive the pointer.
     origin: Option<(usize, usize)>,
@@ -66,6 +70,17 @@ impl LazyRange {
     fn is_filled(&self, chunk: usize) -> bool {
         self.filled[chunk - self.first_chunk]
     }
+
+    fn is_pristine(&self, chunk: usize) -> bool {
+        self.is_filled(chunk) && !self.dirty[chunk - self.first_chunk]
+    }
+}
+
+fn is_writable_protection(protection: PAGE_PROTECTION_FLAGS) -> bool {
+    matches!(
+        protection,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
 }
 
 pub(crate) fn enabled() -> bool {
@@ -276,6 +291,7 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
     let span = chunk_span(start, range, chunk);
     if !span_is_still_unfilled_lazy_memory(&span) {
         range.filled[chunk - range.first_chunk] = true;
+        range.dirty[chunk - range.first_chunk] = true;
         return;
     }
     let offset = span.start - start;
@@ -296,6 +312,7 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
         ) == 0
         {
             range.filled[chunk - range.first_chunk] = true;
+            range.dirty[chunk - range.first_chunk] = true;
             return;
         }
         core::ptr::copy_nonoverlapping(
@@ -313,6 +330,7 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
         }
     }
     range.filled[chunk - range.first_chunk] = true;
+    range.dirty[chunk - range.first_chunk] = is_writable_protection(range.protection);
     if diagnostics_enabled() {
         eprintln!(
             "[lazy_file_map] pid={} filled chunk {:#x}..{:#x}",
@@ -347,11 +365,16 @@ fn split_at(map: &mut BTreeMap<usize, LazyRange>, addr: usize) {
         first_chunk: upper_first,
         filled: range.filled[upper_first - range.first_chunk..=last_chunk - range.first_chunk]
             .to_vec(),
+        dirty: range.dirty[upper_first - range.first_chunk..=last_chunk - range.first_chunk]
+            .to_vec(),
         origin: range.origin.map(|(index, offset)| (index, offset + consumed)),
     };
     range.end = addr;
     range
         .filled
+        .truncate(((addr - 1) >> CHUNK_SHIFT) - range.first_chunk + 1);
+    range
+        .dirty
         .truncate(((addr - 1) >> CHUNK_SHIFT) - range.first_chunk + 1);
     map.insert(addr, upper);
 }
@@ -515,6 +538,7 @@ pub(crate) fn register(range: Range<usize>, source: &'static [u8]) -> bool {
             protection: PAGE_READWRITE,
             first_chunk,
             filled: vec![false; last_chunk - first_chunk + 1],
+            dirty: vec![false; last_chunk - first_chunk + 1],
             origin: locate_source(source),
         },
     );
@@ -545,6 +569,13 @@ pub(crate) fn permission_update_ranges(
         lazy.protection = protection;
         if protection == PAGE_NOACCESS {
             fill_all(start, lazy);
+        }
+        if is_writable_protection(protection) {
+            for chunk in lazy.chunk_indices() {
+                if lazy.is_filled(chunk) {
+                    lazy.dirty[chunk - lazy.first_chunk] = true;
+                }
+            }
         }
         for chunk in lazy.chunk_indices() {
             if lazy.is_filled(chunk) {
@@ -595,26 +626,40 @@ fn locate_source(slice: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Prepares this process's lazy ranges for a cross-process fork and returns the path of a
-/// descriptor file the child re-arms them from. Ranges whose source cannot be identified are
-/// filled now so the ordinary page copy carries them. Unfilled chunks are `PAGE_NOACCESS`, hence
-/// unreadable, hence skipped by that copy: the child gets zero pages it re-arms, not data.
-pub(crate) fn export_for_fork() -> Option<String> {
+/// descriptor file the child re-arms them from, plus the address spans the page copy must skip.
+/// Ranges whose source cannot be identified are filled now so the ordinary page copy carries them.
+/// Unfilled chunks are `PAGE_NOACCESS`, hence unreadable, hence skipped by that copy: the child
+/// gets zero pages it re-arms, not data. Filled chunks that were never writable still equal their
+/// source, so they are described as unfilled too and their spans returned for the copy to skip:
+/// the child refills them from the file on first touch instead of receiving hundreds of MiB of
+/// executable image it never reads.
+pub(crate) fn export_for_fork() -> (Option<String>, Vec<Range<usize>>) {
     if !HAS_RANGES.load(Ordering::Acquire) {
-        return None;
+        return (None, Vec::new());
     }
     let mut map = table();
     let mut lines = String::new();
+    let mut pristine_spans: Vec<Range<usize>> = Vec::new();
     for (&start, lazy) in map.iter_mut() {
         if lazy.origin.is_none() {
             fill_all(start, lazy);
+            lazy.dirty.iter_mut().for_each(|dirty| *dirty = true);
         }
         let Some((index, offset)) = lazy.origin else {
             continue;
         };
-        if lazy.filled.iter().all(|&filled| filled) {
+        for chunk in lazy.chunk_indices() {
+            if lazy.is_pristine(chunk) {
+                push_merged(&mut pristine_spans, chunk_span(start, lazy, chunk));
+            }
+        }
+        let bits: String = lazy
+            .chunk_indices()
+            .map(|chunk| if lazy.is_filled(chunk) && !lazy.is_pristine(chunk) { '1' } else { '0' })
+            .collect();
+        if !bits.contains('0') {
             continue;
         }
-        let bits: String = lazy.filled.iter().map(|&f| if f { '1' } else { '0' }).collect();
         lines.push_str(&format!(
             "{start:x} {:x} {index} {offset:x} {:x} {:x} {bits}
 ",
@@ -623,7 +668,7 @@ pub(crate) fn export_for_fork() -> Option<String> {
     }
     drop(map);
     if lines.is_empty() {
-        return None;
+        return (None, pristine_spans);
     }
     static SEQUENCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -631,8 +676,10 @@ pub(crate) fn export_for_fork() -> Option<String> {
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&path, lines).ok()?;
-    Some(path.to_string_lossy().into_owned())
+    if std::fs::write(&path, lines).is_err() {
+        return (None, Vec::new());
+    }
+    (Some(path.to_string_lossy().into_owned()), pristine_spans)
 }
 
 /// Child side of [`export_for_fork`]: re-arms every described range against this process's own
@@ -669,6 +716,7 @@ pub fn adopt_from_file(path: &str) {
             protection: hex(protection) as PAGE_PROTECTION_FLAGS,
             first_chunk: start >> CHUNK_SHIFT,
             filled: bits.chars().map(|bit| bit == '1').collect(),
+            dirty: bits.chars().map(|bit| bit == '1').collect(),
             origin: Some((index, offset)),
         };
         for chunk in lazy.chunk_indices() {

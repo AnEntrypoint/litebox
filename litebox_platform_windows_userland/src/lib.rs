@@ -5486,6 +5486,17 @@ const CLAIM_HIGH_WATER_STEP: usize = 128;
 /// size that extra full-array scan, multiplied across the thousands of calls a real XFCE
 /// session's startup churn produces, was confirmed live to contribute real, measurable latency to
 /// this already-hot path -- see [`MAX_CLAIMS`]'s own doc comment for the full story.
+/// Set in a cross-process fork child's host process once it has adopted its parent's address
+/// space. The only thread-owned claims such a process holds are the ones its bootstrap thread made
+/// while adopting that address space; every guest thread runs under a guest pid, so those claims
+/// describe the guest's own memory, not another process's.
+static FORK_CHILD_HOST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by the runner in a cross-process fork child after the address space is adopted.
+pub fn mark_fork_child_host() {
+    FORK_CHILD_HOST.store(true, core::sync::atomic::Ordering::Release);
+}
+
 fn find_foreign_claim(
     range: core::ops::Range<usize>,
     exclude_owner: ClaimOwner,
@@ -5507,10 +5518,12 @@ fn find_foreign_claim(
     // for exclusion) -- always consistent across a single thread's lifetime including every
     // `execve` on it, unlike `ClaimOwner`, which can legitimately change mid-lifetime.
     let this_thread = std::thread::current().id();
+    let fork_child_host = FORK_CHILD_HOST.load(core::sync::atomic::Ordering::Acquire);
     let claims = CLAIMED_RANGES.lock().unwrap();
     let foreign = claims.iter().find_map(|slot| {
         slot.as_ref().and_then(|(claimed, owner, tid, _seq)| {
             (*owner != exclude_owner
+                && !(fork_child_host && matches!(owner, ClaimOwner::ThreadId(_)))
                 && *tid != this_thread
                 && claimed.start < range.end
                 && claimed.end > range.start)
@@ -13292,7 +13305,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         identity: litebox::platform::ForkChildIdentity,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         std::env::var_os("LITEBOX_PROCESS_FORK")?;
-        let lazy_file_map_path = crate::lazy_file_map::export_for_fork();
+        let (lazy_file_map_path, pristine_spans) = crate::lazy_file_map::export_for_fork();
         let group_relocations = relocations.group_relocations();
         let vma_layout = relocations.vma_layout();
         if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_some() {
@@ -13341,6 +13354,11 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             while off < len {
                 let addr = range.start.wrapping_add(off);
                 let chunk = (PAGE - (addr % PAGE)).min(len - off);
+                let index = pristine_spans.partition_point(|span| span.end <= addr);
+                if pristine_spans.get(index).is_some_and(|span| span.start <= addr) {
+                    off += chunk;
+                    continue;
+                }
                 let in_cached_region = cached_region.as_ref().is_some_and(|r| r.contains(&addr));
                 if !in_cached_region {
                     cached_region = fork_verify::readable_region(addr);
@@ -13423,7 +13441,8 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             }
         }
 
-        match process_fork::spawn_process_fork_child(
+        let spawn_started = std::time::Instant::now();
+        let spawn_result = process_fork::spawn_process_fork_child(
             group_relocations,
             &vma_layout,
             read_source_bytes,
@@ -13437,7 +13456,12 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             sigreturn_trampoline,
             identity,
             lazy_file_map_path.as_deref(),
-        ) {
+        );
+        litebox_util_log::warn!(
+            elapsed_ms:% = spawn_started.elapsed().as_millis();
+            "spawn_cross_process_fork_child: parent-side spawn (memory copy, process creation) took this long"
+        );
+        match spawn_result {
             Ok(Some((pid, process_handle, thread_handle))) => {
                 litebox_util_log::debug!(
                     pid:% = pid;
