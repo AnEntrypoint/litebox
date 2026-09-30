@@ -25,11 +25,15 @@ Fixed this pass (all committed, newest first):
 - `b33d6cc`/`db56a84` (subagent): `apt-get update`/`install` work (cross-process `/var/lib/apt` file spill run as root,
   pipe-bridge newest-only draining, unlinks reach the parent via whiteouts, `link()` copy-up, `getcwd`, fork children
   inherit cwd/ids/groups). `%TEMP%\litebox-spill-*` directories are never cleaned up.
-- **Open, fundamental (agent working on it)**: a process that dies (ExitProcess, fatal signal, cross-process
-  `kill -9` = TerminateProcess) while its `net_worker` holds net_lock orphans it; recovery then runs
-  `Network::reset_after_poisoning`, which WIPES all sockets incl. selkies' listener -> port 8081 answers an empty reply
-  and the desktop is dead. Triggered by `apt-get` killing its `sqv`/`store` methods. Fix = quiesce the net_worker before
-  any exit + graceful cross-process SIGKILL.
+- **Network lock orphaned by process exit/kill**: a process that died (ExitProcess, fatal signal, cross-process
+  `kill -9` = TerminateProcess) while its `net_worker` held net_lock made recovery run `Network::reset_after_poisoning`,
+  which WIPES all sockets incl. selkies' listener (port 8081 empty reply, desktop dead; `apt-get` killing `sqv`/`store`).
+  Fix: `run_network_worker_round`/`quiesce_network_worker`/`exit_process_quiesced` (platform lib.rs) gate every
+  net_worker round; both runner exits quiesce first; cross-process SIGKILL posts the pending bit, the target's signal
+  listener calls `exit_host_process_quiesced`, the sender waits 1s (`wait_for_host_process_exit`) then falls back to
+  `terminate_host_process`. Repro: python3 http.server + 250 sequential `curl` in the webtop image with
+  `LITEBOX_CHILD_NET_POLL_MS=1`: old binary 2/2 runs wiped (bad=164/243), new 0/3. Residual: a guest thread inside a
+  socket syscall (or a kill before the target's listener exists) still orphans; one wipe in ~5 default-cadence runs.
 - `f594693` **guest identity and DNS**: `setuid`/`setgid`/`setresuid`/`setresgid`/`setreuid`/`setregid`/
   `setfsuid`/`setfsgid`/`setgroups`/`getgroups` were fixed-credential stubs that refused every change with
   EPERM (apt's `_apt` sandbox, `su`, `sudo`, `setpriv` all died); `Credentials` is now interior-mutable

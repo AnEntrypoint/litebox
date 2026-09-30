@@ -217,6 +217,8 @@ impl SharedProcessTable {
     }
 }
 
+const GRACEFUL_SIGKILL_EXIT_LIMIT_MS: u32 = 1000;
+
 fn signal_bit(signal: Signal) -> u64 {
     1u64 << (signal.as_i32() - 1)
 }
@@ -261,7 +263,13 @@ fn drain_host<Platform: ShimPlatform, FS: ShimFS>(global: &GlobalStateHandle<Pla
             .and_then(Weak::upgrade);
         if let Some(process) = process {
             if table.has_pending(view.index) {
-                deliver_bits(&process, table.take_pending(view.index, view.pid));
+                let bits = table.take_pending(view.index, view.pid);
+                if view.owns_host && bits & signal_bit(Signal::SIGKILL) != 0 {
+                    global.platform.exit_host_process_quiesced(
+                        encode_cross_process_exit_status(ExitStatus::Signal(Signal::SIGKILL)),
+                    );
+                }
+                deliver_bits(&process, bits);
             }
             // The listener also fires for cross-process data events (`wake_signal_listener` after
             // a write to a shared connection): every thread blocked in a poll/read re-checks
@@ -510,10 +518,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             self.process_table.post(view.index, view.pid, signal);
             return;
         }
+        if signal == Signal::SIGKILL
+            && view.owns_host
+            && self.process_table.post(view.index, view.pid, signal)
+            && self.platform.wake_signal_listener(view.host_pid)
+            && self.platform.wait_for_host_process_exit(
+                view.host_pid,
+                GRACEFUL_SIGKILL_EXIT_LIMIT_MS,
+            )
+        {
+            return;
+        }
         if signal == Signal::SIGKILL && view.owns_host {
             litebox_util_log::warn!(
                 target_pid:% = view.pid, target_host:% = view.host_pid, sender_host:% = my_host;
-                "xproc SIGKILL: terminating the target's host process"
+                "xproc SIGKILL: target did not exit gracefully, terminating its host process"
             );
         }
         if signal == Signal::SIGKILL

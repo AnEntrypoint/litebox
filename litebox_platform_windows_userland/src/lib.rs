@@ -7491,6 +7491,49 @@ impl WindowsUserland {
     }
 }
 
+static NETWORK_WORKER_STOPPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static NETWORK_WORKER_ROUND_IN_FLIGHT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+const NETWORK_WORKER_QUIESCE_LIMIT: Duration = Duration::from_secs(2);
+
+struct NetworkRoundInFlight;
+
+impl Drop for NetworkRoundInFlight {
+    fn drop(&mut self) {
+        NETWORK_WORKER_ROUND_IN_FLIGHT.store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn run_network_worker_round<R>(round: impl FnOnce() -> R) -> Option<R> {
+    NETWORK_WORKER_ROUND_IN_FLIGHT.store(true, core::sync::atomic::Ordering::SeqCst);
+    let _in_flight = NetworkRoundInFlight;
+    if NETWORK_WORKER_STOPPED.load(core::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    Some(round())
+}
+
+pub fn quiesce_network_worker() {
+    NETWORK_WORKER_STOPPED.store(true, core::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    while NETWORK_WORKER_ROUND_IN_FLIGHT.load(core::sync::atomic::Ordering::SeqCst) {
+        if started.elapsed() >= NETWORK_WORKER_QUIESCE_LIMIT {
+            litebox_util_log::warn!(
+                "quiesce_network_worker: a network round is still in flight after the wait limit"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+pub fn exit_process_quiesced(exit_code: i32) -> ! {
+    quiesce_network_worker();
+    std::process::exit(exit_code)
+}
+
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
@@ -13014,6 +13057,24 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             }
         }
         false
+    }
+
+    fn wait_for_host_process_exit(&self, host_pid: u32, timeout_ms: u32) -> bool {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let handle = unsafe { Win32_Threading::OpenProcess(SYNCHRONIZE, 0, host_pid) };
+        if handle.is_null() {
+            return true;
+        }
+        let exited = unsafe { Win32_Threading::WaitForSingleObject(handle, timeout_ms) } == 0;
+        unsafe {
+            Win32_Foundation::CloseHandle(handle);
+        }
+        exited
+    }
+
+    fn exit_host_process_quiesced(&self, exit_code: u32) -> bool {
+        quiesce_network_worker();
+        unsafe { Win32_Threading::ExitProcess(exit_code) }
     }
 
     fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {

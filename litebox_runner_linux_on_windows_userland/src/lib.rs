@@ -997,11 +997,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // `LinuxShim::force_reset_network_after_panic`'s doc comment), and keep the loop
                 // (and this process's networking) alive instead.
                 let advice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    net_shim.perform_network_interaction()
+                    litebox_platform_windows_userland::run_network_worker_round(|| {
+                        net_shim.perform_network_interaction()
+                    })
                 }));
                 match advice {
-                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately) => {}
-                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout }) => {
+                    Ok(None) => return,
+                    Ok(Some(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately)) => {}
+                    Ok(Some(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout })) => {
                         break timeout;
                     }
                     Err(payload) => {
@@ -1019,10 +1022,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             };
             platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
         }
-        // Final flush
-        while net_shim
-            .perform_network_interaction()
-            .call_again_immediately()
+        while litebox_platform_windows_userland::run_network_worker_round(|| {
+            net_shim
+                .perform_network_interaction()
+                .call_again_immediately()
+        }) == Some(true)
         {}
     });
 
@@ -1250,7 +1254,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     Ok(program) => program,
                     Err(e) => {
                         eprintln!("failed to load program {prog_path:?}: {e:?}");
-                        std::process::exit(1);
+                        litebox_platform_windows_userland::exit_process_quiesced(1);
                     }
                 };
                 unsafe {
@@ -1297,7 +1301,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // does not run destructors, so this must happen here, not in a `Drop` impl).
     litebox_platform_windows_userland::presentation::dump_frame_diagnostic_report_drops();
 
-    std::process::exit(exit_code)
+    litebox_platform_windows_userland::exit_process_quiesced(exit_code)
 }
 
 /// Pass 136 -- STEP 1 of pass 135's four-step plan: prove a REAL, standalone `GlobalState` (the
@@ -2234,11 +2238,14 @@ fn diag_process_fork_task_resume_probe(
                 // live-confirmed to matter (2026-09-18: this worker's own panic was the LAST
                 // thing ever logged before a genuine, permanent full-boot stall).
                 let advice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    net_shim.perform_network_interaction()
+                    litebox_platform_windows_userland::run_network_worker_round(|| {
+                        net_shim.perform_network_interaction()
+                    })
                 }));
                 match advice {
-                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately) => {}
-                    Ok(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout }) => {
+                    Ok(None) => return,
+                    Ok(Some(litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately)) => {}
+                    Ok(Some(litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout })) => {
                         break timeout;
                     }
                     Err(payload) => {
@@ -2387,7 +2394,7 @@ fn diag_process_fork_task_resume_probe(
     eprintln!(
         "[process_fork_diag] task-resume-probe (child): exiting with encoded status {encoded:#x}"
     );
-    std::process::exit(encoded.cast_signed());
+    litebox_platform_windows_userland::exit_process_quiesced(encoded.cast_signed());
 }
 
 /// Format version for the on-disk merged-rootfs-index cache this module reads/writes (bump

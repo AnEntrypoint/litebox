@@ -1298,6 +1298,20 @@ pub trait ForkChildVerificationProvider {
         false
     }
 
+    /// Ends the calling host process with `exit_code` after letting its background network work
+    /// finish, so it never dies holding a lock shared with other host processes. Returns only if
+    /// the platform cannot do that.
+    fn exit_host_process_quiesced(&self, exit_code: u32) -> bool {
+        let _ = exit_code;
+        false
+    }
+
+    /// Waits up to `timeout_ms` for host process `host_pid` to exit. `true` once it has exited.
+    fn wait_for_host_process_exit(&self, host_pid: u32, timeout_ms: u32) -> bool {
+        let _ = (host_pid, timeout_ms);
+        false
+    }
+
     /// Terminates host process `host_pid` with `exit_code` (guest `SIGKILL` to a process that
     /// owns its own host process). `false` if it could not be terminated.
     fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {
