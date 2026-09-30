@@ -262,6 +262,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platfor
         }
     }
 
+    /// Stable identity of the underlying pipe end, shared by every handle to it.
+    #[must_use]
+    pub fn identity(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => Arc::as_ptr(p).cast::<()>() as usize,
+            PipeEnd::Sender(p) => Arc::as_ptr(p).cast::<()>() as usize,
+        }
+    }
+
     /// Whether a read on this end can only ever return end-of-file: it is a receiver half with
     /// every writer gone and nothing left buffered. Delivering that EOF to a second reader steals
     /// no bytes, which is what lets a bridge release a child's copy of the end without waiting for

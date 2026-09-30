@@ -52,6 +52,7 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
             first_error = Some(e);
         }
     };
+    let mut whiteouts: alloc::vec::Vec<String> = alloc::vec::Vec::new();
     let mut block_index = 0usize;
     let total_blocks = tar_data.len() / BLOCKSIZE;
     while block_index < total_blocks {
@@ -79,6 +80,12 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
         };
         let path = normalize(name);
         if path.is_empty() {
+            continue;
+        }
+        if let Some(removed) = whiteout_target(&path) {
+            let payload_blocks = header.payload_block_count().unwrap_or(0);
+            block_index += payload_blocks;
+            whiteouts.push(removed);
             continue;
         }
         let mode = mode_of_modeflags(
@@ -139,7 +146,19 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
             let _ = fs.chmod(&*path, mode);
         }
     }
+    whiteouts.sort_by_key(|path| core::cmp::Reverse(path.len()));
+    for path in whiteouts {
+        if fs.unlink(&*path).is_err() {
+            let _ = fs.rmdir(&*path);
+        }
+    }
     first_error.map_or(Ok(()), Err)
+}
+
+fn whiteout_target(path: &str) -> Option<String> {
+    let (directory, name) = path.rsplit_once('/')?;
+    let removed = name.strip_prefix(".wh.")?;
+    Some(format!("{directory}/{removed}"))
 }
 
 /// Writes one regular file. The import applies another process's writes to the one shared

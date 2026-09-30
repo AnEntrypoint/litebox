@@ -1064,6 +1064,45 @@ enum ThreadInitState {
     ),
 }
 
+pub(crate) const TASK_STATE_SHIM_FD: i32 = i32::MAX;
+
+static SOURCE_BRIDGES: spin::Mutex<alloc::vec::Vec<(usize, u64)>> = spin::Mutex::new(alloc::vec::Vec::new());
+static NEXT_SOURCE_BRIDGE_SEQUENCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+struct SourceBridgeRegistration {
+    end_identity: usize,
+    sequence: u64,
+}
+
+impl SourceBridgeRegistration {
+    fn new(end_identity: usize) -> Self {
+        let sequence = NEXT_SOURCE_BRIDGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        SOURCE_BRIDGES.lock().push((end_identity, sequence));
+        Self { end_identity, sequence }
+    }
+
+    fn effective_owners(&self, raw_owners: usize) -> usize {
+        let bridges = SOURCE_BRIDGES.lock();
+        let siblings = bridges.iter().filter(|(identity, _)| *identity == self.end_identity);
+        let (count, newest) = siblings.fold((0usize, 0u64), |(count, newest), (_, sequence)| {
+            (count + 1, newest.max(*sequence))
+        });
+        if newest == self.sequence {
+            raw_owners.saturating_sub(count.saturating_sub(1)).max(1)
+        } else {
+            raw_owners.max(2)
+        }
+    }
+}
+
+impl Drop for SourceBridgeRegistration {
+    fn drop(&mut self) {
+        let mut bridges = SOURCE_BRIDGES.lock();
+        if let Some(position) = bridges.iter().position(|entry| *entry == (self.end_identity, self.sequence)) {
+            bridges.swap_remove(position);
+        }
+    }
+}
 /// Most supplementary groups a task can hold (Linux's `NGROUPS_MAX` is 65536; nothing in a
 /// container image needs more than a handful).
 const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
@@ -1135,6 +1174,60 @@ impl Credentials {
 
     pub(crate) fn sgid(&self) -> u32 {
         self.sgid.load(Ordering::Relaxed)
+    }
+
+    fn to_spec(&self) -> alloc::string::String {
+        let count = (self.group_count.load(Ordering::Relaxed) as usize).min(MAX_SUPPLEMENTARY_GROUPS);
+        let groups: alloc::vec::Vec<alloc::string::String> = self.groups[..count]
+            .iter()
+            .map(|group| alloc::format!("{}", group.load(Ordering::Relaxed)))
+            .collect();
+        alloc::format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.uid(),
+            self.euid(),
+            self.suid(),
+            self.gid(),
+            self.egid(),
+            self.sgid(),
+            self.fsuid(),
+            self.fsgid(),
+            self.nice.load(Ordering::Relaxed),
+            u8::from(self.retained_caps.load(Ordering::Relaxed)),
+            self.keep_caps.load(Ordering::Relaxed),
+            groups.join(":"),
+        )
+    }
+
+    fn restore_from_spec(&self, spec: &str) -> Option<()> {
+        let mut fields = spec.split(",");
+        let mut next = || fields.next();
+        let ids: alloc::vec::Vec<u32> = (0..8).map(|_| next()?.parse().ok()).collect::<Option<_>>()?;
+        let nice: i32 = next()?.parse().ok()?;
+        let retained: u8 = next()?.parse().ok()?;
+        let keep_caps: u32 = next()?.parse().ok()?;
+        let groups: alloc::vec::Vec<u32> = next()?
+            .split(":")
+            .filter(|group| !group.is_empty())
+            .map(|group| group.parse().ok())
+            .collect::<Option<_>>()?;
+        for (slot, value) in [
+            &self.uid, &self.euid, &self.suid, &self.gid, &self.egid, &self.sgid, &self.fsuid, &self.fsgid,
+        ]
+        .into_iter()
+        .zip(ids)
+        {
+            slot.store(value, Ordering::Relaxed);
+        }
+        self.nice.store(nice, Ordering::Relaxed);
+        self.retained_caps.store(retained != 0, Ordering::Relaxed);
+        self.keep_caps.store(keep_caps, Ordering::Relaxed);
+        let count = groups.len().min(MAX_SUPPLEMENTARY_GROUPS);
+        for (slot, group) in self.groups.iter().zip(groups) {
+            slot.store(group, Ordering::Relaxed);
+        }
+        self.group_count.store(count as u32, Ordering::Relaxed);
+        Some(())
     }
 
     pub(crate) fn fsuid(&self) -> u32 {
@@ -3188,9 +3281,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         owners:% = end.strong_count();
                         "clone: carrying a pipe end into the cross-process child"
                     );
+                    let end_identity = end.identity();
                     let end = alloc::sync::Arc::new(end);
                     let counted = alloc::sync::Arc::clone(&end);
-                    let owners = move || counted.strong_count();
+                    let owners = match half {
+                        litebox::pipes::HalfPipeType::SenderHalf => {
+                            alloc::boxed::Box::new(move || counted.strong_count())
+                                as alloc::boxed::Box<dyn Fn() -> usize + Send>
+                        }
+                        litebox::pipes::HalfPipeType::ReceiverHalf => {
+                            let registration = SourceBridgeRegistration::new(end_identity);
+                            alloc::boxed::Box::new(move || registration.effective_owners(counted.strong_count()))
+                        }
+                    };
                     let eof_probe = alloc::sync::Arc::clone(&end);
                     let bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
@@ -3719,6 +3822,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut inherited_shim_fds: alloc::vec::Vec<litebox::platform::ForkInheritedShimFd> =
             alloc::vec::Vec::new();
         let mut unix_holds = alloc::vec::Vec::new();
+        inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+            fd: TASK_STATE_SHIM_FD,
+            spec: self.task_state_spec(),
+        });
         for (raw_fd, id, cloexec) in pty_masters_to_carry {
             inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
                 fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
@@ -6258,6 +6365,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `setregid`.
     pub(crate) fn sys_setregid(&self, rgid: u32, egid: u32) -> Result<(), Errno> {
         self.credentials.set_re_gid(rgid, egid)
+    }
+
+    fn task_state_spec(&self) -> alloc::string::String {
+        alloc::format!("task-state:{}\t{}", self.fs.borrow().cwd.read().clone(), self.credentials.to_spec())
+    }
+
+    pub(crate) fn install_task_state(&self, spec: &str) -> Option<()> {
+        let (cwd, credentials) = spec.split_once('\t')?;
+        self.credentials.restore_from_spec(credentials)?;
+        *self.fs.borrow().cwd.write() = alloc::string::String::from(cwd);
+        Some(())
     }
 
     fn priority_target_is_self(&self, which: i32, who: i32) -> Result<(), Errno> {

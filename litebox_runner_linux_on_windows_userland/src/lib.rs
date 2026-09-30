@@ -2565,6 +2565,19 @@ fn write_merged_rootfs_index_cache(
     }
 }
 
+static ADOPTED_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn whiteout_tar_path(path: &str) -> Option<String> {
+    let (directory, name) = path.trim_start_matches('/').rsplit_once('/').unwrap_or(("", path.trim_start_matches('/')));
+    (!name.is_empty()).then(|| {
+        if directory.is_empty() {
+            format!(".wh.{name}")
+        } else {
+            format!("{directory}/.wh.{name}")
+        }
+    })
+}
+
 /// Export the writable upper layer of a layered file system (every file the guest created or
 /// modified this run) to a tar archive at `export_path`, for a later run's `--resume-from`.
 ///
@@ -2653,6 +2666,21 @@ where
             _ => {}
         }
     }
+    let present: std::collections::HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    let adopted = ADOPTED_PATHS.lock().map(|paths| paths.clone()).unwrap_or_default();
+    for path in adopted.iter().filter(|path| !present.contains(path.as_str())) {
+        let Some(whiteout) = whiteout_tar_path(path) else {
+            continue;
+        };
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o600);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &whiteout, std::io::empty())
+            .map_err(|e| anyhow!("failed to add {whiteout} to export tar: {e}"))?;
+    }
     builder
         .finish()
         .map_err(|e| anyhow!("failed to finalize {}: {e}", export_path.display()))?;
@@ -2685,7 +2713,13 @@ fn import_writable_layer(
             .map_err(|e| anyhow!("invalid entry path in {}: {e}", resume_from.display()))?
             .to_string_lossy()
             .into_owned();
+        if header_path.rsplit('/').next().is_some_and(|name| name.starts_with(".wh.")) {
+            continue;
+        }
         let path = alloc::format!("/{header_path}");
+        if let Ok(mut adopted) = ADOPTED_PATHS.lock() {
+            adopted.push(path.clone());
+        }
         let mode_bits = entry.header().mode().unwrap_or(0o644);
         let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o7777);
         let owner_user = u16::try_from(entry.header().uid().unwrap_or(0)).unwrap_or(0);

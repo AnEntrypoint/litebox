@@ -1442,7 +1442,8 @@ impl<
         // links a temp file it just wrote); a lower-only source is real Linux `EXDEV` -- gm mutable
         // `layered-rename-link-exdev-and-invalidation`.
         if self.ensure_lower_contains(&oldpath).is_ok() {
-            return Err(LinkError::CrossDevice);
+            self.migrate_entry_up_for_metadata(&oldpath)
+                .map_err(|_| LinkError::CrossDevice)?;
         }
         // Anything already at `newpath` in EITHER layer is `link(2)`'s `EEXIST`, since creation only
         // ever targets the upper layer -- gm mutable

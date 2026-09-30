@@ -309,7 +309,7 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     /// The current working directory
     ///
     /// Must end with a '/'.
-    cwd: litebox::sync::RwLock<Platform, String>,
+    pub(crate) cwd: litebox::sync::RwLock<Platform, String>,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
@@ -4393,7 +4393,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getcwd`
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let cwd = self.fs.borrow().cwd.read().clone();
+        let mut cwd = self.fs.borrow().cwd.read().clone();
+        if cwd.len() > 1 && cwd.ends_with('/') {
+            cwd.pop();
+        }
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);

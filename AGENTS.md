@@ -175,7 +175,7 @@ private-heap nodes, so shared registries are fixed-slot, lock-free, atomic table
   it killed any idle method process (apt's sqv, exit code 1 = "signal 9").
 - `NETLINK_AUDIT` sockets ack every `NLM_F_ACK` message (libaudit/PAM need the ack); `getpriority`/`setpriority`
   exist (pam_limits aborts on ENOSYS); AF_INET6 sockets answer `getsockname` etc. as v4-mapped `sockaddr_in6`.
-- Open: `apt-get install` hangs in dpkg-deb's pipe pair (cross-process pipe, `Unpacking ...`).
+- Cross-process fork children now inherit cwd and full credentials (`task-state:` shim spec, fd `i32::MAX`), a child's deletions reach the parent as `.wh.` tar entries, and only the newest Source pipe bridge of a read end drains (older siblings deadlocked dpkg-deb). `apt-get install -y file` completes.
 
 ## Containers and OCI
 
