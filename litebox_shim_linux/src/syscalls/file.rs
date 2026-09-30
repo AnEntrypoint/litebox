@@ -6874,6 +6874,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 raw_fd,
                 |fd| {
                     let flags = files.fs.open_flags(fd)?;
+                    let is_directory = files
+                        .fs
+                        .fd_file_status(fd)
+                        .is_ok_and(|status| status.file_type == litebox::fs::FileType::Directory);
+                    if is_directory {
+                        return Some((path, (flags | OFlags::DIRECTORY).bits(), 0));
+                    }
                     let offset = files
                         .fs
                         .seek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
@@ -7080,6 +7087,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(raw_fd) {
             return Some(alloc::format!("S|{flags}|{size}|{name}"));
         }
+        if self.raw_fd_subsystem_name(raw_fd) == "unix-socket"
+            && let Ok((spec, hold)) = self.raw_fd_unix_carry(raw_fd, 0)
+        {
+            match hold {
+                Some(crate::syscalls::unix::UnixCarryHold::Presence { .. }) => {
+                    if let Some(hold) = hold {
+                        crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
+                            &self.global,
+                            hold,
+                        );
+                    }
+                }
+                _ => return Some(alloc::format!("U|{spec}")),
+            }
+        }
         if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
             let (path, flags) = match raw_fd {
                 0 => ("/dev/stdin", OFlags::RDONLY),
@@ -7095,6 +7117,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// returns its raw fd number.
     pub(crate) fn rebuild_carried_fd(&self, spec: &str, cloexec: bool) -> Result<usize, Errno> {
         const AT_FDCWD: i32 = -100;
+        if let Some(carried) = spec.strip_prefix("U|") {
+            return self.rebuild_carried_unix(carried, cloexec);
+        }
         let mut parts = spec.splitn(4, '|');
         let kind = parts.next().ok_or(Errno::EINVAL)?;
         let first: u64 = parts
@@ -7152,6 +7177,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _ => return Err(Errno::EINVAL),
         };
         usize::try_from(raw).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Receiving half of a unix socket passed by `SCM_RIGHTS` over a cross-process connection:
+    /// `carried` is `<cloexec 0|1>|<fork spec>` as produced by [`Self::raw_fd_unix_carry`].
+    fn rebuild_carried_unix(&self, carried: &str, cloexec: bool) -> Result<usize, Errno> {
+        let (sender_cloexec, spec) = carried.split_once('|').ok_or(Errno::EINVAL)?;
+        let socket =
+            crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec).ok_or(Errno::EINVAL)?;
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
+        let raw = {
+            let files = self.files.borrow();
+            files
+                .insert_raw_fd(typed)
+                .map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?
+        };
+        if cloexec || sender_cloexec == "1" && cloexec {
+            let files = self.files.borrow();
+            set_file_descriptor_flags(raw, &self.global, &files, FileDescriptorFlags::FD_CLOEXEC)?;
+        }
+        Ok(raw)
     }
 
     /// Reopen `path` at exactly `target_fd`, positioned at `offset`.

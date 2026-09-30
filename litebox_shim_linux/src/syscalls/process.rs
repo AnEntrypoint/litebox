@@ -7302,6 +7302,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             copy_vector::<Platform>(envp, "envp", fork_relocations.as_deref())?
         };
 
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::process_timeline",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            pid = %self.pid.get(),
+            args = %argv_vec
+                .iter()
+                .skip(1)
+                .map(|arg| {
+                    let text = arg.to_string_lossy();
+                    text.chars().take(60).collect::<alloc::string::String>()
+                })
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" "),
+            "DIAG_TIMELINE execve args"
+        );
+
         // One-off diagnostic (113th pass, litebox-main): xfce4-session prints "Cannot open
         // display: ." and exits(1) immediately after execve on the cross-process-fork path, and
         // this crate's own copy_vector doc comment already records a live-confirmed prior

@@ -821,9 +821,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     fn peer_gone(&self) -> bool {
         let (read_ring, _) = self.rings();
         if read_ring.is_shutdown() {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::unix_conn_teardown",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                slot = %self.slot,
+                is_client = %self.is_client,
+                host_pid = %self.platform().current_host_pid(),
+                "DIAG unix shared conn: peer_gone because the read ring was shut down"
+            );
             return true;
         }
         if self.slot_ref().side_gone(!self.is_client, self.platform()) {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::unix_conn_teardown",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                slot = %self.slot,
+                is_client = %self.is_client,
+                host_pid = %self.platform().current_host_pid(),
+                "DIAG unix shared conn: peer_gone because the peer side has no live holder"
+            );
             read_ring.shutdown();
             return true;
         }
@@ -831,6 +847,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     }
 
     fn hold(&self) {
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::unix_conn_teardown",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            slot = %self.slot,
+            is_client = %self.is_client,
+            host_pid = %self.platform().current_host_pid(),
+            "DIAG unix shared conn: hold"
+        );
         self.slot_ref()
             .hold(self.is_client, self.platform().current_host_pid());
     }
@@ -850,6 +874,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// One holder of this side is gone. Once none remains, this side's write direction ends;
     /// once neither side is held, the slot returns to the pool.
     fn release_holder(&self) {
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::unix_conn_teardown",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            slot = %self.slot,
+            is_client = %self.is_client,
+            host_pid = %self.platform().current_host_pid(),
+            before = %self.slot_ref().holder_dump(),
+            "DIAG unix shared conn: release_holder"
+        );
         let slot_ref = self.slot_ref();
         slot_ref.release(self.is_client, self.platform().current_host_pid());
         if slot_ref.side_gone(self.is_client, self.platform()) {
@@ -1235,6 +1268,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let need = bytes + if framed { 4 * messages } else { 0 };
         let table = &global.unix_shared_conn_table;
         let existing = link.slot.load(Ordering::Acquire);
+        // Only the first promotion may fold the local peer's state into the shared ring. On a
+        // later promotion (this end carried again by another fork) the local peer object being
+        // closed no longer means the peer is gone: its side lives on in the slot, held by the
+        // process the earlier fork gave it to, and shutting the ring would end a live connection.
+        let first_promotion = existing == u32::MAX;
         let slot = if existing == u32::MAX {
             if need > SHARED_UNIX_CONN_BUF {
                 return Err("more unread data queued on a unix socket than a shared ring holds");
@@ -1291,7 +1329,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             };
             debug_assert!(written, "capacity was checked above");
         }
-        if recv_channel.is_peer_shutdown() {
+        if first_promotion && recv_channel.is_peer_shutdown() {
             read_ring.shutdown();
         }
         Ok((slot, is_client))
@@ -3760,6 +3798,21 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         }
     }
 
+    fn holder_dump(&self) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for side in 0..2 {
+            out.push_str(if side == 0 { "client[" } else { " server[" });
+            for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+                let n = c.load(Ordering::Acquire);
+                if n > 0 {
+                    out.push_str(&alloc::format!("{}x{} ", h.load(Ordering::Acquire), n));
+                }
+            }
+            out.push(']');
+        }
+        out
+    }
+
     /// The side was held and no live host process holds it any more.
     fn side_gone(&self, is_client: bool, platform: &Platform) -> bool {
         let side = conn_side(is_client);
@@ -4370,6 +4423,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         let (slot, is_client) =
                             conn.promote_for_fork(global, own_cred, stream.preserve_boundaries)?;
                         let me = global.platform.current_host_pid();
+                        litebox_util_log::__private::tracing::event!(
+                            target: "litebox_diag::unix_conn_teardown",
+                            litebox_util_log::__private::tracing::Level::DEBUG,
+                            slot = %slot,
+                            is_client = %is_client,
+                            host_pid = %me,
+                            "DIAG unix shared conn: fork_carry extra hold for the child"
+                        );
                         global
                             .unix_shared_conn_table
                             .get(slot)
@@ -4478,11 +4539,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         peer_addr,
                         peer_cred,
                     );
+                    litebox_util_log::__private::tracing::event!(
+                        target: "litebox_diag::unix_conn_teardown",
+                        litebox_util_log::__private::tracing::Level::DEBUG,
+                        slot = %slot,
+                        is_client = %is_client,
+                        parent_host = %parent_host,
+                        child_host = %task.global.platform.current_host_pid(),
+                        "DIAG unix shared conn: child adopted, releasing the parent's extra hold"
+                    );
                     // The holder the parent counted for this child now lives here.
                     task.global
                         .unix_shared_conn_table
                         .get(slot)
                         .release(is_client, parent_host);
+                    litebox_util_log::__private::tracing::event!(
+                        target: "litebox_diag::unix_conn_teardown",
+                        litebox_util_log::__private::tracing::Level::DEBUG,
+                        slot = %slot,
+                        after = %task.global.unix_shared_conn_table.get(slot).holder_dump(),
+                        "DIAG unix shared conn: holders after the child adopted"
+                    );
                     UnixStreamState::Connected(conn)
                 }
                 _ => return None,

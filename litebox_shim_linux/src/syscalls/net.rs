@@ -2032,7 +2032,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .map_err(|_| Errno::EBADF)?
                         .ok_or(Errno::EBADF)?;
                     drop(files);
-                    specs.push(self.scm_carry_spec(raw_fd));
+                    let spec = self.scm_carry_spec(raw_fd);
+                    if spec.is_none() {
+                        litebox_util_log::debug!(
+                            fd:% = raw_fd, kind:% = self.raw_fd_subsystem_name(raw_fd);
+                            "SCM_RIGHTS: this fd kind cannot cross a process boundary"
+                        );
+                    }
+                    specs.push(spec);
                     fds.push(any);
                 }
             }
