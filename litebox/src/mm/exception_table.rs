@@ -78,8 +78,7 @@ pub struct Fault;
 // through this crate's own fallible-write path (as opposed to a raw guest-code
 // memory store that never calls into litebox at all).
 // Remove once the investigation concludes.
-static WATCH_RANGE_START: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static WATCH_RANGE_START: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static WATCH_RANGE_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static WATCH_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 

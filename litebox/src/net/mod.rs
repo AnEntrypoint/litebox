@@ -26,18 +26,18 @@ pub mod socket_channel;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError, ShutdownError,
-    RemoteAddrError, SendError, SocketError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
+    RemoteAddrError, SendError, ShutdownError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
 /// IP address for LiteBox interface
 // TODO: Make this configurable
-const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+pub const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
 /// IP address for the gateway
 // TODO: Make this configurable
-const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+pub const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Size of each socket rx/tx buffer. Buffers come from fixed slot pools in the shared kernel
 /// arena (see `socket_buffers`), so this is a pool slot size, not a per-socket allocation.
@@ -109,8 +109,10 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 /// to set up a proxy for each socket created, so that events can be notified properly.
 pub struct Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     litebox: LiteBox<Platform>,
     /// The set of sockets
@@ -165,8 +167,10 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Construct a new `Network` instance
     ///
@@ -280,7 +284,13 @@ where
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
     /// it lingers for a bit to allow pending data to be sent).
-    consider_closed: bool,
+    ///
+    /// Atomic so `close` can flag it under a shared entry lock: a thread blocked in a read of the
+    /// same socket holds that lock, and `close` must not wait for it.
+    consider_closed: core::sync::atomic::AtomicBool,
+    /// `shutdown(SHUT_WR)` was requested while written data had not yet reached the wire: the
+    /// FIN is sent once it has, never ahead of it.
+    shutdown_wr_pending: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -586,8 +596,10 @@ impl PlatformInteractionReinvocationAdvice {
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
@@ -668,7 +680,9 @@ where
     /// levels deeper because these particular stale pointers live inside a struct that is itself
     /// correctly, genuinely shared rather than at `GlobalState`'s own top level.
     pub fn rebind_per_process_fields(&mut self, litebox: &LiteBox<Platform>) {
+        let loopback = core::mem::take(&mut self.device.loopback);
         self.device = phy::Device::new(litebox.x.platform);
+        self.device.loopback = loopback;
         // 49th pass (2026-09-22), root-caused live via RUST_BACKTRACE=full on a reproducible
         // `buddy_system_allocator-0.11.0/src/lib.rs:165` "index out of bounds: the len is 34 but
         // the index is 53" panic, 3/3 independent occurrences with the BIT-IDENTICAL backtrace:
@@ -936,14 +950,44 @@ where
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
         let table = self.litebox.descriptor_table();
-        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
+        for (_, mut handle) in table.iter_mut_nowait::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
-            if socket_handle.consider_closed {
+            if socket_handle.shutdown_wr_pending {
+                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                    socket_handle.shutdown_wr_pending = false;
+                } else if !socket_handle
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|proxy| proxy.has_pending_tx())
+                {
+                    let sent_fin = socket_handle.with_socket_mut(
+                        &mut self.socket_set,
+                        |tcp_socket| {
+                            let has_pending_data =
+                                tcp_socket.may_send() && tcp_socket.send_queue() > 0;
+                            if !has_pending_data {
+                                tcp_socket.close();
+                            }
+                            !has_pending_data
+                        },
+                        |_| true,
+                    );
+                    if sent_fin {
+                        socket_handle.shutdown_wr_pending = false;
+                    }
+                }
+            }
+            if socket_handle
+                .consider_closed
+                .load(core::sync::atomic::Ordering::Relaxed)
+            {
                 // See `socket_set_contains`'s doc comment: a stale handle (this descriptor's own
                 // socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
                 // elsewhere) has nothing left to close.
                 if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
-                    socket_handle.consider_closed = false;
+                    socket_handle
+                        .consider_closed
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 // check if there is pending data to be sent
@@ -971,7 +1015,9 @@ where
                     },
                 );
                 if closed {
-                    socket_handle.consider_closed = false;
+                    socket_handle
+                        .consider_closed
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -981,7 +1027,7 @@ where
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
         let table = self.litebox.descriptor_table();
-        for (_, entry) in table.iter::<Network<Platform>>() {
+        for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
         }
     }
@@ -1158,8 +1204,10 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
@@ -1233,7 +1281,8 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
-            consider_closed: false,
+            consider_closed: core::sync::atomic::AtomicBool::new(false),
+            shutdown_wr_pending: false,
             handle,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
@@ -1371,8 +1420,12 @@ where
                 // whole struct already went to real effort to remove (twenty-eighth pass).
             }
             super::fd::CloseResult::Deferred => {
-                let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
-                else {
+                let Some(()) = dt.with_entry(fd, |entry| {
+                    entry
+                        .entry
+                        .consider_closed
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                }) else {
                     unreachable!()
                 };
                 // `close_pending_sockets` now owns this socket: it closes once the TX ring and
@@ -1416,6 +1469,7 @@ where
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
             consider_closed: _,
+            shutdown_wr_pending: _,
             handle,
             mut specific,
             proxy,
@@ -1651,7 +1705,29 @@ where
                             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
                         }
                     },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                    // Bound but not connected (a listener, or a socket that only called
+                    // `bind`): smoltcp has no local endpoint yet, but the address the guest bound
+                    // is recorded on our side and is what `getsockname` must report.
+                    None => {
+                        let specific = socket_handle.tcp();
+                        if let Some(server) = &specific.server_socket {
+                            let ip = match server.ip_listen_endpoint.addr {
+                                Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                                None => Ipv4Addr::UNSPECIFIED,
+                            };
+                            Ok(SocketAddr::V4(SocketAddrV4::new(
+                                ip,
+                                server.ip_listen_endpoint.port,
+                            )))
+                        } else if let Some(local_port) = &specific.local_port {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(
+                                Ipv4Addr::UNSPECIFIED,
+                                local_port.port(),
+                            )))
+                        } else {
+                            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+                        }
+                    }
                 }
             }
             Protocol::Udp => {
@@ -1845,10 +1921,10 @@ where
         write_half: bool,
     ) -> Result<(), ShutdownError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table
-            .get_entry(fd)
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
             .ok_or(ShutdownError::InvalidFd)?;
-        let socket_handle = &table_entry.entry;
+        let socket_handle = &mut table_entry.entry;
         if !write_half {
             // `SHUT_RD` alone: nothing to emit on the wire (see this function's doc comment).
             return Ok(());
@@ -1871,9 +1947,19 @@ where
                         let now = self.now();
                         Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
                     } else {
+                        let pending_in_channel = socket_handle
+                            .proxy
+                            .as_ref()
+                            .is_some_and(|proxy| proxy.has_pending_tx());
                         let tcp_socket: &mut tcp::Socket =
                             self.socket_set.get_mut(socket_handle.handle);
-                        tcp_socket.close();
+                        if pending_in_channel
+                            || (tcp_socket.may_send() && tcp_socket.send_queue() > 0)
+                        {
+                            socket_handle.shutdown_wr_pending = true;
+                        } else {
+                            tcp_socket.close();
+                        }
                     }
                 }
                 Ok(())
@@ -1959,7 +2045,9 @@ where
                     // those are equivalent placeholders with no client-visible state yet.
                     let new_backlog_usize: usize = backlog.into();
                     if server_socket.socket_set_handles.len() > new_backlog_usize {
-                        for handle in server_socket.socket_set_handles.split_off(new_backlog_usize)
+                        for handle in server_socket
+                            .socket_set_handles
+                            .split_off(new_backlog_usize)
                         {
                             // Stale-handle guard (see `socket_set_contains`'s own doc comment) --
                             // a handle already wiped by a dead-holder `reset_after_poisoning()`
@@ -2063,7 +2151,8 @@ where
                 drop(descriptor_table);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
-                    consider_closed: false,
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
+                    shutdown_wr_pending: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,

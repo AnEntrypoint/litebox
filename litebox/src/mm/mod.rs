@@ -449,9 +449,7 @@ impl AddressRelocations {
     /// ancestor groups are not currently consumed by any caller that would need them chained).
     #[must_use]
     pub fn merge_ancestor_ranges(mut self, ancestor: &Self) -> Self {
-        for (i, (ancestor_source_range, ancestor_dest_base)) in
-            ancestor.ranges.iter().enumerate()
-        {
+        for (i, (ancestor_source_range, ancestor_dest_base)) in ancestor.ranges.iter().enumerate() {
             let dest_base = self
                 .translate(*ancestor_dest_base)
                 .unwrap_or(*ancestor_dest_base);
@@ -770,6 +768,30 @@ where
         )
     }
 
+    /// [`Self::new_adopting_existing_memory`] for a child that inherited the parent's address
+    /// space natively: every region, `PROT_NONE` reservations and shared mappings included, is
+    /// tracked because each really exists in the child.
+    pub fn new_adopting_inherited_memory(
+        litebox: &LiteBox<Platform>,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        let (vmem, adopted, shared) = linux::Vmem::new_adopting_inherited_memory(
+            litebox.x.platform,
+            regions,
+            brk,
+            group_spans,
+        );
+        (
+            Self {
+                vmem: RwLock::new(vmem),
+            },
+            adopted,
+            shared,
+        )
+    }
+
     /// The number of guest regions currently tracked, and the current program break -- a cheap
     /// read-only summary for a caller that needs to verify a reconstructed address-space
     /// description matches the one it was built from (see
@@ -1035,7 +1057,34 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let mut vmem = self.vmem.write();
-        unsafe { vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle) }
+        unsafe {
+            vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle)
+        }
+    }
+
+    /// Map a shared-memory object read-only, never able to become writable (see
+    /// [`Self::map_existing_shared_pages`] for the writable counterpart). Used to let every
+    /// process that maps the same large read-only file share one copy of its pages.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::map_existing_shared_pages`].
+    pub unsafe fn map_existing_shared_pages_file_readonly(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.map_existing_shared_pages_file_readonly(
+                suggested_address,
+                length,
+                flags,
+                shared_handle,
+            )
+        }
     }
 
     /// Create read-only pages.
@@ -1158,7 +1207,16 @@ where
         } else {
             MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
         };
-        unsafe { self.create_pages(suggested_address, length, flags, before_perms, permissions, op) }
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                permissions,
+                op,
+            )
+        }
     }
 
     /// Create stack pages.
@@ -1292,11 +1350,8 @@ where
             if placed.as_usize() != suggested_address.as_usize() {
                 unsafe {
                     vmem.remove_mapping(
-                        PageRange::new(
-                            placed.as_usize(),
-                            placed.as_usize() + length.as_usize(),
-                        )
-                        .ok_or(MappingError::UnAligned)?,
+                        PageRange::new(placed.as_usize(), placed.as_usize() + length.as_usize())
+                            .ok_or(MappingError::UnAligned)?,
                     )
                 }
                 .ok();
@@ -1522,7 +1577,12 @@ where
         // concurrent `write`/`execute` access), which is equal to or stronger than
         // `change_page_permissions`'s precondition.
         unsafe {
-            self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ, "make_pages_readable")
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ,
+                "make_pages_readable",
+            )
         }
     }
 
@@ -1540,7 +1600,12 @@ where
         // concurrent access at all), which is equal to or stronger than
         // `change_page_permissions`'s precondition.
         unsafe {
-            self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty(), "make_pages_inaccessible")
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::empty(),
+                "make_pages_inaccessible",
+            )
         }
     }
 

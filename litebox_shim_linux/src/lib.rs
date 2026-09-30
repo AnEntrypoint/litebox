@@ -318,9 +318,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 .into_iter()
                 .any(|(r, _)| r.contains(&(ctx.rip as usize)));
             if rip_mapped {
-                let dump = unsafe {
-                    core::slice::from_raw_parts(ctx.rip as *const u8, 64)
-                };
+                let dump = unsafe { core::slice::from_raw_parts(ctx.rip as *const u8, 64) };
                 litebox_util_log::debug!(
                     rip:% = format_args!("{:#x}", ctx.rip),
                     bytes:% = format_args!("{:02x?}", dump);
@@ -608,12 +606,26 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // relocated into cross-process-shared memory or referenced from a different process at all
         // -- unlike a `BTreeMap`, there is no "move the collection into the shared arena" fix
         // available here even in principle.
-        let my_futex_manager = Arc::new(FutexManager::new());
+        // Allocated privately (never in the shared arena): a native-fork child gets its own
+        // copy-on-write duplicate, and `reinit_as_native_fork_child` empties it, so waiters
+        // pinned on one process's stacks are never reachable from another process.
+        let my_futex_manager = {
+            let _private = litebox_util_log::PrivateAllocGuard::new();
+            Arc::new(FutexManager::new())
+        };
         // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
         // comment's "Seventh and eighth instances of the SAME defect" section.
-        let my_memfds = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
-        let my_shared_files =
-            Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        let my_memfds = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_shared_files = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning again for the inotify registry and its "anything watched" counter.
+        let my_inotify = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_inotify_watching = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         // Ninth instance of the SAME defect -- see `GlobalStateHandle::unix_addr_table`'s doc
         // comment (2026-09-18 systematic audit).
         let my_unix_addr_table = Arc::new(litebox::sync::RwLock::new(
@@ -621,8 +633,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         ));
         // Tenth instance of the SAME defect -- see `GlobalStateHandle::fifo_registry`'s doc
         // comment (2026-09-18 systematic audit).
-        let my_fifo_registry =
-            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
+        let my_fifo_registry = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
         // Eleventh instance of the SAME defect -- see `GlobalStateHandle::pty_registry`'s doc
         // comment. The genuine cross-process capability these two fields' ORIGINAL doc comments
         // (also preserved there) actually need is restored separately by `GlobalState::
@@ -649,6 +662,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
                         live_cross_process_fork_children: core::sync::atomic::AtomicU32::new(0),
+                        native_vfork_gates: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        process_registry: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
                         unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
@@ -660,6 +679,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+                        record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                        record_lock_pollee: litebox::event::polling::Pollee::new(),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
                         process_table: syscalls::signal::xproc::SharedProcessTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
@@ -680,6 +701,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             segment_scan_cache: my_segment_scan_cache,
             futex_manager: my_futex_manager,
             memfds: my_memfds,
+            inotify: my_inotify,
+            inotify_watching: my_inotify_watching,
             shared_files: my_shared_files,
             unix_addr_table: my_unix_addr_table,
             fifo_registry: my_fifo_registry,
@@ -909,11 +932,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     bootstrap_shared_pending.clone(),
                     None,
                 )),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -933,6 +956,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             .bootstrap_process
             .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
         entrypoints.task.xproc_register_self(false);
+        self.0
+            .process_registry
+            .lock()
+            .insert(entrypoints.task.pid.get(), entrypoints.task.process());
 
         let (path, argv) = entrypoints
             .task
@@ -1120,11 +1147,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             task: Task {
                 global: self.0.clone(),
                 thread: RefCell::new(thread_state),
-                wait_state: wait::WaitState::new(self.0.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
-                credentials: syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: comm.into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1399,26 +1426,83 @@ fn default_fs<Platform: ShimPlatform>(
                         // assertion abort in any GTK app that has to decode a PNG -- confirmed
                         // live as what was crashing `xfce4-panel` on its own bundled
                         // `image-missing.png` fallback icon.
-                        litebox::fs::static_files::file("kernel/overflowuid", b"65534
-"),
-                        litebox::fs::static_files::file("kernel/overflowgid", b"65534
-"),
+                        litebox::fs::static_files::file(
+                            "kernel/overflowuid",
+                            b"65534
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/overflowgid",
+                            b"65534
+"
+                        ),
                         // The highest capability number this "kernel" knows. `40` is
                         // `CAP_CHECKPOINT_RESTORE`, the last one defined as of Linux 5.9 and
                         // still the last in 6.x. libcap reads this to size its own capability
                         // bitmaps and to bound `cap_get_bound` loops.
-                        litebox::fs::static_files::file("kernel/cap_last_cap", b"40
-"),
+                        litebox::fs::static_files::file(
+                            "kernel/cap_last_cap",
+                            b"40
+"
+                        ),
                         // Not a FIPS build. OpenSSL and GnuTLS both read this at init; absent, at
                         // least one of them logs a startup complaint on every process.
-                        litebox::fs::static_files::file("crypto/fips_enabled", b"0
-"),
+                        litebox::fs::static_files::file(
+                            "crypto/fips_enabled",
+                            b"0
+"
+                        ),
                         // Heuristic overcommit (the Linux default). Read by allocators deciding
                         // whether a large speculative reservation will be honoured -- which, on
                         // this platform, it is, since `allocate_pages` reserves without
                         // committing until touched.
-                        litebox::fs::static_files::file("vm/overcommit_memory", b"0
-"),
+                        litebox::fs::static_files::file(
+                            "vm/overcommit_memory",
+                            b"0
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "vm/max_map_count",
+                            b"1048576
+"
+                        ),
+                        // Limits programs read to size their own tables or loops (inotify
+                        // watch budgets, supplementary-group arrays, fd ceilings, pid space).
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_user_watches",
+                            b"524288
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_user_instances",
+                            b"128
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_queued_events",
+                            b"16384
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/nr_open",
+                            b"1048576
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/ngroups_max",
+                            b"65536
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/pid_max",
+                            b"4194304
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/threads-max",
+                            b"1048576
+"
+                        ),
                     ],
                 )
             })
@@ -1430,10 +1514,15 @@ fn default_fs<Platform: ShimPlatform>(
                     litebox,
                     allocator,
                     alloc::vec![
-                        litebox::fs::static_files::file("enabled", b"N
-"),
-                        litebox::fs::static_files::file("available", b"N
-"),
+                        litebox::fs::static_files::file(
+                            "enabled", b"N
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "available",
+                            b"N
+"
+                        ),
                     ],
                 )
             })
@@ -1443,11 +1532,16 @@ fn default_fs<Platform: ShimPlatform>(
             // answer here sizes every thread pool in the session.
             .mount("/sys/devices/system/cpu", |allocator| {
                 let range = if cpu_count > 1 {
-                    alloc::format!("0-{}
-", cpu_count - 1)
+                    alloc::format!(
+                        "0-{}
+",
+                        cpu_count - 1
+                    )
                 } else {
-                    alloc::string::String::from("0
-")
+                    alloc::string::String::from(
+                        "0
+",
+                    )
                 };
                 let mut entries = alloc::vec![
                     litebox::fs::static_files::file("online", range.as_bytes()),
@@ -1593,7 +1687,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
     /// resolve to `GlobalStateHandle`'s own, always-locally-valid `litebox` field (see that
     /// struct's doc comment), not `GlobalState`'s shared/cross-process-unsafe one (which no
     /// longer exists as a field at all, precisely to make that mistake impossible here).
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalStateHandle<Platform, FS>) {
+    fn initialize_stdio_in_shared_descriptors_table(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
@@ -1757,12 +1854,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = self
                         .global
                         .net_lock()
-                        .close(&fd, litebox::net::CloseBehavior::Immediate);
+                        .close(&fd, litebox::net::CloseBehavior::Graceful);
                 }
             } else {
                 let _ = self.do_close(raw_fd);
             }
-            if let Ok(Some(pair)) = slave_pair {
+            if let Ok(Some(pair)) = slave_pair
+                && self.is_session_leader()
+            {
                 self.global.hangup_slave(&pair);
             }
         }
@@ -1955,14 +2054,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // process environment -- see `diag`'s module doc comment) and, when enabled, time this
         // dispatch and record the outcome. Zero overhead beyond one relaxed atomic load when
         // unset.
-        crate::diag::init_strace_summary(|| self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY"));
+        crate::diag::init_strace_summary(|| {
+            self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY")
+        });
         let timed = crate::diag::strace_summary_enabled();
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let start = timed.then(|| self.global.platform.now());
-        litebox::fs::set_effective_identity(self.credentials.fsuid(), self.credentials.fsgid());
+        litebox::fs::set_effective_identity(self.creds().fsuid, self.creds().fsgid);
 
         // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`: log syscall ENTRY (before dispatch, so a syscall
         // that blocks forever still shows up -- `LITEBOX_STRACE_SUMMARY`'s aggregate-only
@@ -1984,13 +2085,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // then outlived its cause and made the shim's most useful instrument answer questions
         // about exactly one desktop. `SystemInfoProvider::env_value` now exists and this reads it;
         // see `diag::init_syscall_timeline` for why the bound is unchanged by that.
-        crate::diag::init_syscall_timeline(|| self.global.platform.env_value("LITEBOX_DIAG_SYSCALL_TIMELINE"));
+        crate::diag::init_syscall_timeline(|| {
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE")
+        });
         // 74th pass: same lazy-latch shape, for the `litebox_diag::socket_read` payload-preview
         // diagnostic's own optional comm filter -- see `diag::init_socket_read_filter`'s doc
         // comment for what problem this solves (blanket-on-every-process cost once that
         // tracing target is enabled) and why unset is a no-op, not a behavior change.
         crate::diag::init_socket_read_filter(|| {
-            self.global.platform.env_value("LITEBOX_DIAG_SOCKET_READ_TARGET")
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SOCKET_READ_TARGET")
         });
         // 113th pass: companion pid-based filter (see `init_syscall_timeline_pids`'s own doc
         // comment) -- necessary because `comm` is never inherited at fork time in this codebase,
@@ -2037,7 +2144,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         if let Some(start) = start {
-            let elapsed = litebox::platform::Instant::duration_since(&self.global.platform.now(), &start);
+            let elapsed =
+                litebox::platform::Instant::duration_since(&self.global.platform.now(), &start);
             let err_debug = result.as_ref().err().map(|e| alloc::format!("{e:?}"));
             crate::diag::record_syscall(
                 syscall_number,
@@ -2053,6 +2161,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
+            if let Some(sp) = syscalls::process::take_native_child_sp() {
+                ctx.rsp = sp;
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -2096,8 +2207,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
-        let request = match SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)
-        {
+        let request = match SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt) {
             Ok(r) => r,
             Err(e) => {
                 if crate::diag::strace_summary_enabled() {
@@ -2120,9 +2230,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if crate::diag::is_syscall_timeline_target_comm(&self.comm.get())
             || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
         {
-            let debug_str = alloc::format!("{request:?}");
-            let truncated = if debug_str.len() > 200 {
-                alloc::format!("{}...", &debug_str[..200])
+            let mut debug_str = alloc::format!("{request:?}");
+            if let SyscallRequest::Prctl {
+                args: litebox_common_linux::PrctlArg::SetName(ptr),
+            } = &request
+                && let Some(c) = ptr.to_owned_slice::<Platform>(16)
+            {
+                debug_str = alloc::format!(
+                    "{debug_str} name={:?}",
+                    alloc::string::String::from_utf8_lossy(&c)
+                );
+            }
+            let truncated = if debug_str.len() > 320 {
+                alloc::format!("{}...", &debug_str[..320])
             } else {
                 debug_str.clone()
             };
@@ -2144,7 +2264,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | SyscallRequest::Clone3 { .. }
                 | SyscallRequest::Execve { .. }
                 | SyscallRequest::Wait4 { .. }
-            | SyscallRequest::Waitid { .. }
+                | SyscallRequest::Waitid { .. }
                 | SyscallRequest::Exit { .. }
                 | SyscallRequest::ExitGroup { .. }
                 | SyscallRequest::Openat { .. }
@@ -2286,6 +2406,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 oldset,
                 sigsetsize,
             } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
+            SyscallRequest::RtTgsigqueueinfo { tgid, tid, sig } => {
+                self.sys_rt_tgsigqueueinfo(tgid, tid, sig)
+            }
+            SyscallRequest::RtSigqueueinfo { pid, sig } => self.sys_rt_sigqueueinfo(pid, sig),
             SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
                 self.sys_rt_sigsuspend(ctx, mask, sigsetsize)
             }
@@ -2312,6 +2442,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
+            SyscallRequest::CopyFileRange {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_copy_file_range(
+                fd_in, off_in, fd_out, off_out, len, flags
+            )),
+            SyscallRequest::Splice {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_splice(fd_in, off_in, fd_out, off_out, len, flags)),
             SyscallRequest::Sendfile {
                 out_fd,
                 in_fd,
@@ -2373,6 +2521,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 behavior,
             } => syscall!(sys_madvise(addr, length, behavior)),
+            SyscallRequest::InotifyInit { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                syscall!(sys_inotify_add_watch(fd, pathname, mask))
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
+            SyscallRequest::Mincore { addr, length, vec } => {
+                syscall!(sys_mincore(addr, length, vec))
+            }
+            SyscallRequest::Msync {
+                addr,
+                length,
+                flags,
+            } => syscall!(sys_msync(addr, length, flags)),
             SyscallRequest::Dup {
                 oldfd,
                 newfd,
@@ -2769,20 +2930,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 path
             }
-                .map_or(Err(Errno::EFAULT), |path| {
-                    let times = if times.is_null() {
-                        None
-                    } else {
-                        let Some(atime) = times.read_at_offset::<Platform>(0) else {
-                            return Err(Errno::EFAULT);
-                        };
-                        let Some(mtime) = times.read_at_offset::<Platform>(1) else {
-                            return Err(Errno::EFAULT);
-                        };
-                        Some((atime, mtime))
+            .map_or(Err(Errno::EFAULT), |path| {
+                let times = if times.is_null() {
+                    None
+                } else {
+                    let Some(atime) = times.read_at_offset::<Platform>(0) else {
+                        return Err(Errno::EFAULT);
                     };
-                    syscall!(sys_utimensat(dirfd, path, times, flags))
-                }),
+                    let Some(mtime) = times.read_at_offset::<Platform>(1) else {
+                        return Err(Errno::EFAULT);
+                    };
+                    Some((atime, mtime))
+                };
+                syscall!(sys_utimensat(dirfd, path, times, flags))
+            }),
             SyscallRequest::Statx {
                 dirfd,
                 pathname,
@@ -2835,7 +2996,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // pointer must still surface as a real `EFAULT`, matching real Linux, rather than
                 // being silently ignored.
                 name.to_cstring::<Platform>()
-                    .map_or(Err(Errno::EFAULT), |_name| syscall!(sys_memfd_create(flags)))
+                    .map_or(Err(Errno::EFAULT), |_name| {
+                        syscall!(sys_memfd_create(flags))
+                    })
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
@@ -2933,6 +3096,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
             SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
+            SyscallRequest::Personality { persona } => Ok(self.sys_personality(persona) as usize),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }
@@ -2953,6 +3117,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EFAULT)
                 }
             }
+            SyscallRequest::Getrusage { who, usage } => {
+                // RUSAGE_CHILDREN = -1, RUSAGE_SELF = 0, RUSAGE_THREAD = 1. No per-process
+                // accounting exists here, so every counter reads zero.
+                if !(-1..=1).contains(&who) {
+                    return Err(Errno::EINVAL);
+                }
+                usage
+                    .write_slice_at_offset::<Platform>(0, &[0u8; 144])
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
+            SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.
@@ -3172,6 +3348,10 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// for the live-caught 2026-09-18 evidence (`sed`/`xset` both died on this, a corrupted-
     /// `BTreeMap`-node panic in `syscalls::mm::MemfdRegistry`, fixed the identical way).
     memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    /// Every inotify instance (see `syscalls::inotify`), shared by all processes.
+    inotify: Arc<litebox::sync::Mutex<Platform, syscalls::inotify::InotifyRegistry<Platform>>>,
+    /// How many watches exist; file-system syscalls skip event delivery when it is zero.
+    inotify_watching: Arc<core::sync::atomic::AtomicUsize>,
     shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
     /// Ninth instance of the SAME defect class this struct's own doc comment documents eight
     /// times over, found during the 2026-09-18 systematic `GlobalState`-field audit: this table's
@@ -3188,14 +3368,18 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// carries its own, always-freshly-constructed-per-process `unix_addr_table`, shadowing
     /// `GlobalState`'s (now removed) field for every existing `self.global.unix_addr_table` call
     /// site with no further change.
-    unix_addr_table: Arc<litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>>,
+    unix_addr_table:
+        Arc<litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>>,
     /// Tenth instance of the SAME defect class, found in the same audit: `GlobalState::
     /// fifo_registry`'s own doc comment already says outright "shared by every thread of this
     /// process -- but NOT across processes" -- i.e. this too was always meant to be per-process
     /// private state, mistakenly placed as a byte-shared `GlobalState` field. Fixed the identical
     /// way, shadowing `GlobalState`'s (now removed) field.
     fifo_registry: Arc<
-        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>>,
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
+        >,
     >,
     /// Eleventh instance of the SAME defect class this struct's own doc comment documents ten
     /// times over: a real cross-process-forked child's copy of this `BTreeMap<u32,
@@ -3220,7 +3404,10 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// `open("/dev/pts/<id>")` for an id THIS process allocated instead takes
     /// `GlobalStateHandle::pts_open`'s `SharedPtyTable`-backed cross-process fallback.
     pty_registry: Arc<
-        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>>,
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+        >,
     >,
     /// Same reasoning as [`Self::pty_registry`] immediately above. Registry of allocated ptys'
     /// master-side fd, keyed by pty id, populated only for a pty created via
@@ -3230,7 +3417,10 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// `SharedPtyTable` directly when THIS process's own copy of this map doesn't have the
     /// requested id (i.e. it was allocated by a different process in the fork family).
     daemon_pty_masters: Arc<
-        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>>,
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+        >,
     >,
     /// The guest processes running in THIS host process, by pid -- per-process by design (it
     /// holds `Weak` pointers into this process's heap); the cross-process view is
@@ -3251,6 +3441,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             segment_scan_cache: self.segment_scan_cache.clone(),
             futex_manager: self.futex_manager.clone(),
             memfds: self.memfds.clone(),
+            inotify: self.inotify.clone(),
+            inotify_watching: self.inotify_watching.clone(),
             shared_files: self.shared_files.clone(),
             unix_addr_table: self.unix_addr_table.clone(),
             fifo_registry: self.fifo_registry.clone(),
@@ -3371,6 +3563,13 @@ impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
         self.pipes.detach_end(self.litebox, fd)
     }
 
+    pub(crate) fn readable_bytes(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<usize, litebox::pipes::errors::ClosedError> {
+        self.pipes.readable_bytes(self.litebox, fd)
+    }
+
     pub(crate) fn half_pipe_type(
         &self,
         fd: &litebox::pipes::PipeFd<Platform>,
@@ -3466,6 +3665,24 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// fix (share the parsed rootfs itself instead of re-deriving it per child) remains open, see
     /// AGENTS.md.
     live_cross_process_fork_children: core::sync::atomic::AtomicU32,
+    /// One gate per native-`fork()` child that was created by `vfork()`/`clone(CLONE_VFORK)`,
+    /// keyed by the child's pid. The parent blocks on it (`vfork()` suspends the caller until the
+    /// child execs or exits); the child opens it. Lives in the shared kernel heap so the two
+    /// processes see the same futex word.
+    native_vfork_gates: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            i32,
+            Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>,
+        >,
+    >,
+    /// Every live guest process that is not a thread-based child of its parent -- the bootstrap
+    /// process and each native-`fork()` child -- by pid. `getpgid`/`setpgid`/`kill` use it to
+    /// reach a process that is not a direct child of the caller. Lives in the shared kernel heap.
+    process_registry: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<i32, Arc<syscalls::process::Process<Platform>>>,
+    >,
     // NOTE: this struct deliberately has NO `unix_addr_table` field -- NINTH instance of the SAME
     // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
     // comment, found in the 2026-09-18 systematic audit. See `GlobalStateHandle::unix_addr_table`'s
@@ -3568,6 +3785,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
+    /// POSIX (`fcntl`) record locks held by any guest process, owned by pid.
+    record_locks: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>,
+    /// Woken whenever a record lock is released, so `F_SETLKW` waiters retry.
+    record_lock_pollee: litebox::event::polling::Pollee<Platform>,
     // NOTE: this struct deliberately has NO `pty_registry`/`daemon_pty_masters` fields --
     // ELEVENTH instance of the SAME cross-process-garbage-pointer defect class documented on
     // `GlobalStateHandle`'s own doc comment. Unlike `fifo_registry` (whose own doc comment
@@ -3722,20 +3943,67 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// normally, inside the `libc::fork()` call this wraps -- nothing here replaces those, only
     /// adds to them, narrowly, for the one thing this crate owns that they don't: its own
     /// shim-wide locks.
-    fn with_shimwide_locks_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _net = self.net_lock();
-        let _unix_addr_table = self.unix_addr_table.write();
-        let _elf_patch_cache = self.elf_patch_cache.lock();
-        let _segment_scan_cache = self.segment_scan_cache.lock();
-        let _exec_ranges_cache = self.exec_ranges_cache.lock();
-        let _sysv_shm = self.sysv_shm.lock();
-        let _flock_registry = self.flock_registry.lock();
-        let _pty_registry = self.pty_registry.write();
-        let _daemon_pty_masters = self.daemon_pty_masters.write();
-        let _memfds = self.memfds.lock();
-        let _shared_files = self.shared_files.lock();
-        let _proc_self_info = self.proc_self_info.write();
-        f()
+    fn with_shimwide_locks_held<R>(
+        &self,
+        f: impl FnOnce() -> R,
+        is_forked_child: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let guards = (
+            self.net_lock(),
+            self.unix_addr_table.write(),
+            self.elf_patch_cache.lock(),
+            self.segment_scan_cache.lock(),
+            self.exec_ranges_cache.lock(),
+            self.sysv_shm.lock(),
+            self.flock_registry.lock(),
+            self.pty_registry.write(),
+            self.daemon_pty_masters.write(),
+            self.memfds.lock(),
+            self.shared_files.lock(),
+            self.proc_self_info.write(),
+        );
+        let result = f();
+        if is_forked_child(&result) && self.platform.native_fork_shares_kernel_state() {
+            // The kernel state these guards protect lives in memory the parent and child share,
+            // so the parent's own drop of its guards is the one and only unlock. Dropping them
+            // here as well would release a lock the parent may since have re-taken.
+            core::mem::forget(guards);
+        }
+        result
+    }
+}
+
+/// A [`wait::WaitState`] that the one native-`fork()` child path can swap for a fresh one.
+///
+/// The wait state's inner `Arc` is what other threads use to wake this host thread. When the
+/// kernel heap is shared across a `fork()`, the child's copy of the `Task` points at the SAME
+/// inner state as the parent's, so a wake meant for one would land on the other; the child gives
+/// itself a new one. Dereferences like a plain `WaitState`.
+struct ReplaceableWaitState<Platform: ShimPlatform>(
+    core::cell::UnsafeCell<wait::WaitState<Platform>>,
+);
+
+impl<Platform: ShimPlatform> ReplaceableWaitState<Platform> {
+    fn new(inner: wait::WaitState<Platform>) -> Self {
+        Self(core::cell::UnsafeCell::new(inner))
+    }
+
+    /// Replaces the wait state and forgets the old one without dropping it (its `Arc` is shared
+    /// with the parent process, which still owns that reference).
+    ///
+    /// # Safety
+    /// No reference obtained through `Deref` may be live across this call.
+    unsafe fn replace_forgetting_old(&self, new: wait::WaitState<Platform>) {
+        // SAFETY: the caller guarantees no outstanding borrow.
+        core::mem::forget(unsafe { core::ptr::replace(self.0.get(), new) });
+    }
+}
+
+impl<Platform: ShimPlatform> core::ops::Deref for ReplaceableWaitState<Platform> {
+    type Target = wait::WaitState<Platform>;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: only `replace_forgetting_old` mutates, under its own contract.
+        unsafe { &*self.0.get() }
     }
 }
 
@@ -3746,7 +4014,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     /// primitives, which a real `fork()` leaves completely unaffected -- only which GUEST
     /// PROCESS the thread belongs to changes, never its own interruptibility. The existing
     /// value stays exactly as correct for the child as it was for the parent.
-    wait_state: wait::WaitState<Platform>,
+    wait_state: ReplaceableWaitState<Platform>,
     /// `RefCell` for the same reason as [`Self::pid`]: a native fork() child needs its own
     /// [`syscalls::process::Process`] (fresh children list, parent pointing at the process that
     /// forked it, its own adopted [`litebox::mm::PageManager`]) in place of the one it continues
@@ -3763,7 +4031,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    credentials: RefCell<Arc<syscalls::process::Credentials>>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` state, per process.
@@ -3817,7 +4085,7 @@ mod test_utils {
                 syscalls::signal::PendingSignals::new(),
             ));
             Task {
-                wait_state: wait::WaitState::new(self.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.platform)),
                 thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.litebox)),
@@ -3829,7 +4097,7 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(0),
                 tid: Cell::new(pid),
-                credentials: Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0)),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -3849,13 +4117,13 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
                 thread: RefCell::new(self.thread.borrow().new_thread(tid)?),
                 pid: Cell::new(self.pid.get()),
                 ppid: Cell::new(self.ppid.get()),
                 tid: Cell::new(tid),
-                credentials: self.credentials.clone(),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
@@ -3894,19 +4162,21 @@ mod test_utils {
                 Some(litebox_common_linux::signal::Signal::SIGCHLD.as_i32()),
             );
             let child = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
                 thread: RefCell::new(thread),
                 pid: Cell::new(pid),
                 ppid: Cell::new(self.pid.get()),
                 tid: Cell::new(pid),
-                credentials: Arc::new(self.credentials.fork_copy()),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: RefCell::new(
-                    self.signals.borrow().clone_for_new_task(Some(shared_pending)),
+                    self.signals
+                        .borrow()
+                        .clone_for_new_task(Some(shared_pending)),
                 ),
                 attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
@@ -3943,7 +4213,8 @@ mod test_utils {
         /// always goes through, which `spawn_clone_for_test` deliberately bypasses (it does not
         /// run any guest code).
         pub(crate) fn set_thread_handle_for_test(&self) {
-            self.thread.borrow()
+            self.thread
+                .borrow()
                 .remote_handle_cell()
                 .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
                 .ok();

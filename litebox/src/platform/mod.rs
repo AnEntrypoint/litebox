@@ -168,6 +168,14 @@ pub trait ThreadProvider: RawPointerProvider {
         None
     }
 
+    /// Records that the WHOLE calling host process now is guest process `pid`, for platforms where
+    /// a guest process is a host process of its own (a native `fork()` child) rather than an OS
+    /// thread that [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)
+    /// tags. Backs [`current_guest_pid`](Self::current_guest_pid). Default: nothing.
+    fn set_process_guest_pid(&self, pid: i32) {
+        let _ = pid;
+    }
+
     /// Temporarily attributes any host-memory-ownership bookkeeping this platform performs
     /// (see [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)'s
     /// doc comment for why such bookkeeping exists at all -- `litebox_platform_windows_userland`'s
@@ -418,7 +426,11 @@ pub trait SharedKernelStateProvider {
     /// a platform that supports it. Mirrors `alloc::sync::Arc<T>`'s ergonomics (`Clone`,
     /// `Deref`) exactly, so call sites need no further changes beyond swapping which type
     /// constructs the handle.
-    type Handle<T: Send + Sync + 'static>: Clone + core::ops::Deref<Target = T> + Send + Sync + 'static;
+    type Handle<T: Send + Sync + 'static>: Clone
+        + core::ops::Deref<Target = T>
+        + Send
+        + Sync
+        + 'static;
 
     /// Whether the CALLING process should [`Self::attach_shared_kernel_state`] to an ancestor's
     /// already-existing shared allocation for `slot`, rather than
@@ -432,7 +444,10 @@ pub trait SharedKernelStateProvider {
     /// platform with a real native `fork()` (which already gives correct, isolated per-process
     /// state for free, see [`Self::create_shared_kernel_state`]'s own doc comment), or an
     /// attach attempt that could not be confirmed safe -- returns `false`, the default.
-    #[expect(unused_variables, reason = "slot unused by the correct-but-unshared default")]
+    #[expect(
+        unused_variables,
+        reason = "slot unused by the correct-but-unshared default"
+    )]
     fn is_shared_kernel_state_attach_child(&self, slot: SharedKernelStateSlot) -> bool {
         false
     }
@@ -975,7 +990,9 @@ pub trait ForkChildVerificationProvider {
     /// thread that is not itself under verification (the common case: a top-level, non-nested
     /// fork), which is exactly when no merge is needed. The default implementation returns
     /// `None`, matching every other member's "correct-but-unverified" default.
-    fn current_thread_fork_relocations(&self) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
+    fn current_thread_fork_relocations(
+        &self,
+    ) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
         None
     }
 
@@ -1384,6 +1401,32 @@ pub trait ForkChildVerificationProvider {
     /// around a raw `libc::fork()` call directly.
     unsafe fn native_fork(&self) -> Option<i32> {
         None
+    }
+
+    /// Ends the calling host process, a native-`fork()` child (see [`Self::native_fork`]), with
+    /// `status` as its raw host exit code once its guest process has fully exited.
+    ///
+    /// A native child is the forking guest thread and nothing else: the runner's `main` thread,
+    /// which is what normally turns the guest's exit status into the host process's, exists only
+    /// in the parent. Without this the child's last thread just returns and the host reports exit
+    /// code `0` to the parent's `waitpid`, losing every non-zero guest status. The default is a
+    /// no-op: only a platform that returns `true` from [`Self::has_native_fork`] is ever asked.
+    /// Whether the kernel state a native-`fork()` child inherits is memory it SHARES with its
+    /// parent (rather than a private copy-on-write duplicate). When it is, a lock the parent held
+    /// across the `fork()` is one lock seen by both processes, so the child must not release it.
+    /// Non-consuming check of whether the native-fork child `handle` has already exited (it is
+    /// left un-reaped so `wait4` can still collect its status). `false` when unknown.
+    fn cross_process_child_has_exited(&self, handle: CrossProcessChildHandle) -> bool {
+        let _ = handle;
+        false
+    }
+
+    fn native_fork_shares_kernel_state(&self) -> bool {
+        false
+    }
+
+    fn exit_native_fork_child(&self, status: i32) {
+        let _ = status;
     }
 
     /// On a host with no real `fork()`, litebox maps every guest process into ONE shared host

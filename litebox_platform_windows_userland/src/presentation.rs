@@ -39,9 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{
-    ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy,
-};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::{Window, WindowId};
@@ -65,7 +63,8 @@ static DUMP_FRAMES_ENQUEUED: core::sync::atomic::AtomicUsize =
 /// Frames silently (from the guest's point of view) DROPPED because the bounded queue was full
 /// when the flip path tried to enqueue -- counted, never hidden; reported via
 /// `dump_frame_diagnostic_report_drops` at end-of-run.
-static DUMP_FRAMES_DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DUMP_FRAMES_DROPPED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Bounded channel capacity for queued frames awaiting the background BMP writer. Small and
 /// fixed: this diagnostic's whole point is to observe guest timing, so a large buffer that lets
@@ -79,8 +78,7 @@ fn dump_frames_writer_channel() -> &'static std::sync::mpsc::SyncSender<QueuedDu
     static CHANNEL: std::sync::OnceLock<std::sync::mpsc::SyncSender<QueuedDumpFrame>> =
         std::sync::OnceLock::new();
     CHANNEL.get_or_init(|| {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<QueuedDumpFrame>(DUMP_FRAMES_QUEUE_CAPACITY);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<QueuedDumpFrame>(DUMP_FRAMES_QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("litebox-dump-frames-writer".to_owned())
             .spawn(move || {
@@ -172,7 +170,12 @@ pub fn encode_bmp(width: usize, height: usize, pitch: usize, bytes: &[u8]) -> Ve
 /// `screenshot`'s `<non_black_pixels> <distinct_colors_capped64>` reply tokens
 /// (`docs/presenter-process-design.md` section 3.2) reuse the exact same counting logic.
 #[must_use]
-pub fn count_pixel_stats(width: usize, height: usize, pitch: usize, bytes: &[u8]) -> (usize, usize) {
+pub fn count_pixel_stats(
+    width: usize,
+    height: usize,
+    pitch: usize,
+    bytes: &[u8],
+) -> (usize, usize) {
     let mut non_black_pixels = 0usize;
     let mut distinct_colors = std::collections::HashSet::new();
     for row in 0..height {
@@ -286,7 +289,8 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
     // queue drops the new frame rather than stalling the flip path. Every drop is counted, never
     // silent (see `dump_frame_diagnostic_report_drops`).
     if let Err(_dropped) = dump_frames_writer_channel().try_send(queued) {
-        let total_dropped = DUMP_FRAMES_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        let total_dropped =
+            DUMP_FRAMES_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         eprintln!(
             "[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame {n} (total dropped so far: {total_dropped})"
         );
@@ -759,7 +763,10 @@ fn build_texture_pool(
                 ],
             });
             let _ = i;
-            SourceTexture { texture, bind_group }
+            SourceTexture {
+                texture,
+                bind_group,
+            }
         })
         .collect()
 }
@@ -928,7 +935,10 @@ impl PresenterApp {
         // regression that stalled the presenter entirely (or silently disabled the texture pool)
         // would leave every producer-side number unchanged, which is exactly the blind spot that
         // makes a "throughput" figure meaningless. See `present_stats`.
-        let elapsed_nanos = present_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let elapsed_nanos = present_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
         PRESENTS_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         PRESENT_NANOS_TOTAL.fetch_add(elapsed_nanos, core::sync::atomic::Ordering::Relaxed);
         // Bounded recent-latency ring, so a caller (e.g. `presenter_bench`) can compute a real
@@ -1052,20 +1062,31 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             }));
-        eprintln!("[presenter-diag] request_adapter returned: {}", adapter_result.is_ok());
+        eprintln!(
+            "[presenter-diag] request_adapter returned: {}",
+            adapter_result.is_ok()
+        );
         let Ok(adapter) = adapter_result else {
-            eprintln!("[presenter-diag] request_adapter FAILED: {:?}", adapter_result.err());
+            eprintln!(
+                "[presenter-diag] request_adapter FAILED: {:?}",
+                adapter_result.err()
+            );
             return;
         };
         eprintln!("[presenter-diag] requesting device");
-        let device_result =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("litebox-presenter"),
-                ..Default::default()
-            }));
-        eprintln!("[presenter-diag] request_device returned: {}", device_result.is_ok());
+        let device_result = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("litebox-presenter"),
+            ..Default::default()
+        }));
+        eprintln!(
+            "[presenter-diag] request_device returned: {}",
+            device_result.is_ok()
+        );
         let Ok((device, queue)) = device_result else {
-            eprintln!("[presenter-diag] request_device FAILED: {:?}", device_result.err());
+            eprintln!(
+                "[presenter-diag] request_device FAILED: {:?}",
+                device_result.err()
+            );
             return;
         };
         eprintln!("[presenter-diag] device+queue obtained, continuing setup");
@@ -1115,7 +1136,10 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
             .copied()
             .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
             .unwrap_or(caps.alpha_modes[0]);
-        eprintln!("[presenter-diag] configuring surface, alpha_mode={alpha_mode:?} (available: {:?})", caps.alpha_modes);
+        eprintln!(
+            "[presenter-diag] configuring surface, alpha_mode={alpha_mode:?} (available: {:?})",
+            caps.alpha_modes
+        );
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format: surface_format,
@@ -1263,7 +1287,12 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
         // platform backend guarantees the swapchain is in a presentable state), never from a
         // `user_event`/custom-event handler. This just stores the frame and asks the window to
         // redraw; `window_event`'s `RedrawRequested` arm does the actual `present()` call.
-        let latest = self.slot.pending.lock().expect("frame slot mutex poisoned").take();
+        let latest = self
+            .slot
+            .pending
+            .lock()
+            .expect("frame slot mutex poisoned")
+            .take();
         if let Some(frame) = latest {
             if std::env::var_os("LITEBOX_DUMP_FRAMES").is_some() {
                 dump_frame_diagnostic(&frame);
@@ -1307,7 +1336,9 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                 state.surface_size = new_size;
                 state.surface_config.width = new_size.width;
                 state.surface_config.height = new_size.height;
-                state.surface.configure(&state.device, &state.surface_config);
+                state
+                    .surface
+                    .configure(&state.device, &state.surface_config);
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {

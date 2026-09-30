@@ -1022,7 +1022,8 @@ static LAZY_FAULTS_ZERO_FILLED: AtomicUsize = AtomicUsize::new(0);
 /// at all once disarmed) without needing to change their storage type. A no-op, one relaxed atomic
 /// load, for the overwhelming majority of VEH invocations that belong to an entirely unrelated fault
 /// class (this process's own main `vectored_exception_handler_entry`/`fork_verify` machinery).
-static DISARMED_BY_EXECVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DISARMED_BY_EXECVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Called from `sys_execve`'s teardown (via `WindowsUserland::end_fork_child_verification`) to
 /// permanently disarm this process's own lazy-fork-commit child-side machinery -- see
@@ -1218,8 +1219,14 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
     }
     let page_addr = fault_addr & !(PAGE_SIZE - 1);
 
-    let committed =
-        unsafe { VirtualAlloc(page_addr as *mut c_void, PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE) };
+    let committed = unsafe {
+        VirtualAlloc(
+            page_addr as *mut c_void,
+            PAGE_SIZE,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
     if committed.is_null() {
         // Genuinely can't service this fault (e.g. host OOM) -- decline rather than pretend
         // success; the guest sees a real SIGSEGV via whatever this process's normal unhandled-AV
@@ -1537,10 +1544,8 @@ const GUARD_COW_CONCURRENT_CLAIM_CAP: u32 = 3;
 static GUARD_VEH_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn ensure_guard_cow_veh_installed() {
-    GUARD_VEH_INSTALLED.get_or_init(|| {
-        unsafe {
-            AddVectoredExceptionHandler(1, Some(guard_cow_write_fault_veh));
-        }
+    GUARD_VEH_INSTALLED.get_or_init(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(guard_cow_write_fault_veh));
     });
 }
 
@@ -1623,7 +1628,12 @@ fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_i
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut discard_old: u32 = 0;
         unsafe {
-            VirtualProtect(page as *mut c_void, PAGE_SIZE, true_original_protect, &mut discard_old);
+            VirtualProtect(
+                page as *mut c_void,
+                PAGE_SIZE,
+                true_original_protect,
+                &mut discard_old,
+            );
         }
         if diag {
             eprintln!(
@@ -1657,7 +1667,14 @@ fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_i
         let _vp_guard = crate::VIRTUAL_PROTECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { VirtualProtect(page as *mut c_void, PAGE_SIZE, PAGE_READONLY, &mut old_protect) != 0 }
+        unsafe {
+            VirtualProtect(
+                page as *mut c_void,
+                PAGE_SIZE,
+                PAGE_READONLY,
+                &mut old_protect,
+            ) != 0
+        }
     };
     if !protected {
         map.remove(&page);
@@ -1846,8 +1863,12 @@ fn reserve_group_lazy_guarded(
             break;
         }
         let region_start = addr.max(mbi.BaseAddress as usize);
-        let region_end = ((mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)).min(source_group.end);
-        if mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && region_end > region_start {
+        let region_end =
+            ((mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)).min(source_group.end);
+        if mbi.State == MEM_COMMIT
+            && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+            && region_end > region_start
+        {
             let batched = try_guard_region_batched(
                 claim,
                 child_pid,
@@ -1967,7 +1988,9 @@ pub fn try_claim_guard_cow_table(total_pages: usize) -> Option<GuardCowClaim> {
             Err(observed) => current = observed,
         }
     }
-    let table: Vec<GuardSnapshotSlot> = (0..total_pages).map(|_| GuardSnapshotSlot::zeroed()).collect();
+    let table: Vec<GuardSnapshotSlot> = (0..total_pages)
+        .map(|_| GuardSnapshotSlot::zeroed())
+        .collect();
     let table: &'static [GuardSnapshotSlot] = Box::leak(table.into_boxed_slice());
     Some(GuardCowClaim {
         table,

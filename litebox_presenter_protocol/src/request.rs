@@ -11,15 +11,23 @@ pub enum Request {
     /// Request/refresh the shared framebuffer mapping.
     Scanout,
     /// Write the current scanout content to a file on the runner's own filesystem.
-    Screenshot { path: String },
+    Screenshot {
+        path: String,
+    },
     Show,
     Hide,
     /// `presenter?` -- query current presenter state (none/hidden/visible).
     PresenterQuery,
     /// `key <evdev_code> <0|1|2>` (0=release, 1=press, 2=repeat).
-    Key { code: u16, value: u8 },
+    Key {
+        code: u16,
+        value: u8,
+    },
     /// `rel <evdev_code> <i32>` (motion/wheel, REL_X/REL_Y/REL_WHEEL).
-    Rel { code: u16, value: i32 },
+    Rel {
+        code: u16,
+        value: i32,
+    },
     /// `relmotion <dx:i32> <dy:i32>` -- one 2D cursor movement as a SINGLE evdev report
     /// (`REL_X`, `REL_Y`, one `SYN_REPORT`), matching what real hardware emits for one physical
     /// motion. A presenter MUST send this instead of two `Rel` requests for cursor movement: two
@@ -28,9 +36,15 @@ pub enum Request {
     /// duplicate-`SYN_REPORT` bug class already fixed once for the in-process presentation path
     /// (`litebox_shim_linux::push_input_rel_motion`'s own doc comment) and reintroduced by the
     /// presenter/runner process split until this variant existed.
-    RelMotion { dx: i32, dy: i32 },
+    RelMotion {
+        dx: i32,
+        dy: i32,
+    },
     /// `abs <evdev_code> <i32>` -- reserved, always replies `err unsupported` today.
-    Abs { code: u16, value: i32 },
+    Abs {
+        code: u16,
+        value: i32,
+    },
     /// List guest processes.
     Ps,
     StraceOn,
@@ -39,7 +53,9 @@ pub enum Request {
     /// Trigger `print_strace_summary` immediately and stream it back.
     StraceDump,
     /// `frames on <dir>`.
-    FramesOn { dir: String },
+    FramesOn {
+        dir: String,
+    },
     FramesOff,
     /// Internal, presenter -> runner unprompted, once after its first successful `scanout` call
     /// and first successful window creation (section 5 risk 3's readiness signal for a blocking
@@ -72,7 +88,9 @@ impl Request {
         match cmd {
             "scanout" => Ok(Self::Scanout),
             "screenshot" => {
-                let path = tokens.next().ok_or_else(|| bad("screenshot: missing path"))?;
+                let path = tokens
+                    .next()
+                    .ok_or_else(|| bad("screenshot: missing path"))?;
                 Ok(Self::Screenshot {
                     path: path.to_owned(),
                 })

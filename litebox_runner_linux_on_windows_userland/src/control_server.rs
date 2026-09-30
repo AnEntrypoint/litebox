@@ -22,7 +22,9 @@ use litebox_presenter_protocol::reply::{ErrorCode, Reply, ScanoutReply};
 use litebox_presenter_protocol::request::Request;
 use litebox_shim_linux::{LinuxShim, ShimFS};
 
-use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE,
+};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
     UnmapViewOfFile,
@@ -82,7 +84,15 @@ impl HeaderSection {
         }
         // SAFETY: `handle` was just created above with `PAGE_READWRITE`, so a read-write mapping
         // of its full size is valid.
-        let ptr = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, HEADER_SECTION_SIZE) };
+        let ptr = unsafe {
+            MapViewOfFile(
+                handle,
+                FILE_MAP_WRITE | FILE_MAP_READ,
+                0,
+                0,
+                HEADER_SECTION_SIZE,
+            )
+        };
         if ptr.Value.is_null() {
             // SAFETY: `GetLastError` has no preconditions; `handle` is still owned (not yet
             // wrapped) so closing it here on this error path is correct.
@@ -99,7 +109,10 @@ impl HeaderSection {
     }
 
     fn seq_ptr(&self) -> *const AtomicU64 {
-        self.ptr.cast::<HeaderLayout>().cast_const().cast::<AtomicU64>()
+        self.ptr
+            .cast::<HeaderLayout>()
+            .cast_const()
+            .cast::<AtomicU64>()
     }
 
     /// Writes the current snapshot into the header, geometry first, `frame_seq` last with
@@ -130,9 +143,9 @@ impl Drop for HeaderSection {
         // SAFETY: `self.ptr`/`self.handle` were established together in `create` and never
         // handed to anything that outlives this `HeaderSection`.
         unsafe {
-            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.ptr,
-            });
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.ptr },
+            );
             CloseHandle(self.handle);
         }
     }
@@ -180,18 +193,20 @@ fn ensure_frames_callback_registered<FS: ShimFS>(shared: &Arc<Shared<FS>>) {
         return; // already registered by a previous call.
     }
     let shared_for_closure = shared.clone();
-    shared.shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
-        if !shared_for_closure.frames_enabled.load(Ordering::Acquire) {
-            return;
-        }
-        let frame = litebox_platform_windows_userland::presentation::Frame {
-            width,
-            height,
-            pitch,
-            bytes: bytes.to_vec(),
-        };
-        litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
-    });
+    shared
+        .shim
+        .add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+            if !shared_for_closure.frames_enabled.load(Ordering::Acquire) {
+                return;
+            }
+            let frame = litebox_platform_windows_userland::presentation::Frame {
+                width,
+                height,
+                pitch,
+                bytes: bytes.to_vec(),
+            };
+            litebox_platform_windows_userland::presentation::dump_frame_diagnostic(&frame);
+        });
 }
 
 fn duplicate_into_current_process(handle: HANDLE) -> std::io::Result<HANDLE> {
@@ -338,15 +353,19 @@ fn wait_for_presenter_ready(shared: &Shared<impl ShimFS>, timeout: Duration) -> 
 fn push_to_presenter(shared: &Shared<impl ShimFS>, line: &str) -> Result<(), Reply> {
     let guard = shared.presenter.lock().expect("presenter mutex poisoned");
     match &*guard {
-        Some(PresenterConn(handle)) => pipe::write_line(handle, line).map_err(|e| {
-            Reply::err(ErrorCode::IoError, format!("presenter write failed: {e}"))
-        }),
+        Some(PresenterConn(handle)) => pipe::write_line(handle, line)
+            .map_err(|e| Reply::err(ErrorCode::IoError, format!("presenter write failed: {e}"))),
         None => Err(Reply::err(ErrorCode::NotFound, "no presenter connected")),
     }
 }
 
 fn handle_show<FS: ShimFS>(shared: &Arc<Shared<FS>>) -> Reply {
-    if shared.presenter.lock().expect("presenter mutex poisoned").is_none() {
+    if shared
+        .presenter
+        .lock()
+        .expect("presenter mutex poisoned")
+        .is_none()
+    {
         if let Err(e) = spawn_presenter_process(shared) {
             return Reply::err(
                 ErrorCode::IoError,
@@ -450,12 +469,13 @@ fn handle_screenshot<FS: ShimFS>(shared: &Arc<Shared<FS>>, path: &str) -> Reply 
     // SAFETY: `view.Value` was just established above as a valid read-only mapping of
     // `snap.size` bytes; it is not unmapped until immediately after this slice's last use.
     let bytes = unsafe { core::slice::from_raw_parts(view.Value.cast::<u8>(), snap.size) };
-    let (non_black_pixels, distinct_colors) = litebox_platform_windows_userland::presentation::count_pixel_stats(
-        snap.width as usize,
-        snap.height as usize,
-        snap.pitch as usize,
-        bytes,
-    );
+    let (non_black_pixels, distinct_colors) =
+        litebox_platform_windows_userland::presentation::count_pixel_stats(
+            snap.width as usize,
+            snap.height as usize,
+            snap.pitch as usize,
+            bytes,
+        );
     let encoded = litebox_platform_windows_userland::presentation::encode_bmp(
         snap.width as usize,
         snap.height as usize,
@@ -542,7 +562,11 @@ fn dispatch<FS: ShimFS>(
         Request::Show => handle_show(shared),
         Request::Hide => handle_hide(shared),
         Request::PresenterQuery => {
-            let connected = shared.presenter.lock().expect("presenter mutex poisoned").is_some();
+            let connected = shared
+                .presenter
+                .lock()
+                .expect("presenter mutex poisoned")
+                .is_some();
             let state = if !connected {
                 "none"
             } else if shared.presenter_visible.load(Ordering::Acquire) {
@@ -564,7 +588,10 @@ fn dispatch<FS: ShimFS>(
             shared.shim.push_input_rel_motion(dx, dy);
             Reply::Ok
         }
-        Request::Abs { .. } => Reply::err(ErrorCode::Unsupported, "abs is reserved, not yet implemented"),
+        Request::Abs { .. } => Reply::err(
+            ErrorCode::Unsupported,
+            "abs is reserved, not yet implemented",
+        ),
         Request::Ps => handle_ps(),
         Request::StraceOn | Request::StraceOff | Request::StraceQuery | Request::StraceDump => {
             handle_strace(&req)
@@ -598,15 +625,20 @@ fn handle_connection<FS: ShimFS>(shared: Arc<Shared<FS>>, pipe: PipeHandle) {
         // `show`/`hide` from OTHER connections can write into it, then continue this loop reading
         // further requests (`key`/`rel`) from `pipe` directly, unlocked -- see this module's doc
         // comment for why the two handle values are kept independent.
-        if became_presenter && shared.presenter.lock().expect("presenter mutex poisoned").is_none() {
+        if became_presenter
+            && shared
+                .presenter
+                .lock()
+                .expect("presenter mutex poisoned")
+                .is_none()
+        {
             if let Ok(dup) = duplicate_into_current_process(pipe.raw()) {
-                *shared.presenter.lock().expect("presenter mutex poisoned") =
-                    Some(PresenterConn(
-                        // SAFETY: `dup` was just freshly duplicated above by
-                        // `duplicate_into_current_process`; nothing else holds or will close this
-                        // specific value.
-                        unsafe { PipeHandle::from_raw(dup) },
-                    ));
+                *shared.presenter.lock().expect("presenter mutex poisoned") = Some(PresenterConn(
+                    // SAFETY: `dup` was just freshly duplicated above by
+                    // `duplicate_into_current_process`; nothing else holds or will close this
+                    // specific value.
+                    unsafe { PipeHandle::from_raw(dup) },
+                ));
             }
         }
         for l in reply.to_lines() {
@@ -635,7 +667,10 @@ fn handle_connection<FS: ShimFS>(shared: Arc<Shared<FS>>, pipe: PipeHandle) {
 ///
 /// Returns an error if spawning `litebox-presenter.exe` fails, or (for
 /// [`crate::GuiMode::Shown`]) if it never becomes ready within 5s.
-pub fn spawn_and_maybe_show<FS: ShimFS>(shared: &Arc<Shared<FS>>, mode: crate::GuiMode) -> std::io::Result<()> {
+pub fn spawn_and_maybe_show<FS: ShimFS>(
+    shared: &Arc<Shared<FS>>,
+    mode: crate::GuiMode,
+) -> std::io::Result<()> {
     spawn_presenter_process(shared)?;
     match mode {
         crate::GuiMode::Hidden => Ok(()),
@@ -664,14 +699,21 @@ pub fn spawn_and_maybe_show<FS: ShimFS>(shared: &Arc<Shared<FS>>, mode: crate::G
 /// the runner process itself exits.
 #[must_use]
 pub fn is_presenter_connected<FS: ShimFS>(shared: &Shared<FS>) -> bool {
-    shared.presenter.lock().expect("presenter mutex poisoned").is_some()
+    shared
+        .presenter
+        .lock()
+        .expect("presenter mutex poisoned")
+        .is_some()
 }
 
 /// Starts the `ControlServer` accept loop on a dedicated thread and returns immediately --
 /// matches `docs/presenter-process-design.md` section 4.3's "always" requirement (headless or
 /// not). `presenter_exe` is the path to `litebox-presenter.exe` used for every `show`-triggered
 /// spawn.
-pub fn start<FS: ShimFS>(shim: LinuxShim<Platform, FS>, presenter_exe: PathBuf) -> std::io::Result<Arc<Shared<FS>>> {
+pub fn start<FS: ShimFS>(
+    shim: LinuxShim<Platform, FS>,
+    presenter_exe: PathBuf,
+) -> std::io::Result<Arc<Shared<FS>>> {
     let runner_pid = std::process::id();
     let pipe_name = pipe::pipe_name(runner_pid);
     let header = HeaderSection::create()?;
@@ -697,14 +739,16 @@ pub fn start<FS: ShimFS>(shim: LinuxShim<Platform, FS>, presenter_exe: PathBuf) 
     let accept_shared = shared.clone();
     std::thread::Builder::new()
         .name("litebox-control-server".to_owned())
-        .spawn(move || loop {
-            match pipe::create_and_accept_one_instance(&pipe_name) {
-                Ok(handle) => {
-                    let shared = accept_shared.clone();
-                    std::thread::spawn(move || handle_connection(shared, handle));
-                }
-                Err(e) => {
-                    eprintln!("[litebox-control-server] accept failed: {e}, retrying");
+        .spawn(move || {
+            loop {
+                match pipe::create_and_accept_one_instance(&pipe_name) {
+                    Ok(handle) => {
+                        let shared = accept_shared.clone();
+                        std::thread::spawn(move || handle_connection(shared, handle));
+                    }
+                    Err(e) => {
+                        eprintln!("[litebox-control-server] accept failed: {e}, retrying");
+                    }
                 }
             }
         })

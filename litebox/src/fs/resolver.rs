@@ -76,10 +76,6 @@ impl Context {
         }
     }
 
-    fn is_root(&self) -> bool {
-        self.user_info.user == 0
-    }
-
     /// Resolve `path` against the current context.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
@@ -105,12 +101,21 @@ impl Context {
         Ok(ResolvedPath { components })
     }
 
+    /// The identity to check against: the shim's per-process one when set.
+    fn acting_user(&self) -> UserInfo {
+        super::ident::get().unwrap_or(self.user_info)
+    }
+
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.is_root() {
-            true
-        } else if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return permissions
+                .mode
+                .intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::XGRP)
         } else {
             permissions.mode.contains(Mode::XOTH)
@@ -118,11 +123,13 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.is_root() {
-            true
-        } else if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::RGRP)
         } else {
             permissions.mode.contains(Mode::ROTH)
@@ -130,11 +137,13 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.is_root() {
-            true
-        } else if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::WGRP)
         } else {
             permissions.mode.contains(Mode::WOTH)
@@ -530,7 +539,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                                 v
                             };
                         new_components.extend(
-                            component_refs[walked + 1..].iter().map(|c| (*c).to_string()),
+                            component_refs[walked + 1..]
+                                .iter()
+                                .map(|c| (*c).to_string()),
                         );
                         components = new_components;
                         continue;
@@ -1023,12 +1034,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // `resolver-symlinkmetadata-readlink-before-open`.
         let context = default_context_pre_context_management_changes();
         let resolved = context.resolve(path)?;
-        let Some((parent, name)) = self.parent_dir_and_name(&context, &resolved).map_err(
-            |error| match error {
-                WalkError::Io => FileStatusError::Io,
-                WalkError::PathError(error) => error.into(),
-            },
-        )?
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &resolved)
+                .map_err(|error| match error {
+                    WalkError::Io => FileStatusError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
         else {
             // The root itself was requested; it is always a directory, never a symlink.
             return self.file_status("/");

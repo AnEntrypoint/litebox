@@ -189,7 +189,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SignalfdFile<Platform> 
     /// real-world usage: glib/D-Bus/most event loops always create a signalfd with `SFD_NONBLOCK`
     /// and integrate it into their own poll loop, checked via `check_io_events` above, which IS
     /// fully accurate) is unaffected by this gap.
-    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, Errno> {
+    pub(crate) fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, Errno> {
         if buf.len() < core::mem::size_of::<SignalfdSiginfo>() {
             return Err(Errno::EINVAL);
         }

@@ -224,7 +224,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> IOPollable for TimerfdFile<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> IOPollable
+    for TimerfdFile<Platform>
+{
     fn check_io_events(&self) -> Events {
         let now = self.platform.now();
         let mut state = self.state.lock();

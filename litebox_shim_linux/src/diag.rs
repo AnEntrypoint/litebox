@@ -96,6 +96,9 @@ pub fn set_strace_summary_enabled(enabled: bool) {
 /// Record one completed syscall dispatch. `duration_ns` is the wall time spent in
 /// `do_syscall`. `err_debug` is `Some(format!("{err:?}"))` on an `Err` result.
 pub fn record_syscall(syscall_number: usize, duration_ns: u64, err_debug: Option<String>) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     if !strace_summary_enabled() {
         return;
     }
@@ -113,6 +116,9 @@ pub fn record_syscall(syscall_number: usize, duration_ns: u64, err_debug: Option
 
 /// Record a raw syscall number that `SyscallRequest::try_from_raw` could not resolve at all.
 pub fn record_unresolved_syscall(syscall_number: usize, pid: i32, comm: &str) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     if !strace_summary_enabled() {
         return;
     }
@@ -133,6 +139,9 @@ pub fn record_unresolved_syscall(syscall_number: usize, pid: i32, comm: &str) {
 /// `"ioctl(0x5413)"` or `"setsockopt(SOL_SOCKET, SO_REUSEPORT)"`. `errno_name` should be the
 /// `Debug`-formatted errno (e.g. `"ENOSYS"`).
 pub fn record_unsupported_subcommand(description: &str, errno_name: &str, pid: i32, comm: &str) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     if !strace_summary_enabled() {
         return;
     }
@@ -167,7 +176,8 @@ static SYSCALL_TIMELINE_COMMS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::
 /// These are the XFCE components from the "why does this client go silent after CreateWindow"
 /// investigation (AGENTS.md's "Rendering/scanout blocker" section), confirmed via X11 protocol
 /// decode to create a window, do some property setup, then never issue another X11 request.
-const SYSCALL_TIMELINE_DEFAULT_COMMS: &[&str] = &["xfwm4", "xfdesktop", "xfce4-panel", "xfce4-about"];
+const SYSCALL_TIMELINE_DEFAULT_COMMS: &[&str] =
+    &["xfwm4", "xfdesktop", "xfce4-panel", "xfce4-about"];
 
 /// Call once, early, with a closure performing the platform's `env_value` lookup for
 /// `LITEBOX_DIAG_SYSCALL_TIMELINE`. Idempotent, same lazy-latch pattern as
@@ -191,15 +201,20 @@ const SYSCALL_TIMELINE_DEFAULT_COMMS: &[&str] = &["xfwm4", "xfdesktop", "xfce4-p
 /// - `1` / `true` / `yes` / `on` -> [`SYSCALL_TIMELINE_DEFAULT_COMMS`], the historical behavior
 /// - anything else -> a comma-separated list of `comm` names, e.g. `mate-session,marco,caja`
 pub fn init_syscall_timeline(value: impl FnOnce() -> Option<String>) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     if SYSCALL_TIMELINE_INIT.load(Ordering::Acquire) {
         return;
     }
     let comms: Vec<String> = match value() {
         None => Vec::new(),
-        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => SYSCALL_TIMELINE_DEFAULT_COMMS
-            .iter()
-            .map(|s| String::from(*s))
-            .collect(),
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
+            SYSCALL_TIMELINE_DEFAULT_COMMS
+                .iter()
+                .map(|s| String::from(*s))
+                .collect()
+        }
         Some(v) => v
             .split(',')
             .map(str::trim)
@@ -239,8 +254,11 @@ pub fn emit_timeline_line<Platform: litebox::platform::StdioProvider>(
     line: &str,
 ) {
     let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, line.as_bytes());
-    let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, b"
-");
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        b"
+",
+    );
 }
 
 pub fn syscall_timeline_enabled() -> bool {
@@ -364,6 +382,9 @@ static SOCKET_READ_FILTER_COMMS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec
 /// - anything set -> a comma-separated list of `comm` names (e.g. `xfwm4` or
 ///   `xfwm4,dbus-daemon`); only a matching process's socket reads emit the payload preview.
 pub fn init_socket_read_filter(value: impl FnOnce() -> Option<String>) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     if SOCKET_READ_FILTER_INIT.load(Ordering::Acquire) {
         return;
     }
@@ -458,7 +479,9 @@ pub fn print_strace_summary(mut eprint: impl FnMut(&str)) {
         }
     }
 
-    eprint("\n=== LITEBOX_STRACE_SUMMARY: unsupported sub-commands (ENOSYS/EINVAL/ENOTSUP/EOPNOTSUPP/EPERM) ===\n");
+    eprint(
+        "\n=== LITEBOX_STRACE_SUMMARY: unsupported sub-commands (ENOSYS/EINVAL/ENOTSUP/EOPNOTSUPP/EPERM) ===\n",
+    );
     for (desc, hit) in &guard.unsupported_subcommands {
         eprint(&alloc::format!(
             "{desc} count={count} first_caller={comm}[{pid}]\n",
@@ -493,6 +516,9 @@ pub fn next_seq() -> u64 {
 
 /// Record (or update) a pid -> (ppid, comm) edge for the exit-time process-tree dump.
 pub fn record_process(pid: i32, ppid: i32, comm: &str) {
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
     let mut guard = PROCESS_TREE.lock();
     guard.insert(
         pid,

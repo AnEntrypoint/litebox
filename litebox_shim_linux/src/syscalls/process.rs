@@ -268,6 +268,9 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) pgid: core::sync::atomic::AtomicI32,
     /// Index of this process's slot in `GlobalState::process_table`, or `xproc::NO_SLOT`.
     pub(crate) xproc_slot: core::sync::atomic::AtomicU32,
+    /// Session id: own pid until `setsid()`; a forked child inherits its parent's. A process is a
+    /// session leader (the one whose exit hangs up its controlling pty) iff `sid == pid`.
+    pub(crate) sid: core::sync::atomic::AtomicI32,
     /// This process's process-directed pending-signal queue -- the exact same `Arc` as this
     /// process's own live `Task`'s `SignalState::shared_pending` (see that field's doc comment
     /// on why they must be identical). Reachable from a `Process` handle alone (e.g. via
@@ -378,15 +381,6 @@ pub(crate) fn encode_cross_process_exit_status(status: ExitStatus) -> u32 {
     }
 }
 
-/// Decodes a raw Windows process exit code produced by [`encode_cross_process_exit_status`] back
-/// into the Linux [`wait4`](Task::sys_wait4)-style status word the guest expects (the SAME
-/// `(exit_code & 0xff) << 8` / `sig & 0x7f` encoding `sys_wait4` already uses for thread-based
-/// children -- see that function's body). If `raw_exit_code` does not carry the marker (the
-/// child never reached the encoding `ExitProcess` call -- e.g. it was killed by Windows itself,
-/// or crashed inside the Windows loader before guest code ever ran), falls back to reporting it
-/// as `WIFSIGNALED(SIGKILL)`: the child is definitely gone, and "killed" is a safe, conservative
-/// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
-/// code.
 /// The [`ExitStatus`] behind a cross-process child's raw exit code, with the same
 /// no-marker-means-`SIGKILL` fallback as [`decode_cross_process_wait_status`].
 pub(crate) fn decode_cross_process_exit_status(raw_exit_code: u32) -> ExitStatus {
@@ -402,6 +396,33 @@ pub(crate) fn decode_cross_process_exit_status(raw_exit_code: u32) -> ExitStatus
     }
 }
 
+/// Set (per host process) once this process has become a native-`fork()` child, so its guest
+/// process's exit can end the host process with the right status; see
+/// `ForkChildVerificationProvider::exit_native_fork_child`.
+static IS_NATIVE_FORK_CHILD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The stack pointer a native-`fork()` child must resume with, when the guest passed a `stack` to
+/// `clone()` (glibc's `posix_spawn` does: the child runs a function on a fresh stack). Set in the
+/// child by `reinit_as_native_fork_child`, consumed once by the syscall-return path.
+static NATIVE_CHILD_SP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn take_native_child_sp() -> Option<usize> {
+    match NATIVE_CHILD_SP.swap(0, Ordering::Relaxed) {
+        0 => None,
+        sp => Some(sp),
+    }
+}
+
+/// Decodes a raw Windows process exit code produced by [`encode_cross_process_exit_status`] back
+/// into the Linux [`wait4`](Task::sys_wait4)-style status word the guest expects (the SAME
+/// `(exit_code & 0xff) << 8` / `sig & 0x7f` encoding `sys_wait4` already uses for thread-based
+/// children -- see that function's body). If `raw_exit_code` does not carry the marker (the
+/// child never reached the encoding `ExitProcess` call -- e.g. it was killed by Windows itself,
+/// or crashed inside the Windows loader before guest code ever ran), falls back to reporting it
+/// as `WIFSIGNALED(SIGKILL)`: the child is definitely gone, and "killed" is a safe, conservative
+/// approximation when the real Linux-specific cause cannot be recovered from a bare Windows exit
+/// code.
 pub(crate) fn decode_cross_process_wait_status(raw_exit_code: u32) -> i32 {
     const SIGKILL: i32 = 9;
     if raw_exit_code & CROSS_PROCESS_EXIT_MARKER_MASK != CROSS_PROCESS_EXIT_MARKER {
@@ -458,6 +479,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             vfork_done,
             pgid: core::sync::atomic::AtomicI32::new(pid),
             xproc_slot: core::sync::atomic::AtomicU32::new(super::signal::xproc::NO_SLOT),
+            sid: core::sync::atomic::AtomicI32::new(pid),
             shared_pending,
             exit_signal,
         }
@@ -708,6 +730,16 @@ impl<Platform: ShimPlatform> Process<Platform> {
         }
     }
 
+    /// The ids of this process's live threads, ascending.
+    pub(crate) fn tids(&self) -> alloc::vec::Vec<i32> {
+        self.inner.lock().threads.keys().copied().collect()
+    }
+
+    /// Whether `tid` is a live thread of this process.
+    pub(crate) fn has_thread(&self, tid: i32) -> bool {
+        self.inner.lock().threads.contains_key(&tid)
+    }
+
     /// Interrupts exactly one live thread of this process by `tid` (a no-op if that `tid` isn't a
     /// currently-live thread of this process), causing it to re-evaluate its wait condition at
     /// its next opportunity -- same purpose and same "never call `interrupt()` while still
@@ -866,7 +898,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         inner.exit_status = ExitStatus::Exit(code);
-        self.thread.borrow().remote.is_exiting.store(true, Ordering::Relaxed);
+        self.thread
+            .borrow()
+            .remote
+            .is_exiting
+            .store(true, Ordering::Relaxed);
         litebox_util_log::debug!(tid:% = self.tid.get(); "sys_exit: is_exiting set, thread will unwind to prepare_for_exit");
     }
 
@@ -1017,7 +1053,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             let _ = self.thread.borrow().process.nr_threads.block(n);
         }
-        self.thread.borrow().process.inner.lock().is_killing_other_threads = false;
+        self.thread
+            .borrow()
+            .process
+            .inner
+            .lock()
+            .is_killing_other_threads = false;
         litebox_util_log::debug!(tid:% = self.tid.get(); "kill_other_threads: done");
         true
     }
@@ -1025,7 +1066,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns true if the task is exiting and should not continue running
     /// guest code.
     pub fn is_exiting(&self) -> bool {
-        self.thread.borrow().remote.is_exiting.load(Ordering::Relaxed)
+        self.thread
+            .borrow()
+            .remote
+            .is_exiting
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -1103,251 +1148,210 @@ impl Drop for SourceBridgeRegistration {
         }
     }
 }
-/// Most supplementary groups a task can hold (Linux's `NGROUPS_MAX` is 65536; nothing in a
-/// container image needs more than a handful).
-const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
-
-/// Credentials of a process: real/effective/saved user and group ids plus supplementary groups.
+/// Credentials of a process: real/effective/saved/filesystem user and group ids, supplementary
+/// groups, capability sets and the nice value.
 ///
-/// Interior-mutable because `setuid(2)`-family calls change them through a shared `&Task`, and
-/// shared between the threads of one process (glibc broadcasts an id change to every thread, so
-/// one shared set is what they all end up with); a `fork()` child gets its own copy via
-/// [`Credentials::fork_copy`].
+/// An immutable snapshot held in an `Arc` per task: `setuid(2)`-family calls build a changed copy
+/// and install it with `Task::set_creds`, and a `fork()` child inherits the parent's snapshot.
+#[derive(Clone)]
 pub(crate) struct Credentials {
-    uid: AtomicU32,
-    euid: AtomicU32,
-    suid: AtomicU32,
-    gid: AtomicU32,
-    egid: AtomicU32,
-    sgid: AtomicU32,
-    groups: [AtomicU32; MAX_SUPPLEMENTARY_GROUPS],
-    group_count: AtomicU32,
-    keep_caps: AtomicU32,
-    /// Set when root changed its uid with `PR_SET_KEEPCAPS` on: capabilities (and so the right to
-    /// keep changing ids) survive the drop, as `setpriv` and `gosu`-style tools rely on.
-    retained_caps: core::sync::atomic::AtomicBool,
-    secure_bits: AtomicU32,
-    fsuid: AtomicU32,
-    fsgid: AtomicU32,
-    nice: core::sync::atomic::AtomicI32,
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub groups: alloc::vec::Vec<u32>,
+    /// Effective, permitted and inheritable capability sets (bit N = capability N).
+    pub cap_eff: u64,
+    pub cap_perm: u64,
+    pub cap_inh: u64,
+    /// `PR_SET_KEEPCAPS`: root dropping its uids keeps the permitted set (as `setpriv` and
+    /// `gosu`-style tools rely on).
+    pub keep_caps: u32,
+    pub secure_bits: u32,
+    pub nice: i32,
 }
+
+/// Every capability the kernel defines (0..=40).
+const CAP_FULL: u64 = (1 << 41) - 1;
+const CAP_SETUID_BIT: u64 = 1 << 7;
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
+        litebox::fs::ident::set(euid, egid);
         Self {
-            uid: uid.into(),
-            euid: euid.into(),
-            suid: euid.into(),
-            gid: gid.into(),
-            egid: egid.into(),
-            sgid: egid.into(),
-            groups: core::array::from_fn(|i| AtomicU32::new(if i == 0 { gid } else { 0 })),
-            group_count: 1.into(),
-            keep_caps: 0.into(),
-            retained_caps: false.into(),
-            secure_bits: 0.into(),
-            fsuid: euid.into(),
-            fsgid: egid.into(),
-            nice: 0.into(),
+            uid,
+            euid,
+            suid: euid,
+            gid,
+            egid,
+            sgid: egid,
+            fsuid: euid,
+            fsgid: egid,
+            groups: alloc::vec![gid],
+            cap_eff: if euid == 0 { CAP_FULL } else { 0 },
+            cap_perm: if euid == 0 { CAP_FULL } else { 0 },
+            cap_inh: 0,
+            keep_caps: 0,
+            secure_bits: 0,
+            nice: 0,
         }
     }
 
-    pub(crate) fn uid(&self) -> u32 {
-        self.uid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn euid(&self) -> u32 {
-        self.euid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn suid(&self) -> u32 {
-        self.suid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn gid(&self) -> u32 {
-        self.gid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn egid(&self) -> u32 {
-        self.egid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn sgid(&self) -> u32 {
-        self.sgid.load(Ordering::Relaxed)
+    /// Whether the caller may change ids and groups freely: root, or a task that kept
+    /// `CAP_SETUID` in its permitted set across a uid drop (`PR_SET_KEEPCAPS`).
+    pub(crate) fn is_privileged(&self) -> bool {
+        self.euid == 0 || self.cap_perm & CAP_SETUID_BIT != 0
     }
 
     fn to_spec(&self) -> alloc::string::String {
-        let count = (self.group_count.load(Ordering::Relaxed) as usize).min(MAX_SUPPLEMENTARY_GROUPS);
-        let groups: alloc::vec::Vec<alloc::string::String> = self.groups[..count]
-            .iter()
-            .map(|group| alloc::format!("{}", group.load(Ordering::Relaxed)))
-            .collect();
+        let groups: alloc::vec::Vec<alloc::string::String> =
+            self.groups.iter().map(|g| alloc::format!("{g}")).collect();
         alloc::format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}",
-            self.uid(),
-            self.euid(),
-            self.suid(),
-            self.gid(),
-            self.egid(),
-            self.sgid(),
-            self.fsuid(),
-            self.fsgid(),
-            self.nice.load(Ordering::Relaxed),
-            u8::from(self.retained_caps.load(Ordering::Relaxed)),
-            self.keep_caps.load(Ordering::Relaxed),
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.uid,
+            self.euid,
+            self.suid,
+            self.gid,
+            self.egid,
+            self.sgid,
+            self.fsuid,
+            self.fsgid,
+            self.nice,
+            self.keep_caps,
+            self.secure_bits,
+            self.cap_eff,
+            self.cap_perm,
+            self.cap_inh,
             groups.join(":"),
         )
     }
 
-    fn restore_from_spec(&self, spec: &str) -> Option<()> {
-        let mut fields = spec.split(",");
+    fn from_spec(spec: &str) -> Option<Self> {
+        let mut fields = spec.split(',');
         let mut next = || fields.next();
-        let ids: alloc::vec::Vec<u32> = (0..8).map(|_| next()?.parse().ok()).collect::<Option<_>>()?;
+        let ids: alloc::vec::Vec<u32> = (0..8)
+            .map(|_| next()?.parse().ok())
+            .collect::<Option<_>>()?;
         let nice: i32 = next()?.parse().ok()?;
-        let retained: u8 = next()?.parse().ok()?;
         let keep_caps: u32 = next()?.parse().ok()?;
+        let secure_bits: u32 = next()?.parse().ok()?;
+        let cap_eff: u64 = next()?.parse().ok()?;
+        let cap_perm: u64 = next()?.parse().ok()?;
+        let cap_inh: u64 = next()?.parse().ok()?;
         let groups: alloc::vec::Vec<u32> = next()?
-            .split(":")
+            .split(':')
             .filter(|group| !group.is_empty())
             .map(|group| group.parse().ok())
             .collect::<Option<_>>()?;
-        for (slot, value) in [
-            &self.uid, &self.euid, &self.suid, &self.gid, &self.egid, &self.sgid, &self.fsuid, &self.fsgid,
-        ]
-        .into_iter()
-        .zip(ids)
-        {
-            slot.store(value, Ordering::Relaxed);
-        }
-        self.nice.store(nice, Ordering::Relaxed);
-        self.retained_caps.store(retained != 0, Ordering::Relaxed);
-        self.keep_caps.store(keep_caps, Ordering::Relaxed);
-        let count = groups.len().min(MAX_SUPPLEMENTARY_GROUPS);
-        for (slot, group) in self.groups.iter().zip(groups) {
-            slot.store(group, Ordering::Relaxed);
-        }
-        self.group_count.store(count as u32, Ordering::Relaxed);
-        Some(())
-    }
-
-    pub(crate) fn fsuid(&self) -> u32 {
-        self.fsuid.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn fsgid(&self) -> u32 {
-        self.fsgid.load(Ordering::Relaxed)
-    }
-
-    /// Whether the effective user may change ids and groups freely (this shim has no capability
-    /// model: root is the only privileged user).
-    fn is_privileged(&self) -> bool {
-        self.euid() == 0 || self.retained_caps.load(Ordering::Relaxed)
-    }
-
-    /// A `fork()` child's own copy: later id changes in either process stay private to it.
-    pub(crate) fn fork_copy(&self) -> Self {
-        let copy = Self::new(self.uid(), self.euid(), self.gid(), self.egid());
-        copy.suid.store(self.suid(), Ordering::Relaxed);
-        copy.sgid.store(self.sgid(), Ordering::Relaxed);
-        for (dst, src) in copy.groups.iter().zip(&self.groups) {
-            dst.store(src.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        copy.retained_caps
-            .store(self.retained_caps.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy.fsuid.store(self.fsuid.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy.fsgid.store(self.fsgid.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy.nice.store(self.nice.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy.nice.store(self.nice.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy.group_count
-            .store(self.group_count.load(Ordering::Relaxed), Ordering::Relaxed);
-        copy
+        Some(Self {
+            uid: ids[0],
+            euid: ids[1],
+            suid: ids[2],
+            gid: ids[3],
+            egid: ids[4],
+            sgid: ids[5],
+            fsuid: ids[6],
+            fsgid: ids[7],
+            groups,
+            cap_eff,
+            cap_perm,
+            cap_inh,
+            keep_caps,
+            secure_bits,
+            nice,
+        })
     }
 
     /// `setresuid(2)`: `u32::MAX` leaves an id unchanged; an unprivileged caller may only pick
     /// values it already holds as real, effective or saved id.
-    fn set_res_uid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
-        let holds = |v: u32| v == self.uid() || v == self.euid() || v == self.suid();
+    fn set_res_uid(&mut self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
+        let holds = |v: u32| v == self.uid || v == self.euid || v == self.suid;
         let allowed = |v: u32| v == u32::MAX || holds(v);
         if !self.is_privileged() && !(allowed(ruid) && allowed(euid) && allowed(suid)) {
             return Err(Errno::EPERM);
         }
-        let keeps_caps = self.is_privileged() && self.keep_caps.load(Ordering::Relaxed) == 1;
-        for (slot, v) in [(&self.uid, ruid), (&self.euid, euid), (&self.suid, suid)] {
-            if v != u32::MAX {
-                slot.store(v, Ordering::Relaxed);
-            }
+        if ruid != u32::MAX {
+            self.uid = ruid;
         }
         if euid != u32::MAX {
-            self.fsuid.store(euid, Ordering::Relaxed);
+            self.euid = euid;
+            self.fsuid = euid;
         }
-        if keeps_caps && self.euid() != 0 {
-            self.retained_caps.store(true, Ordering::Relaxed);
+        if suid != u32::MAX {
+            self.suid = suid;
         }
         Ok(())
     }
 
     /// `setresgid(2)`; see [`Self::set_res_uid`].
-    fn set_res_gid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
-        let holds = |v: u32| v == self.gid() || v == self.egid() || v == self.sgid();
+    fn set_res_gid(&mut self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
+        let holds = |v: u32| v == self.gid || v == self.egid || v == self.sgid;
         let allowed = |v: u32| v == u32::MAX || holds(v);
         if !self.is_privileged() && !(allowed(rgid) && allowed(egid) && allowed(sgid)) {
             return Err(Errno::EPERM);
         }
-        for (slot, v) in [(&self.gid, rgid), (&self.egid, egid), (&self.sgid, sgid)] {
-            if v != u32::MAX {
-                slot.store(v, Ordering::Relaxed);
-            }
+        if rgid != u32::MAX {
+            self.gid = rgid;
         }
         if egid != u32::MAX {
-            self.fsgid.store(egid, Ordering::Relaxed);
+            self.egid = egid;
+            self.fsgid = egid;
+        }
+        if sgid != u32::MAX {
+            self.sgid = sgid;
         }
         Ok(())
     }
 
     /// `setreuid(2)`: `u32::MAX` leaves an id unchanged; the saved id follows the new effective
     /// id when the real id is set or the effective id differs from the old real id.
-    fn set_re_uid(&self, ruid: u32, euid: u32) -> Result<(), Errno> {
-        let old_real = self.uid();
-        let old_effective = self.euid();
+    fn set_re_uid(&mut self, ruid: u32, euid: u32) -> Result<(), Errno> {
+        let old_real = self.uid;
+        let old_effective = self.euid;
         let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
         let allowed_effective =
-            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.suid();
+            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.suid;
         if !self.is_privileged() && !(allowed_real(ruid) && allowed_effective(euid)) {
             return Err(Errno::EPERM);
         }
         let new_suid = if ruid != u32::MAX || (euid != u32::MAX && euid != old_real) {
             if euid != u32::MAX { euid } else { old_effective }
         } else {
-            self.suid()
+            self.suid
         };
         self.set_res_uid(ruid, euid, new_suid)
     }
 
     /// `setregid(2)`; see [`Self::set_re_uid`].
-    fn set_re_gid(&self, rgid: u32, egid: u32) -> Result<(), Errno> {
-        let old_real = self.gid();
-        let old_effective = self.egid();
+    fn set_re_gid(&mut self, rgid: u32, egid: u32) -> Result<(), Errno> {
+        let old_real = self.gid;
+        let old_effective = self.egid;
         let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
         let allowed_effective =
-            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.sgid();
+            |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.sgid;
         if !self.is_privileged() && !(allowed_real(rgid) && allowed_effective(egid)) {
             return Err(Errno::EPERM);
         }
         let new_sgid = if rgid != u32::MAX || (egid != u32::MAX && egid != old_real) {
             if egid != u32::MAX { egid } else { old_effective }
         } else {
-            self.sgid()
+            self.sgid
         };
         self.set_res_gid(rgid, egid, new_sgid)
     }
 
     /// `setuid(2)`: privileged sets all three ids, unprivileged sets only the effective one.
-    fn set_uid(&self, uid: u32) -> Result<(), Errno> {
+    fn set_uid(&mut self, uid: u32) -> Result<(), Errno> {
         if self.is_privileged() {
             return self.set_res_uid(uid, uid, uid);
         }
-        if uid == self.uid() || uid == self.suid() {
-            self.euid.store(uid, Ordering::Relaxed);
+        if uid == self.uid || uid == self.suid {
+            self.euid = uid;
+            self.fsuid = uid;
             Ok(())
         } else {
             Err(Errno::EPERM)
@@ -1355,15 +1359,30 @@ impl Credentials {
     }
 
     /// `setgid(2)`; see [`Self::set_uid`].
-    fn set_gid(&self, gid: u32) -> Result<(), Errno> {
+    fn set_gid(&mut self, gid: u32) -> Result<(), Errno> {
         if self.is_privileged() {
             return self.set_res_gid(gid, gid, gid);
         }
-        if gid == self.gid() || gid == self.sgid() {
-            self.egid.store(gid, Ordering::Relaxed);
+        if gid == self.gid || gid == self.sgid {
+            self.egid = gid;
+            self.fsgid = gid;
             Ok(())
         } else {
             Err(Errno::EPERM)
+        }
+    }
+
+    /// Applies the kernel's capability changes that follow a uid transition.
+    fn fixup_caps(&mut self, old_euid: u32) {
+        if self.uid != 0 && self.euid != 0 && self.suid != 0 {
+            if self.keep_caps == 0 {
+                self.cap_perm = 0;
+            }
+            self.cap_eff = 0;
+        } else if self.euid != 0 {
+            self.cap_eff = 0;
+        } else if old_euid != 0 {
+            self.cap_eff = self.cap_perm;
         }
     }
 }
@@ -1410,6 +1429,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.set_task_comm(&name_buf);
                 Ok(0)
             }
+            PrctlArg::GetSecureBits => Ok(0),
+            PrctlArg::SetSecureBits(_) => Ok(0),
+            // Ambient capabilities: none are ever raised, so IS_SET reads 0 and the rest succeed.
+            PrctlArg::CapAmbient(op) => match op {
+                1 | 2 | 4 => Ok(0), // PR_CAP_AMBIENT_IS_SET | LOWER | CLEAR_ALL: nothing raised
+                _ => Err(Errno::EPERM),
+            },
             PrctlArg::CapBSetRead(cap) => {
                 // Return 1 if the capability specified in cap is in the calling
                 // thread's capability bounding set, or 0 if it is not.
@@ -1420,8 +1446,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     return Err(Errno::EINVAL);
                 }
-                // Note we don't support capabilities in LiteBox, so we always return 0.
-                Ok(0)
+                // The bounding set is the kernel default: every capability.
+                Ok(1)
             }
             PrctlArg::SetNoNewPrivs(value) => {
                 // PR_SET_NO_NEW_PRIVS: once set, the calling thread and its descendants can
@@ -1461,19 +1487,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if value > 1 {
                     return Err(Errno::EINVAL);
                 }
-                self.credentials.keep_caps.store(value as u32, Ordering::Relaxed);
+                let mut c = (*self.creds()).clone();
+                c.keep_caps = value as u32;
+                self.set_creds(c);
                 Ok(0)
             }
             PrctlArg::GetKeepCaps => {
-                Ok(self.credentials.keep_caps.load(Ordering::Relaxed) as usize)
+                Ok(self.creds().keep_caps as usize)
             }
             PrctlArg::GetSecureBits => {
-                Ok(self.credentials.secure_bits.load(Ordering::Relaxed) as usize)
+                Ok(self.creds().secure_bits as usize)
             }
             PrctlArg::SetSecureBits(bits) => {
-                self.credentials
-                    .secure_bits
-                    .store(u32::try_from(bits).map_err(|_| Errno::EINVAL)?, Ordering::Relaxed);
+                let mut c = (*self.creds()).clone();
+                c.secure_bits = u32::try_from(bits).map_err(|_| Errno::EINVAL)?;
+                self.set_creds(c);
                 Ok(0)
             }
             // Capabilities are not modelled (see `CapBSetRead`): no ambient capability is ever
@@ -1538,7 +1566,6 @@ fn futex_compare_exchange<Platform: ShimPlatform>(
         .compare_exchange_at_offset(0, current, new)
         .ok_or(Errno::EFAULT)
 }
-
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Process a single robust-futex-list entry belonging to a dying thread: if the futex word
@@ -2165,7 +2192,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // process, for which this is already a guaranteed no-op (`vfork_done` is only ever
         // nonzero for a `CLONE_VFORK` child's OWN initial thread, between `clone()` and its own
         // first `execve`/`exit`).
-        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
+        let _ = self
+            .process()
+            .detach_pm_for_vfork_execve(&self.global.litebox);
         // Deferred: do NOT wake `wait4`/`wait_for_exit` waiters yet. See
         // `Process::detach_thread`'s doc comment -- a parent's `wait4()` must never be allowed to
         // return before this process's fds are released below, mirroring real Linux's `do_exit()`
@@ -2263,7 +2292,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     super::signal::siginfo_child(
                         signal,
                         self.pid.get(),
-                        self.credentials.uid(),
+                        self.creds().uid,
                         status,
                     ),
                 );
@@ -2348,6 +2377,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: exiting fn");
+        if process_exited {
+            self.signal_native_vfork_gate();
+        }
+        if process_exited {
+            self.release_record_locks();
+            self.global.process_registry.lock().remove(&self.pid.get());
+        }
+        if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
+            // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
+            let code = match self.process().wait_for_exit() {
+                ExitStatus::Exit(code) => i32::from(code) & 0xff,
+                ExitStatus::Signal(sig) => 128 + sig.as_i32(),
+            };
+            self.global.platform.exit_native_fork_child(code);
+        }
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
@@ -2413,16 +2458,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         crate::diag::print_strace_summary(|s| {
-            let _ = self.global.platform.write_to(
-                litebox::platform::StdioOutStream::Stderr,
-                s.as_bytes(),
-            );
+            let _ = self
+                .global
+                .platform
+                .write_to(litebox::platform::StdioOutStream::Stderr, s.as_bytes());
         });
         crate::diag::print_process_tree(|s| {
-            let _ = self.global.platform.write_to(
-                litebox::platform::StdioOutStream::Stderr,
-                s.as_bytes(),
-            );
+            let _ = self
+                .global
+                .platform
+                .write_to(litebox::platform::StdioOutStream::Stderr, s.as_bytes());
         });
     }
 
@@ -2488,6 +2533,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         const P_ALL: i32 = 0;
         const P_PID: i32 = 1;
+        const P_PIDFD: i32 = 3;
 
         const WNOHANG: i32 = 0x1;
         const WEXITED: i32 = 0x4;
@@ -2508,6 +2554,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let target_pid: i32 = match idtype {
             P_ALL => -1,
             P_PID => i32::try_from(id).map_err(|_| Errno::EINVAL)?,
+            P_PIDFD => self.pidfd_target(i32::try_from(id).map_err(|_| Errno::EBADF)?)?,
             // `P_PGID`/`P_PIDFD`: this shim tracks only its own `pgid` and has no registry to
             // resolve another group with, exactly as `sys_wait4` documents for `pid < -1`.
             // `ECHILD` ("no child matched") is the honest answer; `EINVAL` would blame the
@@ -2518,7 +2565,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
-        let (child_pid, exit_status) = if target_pid == -1 {
+        // A child forked as a separate OS process is not in `children`; `wait4` already knows how to
+        // wait for one, so borrow it and translate the packed status back into a `waitid` result.
+        let cross_process_target = if target_pid == -1 {
+            process.children.lock().is_empty() && !process.cross_process_children.lock().is_empty()
+        } else {
+            process.find_cross_process_child(target_pid).is_some()
+        };
+        let cross_process_result = if cross_process_target {
+            let mut packed: i32 = 0;
+            let packed_ptr = UserPtrMut::from_usize((&raw mut packed).expose_provenance());
+            let wait_options = if no_hang { WNOHANG } else { 0 };
+            let reaped = self.sys_wait4(target_pid, Some(packed_ptr), wait_options, None)?;
+            if reaped == 0 {
+                if let Some(infop) = infop {
+                    for i in 0..7 {
+                        let _ = infop.write_at_offset::<Platform>(i, 0);
+                    }
+                }
+                return Ok(0);
+            }
+            let status = if packed & 0x7f == 0 {
+                ExitStatus::Exit(((packed >> 8) & 0xff) as u8 as i8)
+            } else {
+                match litebox_common_linux::signal::Signal::try_from(packed & 0x7f) {
+                    Ok(sig) => ExitStatus::Signal(sig),
+                    Err(_) => ExitStatus::Exit(0),
+                }
+            };
+            Some((i32::try_from(reaped).unwrap_or(target_pid), status))
+        } else {
+            None
+        };
+
+        let (child_pid, exit_status) = if let Some(done) = cross_process_result {
+            done
+        } else if target_pid == -1 {
             if process.children.lock().is_empty() {
                 return Err(Errno::ECHILD);
             }
@@ -2766,7 +2848,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // of an unrelated signal, which `ready()` below simply reports not-ready-yet and loops
         // again).
         let (child_pid, exit_status) = if pid == -1 {
-            if process.children.lock().is_empty() && process.cross_process_children.lock().is_empty()
+            if process.children.lock().is_empty()
+                && process.cross_process_children.lock().is_empty()
             {
                 return Err(Errno::ECHILD);
             }
@@ -2936,7 +3019,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     }
                 }
-                exit_status.expect("loop only exits Ok/break-with-Interrupted once exit_status is set")
+                exit_status
+                    .expect("loop only exits Ok/break-with-Interrupted once exit_status is set")
             };
             (child_pid, exit_status)
         };
@@ -3148,6 +3232,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // A platform with a REAL `fork()` needs none of what follows below in this function: no
         // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
@@ -3157,7 +3243,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // branch exists solely to reconstruct, by hand and imperfectly, what a real `fork()`
         // syscall already does completely.
         if self.global.platform.has_native_fork() {
-            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
+            return self.try_native_cross_process_fork(
+                ctx,
+                child_tid,
+                exit_signal,
+                vfork,
+                child_sp,
+            );
         }
 
         // Xvfb/dbus-daemon used to be excluded here by name, unconditionally, before the
@@ -3717,7 +3809,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // between regions); this classification instead sums each individual per-VMA `layout`
         // length, so `file_ro_bytes + file_rw_bytes + anon_bytes` undercounts `total_bytes` by
         // exactly that padding, not by double-counting or missing a region.
-        if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN")
+        {
             let mut file_ro_bytes: u64 = 0;
             let mut file_ro_regions: u64 = 0;
             let mut file_rw_bytes: u64 = 0;
@@ -3726,7 +3822,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             for (range, flag_bits, is_file_backed) in &layout {
                 let len = (range.end - range.start) as u64;
                 let f = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
-                if f.intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS).is_empty() {
+                if f.intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
+                    .is_empty()
+                {
                     guard_bytes += len;
                 } else if *is_file_backed && !f.contains(litebox::mm::linux::VmFlags::VM_WRITE) {
                     file_ro_bytes += len;
@@ -3764,8 +3862,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             })
             .collect();
         let flags: alloc::vec::Vec<u32> = layout.iter().map(|(_, f, _)| *f).collect();
-        let is_file_backed: alloc::vec::Vec<bool> =
-            layout.iter().map(|(_, _, fb)| *fb).collect();
+        let is_file_backed: alloc::vec::Vec<bool> = layout.iter().map(|(_, _, fb)| *fb).collect();
         let executable: alloc::vec::Vec<bool> = layout
             .iter()
             .map(|(_, f, _)| f & litebox::mm::linux::VmFlags::VM_EXEC.bits() != 0)
@@ -3929,11 +4026,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .env_flag("LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE")
         {
             const POST_SPAWN_SENTINEL_DELTA: i32 = 7;
-            let after = self
-                .global
-                .next_thread_id
-                .fetch_add(POST_SPAWN_SENTINEL_DELTA, core::sync::atomic::Ordering::SeqCst)
-                + POST_SPAWN_SENTINEL_DELTA;
+            let after = self.global.next_thread_id.fetch_add(
+                POST_SPAWN_SENTINEL_DELTA,
+                core::sync::atomic::Ordering::SeqCst,
+            ) + POST_SPAWN_SENTINEL_DELTA;
             litebox_util_log::warn!(
                 after:% = after;
                 "[globalstate_share_probe] parent bumped next_thread_id AGAIN, strictly after spawn_cross_process_fork_child returned"
@@ -3971,6 +4067,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // The Windows-shaped reconstruction path above (GPR injection, VMA relocation) is only
         // wired up for x86_64 -- but native `fork()` needs none of that machinery at all (see
@@ -4000,21 +4098,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         _ctx: &litebox_common_linux::PtRegs,
         child_tid: i32,
         exit_signal: u64,
+        vfork: bool,
+        child_sp: Option<usize>,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_native_cross_process_fork entry");
         // SAFETY: no `RefCell`/lock guard local to this function is held across the call. Every
         // SHIM-WIDE lock that could otherwise be caught mid-hold by a sibling host thread at the
         // instant `fork()` runs is quiesced by `with_shimwide_locks_held` itself -- see its own
         // doc comment for what that covers and, explicitly, what it does not.
-        let result = self
-            .global
-            .with_shimwide_locks_held(|| unsafe { self.global.platform.native_fork() });
+        // With kernel state shared across the `fork()`, the child's fd table and fs state must be
+        // duplicated NOW, by the parent: the parent goes on to close the pipe ends the child was
+        // meant to inherit (`dup2` then `close`) and a table duplicated later, by the child, would
+        // already be missing them.
+        let shared = self.global.platform.native_fork_shares_kernel_state();
+        let child_state = shared.then(|| {
+            (
+                Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox)),
+                Arc::new((**self.fs.borrow()).clone()),
+            )
+        });
+        // `vfork()` suspends the caller until the child execs or exits; a real `fork()` child runs
+        // concurrently, so hold the parent on a gate the child opens (see `native_vfork_gates`).
+        let vfork_gate = vfork.then(|| {
+            let gate = Arc::new(
+                <<Platform as litebox::platform::RawMutexProvider>::RawMutex as litebox::platform::RawMutex>::INIT,
+            );
+            gate.underlying_atomic().store(0, Ordering::Release);
+            self.global
+                .native_vfork_gates
+                .lock()
+                .insert(child_tid, gate.clone());
+            gate
+        });
+        let result = self.global.with_shimwide_locks_held(
+            || unsafe { self.global.platform.native_fork() },
+            |forked| *forked == Some(0),
+        );
         match result {
             None => {
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() failed (EAGAIN/ENOMEM) -- falling back to the thread-based relocating fork"
                 );
+                drop(child_state);
+                if vfork_gate.is_some() {
+                    self.global.native_vfork_gates.lock().remove(&child_tid);
+                }
                 None
             }
             Some(0) => {
@@ -4029,7 +4158,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // here on. Nothing about it (pid, `Process`, pending signals, `/proc/self`) is
                 // correct for that identity yet; `reinit_as_native_fork_child` makes it so, in
                 // place, before anything else runs on this thread again.
-                self.reinit_as_native_fork_child(child_tid, exit_signal);
+                // This frame's copy of the gate `Arc` is the parent's reference, not the child's.
+                core::mem::forget(vfork_gate);
+                self.reinit_as_native_fork_child(child_tid, exit_signal, child_state, child_sp);
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() succeeded -- this thread is now the child, resuming in place"
@@ -4037,15 +4168,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(litebox::platform::CrossProcessChildHandle(0))
             }
             Some(child_pid) => {
+                // The child owns the duplicated tables now; this frame's copy of the references
+                // is not a second owner.
+                core::mem::forget(child_state);
                 litebox_util_log::debug!(
                     tid:% = self.tid.get(), child_pid:% = child_pid;
                     "clone: native fork() succeeded -- spawned real child pid"
                 );
+                if let Some(gate) = vfork_gate {
+                    let handle = litebox::platform::CrossProcessChildHandle(
+                        usize::try_from(child_pid)
+                            .expect("a real fork() child pid is always positive"),
+                    );
+                    // Bounded repoll, not a single unbounded wait: a child that dies before it
+                    // ever reaches `execve` (host-level crash) never opens the gate.
+                    loop {
+                        if gate.underlying_atomic().load(Ordering::Acquire) != 0
+                            || self.global.platform.cross_process_child_has_exited(handle)
+                        {
+                            break;
+                        }
+                        let _ = self
+                            .wait_cx()
+                            .with_timeout(core::time::Duration::from_millis(15))
+                            .wait_until(|| gate.underlying_atomic().load(Ordering::Acquire) != 0);
+                    }
+                    self.global.native_vfork_gates.lock().remove(&child_tid);
+                }
                 // A real pid from a real `fork()` is always > 0 here (the `Some(0)` arm above
                 // already took the only case that isn't), so this always fits.
                 Some(litebox::platform::CrossProcessChildHandle(
-                    usize::try_from(child_pid)
-                        .expect("a real fork() child pid is always positive"),
+                    usize::try_from(child_pid).expect("a real fork() child pid is always positive"),
                 ))
             }
         }
@@ -4068,7 +4221,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// kernel's copy-on-write already produced in this process's own memory, with nothing further
     /// for this function to do), and `wait_state` describes this HOST THREAD's own park/wake
     /// primitives, untouched by which guest process it now belongs to.
-    fn reinit_as_native_fork_child(&self, new_pid: i32, exit_signal: u64) {
+    fn reinit_as_native_fork_child(
+        &self,
+        new_pid: i32,
+        exit_signal: u64,
+        shared_state: Option<(
+            Arc<super::file::FilesState<Platform, FS>>,
+            Arc<super::file::FsState<Platform>>,
+        )>,
+        child_sp: Option<usize>,
+    ) {
+        if let Some(sp) = child_sp {
+            NATIVE_CHILD_SP.store(sp, Ordering::Relaxed);
+        }
+        IS_NATIVE_FORK_CHILD.store(true, Ordering::Relaxed);
+        // The child's copy of `credentials` points at the same `Arc` as the parent's without
+        // owning a reference count of its own; take one so that replacing or dropping it here
+        // never frees memory the parent still uses.
+        core::mem::forget(self.creds());
+        // Futex waiters are pinned on their own thread's stack; whatever the parent's threads had
+        // queued in this (private, copy-on-write) manager means nothing in this process. Start
+        // it empty.
+        {
+            let _private = litebox_util_log::PrivateAllocGuard::new();
+            let fresh = litebox::sync::futex::FutexManager::new();
+            let manager = Arc::as_ptr(&self.global.futex_manager).cast_mut();
+            // SAFETY: the manager lives in this process's private memory, and this process has
+            // exactly one thread here (the forked child), so nothing else can be using it.
+            core::mem::forget(unsafe { core::ptr::replace(manager, fresh) });
+        }
         let old_pid = self.pid.get();
         let old_process = self.process();
 
@@ -4099,7 +4280,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rounding to account for -- see `PageManager::new_adopting_existing_memory`'s own doc
         // comment on `group_spans` for why the Windows cross-process-fork caller passes a
         // non-empty set here and this one correctly passes none.
-        let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_existing_memory(
+        let (new_pm, _adopted, _shared) = litebox::mm::PageManager::new_adopting_inherited_memory(
             &self.global.litebox,
             regions.into_iter(),
             brk,
@@ -4122,8 +4303,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // time `do_clone` reaches either path.
             (exit_signal != 0).then_some(i32::try_from(exit_signal).unwrap_or(0)),
         );
-        self.thread.replace(new_thread);
-        self.signals.replace(new_signals);
+        // The values being replaced are this process's copy of references the PARENT still owns
+        // when the kernel heap is shared across the `fork()`: dropping them would release a
+        // reference count the parent never gave up. Forget them instead.
+        core::mem::forget(self.thread.replace(new_thread));
+        core::mem::forget(self.signals.replace(new_signals));
+        if let Some((files, fs)) = shared_state {
+            if self.files.try_borrow_mut().is_err() || self.fs.try_borrow_mut().is_err() {
+                litebox_util_log::error!(
+                    tid:% = self.tid.get(),
+                    files_free:% = self.files.try_borrow_mut().is_ok(),
+                    fs_free:% = self.fs.try_borrow_mut().is_ok();
+                    "DIAG native fork child: files/fs RefCell still borrowed"
+                );
+            }
+            // Adopt the tables the parent duplicated before the `fork()` (see
+            // `try_native_cross_process_fork`); without shared kernel memory the kernel's own
+            // copy-on-write already gave this process independent ones.
+            core::mem::forget(self.files.replace(files));
+            core::mem::forget(self.fs.replace(fs));
+            // SAFETY: no wait context is live on this thread at this point in `do_clone`.
+            unsafe {
+                self.wait_state
+                    .replace_forgetting_old(crate::wait::WaitState::new(self.global.platform));
+            }
+        }
+
+        // The child's `ThreadRemote` has no interrupt handle until one is attached (a normal new
+        // thread gets it in `handle_init_request`, which a native-fork child never goes through);
+        // without it nothing can interrupt this thread's waits, e.g. a `kill()` or `exit_group`.
+        self.thread
+            .borrow()
+            .remote
+            .handle
+            .set(Box::new(self.wait_state.thread_handle()))
+            .ok();
 
         // Give this child its own `/proc/self` entry, copied from the parent's, exactly as
         // `do_clone`'s thread-based path does for ITS new `Task` -- BEFORE overwriting `pid`
@@ -4133,11 +4347,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid.set(old_pid);
         self.pid.set(new_pid);
         self.tid.set(new_pid);
+        // A forked child inherits its parent's process group.
+        self.process()
+            .pgid
+            .store(old_process.pgid.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.process()
+            .sid
+            .store(old_process.sid.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.global
+            .process_registry
+            .lock()
+            .insert(new_pid, self.process());
         // A forked child starts attached to no pty of its own -- see this field's own doc
         // comment ("`None` for every ordinary (non-`--pty-mode`) process"); the PARENT's
         // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
         // something a freshly forked child inherits.
         self.attached_pty_id.set(None);
+        self.global.platform.set_process_guest_pid(new_pid);
+        self.install_proc_live_views();
+    }
+
+    /// Points this process's `/proc/self/{task,fd}` views at ITS OWN thread list and fd table.
+    ///
+    /// The closures capture the `Process`/`FilesState` current at the call, so a forked child
+    /// must re-install them: the entry it inherits still names the parent's tables, which made
+    /// `/proc/self/fd` list descriptors the child had closed (and `stat` of them fail).
+    pub(crate) fn install_proc_live_views(&self) {
+        if !self.global.platform.has_native_fork() {
+            return;
+        }
+        let process = self.process();
+        let files = self.files.borrow().clone();
+        self.global
+            .proc_self_info
+            .write()
+            .with_mut(self.pid.get(), |info| {
+                info.tids = Some(alloc::sync::Arc::new(move || process.tids()));
+                info.fds = Some(alloc::sync::Arc::new(move || {
+                    let alive: alloc::vec::Vec<usize> =
+                        files.raw_descriptor_store.read().iter_alive().collect();
+                    alive
+                        .into_iter()
+                        .filter_map(|fd| {
+                            let target = files.lookup_fd_path(fd).map_or_else(
+                                || alloc::format!("anon_inode:[{fd}]"),
+                                |c| c.to_string_lossy().into_owned(),
+                            );
+                            Some((i32::try_from(fd).ok()?, target))
+                        })
+                        .collect()
+                }));
+            });
     }
 
     /// Bridges a `LITEBOX_PROCESS_FORK=1` cross-process child's real OS-level exit into this
@@ -4174,7 +4434,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) {
         let Some(signal) = signal else { return };
         let process = self.process();
-        let uid = self.credentials.uid();
+        let uid = self.creds().uid;
         self.global.platform.spawn_cross_process_exit_notifier(
             handle,
             alloc::boxed::Box::new(move |raw_exit_code| {
@@ -4398,10 +4658,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let fs = if flags.contains(CloneFlags::FS) {
-            self.fs.borrow().clone()
-        } else {
-            alloc::sync::Arc::new((**self.fs.borrow()).clone())
+        // Deferred like `make_files`: with kernel state shared across a native `fork()`, an `Arc`
+        // built here is a local of BOTH the parent's and the child's copy of this frame, and each
+        // would drop it on the early-return path -- a double free.
+        let make_fs = || {
+            if flags.contains(CloneFlags::FS) {
+                self.fs.borrow().clone()
+            } else {
+                alloc::sync::Arc::new((**self.fs.borrow()).clone())
+            }
         };
         // DEFERRED, not computed here: `fork_duplicate` has a side effect on shared state, and the
         // cross-process `fork()` path below returns before ever needing the result.
@@ -4471,8 +4736,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `PageManager` for the window until its own `execve`/`_exit`, which is both correct
             // Linux semantics and already litebox's own answer to the fixed-address collision the
             // cross-process path exists to solve. It has nothing to hand a separate address space.
-            if !vforked
-                && let Some(handle) = self.try_cross_process_fork(ctx, child_tid, exit_signal)
+            if (!vforked || self.global.platform.has_native_fork())
+                && let Some(handle) =
+                    self.try_cross_process_fork(ctx, child_tid, exit_signal, vforked, sp)
             {
                 // `handle.0 == 0` is the reserved sentinel `try_native_cross_process_fork`
                 // documents: this very call is returning in the CHILD's own copy of this exact
@@ -4615,7 +4881,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // everything else (`file_backed && VM_WRITE` -- ELF `.data`/`.got`/`.bss`; and
             // anonymous -- heap/stack/thread-arena) is memory this fork must keep copying
             // regardless of any such fix.
-            if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+            if self
+                .global
+                .platform
+                .env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN")
+            {
                 let mut file_ro_bytes: u64 = 0;
                 let mut file_ro_regions: u64 = 0;
                 let mut file_rw_bytes: u64 = 0;
@@ -5434,7 +5704,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(child_shared_pending),
             )
         } else {
-            let thread = self.thread.borrow().new_thread(child_tid).ok_or(Errno::EBUSY)?;
+            let thread = self
+                .thread
+                .borrow()
+                .new_thread(child_tid)
+                .ok_or(Errno::EBUSY)?;
             (
                 thread,
                 ThreadInitState::NewThread {
@@ -5498,19 +5772,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        wait_state: crate::wait::WaitState::new(self.global.platform),
+                        wait_state: crate::ReplaceableWaitState::new(crate::wait::WaitState::new(
+                            self.global.platform,
+                        )),
                         thread: RefCell::new(thread),
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
                         ppid: Cell::new(ppid),
-                        credentials: Arc::new(self.credentials.fork_copy()),
+                        credentials: RefCell::new(self.creds()),
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
-                        fs: fs.into(),
+                        fs: make_fs().into(),
                         files: make_files().into(),
                         signals: RefCell::new({
-                            let signals = self.signals.borrow().clone_for_new_task(child_shared_pending);
+                            let signals = self
+                                .signals
+                                .borrow()
+                                .clone_for_new_task(child_shared_pending);
                             // `CLONE_CLEAR_SIGHAND`: the child starts with default dispositions.
                             // Applied to the CHILD's freshly-cloned state, never the caller's.
                             if flags.contains(CloneFlags::CLEAR_SIGHAND) {
@@ -5617,6 +5896,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `set_tid_address`.
+    /// Opens this process's `vfork()` gate, releasing a parent blocked in
+    /// `try_native_cross_process_fork`. Idempotent, and a no-op for every process that was not
+    /// created by a native `vfork()`.
+    fn signal_native_vfork_gate(&self) {
+        let gate = self
+            .global
+            .native_vfork_gates
+            .lock()
+            .remove(&self.pid.get());
+        if let Some(gate) = gate {
+            gate.underlying_atomic().store(1, Ordering::Release);
+            gate.wake_all();
+        }
+    }
+
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.borrow().clear_child_tid.set(Some(tidptr));
         self.tid.get()
@@ -5772,7 +6066,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // without making ordinary `ulimit -c 0`/`ulimit -s ...` calls
             // panic the whole runner.
             let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-            self.thread.borrow().process.limits.set_rlimit(resource, new_limit);
+            self.thread
+                .borrow()
+                .process
+                .limits
+                .set_rlimit(resource, new_limit);
             if let litebox_common_linux::RlimitResource::NOFILE = resource {
                 self.files.borrow().set_max_fd(new_max_fd);
             }
@@ -6188,7 +6486,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let process = self.process();
                 let alarm = process.alarm_timer.lock();
                 let now = self.global.platform.now();
-                (alarm.remaining(now), alarm.interval.unwrap_or(Duration::ZERO))
+                (
+                    alarm.remaining(now),
+                    alarm.interval.unwrap_or(Duration::ZERO),
+                )
             }
             IntervalTimer::Virtual | IntervalTimer::Prof => {
                 log_unsupported!("getitimer: ITIMER_VIRTUAL/PROF not supported");
@@ -6196,7 +6497,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         curr_value
-            .write_at_offset::<Platform>(0, ItimerVal::new(TimeVal::from(interval), TimeVal::from(value)))
+            .write_at_offset::<Platform>(
+                0,
+                ItimerVal::new(TimeVal::from(interval), TimeVal::from(value)),
+            )
             .ok_or(Errno::EFAULT)
     }
 
@@ -6236,10 +6540,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if own {
             return Ok(self.process().pgid.load(Ordering::Relaxed));
         }
+        self.lookup_process(pid)
+            .map(|p| p.pgid.load(Ordering::Relaxed))
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Finds a live process by pid: the caller itself, a direct child, or any process in the
+    /// shim-wide registry (the bootstrap process and native-`fork()` children).
+    pub(crate) fn lookup_process(&self, pid: i32) -> Option<Arc<Process<Platform>>> {
+        if pid == self.pid.get() {
+            return Some(self.process());
+        }
         self.process()
             .find_child(pid)
-            .map(|child| child.pgid.load(Ordering::Relaxed))
-            .ok_or(Errno::ESRCH)
+            .or_else(|| self.global.process_registry.lock().get(&pid).cloned())
+    }
+
+    /// Every live process (other than the caller's own) in process group `group`.
+    pub(crate) fn processes_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
+        let me = self.process();
+        let mut out: alloc::vec::Vec<Arc<Process<Platform>>> = self
+            .process()
+            .children_in_group(group)
+            .into_iter()
+            .map(|(_, child)| child)
+            .collect();
+        for p in self.global.process_registry.lock().values() {
+            if !Arc::ptr_eq(p, &me)
+                && p.pgid.load(Ordering::Relaxed) == group
+                && !out.iter().any(|o| Arc::ptr_eq(o, p))
+            {
+                out.push(p.clone());
+            }
+        }
+        out
     }
 
     /// Handle syscall `setpgid`.
@@ -6263,11 +6597,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             requested_group
         };
-        let local = if target_pid == self.pid.get() {
-            Some(self.process().clone())
-        } else {
-            self.process().find_child(target_pid)
-        };
+        let local = self.lookup_process(target_pid);
         if local.is_none() && self.process().find_cross_process_child(target_pid).is_none() {
             return Err(Errno::ESRCH);
         }
@@ -6297,105 +6627,128 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     )]
     pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
         self.process().pgid.store(self.pid.get(), Ordering::Relaxed);
+        self.process().sid.store(self.pid.get(), Ordering::Relaxed);
         self.xproc_set_pgid(self.pid.get(), self.pid.get());
         Ok(self.pid.get())
     }
 
+    /// Whether this process is a session leader (its exit hangs up its controlling terminal).
+    pub(crate) fn is_session_leader(&self) -> bool {
+        self.process().sid.load(Ordering::Relaxed) == self.pid.get()
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid()
+        self.creds().uid
     }
 
     /// Handle syscall `getresuid`.
-    ///
-    /// Real Linux reports the real, effective and saved user ids. This shim models one real and one
-    /// effective id (`Credentials`) and no saved id, so the saved id is reported as the effective
-    /// one -- which is what a real kernel reports for any process that has not performed a
-    /// set-user-ID transition away from it, and is the honest answer here rather than inventing a
-    /// third value.
     pub(crate) fn sys_getresuid(
         &self,
         ruid: UserPtrMut<u32>,
         euid: UserPtrMut<u32>,
         suid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        for (ptr, value) in [
-            (ruid, self.credentials.uid()),
-            (euid, self.credentials.euid()),
-            (suid, self.credentials.suid()),
-        ] {
-            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+        let c = self.creds();
+        for (ptr, value) in [(ruid, c.uid), (euid, c.euid), (suid, c.suid)] {
+            ptr.write_at_offset::<Platform>(0, value)
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
 
-    /// Handle syscall `getresgid`. See [`Self::sys_getresuid`] for why the saved id mirrors the
-    /// effective one.
+    /// Handle syscall `getresgid`.
     pub(crate) fn sys_getresgid(
         &self,
         rgid: UserPtrMut<u32>,
         egid: UserPtrMut<u32>,
         sgid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        for (ptr, value) in [
-            (rgid, self.credentials.gid()),
-            (egid, self.credentials.egid()),
-            (sgid, self.credentials.sgid()),
-        ] {
-            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+        let c = self.creds();
+        for (ptr, value) in [(rgid, c.gid), (egid, c.egid), (sgid, c.sgid)] {
+            ptr.write_at_offset::<Platform>(0, value)
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid()
+        self.creds().euid
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid()
+        self.creds().gid
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid()
+        self.creds().egid
     }
 
-    /// This task's own real credentials, as reported to a peer via `SO_PEERCRED` on a
-    /// connected Unix socket -- matches real Linux, which reports the *effective* uid/gid
-    /// (not the real uid/gid) of the connecting/listening process, plus its pid.
+    /// This task's own credentials, as reported to a peer via `SO_PEERCRED`.
     pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
+        let c = self.creds();
         litebox_common_linux::Ucred {
             pid: self.pid.get() as u32,
-            uid: self.credentials.euid(),
-            gid: self.credentials.egid(),
+            uid: c.euid,
+            gid: c.egid,
         }
+    }
+
+    /// The task's current credentials snapshot (immutable `Arc`; a change replaces it).
+    pub(crate) fn creds(&self) -> Arc<Credentials> {
+        self.credentials.borrow().clone()
+    }
+
+    pub(crate) fn set_creds(&self, c: Credentials) {
+        litebox::fs::ident::set(c.euid, c.egid);
+        *self.credentials.borrow_mut() = Arc::new(c);
+    }
+
+    /// Applies `change` to a copy of the credentials, runs the capability fix-up that follows a
+    /// uid transition, and installs the result only when `change` succeeded.
+    fn update_creds(
+        &self,
+        change: impl FnOnce(&mut Credentials) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        let mut c = (*self.creds()).clone();
+        let old_euid = c.euid;
+        change(&mut c)?;
+        c.fixup_caps(old_euid);
+        self.set_creds(c);
+        Ok(())
     }
 
     /// Handle syscall `setuid`.
     pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
-        self.credentials.set_uid(uid)
+        self.update_creds(|c| c.set_uid(uid))
     }
 
     /// Handle syscall `setgid`.
     pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
-        self.credentials.set_gid(gid)
+        self.update_creds(|c| c.set_gid(gid))
     }
 
     /// Handle syscall `setresuid`.
     pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
-        self.credentials.set_res_uid(ruid, euid, suid)
+        self.update_creds(|c| c.set_res_uid(ruid, euid, suid))
+    }
+
+    /// Handle syscall `setresgid`.
+    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
+        self.update_creds(|c| c.set_res_gid(rgid, egid, sgid))
     }
 
     /// Handle syscall `setreuid`.
     pub(crate) fn sys_setreuid(&self, ruid: u32, euid: u32) -> Result<(), Errno> {
-        self.credentials.set_re_uid(ruid, euid)
+        self.update_creds(|c| c.set_re_uid(ruid, euid))
     }
 
     /// Handle syscall `setregid`.
     pub(crate) fn sys_setregid(&self, rgid: u32, egid: u32) -> Result<(), Errno> {
-        self.credentials.set_re_gid(rgid, egid)
+        self.update_creds(|c| c.set_re_gid(rgid, egid))
     }
 
     fn task_state_spec(&self) -> alloc::string::String {
@@ -6423,7 +6776,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         alloc::format!(
             "task-state:{}\t{}{identity}",
             self.fs.borrow().cwd.read().clone(),
-            self.credentials.to_spec()
+            self.creds().to_spec()
         )
     }
 
@@ -6431,7 +6784,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut parts = spec.splitn(6, '\t');
         let cwd = parts.next()?;
         let credentials = parts.next()?;
-        self.credentials.restore_from_spec(credentials)?;
+        self.set_creds(Credentials::from_spec(credentials)?);
         *self.fs.borrow().cwd.write() = alloc::string::String::from(cwd);
         let unhex = |text: &str| -> Option<alloc::vec::Vec<u8>> {
             if text.len() % 2 != 0 {
@@ -6455,7 +6808,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     comm: alloc::string::String::from_utf8(unhex(comm)?).ok()?,
                     auxv: alloc::vec::Vec::new(),
                     maps: None,
-                    fds: alloc::vec::Vec::new(),
+                    tids: None,
+                    fds: None,
                 },
             );
         }
@@ -6475,7 +6829,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .is_some_and(|group| group == who)
             }
             PRIO_USER => {
-                who == 0 || u32::try_from(who).is_ok_and(|user| user == self.credentials.uid())
+                who == 0 || u32::try_from(who).is_ok_and(|user| user == self.creds().uid)
             }
             _ => return Err(Errno::EINVAL),
         };
@@ -6484,90 +6838,81 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_getpriority(&self, which: i32, who: i32) -> Result<usize, Errno> {
         self.priority_target_is_self(which, who)?;
-        let raw_priority = 20 - self.credentials.nice.load(Ordering::Relaxed);
+        let raw_priority = 20 - self.creds().nice;
         Ok(usize::try_from(raw_priority).unwrap_or(0))
     }
 
     pub(crate) fn sys_setpriority(&self, which: i32, who: i32, prio: i32) -> Result<(), Errno> {
         self.priority_target_is_self(which, who)?;
         let requested = prio.clamp(-20, 19);
-        let lowers_nice = requested < self.credentials.nice.load(Ordering::Relaxed);
-        if lowers_nice && self.credentials.euid() != 0 {
+        let mut c = (*self.creds()).clone();
+        if requested < c.nice && c.euid != 0 {
             return Err(Errno::EACCES);
         }
-        self.credentials.nice.store(requested, Ordering::Relaxed);
+        c.nice = requested;
+        self.set_creds(c);
         Ok(())
     }
+
     /// Handle syscall `setfsuid`: returns the previous value and never reports failure (the
     /// kernel ignores a refused change too). File permission checks use the effective ids.
     pub(crate) fn sys_setfsuid(&self, uid: u32) -> u32 {
-        let previous = self.credentials.fsuid.load(Ordering::Relaxed);
-        let holds = uid == self.credentials.uid()
-            || uid == self.credentials.euid()
-            || uid == self.credentials.suid()
-            || uid == previous;
-        if self.credentials.is_privileged() || holds {
-            self.credentials.fsuid.store(uid, Ordering::Relaxed);
+        let mut c = (*self.creds()).clone();
+        let previous = c.fsuid;
+        if c.is_privileged() || uid == c.uid || uid == c.euid || uid == c.suid || uid == previous {
+            c.fsuid = uid;
+            self.set_creds(c);
         }
         previous
     }
 
     /// Handle syscall `setfsgid`; see [`Self::sys_setfsuid`].
     pub(crate) fn sys_setfsgid(&self, gid: u32) -> u32 {
-        let previous = self.credentials.fsgid.load(Ordering::Relaxed);
-        let holds = gid == self.credentials.gid()
-            || gid == self.credentials.egid()
-            || gid == self.credentials.sgid()
-            || gid == previous;
-        if self.credentials.is_privileged() || holds {
-            self.credentials.fsgid.store(gid, Ordering::Relaxed);
+        let mut c = (*self.creds()).clone();
+        let previous = c.fsgid;
+        if c.is_privileged() || gid == c.gid || gid == c.egid || gid == c.sgid || gid == previous {
+            c.fsgid = gid;
+            self.set_creds(c);
         }
         previous
-    }
-
-    /// Handle syscall `setresgid`.
-    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
-        self.credentials.set_res_gid(rgid, egid, sgid)
     }
 
     /// Handle syscall `getgroups`. `size == 0` is the standard "just tell me the count" query
     /// and never touches `list`.
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<u32, Errno> {
-        let count = self.credentials.group_count.load(Ordering::Relaxed);
+        let c = self.creds();
         if size == 0 {
-            return Ok(count);
+            return Ok(c.groups.len() as u32);
         }
-        let capacity = u32::try_from(size).map_err(|_| Errno::EINVAL)?;
-        if capacity < count {
+        if size < 0 || (size as usize) < c.groups.len() {
             return Err(Errno::EINVAL);
         }
-        let groups: alloc::vec::Vec<u32> = self.credentials.groups[..count as usize]
-            .iter()
-            .map(|g| g.load(Ordering::Relaxed))
-            .collect();
-        list.copy_from_slice::<Platform>(0, &groups)
-            .ok_or(Errno::EFAULT)?;
-        Ok(count)
+        if !c.groups.is_empty() {
+            list.copy_from_slice::<Platform>(0, &c.groups)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(c.groups.len() as u32)
     }
 
     /// Handle syscall `setgroups`: only a privileged caller may replace the group list.
     pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
-        if !self.credentials.is_privileged() {
+        let mut c = (*self.creds()).clone();
+        if !c.is_privileged() {
+            litebox_util_log::warn!(pid = self.pid.get(), euid = c.euid; "setgroups denied: not privileged");
             return Err(Errno::EPERM);
         }
-        if size > MAX_SUPPLEMENTARY_GROUPS {
+        if size > 65536 {
             return Err(Errno::EINVAL);
         }
-        for (i, slot) in self.credentials.groups[..size].iter().enumerate() {
-            let gid = list
-                .read_at_offset::<Platform>(isize::try_from(i).map_err(|_| Errno::EINVAL)?)
-                .ok_or(Errno::EFAULT)?;
-            slot.store(gid, Ordering::Relaxed);
+        let mut groups = alloc::vec::Vec::with_capacity(size);
+        for i in 0..size {
+            groups.push(
+                list.read_at_offset::<Platform>(i as isize)
+                    .ok_or(Errno::EFAULT)?,
+            );
         }
-        self.credentials.group_count.store(
-            u32::try_from(size).map_err(|_| Errno::EINVAL)?,
-            Ordering::Relaxed,
-        );
+        c.groups = groups;
+        self.set_creds(c);
         Ok(())
     }
 }
@@ -6664,7 +7009,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// implementing real scheduling semantics.
     pub(crate) fn sys_sched_setparam(&self, _pid: Option<i32>, sched_priority: i32) {
         let (policy, _) = self.thread.borrow().sched_policy_priority.get();
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
@@ -6682,7 +7028,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         policy: i32,
         sched_priority: i32,
     ) {
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
@@ -6702,7 +7049,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         macro_rules! warn_shared_futex {
             ($flag:ident) => {
                 if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    litebox_util_log::debug!("futex: shared futex treated as private (correct in a single address space)");
+                    litebox_util_log::debug!(
+                        "futex: shared futex treated as private (correct in a single address space)"
+                    );
                 }
             };
         }
@@ -6945,7 +7294,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         None,
                     ) {
                         Ok(()) => {}
-                        Err(litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch) => {}
+                        Err(
+                            litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch,
+                        ) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -7058,10 +7409,26 @@ fn render_proc_maps<Platform: ShimPlatform>(
 ",
                 range.start,
                 range.end,
-                if flags.contains(VmFlags::VM_READ) { "r" } else { "-" },
-                if flags.contains(VmFlags::VM_WRITE) { "w" } else { "-" },
-                if flags.contains(VmFlags::VM_EXEC) { "x" } else { "-" },
-                if flags.contains(VmFlags::VM_SHARED) { "s" } else { "p" },
+                if flags.contains(VmFlags::VM_READ) {
+                    "r"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_WRITE) {
+                    "w"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_EXEC) {
+                    "x"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_SHARED) {
+                    "s"
+                } else {
+                    "p"
+                },
             ),
         );
     }
@@ -7360,6 +7727,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 path
             }
         };
+        let path = self
+            .resolve_path(path.as_str())
+            .ok()
+            .and_then(|c| c.into_string().ok())
+            .map(|p| {
+                let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+                for comp in p.split('/') {
+                    match comp {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        c => parts.push(c),
+                    }
+                }
+                alloc::format!("/{}", parts.join("/"))
+            })
+            .unwrap_or(path);
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 
@@ -7387,7 +7772,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // swap, and nothing else in this now-execve'ing child needs the old address space's
         // contents (real vfork's own POSIX contract already requires the child not to rely on
         // anything it wrote there surviving past this point).
-        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
+        let _ = self
+            .process()
+            .detach_pm_for_vfork_execve(&self.global.litebox);
 
         // Close CLOEXEC descriptors
         self.close_on_exec();
@@ -7430,7 +7817,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.exit_group(ExitStatus::Signal(
                 litebox_common_linux::signal::Signal::SIGSEGV,
             ));
-            self.process().signal_vfork_done();
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
             return Ok(0);
         }
 
@@ -7466,11 +7856,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_common_linux::loader::ElfLoadError::Map(Errno::EEXIST)
                 )
             ) && let Some(result) = self.global.platform.spawn_exec_collision_child(
-                    &path,
-                    &argv_for_collision_retry,
-                    &envp_for_collision_retry,
-                )
-            {
+                &path,
+                &argv_for_collision_retry,
+                &envp_for_collision_retry,
+            ) {
                 litebox_util_log::warn!(
                     tid:% = self.tid.get(), path:% = path, raw_status:% = result.raw_status;
                     "sys_execve: load_program hit a fixed-address collision, but a fresh process \
@@ -7491,7 +7880,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
                 self.exit_group(ExitStatus::Exit(result.raw_status.clamp(0, 255) as u8 as i8));
-                self.process().signal_vfork_done();
+                {
+                    self.process().signal_vfork_done();
+                    self.signal_native_vfork_gate();
+                }
                 return Ok(0);
             }
             // The old program image is already torn down (memory released, other threads killed,
@@ -7520,7 +7912,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // matching every other in-guest process-termination path in this module (see
             // `exit_thread`'s doc comment) -- no register/stack setup for a new program is needed
             // or possible, since there is no new program.
-            self.process().signal_vfork_done();
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
             return Ok(0);
         }
 
@@ -7538,7 +7933,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `init_thread_context()`, never reaching the final "returning from sys_execve" point,
         // because waking the suspended grandparent let it resume concurrently on its own real OS
         // thread while this thread's own new-program register/stack state was still mid-setup.
-        self.process().signal_vfork_done();
+        {
+            self.process().signal_vfork_done();
+            self.signal_native_vfork_gate();
+        }
         Ok(0)
     }
 
@@ -7570,6 +7968,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Keyed by THIS process's pid, not written over a single global cell. See
             // `litebox::fs::procfs::ProcSelfTable`'s doc comment: the cell meant every other
             // live process read this one's `exe`/`cmdline`/`auxv`/`maps` as its own.
+            self.global.platform.set_process_guest_pid(self.pid.get());
             self.global.proc_self_info.write().set(
                 self.pid.get(),
                 litebox::fs::procfs::ProcSelfInfo {
@@ -7583,7 +7982,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // installed against this process's page manager once it exists.
                     auxv: alloc::vec::Vec::new(),
                     maps: None,
-                    fds: alloc::vec::Vec::new(),
+                    tids: None,
+                    fds: None,
                 },
             );
         }
@@ -7600,9 +8000,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .with_mut(self.pid.get(), |info| {
                     info.maps = Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
                 });
+            self.install_proc_live_views();
         }
 
         let load_info = loader.load(argv, envp, self.init_auxv())?;
+        if self.global.platform.env_flag("LITEBOX_DIAG_FAULT") {
+            // Where this image landed (`AT_ENTRY`), so a fault's absolute `rip` can be turned
+            // into a file offset: offset = rip - AT_ENTRY + e_entry.
+            let at_entry = load_info
+                .auxv
+                .chunks_exact(16)
+                .find(|c| usize::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])) == 9)
+                .map(|c| usize::from_ne_bytes(c[8..16].try_into().unwrap_or([0; 8])));
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-exec] pid={} at_entry={:#x} path={}",
+                    self.pid.get(),
+                    at_entry.unwrap_or(0),
+                    loader.path()
+                ),
+            );
+        }
         // Completes the snapshot above. Deliberately after `load`, because the full auxiliary
         // vector does not exist until the image has been placed (`AT_PHDR`/`AT_ENTRY`/`AT_BASE`)
         // and the stack written (`AT_RANDOM`), and deliberately not reconstructed here -- these
@@ -7614,7 +8033,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.set_task_comm(loader.comm());
 
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .init_state
             .set(ThreadInitState::NewProcess(load_info));
         Ok(())
@@ -7623,7 +8043,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .remote
             .handle
             .set(Box::new(self.wait_state.thread_handle()))

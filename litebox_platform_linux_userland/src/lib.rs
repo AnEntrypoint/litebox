@@ -34,10 +34,11 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+pub mod presentation;
 /// GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer). See the
 /// module's own doc comment for the full design and how it differs from `litebox_platform_windows_
 /// userland::presentation`, the reference implementation this was ported from.
-pub mod presentation;
+pub mod shared_heap;
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
@@ -226,7 +227,33 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        DIAG_FAULT.store(
+            std::env::var_os("LITEBOX_DIAG_FAULT").is_some_and(|v| !v.is_empty()),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        shared_heap::BIG_DIAG.store(
+            std::env::var_os("LITEBOX_DIAG_BIGALLOC").is_some_and(|v| !v.is_empty()),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         register_exception_handlers();
+        litebox::fs::clock::set_now_fn(|| {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime writes one timespec through a valid pointer.
+            unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+            litebox::fs::Timestamp {
+                sec: ts.tv_sec,
+                nsec: ts.tv_nsec as u32,
+            }
+        });
+        litebox::fs::ident::set_thread_id_fn(cached_host_tid);
+        litebox::fs::ident::set_thread_alive_fn(|tid| {
+            // SAFETY: signal 0 only probes for existence.
+            let r = unsafe { libc::syscall(libc::SYS_tkill, tid as libc::c_long, 0) };
+            r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        });
 
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
@@ -539,6 +566,7 @@ impl LinuxUserland {
             // tgkill/rt_sigaction calls (e.g. glibc's pthread_create signal setup) instead.
             #[cfg(not(target_arch = "aarch64"))]
             (libc::SYS_tgkill, vec![]),
+            (libc::SYS_tkill, vec![]),
             (libc::SYS_timer_create, vec![]),
             (libc::SYS_timer_settime, vec![]),
             (libc::SYS_timer_delete, vec![]),
@@ -599,6 +627,11 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
+            // Host-side reaping of a native-fork child (`native_fork_waitpid`,
+            // `spawn_cross_process_exit_notifier`). A guest `wait4` is rewritten and emulated by
+            // the shim, never issued raw, so allowing these only serves the platform's own calls.
+            (libc::SYS_wait4, vec![]),
+            (libc::SYS_waitid, vec![]),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
             //
             // `open` does not exist as a syscall number on aarch64 (glibc always emits
@@ -1843,9 +1876,44 @@ where
     T: Send + 'static,
 {
     std::thread::spawn(move || {
+        shared_heap::mark_shared_thread(true);
+        let _unshare = litebox::utils::defer(|| shared_heap::mark_shared_thread(false));
         block_guest_signals();
         f()
     })
+}
+
+/// Moves a new thread's shim state (its `Task`) out of the Rust heap into private memory.
+///
+/// With the shared-arena heap, everything `Box`ed is visible to every process in a native-fork
+/// family. A thread's `Task` is per-process, per-thread state that a `fork()` child reinitialises
+/// IN PLACE (see `reinit_as_native_fork_child`), so it must live in memory the fork copies rather
+/// than shares -- as the initial thread's does on its stack. The moved value is not dropped or
+/// re-created, only relocated; a later `Drop` frees it through the global allocator, which routes
+/// any pointer outside the arena to the system allocator.
+#[allow(unused_imports)]
+use std::alloc::GlobalAlloc as _;
+
+fn privatize_thread_state<T: ?Sized>(state: Box<T>) -> Box<T> {
+    if !shared_heap::is_active() {
+        return state;
+    }
+    let raw = Box::into_raw(state);
+    // SAFETY: `raw` came from `Box::into_raw`, so it is valid and uniquely owned.
+    let layout = std::alloc::Layout::for_value(unsafe { &*raw });
+    if layout.size() == 0 {
+        // SAFETY: zero-sized: nothing was allocated.
+        return unsafe { Box::from_raw(raw) };
+    }
+    // SAFETY: non-zero layout; the copy is a bitwise move of a value that is never used again
+    // at its old address, whose block is then released without running its destructor.
+    unsafe {
+        let private = std::alloc::System.alloc(layout);
+        assert!(!private.is_null(), "out of memory privatizing thread state");
+        core::ptr::copy_nonoverlapping(raw.cast::<u8>(), private, layout.size());
+        std::alloc::dealloc(raw.cast::<u8>(), layout);
+        Box::from_raw(raw.with_addr(private as usize))
+    }
 }
 
 fn thread_start(
@@ -1854,8 +1922,10 @@ fn thread_start(
     >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
+    shared_heap::mark_shared_thread(true);
+    let _unshare = litebox::utils::defer(|| shared_heap::mark_shared_thread(false));
     // Allow caller to run some code before we return to the new thread.
-    let shim = init_thread.init();
+    let shim = privatize_thread_state(init_thread.init());
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
     // TODO: have syscall_callback return if we need to terminate the process.
@@ -1865,7 +1935,13 @@ fn thread_start(
 
 // A handle to a platform thread.
 #[derive(Clone)]
-pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<libc::pthread_t>>>);
+pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>);
+
+/// The calling thread's host `(pid, tid)`.
+fn host_thread_ids() -> (i32, i32) {
+    // SAFETY: getpid/gettid take no arguments and cannot fail.
+    unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid) as i32) }
+}
 
 thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
@@ -1874,9 +1950,9 @@ thread_local! {
 impl ThreadHandle {
     /// Runs `f`, ensuring that [`ThreadHandle::current`] can be called within `f`.
     fn run_with_handle<R>(f: impl FnOnce() -> R) -> R {
-        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(unsafe {
-            libc::pthread_self()
-        }))));
+        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            host_thread_ids(),
+        ))));
         CURRENT_THREAD.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -1903,15 +1979,40 @@ impl ThreadHandle {
     /// Interrupts the thread, delivering a signal to it.
     fn interrupt(&self) {
         let thread = self.0.lock().unwrap();
-        if let Some(&thread) = thread.as_ref() {
+        if let Some(&(pid, tid)) = thread.as_ref() {
+            // `tgkill` (not `pthread_kill`) so a thread of ANOTHER process in this native-fork
+            // family can be interrupted too.
             unsafe {
-                libc::pthread_kill(thread, INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed));
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    pid,
+                    tid,
+                    INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed),
+                );
             }
         }
     }
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
+    fn set_process_guest_pid(&self, pid: i32) {
+        GUEST_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        // A forked child keeps its parent's thread-local copy; drop the stale cached id.
+        HOST_TID.with(|t| t.set(0));
+        if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: getpid/gettid take no arguments and cannot fail.
+            let (host_pid, host_tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
+            eprintln!("[diag-hostpid] host_pid={host_pid} host_tid={host_tid} guest_pid={pid}");
+        }
+    }
+
+    fn current_guest_pid(&self) -> Option<i32> {
+        match GUEST_PID.load(core::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
@@ -2133,13 +2234,46 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
+    // Token of the thread that holds this mutex (set by `note_locked`, cleared by
+    // `note_unlocked`; 0 when free or unknown). This mutex lives in memory shared between guest
+    // processes, so a process that dies mid-critical-section (a panic, a kill, an OOM) leaves it
+    // locked forever; a long-blocked waiter uses this to notice the holder is gone and reopen it.
+    owner: AtomicU32,
 }
+
+/// How long a waiter on a held mutex sleeps before checking whether the holder still exists.
+const HOLDER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 impl RawMutex {
     const fn new() -> Self {
         Self {
             inner: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
         }
+    }
+
+    /// If the holder of this mutex is dead, forces it open and returns whether it did.
+    #[cold]
+    fn reopen_if_holder_dead(&self) -> bool {
+        let owner = self.owner.load(core::sync::atomic::Ordering::Relaxed);
+        if owner == 0 || litebox::fs::ident::thread_token_alive(owner) {
+            return false;
+        }
+        if self
+            .owner
+            .compare_exchange(
+                owner,
+                0,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.inner.store(0, core::sync::atomic::Ordering::Release);
+        futex_val2(&self.inner, FutexOperation::Wake, 1, 0, None).ok();
+        true
     }
 
     fn block_or_maybe_timeout(
@@ -2147,19 +2281,55 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We wait on the futex, with a timeout if needed
-        match futex_timeout(
-            &self.inner,
-            FutexOperation::Wait,
-            /* expected value */ val,
-            timeout,
-            /* ignored */ None,
-        ) {
+        // We wait on the futex, with a timeout if needed. The host kernel has been seen to answer a
+        // FUTEX_WAIT on a healthy, aligned shared-heap word with a single transient EINVAL that a
+        // re-issue of the identical call does not reproduce (diagnosed by the probes below, which
+        // all succeed); re-issue a few times before treating it as a real error.
+        let mut attempt = 0;
+        let result = loop {
+            let r = futex_timeout(
+                &self.inner,
+                FutexOperation::Wait,
+                /* expected value */ val,
+                timeout,
+                /* ignored */ None,
+            );
+            if matches!(r, Err(syscalls::Errno::EINVAL)) && attempt < 3 {
+                attempt += 1;
+                continue;
+            }
+            break r;
+        };
+        match result {
             Ok(0) | Err(syscalls::Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
             Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
             Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
             Err(e) => {
-                panic!("Unexpected errno={e} for FUTEX_WAIT")
+                // Diagnostics for an unexpected errno: re-issue variations to see what the kernel
+                // (or the seccomp filter) objects to.
+                let addr = &self.inner as *const AtomicU32 as usize;
+                let probe = |op: usize, ts: usize| -> isize {
+                    // SAFETY: probes the same live futex word; a zero timeout pointer means none.
+                    match unsafe {
+                        syscalls::syscall6(syscalls::Sysno::futex, addr, op, val as usize, ts, 0, 0)
+                    } {
+                        Ok(v) => v as isize,
+                        Err(e) => -(e.into_raw() as isize),
+                    }
+                };
+                let no_ts = probe(0, 0);
+                let private = probe(128, 0);
+                let ts = litebox_common_linux::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
+                let with_ts = probe(0, core::ptr::from_ref(&ts) as usize);
+                let gettid = unsafe { libc::syscall(libc::SYS_gettid) };
+                let getpid = unsafe { libc::syscall(libc::SYS_getpid) };
+                panic!(
+                    "Unexpected errno={e} for FUTEX_WAIT addr={addr:#x} val={val} timeout={timeout:?} \
+                     [retry: no_ts={no_ts} private={private} 1ms_ts={with_ts} tid={gettid} pid={getpid}]"
+                )
             }
             _ => unreachable!(),
         }
@@ -2188,9 +2358,15 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
+        // Only a mutex with a recorded holder can be recovered, so only then wake up periodically.
+        let timeout = (self.owner.load(core::sync::atomic::Ordering::Relaxed) != 0)
+            .then_some(HOLDER_CHECK_INTERVAL);
+        match self.block_or_maybe_timeout(val, timeout) {
             Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+            Ok(UnblockedOrTimedOut::TimedOut) => {
+                self.reopen_if_holder_dead();
+                Ok(())
+            }
             Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
         }
     }
@@ -2201,6 +2377,17 @@ impl litebox::platform::RawMutex for RawMutex {
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(timeout))
+    }
+
+    fn note_locked(&self) {
+        self.owner.store(
+            litebox::fs::ident::thread_token(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn note_unlocked(&self) {
+        self.owner.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2684,6 +2871,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // Handles are recorded in cross-process tables (memfds, shared file mappings), so they
+        // must name something every process can reach: a segment of the inherited pool. A plain
+        // memfd number is only meaningful in the process that created it, and a sibling that
+        // was forked earlier would map whatever unrelated descriptor has that number.
+        if let Some(h) = shared_heap::pool_segment(0, size) {
+            return Ok(h);
+        }
         let name = c"litebox-shared-mem";
         let fd =
             unsafe { syscalls::syscall2(syscalls::Sysno::memfd_create, name.as_ptr() as usize, 0) }
@@ -2693,6 +2887,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             return Err(SharedMemoryError::OutOfMemory);
         }
         Ok(fd)
+    }
+
+    fn create_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // FNV-1a; 0 is reserved for "anonymous".
+        let mut key: usize = 0xcbf2_9ce4_8422_2325_u64 as usize;
+        for b in name.bytes() {
+            key = (key ^ usize::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        shared_heap::pool_segment(key | 1, size).ok_or(SharedMemoryError::UnsupportedByPlatform)
     }
 
     fn map_shared_memory(
@@ -2709,6 +2916,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
         }
 
+        let (fd, offset) = if handle & shared_heap::POOL_HANDLE_TAG != 0 {
+            (
+                shared_heap::pool_fd().ok_or(SharedMemoryError::UnsupportedByPlatform)?,
+                shared_heap::pool_offset(handle),
+            )
+        } else {
+            (handle, 0)
+        };
         let result = unsafe {
             syscalls::syscall6(
                 syscalls::Sysno::mmap,
@@ -2718,8 +2933,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     .bits()
                     .reinterpret_as_unsigned() as usize,
                 flags.bits().reinterpret_as_unsigned() as usize,
-                handle,
-                0,
+                fd,
+                offset,
             )
         };
         match result {
@@ -2742,7 +2957,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         handle: Self::SharedMemoryHandle,
     ) -> Result<(), SharedMemoryError> {
-        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, handle) };
+        if handle & shared_heap::POOL_HANDLE_TAG == 0 {
+            let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, handle) };
+        }
         Ok(())
     }
 }
@@ -2954,6 +3171,58 @@ impl ThreadContext<'_> {
     }
 }
 
+/// Clears this thread's registered-waker TLS slot WITHOUT dropping what it points to; see
+/// [`LinuxUserland::native_fork`]'s caller for why a forked child must not release it.
+fn forget_inherited_waker() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut waker_ptr: *mut litebox::event::wait::Waker<LinuxUserland> = std::ptr::null_mut();
+        // SAFETY: swaps this thread's own TLS slot with null; the old value is deliberately leaked.
+        unsafe {
+            core::arch::asm!(
+                concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
+                inout(reg) waker_ptr,
+                options(nostack),
+            );
+        }
+        let _ = waker_ptr;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let scratch_ptr = aarch64_scratch_or_host_only();
+        // SAFETY: same-thread access, as in `update_waker`; the old value is deliberately leaked.
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*scratch_ptr).wait_waker_addr, 0);
+        }
+    }
+}
+
+/// `waitpid(2)` on a native-fork child (see `ForkChildVerificationProvider::native_fork`),
+/// returning the status re-encoded into the shim's cross-process exit layout. `None` means "still
+/// running" (`WNOHANG`) or a retriable `EINTR`.
+fn native_fork_waitpid(
+    handle: litebox::platform::CrossProcessChildHandle,
+    options: libc::c_int,
+) -> Option<u32> {
+    const MARKER: u32 = 0xC0DE_0000;
+    const SIGNAL_FLAG: u32 = 0x0000_8000;
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(handle.0 as libc::pid_t, &raw mut status, options) };
+    if r <= 0 {
+        // `0` = WNOHANG-not-yet; `-1` = EINTR (retry) or ECHILD (someone else reaped it: report
+        // as killed so a waiter does not spin forever).
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            return Some(MARKER | SIGNAL_FLAG | 9);
+        }
+        return None;
+    }
+    Some(if libc::WIFEXITED(status) {
+        MARKER | (libc::WEXITSTATUS(status) as u32 & 0xff)
+    } else {
+        MARKER | SIGNAL_FLAG | (libc::WTERMSIG(status) as u32 & 0xff)
+    })
+}
+
 impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
     // "Think rust, not windows": this trait's default `spawn_cross_process_fork_child` contract
     // (a relocation map to translate, a register snapshot to inject, pipes/files/eventfds to
@@ -2993,13 +3262,152 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
         // SAFETY: `fork()` has no arguments and no precondition of its own beyond the caller's
         // lock-quiescing contract (see above) -- nothing here can misuse it further.
         let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // The child's copy of this thread's TLS still points at the PARENT's registered
+            // `Waker` box (kernel state, and so that box, is shared across the fork). The next
+            // `update_waker` would drop it -- releasing a reference the parent still holds --
+            // so abandon it here instead.
+            forget_inherited_waker();
+            // Likewise the thread handle: it names the PARENT's host thread and is shared with
+            // it. Replace it with one for this process's only thread.
+            CURRENT_THREAD.with_borrow_mut(|current| {
+                if let Some(old) = current.take() {
+                    core::mem::forget(old);
+                }
+                *current = Some(ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(
+                    Some(host_thread_ids()),
+                ))));
+            });
+        }
         if pid < 0 { None } else { Some(pid) }
+    }
+
+    fn cross_process_child_has_exited(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> bool {
+        // SAFETY: zeroed siginfo is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                handle.0 as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // `0` with an unfilled `si_pid` means "still running"; an error (ECHILD) means it is gone.
+        // SAFETY: `si_pid` is a plain field read of the struct waitid just filled in.
+        r < 0 || unsafe { info.si_pid() } != 0
+    }
+
+    fn native_fork_shares_kernel_state(&self) -> bool {
+        shared_heap::is_active()
+    }
+
+    fn exit_native_fork_child(&self, status: i32) {
+        // SAFETY: `_exit` takes no pointers and never returns; the child's guest process is
+        // already fully torn down, and running Rust/libc exit handlers here would only touch
+        // state the parent still owns a COW view of.
+        unsafe { libc::_exit(status) }
+    }
+
+    // A native-fork child's `CrossProcessChildHandle` is its real host pid, so the "wait for a
+    // cross-process child" hooks are plain `waitpid(2)` on it. The status is re-encoded into the
+    // marker layout `decode_cross_process_wait_status` reads (high 16 bits `0xC0DE`, bit 15 =
+    // signalled, low 8 bits = exit code or signal number) so the shim's one decoder serves both
+    // this and the Windows path.
+    fn wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> u32 {
+        loop {
+            if let Some(code) = native_fork_waitpid(handle, 0) {
+                return code;
+            }
+        }
+    }
+
+    fn try_wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> Option<u32> {
+        native_fork_waitpid(handle, libc::WNOHANG)
+    }
+
+    fn spawn_cross_process_exit_notifier(
+        &'static self,
+        handle: litebox::platform::CrossProcessChildHandle,
+        on_exit: alloc::boxed::Box<dyn FnOnce(u32) + Send>,
+    ) {
+        // `WNOWAIT` leaves the zombie in place: `sys_wait4` must still be able to reap the child
+        // and read its status itself.
+        std::thread::spawn(move || {
+            shared_heap::mark_shared_thread(true);
+            let _unshare = litebox::utils::defer(|| shared_heap::mark_shared_thread(false));
+            let pid = handle.0 as libc::id_t;
+            let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+            loop {
+                let r = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &raw mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if r == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    // ECHILD: already reaped by `sys_wait4`, which needs no wake from us.
+                    return;
+                }
+            }
+            let code = unsafe { info.si_status() } as u32 & 0xff;
+            let marker = 0xC0DE_0000_u32;
+            on_exit(if info.si_code == libc::CLD_EXITED {
+                marker | code
+            } else {
+                marker | 0x8000 | code
+            });
+        });
     }
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
+    }
+
+    fn memory_info_kb(&self) -> (u64, u64) {
+        // The host's real figures: guest code runs natively, so what it can allocate is what the
+        // host has. Read once, at first use (before the seccomp filter goes up -- a later
+        // `open` from here would be refused and silently fall back to the defaults).
+        static INFO: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        *INFO.get_or_init(|| {
+            let default = (1024 * 1024, 512 * 1024);
+            let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+                return default;
+            };
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            };
+            match (field("MemTotal:"), field("MemAvailable:")) {
+                (Some(t), Some(a)) => (t, a),
+                _ => default,
+            }
+        })
+    }
+
+    fn env_flag(&self, name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+    }
+
+    fn env_value(&self, name: &str) -> Option<std::string::String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -3128,8 +3536,7 @@ fn register_exception_handlers() {
                 // any non-interactive launch context). Only a genuine pre-existing custom handler
                 // is a conflict worth surfacing.
                 assert!(
-                    old_sa.sa_sigaction == libc::SIG_DFL
-                        || old_sa.sa_sigaction == libc::SIG_IGN,
+                    old_sa.sa_sigaction == libc::SIG_DFL || old_sa.sa_sigaction == libc::SIG_IGN,
                     "signal {sig} handler already installed",
                 );
             }
@@ -3301,12 +3708,15 @@ fn with_signal_alt_stack<R>(f: impl FnOnce(*mut u8) -> R) -> R {
         );
     }
     let _restore_guard = litebox::utils::defer(|| unsafe {
+        // Runs from a drop guard, possibly while unwinding from another panic: a second panic
+        // here aborts in an unbounded backtrace loop, so a failure is reported, not asserted.
         let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
-        assert!(
-            r >= 0,
-            "failed to restore original signal stack: {}",
-            std::io::Error::last_os_error()
-        );
+        if r < 0 {
+            eprintln!(
+                "failed to restore original signal stack: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     });
     f(mapping_base.cast::<u8>())
 }
@@ -3613,6 +4023,14 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
     true
 }
 
+/// Guest pid of THIS host process (0 = not yet recorded). A native-fork child is a host process
+/// of its own, so a plain static (COW-private after `fork()`) is the per-process identity
+/// `/proc/self` needs.
+static GUEST_PID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// Whether `LITEBOX_DIAG_FAULT` was set at startup (see [`exception_signal_handler`]).
+static DIAG_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 #[allow(
     clippy::cast_possible_truncation,
@@ -3623,6 +4041,84 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // `LITEBOX_DIAG_FAULT=1`: name every hardware exception the guest takes (which signal, at
+    // which instruction, touching which address) on stderr. Async-signal-safe: no allocation.
+    #[cfg(target_arch = "x86_64")]
+    if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+        let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let addr = unsafe { info.si_addr() } as u64;
+        let mut buf = [0u8; 128];
+        let mut n = 0;
+        let mut put = |b: &[u8]| {
+            for &c in b {
+                if n < buf.len() {
+                    buf[n] = c;
+                    n += 1;
+                }
+            }
+        };
+        let hex = |mut v: u64, out: &mut [u8; 16]| {
+            for i in (0..16).rev() {
+                out[i] = b"0123456789abcdef"[(v & 0xf) as usize];
+                v >>= 4;
+            }
+        };
+        let mut h = [0u8; 16];
+        put(b"[diag-fault] sig=");
+        put(&[b'0' + (signum / 10) as u8, b'0' + (signum % 10) as u8]);
+        put(b" rip=0x");
+        hex(rip, &mut h);
+        put(&h);
+        put(b" addr=0x");
+        hex(addr, &mut h);
+        put(&h);
+        put(b" pid=");
+        let mut pid = GUEST_PID.load(core::sync::atomic::Ordering::Relaxed).max(0) as u32;
+        let mut digits = [0u8; 10];
+        let mut nd = 0;
+        loop {
+            digits[nd] = b'0' + (pid % 10) as u8;
+            nd += 1;
+            pid /= 10;
+            if pid == 0 {
+                break;
+            }
+        }
+        for i in (0..nd).rev() {
+            put(&[digits[i]]);
+        }
+        put(b"\n");
+        unsafe { libc::write(2, buf.as_ptr().cast(), n) };
+        // Frame-pointer walk (Chromium and most distro binaries keep frame pointers): the
+        // return addresses name the callers, which is usually enough to identify the site.
+        let rsp = context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
+        let mut rbp = context.uc_mcontext.gregs[libc::REG_RBP as usize] as u64;
+        for _ in 0..14 {
+            if rbp % 8 != 0 || rbp < rsp || rbp > rsp + (1 << 22) {
+                break;
+            }
+            let ret = unsafe { *((rbp + 8) as *const u64) };
+            let next = unsafe { *(rbp as *const u64) };
+            let mut b2 = [0u8; 40];
+            let mut m = 0;
+            for &c in b"  ret=0x" {
+                b2[m] = c;
+                m += 1;
+            }
+            hex(ret, &mut h);
+            for &c in &h {
+                b2[m] = c;
+                m += 1;
+            }
+            b2[m] = b'\n';
+            m += 1;
+            unsafe { libc::write(2, b2.as_ptr().cast(), m) };
+            if next <= rbp {
+                break;
+            }
+            rbp = next;
+        }
+    }
     // On aarch64 there is no fast-path syscall-rewriting trampoline (unlike x86_64's patched
     // `syscall`->`call` rewrite): every guest `svc #0` is unpatched and always reaches the
     // kernel directly, so this SIGSYS handler is the ONLY guest-syscall interception point on
@@ -3861,6 +4357,24 @@ unsafe fn next_signal_handler(
         let next_sa = &NEXT_SA[signum.reinterpret_as_unsigned() as usize];
         match next_sa.sa_sigaction {
             libc::SIG_DFL => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // Name the fault site before dying: a host-side fault here is a litebox bug,
+                    // and the default disposition below otherwise reports only an abort.
+                    let mut buf = [0u8; 160];
+                    let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize];
+                    let sp = context.uc_mcontext.gregs[libc::REG_RSP as usize];
+                    let n = libc::snprintf(
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        c"litebox host fault: sig=%d ip=0x%llx sp=0x%llx addr=0x%llx\n".as_ptr(),
+                        signum,
+                        ip as libc::c_ulonglong,
+                        sp as libc::c_ulonglong,
+                        info.si_addr() as libc::c_ulonglong,
+                    );
+                    libc::write(2, buf.as_ptr().cast(), usize::try_from(n).unwrap_or(0));
+                }
                 // Block this signal and raise.
                 let mut set: libc::sigset_t = core::mem::zeroed();
                 libc::sigemptyset(&raw mut set);
@@ -4253,4 +4767,23 @@ mod tests {
             };
         }
     }
+}
+
+thread_local! {
+    static HOST_TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The calling thread's kernel tid, cached per thread (a fresh syscall on every lock acquisition
+/// would be far too costly). Cleared in a forked child by `set_process_guest_pid`.
+fn cached_host_tid() -> usize {
+    HOST_TID.with(|t| {
+        let cached = t.get();
+        if cached != 0 {
+            return cached;
+        }
+        // SAFETY: gettid takes no arguments and cannot fail.
+        let tid = (unsafe { libc::syscall(libc::SYS_gettid) }) as usize;
+        t.set(tid);
+        tid
+    })
 }

@@ -45,6 +45,7 @@
 use core::ffi::c_void;
 use std::ops::Range;
 
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
@@ -54,6 +55,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE, VirtualFreeEx,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetExitCodeThread, GetProcessId,
@@ -62,8 +64,6 @@ use windows_sys::Win32::System::Threading::{
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-use windows_sys::Win32::Foundation::FILETIME;
 
 /// Converts a `FILETIME` (100ns ticks since 1601-01-01) to a raw `u64`, matching how the two
 /// halves are meant to be combined (`dwLowDateTime`/`dwHighDateTime` per MSDN, not a native
@@ -93,8 +93,13 @@ fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_
         let mut exit = core::mem::zeroed::<FILETIME>();
         let mut kernel = core::mem::zeroed::<FILETIME>();
         let mut user = core::mem::zeroed::<FILETIME>();
-        let got_times =
-            GetProcessTimes(handle, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user) != 0;
+        let got_times = GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        ) != 0;
         let mut now = core::mem::zeroed::<FILETIME>();
         GetSystemTimeAsFileTime(&raw mut now);
         let now_ticks = filetime_to_u64(now);
@@ -120,7 +125,11 @@ fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_
              GetLastError={get_last_error} got_process_times={got_times} \
              elapsed_ms_since_CreateProcessW={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
              exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
-            if exit_code == STILL_ACTIVE { "STILL_ACTIVE" } else { "real_exit_code" },
+            if exit_code == STILL_ACTIVE {
+                "STILL_ACTIVE"
+            } else {
+                "real_exit_code"
+            },
             exit_code == STILL_ACTIVE
         );
     }
@@ -140,8 +149,13 @@ fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, ge
         let mut exit = core::mem::zeroed::<FILETIME>();
         let mut kernel = core::mem::zeroed::<FILETIME>();
         let mut user = core::mem::zeroed::<FILETIME>();
-        let got_times =
-            GetThreadTimes(handle, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user) != 0;
+        let got_times = GetThreadTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        ) != 0;
         let mut now = core::mem::zeroed::<FILETIME>();
         GetSystemTimeAsFileTime(&raw mut now);
         let now_ticks = filetime_to_u64(now);
@@ -167,7 +181,11 @@ fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, ge
              GetLastError={get_last_error} got_thread_times={got_times} \
              elapsed_ms_since_thread_start={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
              exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
-            if exit_code == STILL_ACTIVE { "STILL_ACTIVE" } else { "real_exit_code" },
+            if exit_code == STILL_ACTIVE {
+                "STILL_ACTIVE"
+            } else {
+                "real_exit_code"
+            },
             exit_code == STILL_ACTIVE
         );
     }
@@ -1125,7 +1143,8 @@ pub fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::
     // view, matching this module's own already-accepted "last exporter wins" semantics for the
     // common case instead of overriding it with a proxy that was wrong most of the time it fired.
     let diag = std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some();
-    let this_process_degraded = !WRITABLE_LAYER_IMPORT_OK.load(core::sync::atomic::Ordering::Relaxed);
+    let this_process_degraded =
+        !WRITABLE_LAYER_IMPORT_OK.load(core::sync::atomic::Ordering::Relaxed);
     if this_process_degraded
         && let Ok(existing) = std::fs::metadata(&shared)
         && let Ok(new) = std::fs::metadata(&written_to)
@@ -1553,8 +1572,7 @@ pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGp
     let task_addr_max = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
         { litebox::mm::linux::PAGE_SIZE },
     >>::TASK_ADDR_MAX;
-    if !litebox_common_linux::arch::is_valid_user_fs_base(g.fs_base) || g.fs_base >= task_addr_max
-    {
+    if !litebox_common_linux::arch::is_valid_user_fs_base(g.fs_base) || g.fs_base >= task_addr_max {
         crate::diag_raw_print(
             b"[fsbase-reject] deserialize_full_gprs: fs_base=0x",
             g.fs_base,
@@ -2247,8 +2265,16 @@ pub fn spawn_process_fork_child(
         if diag_copy_timing {
             eprintln!(
                 "[diag-fork-timing] (parent) {}group={:#x}..{:#x} len={:#x} succeeded={} took {:?}",
-                if *lazy { "reserve_group_lazy " } else { "copy_one_group " },
-                source_group.start, source_group.end, source_group.len(), result.succeeded, group_t0.elapsed()
+                if *lazy {
+                    "reserve_group_lazy "
+                } else {
+                    "copy_one_group "
+                },
+                source_group.start,
+                source_group.end,
+                source_group.len(),
+                result.succeeded,
+                group_t0.elapsed()
             );
         }
         if !result.succeeded {
@@ -3946,7 +3972,10 @@ fn build_child_environment_block(extra: &[(&str, String)]) -> Vec<u16> {
         // Skip anything we are about to override, so the child never sees a stale duplicate --
         // Windows resolves duplicates by first occurrence, so a leftover would win.
         let name_lossy = name.to_string_lossy();
-        if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case(&name_lossy)) {
+        if extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(&name_lossy))
+        {
             return;
         }
         block.extend(name.encode_wide_for_windows());
@@ -4316,10 +4345,9 @@ fn spawn_suspended_impl(
                 };
                 if update_ok != 0 {
                     startup_info_ex.StartupInfo = startup_info;
-                    startup_info_ex.StartupInfo.cb = u32::try_from(
-                        core::mem::size_of::<STARTUPINFOEXW>(),
-                    )
-                    .expect("STARTUPINFOEXW fits in u32");
+                    startup_info_ex.StartupInfo.cb =
+                        u32::try_from(core::mem::size_of::<STARTUPINFOEXW>())
+                            .expect("STARTUPINFOEXW fits in u32");
                     startup_info_ex.lpAttributeList = list_ptr;
                     creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
                 } else {
@@ -4339,13 +4367,12 @@ fn spawn_suspended_impl(
             }
         }
     }
-    let startup_info_ptr: *const STARTUPINFOW = if creation_flags & EXTENDED_STARTUPINFO_PRESENT
-        != 0
-    {
-        (&raw const startup_info_ex).cast::<STARTUPINFOW>()
-    } else {
-        &raw const startup_info
-    };
+    let startup_info_ptr: *const STARTUPINFOW =
+        if creation_flags & EXTENDED_STARTUPINFO_PRESENT != 0 {
+            (&raw const startup_info_ex).cast::<STARTUPINFOW>()
+        } else {
+            &raw const startup_info
+        };
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -4587,7 +4614,11 @@ fn copy_one_group(
             if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
                 eprintln!(
                     "[diag_alloc_vec] copy_one_group WriteProcessMemory FAILED child={:p} addr={:#x} len={:#x} written={} err={}",
-                    child, reserved as usize + (cursor - source_group.start), bytes.len(), written, err
+                    child,
+                    reserved as usize + (cursor - source_group.start),
+                    bytes.len(),
+                    written,
+                    err
                 );
             }
             return fail(err);
@@ -4642,7 +4673,12 @@ pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
         // comment for the full rationale and AGENTS_ARCHIVE_2026-09-22.md's 53rd-pass pickup.
         let wait_result = WaitForSingleObject(handle, INFINITE);
         let last_error = GetLastError();
-        diag_log_wait_evidence("wait_for_process_exit(blocking/INFINITE)", handle, wait_result, last_error);
+        diag_log_wait_evidence(
+            "wait_for_process_exit(blocking/INFINITE)",
+            handle,
+            wait_result,
+            last_error,
+        );
         let mut exit_code: u32 = 0;
         if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             eprintln!(
@@ -4743,7 +4779,12 @@ pub unsafe fn wait_for_thread_exit(handle: HANDLE) -> u32 {
     unsafe {
         let wait_result = WaitForSingleObject(handle, INFINITE);
         let last_error = GetLastError();
-        diag_log_thread_wait_evidence("wait_for_thread_exit(blocking/INFINITE)", handle, wait_result, last_error);
+        diag_log_thread_wait_evidence(
+            "wait_for_thread_exit(blocking/INFINITE)",
+            handle,
+            wait_result,
+            last_error,
+        );
         let mut exit_code: u32 = 0;
         if GetExitCodeThread(handle, &raw mut exit_code) == 0 {
             eprintln!(
@@ -5097,9 +5138,8 @@ pub fn run_external_fault_watchdog_child() -> ! {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-    let handle = unsafe {
-        windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid)
-    };
+    let handle =
+        unsafe { windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid) };
     if handle.is_null() {
         // The target has already exited (or never existed) by the time this watchdog got
         // scheduled -- nothing to watch. Not an error: a normal, fast-exiting run races this
@@ -5140,10 +5180,8 @@ pub fn run_external_fault_watchdog_child() -> ! {
     // period elapsing first, without racing it.
     const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(500);
     const EXTERNAL_GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(15);
-    let grace_ticks = u32::try_from(
-        EXTERNAL_GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis(),
-    )
-    .expect("grace period fits in a u32 tick count");
+    let grace_ticks = u32::try_from(EXTERNAL_GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis())
+        .expect("grace period fits in a u32 tick count");
     let mut stalled_ticks: u32 = 0;
     let mut cpu_time_at_stall_start: Option<u64> = None;
     let diag_enabled = std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some();
@@ -5210,7 +5248,9 @@ pub fn run_external_fault_watchdog_child() -> ! {
         // as a margin against ordinary scheduler/measurement noise.
         const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
         let made_progress = match (cpu_time_at_stall_start, cpu_now) {
-            (Some(before), Some(after)) => after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS,
+            (Some(before), Some(after)) => {
+                after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS
+            }
             _ => false,
         };
         if made_progress {

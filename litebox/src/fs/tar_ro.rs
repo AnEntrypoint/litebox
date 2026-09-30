@@ -155,16 +155,7 @@ pub enum MergedLiveEntryKind {
         /// Owning uid/gid.
         owner: UserInfo,
         /// Modification time, seconds since the Unix epoch, as recorded in the tar header.
-        mtime: u64,
-    },
-    /// A directory whose tar header carried a modification time. Programs compare a directory's
-    /// mtime against values they cached at image build time (fontconfig's `cache-N` files), so
-    /// the time must survive the merge.
-    Dir {
-        /// Owning uid/gid.
-        owner: UserInfo,
-        /// Modification time, seconds since the Unix epoch.
-        mtime: u64,
+        mtime: i64,
     },
     /// A symlink.
     Symlink {
@@ -172,6 +163,17 @@ pub enum MergedLiveEntryKind {
         target: String,
         /// Owning uid/gid.
         owner: UserInfo,
+    },
+    /// An explicit directory: one no file/symlink path implies, or one whose tar header carried
+    /// its own attributes. Programs compare a directory's mtime against values they cached at
+    /// image build time (fontconfig's `cache-N` files), so the time must survive the merge.
+    Dir {
+        /// Owning uid/gid.
+        owner: UserInfo,
+        /// Modification time, seconds since the Unix epoch.
+        mtime: i64,
+        /// POSIX permission bits.
+        mode: Mode,
     },
 }
 
@@ -209,17 +211,18 @@ pub fn encode_merged_live_entries(entries: &[MergedLiveEntry]) -> Vec<u8> {
                 out.extend_from_slice(&owner.group.to_le_bytes());
                 out.extend_from_slice(&mtime.to_le_bytes());
             }
-            MergedLiveEntryKind::Dir { owner, mtime } => {
-                out.push(2);
-                out.extend_from_slice(&owner.user.to_le_bytes());
-                out.extend_from_slice(&owner.group.to_le_bytes());
-                out.extend_from_slice(&mtime.to_le_bytes());
-            }
             MergedLiveEntryKind::Symlink { target, owner } => {
                 out.push(1);
                 write_len_prefixed_str(&mut out, target);
                 out.extend_from_slice(&owner.user.to_le_bytes());
                 out.extend_from_slice(&owner.group.to_le_bytes());
+            }
+            MergedLiveEntryKind::Dir { owner, mtime, mode } => {
+                out.push(2);
+                out.extend_from_slice(&owner.user.to_le_bytes());
+                out.extend_from_slice(&owner.group.to_le_bytes());
+                out.extend_from_slice(&mtime.to_le_bytes());
+                out.extend_from_slice(&mode.bits().to_le_bytes());
             }
         }
     }
@@ -279,20 +282,11 @@ pub fn decode_merged_live_entries(bytes: &[u8]) -> Option<Vec<MergedLiveEntry>> 
                 let mode = Mode::from_bits_truncate(read_u32(&mut pos)?);
                 let user = read_u16(&mut pos)?;
                 let group = read_u16(&mut pos)?;
-                let mtime = read_u64(&mut pos)?;
+                let mtime = read_u64(&mut pos)? as i64;
                 MergedLiveEntryKind::File {
                     layer_idx,
                     data_range: start..end,
                     mode,
-                    owner: UserInfo { user, group },
-                    mtime,
-                }
-            }
-            2 => {
-                let user = read_u16(&mut pos)?;
-                let group = read_u16(&mut pos)?;
-                let mtime = read_u64(&mut pos)?;
-                MergedLiveEntryKind::Dir {
                     owner: UserInfo { user, group },
                     mtime,
                 }
@@ -304,6 +298,17 @@ pub fn decode_merged_live_entries(bytes: &[u8]) -> Option<Vec<MergedLiveEntry>> 
                 MergedLiveEntryKind::Symlink {
                     target,
                     owner: UserInfo { user, group },
+                }
+            }
+            2 => {
+                let user = read_u16(&mut pos)?;
+                let group = read_u16(&mut pos)?;
+                let mtime = read_u64(&mut pos)? as i64;
+                let mode = Mode::from_bits_truncate(read_u32(&mut pos)?);
+                MergedLiveEntryKind::Dir {
+                    owner: UserInfo { user, group },
+                    mtime,
+                    mode,
                 }
             }
             _ => return None,
@@ -362,7 +367,7 @@ impl super::backend::Backend for TarRo {
             walked_components.push(super::backend::WalkedComponent {
                 permissions: super::backend::PermissionCheck::ByResolver(
                     super::backend::PermissionInfo {
-                        mode: DEFAULT_DIR_MODE,
+                        mode: child.mode.unwrap_or(DEFAULT_DIR_MODE),
                         owner: child.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
                     },
                 ),
@@ -506,15 +511,19 @@ impl super::backend::Backend for TarRo {
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let file = &self.tar_index.files[h.get_typed::<Self>().idx];
         Ok(super::FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: file.mode,
             size: file.data_range.len(),
             owner: file.owner,
             node_info: file.node_info.clone(),
             blksize: BLOCK_SIZE,
-            atime: Timestamp::default(),
+            atime: Timestamp {
+                sec: file.mtime,
+                nsec: 0,
+            },
             mtime: Timestamp {
-                sec: i64::try_from(file.mtime).unwrap_or(0),
+                sec: file.mtime,
                 nsec: 0,
             },
         })
@@ -526,17 +535,21 @@ impl super::backend::Backend for TarRo {
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
         Ok(super::FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
-            mode: DEFAULT_DIR_MODE,
+            mode: dir.mode.unwrap_or(DEFAULT_DIR_MODE),
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
             node_info: dir.node_info.clone(),
             blksize: BLOCK_SIZE,
-            atime: Timestamp::default(),
-            mtime: dir.mtime.map_or_else(Timestamp::default, |sec| Timestamp {
-                sec: i64::try_from(sec).unwrap_or(0),
+            atime: Timestamp {
+                sec: dir.mtime,
                 nsec: 0,
-            }),
+            },
+            mtime: Timestamp {
+                sec: dir.mtime,
+                nsec: 0,
+            },
         })
     }
 
@@ -641,14 +654,19 @@ struct IndexedFile {
     mode: Mode,
     owner: UserInfo,
     node_info: NodeInfo,
-    mtime: u64,
+    /// Modification time (seconds since the epoch) from the tar header; 0 when the index was
+    /// rebuilt from merged live entries, which do not carry it.
+    mtime: i64,
 }
 
 struct IndexedDir {
     owner: Option<UserInfo>,
+    /// Modification time from the directory's own tar entry; 0 for implied directories.
+    mtime: i64,
+    /// Permission bits from the directory's own tar entry; `None` for implied directories.
+    mode: Option<Mode>,
     node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
-    mtime: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -676,6 +694,13 @@ struct TarIndex {
 /// entries an earlier layer contributed (and nothing from a still-later layer that re-created
 /// the same path).
 enum RawEntry {
+    /// An explicit directory entry (`DIRTYPE`), kept so empty directories exist.
+    Dir {
+        path: String,
+        owner: UserInfo,
+        mtime: i64,
+        mode: Mode,
+    },
     File {
         path: String,
         file_idx: usize,
@@ -687,12 +712,14 @@ enum RawEntry {
     /// `.wh.<name>`: delete the single sibling entry `<name>` (file, symlink, or whole directory
     /// subtree) contributed by any earlier layer. Never removes an entry a later layer in the
     /// same merge re-creates, since whiteouts are applied strictly in bottom-to-top layer order.
-    Whiteout { path: String },
-    /// A directory header, kept only for its modification time.
-    Dir { path: String, mtime: u64 },
+    Whiteout {
+        path: String,
+    },
     /// `.wh..wh..opq`: clear every entry earlier layers contributed under this entry's own
     /// parent directory (but not the directory itself), per the OCI opaque-whiteout spec.
-    OpaqueWhiteout { parent: String },
+    OpaqueWhiteout {
+        parent: String,
+    },
     /// A POSIX hard link (`tar_no_std::TypeFlag::LINK`): `path` aliases whatever `link_target`
     /// resolves to once every layer is folded. Must be indexed (busybox's official image ships
     /// `bin/busybox` itself as a hard link) and must stay deferred -- see gm mutable
@@ -800,9 +827,7 @@ impl TarIndex {
             // flag, so `.wh.<name>` / `.wh..wh..opq` must be detected by basename -- see gm
             // mutable fs-tarro-whiteout-basename.
             {
-                let (parent, basename) = path
-                    .rsplit_once('/')
-                    .unwrap_or(("", path.as_str()));
+                let (parent, basename) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
                 if basename == ".wh..wh..opq" {
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
                     block_index += payload_blocks;
@@ -849,7 +874,7 @@ impl TarIndex {
                             .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
-                        mtime: header_mtime_seconds(header),
+                        mtime: tar_mtime_seconds(header),
                     });
                     raw_entries.push(RawEntry::File { path, file_idx });
                 }
@@ -879,12 +904,17 @@ impl TarIndex {
                     block_index += payload_blocks;
                     raw_entries.push(RawEntry::Dir {
                         path: path.trim_end_matches('/').into(),
-                        mtime: header_mtime_seconds(header),
+                        owner: owner_from_posix_header(header),
+                        mtime: tar_mtime_seconds(header),
+                        mode: header
+                            .mode
+                            .to_flags()
+                            .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                     });
                 }
                 _ => {
-                    // Directories are implied by file/symlink paths below; device nodes and FIFOs
-                    // are not needed for the base-image use case this backend supports.
+                    // Device nodes and FIFOs are not needed for the base-image use case this
+                    // backend supports.
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
                     block_index += payload_blocks;
                 }
@@ -927,35 +957,41 @@ impl TarIndex {
         // Hard links resolve against `live` only once every layer is folded -- see gm mutable
         // fs-tarro-hardlink-busybox.
         let mut deferred_hardlinks: Vec<(String, String)> = Vec::new();
-        let mut dir_mtimes: alloc::collections::BTreeMap<String, u64> =
-            alloc::collections::BTreeMap::new();
 
         for raw_entry in raw_entries {
             match raw_entry {
+                RawEntry::Dir {
+                    path,
+                    owner,
+                    mtime,
+                    mode,
+                } => {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    // Only this node is replaced: earlier layers' children stay.
+                    if !matches!(live.get(path.as_str()), Some(RawLiveEntry::Dir(..))) {
+                        live.remove(path.as_str());
+                    }
+                    live.insert(path, RawLiveEntry::Dir(owner, mtime, mode));
+                }
                 RawEntry::File { path, file_idx } => {
                     remove_path_and_descendants(&mut live, &path);
-                    drop_dir_mtimes(&mut dir_mtimes, &path, true);
                     live.insert(path, RawLiveEntry::File(file_idx));
                 }
                 RawEntry::Symlink { path, symlink_idx } => {
                     remove_path_and_descendants(&mut live, &path);
-                    drop_dir_mtimes(&mut dir_mtimes, &path, true);
                     live.insert(path, RawLiveEntry::Symlink(symlink_idx));
                 }
                 RawEntry::Whiteout { path } => {
                     remove_path_and_descendants(&mut live, &path);
-                    drop_dir_mtimes(&mut dir_mtimes, &path, true);
                 }
                 RawEntry::OpaqueWhiteout { parent } => {
                     remove_descendants_of(&mut live, &parent);
-                    drop_dir_mtimes(&mut dir_mtimes, &parent, false);
                 }
                 RawEntry::HardLink { path, link_target } => {
                     remove_path_and_descendants(&mut live, &path);
                     deferred_hardlinks.push((path, link_target));
-                }
-                RawEntry::Dir { path, mtime } => {
-                    dir_mtimes.insert(path, mtime);
                 }
             }
         }
@@ -969,14 +1005,31 @@ impl TarIndex {
 
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
+            mtime: 0,
+            mode: None,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
-            mtime: None,
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
 
         for (path, entry) in live {
             match entry {
+                RawLiveEntry::Dir(owner, mtime, mode) => {
+                    let mut probe = path.clone();
+                    probe.push_str("/x");
+                    ensure_ancestors(
+                        &mut dirs,
+                        &mut dirs_by_path,
+                        &probe,
+                        owner,
+                        &inode_allocator,
+                    );
+                    if let Some(&idx) = dirs_by_path.get(path.as_str()) {
+                        dirs[idx].owner = Some(owner);
+                        dirs[idx].mtime = mtime;
+                        dirs[idx].mode = Some(mode);
+                    }
+                }
                 RawLiveEntry::File(file_idx) => {
                     let owner = files[file_idx].owner;
                     let (parent_dir_idx, name) = ensure_ancestors(
@@ -1003,12 +1056,6 @@ impl TarIndex {
                         .children
                         .insert(name, IndexedChild::Symlink(symlink_idx));
                 }
-            }
-        }
-
-        for (path, mtime) in &dir_mtimes {
-            if let Some(&idx) = dirs_by_path.get(path) {
-                dirs[idx].mtime = Some(*mtime);
             }
         }
 
@@ -1061,12 +1108,13 @@ impl TarIndex {
                     });
                 }
                 IndexedChild::Dir(idx) => {
-                    if let Some(mtime) = self.dirs[idx].mtime {
+                    if self.dirs[idx].children.is_empty() || self.dirs[idx].mode.is_some() {
                         out.push(MergedLiveEntry {
                             path: path.clone(),
                             kind: MergedLiveEntryKind::Dir {
                                 owner: self.dirs[idx].owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                                mtime,
+                                mtime: self.dirs[idx].mtime,
+                                mode: self.dirs[idx].mode.unwrap_or(DEFAULT_DIR_MODE),
                             },
                         });
                     }
@@ -1089,9 +1137,10 @@ impl TarIndex {
         let mut symlinks = Vec::new();
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
+            mtime: 0,
+            mode: None,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
-            mtime: None,
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
         // `entries` comes from `walk_live_entries`'s depth-first walk, which visits every entry
@@ -1161,16 +1210,22 @@ impl TarIndex {
                         .children
                         .insert(name.into(), IndexedChild::File(file_idx));
                 }
-                MergedLiveEntryKind::Dir { owner, mtime } => {
-                    let probe = alloc::format!("{}/.", entry.path);
-                    let (idx, _name) = ensure_ancestors(
+                MergedLiveEntryKind::Dir { owner, mtime, mode } => {
+                    let mut probe = entry.path.clone();
+                    probe.push_str("/x");
+                    ensure_ancestors(
                         &mut dirs,
                         &mut dirs_by_path,
                         &probe,
                         owner,
                         &inode_allocator,
                     );
-                    dirs[idx].mtime = Some(mtime);
+                    if let Some(&idx) = dirs_by_path.get(entry.path.as_str()) {
+                        dirs[idx].owner = Some(owner);
+                        dirs[idx].mtime = mtime;
+                        dirs[idx].mode = Some(mode);
+                    }
+                    last_parent = None;
                 }
                 MergedLiveEntryKind::Symlink { target, owner } => {
                     let symlink_idx = symlinks.len();
@@ -1215,6 +1270,7 @@ impl TarIndex {
 /// fold, exactly as the pre-multi-layer single-tar builder already worked.
 #[derive(Clone, Copy)]
 enum RawLiveEntry {
+    Dir(UserInfo, i64, Mode),
     File(usize),
     Symlink(usize),
 }
@@ -1224,7 +1280,10 @@ enum RawLiveEntry {
 /// whiteout (`.wh.<name>`, which may target a whole directory subtree in an earlier layer) and
 /// before inserting a fresh file/symlink at `path` (a later layer's file may replace what was
 /// previously a directory at the same path, or vice versa).
-fn remove_path_and_descendants(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, path: &str) {
+fn remove_path_and_descendants(
+    live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>,
+    path: &str,
+) {
     live.remove(path);
     remove_descendants_of(live, path);
 }
@@ -1232,7 +1291,10 @@ fn remove_path_and_descendants(live: &mut alloc::collections::BTreeMap<String, R
 /// Remove every currently-live entry nested strictly under `parent` (not `parent` itself). Used
 /// by opaque-whiteout handling, and as the subtree-removal half of
 /// [`remove_path_and_descendants`].
-fn remove_descendants_of(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, parent: &str) {
+fn remove_descendants_of(
+    live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>,
+    parent: &str,
+) {
     if parent.is_empty() {
         // An empty parent means "everything" would match `starts_with("")` unconditionally --
         // only reachable via a root-level opaque whiteout, which legitimately does mean "clear
@@ -1289,31 +1351,6 @@ fn parse_pax_path(payload: &str) -> Option<&str> {
     None
 }
 
-/// Forget the directory modification times recorded at or below `path` (`include_self` keeps or
-/// drops `path` itself), mirroring what `remove_path_and_descendants` does to the live map.
-fn drop_dir_mtimes(
-    dir_mtimes: &mut alloc::collections::BTreeMap<String, u64>,
-    path: &str,
-    include_self: bool,
-) {
-    let prefix = alloc::format!("{path}/");
-    dir_mtimes.retain(|key, _| {
-        !(key.starts_with(&prefix) || (include_self && key.as_str() == path))
-    });
-}
-
-/// The header's `mtime` in seconds. `tar_no_std` reports the octal digits of this field read as
-/// a decimal number (the ASCII `15255011723` stands for octal 15255011723 = 1790186451), so the
-/// digits are re-read as octal here.
-fn header_mtime_seconds(header: &tar_no_std::PosixHeader) -> u64 {
-    header
-        .mtime
-        .as_number::<u64>()
-        .ok()
-        .and_then(|digits| u64::from_str_radix(&alloc::format!("{digits}"), 8).ok())
-        .unwrap_or(0)
-}
-
 /// Strip the `./` prefix from tar filenames if present.
 ///
 /// This is helpful for tar files that have been created via `tar cvf foo.tar .`
@@ -1350,9 +1387,10 @@ fn ensure_ancestors(
         let child_dir_idx = *dirs_by_path.entry(parent.clone()).or_insert_with(|| {
             dirs.push(IndexedDir {
                 owner: Some(owner),
+                mtime: 0,
+                mode: None,
                 node_info: inode_allocator.next(),
                 children: HashMap::new(),
-                mtime: None,
             });
             dirs.len() - 1
         });
@@ -1387,6 +1425,18 @@ fn mode_of_modeflags(perms: tar_no_std::ModeFlags) -> Mode {
     mode.set(Mode::WOTH, perms.contains(ModeFlags::OthersWrite));
     mode.set(Mode::XOTH, perms.contains(ModeFlags::OthersExec));
     mode
+}
+
+/// The header's modification time in seconds. `tar_no_std` declares this field decimal, but ustar
+/// stores every numeric field in octal, so it is parsed here from the raw field text.
+fn tar_mtime_seconds(header: &tar_no_std::PosixHeader) -> i64 {
+    header
+        .mtime
+        .as_inner()
+        .as_str_until_first_space()
+        .ok()
+        .and_then(|t| i64::from_str_radix(t.trim_matches('\0'), 8).ok())
+        .unwrap_or(0)
 }
 
 fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {

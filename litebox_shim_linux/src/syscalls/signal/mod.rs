@@ -23,9 +23,9 @@ use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use litebox::platform::{Instant as _, TimerHandle as _};
 #[cfg(target_arch = "x86_64")]
 use litebox::utils::TruncateExt as _;
-use litebox::platform::{Instant as _, TimerHandle as _};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
@@ -299,6 +299,12 @@ impl PendingSignals {
     /// poll of a registered signalfd).
     pub(crate) fn pending_matching(&self, mask: SigSet) -> bool {
         !(self.pending & mask).is_empty()
+    }
+
+    /// Drops every queued instance of `signal` and clears its pending bit.
+    pub(crate) fn discard(&mut self, signal: Signal) {
+        self.queue.retain(|info| info.signo != signal.as_i32());
+        self.pending.remove(signal);
     }
 
     pub(crate) fn remove(&mut self, signal: Signal) -> Siginfo {
@@ -753,7 +759,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(mask_ptr) = mask_ptr else {
             return Err(Errno::EFAULT);
         };
-        let mask = mask_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let mask = mask_ptr
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
 
         let old_mask = self.signals.borrow().blocked.get();
         self.signals.borrow().set_signal_mask(mask);
@@ -778,6 +786,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 unreachable!("sigsuspend sleep has no deadline")
             }
         }
+    }
+
+    /// `rt_sigtimedwait(2)`: synchronously consumes one pending signal from `set`. The signals in
+    /// `set` are normally blocked, so a blocked wake-up is not delivered as an interrupt; the wait
+    /// therefore re-checks the queues in short slices until the timeout.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<Siginfo>>,
+        timeout: Option<UserPtr<litebox_common_linux::Timespec>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let set = set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let deadline = match timeout {
+            None => None,
+            Some(t) => {
+                let ts = t.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                Some(core::time::Duration::try_from(ts)?)
+            }
+        };
+        let slice = core::time::Duration::from_millis(2);
+        let mut waited = core::time::Duration::ZERO;
+        loop {
+            let taken = {
+                let thread = self.signals.borrow();
+                let mut own = thread.pending.borrow_mut();
+                if let Some(sig) = own.next_matching(set) {
+                    Some((sig, own.remove(sig)))
+                } else {
+                    let mut shared = thread.shared_pending.lock();
+                    shared
+                        .next_matching(set)
+                        .map(|sig| (sig, shared.remove(sig)))
+                }
+            };
+            if let Some((sig, siginfo)) = taken {
+                if let Some(info) = info {
+                    info.write_at_offset::<Platform>(0, siginfo)
+                        .ok_or(Errno::EFAULT)?;
+                }
+                return Ok(usize::try_from(sig.as_i32()).unwrap());
+            }
+            if self.has_pending_signals() {
+                return Err(Errno::EINTR);
+            }
+            let step = match deadline {
+                Some(d) if waited >= d => return Err(Errno::EAGAIN),
+                Some(d) => slice.min(d - waited),
+                None => slice,
+            };
+            let _ = self.wait_cx().with_timeout(step).sleep();
+            waited += step;
+        }
+    }
+
+    /// `rt_tgsigqueueinfo(2)`/`rt_sigqueueinfo(2)`: delivered as a plain `tgkill`/`kill`; the
+    /// caller-supplied `siginfo` payload (`si_value`) is not carried through.
+    pub(crate) fn sys_rt_tgsigqueueinfo(
+        &self,
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    ) -> Result<usize, Errno> {
+        self.do_kill(Some(tgid), Some(tid), sig)
+    }
+
+    pub(crate) fn sys_rt_sigqueueinfo(&self, pid: i32, sig: i32) -> Result<usize, Errno> {
+        self.do_kill(Some(pid), None, sig)
     }
 
     pub(crate) fn sys_sigaltstack(
@@ -912,7 +991,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `None` here means "this is the null probe": skip actually enqueuing/delivering a signal
         // to any target below, while still running every existence/reachability check exactly as
         // for a real signal.
-        let signal = (signal != 0).then(|| Signal::try_from(signal)).transpose()?;
+        let signal = (signal != 0)
+            .then(|| Signal::try_from(signal))
+            .transpose()?;
         // A `tkill`/`tgkill` targeting a DIFFERENT thread of THIS SAME process (the overwhelmingly
         // common real-world case: glibc/musl's NPTL uses exactly this to signal one specific
         // sibling thread for internal cross-thread synchronization handshakes, e.g. dlopen's
@@ -941,6 +1022,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // signal at all.
         if let Some(target_tid) = tid
             && target_tid != self.tid.get()
+            && !self.process().has_thread(target_tid)
+            && let Some(remote) = self
+                .global
+                .process_registry
+                .lock()
+                .get(&target_tid)
+                .cloned()
+        {
+            // A thread of ANOTHER process in this native-`fork()` family (only its main thread's
+            // tid is known here, which is its pid).
+            if let Some(signal) = signal {
+                remote
+                    .shared_pending
+                    .lock()
+                    .push(&remote.limits, signal, siginfo_kill(signal));
+                remote.interrupt_all_threads();
+            }
+            return Ok(0);
+        }
+        if let Some(target_tid) = tid
+            && target_tid != self.tid.get()
         {
             // Push the signal into `shared_pending` BEFORE checking whether the target thread is
             // still live: a thread that exits between this check and the push could otherwise
@@ -953,10 +1055,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if let Some(signal) = signal
                 && !self.is_signal_ignored(signal)
             {
-                self.signals.borrow()
-                    .shared_pending
-                    .lock()
-                    .push(&self.process().limits, signal, siginfo_kill(signal));
+                self.signals.borrow().shared_pending.lock().push(
+                    &self.process().limits,
+                    signal,
+                    siginfo_kill(signal),
+                );
             }
             return if self.process().interrupt_thread(target_tid) {
                 Ok(0)
@@ -1007,21 +1110,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 p if p < 0 => p.checked_neg(),
                 _ => None,
             });
+        if pid == Some(-1) && tid.is_none() {
+            let me = self.process();
+            let all: alloc::vec::Vec<_> = self
+                .global
+                .process_registry
+                .lock()
+                .iter()
+                .filter(|(p, q)| **p > 1 && !Arc::ptr_eq(q, &me))
+                .map(|(_, q)| q.clone())
+                .collect();
+            for p in &all {
+                deliver_to_child(p);
+                delivered = true;
+            }
+        }
         if let Some(group) = target_group {
-            // The registry reaches every registered process in the group (or, for `-1`, every
-            // process but init and the caller), wherever it runs; `children_in_group` covers any
-            // local child the registry could not hold.
             let reached = if pid == Some(-1) {
                 self.xproc_send_many(signal, |v| v.pid != 1)
             } else {
                 self.xproc_send_many(signal, |v| v.pgid == group)
             };
             delivered |= !reached.is_empty();
-            for (child_pid, child) in &self.process().children_in_group(group) {
+            let local_children = self.process().children_in_group(group);
+            for (child_pid, child) in &local_children {
                 if !reached.contains(child_pid) {
                     deliver_to_child(child);
                     delivered = true;
                 }
+            }
+            let me = self.process();
+            let registered: alloc::vec::Vec<_> = self
+                .global
+                .process_registry
+                .lock()
+                .iter()
+                .filter(|(p, q)| {
+                    !reached.contains(p)
+                        && !Arc::ptr_eq(q, &me)
+                        && q.pgid.load(core::sync::atomic::Ordering::Relaxed) == group
+                        && !local_children.iter().any(|(_, c)| Arc::ptr_eq(c, q))
+                })
+                .map(|(_, q)| q.clone())
+                .collect();
+            for q in &registered {
+                deliver_to_child(q);
+                delivered = true;
             }
             // A group op targeting neither self's own group nor any reachable child's group has
             // literally nothing this shim can deliver to -- ESRCH, matching real Linux's
@@ -1041,7 +1175,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if self.xproc_send(pid, signal).is_ok() {
                 return Ok(0);
             }
-            if let Some(child) = self.process().find_child(pid) {
+            if let Some(child) = self.lookup_process(pid) {
                 deliver_to_child(&child);
                 return Ok(0);
             }
@@ -1053,13 +1187,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
         self.xproc_drain_own();
-        let blocked = self.signals.borrow().blocked.get();
-        let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
-        if !thread_pending.is_empty() {
-            return true;
+        loop {
+            let blocked = self.signals.borrow().blocked.get();
+            let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
+            let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
+            let Some(signal) = (thread_pending | shared_pending).lowest_set() else {
+                return false;
+            };
+            if !self.is_signal_ignored(signal) {
+                return true;
+            }
+            if thread_pending.contains(signal) {
+                self.signals.borrow().pending.borrow_mut().discard(signal);
+            }
+            if shared_pending.contains(signal) {
+                self.signals.borrow().shared_pending.lock().discard(signal);
+            }
         }
-        let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
-        !shared_pending.is_empty()
     }
 
     /// Returns the set of all pending (deliverable) signals.
@@ -1074,9 +1218,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         #[cfg(target_arch = "x86_64")]
-            // Debug, not warn: `process_signals` is the GENERAL signal path, not DRM-specific --
-            // the `drm-diag` prefix is leftover from a DRM investigation. It runs 32 times per
-            // exec, emitting 128 warn-level lines per exec on a completely normal run.
+        // Debug, not warn: `process_signals` is the GENERAL signal path, not DRM-specific --
+        // the `drm-diag` prefix is leftover from a DRM investigation. It runs 32 times per
+        // exec, emitting 128 warn-level lines per exec on a completely normal run.
         litebox_util_log::debug!(
             tid:% = self.tid.get(), rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
             "drm-diag: process_signals entry with ctx"
@@ -1197,7 +1341,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: process_signals returning normally");
     }
 
-
     /// Check whether the process-wide alarm deadline has passed and, if so,
     /// enqueue `SIGALRM`.
     ///
@@ -1280,7 +1423,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.is_signal_ignored(signal) {
             return;
         }
-        self.signals.borrow()
+        self.signals
+            .borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
@@ -1291,7 +1435,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.is_signal_ignored(signal) {
             return;
         }
-        self.signals.borrow()
+        self.signals
+            .borrow()
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
@@ -1320,7 +1465,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
         ));
 
-        self.signals.borrow()
+        self.signals
+            .borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);

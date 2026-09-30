@@ -204,6 +204,10 @@ pub fn sys_mprotect<
         }
         permissions
     };
+    // Linux rounds the length up to a whole page (Chromium protects a `0x101a`-byte region).
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
     unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }
         .map_err(Errno::from)
 }

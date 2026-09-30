@@ -69,6 +69,22 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
+    /// The variant's name, for diagnostics.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Eventfd(_) => "eventfd",
+            Self::Epoll(_) => "epoll",
+            Self::File(_) => "file",
+            Self::Socket(_) => "socket",
+            Self::Pipe(_) => "pipe",
+            Self::Unix(_) => "unix",
+            Self::Pty(_) => "pty",
+            Self::Signalfd(_) => "signalfd",
+            Self::Timerfd(_) => "timerfd",
+            Self::Netlink(_) => "netlink",
+        }
+    }
+
     pub fn try_from(files: &FilesState<Platform, FS>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
@@ -354,7 +370,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // never again, leaving the guest's on-screen framebuffer permanently stuck). Folding
             // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
-            let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
+            let has_bounded_repoll_interest =
+                self.has_unready_stdin_or_armed_timerfd_interest(global);
             // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
             // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
             // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
@@ -421,7 +438,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// its read side, and the cost of an unnecessary 15ms-interval re-check for an ordinary
     /// same-process Unix socket (which still gets its real wake immediately; this only adds an
     /// upper bound) is the same accepted tradeoff already established for timerfd/stdin.
-    fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalStateHandle<Platform, FS>) -> bool {
+    fn has_unready_stdin_or_armed_timerfd_interest(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> bool {
         self.interests.lock().values().any(|entry| {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 return false;
@@ -541,9 +561,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: Option<EpollEvent>,
+        pid: i32,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap(), pid),
             EpollOp::EpollCtlMod => self.mod_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
@@ -555,12 +576,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
     }
 
+    /// Re-targets interests that another process registered (this epoll set was inherited across
+    /// `fork()`) at this process's own descriptor for the same fd number, once the registering
+    /// process's descriptor is gone. Real epoll ties an interest to the open file description,
+    /// which the inheriting process still holds; here it is tied to a descriptor handle, so the
+    /// handle has to be looked up again.
+    pub(crate) fn rebind_inherited(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        files: &FilesState<Platform, FS>,
+        pid: i32,
+    ) {
+        let stale: alloc::vec::Vec<(u32, usize)> = {
+            let interests = self.interests.lock();
+            interests
+                .iter()
+                .filter(|(_, entry)| entry.owner_pid != pid && entry.desc.upgrade().is_none())
+                .map(|(key, _)| (key.0, key.1))
+                .collect()
+        };
+        for (fd, ptr) in stale {
+            let Ok(file) = EpollDescriptor::try_from(files, fd as usize) else {
+                continue;
+            };
+            let mut interests = self.interests.lock();
+            let Some(old) = interests.remove(&EpollEntryKey(fd, ptr)) else {
+                continue;
+            };
+            let (mask, flags, data) = {
+                let inner = old.inner.lock();
+                (
+                    inner.mask,
+                    EpollFlags::from_bits_truncate(inner.flags.bits()),
+                    inner.data,
+                )
+            };
+            let entry = EpollEntry::new(
+                DescriptorRef::from(&file),
+                mask,
+                flags,
+                data,
+                self.ready.clone(),
+                pid,
+            );
+            if let Some(events) = file.poll(global, mask, Some(entry.weak_self.clone() as _)) {
+                if !events.is_empty() {
+                    self.ready.push(&entry);
+                }
+                interests.insert(EpollEntryKey::new(fd, &file), entry);
+            }
+        }
+    }
+
     fn add_interest(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
+        pid: i32,
     ) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
@@ -590,6 +664,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             flags,
             event.data,
             self.ready.clone(),
+            pid,
         );
         let events = file
             .poll(global, mask, Some(entry.weak_self.clone() as _))
@@ -745,6 +820,10 @@ struct EpollEntry<Platform: ShimPlatform, FS: ShimFS> {
     is_ready: AtomicBool,
     is_enabled: AtomicBool,
     weak_self: Weak<Self>,
+    /// The guest pid that registered this interest. An interest registered by another process
+    /// (the epoll set was inherited across `fork()`) names that process's descriptor, which dies
+    /// when it exits even though the open file description lives on in this process.
+    owner_pid: i32,
 }
 
 struct EpollEntryInner {
@@ -760,8 +839,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         flags: EpollFlags,
         data: u64,
         ready: Arc<ReadySet<Platform, FS>>,
+        owner_pid: i32,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
+            owner_pid,
             desc,
             inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
             ready,
@@ -990,9 +1071,17 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 // above. `Self::wait` detects a stdin fd up front (via `has_stdin_fd`) and falls
                 // back to bounded periodic re-polling for the whole set whenever one is present,
                 // rather than relying on an observer this arm can never actually register.
-                poll_descriptor
+                let polled = poll_descriptor
                     .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    .unwrap_or(Events::NVAL);
+                litebox_util_log::trace!(
+                    fd:% = entry.fd,
+                    kind:% = poll_descriptor.kind(),
+                    mask:? = entry.mask.bits(),
+                    revents:? = polled.bits();
+                    "poll scan"
+                );
+                polled
             } else {
                 Events::NVAL
             };
@@ -1077,17 +1166,17 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                             || matches!(&desc, EpollDescriptor::Socket(_))
                             || matches!(&desc, EpollDescriptor::Pty(pty) if pty_needs_repoll(global, pty))
                             || matches!(&desc, EpollDescriptor::File(file)
-                        if global.litebox.descriptor_table().with_metadata(
-                            file,
-                            |_: &crate::syscalls::file::EvdevFd| (),
-                        ).is_ok()
-                        || matches!(
-                            global.litebox.descriptor_table().with_metadata(
+                            if global.litebox.descriptor_table().with_metadata(
                                 file,
-                                |stream: &litebox::platform::StdioStream| *stream,
-                            ),
-                            Ok(litebox::platform::StdioStream::Stdin)
-                        ))
+                                |_: &crate::syscalls::file::EvdevFd| (),
+                            ).is_ok()
+                            || matches!(
+                                global.litebox.descriptor_table().with_metadata(
+                                    file,
+                                    |stream: &litebox::platform::StdioStream| *stream,
+                                ),
+                                Ok(litebox::platform::StdioStream::Stdin)
+                            ))
                     })
         });
         let mut register = true;
@@ -1198,6 +1287,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1284,6 +1374,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1301,6 +1392,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1465,6 +1557,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1482,6 +1575,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1651,6 +1745,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1666,6 +1761,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1760,7 +1856,12 @@ mod test {
                         .litebox
                         .descriptor_table()
                         .with_entry(&writer_typed, |entry| {
-                            entry.sendto(&task, b"x", litebox_common_linux::SendFlags::empty(), None)
+                            entry.sendto(
+                                &task,
+                                b"x",
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                            )
                         })
                         .unwrap();
                 }
@@ -1796,6 +1897,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 

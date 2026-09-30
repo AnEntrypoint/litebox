@@ -71,11 +71,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();
 
-        let user_info = &self.credentials;
-        aux.insert(AuxKey::AT_UID, user_info.uid() as usize);
-        aux.insert(AuxKey::AT_EUID, user_info.euid() as usize);
-        aux.insert(AuxKey::AT_GID, user_info.gid() as usize);
-        aux.insert(AuxKey::AT_EGID, user_info.egid() as usize);
+        let user_info = self.creds();
+        aux.insert(AuxKey::AT_UID, user_info.uid as usize);
+        aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
+        aux.insert(AuxKey::AT_GID, user_info.gid as usize);
+        aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
         // Always 0: this shim has no setuid/setgid execution to make a program "secure" in the
         // kernel's sense. Leaving the entry out entirely is not equivalent -- glibc's
         // `getauxval(AT_SECURE)` reports a missing entry as `ENOENT`, and GLib treats that as

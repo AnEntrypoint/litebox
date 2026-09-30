@@ -486,11 +486,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
     ) -> Option<UnixConnectedStream<Platform, FS>> {
         let key = self.addr.to_key();
         let (kind, key_bytes) = presence_kind_and_bytes(&key);
-        let (request_idx, client_cred) = global.unix_shared_connect_queue.try_claim(kind, key_bytes)?;
-        let Some(slot) = global
-            .unix_shared_conn_table
-            .alloc(global.litebox.platform(), &client_cred, &self.listener_cred)
-        else {
+        let (request_idx, client_cred) = global
+            .unix_shared_connect_queue
+            .try_claim(kind, key_bytes)?;
+        let Some(slot) = global.unix_shared_conn_table.alloc(
+            global.litebox.platform(),
+            &client_cred,
+            &self.listener_cred,
+        ) else {
             // Pool exhausted -- leave this request CLAIMED-but-never-completed; the client's own
             // bounded poll loop eventually times out and retries with a fresh `post()`. Bounded,
             // self-healing, never a panic.
@@ -527,7 +530,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
         } else if !state.is_shutdown {
             let key = self.addr.to_key();
             let (kind, key_bytes) = presence_kind_and_bytes(&key);
-            if global.unix_shared_connect_queue.has_pending(kind, key_bytes) {
+            if global
+                .unix_shared_connect_queue
+                .has_pending(kind, key_bytes)
+            {
                 events |= Events::IN;
             }
         }
@@ -981,12 +987,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         &self,
         buf: &mut [u8],
         self_read_shutdown: bool,
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         if self_read_shutdown {
             return Err(TryOpError::Other(Errno::ESHUTDOWN));
         }
         let (read_ring, _) = self.rings();
-        let got = if self.slot_ref().framed.load(Ordering::Acquire) {
+        let framed = self.slot_ref().framed.load(Ordering::Acquire);
+        if peek {
+            let peeked = if framed {
+                read_ring.try_peek_record(buf)
+            } else {
+                Some(read_ring.try_peek(buf)).filter(|&n| n > 0)
+            };
+            if let Some(n) = peeked {
+                return Ok((n, Vec::new()));
+            }
+            if self.peer_gone() && read_ring.is_empty() {
+                return Err(TryOpError::Other(Errno::ESHUTDOWN));
+            }
+            return Err(TryOpError::TryAgain);
+        }
+        let got = if framed {
             read_ring.try_read_record_with_fds(buf)
         } else {
             let (n, specs) = read_ring.try_read_with_fds(buf);
@@ -1058,6 +1080,10 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
     /// Real credentials (pid/uid/gid) of the *peer* task, as of connection
     /// establishment -- what `getsockopt(SO_PEERCRED)` reports to this side.
     peer_cred: Ucred,
+    /// Latest sender in the direction this side writes / reads (pid, uid, gid; pid 0 = unset),
+    /// shared with the peer's opposite fields -- see `SharedConnSlot::last_writer_c2s`.
+    send_cred: Arc<[AtomicU32; 3]>,
+    recv_cred: Arc<[AtomicU32; 3]>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for ConnTransport<Platform, FS> {
@@ -1115,6 +1141,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         second_cred: Ucred,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
+        let cred_a: Arc<[AtomicU32; 3]> = Arc::new([const { AtomicU32::new(0) }; 3]);
+        let cred_b: Arc<[AtomicU32; 3]> = Arc::new([const { AtomicU32::new(0) }; 3]);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
         let pollee2 = Arc::new(Pollee::new());
         let (send_channel, recv_channel) =
@@ -1132,6 +1160,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: pollee1,
             peer_cred: second_cred,
+            send_cred: cred_a.clone(),
+            recv_cred: cred_b.clone(),
         };
         let second = UnixConnectedStream {
             transport: ConnTransport::Local {
@@ -1143,6 +1173,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: pollee2,
             peer_cred: first_cred,
+            send_cred: cred_b,
+            recv_cred: cred_a,
         };
         let ConnTransport::Local {
             recv_channel,
@@ -1189,6 +1221,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             },
             pollee: Arc::new(Pollee::new()),
             peer_cred,
+            // Unused for `Shared` (the slot carries these); present to keep one struct shape.
+            send_cred: Arc::new([const { AtomicU32::new(0) }; 3]),
+            recv_cred: Arc::new([const { AtomicU32::new(0) }; 3]),
         }
     }
 
@@ -1413,20 +1448,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     fn try_recvfrom(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let recv_channel = match &self.transport {
             ConnTransport::Local { recv_channel, .. } => recv_channel,
             ConnTransport::Shared { .. } => {
-                return self
-                    .shared_view()
-                    .expect("shared endpoint")
-                    .recv(buf, self.self_read_shutdown());
+                return self.shared_view().expect("shared endpoint").recv(
+                    buf,
+                    self.self_read_shutdown(),
+                    peek,
+                );
             }
         };
         if recv_channel.is_empty()
             && let Some(view) = self.shared_view()
         {
-            return view.recv(buf, self.self_read_shutdown());
+            return view.recv(buf, self.self_read_shutdown(), peek);
+        }
+        if peek {
+            // Bytes only, across as many queued messages as `buf` holds; ancillary fds stay queued.
+            return recv_channel
+                .peek_all(|messages| {
+                    let mut total = 0;
+                    for msg in messages {
+                        if total == buf.len() {
+                            break;
+                        }
+                        let n = (buf.len() - total).min(msg.data.len());
+                        buf[total..total + n].copy_from_slice(&msg.data[..n]);
+                        total += n;
+                    }
+                    (total, Vec::new())
+                })
+                .map_err(|e| match e {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                });
         }
         let mut total_read = 0;
         let mut fds = Vec::new();
@@ -1497,20 +1554,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     fn try_recvfrom_one_message(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let recv_channel = match &self.transport {
             ConnTransport::Local { recv_channel, .. } => recv_channel,
             ConnTransport::Shared { .. } => {
-                return self
-                    .shared_view()
-                    .expect("shared endpoint")
-                    .recv(buf, self.self_read_shutdown());
+                return self.shared_view().expect("shared endpoint").recv(
+                    buf,
+                    self.self_read_shutdown(),
+                    peek,
+                );
             }
         };
         if recv_channel.is_empty()
             && let Some(view) = self.shared_view()
         {
-            return view.recv(buf, self.self_read_shutdown());
+            return view.recv(buf, self.self_read_shutdown(), peek);
+        }
+        if peek {
+            return recv_channel
+                .peek_all(|messages| {
+                    let n = messages.next().map_or(0, |msg| {
+                        let n = buf.len().min(msg.data.len());
+                        buf[..n].copy_from_slice(&msg.data[..n]);
+                        n
+                    });
+                    (n, Vec::new())
+                })
+                .map_err(|e| match e {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                });
         }
         let mut fds = Vec::new();
         let n = recv_channel.peek_and_consume_one(|msg| {
@@ -1554,9 +1628,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let is_read_shutdown = recv_channel.is_shutdown();
         let is_peer_write_shutdown = recv_channel.is_peer_shutdown();
         let is_write_shutdown = connected_send_channel.is_shutdown();
+        // Linux reports `POLLHUP` once the socket is shut down in BOTH directions, which is also
+        // what happens to the survivor when its peer is closed (`unix_release_sock` sets the
+        // peer's `sk_shutdown` to `SHUTDOWN_MASK`). Code such as D-Bus's babysitter watches its
+        // parent socket for exactly that and ignores plain `POLLIN`; without `HUP` it never
+        // notices the parent went away and re-polls a permanently-readable fd forever.
+        let peer_closed = is_peer_write_shutdown && connected_send_channel.is_peer_shutdown();
         if is_read_shutdown || is_peer_write_shutdown {
             events |= Events::RDHUP | Events::IN;
-            if is_write_shutdown {
+            if is_write_shutdown || peer_closed {
                 events |= Events::HUP;
             }
         }
@@ -1644,6 +1724,22 @@ struct UnixStream<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
+    /// Records `cred` as the latest sender on a cross-process connection (see
+    /// `SharedConnSlot::last_writer_c2s`); a no-op for anything else.
+    fn note_sender(&self, cred: &Ucred) {
+        self.with_state_ref(|state| {
+            if let Some(conn) = state.connected() {
+                if let Some(view) = conn.shared_view() {
+                    view.slot_ref().set_last_writer(view.is_client, *cred);
+                } else {
+                    conn.send_cred[0].store(cred.pid as u32, Ordering::Relaxed);
+                    conn.send_cred[1].store(cred.uid, Ordering::Relaxed);
+                    conn.send_cred[2].store(cred.gid, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
         Self {
             state: litebox::sync::RwLock::new(Some(state)),
@@ -1775,7 +1871,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 if let Some(connected) = connecting.try_complete() {
                     (UnixStreamState::Connected(connected), Some(Ok(())))
                 } else {
-                    (UnixStreamState::Connecting(connecting), Some(Err(Errno::EALREADY)))
+                    (
+                        UnixStreamState::Connecting(connecting),
+                        Some(Err(Errno::EALREADY)),
+                    )
                 }
             }
             other => (other, None),
@@ -1787,7 +1886,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         let backlog = match self.lookup(task, &addr) {
             Ok(b) => b,
             Err(Errno::ECONNREFUSED) => {
-                return self.connect_cross_process(task, &addr, is_nonblocking);
+                return match self.connect_cross_process(task, &addr, is_nonblocking) {
+                    // `ECONNREFUSED` means something is at that path but nobody listens; a path
+                    // that does not exist at all is `ENOENT`, which callers such as PulseAudio's
+                    // stale-socket cleanup depend on to tell the two apart.
+                    Err(Errno::ECONNREFUSED) => Err(Self::refused_or_missing(task, &addr)),
+                    other => other,
+                };
             }
             Err(e) => {
                 litebox_util_log::debug!(addr:? = addr, err:? = e; "TRACE unix_connect: lookup failed");
@@ -1824,6 +1929,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         result
     }
 
+    /// `ENOENT` when `addr` is a filesystem path with nothing at it, else `ECONNREFUSED`.
+    fn refused_or_missing(task: &Task<Platform, FS>, addr: &UnixSocketAddr) -> Errno {
+        if let UnixSocketAddr::Path(path) = addr {
+            if let Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory
+                | litebox::fs::errors::PathError::MissingComponent,
+            )) = task.files.borrow().fs.symlink_metadata(path.as_str())
+            {
+                return Errno::ENOENT;
+            }
+        }
+        Errno::ECONNREFUSED
+    }
+
     /// The genuinely-cross-process half of [`Self::connect`]: reached only once the ordinary
     /// same-process `lookup()` against the real `unix_addr_table` has already missed. Posts a
     /// request into `global.unix_shared_connect_queue` and polls for the listener's own
@@ -1855,10 +1974,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             }
         }
         let client_cred = task.peer_cred();
-        let Some(request_idx) = task
-            .global
-            .unix_shared_connect_queue
-            .post(kind, key_bytes, &client_cred)
+        let Some(request_idx) =
+            task.global
+                .unix_shared_connect_queue
+                .post(kind, key_bytes, &client_cred)
         else {
             // Queue full -- ordinary, guest-triggerable degrade, not a bug, but real enough to be
             // worth a visible signal now that `cancel`'s own leak-on-claim-race is fixed (62nd
@@ -1889,13 +2008,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         // `connect()` CAN legitimately wait a while for a slow-to-accept listener, but never
         // forever without any caller-requested timeout being involved -- bounding it here trades
         // strict fidelity for never being the thing that hangs a boot.
-        let cx = task.wait_cx().with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT);
+        let cx = task
+            .wait_cx()
+            .with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT);
         let result = wait_on_events_polling(
             &cx,
             is_nonblocking,
             Events::empty(),
             |_observer, _mask| Ok::<(), Errno>(()), // no real wake source exists yet -- see doc
-            || match task.global.unix_shared_connect_queue.poll_result(request_idx) {
+            || match task
+                .global
+                .unix_shared_connect_queue
+                .poll_result(request_idx)
+            {
                 Some(slot) => Ok(slot),
                 None => Err(TryOpError::TryAgain),
             },
@@ -1960,17 +2085,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     pollee: Pollee::new(),
                 };
                 return self.with_state(|state| match state {
-                    UnixStreamState::Init(_) => {
-                        (UnixStreamState::Connecting(connecting), Err(Errno::EINPROGRESS))
-                    }
+                    UnixStreamState::Init(_) => (
+                        UnixStreamState::Connecting(connecting),
+                        Err(Errno::EINPROGRESS),
+                    ),
                     // Lost a race with something else mutating this fd's state (e.g. a
                     // concurrent `close()`/`shutdown()` reusing the slot) between the lookup at
                     // the top of this function and here -- withdraw the request rather than leak
                     // it on a state this socket will never revisit.
                     other => {
-                        task.global
-                            .unix_shared_connect_queue
-                            .cancel(&task.global, addr, request_idx);
+                        task.global.unix_shared_connect_queue.cancel(
+                            &task.global,
+                            addr,
+                            request_idx,
+                        );
                         (other, Err(Errno::EINPROGRESS))
                     }
                 });
@@ -2099,6 +2227,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         let res = wait_on_events_polling(
@@ -2118,9 +2247,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                         .connected()
                         .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
                     let n = if self.preserve_boundaries {
-                        conn.try_recvfrom_one_message(buf)?
+                        conn.try_recvfrom_one_message(buf, peek)?
                     } else {
-                        conn.try_recvfrom(buf)?
+                        conn.try_recvfrom(buf, peek)?
                     };
                     // For connected stream sockets, no need to return the source address
                     if let Some(source_addr) = source_addr.as_deref_mut() {
@@ -2297,6 +2426,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
         &self,
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+        peek: bool,
     ) -> Result<usize, TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
@@ -2305,8 +2435,8 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
             if let Some(source_addr) = source_addr.as_deref_mut() {
                 *source_addr = Some(msg.source.clone());
             }
-            // Always consume the entire message to preserve boundaries.
-            Ok((true, msg.data.len()))
+            // Always consume the entire message to preserve boundaries (unless only peeking).
+            Ok((!peek, msg.data.len()))
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
@@ -2325,7 +2455,11 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
 /// in (used to deregister the address on drop), and the guest pid that registered it in
 /// `global.unix_addr_presence` (see `SharedUnixAddrPresenceTable::remove`'s same-owner-only
 /// contract).
-type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, GlobalStateHandle<Platform, FS>, u32);
+type BoundDatagramAddr<Platform, FS> = (
+    UnixBoundSocketAddr<FS>,
+    GlobalStateHandle<Platform, FS>,
+    u32,
+);
 
 struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     /// The local address this socket is bound to, if any.
@@ -2511,6 +2645,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
         let res = cx
@@ -2527,7 +2662,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut())
+                    recv_channel.try_read(buf, source_addr.as_deref_mut(), peek)
                 },
             )
             .map_err(Errno::from);
@@ -2661,12 +2796,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let inner = match sock_type {
-            SockType::Stream | SockType::SeqPacket => {
-                UnixSocketInner::Stream(UnixStream::new(
-                    UnixStreamState::Init(UnixInitStream::new()),
-                    matches!(sock_type, SockType::SeqPacket),
-                ))
-            }
+            SockType::Stream | SockType::SeqPacket => UnixSocketInner::Stream(UnixStream::new(
+                UnixStreamState::Init(UnixInitStream::new()),
+                matches!(sock_type, SockType::SeqPacket),
+            )),
             SockType::Datagram => UnixSocketInner::Datagram(UnixDatagram::new()),
             e => {
                 log_unsupported!("Unsupported unix socket type: {:?}", e);
@@ -2769,6 +2902,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
+                stream.note_sender(&task.peer_cred());
                 stream.sendto(
                     &task.wait_cx(),
                     timeout,
@@ -2797,6 +2931,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
     /// read (always empty for a datagram socket or a message with no attached fds).
+    /// The credentials to attach as `SCM_CREDENTIALS` to data this socket receives: the peer's,
+    /// when `SO_PASSCRED` is on and the socket is a connected stream.
+    pub(super) fn passcred_ucred(&self) -> Option<Ucred> {
+        if !self.options.lock().passcred {
+            return None;
+        }
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
+                UnixStreamState::Connected(conn) => Some(match conn.shared_view() {
+                    // The peer that last SENT, not the one that connected.
+                    Some(view) => view
+                        .slot_ref()
+                        .last_writer(!view.is_client)
+                        .unwrap_or(conn.peer_cred),
+                    None => {
+                        let pid = conn.recv_cred[0].load(Ordering::Relaxed);
+                        if pid == 0 {
+                            conn.peer_cred
+                        } else {
+                            Ucred {
+                                pid: pid as _,
+                                uid: conn.recv_cred[1].load(Ordering::Relaxed),
+                                gid: conn.recv_cred[2].load(Ordering::Relaxed),
+                            }
+                        }
+                    }
+                }),
+                _ => None,
+            }),
+            UnixSocketInner::Datagram(_) => None,
+        }
+    }
+
     pub(super) fn recvmsg(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -2806,21 +2973,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         // CMSG_CLOEXEC is meaningless for plain recvfrom (no ancillary data ever flows there) but
         // harmless to accept -- net.rs's do_recvmsg is what actually honors it.
-        let supported_flags =
-            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::CMSG_CLOEXEC
+            | ReceiveFlags::PEEK;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
+        let peek = flags.contains(ReceiveFlags::PEEK);
         let timeout = self.options.lock().recv_timeout;
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
             }
             UnixSocketInner::Datagram(datagram) => datagram
-                .recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                .recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
                 .map(|n| (n, Vec::new())),
         };
         match ret {
@@ -2922,6 +3092,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS | IpOption::RECVERR => Err(Errno::EOPNOTSUPP),
+                _ => Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::IPV6(_) => Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
@@ -2947,6 +3118,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     );
                     Ok(())
                 }
+                SocketOption::PASSCRED => {
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    self.options.lock().passcred = val != 0;
+                    Ok(())
+                }
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => Ok(()),
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -2980,6 +3157,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS | IpOption::RECVERR => return Err(Errno::EOPNOTSUPP),
+                _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::IPV6(_) => return Err(Errno::ENOPROTOOPT),
             SocketOptionName::Socket(so) => match so {
@@ -3002,6 +3180,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
+                SocketOption::PASSCRED => u32::from(self.options.lock().passcred),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {
@@ -3267,7 +3447,11 @@ fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
     key: &UnixSocketAddrKey,
 ) {
     let (presence_kind, presence_bytes) = presence_kind_and_bytes(key);
-    match task.global.unix_addr_presence.lookup(presence_kind, presence_bytes) {
+    match task
+        .global
+        .unix_addr_presence
+        .lookup(presence_kind, presence_bytes)
+    {
         Some(owner_pid) if owner_pid != task.pid.get() as u32 => {
             litebox_util_log::warn!(
                 self_pid:% = task.pid.get(), owner_pid:% = owner_pid;
@@ -3362,7 +3546,10 @@ pub(crate) fn wait_on_events_polling<Platform, R, E>(
     cx: &WaitContext<'_, Platform>,
     nonblock: bool,
     events: Events,
-    mut register_observer: impl FnMut(Weak<dyn litebox::event::observer::Observer<Events>>, Events) -> Result<(), E>,
+    mut register_observer: impl FnMut(
+        Weak<dyn litebox::event::observer::Observer<Events>>,
+        Events,
+    ) -> Result<(), E>,
     mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
 ) -> Result<R, TryOpError<E>>
 where
@@ -3378,16 +3565,24 @@ where
     // real deadline exists up front, before it can have expired, resolves the ambiguity: `None`
     // afterward can only mean "expired", never "never had one".
     let has_real_deadline = cx.deadline().is_some();
+    // The operation is always attempted at least once, even when the deadline has already passed
+    // (a zero timeout is a poll, not a refusal to look): only a LATER iteration may report
+    // `TimedOut` from an expired deadline.
+    let mut first_attempt = true;
     loop {
         let remaining = cx.remaining_timeout();
-        if has_real_deadline && remaining.is_none() {
-            return Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut));
+        if has_real_deadline && remaining.is_none() && !first_attempt {
+            return Err(TryOpError::WaitError(
+                litebox::event::wait::WaitError::TimedOut,
+            ));
         }
         let this_iter_timeout = match remaining {
+            None if has_real_deadline => core::time::Duration::ZERO,
             None => SHARED_UNIX_POLL_INTERVAL,
             Some(d) => d.min(SHARED_UNIX_POLL_INTERVAL),
         };
         let bounded = cx.with_timeout(this_iter_timeout);
+        first_attempt = false;
         match bounded.wait_on_events(nonblock, events, &mut register_observer, &mut try_op) {
             Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut))
                 if !has_real_deadline || remaining.is_some_and(|d| d > this_iter_timeout) =>
@@ -3630,6 +3825,18 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         n
     }
 
+    /// Like [`Self::try_read`] but leaves the bytes queued (`MSG_PEEK`).
+    pub(crate) fn try_peek(&self, out: &mut [u8]) -> usize {
+        let cursor = self.cursor.lock();
+        let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
+        for (i, slot) in out.iter_mut().take(n).enumerate() {
+            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+                .load(Ordering::Relaxed);
+        }
+        n
+    }
+
     /// Reads up to `out.len()` bytes; returns the count read. `0` is ambiguous between "empty and
     /// still open" and "empty and shut down" by design -- callers distinguish via
     /// [`Self::is_shutdown`]/[`Self::is_empty`], mirroring `channel::ReadEnd::peek_and_consume_one`'s
@@ -3715,6 +3922,27 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         Some((n, specs))
     }
 
+    /// Like [`Self::try_read_record`] but leaves the record queued (`MSG_PEEK`).
+    pub(crate) fn try_peek_record(&self, out: &mut [u8]) -> Option<usize> {
+        let cursor = self.cursor.lock();
+        let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        if avail < 4 {
+            return None;
+        }
+        let at = |i: usize| {
+            self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF].load(Ordering::Relaxed)
+        };
+        let len = u32::from_le_bytes([at(0), at(1), at(2), at(3)]) as usize;
+        if avail < 4 + len {
+            return None;
+        }
+        let n = out.len().min(len);
+        for (i, b) in out.iter_mut().take(n).enumerate() {
+            *b = at(4 + i);
+        }
+        Some(n)
+    }
+
     pub(crate) fn is_full(&self) -> bool {
         let cursor = self.cursor.lock();
         cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
@@ -3752,6 +3980,11 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     side_ever_held: [AtomicBool; 2],
     /// The rings carry length-prefixed records (a promoted `SOCK_SEQPACKET` connection).
     framed: AtomicBool,
+    /// Credentials of whichever process most recently sent in each direction -- what
+    /// `SCM_CREDENTIALS` reports (a forked or `SCM_RIGHTS`-passed endpoint sends from a process
+    /// other than the one that connected, and the receiver must see the sender).
+    last_writer_c2s: [AtomicU32; 3],
+    last_writer_s2c: [AtomicU32; 3],
 }
 
 /// Distinct host processes that can hold one side of a shared connection at once.
@@ -3891,7 +4124,34 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             holder_counts: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(0))),
             side_ever_held: [AtomicBool::new(false), AtomicBool::new(false)],
             framed: AtomicBool::new(false),
+            last_writer_c2s: [const { AtomicU32::new(0) }; 3],
+            last_writer_s2c: [const { AtomicU32::new(0) }; 3],
         }
+    }
+
+    fn set_last_writer(&self, from_client: bool, cred: Ucred) {
+        let w = if from_client {
+            &self.last_writer_c2s
+        } else {
+            &self.last_writer_s2c
+        };
+        w[0].store(cred.pid as u32, Ordering::Relaxed);
+        w[1].store(cred.uid, Ordering::Relaxed);
+        w[2].store(cred.gid, Ordering::Relaxed);
+    }
+
+    fn last_writer(&self, from_client: bool) -> Option<Ucred> {
+        let w = if from_client {
+            &self.last_writer_c2s
+        } else {
+            &self.last_writer_s2c
+        };
+        let pid = w[0].load(Ordering::Relaxed);
+        (pid != 0).then(|| Ucred {
+            pid: pid as _,
+            uid: w[1].load(Ordering::Relaxed),
+            gid: w[2].load(Ordering::Relaxed),
+        })
     }
 
     fn server_cred(&self) -> Ucred {
@@ -3976,10 +4236,12 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
                 slot.client_to_server.reset();
                 slot.server_to_client.reset();
                 slot.reset_holders();
-                slot.client_pid.store(client_cred.pid as u32, Ordering::Relaxed);
+                slot.client_pid
+                    .store(client_cred.pid as u32, Ordering::Relaxed);
                 slot.client_uid.store(client_cred.uid, Ordering::Relaxed);
                 slot.client_gid.store(client_cred.gid, Ordering::Relaxed);
-                slot.server_pid.store(server_cred.pid as u32, Ordering::Relaxed);
+                slot.server_pid
+                    .store(server_cred.pid as u32, Ordering::Relaxed);
                 slot.server_uid.store(server_cred.uid, Ordering::Relaxed);
                 slot.server_gid.store(server_cred.gid, Ordering::Relaxed);
                 return Some(i as u32);
@@ -4114,7 +4376,8 @@ impl SharedUnixConnectQueue {
                 }
                 req.len.store(key.len() as u32, Ordering::Relaxed);
                 req.kind.store(kind, Ordering::Relaxed);
-                req.client_pid.store(client_cred.pid as u32, Ordering::Relaxed);
+                req.client_pid
+                    .store(client_cred.pid as u32, Ordering::Relaxed);
                 req.client_uid.store(client_cred.uid, Ordering::Relaxed);
                 req.client_gid.store(client_cred.gid, Ordering::Relaxed);
                 req.conn_slot.store(u32::MAX, Ordering::Relaxed);
@@ -4152,8 +4415,9 @@ impl SharedUnixConnectQueue {
                 .map(|(i, req)| {
                     let len = req.len.load(Ordering::Relaxed) as usize;
                     let len = len.min(UNIX_ADDR_KEY_MAX);
-                    let bytes: alloc::vec::Vec<u8> =
-                        (0..len).map(|j| req.bytes[j].load(Ordering::Relaxed)).collect();
+                    let bytes: alloc::vec::Vec<u8> = (0..len)
+                        .map(|j| req.bytes[j].load(Ordering::Relaxed))
+                        .collect();
                     (i, req.kind.load(Ordering::Relaxed), bytes)
                 })
                 .collect();
@@ -4183,7 +4447,12 @@ impl SharedUnixConnectQueue {
                 && req.matches(kind, key)
                 && req
                     .state
-                    .compare_exchange(REQ_PENDING, REQ_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        REQ_PENDING,
+                        REQ_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
             {
                 let cred = Ucred {

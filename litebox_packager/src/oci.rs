@@ -541,7 +541,12 @@ pub mod cache {
     /// (verbose-gated) and swallowed rather than propagated -- failing to populate the cache must
     /// never fail the boot that produced the data, since the freshly rewritten bytes are already
     /// available to the caller regardless of whether they get persisted.
-    pub fn write_cached_layer(layer_digest: &str, rewriter_version: u32, data: &[u8], verbose: bool) {
+    pub fn write_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        data: &[u8],
+        verbose: bool,
+    ) {
         let final_path = cache_path(layer_digest, rewriter_version);
         if let Err(e) = write_cached_layer_inner(&final_path, data) {
             if verbose {
@@ -660,9 +665,8 @@ pub mod cache {
                     final_path.display()
                 )
             })?;
-            let file = std::fs::File::open(&final_path).with_context(|| {
-                format!("failed to reopen cache file {}", final_path.display())
-            })?;
+            let file = std::fs::File::open(&final_path)
+                .with_context(|| format!("failed to reopen cache file {}", final_path.display()))?;
             // SAFETY: mirrors `read_cached_layer` -- this file was just renamed into place from a
             // process-and-call-unique temp path, so no other writer can be mutating it.
             let mmap = unsafe { memmap2::Mmap::map(&file) }
@@ -1253,7 +1257,11 @@ fn pull_layers_in_memory_impl(
 /// giant ordinary heap `Vec` at all. On any failure to open that file, the caller falls back to
 /// passing a `Vec<u8>` as `out` instead, so correctness is preserved regardless of which sink is
 /// used; this function itself has no opinion on which sink backs a real file vs. memory.
-pub fn rewrite_layer_elfs<W: Write>(layer_tar: &[u8], out: &mut W, verbose: bool) -> anyhow::Result<()> {
+pub fn rewrite_layer_elfs<W: Write>(
+    layer_tar: &[u8],
+    out: &mut W,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(layer_tar);
     let mut builder = tar::Builder::new(out);
     for entry_result in archive.entries()? {
@@ -1741,7 +1749,8 @@ fn resolve_symlink_in_rootfs(
 /// packaging `linuxserver/webtop:arch-xfce`, an Arch-based image; Alpine-based
 /// images (using `apk`, no colon-bearing package-db paths) don't hit this.
 fn is_excluded_path(path_str: &str) -> bool {
-    path_str.starts_with("var/lib/pacman/local/") || path_str.starts_with("var\\lib\\pacman\\local\\")
+    path_str.starts_with("var/lib/pacman/local/")
+        || path_str.starts_with("var\\lib\\pacman\\local\\")
 }
 
 /// Check if a path starts with `/` (Unix-style absolute).

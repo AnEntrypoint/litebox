@@ -401,6 +401,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let atime_nsec = i64::from(atime.nsec);
@@ -409,9 +410,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: if file_type == litebox::fs::FileType::Directory {
-                3
+                <_>::try_from(nlink.max(3)).unwrap_or(3)
             } else {
-                1
+                <_>::try_from(nlink).unwrap_or(1)
             },
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
@@ -594,6 +595,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let dev = dev as u64;
@@ -613,7 +615,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             // this call path.
             stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
-            stx_nlink: 1,
+            stx_nlink: u32::try_from(nlink).unwrap_or(1),
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
             stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
@@ -698,10 +700,17 @@ pub enum FcntlArg {
     GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
+    /// `F_SETOWN`: name the process to receive `SIGIO`/`SIGURG`. Accepted; those signals are
+    /// never generated.
+    SETOWN(i32),
+    /// `F_GETOWN`.
+    GETOWN,
+    /// `F_SETPIPE_SZ` / `F_GETPIPE_SZ`: pipe capacity is fixed, so both report it.
+    PIPE_SZ,
 }
 
 #[repr(i16)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
 pub enum FlockType {
     /// Shared or read lock
     ReadLock = 0,
@@ -745,6 +754,10 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_SETOWN: i32 = 8;
+const F_GETOWN: i32 = 9;
+const F_SETPIPE_SZ: i32 = 1031;
+const F_GETPIPE_SZ: i32 = 1032;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -783,6 +796,9 @@ impl FcntlArg {
             // only on the calls succeeding.
             F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
             F_GET_SEALS => Self::GET_SEALS,
+            F_SETOWN => Self::SETOWN(arg as i32),
+            F_GETOWN => Self::GETOWN,
+            F_SETPIPE_SZ | F_GETPIPE_SZ => Self::PIPE_SZ,
             _ => return None,
         })
     }
@@ -1898,6 +1914,8 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const FIONCLEX: u32 = 0x5450;
+pub const FIONREAD: u32 = 0x541B;
+pub const FIOASYNC: u32 = 0x5452;
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
@@ -1981,6 +1999,10 @@ pub enum IoctlArg {
     FIOCLEX,
     /// Clear close on exec
     FIONCLEX,
+    /// Bytes waiting to be read
+    FIONREAD(UserPtrMut<i32>),
+    /// Enable or disable `O_ASYNC` (`SIGIO` delivery), which is never generated here
+    FIOASYNC(UserPtr<i32>),
     /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
     /// object IDs (two-call size-probe pattern, see [`DrmModeCardRes`]'s doc comment).
     DrmModeGetResources(UserPtrMut<DrmModeCardRes>),
@@ -2262,16 +2284,23 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    TTL = 2,
+    PKTINFO = 8,
+    MTU_DISCOVER = 10,
     /// `IP_RECVERR`: queue ICMP errors on the socket error queue. glibc's resolver sets it on
     /// every DNS socket and treats failure as fatal.
     RECVERR = 11,
 }
 
+/// `IPPROTO_IPV6`-level options.
 #[repr(u32)]
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum Ipv6Option {
+    UNICAST_HOPS = 16,
+    MULTICAST_HOPS = 18,
     RECVERR = 25,
     V6ONLY = 26,
+    RECVPKTINFO = 49,
 }
 
 #[repr(u32)]
@@ -2284,6 +2313,9 @@ pub enum SocketOption {
     SNDBUF = 7,
     RCVBUF = 8,
     KEEPALIVE = 9,
+    PRIORITY = 12,
+    REUSEPORT = 15,
+    PASSCRED = 16,
     /// This option controls the action taken when unsent messages queue on
     /// a socket and close() is performed. If SO_LINGER is set, the system
     /// shall block the process during close() until it can transmit the data
@@ -3022,8 +3054,9 @@ pub struct Sysinfo {
     pub procs: u16,
     /// Explicit padding for m68k
     pub pad: u16,
+    /// Alignment padding before `totalhigh` (explicit so the C layout has no implicit holes).
     #[allow(clippy::pub_underscore_fields)]
-    pub _pad2: u32,
+    pub _align: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
@@ -3033,6 +3066,7 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+    /// Tail padding up to `sizeof(struct sysinfo)` == 112.
     #[allow(clippy::pub_underscore_fields)]
     pub _tail: u32,
 }
@@ -3646,6 +3680,21 @@ pub enum SyscallRequest {
         oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
+    RtSigtimedwait {
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<signal::Siginfo>>,
+        timeout: Option<UserPtr<Timespec>>,
+        sigsetsize: usize,
+    },
+    RtTgsigqueueinfo {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    },
+    RtSigqueueinfo {
+        pid: i32,
+        sig: i32,
+    },
     RtSigsuspend {
         mask: Option<UserPtr<SigSet>>,
         sigsetsize: usize,
@@ -3739,6 +3788,22 @@ pub enum SyscallRequest {
         count: usize,
         offset: i64,
     },
+    CopyFileRange {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    },
+    Splice {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    },
     Sendfile {
         out_fd: i32,
         in_fd: i32,
@@ -3779,6 +3844,28 @@ pub enum SyscallRequest {
         addr: UserPtrMut<u8>,
         length: usize,
         behavior: MadviseBehavior,
+    },
+    InotifyInit {
+        flags: u32,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: UserPtr<c_char>,
+        mask: u32,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
+    Mincore {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    },
+    Msync {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        flags: u32,
     },
     Dup {
         oldfd: i32,
@@ -4195,6 +4282,9 @@ pub enum SyscallRequest {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtr<CapData>>,
     },
+    Personality {
+        persona: u32,
+    },
     GetDirent64 {
         fd: i32,
         dirp: UserPtrMut<u8>,
@@ -4206,6 +4296,14 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    PidfdOpen {
+        pid: i32,
+        flags: u32,
+    },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<u8>,
+    },
     SchedGetParam {
         pid: Option<i32>,
         param: UserPtrMut<i32>,
@@ -4427,6 +4525,11 @@ impl SyscallRequest {
                 oldset:*,
                 sigsetsize,
             }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout:*, sigsetsize })
+            }
+            Sysno::rt_tgsigqueueinfo => sys_req!(RtTgsigqueueinfo { tgid, tid, sig }),
+            Sysno::rt_sigqueueinfo => sys_req!(RtSigqueueinfo { pid, sig }),
             Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::rt_sigaction => sys_req!(RtSigaction {
                 signum:?,
@@ -4481,6 +4584,8 @@ impl SyscallRequest {
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         FIONCLEX => IoctlArg::FIONCLEX,
+                        FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
+                        FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETRESOURCES => {
                             IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
                         }
@@ -4629,6 +4734,10 @@ impl SyscallRequest {
                 count,
                 offset
             }),
+            Sysno::copy_file_range => {
+                sys_req!(CopyFileRange { fd_in, off_in:*, fd_out, off_out:*, len, flags })
+            }
+            Sysno::splice => sys_req!(Splice { fd_in, off_in:*, fd_out, off_out:*, len, flags }),
             Sysno::sendfile => sys_req!(Sendfile { out_fd, in_fd, offset:*, count }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
@@ -4652,6 +4761,12 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::inotify_init => SyscallRequest::InotifyInit { flags: 0 },
+            Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
+            Sysno::mincore => sys_req!(Mincore { addr:*, length, vec:* }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -4914,6 +5029,15 @@ impl SyscallRequest {
                         // EINVAL claims the caller's ARGUMENTS are malformed, which they are not.
                         PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
                             args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
@@ -5181,6 +5305,7 @@ impl SyscallRequest {
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
             Sysno::capset => sys_req!(CapSet { header:*,data:* }),
+            Sysno::personality => sys_req!(Personality { persona }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
@@ -5293,6 +5418,37 @@ impl SyscallRequest {
             // return can conclude the fd is unusable, and there is no upside to refusing a hint
             // whose entire contract is that it may be disregarded.
             Sysno::fadvise64 => SyscallRequest::Fadvise64,
+            // The guest file systems carry no extended attributes: listing them yields an empty
+            // list (returned as length 0, which is what `SchedYield` answers), reading one is
+            // "no such attribute", and setting one is "not supported here" -- what a tmpfs
+            // without xattr support says. GIO asks for the list of every file it inspects
+            // (thousands of calls); failing them as unimplemented is only noise.
+            // Scheduling priority has no meaning here (every guest thread is an ordinary host
+            // thread, and the host scheduler is not the guest's to tune); accepting the request
+            // is what an unprivileged `nice` that happens to succeed looks like.
+            Sysno::setpriority => SyscallRequest::SchedYield,
+            // Tracing another process is not offered; `EPERM` is what a kernel with ptrace
+            // restricted (yama, or a container default) answers, which debuggers and crash
+            // handlers already handle, unlike an unimplemented-syscall error.
+            Sysno::ptrace => return Err(errno::Errno::EPERM),
+            // Guest memory is never swapped, so pinning it in RAM is already true of every page.
+            Sysno::mlock | Sysno::mlock2 | Sysno::munlock | Sysno::mlockall | Sysno::munlockall => {
+                SyscallRequest::SchedYield
+            }
+            Sysno::pidfd_open => sys_req!(PidfdOpen { pid, flags }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
+            Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => SyscallRequest::SchedYield,
+            Sysno::getxattr
+            | Sysno::lgetxattr
+            | Sysno::fgetxattr
+            | Sysno::removexattr
+            | Sysno::lremovexattr
+            | Sysno::fremovexattr => {
+                return Err(errno::Errno::ENODATA);
+            }
+            Sysno::setxattr | Sysno::lsetxattr | Sysno::fsetxattr => {
+                return Err(errno::Errno::EOPNOTSUPP);
+            }
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }

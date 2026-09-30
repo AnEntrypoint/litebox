@@ -398,6 +398,8 @@ pub struct FileStatus {
     pub atime: Timestamp,
     /// Last modification time
     pub mtime: Timestamp,
+    /// Number of hard links to this node.
+    pub nlink: usize,
 }
 
 impl FileStatus {
@@ -423,6 +425,7 @@ impl FileStatus {
             blksize,
             atime,
             mtime,
+            nlink: 1,
         }
     }
 }
@@ -440,6 +443,167 @@ pub struct Timestamp {
     pub sec: i64,
     /// Nanosecond remainder, in `[0, 1_000_000_000)`.
     pub nsec: u32,
+}
+
+/// The wall clock file timestamps are taken from.
+///
+/// The in-memory file system is generic over a platform that need not know about time, so the
+/// platform registers a plain function once at startup instead. Unset, every timestamp stays `0`.
+pub mod clock {
+    use super::Timestamp;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static NOW_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers the function that returns the current wall-clock time.
+    pub fn set_now_fn(f: fn() -> Timestamp) {
+        NOW_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// The current time, or the epoch when no clock was registered.
+    #[must_use]
+    pub fn now() -> Timestamp {
+        let raw = NOW_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return Timestamp::default();
+        }
+        // SAFETY: only `set_now_fn` stores here, and it stores a `fn() -> Timestamp`.
+        let f: fn() -> Timestamp = unsafe { core::mem::transmute(raw) };
+        f()
+    }
+}
+
+/// The identity every file-system permission check acts as, per host process.
+///
+/// A `static` is deliberate: each native-`fork()`ed guest process has its own copy of this
+/// memory, so every process checks (and creates files as) its own credentials, while the file
+/// system objects themselves are shared. The shim updates it whenever a task's credentials change.
+pub mod ident {
+    use super::UserInfo;
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    static USER: AtomicU32 = AtomicU32::new(u32::MAX);
+    static GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// Sets the acting uid/gid (ids above `u16::MAX` are clamped).
+    pub fn set(user: u32, group: u32) {
+        USER.store(user.min(u32::from(u16::MAX)), Ordering::Relaxed);
+        GROUP.store(group.min(u32::from(u16::MAX)), Ordering::Relaxed);
+    }
+
+    /// Identity of the calling thread, registered by the platform. A root guard is scoped to the
+    /// thread that took it: a process-wide flag made every OTHER thread act as root while one
+    /// thread copied a file up, so a concurrent `mkdir` came out root-owned and its own creator
+    /// then failed to search it.
+    static THREAD_ID_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to name the calling thread (any stable non-zero-distinguishing id).
+    pub fn set_thread_id_fn(f: fn() -> usize) {
+        THREAD_ID_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    static THREAD_ALIVE_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to test whether a thread id (as returned by the function given to
+    /// [`set_thread_id_fn`]) still names a live thread. Locks in memory shared between processes
+    /// use it to recover from a holder that died without releasing.
+    pub fn set_thread_alive_fn(f: fn(usize) -> bool) {
+        THREAD_ALIVE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Non-zero token naming the calling thread, or 0 when the platform registered no id function.
+    #[must_use]
+    pub fn thread_token() -> u32 {
+        current_thread().map_or(0, |t| t as u32)
+    }
+
+    /// Whether the thread named by `token` (from [`thread_token`]) is still alive; `true` when
+    /// that cannot be determined.
+    #[must_use]
+    pub fn thread_token_alive(token: u32) -> bool {
+        let raw = THREAD_ALIVE_FN.load(Ordering::Relaxed);
+        if raw == 0 || token == 0 {
+            return true;
+        }
+        // SAFETY: only `set_thread_alive_fn` stores here, and it stores a `fn(usize) -> bool`.
+        let f: fn(usize) -> bool = unsafe { core::mem::transmute(raw) };
+        f((token as usize).wrapping_sub(1))
+    }
+
+    fn current_thread() -> Option<usize> {
+        let raw = THREAD_ID_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return None;
+        }
+        // SAFETY: only `set_thread_id_fn` stores here, and it stores a `fn() -> usize`.
+        let f: fn() -> usize = unsafe { core::mem::transmute(raw) };
+        Some(f().wrapping_add(1))
+    }
+
+    const ROOT_SLOTS: usize = 64;
+    /// Threads currently inside a root guard (thread id + 1; 0 = free slot), one entry per guard.
+    static ROOT_TIDS: [AtomicUsize; ROOT_SLOTS] = [const { AtomicUsize::new(0) }; ROOT_SLOTS];
+    /// Fallback when no thread-id function is registered or every slot is taken: process-wide.
+    static ROOT_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+    /// While alive, permission checks on the creating thread act as root: the layered file
+    /// system's internal copy-up (creating ancestors and the upper copy of a lower file) is done
+    /// by the "kernel", not as the calling user.
+    pub struct RootGuard {
+        slot: Option<usize>,
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            match self.slot {
+                Some(slot) => ROOT_TIDS[slot].store(0, Ordering::Release),
+                None => {
+                    ROOT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Acts as root on this thread until the returned guard drops.
+    #[must_use]
+    pub fn root_guard() -> RootGuard {
+        if let Some(tid) = current_thread() {
+            for (slot, cell) in ROOT_TIDS.iter().enumerate() {
+                if cell
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return RootGuard { slot: Some(slot) };
+                }
+            }
+        }
+        ROOT_DEPTH.fetch_add(1, Ordering::Relaxed);
+        RootGuard { slot: None }
+    }
+
+    fn thread_is_root() -> bool {
+        if ROOT_DEPTH.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        match current_thread() {
+            Some(tid) => ROOT_TIDS.iter().any(|c| c.load(Ordering::Acquire) == tid),
+            None => false,
+        }
+    }
+
+    /// The acting identity, if the shim has set one.
+    #[must_use]
+    pub fn get() -> Option<UserInfo> {
+        if thread_is_root() {
+            return Some(UserInfo::ROOT);
+        }
+        let user = USER.load(Ordering::Relaxed);
+        let group = GROUP.load(Ordering::Relaxed);
+        (user != u32::MAX && group != u32::MAX).then(|| UserInfo {
+            user: user as u16,
+            group: group as u16,
+        })
+    }
 }
 
 /// User information

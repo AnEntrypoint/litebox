@@ -322,8 +322,8 @@ fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
             .encoded_len()
             .and_then(usize::try_from)
             .map_err(|_| VsmError::CertificateParseFailed)?;
-        let content_len: usize = usize::try_from(header.length)
-            .map_err(|_| VsmError::CertificateParseFailed)?;
+        let content_len: usize =
+            usize::try_from(header.length).map_err(|_| VsmError::CertificateParseFailed)?;
         let total_len = header_len
             .checked_add(content_len)
             .ok_or(VsmError::CertificateParseFailed)?;

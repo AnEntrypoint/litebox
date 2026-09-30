@@ -479,7 +479,6 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
         self.is_file_backed
     }
 
-
     /// Create a new private (non-shared) [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
@@ -978,6 +977,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         brk: usize,
         group_spans: impl Iterator<Item = Range<usize>>,
     ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, false)
+    }
+
+    /// Like [`Self::new_adopting_existing_memory`], but for a child that INHERITED the parent's
+    /// address space natively (a Linux `fork()`): `PROT_NONE` reservations and shared mappings
+    /// exist for real in such a child, so they are tracked too. Dropping them (right for a
+    /// Windows child, which has nothing behind them) made `mprotect` on an allocator's reserved
+    /// range fail with `ENOMEM` and left shared mappings un-`munmap`-able.
+    pub(super) fn new_adopting_inherited_memory(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, true)
+    }
+
+    fn adopt(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+        keep_all: bool,
+    ) -> (Self, usize, usize) {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk,
@@ -1038,8 +1061,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
-            if flags.contains(VmFlags::VM_SHARED)
-                || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty()
+            if !keep_all
+                && (flags.contains(VmFlags::VM_SHARED)
+                    || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty())
             {
                 // See this function's own doc comment (both the `VM_SHARED` paragraph and the
                 // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into `vmas`
@@ -1200,9 +1224,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     // `munmap()` call never asked to touch).
                     let overlap_start = range.start.max(vma_range.start);
                     let overlap_end = range.end.min(vma_range.end);
-                    let _ = self
-                        .platform
-                        .update_permissions(overlap_start..overlap_end, MemoryRegionPermissions::empty());
+                    let _ = self.platform.update_permissions(
+                        overlap_start..overlap_end,
+                        MemoryRegionPermissions::empty(),
+                    );
                 }
             }
             if shared_overlaps.is_empty() {
@@ -1378,15 +1403,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     // legitimately allowed to steal, see the case below), this marks memory a
                     // DIFFERENT, still-live process owns -- there is no "legitimate ELF segment
                     // placement" reading of overwriting that, ever.
-                    if let Some((r, _)) = self
-                        .vmas
-                        .iter()
-                        .find(|(r, vma)| {
-                            r.start < end
-                                && r.end > start
-                                && vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
-                        })
-                    {
+                    if let Some((r, _)) = self.vmas.iter().find(|(r, vma)| {
+                        r.start < end
+                            && r.end > start
+                            && vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+                    }) {
                         litebox_util_log::warn!(
                             target_start:% = start, target_end:% = end, overlapping:? = r;
                             "insert_mapping: MAP_FIXED target overlaps memory a different, still-live process owns, rejecting as AddressPartiallyInUse"
@@ -2092,8 +2113,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // Try to extend the mapping. Although we checked that there are no
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
-            let (diag_cur_start, diag_cur_end, diag_is_shared) =
-                (cur_range.start, cur_range.end, cur_vma.shared_handle.is_some());
+            let (diag_cur_start, diag_cur_end, diag_is_shared) = (
+                cur_range.start,
+                cur_range.end,
+                cur_vma.shared_handle.is_some(),
+            );
             match unsafe {
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
@@ -2136,9 +2160,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 }
                 // `range` is built from page-aligned bounds by construction, so a misalignment
                 // here really would be a bug in this function rather than a caller error.
-                Err(AllocationError::Unaligned) => unreachable!(
-                    "resize_mapping builds `range` from page-aligned bounds"
-                ),
+                Err(AllocationError::Unaligned) => {
+                    unreachable!("resize_mapping builds `range` from page-aligned bounds")
+                }
             }
             return Ok(());
         }
@@ -2268,9 +2292,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         vma.flags.contains(VmFlags::VM_GROWSDOWN),
                     )
                     .ok_or(VmemMoveError::OutOfMemory)?;
-                let new_range =
-                    PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize())
-                        .ok_or(VmemMoveError::UnAligned)?;
+                let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize())
+                    .ok_or(VmemMoveError::UnAligned)?;
                 match unsafe {
                     self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Hint)
                 } {
@@ -2281,9 +2304,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         attempt += 1;
                         next_hint = None;
                     }
-                    Err(AllocationError::OutOfMemory | AllocationError::AddressInUse
+                    Err(
+                        AllocationError::OutOfMemory
+                        | AllocationError::AddressInUse
                         | AllocationError::AddressInUseByPlatform
-                        | AllocationError::AddressPartiallyInUse) => {
+                        | AllocationError::AddressPartiallyInUse,
+                    ) => {
                         return Err(VmemMoveError::OutOfMemory);
                     }
                     Err(
@@ -2296,8 +2322,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // Drop the old view of the same shared object; this only unmaps the view (via
             // `unmap_shared_memory`), it does not release the underlying shared-memory object,
             // which the new mapping above still holds a live view of.
-            unsafe { self.remove_mapping(old_range) }
-                .map_err(|_| VmemMoveError::OutOfMemory)?;
+            unsafe { self.remove_mapping(old_range) }.map_err(|_| VmemMoveError::OutOfMemory)?;
             return Ok(new_ptr);
         }
 
@@ -2611,6 +2636,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let vm_flags = VmFlags::from(perms) | VmFlags::may_flags_for_mapping(true, false);
         let vma = VmArea::new_shared(vm_flags, false, shared_handle);
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
+    }
+
+    /// Maps `shared_handle` READ-ONLY as if it were a private, read-only view of a file: the
+    /// mapping can never gain write permission (`VM_MAYWRITE` is clear, like any shared
+    /// file-backed mapping), so every process mapping the same object sees identical pages.
+    pub(super) unsafe fn map_existing_shared_pages_file_readonly(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let vm_flags = VmFlags::from(MemoryRegionPermissions::READ)
+            | VmFlags::may_flags_for_mapping(true, true);
+        let vma = VmArea::new_shared(vm_flags, true, shared_handle);
         unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
             .map_err(MappingError::MapError)
     }

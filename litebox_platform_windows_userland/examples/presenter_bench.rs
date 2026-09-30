@@ -30,8 +30,8 @@
 //! never once. An earlier version of this benchmark reported only the producer rate (and paid for
 //! an 8.3MiB per-byte pattern fill inside the timed loop, which dominated it); both are fixed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -160,12 +160,17 @@ fn main() {
             let idx = idx.min(samples.len() - 1);
             samples[idx] as f64 / 1.0e6
         };
-        println!("PRESENTER_BENCH_RESULT duration_s={elapsed:.3} sends={total_sends} sends_per_s={:.2} presents={presents} presents_per_s={:.2} mean_present_ms={mean_present_ms:.3} p99_present_ms={p99_present_ms:.3} presented_mb_per_s={:.2} coalesced_dropped={} coalesced_drop_rate={:.4} sent_mb_per_s={:.2}",
+        println!(
+            "PRESENTER_BENCH_RESULT duration_s={elapsed:.3} sends={total_sends} sends_per_s={:.2} presents={presents} presents_per_s={:.2} mean_present_ms={mean_present_ms:.3} p99_present_ms={p99_present_ms:.3} presented_mb_per_s={:.2} coalesced_dropped={} coalesced_drop_rate={:.4} sent_mb_per_s={:.2}",
             total_sends as f64 / elapsed,
             presents as f64 / elapsed,
             presented_bytes_per_s / (1024.0 * 1024.0),
             total_sends.saturating_sub(presents),
-            if total_sends > 0 { total_sends.saturating_sub(presents) as f64 / total_sends as f64 } else { 0.0 },
+            if total_sends > 0 {
+                total_sends.saturating_sub(presents) as f64 / total_sends as f64
+            } else {
+                0.0
+            },
             (total_bytes as f64 / elapsed) / (1024.0 * 1024.0)
         );
         if presents == 0 {

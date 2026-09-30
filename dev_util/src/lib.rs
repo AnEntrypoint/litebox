@@ -14,7 +14,10 @@ pub fn project_root() -> Result<PathBuf> {
     loop {
         if dir.join("target").is_dir() {
             std::env::set_current_dir(&dir)?;
-            eprintln!("Changed working directory to project root: {}", dir.display());
+            eprintln!(
+                "Changed working directory to project root: {}",
+                dir.display()
+            );
             return Ok(dir);
         }
         if !dir.pop() {

@@ -6,10 +6,10 @@
 //! construction, and the owned (not `&'static`) table also admits values fixed once per boot, while
 //! live-changing content belongs in [`super::procfs`]. See gm mutable mut-1789043521509.
 
+use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::borrow::ToOwned as _;
 
 use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
@@ -276,6 +276,7 @@ where
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let idx = h.get_typed::<Self>().0;
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: self.files[idx].1.len(),
@@ -290,6 +291,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let idx = h.get_typed::<Self>().0;
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

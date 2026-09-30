@@ -107,6 +107,11 @@ pub(crate) struct SysvShmSegment {
     /// Set by `shmctl(IPC_RMID)`. Real Linux keeps a removed segment alive until the last
     /// detach, and so does this.
     removed: bool,
+    /// Creator's uid/gid and the permission bits from `shmget`, reported by `IPC_STAT` (the X
+    /// server's MIT-SHM `ShmAttach` checks them against the client).
+    uid: u32,
+    gid: u32,
+    mode: u32,
 }
 
 /// Realistic upper bound on simultaneously live SysV shm segments in one guest session (X11's
@@ -247,6 +252,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     key,
                     attaches: 0,
                     removed: false,
+                    uid: self.creds().euid,
+                    gid: self.creds().egid,
+                    mode: u32::try_from(shmflg & 0o777).unwrap_or(0o600),
                 },
             )
             .map_err(|_| Errno::ENOMEM)?;
@@ -398,6 +406,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let size = seg.size;
                 for i in 0..48isize {
                     let _ = buf.write_at_offset::<Platform>(i, 0u8);
+                }
+                // `struct ipc64_perm`: key, uid, gid, cuid, cgid (i32/u32 each), then mode.
+                for (off, v) in [
+                    (0isize, seg.key as u32),
+                    (4, seg.uid),
+                    (8, seg.gid),
+                    (12, seg.uid),
+                    (16, seg.gid),
+                    (20, seg.mode),
+                ] {
+                    for (i, b) in v.to_le_bytes().iter().enumerate() {
+                        let _ = buf.write_at_offset::<Platform>(off + i as isize, *b);
+                    }
                 }
                 for (i, b) in size.to_le_bytes().iter().enumerate() {
                     let off = 48isize + isize::try_from(i).unwrap();
@@ -586,7 +607,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = if let Some(cow_result) = cow_attempt {
             cow_result?
         } else {
-            let memcpy_result = self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
+            let memcpy_result =
+                self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
             litebox_util_log::debug!(
                 fd:% = fd, len:% = len, offset:% = offset,
                 memcpy_ok:% = memcpy_result.is_ok(),
@@ -679,7 +701,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()??;
         // DIAG (AGENTS.md pass 223/224): confirm empirically whether this CoW mapping path is
         // even reached for the calls that end up EEXIST-failing, since pass 223's own code
@@ -767,9 +790,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .find_map(|candidate| {
                         let start = addr.checked_sub(candidate)?;
                         let ptr = litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(start)?;
-                        let size = litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(
-                            candidate,
-                        )?;
+                        let size =
+                            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(candidate)?;
                         let perms = self.process().pm().get_memory_permissions(ptr, size)?;
                         // `PROT_NONE` == no permission bits set at all -- anything else (even a
                         // READ-only mapping) is real content this call must not overwrite.
@@ -985,16 +1007,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         // Captures both the memfd identity key AND (if this fd is one) the file's CURRENT bytes
         // in one lookup, so the sync step below never needs a second, separate fd resolution.
-        let (key, current_bytes) = files
+        // Only the identity is looked up here: reading the file's bytes for every mmap of every
+        // file (to find out afterwards that it is not a memfd) copied whole libraries and locale
+        // archives through a buffer of the file's size on each call.
+        let key = files
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| {
                     let status = files.fs.fd_file_status(typed_fd).ok()?;
-                    let key = (status.node_info.dev, status.node_info.ino);
-                    let mut buf = alloc::vec![0u8; status.size];
-                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
-                    buf.truncate(n);
-                    Some((key, buf))
+                    Some((status.node_info.dev, status.node_info.ino))
                 },
                 |_| None,
                 |_| None,
@@ -1004,7 +1025,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()
             .flatten()?;
         let mut memfds = self.global.memfds.lock();
@@ -1026,6 +1048,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let already_mapped = entry.mapped;
         entry.mapped = true;
         drop(memfds);
+        // The bytes are only needed for the first mapping's one-time sync (below).
+        let current_bytes: alloc::vec::Vec<u8> = if already_mapped {
+            alloc::vec::Vec::new()
+        } else {
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let size = files.fs.fd_file_status(typed_fd).map_or(0, |s| s.size);
+                        let mut buf = alloc::vec![0u8; size];
+                        let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
+                        buf.truncate(n);
+                        buf
+                    },
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                )
+                .unwrap_or_default()
+        };
         drop(files);
         // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
         // before ever mmapping (the real Wayland `wl_shm` pattern this bridges: `ftruncate` then
@@ -1053,8 +1101,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let copy_len = current_bytes.len().min(aligned_len);
                 let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
                 let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-                let _ =
-                    litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned_len);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    aligned_len,
+                );
             }
         }
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
@@ -1087,12 +1138,97 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // section); no separate digest is needed here.
         Some(
             unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )
+    }
+
+    /// Keeps a `MAP_SHARED` file mapping coherent with `write()`/`pwrite()` to the same file.
+    ///
+    /// The shared object behind a mapping is a separate allocation seeded from the file once (see
+    /// `try_shared_file_mmap`); without this, bytes written to the file afterwards never reach
+    /// mappers. That is exactly how SQLite (Chromium's every database) works: it maps the file
+    /// read-only and writes it with `pwrite`, so it read back stale zeros, decided the database
+    /// was corrupt, and the browser aborted on a `CHECK`. A no-op unless the file has a mapping.
+    pub(crate) fn propagate_write_to_shared_mapping(
+        &self,
+        raw_fd: usize,
+        explicit_offset: Option<usize>,
+        written: &[u8],
+    ) {
+        if written.is_empty() || self.global.shared_files.lock().is_empty() {
+            return;
+        }
+        let files = self.files.borrow();
+        let Some(key) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    Some((status.node_info.dev, status.node_info.ino))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        drop(files);
+        let (handle, size) = {
+            let shared = self.global.shared_files.lock();
+            match shared.get(&key) {
+                Some(e) => (e.handle, e.size),
+                None => return,
+            }
+        };
+        // Where the write landed: the explicit offset, else the position now that it advanced.
+        let offset = match explicit_offset {
+            Some(o) => o,
+            None => match self.sys_lseek(
+                i32::try_from(raw_fd).unwrap_or(-1),
+                0,
+                litebox::fs::SeekWhence::RelativeToCurrentOffset,
+            ) {
+                Ok(pos) => pos.saturating_sub(written.len()),
+                Err(_) => return,
+            },
+        };
+        if offset >= size {
+            return;
+        }
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(size) else {
+            return;
+        };
+        // SAFETY: a fresh private mapping of `handle`, written and unmapped here; `handle` is
+        // owned by `shared_files` and outlives it.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let n = written.len().min(size - offset);
+            let _ = ptr.write_slice_at_offset(offset as isize, &written[..n]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, size);
+        }
     }
 
     /// If `fd` is an ordinary file and the guest asked for a `MAP_SHARED` mapping, back it with a
@@ -1248,7 +1384,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()
             .flatten()?;
         drop(files);
@@ -1285,7 +1422,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 (handle, false)
             }
         };
-        drop(shared);
+        // `shared` stays locked until the first mapper has seeded the object, so a concurrent
+        // second mapper cannot see it half-initialised.
 
         // Seed the object from the file's current bytes on the FIRST mapping only. After that the
         // shared object is the sole source of truth, and re-copying the (now stale) file bytes
@@ -1314,6 +1452,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
+        drop(shared);
+
         let create_flags = {
             let mut f = litebox::mm::linux::CreatePagesFlags::empty();
             f.set(
@@ -1335,9 +1475,199 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         Some(
             unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
+    /// A large, read-only, private mapping of an ordinary file (locale archives, icon and font
+    /// caches, ...) is served from ONE shared object instead of a per-process copy.
+    ///
+    /// Copying such a file into every mapper's private memory multiplies it by the process count:
+    /// every glibc program maps the multi-hundred-megabyte locale archive, so a desktop of sixty
+    /// processes spent gigabytes on sixty identical copies. A read-only private mapping can never
+    /// observe a difference from a shared one -- the mapping is created without the right to ever
+    /// become writable, so `mprotect(PROT_WRITE)` on it is refused, and the pages are never
+    /// patched (executable mappings and ELF files are excluded and keep their private copies).
+    ///
+    /// Returns `None` whenever the mapping does not qualify, leaving the ordinary path untouched.
+    fn try_shared_readonly_file_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        const MIN_SHARED_LEN: usize = 256 * 1024;
+        if flags.contains(MapFlags::MAP_ANONYMOUS)
+            || flags.contains(MapFlags::MAP_SHARED)
+            || prot.intersects(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC)
+            || offset != 0
+            || align_up(len, PAGE_SIZE) < MIN_SHARED_LEN
+        {
+            return None;
+        }
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let aligned_len = align_up(len, PAGE_SIZE);
+
+        // Identity and size of the file, plus whether it is an ELF image (those keep their
+        // private, patchable copies).
+        let (key, file_size) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let status = files.fs.fd_file_status(typed_fd).ok()?;
+                        if status.file_type != litebox::fs::FileType::RegularFile {
+                            return None;
+                        }
+                        let mut magic = [0u8; 4];
+                        let n = files.fs.read(typed_fd, &mut magic, Some(0)).unwrap_or(0);
+                        if n == 4 && magic == *b"\x7fELF" {
+                            return None;
+                        }
+                        Some(((status.node_info.dev, status.node_info.ino), status.size))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()?
+        };
+        let object_len = align_up(file_size, PAGE_SIZE);
+        // A mapping longer than the file would expose pages past its end.
+        if object_len == 0 || aligned_len > object_len {
+            return None;
+        }
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned_len)?;
+
+        let read_chunk = |at: usize, buf: &mut [u8]| -> usize {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| files.fs.read(typed_fd, buf, Some(at)).unwrap_or(0),
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                )
+                .unwrap_or(0)
+        };
+
+        let mut shared = self.global.shared_files.lock();
+        let (handle, needs_seed) = match shared.get_mut(&key) {
+            Some(entry) if entry.size == object_len => (entry.handle, !entry.mapped),
+            _ => {
+                let handle = self.global.platform.create_shared_memory(object_len).ok()?;
+                shared.insert(
+                    key,
+                    MemfdEntry {
+                        handle,
+                        size: object_len,
+                        mapped: false,
+                        name: None,
+                    },
+                );
+                (handle, true)
+            }
+        };
+        if needs_seed {
+            // Fill the object from the file once, a chunk at a time, through a transient
+            // writable mapping in this process. `shared` stays locked so nobody maps it half
+            // filled.
+            let full = litebox::mm::linux::NonZeroPageSize::new(object_len)?;
+            // SAFETY: a fresh, non-fixed mapping of `handle` that no guest code has seen; it is
+            // unmapped again before returning.
+            let ptr = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    full,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            }
+            .ok()?;
+            let mut chunk = alloc::vec![0u8; 1 << 20];
+            let mut at = 0usize;
+            let mut ok = true;
+            while at < file_size {
+                let want = (file_size - at).min(chunk.len());
+                let n = read_chunk(at, &mut chunk[..want]);
+                if n == 0 {
+                    ok = false;
+                    break;
+                }
+                if ptr
+                    .write_slice_at_offset(at as isize, &chunk[..n])
+                    .is_none()
+                {
+                    ok = false;
+                    break;
+                }
+                at += n;
+            }
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ =
+                litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, object_len);
+            if !ok {
+                shared.remove(&key);
+                return None;
+            }
+            if let Some(entry) = shared.get_mut(&key) {
+                entry.mapped = true;
+            }
+        }
+        drop(shared);
+
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match if addr == 0 { None } else { Some(addr) } {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        Some(
+            unsafe {
+                self.process().pm().map_existing_shared_pages_file_readonly(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )
@@ -1410,7 +1740,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok()
             .flatten();
         let effective_offset = prime_map_offset.unwrap_or(offset as u64);
-        let (shared_handle, buffer_size) = self.global.drm.lookup_by_map_offset(effective_offset)?;
+        let (shared_handle, buffer_size) =
+            self.global.drm.lookup_by_map_offset(effective_offset)?;
         let aligned_len = align_up(len, PAGE_SIZE);
         if aligned_len > buffer_size.next_multiple_of(PAGE_SIZE) {
             // Guest asked to map more than the buffer actually holds -- real Linux rejects an
@@ -1442,9 +1773,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let _ = prot;
         let result = unsafe {
-            self.process()
-                .pm()
-                .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
+            self.process().pm().map_existing_shared_pages(
+                suggested_addr,
+                length,
+                create_flags,
+                shared_handle,
+            )
         };
         // Log the GUEST-visible address this dumb buffer lands at -- unlike the host
         // presentation thread's own transient per-flip mapping (a fresh address every
@@ -1506,6 +1840,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
+        }
+
+        // A descriptor reopened read-only (`open("/proc/self/fd/N", O_RDONLY)` on a memfd) must
+        // not yield a writable shared mapping -- the whole point of such a reopen.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && flags.contains(MapFlags::MAP_SHARED)
+            && prot.contains(ProtFlags::PROT_WRITE)
+            && let Ok(raw) = usize::try_from(fd)
+        {
+            let files = self.files.borrow();
+            let readonly = files
+                .run_on_raw_fd(
+                    raw,
+                    |typed| {
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed, |super::file::ReopenedAccess(a)| {
+                                *a == litebox::fs::OFlags::empty()
+                            })
+                            .unwrap_or(false)
+                    },
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            if readonly {
+                return Err(Errno::EACCES);
+            }
         }
 
         // A DRM dumb-buffer `mmap()` (real clients always use `MAP_SHARED | PROT_WRITE` here --
@@ -1589,6 +1959,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if offset.checked_add(aligned_len).is_none() {
             return Err(Errno::EOVERFLOW);
+        }
+
+        if let Some(result) =
+            self.try_shared_readonly_file_mmap(addr, aligned_len, &prot, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
@@ -1688,6 +2064,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         litebox_common_linux::mm::sys_mprotect(&self.process().pm(), addr, len, prot)
+    }
+
+    /// `msync`: mappings here are coherent with their backing file at write time (see
+    /// `propagate_write_to_shared_mapping`), so there is nothing left to flush.
+    pub(crate) fn sys_mincore(
+        &self,
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    ) -> Result<(), Errno> {
+        let page = litebox::mm::linux::PAGE_SIZE;
+        if addr.as_usize() % page != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pages = length.div_ceil(page);
+        // Every mapped page is reported resident: guest memory is backed by shared
+        // memfd/anonymous pages that are never swapped out.
+        let resident = alloc::vec![1u8; pages];
+        vec.write_slice_at_offset::<Platform>(0, &resident)
+            .ok_or(Errno::EFAULT)
+    }
+
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        _length: usize,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        const MS_ASYNC: u32 = 1;
+        const MS_INVALIDATE: u32 = 2;
+        const MS_SYNC: u32 = 4;
+        if addr.as_usize() % litebox::mm::linux::PAGE_SIZE != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2036,7 +2450,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
             return (false, 0, 0, 0);
         };
-        (true, header.file_offset, header.vaddr, header.trampoline_size)
+        (
+            true,
+            header.file_offset,
+            header.vaddr,
+            header.trampoline_size,
+        )
     }
 
     /// Probe for a free address within JMP rel32 range (`0x7FFF_0000`) of a code segment
@@ -2537,17 +2956,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
             let template = match cached {
                 Some(template) => Ok(template),
-                None => litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
-                    .map(|scanned| {
-                        let scanned = alloc::sync::Arc::new(scanned);
-                        if let Some(key) = scan_key {
-                            self.global
-                                .segment_scan_cache
-                                .lock()
-                                .insert(key, alloc::sync::Arc::clone(&scanned));
-                        }
-                        scanned
-                    }),
+                None => {
+                    litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
+                        .map(|scanned| {
+                            let scanned = alloc::sync::Arc::new(scanned);
+                            if let Some(key) = scan_key {
+                                self.global
+                                    .segment_scan_cache
+                                    .lock()
+                                    .insert(key, alloc::sync::Arc::clone(&scanned));
+                            }
+                            scanned
+                        })
+                }
             };
             let outcome = template.and_then(|template| {
                 litebox_syscall_rewriter::patch_code_segment_scanned(
@@ -2720,13 +3141,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut section_headers = alloc::vec![0u8; total];
         self.read_exact_at(fd, &mut section_headers, usize::try_from(e_shoff).ok()?)?;
 
-        let ranges = alloc::sync::Arc::new(
-            litebox_syscall_rewriter::executable_section_file_ranges(
+        let ranges =
+            alloc::sync::Arc::new(litebox_syscall_rewriter::executable_section_file_ranges(
                 &section_headers,
                 e_shentsize,
                 e_shnum,
-            ),
-        );
+            ));
         if ranges.is_empty() {
             return None;
         }
@@ -3219,10 +3639,7 @@ mod tests {
 
         task.sys_ftruncate(fd, 0x1000).unwrap();
         let content = [0xDD_u8, 0xCC, 0xBB, 0xAA].repeat(4);
-        assert_eq!(
-            task.sys_write(fd, &content, None).unwrap(),
-            content.len()
-        );
+        assert_eq!(task.sys_write(fd, &content, None).unwrap(), content.len());
 
         let addr = task
             .sys_mmap(

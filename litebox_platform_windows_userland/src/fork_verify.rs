@@ -638,10 +638,7 @@ pub(crate) fn translate_stale_source_rip(
     // possible addressing shape (case (3)/(4) exist for the general GOT/PLT-slot and
     // register-indirect forms, exposed separately for the AV path) -- only these two fixed,
     // well-understood, zero-ambiguity offsets relative to a register this handler already has.
-    for candidate in [
-        rsp.wrapping_sub(core::mem::size_of::<usize>()),
-        rsp,
-    ] {
+    for candidate in [rsp.wrapping_sub(core::mem::size_of::<usize>()), rsp] {
         if let Some(slot_value) = read_usize_fault_tolerant(candidate)
             && slot_value == rip
         {
@@ -2170,10 +2167,12 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
     // `PageManagementProvider`), and litebox's own image and heap live above it. So a target
     // outside that window is never a legitimate heal, and refusing it costs nothing: the
     // alternative is not "heal something useful", it is "corrupt the host".
-    const TASK_MIN: usize =
-        <crate::WindowsUserland as litebox::platform::PageManagementProvider<0x1000>>::TASK_ADDR_MIN;
-    const TASK_MAX: usize =
-        <crate::WindowsUserland as litebox::platform::PageManagementProvider<0x1000>>::TASK_ADDR_MAX;
+    const TASK_MIN: usize = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        0x1000,
+    >>::TASK_ADDR_MIN;
+    const TASK_MAX: usize = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        0x1000,
+    >>::TASK_ADDR_MAX;
     if addr < TASK_MIN || addr.saturating_add(core::mem::size_of::<usize>()) > TASK_MAX {
         litebox_util_log::warn!(
             addr:% = addr, value:% = value, task_min:% = TASK_MIN, task_max:% = TASK_MAX;
@@ -2788,8 +2787,7 @@ pub(crate) fn begin(
             .try_lock()
             .map(|t| t.len())
             .unwrap_or(usize::MAX);
-        let diag_next_claim_seq =
-            crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+        let diag_next_claim_seq = crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
         let diag_real_win_tid =
             unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         let mut diag_handle_count: u32 = 0;

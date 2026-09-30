@@ -273,6 +273,7 @@ impl Composer {
             .map(|dir| dir.node_info.clone())
             .expect("virtual directory is precomputed");
         FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             // rwxr-xr-x for virtual dirs
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
@@ -631,7 +632,20 @@ impl Backend for Composer {
         match dir.inner {
             // A virtual directory is a pure mount-point placeholder with no real backend entries
             // of its own; nothing there can be a symlink.
-            ComposerWalkingDirHandleInner::Virtual { .. } => Ok(None),
+            ComposerWalkingDirHandleInner::Virtual { path } => {
+                // Only the mount points themselves exist under a virtual directory; any other
+                // name is absent (`ENOENT`), which a layered caller must be able to tell apart
+                // from "exists but is not a symlink" (`EINVAL`) so it can consult the next layer.
+                if self
+                    .immediate_mount_children(&path)
+                    .iter()
+                    .any(|child| child == name)
+                {
+                    Ok(None)
+                } else {
+                    Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+                }
+            }
             ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,

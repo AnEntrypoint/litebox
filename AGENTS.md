@@ -179,6 +179,29 @@ Fixed this pass (all committed, newest first):
 - **Repo hygiene**: layer tars, frame dumps, debug logs never in git (`.wfgy/` is ignored); no test files;
   commit as lanmower only.
 
+## Linux runner (`litebox_runner_linux_userland`, merged from branch `claude/modest-feynman-3zpzop`)
+
+Cloud sessions are Linux; there the `webtop:debian-xfce` rootfs (`--initial-files rootfs.tar --rewrite-syscalls --uid 0 --gid 0
+--pid1 --tun-device-name tun0 ... /bin/sh /init`) boots under the Linux runner: s6, Xvfb, xfwm4/panel/xfdesktop, nginx, pulseaudio,
+dbus, Selkies; a host browser at `http://10.0.0.2:3000` (TUN, host 10.0.0.1) drives it (xterm, xfce4-terminal, Thunar, Mousepad,
+Settings, Chromium verified). Harness: `tools/webtop/`. Not re-verified after the merge with the Windows line.
+- Native fork (`has_native_fork()==true`, host `fork()`): shared-arena fork with pool-backed shared memory; wait/notify hooks are
+  `waitpid`/`waitid(WNOWAIT)`; `SYS_wait4`/`SYS_waitid` seccomp-allowed (a blocked host syscall answers EINVAL and looks like a hang);
+  `exit_native_fork_child` ends the child with the guest status. A native-fork child COW-copies every private kernel structure, so
+  shared state must live in the shared arena. The thread-based fork corrupts guest memory on Linux -- not a substitute.
+- Per-process `/proc/self` identity, `/proc/<pid>/{task,oom_score_adj,environ,fd}`; real pty line discipline; SCM_CREDENTIALS;
+  shared-mapping coherence; per-thread fs "act as root" guard; network worker never blocks on a per-descriptor lock
+  (`iter_nowait`); runner panic = `_exit(134)`; big read-only private file maps are ONE shared object; freed heap >= 1MiB returns
+  pages (`MADV_REMOVE`). Desktop plateaus near 9GB (cgroup limit ~14GB).
+- Added: inotify, `MSG_PEEK` on unix+inet (used to consume bytes; broke TLS), xattr stubs, timestamps (tar mtimes), `mincore`,
+  `copy_file_range`, `splice`, `rt_sigtimedwait`, `rt_(tg)sigqueueinfo`, `O_TMPFILE`, NETLINK_ROUTE link/addr/route dumps,
+  `pidfd_open`/`waitid(P_PIDFD)` (also reaps cross-process children), `getrusage`/`mlock`, ptrace answers EPERM.
+- Dead-holder recovery for `RwLock` (write owner thread token) and platform `RawMutex`: a waiter blocked 2s checks `tkill(tid,0)`
+  (`litebox::fs::ident::set_thread_id_fn`/`set_thread_alive_fn`); up to 4 readers tracked. A panic holding the layered-fs root write
+  lock hangs every later `open`.
+- Debug kit: `LITEBOX_DIAG_FAULT=1 LITEBOX_PRINT_EXE_BASE=1` + frame-pointer build (`[diag-fault]`, `[diag-hostpid]`, `addr2line`);
+  `LITEBOX_DIAG_BIGALLOC=1`; stalled boot: `gdb -p <root> -batch -ex "thread apply all bt"`. Unit tests in litebox_shim_linux:
+  `RUST_MIN_STACK=64M`, `--skip tun`. Known gaps: IPv6 rides the IPv4 machinery; `/proc/<pid>/fd` shows non-path fds as `anon_inode:[N]`.
 ## Cross-process shared memory and locks (all DONE; mechanism in the archive)
 
 `RawMutex` is a manual wait queue + cross-process `Event`s with `holder_pid` dead-holder recovery

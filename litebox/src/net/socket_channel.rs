@@ -292,6 +292,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
+    /// Bytes received and not yet read (`FIONREAD`): the queued stream bytes, or the size of the
+    /// next datagram.
+    #[must_use]
+    pub fn pending_rx_bytes(&self) -> usize {
+        match self {
+            NetworkProxy::Stream(channel) => channel.inner.rx_cons.lock().occupied_len(),
+            NetworkProxy::Datagram(channel) => channel
+                .inner
+                .rx_cons
+                .lock()
+                .iter()
+                .next()
+                .map_or(0, |m| m.data.len()),
+            NetworkProxy::Raw => 0,
+        }
+    }
+
     /// Check if there is data pending in the TX buffer to be sent.
     pub(super) fn has_pending_tx(&self) -> bool {
         match self {
@@ -424,6 +441,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
+        if flags.contains(super::ReceiveFlags::PEEK) {
+            // `MSG_PEEK`: copy without consuming (and without touching the available count).
+            let (a, b) = rx_cons.as_slices();
+            let n1 = a.len().min(buf.len());
+            buf[..n1].copy_from_slice(&a[..n1]);
+            let n2 = b.len().min(buf.len() - n1);
+            buf[n1..n1 + n2].copy_from_slice(&b[..n2]);
+            let n = n1 + n2;
+            if n > 0 {
+                return Ok(n);
+            }
+            return match self.inner.state() {
+                SocketState::Connected => Ok(0),
+                SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
+                _ => Err(ChannelReadError::NotConnected),
+            };
+        }
         let n = if flags.contains(super::ReceiveFlags::DISCARD) {
             rx_cons.clear()
         } else if flags.contains(super::ReceiveFlags::TRUNC) {
@@ -845,6 +879,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ChannelReadError> {
         let mut rx_cons = self.inner.rx_cons.lock();
+
+        if flags.contains(ReceiveFlags::PEEK) {
+            let Some(DatagramMessage { data, addr }) = rx_cons.iter().next() else {
+                return Ok(0);
+            };
+            if let Some(source_addr) = source_addr {
+                *source_addr = *addr;
+            }
+            if !flags.contains(ReceiveFlags::DISCARD) {
+                let to_copy = core::cmp::min(buf.len(), data.len());
+                buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            }
+            return Ok(data.len());
+        }
 
         if let Some(msg) = rx_cons.try_pop() {
             let DatagramMessage { data, addr } = msg;

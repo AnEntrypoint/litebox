@@ -229,7 +229,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 // this table cannot resolve (see this function's own doc comment) -- both skip
                 // identically; there is no way, or need, to tell them apart from here.
                 let Some(idx) = fd.x.as_usize() else { continue };
-                let Some(Some(entry)) = self.entries.get(idx) else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
                 if !entry.read().matches_subsystem::<Subsystem>() {
                     continue;
                 }
@@ -298,6 +300,28 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         })
     }
 
+    /// Like [`Self::iter`], but skips any entry that cannot be read-locked without waiting (see
+    /// [`Self::iter_mut_nowait`]).
+    pub(crate) fn iter_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                let entry = e.try_read()?;
+                if entry.matches_subsystem::<Subsystem>() {
+                    Some((
+                        InternalFd {
+                            raw: i.try_into().unwrap(),
+                        },
+                        crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     /// An iterator of descriptors and (mutable) entries for a subsystem
     ///
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order
@@ -316,6 +340,37 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     return None;
                 }
                 let entry = e.write();
+                assert!(entry.matches_subsystem::<Subsystem>());
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockWriteGuard::map(entry, |e| {
+                        e.as_subsystem_mut::<Subsystem>()
+                    }),
+                ))
+            })
+        })
+    }
+
+    /// Like [`Self::iter_mut`], but skips any entry whose lock cannot be taken without waiting.
+    ///
+    /// For a single shared worker that must never stall behind a guest thread that holds one
+    /// descriptor across a blocking call: the skipped entry is simply visited on the next pass.
+    pub(crate) fn iter_mut_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            InternalFd,
+            impl core::ops::DerefMut<Target = Subsystem::Entry>,
+        ),
+    > {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                if !e.try_read()?.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
+                let entry = e.try_write()?;
                 assert!(entry.matches_subsystem::<Subsystem>());
                 Some((
                     InternalFd {
@@ -757,15 +812,10 @@ impl RawDescriptorStorage {
         fd: TypedFd<Subsystem>,
         raw_fd: usize,
     ) -> bool {
-        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
-        // be too expensive if someone tries to store into a large raw FD?
-        //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 256,
-            "explicit upper bound restriction for now; see implementation details"
-        );
+        // A dense table is fine for realistic workloads; callers enforce RLIMIT_NOFILE before
+        // reaching here (e.g. `fcntl(F_DUPFD, 1000)` or a spawner parking fds high), so growing to
+        // the requested slot is bounded by that limit rather than by an arbitrary constant that
+        // turned a legal request into a panic.
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
             // There's already something at this slot.
             return false;

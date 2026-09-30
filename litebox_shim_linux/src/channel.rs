@@ -138,6 +138,24 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
         Err(Errno::EAGAIN)
     }
 
+    /// Lets `f` look at every queued item in order without removing any of them (`MSG_PEEK`).
+    pub(crate) fn peek_all<R>(
+        &self,
+        f: impl FnOnce(&mut dyn Iterator<Item = &T>) -> R,
+    ) -> Result<R, Errno> {
+        use ringbuf::traits::Consumer as _;
+        let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
+        let guard = self.endpoint.rb.lock();
+        if guard.is_empty() {
+            return Err(if is_shutdown {
+                Errno::ESHUTDOWN
+            } else {
+                Errno::EAGAIN
+            });
+        }
+        Ok(f(&mut guard.iter()))
+    }
+
     common_functions_for_channel!();
 }
 
