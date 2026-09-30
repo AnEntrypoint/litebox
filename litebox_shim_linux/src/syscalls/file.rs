@@ -998,6 +998,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        if flags.contains(OFlags::TMPFILE) {
+            return self.open_tmpfile(&path, flags, mode);
+        }
         let watching =
             self.inotify_is_watching() && flags.intersects(OFlags::CREAT | OFlags::TRUNC);
         let existed = watching && self.files.borrow().fs.file_status(path.clone()).is_ok();
@@ -1019,6 +1022,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "sys_openat"
         );
         result
+    }
+
+    /// `O_TMPFILE`: an unnamed regular file in directory `dir`, i.e. a file created under a private
+    /// name and unlinked while still open.
+    fn open_tmpfile(&self, dir: &CString, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if !flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
+            return Err(Errno::EINVAL);
+        }
+        let dir_str = dir.to_str().map_err(|_| Errno::EINVAL)?;
+        let is_dir = self
+            .files
+            .borrow()
+            .fs
+            .file_status(dir.clone())
+            .is_ok_and(|st| st.file_type == litebox::fs::FileType::Directory);
+        if !is_dir {
+            return Err(Errno::ENOTDIR);
+        }
+        let name = alloc::format!(
+            "{}/.litebox-tmpfile-{}-{}",
+            dir_str.trim_end_matches('/'),
+            self.pid.get(),
+            NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let path = CString::new(name).map_err(|_| Errno::EINVAL)?;
+        let open_flags = (flags & !(OFlags::TMPFILE)) | OFlags::CREAT | OFlags::EXCL;
+        let fd = self.do_open_resolved(path.clone(), open_flags, mode)?;
+        self.files.borrow().fs.unlink(path).map_err(Errno::from)?;
+        Ok(fd)
     }
 
     /// Open an already-resolved absolute `path`, routing `/dev/ptmx` and `/dev/pts/<id>` to the

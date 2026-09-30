@@ -500,8 +500,14 @@ impl super::backend::Backend for TarRo {
             owner: file.owner,
             node_info: file.node_info.clone(),
             blksize: BLOCK_SIZE,
-            atime: Timestamp::default(),
-            mtime: Timestamp::default(),
+            atime: Timestamp {
+                sec: file.mtime,
+                nsec: 0,
+            },
+            mtime: Timestamp {
+                sec: file.mtime,
+                nsec: 0,
+            },
         })
     }
 
@@ -624,6 +630,9 @@ struct IndexedFile {
     mode: Mode,
     owner: UserInfo,
     node_info: NodeInfo,
+    /// Modification time (seconds since the epoch) from the tar header; 0 when the index was
+    /// rebuilt from merged live entries, which do not carry it.
+    mtime: i64,
 }
 
 struct IndexedDir {
@@ -835,6 +844,7 @@ impl TarIndex {
                             .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                         owner: owner_from_posix_header(header),
                         node_info: inode_allocator.next(),
+                        mtime: header.mtime.as_number::<u64>().map_or(0, |t| t as i64),
                     });
                     raw_entries.push(RawEntry::File { path, file_idx });
                 }
@@ -1130,6 +1140,7 @@ impl TarIndex {
                         mode,
                         owner,
                         node_info: inode_allocator.next(),
+                        mtime: 0,
                     });
                     let parent_dir_idx = match &last_parent {
                         Some((cached_parent, idx)) if cached_parent == parent_path => *idx,
