@@ -33,6 +33,16 @@ impl InodeAllocator {
         Self::for_device(STANDALONE_DEVICE_ID)
     }
 
+    /// Claims `count` consecutive inode numbers and returns the device id and the first of them.
+    #[must_use]
+    pub fn reserve(&self, count: u64) -> (usize, usize) {
+        let first = self.counter.fetch_add(count, Ordering::Relaxed);
+        (
+            self.device_id.try_into().unwrap(),
+            first.try_into().unwrap(),
+        )
+    }
+
     /// Allocate a fresh `NodeInfo` for a new entry on this backend.
     #[must_use]
     pub fn next(&self) -> NodeInfo {

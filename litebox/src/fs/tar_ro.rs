@@ -57,9 +57,7 @@ impl TarRo {
         tar_data: alloc::borrow::Cow<'static, [u8]>,
         inode_allocator: InodeAllocator,
     ) -> Self {
-        Self {
-            tar_index: TarIndex::from_layers(alloc::vec![tar_data], inode_allocator),
-        }
+        Self::from_layers(alloc::vec![tar_data], inode_allocator)
     }
 
     /// Construct a tar backend from multiple OCI-style layer tars, applied bottom-to-top
@@ -72,252 +70,31 @@ impl TarRo {
         inode_allocator: InodeAllocator,
     ) -> Self {
         Self {
-            tar_index: TarIndex::from_layers(layers, inode_allocator),
+            tar_index: TreeIndex::from_layers(layers)
+                .flatten(&inode_allocator),
         }
     }
 
-    /// Every live (post-whiteout-merge) file/symlink this backend's tree holds, as a flat list
-    /// independent of the internal `dirs` tree's shape -- walked back out of the tree
-    /// [`from_layers`] already built, not retained separately. Paired with
-    /// [`from_merged_live_entries`] so a caller can cache this exact list and skip
-    /// [`from_layers`]'s two most expensive phases (parsing every layer's raw tar headers, then
-    /// folding them through whiteout resolution) on a later, equivalent build.
-    ///
-    /// [`from_layers`]: Self::from_layers
-    /// [`from_merged_live_entries`]: Self::from_merged_live_entries
+    /// The flat, position-independent form of this backend's directory index. Persist it and
+    /// hand it back to [`Self::from_flat_index`] (typically as a read-only file mapping) so other
+    /// processes look files up directly in the shared bytes instead of rebuilding a tree.
     #[must_use]
-    pub fn live_entries_after_merge(&self) -> Vec<MergedLiveEntry> {
-        let mut out = Vec::new();
-        self.tar_index.walk_live_entries(0, "", &mut out);
-        out
+    pub fn flat_index(&self) -> &[u8] {
+        &self.tar_index.flat
     }
 
-    /// Rebuild a `TarRo` directly from a previously captured [`live_entries_after_merge`] list
-    /// and the SAME `layers` bytes it was captured against, skipping [`from_layers`]'s tar-parse
-    /// and whiteout-fold phases entirely -- only the comparatively cheap "build a directory tree
-    /// out of a flat live-entry list" phase (`O(final entry count)`, not `O(every entry any layer
-    /// ever contributed)`) still runs.
-    ///
-    /// # Why this is sound
-    ///
-    /// [`from_layers`] is a pure function of `layers`' bytes: the same layer bytes, applied in
-    /// the same order, always fold to the exact same live-entry set -- whiteout resolution has no
-    /// hidden input (no clock, no randomness, no host state). So a `live_entries_after_merge`
-    /// list captured from an earlier [`from_layers`] call against these SAME layer bytes is
-    /// exactly what a fresh [`from_layers`] call would compute again; this function only skips
-    /// redoing that work. The caller owns keying its cache of the captured list by something that
-    /// changes whenever the layer bytes could (e.g. the sorted OCI layer digest list plus the
-    /// rewriter version) -- this function does no validation that `entries` actually matches
-    /// `layers`, the same trust boundary `litebox_packager::oci::cache::read_cached_layer`
-    /// already accepts one level down the pipeline, for the per-layer bytes this builds on.
-    ///
-    /// [`from_layers`]: Self::from_layers
-    /// [`live_entries_after_merge`]: Self::live_entries_after_merge
+    /// Adopt a [`Self::flat_index`] previously produced for the SAME `layers`. `None` when the
+    /// bytes are not a well-formed flat index (see [`is_flat_index`]).
     #[must_use]
-    pub fn from_merged_live_entries(
+    pub fn from_flat_index(
         layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
-        entries: Vec<MergedLiveEntry>,
+        flat: alloc::borrow::Cow<'static, [u8]>,
         inode_allocator: InodeAllocator,
-    ) -> Self {
-        Self {
-            tar_index: TarIndex::from_merged_live_entries(layers, entries, inode_allocator),
-        }
+    ) -> Option<Self> {
+        Some(Self {
+            tar_index: TarIndex::from_flat(layers, flat, &inode_allocator)?,
+        })
     }
-}
-
-/// One post-whiteout-merge file or symlink, as [`TarRo::live_entries_after_merge`]/
-/// [`TarRo::from_merged_live_entries`] exchange it. `path` carries no leading `/`, matching the
-/// convention every path stored inside [`TarIndex`] already uses.
-#[derive(Clone)]
-pub struct MergedLiveEntry {
-    /// Full path from the tree root, no leading `/` (e.g. `"usr/bin/bash"`).
-    pub path: String,
-    /// What kind of entry this is, and its kind-specific data.
-    pub kind: MergedLiveEntryKind,
-}
-
-/// [`MergedLiveEntry`]'s kind-specific payload -- deliberately just the fields [`IndexedFile`]/
-/// [`IndexedSymlink`] hold minus `node_info`, which [`TarRo::from_merged_live_entries`] always
-/// re-allocates fresh (an inode number only needs to be self-consistent within the ONE process
-/// that allocated it; nothing requires it to match a value some earlier process, or an earlier
-/// build in this same process, happened to compute).
-#[derive(Clone)]
-pub enum MergedLiveEntryKind {
-    /// A regular file. `data_range` indexes into `layers[layer_idx]`, exactly as
-    /// [`IndexedFile::data_range`] does.
-    File {
-        /// Which `layers` element (by index) this file's bytes live in.
-        layer_idx: usize,
-        /// Byte range within `layers[layer_idx]` holding this file's contents.
-        data_range: Range<usize>,
-        /// POSIX permission bits.
-        mode: Mode,
-        /// Owning uid/gid.
-        owner: UserInfo,
-        /// Modification time, seconds since the Unix epoch, as recorded in the tar header.
-        mtime: i64,
-    },
-    /// A symlink.
-    Symlink {
-        /// The link's target, exactly as stored in the originating tar entry.
-        target: String,
-        /// Owning uid/gid.
-        owner: UserInfo,
-    },
-    /// An explicit directory: one no file/symlink path implies, or one whose tar header carried
-    /// its own attributes. Programs compare a directory's mtime against values they cached at
-    /// image build time (fontconfig's `cache-N` files), so the time must survive the merge.
-    Dir {
-        /// Owning uid/gid.
-        owner: UserInfo,
-        /// Modification time, seconds since the Unix epoch.
-        mtime: i64,
-        /// POSIX permission bits.
-        mode: Mode,
-    },
-}
-
-/// 4-byte tag identifying [`encode_merged_live_entries`]'s output, bumped whenever the wire
-/// format changes shape (never whenever the semantics it captures change -- that is what a
-/// caller's own cache KEY, e.g. the OCI layer digest list, is for). [`decode_merged_live_entries`]
-/// refuses anything not starting with the CURRENT tag rather than guess at an old layout.
-const MERGED_LIVE_ENTRIES_MAGIC: [u8; 4] = *b"MLE3";
-
-/// Serialize `entries` into a compact binary format `TarRo::from_merged_live_entries`'s caller
-/// can write to a cache file and later hand to [`decode_merged_live_entries`] -- a deliberately
-/// simple, hand-rolled little-endian layout rather than a general serde-based one: this crate is
-/// `no_std`, the shape is small and fixed, and both ends live in this one module.
-#[must_use]
-pub fn encode_merged_live_entries(entries: &[MergedLiveEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + entries.len() * 48);
-    out.extend_from_slice(&MERGED_LIVE_ENTRIES_MAGIC);
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for entry in entries {
-        write_len_prefixed_str(&mut out, &entry.path);
-        match &entry.kind {
-            MergedLiveEntryKind::File {
-                layer_idx,
-                data_range,
-                mode,
-                owner,
-                mtime,
-            } => {
-                out.push(0);
-                out.extend_from_slice(&(*layer_idx as u64).to_le_bytes());
-                out.extend_from_slice(&(data_range.start as u64).to_le_bytes());
-                out.extend_from_slice(&(data_range.end as u64).to_le_bytes());
-                out.extend_from_slice(&mode.bits().to_le_bytes());
-                out.extend_from_slice(&owner.user.to_le_bytes());
-                out.extend_from_slice(&owner.group.to_le_bytes());
-                out.extend_from_slice(&mtime.to_le_bytes());
-            }
-            MergedLiveEntryKind::Symlink { target, owner } => {
-                out.push(1);
-                write_len_prefixed_str(&mut out, target);
-                out.extend_from_slice(&owner.user.to_le_bytes());
-                out.extend_from_slice(&owner.group.to_le_bytes());
-            }
-            MergedLiveEntryKind::Dir { owner, mtime, mode } => {
-                out.push(2);
-                out.extend_from_slice(&owner.user.to_le_bytes());
-                out.extend_from_slice(&owner.group.to_le_bytes());
-                out.extend_from_slice(&mtime.to_le_bytes());
-                out.extend_from_slice(&mode.bits().to_le_bytes());
-            }
-        }
-    }
-    out
-}
-
-fn write_len_prefixed_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// Decode what [`encode_merged_live_entries`] produced. `None` on ANY doubt about validity --
-/// wrong magic, truncated input, an out-of-range length, invalid UTF-8, or an unrecognized kind
-/// tag -- rather than partially trust a corrupt or foreign-format cache file. Mirrors
-/// `litebox_packager::oci::cache::read_cached_layer`'s own "any doubt is a cache miss" discipline
-/// one level down the pipeline.
-#[must_use]
-pub fn decode_merged_live_entries(bytes: &[u8]) -> Option<Vec<MergedLiveEntry>> {
-    let mut pos = 0usize;
-    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
-        let end = pos.checked_add(n)?;
-        let slice = bytes.get(*pos..end)?;
-        *pos = end;
-        Some(slice)
-    };
-    let read_u16 = |pos: &mut usize| -> Option<u16> {
-        Some(u16::from_le_bytes(take(pos, 2)?.try_into().ok()?))
-    };
-    let read_u32 = |pos: &mut usize| -> Option<u32> {
-        Some(u32::from_le_bytes(take(pos, 4)?.try_into().ok()?))
-    };
-    let read_u64 = |pos: &mut usize| -> Option<u64> {
-        Some(u64::from_le_bytes(take(pos, 8)?.try_into().ok()?))
-    };
-    let read_str = |pos: &mut usize| -> Option<String> {
-        let len = read_u32(pos)? as usize;
-        let raw = take(pos, len)?;
-        core::str::from_utf8(raw).ok().map(String::from)
-    };
-
-    if take(&mut pos, 4)? != MERGED_LIVE_ENTRIES_MAGIC {
-        return None;
-    }
-    let count = read_u32(&mut pos)? as usize;
-    let mut out = Vec::with_capacity(count.min(1 << 20));
-    for _ in 0..count {
-        let path = read_str(&mut pos)?;
-        let tag = *take(&mut pos, 1)?.first()?;
-        let kind = match tag {
-            0 => {
-                let layer_idx = read_u64(&mut pos)? as usize;
-                let start = read_u64(&mut pos)? as usize;
-                let end = read_u64(&mut pos)? as usize;
-                if end < start {
-                    return None;
-                }
-                let mode = Mode::from_bits_truncate(read_u32(&mut pos)?);
-                let user = read_u16(&mut pos)?;
-                let group = read_u16(&mut pos)?;
-                let mtime = read_u64(&mut pos)? as i64;
-                MergedLiveEntryKind::File {
-                    layer_idx,
-                    data_range: start..end,
-                    mode,
-                    owner: UserInfo { user, group },
-                    mtime,
-                }
-            }
-            1 => {
-                let target = read_str(&mut pos)?;
-                let user = read_u16(&mut pos)?;
-                let group = read_u16(&mut pos)?;
-                MergedLiveEntryKind::Symlink {
-                    target,
-                    owner: UserInfo { user, group },
-                }
-            }
-            2 => {
-                let user = read_u16(&mut pos)?;
-                let group = read_u16(&mut pos)?;
-                let mtime = read_u64(&mut pos)? as i64;
-                let mode = Mode::from_bits_truncate(read_u32(&mut pos)?);
-                MergedLiveEntryKind::Dir {
-                    owner: UserInfo { user, group },
-                    mtime,
-                    mode,
-                }
-            }
-            _ => return None,
-        };
-        out.push(MergedLiveEntry { path, kind });
-    }
-    // Trailing garbage past the last entry is tolerated (forward-compatible growth room), not
-    // rejected -- only a SHORT read (an in-range access failing) is treated as corruption above.
-    Some(out)
 }
 
 impl super::backend::private::Sealed for TarRo {}
@@ -351,11 +128,11 @@ impl super::backend::Backend for TarRo {
         let mut current = from.into_typed::<Self>();
         let mut walked_components = Vec::with_capacity(components.len());
         for component in components {
-            let child = self.tar_index.dirs[current.idx]
-                .children
-                .get(*component)
+            let child = self
+                .tar_index
+                .child(current.idx, component)
                 .ok_or(WalkError::PathError(PathError::NoSuchFileOrDirectory))?;
-            let IndexedChild::Dir(child_idx) = *child else {
+            let IndexedChild::Dir(child_idx) = child else {
                 return Ok(super::backend::WalkOutcome {
                     components: walked_components,
                     last: WalkingDirHandle::from_typed::<Self>(current),
@@ -363,7 +140,7 @@ impl super::backend::Backend for TarRo {
                 });
             };
 
-            let child = &self.tar_index.dirs[child_idx];
+            let child = self.tar_index.dir(child_idx);
             walked_components.push(super::backend::WalkedComponent {
                 permissions: super::backend::PermissionCheck::ByResolver(
                     super::backend::PermissionInfo {
@@ -405,11 +182,11 @@ impl super::backend::Backend for TarRo {
         flags: OFlags,
     ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let child = self.tar_index.dirs[dir.idx]
-            .children
-            .get(name)
+        let child = self
+            .tar_index
+            .child(dir.idx, name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-        let IndexedChild::File(file_idx) = *child else {
+        let IndexedChild::File(file_idx) = child else {
             // A symlink reaching here means `O_NOFOLLOW`, where Linux returns ELOOP rather than
             // this generic error -- see gm mutable fs-tarro-nofollow-eloop-gap.
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -425,7 +202,7 @@ impl super::backend::Backend for TarRo {
         {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        let file = &self.tar_index.files[file_idx];
+        let file = self.tar_index.file(file_idx);
         Ok(super::backend::Permissioned {
             item: FileHandle::from_typed::<Self>(TarRoFileHandle { idx: file_idx }),
             permissions: super::backend::PermissionCheck::ByResolver(
@@ -439,26 +216,26 @@ impl super::backend::Backend for TarRo {
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
-        Ok(self.tar_index.dirs[handle.idx]
-            .children
-            .iter()
+        Ok(self
+            .tar_index
+            .children(handle.idx)
             .map(|(name, child)| {
-                let (file_type, node_info) = match *child {
+                let (file_type, node_info) = match child {
                     IndexedChild::File(idx) => (
                         FileType::RegularFile,
-                        self.tar_index.files[idx].node_info.clone(),
+                        self.tar_index.file(idx).node_info,
                     ),
                     IndexedChild::Dir(idx) => (
                         FileType::Directory,
-                        self.tar_index.dirs[idx].node_info.clone(),
+                        self.tar_index.dir(idx).node_info,
                     ),
                     IndexedChild::Symlink(idx) => (
                         FileType::Symlink,
-                        self.tar_index.symlinks[idx].node_info.clone(),
+                        self.tar_index.symlink(idx).1,
                     ),
                 };
                 DirEntry {
-                    name: name.clone(),
+                    name: String::from(name),
                     file_type,
                     ino_info: Some(node_info),
                 }
@@ -486,7 +263,7 @@ impl super::backend::Backend for TarRo {
     /// CoW-mmap fast path -- see gm mutable fs-tarro-static-backing-cow.
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         let idx = h.get_typed::<Self>().idx;
-        let file = &self.tar_index.files[idx];
+        let file = self.tar_index.file(idx);
         match &self.tar_index.layers[file.layer_idx] {
             alloc::borrow::Cow::Borrowed(data) => Some(&data[file.data_range.clone()]),
             alloc::borrow::Cow::Owned(_) => None,
@@ -509,14 +286,14 @@ impl super::backend::Backend for TarRo {
         &self,
         h: &FileHandle,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let file = &self.tar_index.files[h.get_typed::<Self>().idx];
+        let file = self.tar_index.file(h.get_typed::<Self>().idx);
         Ok(super::FileStatus {
             nlink: 1,
             file_type: FileType::RegularFile,
             mode: file.mode,
             size: file.data_range.len(),
             owner: file.owner,
-            node_info: file.node_info.clone(),
+            node_info: file.node_info,
             blksize: BLOCK_SIZE,
             atime: Timestamp {
                 sec: file.mtime,
@@ -533,14 +310,14 @@ impl super::backend::Backend for TarRo {
         &self,
         h: &DirHandle,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
+        let dir = self.tar_index.dir(h.get_typed::<Self>().idx);
         Ok(super::FileStatus {
             nlink: 1,
             file_type: FileType::Directory,
             mode: dir.mode.unwrap_or(DEFAULT_DIR_MODE),
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-            node_info: dir.node_info.clone(),
+            node_info: dir.node_info,
             blksize: BLOCK_SIZE,
             atime: Timestamp {
                 sec: dir.mtime,
@@ -568,7 +345,7 @@ impl super::backend::Backend for TarRo {
 
     fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
-        match self.tar_index.dirs[dir.idx].children.get(name) {
+        match self.tar_index.child(dir.idx, name) {
             Some(IndexedChild::Dir(_)) => Err(UnlinkError::IsADirectory),
             Some(IndexedChild::File(_) | IndexedChild::Symlink(_)) => {
                 Err(UnlinkError::ReadOnlyFileSystem)
@@ -579,7 +356,7 @@ impl super::backend::Backend for TarRo {
 
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
-        match self.tar_index.dirs[dir.idx].children.get(name) {
+        match self.tar_index.child(dir.idx, name) {
             Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
             Some(IndexedChild::File(_) | IndexedChild::Symlink(_)) => {
                 Err(RmdirError::NotADirectory)
@@ -594,19 +371,19 @@ impl super::backend::Backend for TarRo {
         name: &str,
     ) -> Result<Option<String>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let child = self.tar_index.dirs[dir.idx]
-            .children
-            .get(name)
+        let child = self
+            .tar_index
+            .child(dir.idx, name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-        match *child {
-            IndexedChild::Symlink(idx) => Ok(Some(self.tar_index.symlinks[idx].target.clone())),
+        match child {
+            IndexedChild::Symlink(idx) => Ok(Some(String::from(self.tar_index.symlink(idx).0))),
             IndexedChild::File(_) | IndexedChild::Dir(_) => Ok(None),
         }
     }
 
     fn chmod_at(&self, dir: DirHandle, name: &str, _mode: Mode) -> Result<(), ChmodError> {
         let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+        if self.tar_index.child(dir.idx, name).is_some() {
             Err(ChmodError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory.into())
@@ -621,7 +398,7 @@ impl super::backend::Backend for TarRo {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+        if self.tar_index.child(dir.idx, name).is_some() {
             Err(ChownError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory.into())
@@ -636,7 +413,7 @@ impl super::backend::Backend for TarRo {
         _mtime: Option<Timestamp>,
     ) -> Result<(), SetTimesError> {
         let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+        if self.tar_index.child(dir.idx, name).is_some() {
             Err(SetTimesError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory.into())
@@ -653,7 +430,6 @@ struct IndexedFile {
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
-    node_info: NodeInfo,
     /// Modification time (seconds since the epoch) from the tar header; 0 when the index was
     /// rebuilt from merged live entries, which do not carry it.
     mtime: i64,
@@ -665,7 +441,6 @@ struct IndexedDir {
     mtime: i64,
     /// Permission bits from the directory's own tar entry; `None` for implied directories.
     mode: Option<Mode>,
-    node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
 
@@ -679,14 +454,361 @@ enum IndexedChild {
 struct IndexedSymlink {
     target: String,
     owner: UserInfo,
-    node_info: NodeInfo,
 }
 
-struct TarIndex {
+struct TreeIndex {
     layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
     files: Vec<IndexedFile>,
     dirs: Vec<IndexedDir>,
     symlinks: Vec<IndexedSymlink>,
+}
+
+const FLAT_MAGIC: [u8; 4] = *b"TFX1";
+const FLAT_HEADER_LEN: usize = 64;
+const FILE_RECORD_LEN: usize = 40;
+const DIR_RECORD_LEN: usize = 32;
+const SYMLINK_RECORD_LEN: usize = 16;
+const CHILD_RECORD_LEN: usize = 16;
+const CHILD_KIND_FILE: u32 = 0;
+const CHILD_KIND_DIR: u32 = 1;
+const CHILD_KIND_SYMLINK: u32 = 2;
+const DIR_HAS_OWNER: u32 = 1;
+const DIR_HAS_MODE: u32 = 2;
+
+struct FileRecord {
+    layer_idx: usize,
+    data_range: Range<usize>,
+    mode: Mode,
+    owner: UserInfo,
+    node_info: NodeInfo,
+    mtime: i64,
+}
+
+struct DirRecord {
+    owner: Option<UserInfo>,
+    mtime: i64,
+    mode: Option<Mode>,
+    node_info: NodeInfo,
+}
+
+struct FlatHeader {
+    file_count: usize,
+    dir_count: usize,
+    symlink_count: usize,
+    files_off: usize,
+    dirs_off: usize,
+    symlinks_off: usize,
+    children_off: usize,
+    strings_off: usize,
+}
+
+impl FlatHeader {
+    fn parse(flat: &[u8]) -> Option<Self> {
+        let header = flat.get(..FLAT_HEADER_LEN)?;
+        if header[..4] != FLAT_MAGIC {
+            return None;
+        }
+        let word = |at: usize| -> usize {
+            u32::from_le_bytes(header[at..at + 4].try_into().unwrap()) as usize
+        };
+        let long = |at: usize| -> Option<usize> {
+            usize::try_from(u64::from_le_bytes(header[at..at + 8].try_into().unwrap())).ok()
+        };
+        let parsed = Self {
+            file_count: word(4),
+            dir_count: word(8),
+            symlink_count: word(12),
+            files_off: long(24)?,
+            dirs_off: long(32)?,
+            symlinks_off: long(40)?,
+            children_off: long(48)?,
+            strings_off: long(56)?,
+        };
+        let child_count = word(16);
+        let fits = |off: usize, count: usize, record: usize| {
+            count
+                .checked_mul(record)
+                .and_then(|n| n.checked_add(off))
+                .is_some_and(|end| end <= flat.len())
+        };
+        (parsed.dir_count != 0
+            && fits(parsed.files_off, parsed.file_count, FILE_RECORD_LEN)
+            && fits(parsed.dirs_off, parsed.dir_count, DIR_RECORD_LEN)
+            && fits(parsed.symlinks_off, parsed.symlink_count, SYMLINK_RECORD_LEN)
+            && fits(parsed.children_off, child_count, CHILD_RECORD_LEN)
+            && parsed.strings_off <= flat.len())
+        .then_some(parsed)
+    }
+}
+
+/// Whether `bytes` is a well-formed [`TarRo::flat_index`] image.
+#[must_use]
+pub fn is_flat_index(bytes: &[u8]) -> bool {
+    FlatHeader::parse(bytes).is_some()
+}
+
+/// The read-only directory index, held as one flat byte image (fixed-size record tables plus a
+/// string blob, children sorted by name) that is read in place. The image has no pointers, so it
+/// can live in a file mapping shared by every process that serves the same layers.
+struct TarIndex {
+    layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+    flat: alloc::borrow::Cow<'static, [u8]>,
+    file_count: usize,
+    dir_count: usize,
+    files_off: usize,
+    dirs_off: usize,
+    symlinks_off: usize,
+    children_off: usize,
+    strings_off: usize,
+    device: usize,
+    first_ino: usize,
+}
+
+impl TarIndex {
+    fn from_flat(
+        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
+        flat: alloc::borrow::Cow<'static, [u8]>,
+        inode_allocator: &InodeAllocator,
+    ) -> Option<Self> {
+        let header = FlatHeader::parse(&flat)?;
+        let (device, first_ino) = inode_allocator
+            .reserve((header.dir_count + header.file_count + header.symlink_count) as u64);
+        Some(Self {
+            layers,
+            flat,
+            file_count: header.file_count,
+            dir_count: header.dir_count,
+            files_off: header.files_off,
+            dirs_off: header.dirs_off,
+            symlinks_off: header.symlinks_off,
+            children_off: header.children_off,
+            strings_off: header.strings_off,
+            device,
+            first_ino,
+        })
+    }
+
+    fn u32_at(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.flat[at..at + 4].try_into().unwrap())
+    }
+
+    fn u64_at(&self, at: usize) -> u64 {
+        u64::from_le_bytes(self.flat[at..at + 8].try_into().unwrap())
+    }
+
+    fn u16_at(&self, at: usize) -> u16 {
+        u16::from_le_bytes(self.flat[at..at + 2].try_into().unwrap())
+    }
+
+    fn string_at(&self, offset: u32, len: u32) -> &str {
+        let start = self.strings_off + offset as usize;
+        core::str::from_utf8(&self.flat[start..start + len as usize]).unwrap_or("")
+    }
+
+    fn node_info(&self, ordinal: usize) -> NodeInfo {
+        NodeInfo {
+            dev: self.device,
+            ino: self.first_ino + ordinal,
+            rdev: None,
+        }
+    }
+
+    fn file(&self, idx: usize) -> FileRecord {
+        let at = self.files_off + idx * FILE_RECORD_LEN;
+        FileRecord {
+            layer_idx: self.u32_at(at) as usize,
+            mode: Mode::from_bits_truncate(self.u32_at(at + 4)),
+            owner: UserInfo {
+                user: self.u16_at(at + 8),
+                group: self.u16_at(at + 10),
+            },
+            mtime: self.u64_at(at + 16) as i64,
+            data_range: self.u64_at(at + 24) as usize..self.u64_at(at + 32) as usize,
+            node_info: self.node_info(self.dir_count + idx),
+        }
+    }
+
+    fn dir(&self, idx: usize) -> DirRecord {
+        let at = self.dirs_off + idx * DIR_RECORD_LEN;
+        let flags = self.u32_at(at + 4);
+        DirRecord {
+            owner: (flags & DIR_HAS_OWNER != 0).then(|| UserInfo {
+                user: self.u16_at(at),
+                group: self.u16_at(at + 2),
+            }),
+            mode: (flags & DIR_HAS_MODE != 0).then(|| Mode::from_bits_truncate(self.u32_at(at + 8))),
+            mtime: self.u64_at(at + 24) as i64,
+            node_info: self.node_info(idx),
+        }
+    }
+
+    fn symlink(&self, idx: usize) -> (&str, NodeInfo) {
+        let at = self.symlinks_off + idx * SYMLINK_RECORD_LEN;
+        (
+            self.string_at(self.u32_at(at), self.u32_at(at + 4)),
+            self.node_info(self.dir_count + self.file_count + idx),
+        )
+    }
+
+    fn child_record(&self, index: usize) -> (&str, IndexedChild) {
+        let at = self.children_off + index * CHILD_RECORD_LEN;
+        let name = self.string_at(self.u32_at(at), self.u32_at(at + 4));
+        let target = self.u32_at(at + 12) as usize;
+        let child = match self.u32_at(at + 8) {
+            CHILD_KIND_FILE => IndexedChild::File(target),
+            CHILD_KIND_DIR => IndexedChild::Dir(target),
+            _ => IndexedChild::Symlink(target),
+        };
+        (name, child)
+    }
+
+    fn child_span(&self, dir: usize) -> Range<usize> {
+        let at = self.dirs_off + dir * DIR_RECORD_LEN;
+        let first = self.u32_at(at + 16) as usize;
+        first..first + self.u32_at(at + 20) as usize
+    }
+
+    fn child(&self, dir: usize, name: &str) -> Option<IndexedChild> {
+        let span = self.child_span(dir);
+        let (mut low, mut high) = (span.start, span.end);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (candidate, child) = self.child_record(mid);
+            match candidate.as_bytes().cmp(name.as_bytes()) {
+                core::cmp::Ordering::Equal => return Some(child),
+                core::cmp::Ordering::Less => low = mid + 1,
+                core::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        None
+    }
+
+    fn children(&self, dir: usize) -> impl Iterator<Item = (&str, IndexedChild)> {
+        self.child_span(dir).map(|index| self.child_record(index))
+    }
+
+    fn file_data(&self, file_idx: usize) -> &[u8] {
+        let file = self.file(file_idx);
+        &self.layers[file.layer_idx][file.data_range]
+    }
+}
+
+impl TreeIndex {
+    fn flatten(self, inode_allocator: &InodeAllocator) -> TarIndex {
+        let Self {
+            layers,
+            files,
+            dirs,
+            symlinks,
+        } = self;
+        let mut file_order: Vec<usize> = Vec::new();
+        let mut file_slot: HashMap<usize, u32> = HashMap::new();
+        let mut symlink_order: Vec<usize> = Vec::new();
+        let mut symlink_slot: HashMap<usize, u32> = HashMap::new();
+        let mut strings: Vec<u8> = Vec::new();
+        let mut children: Vec<u8> = Vec::new();
+        let mut dir_records: Vec<u8> = Vec::with_capacity(dirs.len() * DIR_RECORD_LEN);
+        let mut child_total = 0u32;
+        let push_string = |strings: &mut Vec<u8>, text: &str| -> (u32, u32) {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(text.as_bytes());
+            (offset, text.len() as u32)
+        };
+        for dir in &dirs {
+            let mut names: Vec<(&String, IndexedChild)> =
+                dir.children.iter().map(|(name, child)| (name, *child)).collect();
+            names.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            let first = child_total;
+            for (name, child) in &names {
+                let (name_off, name_len) = push_string(&mut strings, name);
+                let (kind, target) = match *child {
+                    IndexedChild::File(old) => {
+                        let next = file_order.len() as u32;
+                        let slot = *file_slot.entry(old).or_insert_with(|| {
+                            file_order.push(old);
+                            next
+                        });
+                        (CHILD_KIND_FILE, slot)
+                    }
+                    IndexedChild::Dir(idx) => (CHILD_KIND_DIR, idx as u32),
+                    IndexedChild::Symlink(old) => {
+                        let next = symlink_order.len() as u32;
+                        let slot = *symlink_slot.entry(old).or_insert_with(|| {
+                            symlink_order.push(old);
+                            next
+                        });
+                        (CHILD_KIND_SYMLINK, slot)
+                    }
+                };
+                children.extend_from_slice(&name_off.to_le_bytes());
+                children.extend_from_slice(&name_len.to_le_bytes());
+                children.extend_from_slice(&kind.to_le_bytes());
+                children.extend_from_slice(&target.to_le_bytes());
+            }
+            child_total += names.len() as u32;
+            let owner = dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER);
+            let mut flags = 0u32;
+            if dir.owner.is_some() {
+                flags |= DIR_HAS_OWNER;
+            }
+            if dir.mode.is_some() {
+                flags |= DIR_HAS_MODE;
+            }
+            dir_records.extend_from_slice(&owner.user.to_le_bytes());
+            dir_records.extend_from_slice(&owner.group.to_le_bytes());
+            dir_records.extend_from_slice(&flags.to_le_bytes());
+            dir_records.extend_from_slice(&dir.mode.unwrap_or(DEFAULT_DIR_MODE).bits().to_le_bytes());
+            dir_records.extend_from_slice(&0u32.to_le_bytes());
+            dir_records.extend_from_slice(&first.to_le_bytes());
+            dir_records.extend_from_slice(&(names.len() as u32).to_le_bytes());
+            dir_records.extend_from_slice(&dir.mtime.to_le_bytes());
+        }
+        let mut file_records: Vec<u8> = Vec::with_capacity(file_order.len() * FILE_RECORD_LEN);
+        for &old in &file_order {
+            let file = &files[old];
+            file_records.extend_from_slice(&(file.layer_idx as u32).to_le_bytes());
+            file_records.extend_from_slice(&file.mode.bits().to_le_bytes());
+            file_records.extend_from_slice(&file.owner.user.to_le_bytes());
+            file_records.extend_from_slice(&file.owner.group.to_le_bytes());
+            file_records.extend_from_slice(&0u32.to_le_bytes());
+            file_records.extend_from_slice(&file.mtime.to_le_bytes());
+            file_records.extend_from_slice(&(file.data_range.start as u64).to_le_bytes());
+            file_records.extend_from_slice(&(file.data_range.end as u64).to_le_bytes());
+        }
+        let mut symlink_records: Vec<u8> =
+            Vec::with_capacity(symlink_order.len() * SYMLINK_RECORD_LEN);
+        for &old in &symlink_order {
+            let symlink = &symlinks[old];
+            let (offset, len) = push_string(&mut strings, &symlink.target);
+            symlink_records.extend_from_slice(&offset.to_le_bytes());
+            symlink_records.extend_from_slice(&len.to_le_bytes());
+            symlink_records.extend_from_slice(&symlink.owner.user.to_le_bytes());
+            symlink_records.extend_from_slice(&symlink.owner.group.to_le_bytes());
+            symlink_records.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let files_off = FLAT_HEADER_LEN;
+        let dirs_off = files_off + file_records.len();
+        let symlinks_off = dirs_off + dir_records.len();
+        let children_off = symlinks_off + symlink_records.len();
+        let strings_off = children_off + children.len();
+        let mut flat = Vec::with_capacity(strings_off + strings.len());
+        flat.extend_from_slice(&FLAT_MAGIC);
+        flat.extend_from_slice(&(file_order.len() as u32).to_le_bytes());
+        flat.extend_from_slice(&(dirs.len() as u32).to_le_bytes());
+        flat.extend_from_slice(&(symlink_order.len() as u32).to_le_bytes());
+        flat.extend_from_slice(&child_total.to_le_bytes());
+        flat.extend_from_slice(&0u32.to_le_bytes());
+        for off in [files_off, dirs_off, symlinks_off, children_off, strings_off] {
+            flat.extend_from_slice(&(off as u64).to_le_bytes());
+        }
+        flat.extend_from_slice(&file_records);
+        flat.extend_from_slice(&dir_records);
+        flat.extend_from_slice(&symlink_records);
+        flat.extend_from_slice(&children);
+        flat.extend_from_slice(&strings);
+        TarIndex::from_flat(layers, alloc::borrow::Cow::Owned(flat), inode_allocator)
+            .expect("a freshly flattened index is well formed")
+    }
 }
 
 /// A single (path, kind) entry discovered while scanning one layer's raw tar headers, still
@@ -730,7 +852,7 @@ enum RawEntry {
     },
 }
 
-impl TarIndex {
+impl TreeIndex {
     /// Parse one layer's raw tar bytes into a flat list of `RawEntry`, tagging every file/symlink
     /// with `layer_idx` so cross-layer merge order is preserved. Shared by both the single-tar
     /// legacy path and the multi-layer OCI path -- parsing itself has no whiteout awareness; that
@@ -741,7 +863,6 @@ impl TarIndex {
         files: &mut Vec<IndexedFile>,
         symlinks: &mut Vec<IndexedSymlink>,
         raw_entries: &mut Vec<RawEntry>,
-        inode_allocator: &InodeAllocator,
     ) {
         // `tar_no_std::TarArchiveRef::entries()` skips every non-regular-file entry, so symlinks
         // must be indexed by walking the raw header blocks here -- see gm mutable
@@ -873,7 +994,6 @@ impl TarIndex {
                             .to_flags()
                             .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                         owner: owner_from_posix_header(header),
-                        node_info: inode_allocator.next(),
                         mtime: tar_mtime_seconds(header),
                     });
                     raw_entries.push(RawEntry::File { path, file_idx });
@@ -886,7 +1006,6 @@ impl TarIndex {
                     symlinks.push(IndexedSymlink {
                         target: target.into(),
                         owner: owner_from_posix_header(header),
-                        node_info: inode_allocator.next(),
                     });
                     raw_entries.push(RawEntry::Symlink { path, symlink_idx });
                 }
@@ -928,7 +1047,6 @@ impl TarIndex {
     /// folded in order) before that layer's own real files/symlinks are added.
     fn from_layers(
         layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
-        inode_allocator: InodeAllocator,
     ) -> Self {
         let mut files = Vec::new();
         let mut symlinks = Vec::new();
@@ -941,7 +1059,6 @@ impl TarIndex {
                 &mut files,
                 &mut symlinks,
                 &mut raw_entries,
-                &inode_allocator,
             );
         }
 
@@ -1007,7 +1124,6 @@ impl TarIndex {
             owner: None,
             mtime: 0,
             mode: None,
-            node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
@@ -1022,7 +1138,6 @@ impl TarIndex {
                         &mut dirs_by_path,
                         &probe,
                         owner,
-                        &inode_allocator,
                     );
                     if let Some(&idx) = dirs_by_path.get(path.as_str()) {
                         dirs[idx].owner = Some(owner);
@@ -1037,7 +1152,6 @@ impl TarIndex {
                         &mut dirs_by_path,
                         &path,
                         owner,
-                        &inode_allocator,
                     );
                     dirs[parent_dir_idx]
                         .children
@@ -1050,207 +1164,10 @@ impl TarIndex {
                         &mut dirs_by_path,
                         &path,
                         owner,
-                        &inode_allocator,
                     );
                     dirs[parent_dir_idx]
                         .children
                         .insert(name, IndexedChild::Symlink(symlink_idx));
-                }
-            }
-        }
-
-        Self {
-            layers,
-            files,
-            dirs,
-            symlinks,
-        }
-    }
-
-    fn file_data(&self, file_idx: usize) -> &[u8] {
-        let file = &self.files[file_idx];
-        &self.layers[file.layer_idx][file.data_range.clone()]
-    }
-
-    /// Depth-first walk of the already-built `dirs` tree, appending every file/symlink it
-    /// reaches as a [`MergedLiveEntry`] -- the inverse of [`Self::from_merged_live_entries`]'s
-    /// own tree-build loop. `prefix` is the path of `dir_idx` itself (`""` for the root, no
-    /// leading or trailing `/`), matching every path already stored in this index.
-    fn walk_live_entries(&self, dir_idx: usize, prefix: &str, out: &mut Vec<MergedLiveEntry>) {
-        for (name, child) in &self.dirs[dir_idx].children {
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                alloc::format!("{prefix}/{name}")
-            };
-            match *child {
-                IndexedChild::File(idx) => {
-                    let file = &self.files[idx];
-                    out.push(MergedLiveEntry {
-                        path,
-                        kind: MergedLiveEntryKind::File {
-                            layer_idx: file.layer_idx,
-                            data_range: file.data_range.clone(),
-                            mode: file.mode,
-                            owner: file.owner,
-                            mtime: file.mtime,
-                        },
-                    });
-                }
-                IndexedChild::Symlink(idx) => {
-                    let symlink = &self.symlinks[idx];
-                    out.push(MergedLiveEntry {
-                        path,
-                        kind: MergedLiveEntryKind::Symlink {
-                            target: symlink.target.clone(),
-                            owner: symlink.owner,
-                        },
-                    });
-                }
-                IndexedChild::Dir(idx) => {
-                    if self.dirs[idx].children.is_empty() || self.dirs[idx].mode.is_some() {
-                        out.push(MergedLiveEntry {
-                            path: path.clone(),
-                            kind: MergedLiveEntryKind::Dir {
-                                owner: self.dirs[idx].owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                                mtime: self.dirs[idx].mtime,
-                                mode: self.dirs[idx].mode.unwrap_or(DEFAULT_DIR_MODE),
-                            },
-                        });
-                    }
-                    self.walk_live_entries(idx, &path, out);
-                }
-            }
-        }
-    }
-
-    /// The tail half of [`Self::from_layers`] (build a `dirs` tree from a flat live-entry list),
-    /// fed by a previously captured [`MergedLiveEntry`] list instead of a freshly parsed-and-
-    /// folded `live` map -- skips [`Self::parse_layer`] and the whiteout fold entirely. See
-    /// [`TarRo::from_merged_live_entries`]'s own doc comment for the soundness argument.
-    fn from_merged_live_entries(
-        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
-        entries: Vec<MergedLiveEntry>,
-        inode_allocator: InodeAllocator,
-    ) -> Self {
-        let mut files = Vec::new();
-        let mut symlinks = Vec::new();
-        let mut dirs = alloc::vec![IndexedDir {
-            owner: None,
-            mtime: 0,
-            mode: None,
-            node_info: inode_allocator.next(),
-            children: HashMap::new(),
-        }];
-        let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
-        // `entries` comes from `walk_live_entries`'s depth-first walk, which visits every entry
-        // under the same directory consecutively -- so, overwhelmingly, an entry's immediate
-        // parent is the SAME directory the entry right before it was just placed in. Remembering
-        // that one (parent path, parent dir index) pair turns the common case into an O(1)
-        // string comparison instead of `ensure_ancestors`'s full split-and-hash-lookup of every
-        // ancestor component, which is what made an earlier version of this function take nearly
-        // as long as the `TarIndex::from_layers` rebuild it exists to replace (measured live: a
-        // 71k-entry `debian-xfce` merge's tree-build phase alone, without this, cost ~1.8s of a
-        // fork child's ~2.4s total -- see `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 56th pass).
-        let mut last_parent: Option<(alloc::string::String, usize)> = None;
-
-        for entry in entries {
-            let (parent_path, name) = match entry.path.rsplit_once('/') {
-                Some((p, n)) => (p, n),
-                None => ("", entry.path.as_str()),
-            };
-            match entry.kind {
-                MergedLiveEntryKind::File {
-                    layer_idx,
-                    data_range,
-                    mode,
-                    owner,
-                    mtime,
-                } => {
-                    // Never trust a cached entry's byte range blindly: `Self::file_data` indexes
-                    // `layers[layer_idx][data_range]` unchecked, so an out-of-bounds cache entry
-                    // (a stale cache surviving a layer-bytes change some other invalidation
-                    // signal missed, or plain disk corruption) would panic a guest-reachable read
-                    // instead of just serving a wrong/missing file -- see this crate's standing
-                    // "guest-reachable code returns an errno, never a panic" rule. Silently
-                    // dropping the one bad entry (best-effort, matching
-                    // `litebox_packager::oci::cache::read_cached_layer`'s own "any doubt, skip
-                    // it" discipline) is strictly safer than trusting it or aborting the whole
-                    // rebuild over one entry.
-                    let Some(layer_len) = layers.get(layer_idx).map(|l| l.len()) else {
-                        continue;
-                    };
-                    if data_range.end > layer_len {
-                        continue;
-                    }
-                    let file_idx = files.len();
-                    files.push(IndexedFile {
-                        layer_idx,
-                        data_range,
-                        mode,
-                        owner,
-                        node_info: inode_allocator.next(),
-                        mtime,
-                    });
-                    let parent_dir_idx = match &last_parent {
-                        Some((cached_parent, idx)) if cached_parent == parent_path => *idx,
-                        _ => {
-                            let (idx, _name) = ensure_ancestors(
-                                &mut dirs,
-                                &mut dirs_by_path,
-                                &entry.path,
-                                owner,
-                                &inode_allocator,
-                            );
-                            last_parent = Some((parent_path.into(), idx));
-                            idx
-                        }
-                    };
-                    dirs[parent_dir_idx]
-                        .children
-                        .insert(name.into(), IndexedChild::File(file_idx));
-                }
-                MergedLiveEntryKind::Dir { owner, mtime, mode } => {
-                    let mut probe = entry.path.clone();
-                    probe.push_str("/x");
-                    ensure_ancestors(
-                        &mut dirs,
-                        &mut dirs_by_path,
-                        &probe,
-                        owner,
-                        &inode_allocator,
-                    );
-                    if let Some(&idx) = dirs_by_path.get(entry.path.as_str()) {
-                        dirs[idx].owner = Some(owner);
-                        dirs[idx].mtime = mtime;
-                        dirs[idx].mode = Some(mode);
-                    }
-                    last_parent = None;
-                }
-                MergedLiveEntryKind::Symlink { target, owner } => {
-                    let symlink_idx = symlinks.len();
-                    symlinks.push(IndexedSymlink {
-                        target,
-                        owner,
-                        node_info: inode_allocator.next(),
-                    });
-                    let parent_dir_idx = match &last_parent {
-                        Some((cached_parent, idx)) if cached_parent == parent_path => *idx,
-                        _ => {
-                            let (idx, _name) = ensure_ancestors(
-                                &mut dirs,
-                                &mut dirs_by_path,
-                                &entry.path,
-                                owner,
-                                &inode_allocator,
-                            );
-                            last_parent = Some((parent_path.into(), idx));
-                            idx
-                        }
-                    };
-                    dirs[parent_dir_idx]
-                        .children
-                        .insert(name.into(), IndexedChild::Symlink(symlink_idx));
                 }
             }
         }
@@ -1366,7 +1283,6 @@ fn ensure_ancestors(
     dirs_by_path: &mut HashMap<String, usize>,
     path: &str,
     owner: UserInfo,
-    inode_allocator: &InodeAllocator,
 ) -> (usize, String) {
     let components: Vec<&str> = path
         .split('/')
@@ -1389,8 +1305,7 @@ fn ensure_ancestors(
                 owner: Some(owner),
                 mtime: 0,
                 mode: None,
-                node_info: inode_allocator.next(),
-                children: HashMap::new(),
+                    children: HashMap::new(),
             });
             dirs.len() - 1
         });

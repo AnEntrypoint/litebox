@@ -2426,7 +2426,7 @@ fn diag_process_fork_task_resume_probe(
 /// list -- exactly the kind of repeated, avoidable work `.litebox-cache`'s existing per-layer
 /// cache already exists to eliminate one stage earlier in this same pipeline. This cache applies
 /// the identical idea one stage later: cache the MERGE's own result, not just its raw inputs.
-const MERGED_ROOTFS_INDEX_CACHE_VERSION: u32 = 1;
+const MERGED_ROOTFS_INDEX_CACHE_VERSION: u32 = 3;
 
 /// Numbers each borrowed (host-mmapped) layer by its position so demand-paged file mappings can be
 /// re-described to a fork child, which maps the same layers at different addresses.
@@ -2467,12 +2467,12 @@ fn merged_rootfs_index_cache_path(cache_key: &str) -> std::path::PathBuf {
 /// `TarRo::from_layers` cost this pass, same as if this cache didn't exist.
 fn read_merged_rootfs_index_cache(
     resolved_layers_json: &str,
-) -> Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>> {
+) -> Option<std::borrow::Cow<'static, [u8]>> {
     let diag = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
     let cache_key = merged_rootfs_index_cache_key(resolved_layers_json);
     let path = merged_rootfs_index_cache_path(&cache_key);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
+    let bytes: &'static [u8] = match mmapped_file(&path) {
+        Ok(mapped) => mapped.data,
         Err(e) => {
             if diag {
                 eprintln!("[diag-mergedidx] MISS reading {}: {e}", path.display());
@@ -2517,21 +2517,18 @@ fn read_merged_rootfs_index_cache(
         }
         return None;
     }
-    let result = litebox::fs::tar_ro::decode_merged_live_entries(bytes.get(4 + key_len..)?);
+    let flat = bytes.get(4 + key_len..)?;
+    let result = litebox::fs::tar_ro::is_flat_index(flat).then_some(flat);
     if diag {
         match &result {
-            Some(entries) => eprintln!(
-                "[diag-mergedidx] HIT {} ({} entries)",
-                path.display(),
-                entries.len()
-            ),
-            None => eprintln!("[diag-mergedidx] MISS {}: decode failed", path.display()),
+            Some(flat) => eprintln!("[diag-mergedidx] HIT {} ({} bytes)", path.display(), flat.len()),
+            None => eprintln!("[diag-mergedidx] MISS {}: not a flat index", path.display()),
         }
     }
-    result
+    result.map(std::borrow::Cow::Borrowed)
 }
 
-/// Persist `entries` (a [`litebox::fs::tar_ro::TarRo::live_entries_after_merge`] result) as the
+/// Persist `flat_index` (a [`litebox::fs::tar_ro::TarRo::flat_index`] image) as the
 /// cache entry for `resolved_layers_json`, for [`read_merged_rootfs_index_cache`] to find on a
 /// later, equivalent fork or boot. Best-effort and non-fatal, matching every other cache in this
 /// pipeline: a write failure (read-only filesystem, disk full, a losing race against a sibling
@@ -2544,7 +2541,7 @@ fn read_merged_rootfs_index_cache(
 /// `litebox_packager::oci::cache::write_cached_layer_inner` already uses one stage earlier.
 fn write_merged_rootfs_index_cache(
     resolved_layers_json: &str,
-    entries: &[litebox::fs::tar_ro::MergedLiveEntry],
+    flat_index: &[u8],
 ) {
     let cache_key = merged_rootfs_index_cache_key(resolved_layers_json);
     let final_path = merged_rootfs_index_cache_path(&cache_key);
@@ -2557,7 +2554,7 @@ fn write_merged_rootfs_index_cache(
     let mut bytes = Vec::with_capacity(4 + resolved_layers_json.len());
     bytes.extend_from_slice(&(resolved_layers_json.len() as u32).to_le_bytes());
     bytes.extend_from_slice(resolved_layers_json.as_bytes());
-    bytes.extend_from_slice(&litebox::fs::tar_ro::encode_merged_live_entries(entries));
+    bytes.extend_from_slice(flat_index);
 
     let tmp_path = dir.join(format!(
         ".tmp-mergedidx-{}-{}",
@@ -2569,9 +2566,8 @@ fn write_merged_rootfs_index_cache(
         let renamed = std::fs::rename(&tmp_path, &final_path);
         if diag {
             eprintln!(
-                "[diag-mergedidx] WROTE {} ({} entries, {} bytes) ok={}",
+                "[diag-mergedidx] WROTE {} ({} bytes) ok={}",
                 final_path.display(),
-                entries.len(),
                 bytes.len(),
                 renamed.is_ok()
             );

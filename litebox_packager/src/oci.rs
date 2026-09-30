@@ -79,6 +79,43 @@ pub struct RootfsEntry {
     pub symlink_target: Option<String>,
 }
 
+/// Same result as `image_ref.parse::<Reference>()`, without the Unicode regular expression that
+/// parser compiles on first use: its NFA costs about 30MB of heap that the process never returns.
+fn parse_reference(image_ref: &str) -> anyhow::Result<Reference> {
+    anyhow::ensure!(!image_ref.is_empty(), "empty image reference");
+    let (name_and_tag, digest) = match image_ref.split_once('@') {
+        Some((head, digest)) => (head, Some(digest.to_owned())),
+        None => (image_ref, None),
+    };
+    let last_segment_start = name_and_tag.rfind('/').map_or(0, |at| at + 1);
+    let (name, tag) = match name_and_tag[last_segment_start..].rfind(':') {
+        Some(at) => (
+            &name_and_tag[..last_segment_start + at],
+            Some(name_and_tag[last_segment_start + at + 1..].to_owned()),
+        ),
+        None => (name_and_tag, None),
+    };
+    anyhow::ensure!(!name.is_empty(), "empty repository name");
+    let (mut registry, mut repository) = match name.split_once('/') {
+        Some((left, right)) if left.contains('.') || left.contains(':') || left == "localhost" => {
+            (left.to_owned(), right.to_owned())
+        }
+        _ => ("docker.io".to_owned(), name.to_owned()),
+    };
+    if registry == "index.docker.io" {
+        registry = "docker.io".to_owned();
+    }
+    if registry == "docker.io" && !repository.contains('/') {
+        repository = format!("library/{repository}");
+    }
+    Ok(match (tag, digest) {
+        (Some(tag), Some(digest)) => Reference::with_tag_and_digest(registry, repository, tag, digest),
+        (Some(tag), None) => Reference::with_tag(registry, repository, tag),
+        (None, Some(digest)) => Reference::with_digest(registry, repository, digest),
+        (None, None) => Reference::with_tag(registry, repository, "latest".to_owned()),
+    })
+}
+
 /// Pull an OCI image from a registry and extract its layers into a temp directory.
 ///
 /// Supports standard image references like:
@@ -96,8 +133,7 @@ pub struct RootfsEntry {
 /// authorization error from the registry.
 pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
     // Parse the image reference
-    let reference: Reference = image_ref
-        .parse()
+    let reference = parse_reference(image_ref)
         .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
 
     if verbose {
@@ -833,8 +869,7 @@ fn pull_layers_in_memory_impl(
     known_layers: Option<Vec<oci_client::manifest::OciDescriptor>>,
     verbose: bool,
 ) -> anyhow::Result<(PulledLayers, String)> {
-    let reference: Reference = image_ref
-        .parse()
+    let reference = parse_reference(image_ref)
         .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
 
     if verbose {

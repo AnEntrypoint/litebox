@@ -512,7 +512,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         tar_layers: Vec<Cow<'static, [u8]>>,
     ) -> (
         DefaultFS<Platform>,
-        Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+        Option<Cow<'static, [u8]>>,
     ) {
         default_fs(
             &self.litebox,
@@ -544,14 +544,14 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_layers: Vec<Cow<'static, [u8]>>,
-        merged_entries: Vec<litebox::fs::tar_ro::MergedLiveEntry>,
+        flat_index: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
         default_fs(
             &self.litebox,
             self.platform,
             in_mem_fs,
             tar_layers,
-            MergeInput::UseCached(merged_entries),
+            MergeInput::UseCached(flat_index),
             self.proc_self_info.clone(),
             self.pts_registry.clone(),
         )
@@ -1327,7 +1327,7 @@ enum MergeInput {
     /// Skip `TarRo::from_layers` entirely and build straight from an already-known
     /// `live_entries_after_merge` list via `TarRo::from_merged_live_entries` -- see that
     /// function's own doc comment for the soundness argument.
-    UseCached(Vec<litebox::fs::tar_ro::MergedLiveEntry>),
+    UseCached(Cow<'static, [u8]>),
 }
 
 /// Create a default layered file system with the given in-memory layer and one or more
@@ -1342,7 +1342,7 @@ fn default_fs<Platform: ShimPlatform>(
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 ) -> (
     LinuxFS<Platform>,
-    Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+    Option<Cow<'static, [u8]>>,
 ) {
     // Populated as a side effect of the `/`-mount closure below, ONLY on the
     // `BuildFresh { capture_for_caller: true }` branch -- `Composer::builder().mount`'s closure
@@ -1352,7 +1352,7 @@ fn default_fs<Platform: ShimPlatform>(
     // `.build()` below returns (single-threaded, synchronous -- the closure has already run by
     // then), never touched concurrently.
     let freshly_built_entries: core::cell::RefCell<
-        Option<Vec<litebox::fs::tar_ro::MergedLiveEntry>>,
+        Option<Cow<'static, [u8]>>,
     > = core::cell::RefCell::new(None);
     // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
     // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
@@ -1589,16 +1589,15 @@ fn default_fs<Platform: ShimPlatform>(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/", |allocator| match merge_input {
-                MergeInput::UseCached(entries) => {
-                    litebox::fs::tar_ro::TarRo::from_merged_live_entries(
-                        tar_layers, entries, allocator,
-                    )
+                MergeInput::UseCached(flat) => {
+                    litebox::fs::tar_ro::TarRo::from_flat_index(tar_layers, flat, allocator)
+                        .expect("the caller checked the flat index")
                 }
                 MergeInput::BuildFresh { capture_for_caller } => {
                     let built = litebox::fs::tar_ro::TarRo::from_layers(tar_layers, allocator);
                     if capture_for_caller {
                         *freshly_built_entries.borrow_mut() =
-                            Some(built.live_entries_after_merge());
+                            Some(Cow::Owned(built.flat_index().to_vec()));
                     }
                     built
                 }
