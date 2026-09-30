@@ -942,7 +942,12 @@ impl TarIndex {
 
         for raw_entry in raw_entries {
             match raw_entry {
-                RawEntry::Dir { path, owner, mtime, mode } => {
+                RawEntry::Dir {
+                    path,
+                    owner,
+                    mtime,
+                    mode,
+                } => {
                     if path.is_empty() {
                         continue;
                     }

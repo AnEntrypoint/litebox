@@ -36,7 +36,12 @@ struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
     // Token (see `fs::ident::thread_token`) of the thread that write-locked this lock; 0 when
     // unlocked or unknown. Lets a waiter recover the lock if that thread died holding it.
     writer_owner: core::sync::atomic::AtomicU32,
+    // Tokens of up to `READER_SLOTS` threads holding a read lock (0 = free slot); readers beyond
+    // that are simply not tracked. Same purpose as `writer_owner`, for readers that died.
+    reader_owners: [core::sync::atomic::AtomicU32; READER_SLOTS],
 }
+
+const READER_SLOTS: usize = 4;
 
 const READ_LOCKED: u32 = 1;
 const MASK: u32 = (1 << 30) - 1;
@@ -88,6 +93,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
             state: <Platform::RawMutex as RawMutex>::INIT,
             writer_notify: <Platform::RawMutex as RawMutex>::INIT,
             writer_owner: core::sync::atomic::AtomicU32::new(0),
+            reader_owners: [const { core::sync::atomic::AtomicU32::new(0) }; READER_SLOTS],
         }
     }
 
@@ -116,7 +122,49 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     }
 
     #[inline]
+    fn note_reader(&self) {
+        let token = crate::fs::ident::thread_token();
+        if token == 0 {
+            return;
+        }
+        for slot in &self.reader_owners {
+            if slot.compare_exchange(0, token, Relaxed, Relaxed).is_ok() {
+                return;
+            }
+        }
+    }
+
+    #[inline]
     unsafe fn read_unlock(&self) {
+        let token = crate::fs::ident::thread_token();
+        if token != 0 {
+            for slot in &self.reader_owners {
+                if slot.compare_exchange(token, 0, Relaxed, Relaxed).is_ok() {
+                    break;
+                }
+            }
+        }
+        // SAFETY: forwarded.
+        unsafe { self.read_unlock_raw() };
+    }
+
+    /// Releases, on behalf of threads that no longer exist, the read locks they held.
+    #[cold]
+    fn recover_dead_readers(&self) {
+        for slot in &self.reader_owners {
+            let token = slot.load(Relaxed);
+            if token != 0
+                && !crate::fs::ident::thread_token_alive(token)
+                && slot.compare_exchange(token, 0, Relaxed, Relaxed).is_ok()
+            {
+                // SAFETY: the dead thread's read lock will never be released by anyone else.
+                unsafe { self.read_unlock_raw() };
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn read_unlock_raw(&self) {
         let state = self
             .state
             .underlying_atomic()
@@ -213,6 +261,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     /// memory shared across processes), release it on that thread's behalf.
     #[cold]
     fn recover_dead_writer(&self) {
+        self.recover_dead_readers();
         let state = self.state.underlying_atomic().load(Relaxed);
         if !is_write_locked(state) {
             return;
@@ -677,6 +726,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
             &raw const self.raw.state,
         );
         self.raw.read();
+        self.raw.note_reader();
         RwLockReadGuard {
             rwlock: self,
             #[cfg(feature = "lock_tracing")]
@@ -715,6 +765,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         if !self.raw.try_read() {
             return None;
         }
+        self.raw.note_reader();
         Some(RwLockReadGuard {
             rwlock: self,
             #[cfg(feature = "lock_tracing")]
@@ -837,6 +888,26 @@ mod tests {
         *lock.write() += 1;
         assert!(started.elapsed() >= core::time::Duration::from_secs(1));
         assert_eq!(*lock.read(), 8);
+    }
+
+    /// A read holder that vanished must not block writers forever.
+    #[test]
+    fn read_lock_is_recovered_from_a_dead_holder() {
+        crate::fs::ident::set_thread_id_fn(|| ID.with(Cell::get));
+        crate::fs::ident::set_thread_alive_fn(|tid| tid != DEAD_THREAD);
+
+        let lock = alloc::sync::Arc::new(RwLock::<MockPlatform, u32>::new(1));
+        {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                ID.with(|id| id.set(DEAD_THREAD));
+                core::mem::forget(lock.read());
+            })
+            .join()
+            .unwrap();
+        }
+        *lock.write() += 1;
+        assert_eq!(*lock.read(), 2);
     }
 
     /// A live holder is never stolen from.
