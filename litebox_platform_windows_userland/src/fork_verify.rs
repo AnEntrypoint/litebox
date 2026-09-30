@@ -2023,6 +2023,28 @@ pub(crate) fn readable_region(addr: usize) -> Option<core::ops::Range<usize>> {
     (start..end).contains(&addr).then_some(start..end)
 }
 
+/// Like [`readable_region`] but also reports the extent of a NON-readable region, so a caller
+/// walking many pages can skip the whole unreadable run with one query.
+pub(crate) fn region_readability(addr: usize) -> (bool, core::ops::Range<usize>) {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok {
+        return (false, addr..addr + 4096);
+    }
+    let start = mbi.BaseAddress as usize;
+    let end = start.saturating_add(mbi.RegionSize).max(addr + 1);
+    let readable = mbi.State == Win32_Memory::MEM_COMMIT && mbi.Protect & NO_ACCESS == 0;
+    (readable, start.min(addr)..end)
+}
+
 /// If `instruction` writes to memory, computes the effective address it writes to from its
 /// operands plus the live register values in `context`.
 ///

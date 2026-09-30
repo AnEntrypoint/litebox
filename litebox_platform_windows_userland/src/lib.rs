@@ -13343,6 +13343,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // 173MB region, ~42,000 pages) -- see `readable_region`'s own doc comment for the full
         // finding and why batching the WRITE side instead (tried first) did not help.
         let mut cached_region: Option<core::ops::Range<usize>> = None;
+        let mut dead_region: Option<core::ops::Range<usize>> = None;
         let read_source_bytes = |range: core::ops::Range<usize>| {
             use litebox::platform::RawConstPointer as _;
             const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
@@ -13360,8 +13361,18 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                     continue;
                 }
                 let in_cached_region = cached_region.as_ref().is_some_and(|r| r.contains(&addr));
+                if dead_region.as_ref().is_some_and(|r| r.contains(&addr)) {
+                    off += chunk;
+                    continue;
+                }
                 if !in_cached_region {
-                    cached_region = fork_verify::readable_region(addr);
+                    let (readable, region) = fork_verify::region_readability(addr);
+                    if readable {
+                        cached_region = Some(region);
+                    } else {
+                        cached_region = None;
+                        dead_region = Some(region);
+                    }
                 }
                 if cached_region.is_some() {
                     let ptr = <Self as litebox::platform::RawPointerProvider>::RawConstPointer::<

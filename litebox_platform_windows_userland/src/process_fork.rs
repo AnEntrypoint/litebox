@@ -4529,6 +4529,7 @@ fn copy_one_group(
     // `read_source_bytes`'s own construction site in this crate's `lib.rs`
     // (`spawn_cross_process_fork_child`) for where that is addressed instead. Left as simple,
     // unbatched per-page writes here deliberately, now that batching is a confirmed non-fix.
+    let (mut n_unreadable, mut n_zero, mut n_written) = (0usize, 0usize, 0usize);
     let mut cursor = source_group.start;
     while cursor < source_group.end {
         let page_end = (cursor + PAGE_SIZE).min(source_group.end);
@@ -4542,6 +4543,7 @@ fn copy_one_group(
                     page_range.start, page_range.end, source_group.start, source_group.end
                 );
             }
+            n_unreadable += 1;
             cursor = page_end;
             continue;
         };
@@ -4564,9 +4566,11 @@ fn copy_one_group(
             }
         }
         if bytes.iter().all(|b| *b == 0) {
+            n_zero += 1;
             cursor = page_end;
             continue;
         }
+        n_written += 1;
         let mut written = 0usize;
         let dest = (reserved as usize + (cursor - source_group.start)) as *mut c_void;
         let ok = unsafe {
@@ -4591,6 +4595,12 @@ fn copy_one_group(
         cursor = page_end;
     }
 
+    if std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some() && len >= (16 << 20) {
+        eprintln!(
+            "[diag-fork-timing] (parent) group {:#x} pages: unreadable_or_skipped={n_unreadable} zero={n_zero} written={n_written}",
+            source_group.start
+        );
+    }
     if log_zeroes {
         for (run_start, run_words) in &zero_runs {
             let run_end = run_start + run_words * 8;
