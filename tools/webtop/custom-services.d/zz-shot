@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bash
+sleep ${WAIT:-60}
+kill -TERM 1
+sleep 1000
