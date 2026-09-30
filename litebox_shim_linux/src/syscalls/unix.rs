@@ -1028,10 +1028,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     fn try_recvfrom(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let ConnTransport::Local { recv_channel, .. } = &self.transport else {
-            return self.try_recvfrom_shared(buf);
+            return self.try_recvfrom_shared(buf, peek);
         };
+        if peek {
+            // Bytes only, across as many queued messages as `buf` holds; ancillary fds stay queued.
+            return recv_channel
+                .peek_all(|messages| {
+                    let mut total = 0;
+                    for msg in messages {
+                        if total == buf.len() {
+                            break;
+                        }
+                        let n = (buf.len() - total).min(msg.data.len());
+                        buf[total..total + n].copy_from_slice(&msg.data[..n]);
+                        total += n;
+                    }
+                    (total, Vec::new())
+                })
+                .map_err(|e| match e {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                });
+        }
         let mut total_read = 0;
         let mut fds = Vec::new();
         // `buf` itself is reassigned (advanced) below as bytes are consumed; keep a raw pointer
@@ -1099,6 +1120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     fn try_recvfrom_shared(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let ConnTransport::Shared {
             global,
@@ -1114,7 +1136,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             return Err(TryOpError::Other(Errno::ESHUTDOWN));
         }
         let (read_ring, _) = Self::shared_rings(global, *slot, *is_client);
-        let n = read_ring.try_read(buf);
+        let n = if peek { read_ring.try_peek(buf) } else { read_ring.try_read(buf) };
+        if n > 0 && peek {
+            return Ok((n, Vec::new()));
+        }
         if n > 0 {
             litebox_util_log::debug!(
                 slot:% = *slot, is_client:% = *is_client, len:% = n;
@@ -1166,10 +1191,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     fn try_recvfrom_one_message(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), TryOpError<Errno>> {
         let ConnTransport::Local { recv_channel, .. } = &self.transport else {
-            return self.try_recvfrom_shared(buf);
+            return self.try_recvfrom_shared(buf, peek);
         };
+        if peek {
+            return recv_channel
+                .peek_all(|messages| {
+                    let n = messages.next().map_or(0, |msg| {
+                        let n = buf.len().min(msg.data.len());
+                        buf[..n].copy_from_slice(&msg.data[..n]);
+                        n
+                    });
+                    (n, Vec::new())
+                })
+                .map_err(|e| match e {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                });
+        }
         let mut fds = Vec::new();
         let n = recv_channel.peek_and_consume_one(|msg| {
             fds.append(&mut msg.fds);
@@ -1835,6 +1876,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         let res = wait_on_events_polling(
@@ -1854,9 +1896,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                         .connected()
                         .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
                     let n = if self.preserve_boundaries {
-                        conn.try_recvfrom_one_message(buf)?
+                        conn.try_recvfrom_one_message(buf, peek)?
                     } else {
-                        conn.try_recvfrom(buf)?
+                        conn.try_recvfrom(buf, peek)?
                     };
                     // For connected stream sockets, no need to return the source address
                     if let Some(source_addr) = source_addr.as_deref_mut() {
@@ -2033,6 +2075,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
         &self,
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+        peek: bool,
     ) -> Result<usize, TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
@@ -2041,8 +2084,8 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
             if let Some(source_addr) = source_addr.as_deref_mut() {
                 *source_addr = Some(msg.source.clone());
             }
-            // Always consume the entire message to preserve boundaries.
-            Ok((true, msg.data.len()))
+            // Always consume the entire message to preserve boundaries (unless only peeking).
+            Ok((!peek, msg.data.len()))
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
@@ -2247,6 +2290,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
         let res = cx
@@ -2263,7 +2307,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut())
+                    recv_channel.try_read(buf, source_addr.as_deref_mut(), peek)
                 },
             )
             .map_err(Errno::from);
@@ -2568,21 +2612,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         // CMSG_CLOEXEC is meaningless for plain recvfrom (no ancillary data ever flows there) but
         // harmless to accept -- net.rs's do_recvmsg is what actually honors it.
-        let supported_flags =
-            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::CMSG_CLOEXEC
+            | ReceiveFlags::PEEK;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
+        let peek = flags.contains(ReceiveFlags::PEEK);
         let timeout = self.options.lock().recv_timeout;
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
             }
             UnixSocketInner::Datagram(datagram) => datagram
-                .recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                .recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
                 .map(|n| (n, Vec::new())),
         };
         match ret {
@@ -3299,6 +3346,18 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// still open" and "empty and shut down" by design -- callers distinguish via
     /// [`Self::is_shutdown`]/[`Self::is_empty`], mirroring `channel::ReadEnd::peek_and_consume_one`'s
     /// own EAGAIN-vs-ESHUTDOWN split.
+    /// Like [`Self::try_read`] but leaves the bytes queued (`MSG_PEEK`).
+    pub(crate) fn try_peek(&self, out: &mut [u8]) -> usize {
+        let cursor = self.cursor.lock();
+        let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let n = out.len().min(avail);
+        for (i, slot) in out.iter_mut().take(n).enumerate() {
+            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+                .load(Ordering::Relaxed);
+        }
+        n
+    }
+
     pub(crate) fn try_read(&self, out: &mut [u8]) -> usize {
         let mut cursor = self.cursor.lock();
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
