@@ -4236,6 +4236,10 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    PidfdOpen {
+        pid: i32,
+        flags: u32,
+    },
     Getrusage {
         who: i32,
         usage: UserPtrMut<u8>,
@@ -5350,6 +5354,7 @@ impl SyscallRequest {
             Sysno::mlock | Sysno::mlock2 | Sysno::munlock | Sysno::mlockall | Sysno::munlockall => {
                 SyscallRequest::SchedYield
             }
+            Sysno::pidfd_open => sys_req!(PidfdOpen { pid, flags }),
             Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => SyscallRequest::SchedYield,
             Sysno::getxattr

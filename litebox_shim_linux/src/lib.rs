@@ -3041,6 +3041,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.

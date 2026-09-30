@@ -2251,6 +2251,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         const P_ALL: i32 = 0;
         const P_PID: i32 = 1;
+        const P_PIDFD: i32 = 3;
 
         const WNOHANG: i32 = 0x1;
         const WEXITED: i32 = 0x4;
@@ -2271,6 +2272,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let target_pid: i32 = match idtype {
             P_ALL => -1,
             P_PID => i32::try_from(id).map_err(|_| Errno::EINVAL)?,
+            P_PIDFD => self.pidfd_target(i32::try_from(id).map_err(|_| Errno::EBADF)?)?,
             // `P_PGID`/`P_PIDFD`: this shim tracks only its own `pgid` and has no registry to
             // resolve another group with, exactly as `sys_wait4` documents for `pid < -1`.
             // `ECHILD` ("no child matched") is the honest answer; `EINVAL` would blame the
@@ -2281,7 +2283,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
-        let (child_pid, exit_status) = if target_pid == -1 {
+        // A child forked as a separate OS process is not in `children`; `wait4` already knows how to
+        // wait for one, so borrow it and translate the packed status back into a `waitid` result.
+        let cross_process_target = if target_pid == -1 {
+            process.children.lock().is_empty() && !process.cross_process_children.lock().is_empty()
+        } else {
+            process.find_cross_process_child(target_pid).is_some()
+        };
+        let cross_process_result = if cross_process_target {
+            let mut packed: i32 = 0;
+            let packed_ptr = UserPtrMut::from_usize((&raw mut packed).expose_provenance());
+            let wait_options = if no_hang { WNOHANG } else { 0 };
+            let reaped = self.sys_wait4(target_pid, Some(packed_ptr), wait_options, None)?;
+            if reaped == 0 {
+                if let Some(infop) = infop {
+                    for i in 0..7 {
+                        let _ = infop.write_at_offset::<Platform>(i, 0);
+                    }
+                }
+                return Ok(0);
+            }
+            let status = if packed & 0x7f == 0 {
+                ExitStatus::Exit(((packed >> 8) & 0xff) as u8 as i8)
+            } else {
+                match litebox_common_linux::signal::Signal::try_from(packed & 0x7f) {
+                    Ok(sig) => ExitStatus::Signal(sig),
+                    Err(_) => ExitStatus::Exit(0),
+                }
+            };
+            Some((i32::try_from(reaped).unwrap_or(target_pid), status))
+        } else {
+            None
+        };
+
+        let (child_pid, exit_status) = if let Some(done) = cross_process_result {
+            done
+        } else if target_pid == -1 {
             if process.children.lock().is_empty() {
                 return Err(Errno::ECHILD);
             }

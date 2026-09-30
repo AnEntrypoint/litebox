@@ -64,6 +64,10 @@ pub(crate) type InotifyRegistry<Platform> = BTreeMap<u32, InotifyInstance<Platfo
 #[derive(Clone, Copy)]
 pub(crate) struct InotifyId(u32);
 
+/// Entry metadata on a `pidfd_open` read end, naming the child it watches.
+#[derive(Clone, Copy)]
+pub(crate) struct PidfdTarget(i32);
+
 fn event_record(wd: i32, mask: u32, cookie: u32, name: Option<&str>) -> Vec<u8> {
     let name_len = name.map_or(0, |n| (n.len() + 1).next_multiple_of(EVENT_HEADER));
     let mut out = Vec::with_capacity(EVENT_HEADER + name_len);
@@ -333,3 +337,76 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// symlinked target produces; neither is modelled, both are accepted.
 #[allow(dead_code, reason = "documented no-op flags")]
 const _ACCEPTED_FLAGS: u32 = IN_EXCL_UNLINK | IN_DONT_FOLLOW;
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// `pidfd_open(2)` for a child this process forked: a pipe read end that becomes readable
+    /// (one byte, then EOF) when the child exits, which is what poll/epoll on a pidfd observe.
+    /// Any other pid answers `ENOSYS`, which callers (glib) already treat as "no pidfd support" and
+    /// fall back to `SIGCHLD`.
+    pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: u32) -> Result<u32, Errno> {
+        const PIDFD_NONBLOCK: u32 = 0x800;
+        if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let handle = self
+            .process()
+            .find_cross_process_child(pid)
+            .ok_or(Errno::ENOSYS)?;
+        let mut open_flags = OFlags::CLOEXEC;
+        if flags & PIDFD_NONBLOCK != 0 {
+            open_flags |= OFlags::NONBLOCK;
+        }
+        let pipe = self.global.create_linux_pipe(open_flags)?;
+        let writer = self.global.pipes().detach_end(&pipe.writer);
+        let _ = self.global.close_linux_pipe(&pipe.writer);
+        let Ok(writer) = writer else {
+            let _ = self.global.close_linux_pipe(&pipe.reader);
+            return Err(Errno::EMFILE);
+        };
+        let platform = self.global.platform;
+        platform.spawn_cross_process_exit_notifier(
+            handle,
+            alloc::boxed::Box::new(move || {
+                let wait_state = litebox::event::wait::WaitState::new(platform);
+                let _ = writer.write(&wait_state.context(), b"x");
+            }),
+        );
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let _ = dt.set_entry_metadata(&pipe.reader, PidfdTarget(pid));
+        }
+        let files = self.files.borrow();
+        match files.insert_raw_fd(pipe.reader) {
+            Ok(raw) => Ok(u32::try_from(raw).unwrap_or(u32::MAX)),
+            Err(reader) => {
+                let _ = self.global.close_linux_pipe(&reader);
+                Err(Errno::EMFILE)
+            }
+        }
+    }
+
+    /// The child pid a pidfd names (`waitid(P_PIDFD, fd, ...)`), or `EBADF`/`EINVAL`.
+    pub(crate) fn pidfd_target(&self, fd: i32) -> Result<i32, Errno> {
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw,
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |pipe_fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(pipe_fd, |t: &PidfdTarget| t.0)
+                    .map_err(|_| Errno::EINVAL)
+            },
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+        )?
+    }
+}

@@ -76,7 +76,8 @@ the platform `RawMutex` records the mutex holder (`note_locked`); a waiter block
 and reopens the lock if the holder is gone (`litebox::fs::ident::set_thread_id_fn` / `set_thread_alive_fn`; the
 tid is cached per thread and reset in a forked child by `set_process_guest_pid`). Unit tests in
 `litebox/src/sync/rwlock.rs` prove both recovery and that a live holder is never stolen from.
-Known gaps (not yet fixed): `pidfd_open` (glib falls back); `ptrace` answers EPERM, IPv6 is served by the IPv4 machinery only,
+`pidfd_open` works for children this process forked (pipe read end readable at exit, `waitid(P_PIDFD)`); `waitid` now also reaps cross-process fork children (it used to answer ECHILD for them).
+Known gaps (not yet fixed): `ptrace` answers EPERM, IPv6 is served by the IPv4 machinery only,
 `/dev/shm`
 statfs, `/proc/<pid>/fd` for other processes (the per-pid `fds` closures live in that process's private memory),
 (up to 4 readers per lock are tracked for dead-holder recovery),
