@@ -3030,6 +3030,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EFAULT)
                 }
             }
+            SyscallRequest::Getrusage { who, usage } => {
+                // RUSAGE_CHILDREN = -1, RUSAGE_SELF = 0, RUSAGE_THREAD = 1. No per-process
+                // accounting exists here, so every counter reads zero.
+                if !(-1..=1).contains(&who) {
+                    return Err(Errno::EINVAL);
+                }
+                usage
+                    .write_slice_at_offset::<Platform>(0, &[0u8; 144])
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.

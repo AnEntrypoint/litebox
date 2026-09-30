@@ -4236,6 +4236,10 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<u8>,
+    },
     SchedGetParam {
         pid: Option<i32>,
         param: UserPtrMut<i32>,
@@ -5338,6 +5342,11 @@ impl SyscallRequest {
             // thread, and the host scheduler is not the guest's to tune); accepting the request
             // is what an unprivileged `nice` that happens to succeed looks like.
             Sysno::setpriority => SyscallRequest::SchedYield,
+            // Guest memory is never swapped, so pinning it in RAM is already true of every page.
+            Sysno::mlock | Sysno::mlock2 | Sysno::munlock | Sysno::mlockall | Sysno::munlockall => {
+                SyscallRequest::SchedYield
+            }
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => SyscallRequest::SchedYield,
             Sysno::getxattr
             | Sysno::lgetxattr
