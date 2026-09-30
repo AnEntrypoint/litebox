@@ -5342,6 +5342,10 @@ impl SyscallRequest {
             // thread, and the host scheduler is not the guest's to tune); accepting the request
             // is what an unprivileged `nice` that happens to succeed looks like.
             Sysno::setpriority => SyscallRequest::SchedYield,
+            // Tracing another process is not offered; `EPERM` is what a kernel with ptrace
+            // restricted (yama, or a container default) answers, which debuggers and crash
+            // handlers already handle, unlike an unimplemented-syscall error.
+            Sysno::ptrace => return Err(errno::Errno::EPERM),
             // Guest memory is never swapped, so pinning it in RAM is already true of every page.
             Sysno::mlock | Sysno::mlock2 | Sysno::munlock | Sysno::mlockall | Sysno::munlockall => {
                 SyscallRequest::SchedYield
