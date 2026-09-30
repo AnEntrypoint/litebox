@@ -62,14 +62,20 @@ named processes/threads (path arguments decoded); `LITEBOX_DIAG_BIGALLOC=1` name
 `gdb -p <root runner> -batch -ex "thread apply all bt"` and read the futex word a waiter sleeps on (`/proc/<pid>/task/<tid>/syscall`).
 The cgroup memory limit of the dev container is ~14 GB; watch `memory.usage_in_bytes` while booting.
 
-Done since: inotify (real watches, events from every fs syscall), `MSG_PEEK` on AF_UNIX, xattr stubs, file
-timestamps (platform-registered clock), `mincore`, `/proc/<pid>/environ`.
-Known gaps (not yet fixed): netlink `RTM_GETLINK/GETADDR` (Chromium's address tracker),
-`ptrace`/`rt_sigtimedwait`/`rt_tgsigqueueinfo`, `copy_file_range`/`pidfd_open`/`splice`, `O_TMPFILE` and
-`O_DIRECT` pipes, IPv6, `/dev/shm` statfs, `/proc/<pid>/fd` for other processes, HTTPS :3001, dconf-service,
-tar-layer file timestamps are 1970, a leaked per-descriptor `RwLock` reader still blocks that descriptor's
-writers (only the network worker is protected), lib unit tests of `litebox_shim_linux` do not compile
-(pre-existing `add_interest` signature drift).
+Done since: inotify (real watches, events from every fs syscall), `MSG_PEEK` on AF_UNIX AND inet stream/datagram
+channels (it used to consume the bytes, which broke TLS on nginx :3001 -- now fixed and served), xattr stubs, file and
+directory timestamps (platform clock; tar layers carry their octal header mtime), `mincore`, `copy_file_range`,
+`splice`, `rt_sigtimedwait`, `rt_(tg)sigqueueinfo`, `O_TMPFILE`, netlink `NETLINK_ROUTE` link/addr/route dumps,
+`/proc/<pid>/environ`, `litebox_shim_linux` lib tests compile and pass (`RUST_MIN_STACK=64M`, `--skip tun`: the
+`tun` tests need a host TUN device). Unix waits poll once before honoring an already-expired deadline.
+A layered-fs panic while holding the root write lock hangs every later `open` in every process (the panic hook
+`_exit`s without releasing it) -- that is how a single stray panic turned into a "Connecting" desktop; the specific
+panic (closing a lower fd whose cached entry a `rename` had dropped) is fixed.
+Known gaps (not yet fixed): `ptrace`, `pidfd_open`, `getrusage`, `mlock`, IPv6 is served by the IPv4 machinery only,
+directory modes in tar layers are still the permissive default (only owner + mtime come from the tar), `/dev/shm`
+statfs, `/proc/<pid>/fd` for other processes, an unrelated process dying while it holds a shared `RwLock` guard
+still wedges that lock (the root cause of the panic class above; only the network worker and the shared-heap lock
+recover from a dead owner).
 
 ## Linux runner (`litebox_runner_linux_userland`) native fork -- 108th pass
 
