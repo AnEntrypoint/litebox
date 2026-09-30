@@ -2045,10 +2045,14 @@ fn diag_process_fork_task_resume_probe(
                 continue;
             };
             // The guest gets the end it will USE; the host pump gets the other one.
-            let host_end = match dir {
-                pf::ChildPipeEnd::ChildWrites => entrypoints.install_pipe_write_end_at_fd(fd),
-                pf::ChildPipeEnd::ChildReads => entrypoints.install_pipe_read_end_at_fd(fd),
+            let host_end = if dir.child_writes() {
+                entrypoints.install_pipe_write_end_at_fd(fd)
+            } else {
+                entrypoints.install_pipe_read_end_at_fd(fd)
             };
+            if dir.cloexec() && host_end.is_some() {
+                entrypoints.mark_fd_cloexec(fd);
+            }
             let Some(host_end) = host_end else {
                 eprintln!(
                     "[process_fork_diag] task-resume-probe (child): could not install a pipe at guest fd {fd}, it will be missing"
@@ -2057,10 +2061,7 @@ fn diag_process_fork_task_resume_probe(
             };
             eprintln!(
                 "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt over inherited Windows pipe handle {handle:#x} (child {})",
-                match dir {
-                    pf::ChildPipeEnd::ChildWrites => "writes",
-                    pf::ChildPipeEnd::ChildReads => "reads",
-                }
+                if dir.child_writes() { "writes" } else { "reads" }
             );
             let pump_shim = shim.clone();
             // Live-caught (2026-09-21): this pump thread's `detached_pipe_read`/`detached_pipe_write`
@@ -2088,7 +2089,7 @@ fn diag_process_fork_task_resume_probe(
                     // is what gives the parent's own pump a zero-byte read, and hence the guest on
                     // the far side its EOF. `detached_pipe_read` blocks in the guest pipe's own
                     // wait machinery and returns 0 once the guest has closed every writer.
-                    pf::ChildPipeEnd::ChildWrites => {
+                    pf::ChildPipeEnd::ChildWrites | pf::ChildPipeEnd::ChildWritesCloexec => {
                         // `chunk_num`/`total_relayed` (added during the pipe-relay-sigpipe
                         // investigation, 2026-09-16): kept as a permanent, low-volume trace point
                         // -- this only prints once, on the terminal chunk of this pipe's lifetime,
@@ -2114,7 +2115,7 @@ fn diag_process_fork_task_resume_probe(
                     // Fill the guest's pipe from the inherited handle. Dropping `host_end` at the
                     // end releases the local write end, so the guest's `read` sees EOF once the
                     // parent's side is done.
-                    pf::ChildPipeEnd::ChildReads => {
+                    pf::ChildPipeEnd::ChildReads | pf::ChildPipeEnd::ChildReadsCloexec => {
                         loop {
                             let n = pf::read_from_inherited_handle(handle, &mut buf);
                             if n == 0 {

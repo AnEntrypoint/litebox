@@ -1379,6 +1379,12 @@ pub enum ChildPipeEnd {
     ChildWrites,
     /// The child inherits the READ end and reads; the parent keeps the write end.
     ChildReads,
+    /// [`Self::ChildWrites`] for a guest fd that is close-on-exec: the child's rebuilt fd must
+    /// carry `FD_CLOEXEC`, or a `posix_spawn`-style error pipe stays open through `exec` and the
+    /// parent blocks reading it until the exec'd program exits.
+    ChildWritesCloexec,
+    /// [`Self::ChildReads`] for a close-on-exec guest fd.
+    ChildReadsCloexec,
 }
 
 impl ChildPipeEnd {
@@ -1389,6 +1395,31 @@ impl ChildPipeEnd {
         match self {
             Self::ChildWrites => 'w',
             Self::ChildReads => 'r',
+            Self::ChildWritesCloexec => 'W',
+            Self::ChildReadsCloexec => 'R',
+        }
+    }
+
+    /// Whether the child writes into the OS pipe (the parent-side bridge is a `Sink`).
+    #[must_use]
+    pub fn child_writes(self) -> bool {
+        matches!(self, Self::ChildWrites | Self::ChildWritesCloexec)
+    }
+
+    /// Whether the guest fd this pipe rebuilds is close-on-exec.
+    #[must_use]
+    pub fn cloexec(self) -> bool {
+        matches!(self, Self::ChildWritesCloexec | Self::ChildReadsCloexec)
+    }
+
+    /// This direction, marked close-on-exec when `cloexec`.
+    #[must_use]
+    pub fn with_cloexec(self, cloexec: bool) -> Self {
+        match (self.child_writes(), cloexec) {
+            (true, false) => Self::ChildWrites,
+            (true, true) => Self::ChildWritesCloexec,
+            (false, false) => Self::ChildReads,
+            (false, true) => Self::ChildReadsCloexec,
         }
     }
 
@@ -1398,6 +1429,8 @@ impl ChildPipeEnd {
         match tag {
             "w" => Some(Self::ChildWrites),
             "r" => Some(Self::ChildReads),
+            "W" => Some(Self::ChildWritesCloexec),
+            "R" => Some(Self::ChildReadsCloexec),
             _ => None,
         }
     }
@@ -1432,9 +1465,10 @@ pub fn create_inheritable_child_pipe(which: ChildPipeEnd) -> Result<(HANDLE, HAN
             unsafe { GetLastError() }
         ));
     }
-    let (local, child) = match which {
-        ChildPipeEnd::ChildWrites => (read_handle, write_handle),
-        ChildPipeEnd::ChildReads => (write_handle, read_handle),
+    let (local, child) = if which.child_writes() {
+        (read_handle, write_handle)
+    } else {
+        (write_handle, read_handle)
     };
     // Safety: `local` was just returned by `CreatePipe`.
     if unsafe { SetHandleInformation(local, HANDLE_FLAG_INHERIT, 0) } == 0 {

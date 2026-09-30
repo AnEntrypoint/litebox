@@ -13506,7 +13506,8 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 litebox::platform::ForkPipeBridge::Source(_) => {
                     process_fork::ChildPipeEnd::ChildReads
                 }
-            };
+            }
+            .with_cloexec(bridge.cloexec());
             match process_fork::create_inheritable_child_pipe(which) {
                 Ok((local, child)) => {
                     child_pipe_handles.push((fd, child, which));

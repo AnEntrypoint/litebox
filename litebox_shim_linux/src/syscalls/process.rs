@@ -3359,6 +3359,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             alloc::vec::Vec::new();
         let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
+            if self.raw_fd_is_inotify(*raw_fd) {
+                dropped_process_local += 1;
+                continue;
+            }
             let carried = i32::try_from(*raw_fd)
                 .ok()
                 .and_then(|fd| Some((fd, self.detached_pipe_end_for_raw_fd(*raw_fd)?)));
@@ -3390,7 +3394,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     };
                     let eof_probe = alloc::sync::Arc::clone(&end);
-                    let bridge = match half {
+                    let mut bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
                             litebox::platform::ForkPipeBridge::Sink(
                                 litebox::platform::ForkPipeEnd::new(
@@ -3418,6 +3422,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             )
                         }
                     };
+                    bridge.set_cloexec(self.raw_fd_is_cloexec(*raw_fd));
                     inherited_pipes.push((fd, bridge));
                 }
                 // Not a pipe. A regular file needs no bridge at all -- the child's filesystem is

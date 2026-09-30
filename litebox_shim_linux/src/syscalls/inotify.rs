@@ -84,6 +84,9 @@ fn event_record(wd: i32, mask: u32, cookie: u32, name: Option<&str>) -> Vec<u8> 
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_inotify_init1(&self, flags: u32) -> Result<u32, Errno> {
+        if self.global.platform.env_flag("LITEBOX_BISECT_NO_INOTIFY") {
+            return Err(Errno::ENOSYS);
+        }
         let flags = OFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
         if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
@@ -126,6 +129,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(Errno::EMFILE)
             }
         }
+    }
+
+    /// Whether `raw_fd` is an inotify descriptor. An instance is fed by this process's own file
+    /// system syscalls, so a cross-process fork child has nothing to receive on its copy and must
+    /// not be given a pump for it.
+    pub(crate) fn raw_fd_is_inotify(&self, raw_fd: usize) -> bool {
+        self.inotify_instance_of(i32::try_from(raw_fd).unwrap_or(-1)).is_ok()
     }
 
     /// The instance id behind `fd`, or `EINVAL` when `fd` is not an inotify descriptor.
@@ -344,6 +354,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Any other pid answers `ENOSYS`, which callers (glib) already treat as "no pidfd support" and
     /// fall back to `SIGCHLD`.
     pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: u32) -> Result<u32, Errno> {
+        if self.global.platform.env_flag("LITEBOX_BISECT_NO_PIDFD") {
+            return Err(Errno::ENOSYS);
+        }
         const PIDFD_NONBLOCK: u32 = 0x800;
         if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);

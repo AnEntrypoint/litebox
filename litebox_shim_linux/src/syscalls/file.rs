@@ -3616,6 +3616,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
+    /// Set `FD_CLOEXEC` on the descriptor at raw number `raw_fd`, whatever it is; a no-op when
+    /// nothing is open there.
+    pub(crate) fn mark_raw_fd_cloexec(&self, raw_fd: i32) {
+        let Ok(raw_fd) = usize::try_from(raw_fd) else {
+            return;
+        };
+        let files = self.files.borrow();
+        let _ = files.run_on_raw_fd(
+            raw_fd,
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+        );
+    }
+
     /// Set `FD_CLOEXEC` on one descriptor, whatever subsystem it belongs to.
     ///
     /// Close-on-exec is a property of the descriptor table entry, not of the file behind it, so

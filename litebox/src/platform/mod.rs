@@ -1595,6 +1595,23 @@ impl ForkPipeBridge {
             Self::Source(e) => e.owners(),
         }
     }
+
+    /// Record whether the guest fd this bridge carries is close-on-exec.
+    pub fn set_cloexec(&mut self, cloexec: bool) {
+        match self {
+            Self::Sink(e) => e.cloexec = cloexec,
+            Self::Source(e) => e.cloexec = cloexec,
+        }
+    }
+
+    /// Whether the guest fd this bridge carries is close-on-exec.
+    #[must_use]
+    pub fn cloexec(&self) -> bool {
+        match self {
+            Self::Sink(e) => e.cloexec(),
+            Self::Source(e) => e.cloexec(),
+        }
+    }
 }
 
 impl core::fmt::Debug for ForkPipeBridge {
@@ -1612,6 +1629,7 @@ pub struct ForkPipeEnd<F> {
     transfer: F,
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
+    cloexec: bool,
 }
 
 impl<F> ForkPipeEnd<F> {
@@ -1627,7 +1645,21 @@ impl<F> ForkPipeEnd<F> {
             transfer,
             owners: alloc::boxed::Box::new(owners),
             at_eof: alloc::boxed::Box::new(at_eof),
+            cloexec: false,
         }
+    }
+
+    /// Mark the guest fd this end belongs to as close-on-exec, so the child's rebuilt fd is too.
+    #[must_use]
+    pub fn with_cloexec(mut self, cloexec: bool) -> Self {
+        self.cloexec = cloexec;
+        self
+    }
+
+    /// Whether the guest fd this end belongs to is close-on-exec.
+    #[must_use]
+    pub fn cloexec(&self) -> bool {
+        self.cloexec
     }
 
     /// Whether the parent-side pipe can only ever yield end-of-file (see

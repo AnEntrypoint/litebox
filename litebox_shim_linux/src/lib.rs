@@ -373,6 +373,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         self.task.install_pipe_read_end_at_fd(target_fd)
     }
 
+    /// Mark the rebuilt guest fd `target_fd` close-on-exec (a carried pipe end that was).
+    pub fn mark_fd_cloexec(&self, target_fd: i32) {
+        self.task.mark_raw_fd_cloexec(target_fd);
+    }
+
     /// Reopen an inherited regular file at exactly `target_fd`, positioned at `offset`. See
     /// `Task::install_file_at_fd`. Same thread requirement as the pipe installers.
     pub fn install_file_at_fd(
