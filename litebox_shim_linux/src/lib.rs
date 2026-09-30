@@ -605,6 +605,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let my_memfds = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
         let my_shared_files =
             Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        // Same reasoning again for the inotify registry and its "anything watched" counter.
+        let my_inotify = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        let my_inotify_watching = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         // Ninth instance of the SAME defect -- see `GlobalStateHandle::unix_addr_table`'s doc
         // comment (2026-09-18 systematic audit).
         let my_unix_addr_table = Arc::new(litebox::sync::RwLock::new(
@@ -677,6 +680,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             segment_scan_cache: my_segment_scan_cache,
             futex_manager: my_futex_manager,
             memfds: my_memfds,
+            inotify: my_inotify,
+            inotify_watching: my_inotify_watching,
             shared_files: my_shared_files,
             unix_addr_table: my_unix_addr_table,
             fifo_registry: my_fifo_registry,
@@ -2335,6 +2340,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 behavior,
             } => syscall!(sys_madvise(addr, length, behavior)),
+            SyscallRequest::InotifyInit { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                syscall!(sys_inotify_add_watch(fd, pathname, mask))
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
             SyscallRequest::Msync {
                 addr,
                 length,
@@ -3132,6 +3142,10 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// for the live-caught 2026-09-18 evidence (`sed`/`xset` both died on this, a corrupted-
     /// `BTreeMap`-node panic in `syscalls::mm::MemfdRegistry`, fixed the identical way).
     memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    /// Every inotify instance (see `syscalls::inotify`), shared by all processes.
+    inotify: Arc<litebox::sync::Mutex<Platform, syscalls::inotify::InotifyRegistry<Platform>>>,
+    /// How many watches exist; file-system syscalls skip event delivery when it is zero.
+    inotify_watching: Arc<core::sync::atomic::AtomicUsize>,
     shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
     /// Ninth instance of the SAME defect class this struct's own doc comment documents eight
     /// times over, found during the 2026-09-18 systematic `GlobalState`-field audit: this table's
@@ -3206,6 +3220,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             segment_scan_cache: self.segment_scan_cache.clone(),
             futex_manager: self.futex_manager.clone(),
             memfds: self.memfds.clone(),
+            inotify: self.inotify.clone(),
+            inotify_watching: self.inotify_watching.clone(),
             shared_files: self.shared_files.clone(),
             unix_addr_table: self.unix_addr_table.clone(),
             fifo_registry: self.fifo_registry.clone(),

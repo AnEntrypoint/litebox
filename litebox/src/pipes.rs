@@ -208,6 +208,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         Ok(DetachedPipeEnd { end })
     }
 
+    /// The number of bytes waiting to be read from the receiver end at `fd` (`FIONREAD`).
+    ///
+    /// A sender end reports `0`.
+    pub fn readable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let litebox = self.litebox.lock().clone();
+        let dt = litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
+            PipeEnd::Sender(_) => Ok(0),
+        }
+    }
+
     /// Whether the provided FD points to a reader or a writer end.
     pub fn half_pipe_type(
         &self,

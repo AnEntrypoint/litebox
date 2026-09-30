@@ -981,7 +981,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        let watching =
+            self.inotify_is_watching() && flags.intersects(OFlags::CREAT | OFlags::TRUNC);
+        let existed = watching && self.files.borrow().fs.file_status(path.clone()).is_ok();
         let result = self.do_open_resolved(path.clone(), flags, mode);
+        if watching && result.is_ok() {
+            use super::inotify::{IN_CREATE, IN_MODIFY};
+            if !existed && flags.contains(OFlags::CREAT) {
+                self.inotify_path(&path, IN_CREATE, false);
+            } else if existed && flags.contains(OFlags::TRUNC) {
+                self.inotify_path(&path, IN_MODIFY, false);
+            }
+        }
         // Matches `sys_mmap`/`sys_munmap`'s own debug-log pattern (added the same investigation
         // session): without this, no trace can ever map an `init_elf_patch_state`/`sys_mmap`
         // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
@@ -1280,7 +1291,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files
+        let result = files
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
@@ -1312,7 +1323,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL))
-            .flatten()
+            .flatten();
+        if result.is_ok() {
+            self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
+        }
+        result
     }
 
     /// Handle syscall `fallocate` -- ensure `[offset, offset+len)` is allocated in `fd`.
@@ -1580,6 +1595,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             result
         };
+        if result.is_ok() {
+            self.inotify_path(
+                &path,
+                super::inotify::IN_DELETE,
+                flags.contains(AtFlags::AT_REMOVEDIR),
+            );
+        }
         litebox_util_log::debug!(
             tid:% = self.tid.get(), path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
             "sys_unlinkat"
@@ -1684,12 +1706,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
+        let moved_is_dir = self.inotify_is_watching()
+            && self
+                .files
+                .borrow()
+                .fs
+                .symlink_metadata(old_path.clone())
+                .is_ok_and(|s| s.file_type == litebox::fs::FileType::Directory);
         let result = self
             .files
             .borrow()
             .fs
             .rename(old_path.clone(), new_path.clone())
             .map_err(Errno::from);
+        if result.is_ok() && self.inotify_is_watching() {
+            let cookie = Self::inotify_cookie();
+            if let (Ok(from), Ok(to)) = (old_path.to_str(), new_path.to_str()) {
+                self.inotify_notify(from, super::inotify::IN_MOVED_FROM, moved_is_dir, cookie);
+                self.inotify_notify(to, super::inotify::IN_MOVED_TO, moved_is_dir, cookie);
+            }
+        }
         litebox_util_log::debug!(
             tid:% = self.tid.get(),
             from:% = old_path.to_string_lossy(),
@@ -1721,11 +1757,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .link(old_path, new_path)
-            .map_err(Errno::from)
+            .link(old_path, new_path.clone())
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&new_path, super::inotify::IN_CREATE, false);
+        }
+        result
     }
 
     /// Handle syscall `symlinkat`
@@ -1750,6 +1791,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             err:? = result.as_ref().err();
             "sys_symlinkat"
         );
+        if result.is_ok() {
+            self.inotify_path(&linkpath, super::inotify::IN_CREATE, false);
+        }
         result
     }
 
@@ -2217,6 +2261,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten();
         drop(files);
         if let Some(n) = wrote_file {
+            self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
             self.propagate_write_to_shared_mapping(raw_fd, offset, &buf[..n.min(buf.len())]);
         }
         if let Ok(n) = res
@@ -2582,6 +2627,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
         let result = self.do_mkdir(pathname.clone(), Mode::from_bits_retain(mode));
+        if result.is_ok() {
+            self.inotify_path(&pathname, super::inotify::IN_CREATE, true);
+        }
         litebox_util_log::debug!(
             tid:% = self.tid.get(), path:% = pathname.to_string_lossy(), err:? = result.as_ref().err();
             "sys_mkdirat"
@@ -2603,11 +2651,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .chmod(pathname, Mode::from_bits_retain(mode))
-            .map_err(Errno::from)
+            .chmod(pathname.clone(), Mode::from_bits_retain(mode))
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&pathname, super::inotify::IN_ATTRIB, false);
+        }
+        result
     }
 
     /// Handle syscall `fchmod`.
@@ -2719,7 +2772,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<FS>(raw_fd, None)
+        if !self.inotify_is_watching() {
+            return self.do_close_and_replace::<FS>(raw_fd, None);
+        }
+        // The path and access mode are gone once the descriptor is: read them first.
+        let (path, writable) = {
+            let files = self.files.borrow();
+            let path = files.lookup_fd_path(raw_fd);
+            let writable = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed| {
+                        files
+                            .fs
+                            .open_flags(typed)
+                            .is_some_and(|f| f.intersects(OFlags::WRONLY | OFlags::RDWR))
+                    },
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            (path, writable)
+        };
+        let result = self.do_close_and_replace::<FS>(raw_fd, None);
+        if result.is_ok()
+            && let Some(path) = path
+        {
+            use super::inotify::{IN_CLOSE_NOWRITE, IN_CLOSE_WRITE};
+            self.inotify_path(
+                &path,
+                if writable { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE },
+                false,
+            );
+        }
+        result
     }
 
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
@@ -4103,11 +4196,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .set_times(path, atime, mtime)
-            .map_err(Errno::from)
+            .set_times(path.clone(), atime, mtime)
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&path, super::inotify::IN_ATTRIB, false);
+        }
+        result
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
@@ -5686,6 +5784,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             IoctlArg::FIONREAD(out) => {
+                // A pipe (inotify descriptors included) reports its queued bytes.
+                let pipe_bytes = files
+                    .run_on_raw_fd(
+                        desc,
+                        |_| None,
+                        |_| None,
+                        |pipe| self.global.pipes().readable_bytes(pipe).ok(),
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                    )
+                    .ok()
+                    .flatten();
+                if let Some(n) = pipe_bytes {
+                    out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
+                        .ok_or(Errno::EFAULT)?;
+                    return Ok(0);
+                }
                 let n = files
                     .with_socket(&self.global, u32::try_from(desc).map_err(|_| Errno::EBADF)?, |fd| {
                         let proxy = self.global.get_proxy(fd)?;

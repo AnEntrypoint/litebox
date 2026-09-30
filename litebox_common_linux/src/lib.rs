@@ -3777,6 +3777,18 @@ pub enum SyscallRequest {
         length: usize,
         behavior: MadviseBehavior,
     },
+    InotifyInit {
+        flags: u32,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: UserPtr<c_char>,
+        mask: u32,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
     Msync {
         addr: UserPtrMut<u8>,
         length: usize,
@@ -4636,6 +4648,10 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::inotify_init => SyscallRequest::InotifyInit { flags: 0 },
+            Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
             Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
