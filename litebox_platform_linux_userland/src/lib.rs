@@ -2222,14 +2222,26 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We wait on the futex, with a timeout if needed
-        match futex_timeout(
-            &self.inner,
-            FutexOperation::Wait,
-            /* expected value */ val,
-            timeout,
-            /* ignored */ None,
-        ) {
+        // We wait on the futex, with a timeout if needed. The host kernel has been seen to answer a
+        // FUTEX_WAIT on a healthy, aligned shared-heap word with a single transient EINVAL that a
+        // re-issue of the identical call does not reproduce (diagnosed by the probes below, which
+        // all succeed); re-issue a few times before treating it as a real error.
+        let mut attempt = 0;
+        let result = loop {
+            let r = futex_timeout(
+                &self.inner,
+                FutexOperation::Wait,
+                /* expected value */ val,
+                timeout,
+                /* ignored */ None,
+            );
+            if matches!(r, Err(syscalls::Errno::EINVAL)) && attempt < 3 {
+                attempt += 1;
+                continue;
+            }
+            break r;
+        };
+        match result {
             Ok(0) | Err(syscalls::Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
             Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
             Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),

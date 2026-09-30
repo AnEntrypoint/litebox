@@ -336,10 +336,24 @@ fn install_frame_pointer_panic_hook() {
 #[cfg(not(target_arch = "x86_64"))]
 fn install_frame_pointer_panic_hook() {}
 
+/// A panic on any runner thread means this guest process's kernel state is no longer trustworthy:
+/// unwinding out of a thread that entered from guest code leaves the signal stack and TLS
+/// half-restored, which used to turn into millions of faults on the spot while the process (and
+/// any lock it held) lingered. Terminate the process instead, like a fatal signal would.
+fn install_terminate_on_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(std::boxed::Box::new(move |info| {
+        previous(info);
+        // SAFETY: `_exit` never returns and touches no runtime state.
+        unsafe { libc::_exit(134) };
+    }));
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some() {
         install_frame_pointer_panic_hook();
     }
+    install_terminate_on_panic_hook();
     if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some()
         && let Ok(maps) = std::fs::read_to_string("/proc/self/maps")
         && let Some(line) = maps.lines().next()
