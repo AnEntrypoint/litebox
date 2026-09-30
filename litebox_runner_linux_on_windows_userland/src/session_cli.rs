@@ -35,7 +35,10 @@ fn current_exe_string() -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "litebox_runner_linux_on_windows_userland session", no_binary_name = true)]
+#[command(
+    name = "litebox_runner_linux_on_windows_userland session",
+    no_binary_name = true
+)]
 struct SessionCli {
     #[command(subcommand)]
     sub: SessionSub,
@@ -51,7 +54,10 @@ enum SessionSub {
         program_and_args: Vec<String>,
     },
     /// Send a key-string to a running session.
-    Send { session_id: String, key_string: String },
+    Send {
+        session_id: String,
+        key_string: String,
+    },
     /// Print a session's current screen contents.
     Screen {
         session_id: String,
@@ -92,10 +98,14 @@ fn run(args: &[String]) -> i32 {
     };
 
     match cli.sub {
-        SessionSub::Start { rootfs, program_and_args } => {
-            cmd_start(&client, rootfs, program_and_args)
-        }
-        SessionSub::Send { session_id, key_string } => cmd_send(&client, &session_id, &key_string),
+        SessionSub::Start {
+            rootfs,
+            program_and_args,
+        } => cmd_start(&client, rootfs, program_and_args),
+        SessionSub::Send {
+            session_id,
+            key_string,
+        } => cmd_send(&client, &session_id, &key_string),
         SessionSub::Screen { session_id, .. } => cmd_screen(&client, &session_id),
         SessionSub::History { session_id, since } => cmd_history(&client, &session_id, since),
         SessionSub::List => cmd_list(&client),

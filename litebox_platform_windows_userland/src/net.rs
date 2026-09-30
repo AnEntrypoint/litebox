@@ -943,9 +943,10 @@ impl NatGateway {
         let mut bound_any = false;
         for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let (host_str, guest_str) = entry.split_once(':').unwrap_or((entry, entry));
-            let (Ok(host_port), Ok(guest_port)) =
-                (host_str.trim().parse::<u16>(), guest_str.trim().parse::<u16>())
-            else {
+            let (Ok(host_port), Ok(guest_port)) = (
+                host_str.trim().parse::<u16>(),
+                guest_str.trim().parse::<u16>(),
+            ) else {
                 litebox_util_log::warn!(
                     "LITEBOX_PUBLISH: ignoring malformed entry {entry:?} (expected `host:guest`, e.g. `3000:3000`)"
                 );

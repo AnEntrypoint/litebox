@@ -276,7 +276,10 @@ where
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
     /// it lingers for a bit to allow pending data to be sent).
-    consider_closed: bool,
+    ///
+    /// Atomic so `close` can flag it under a shared entry lock: a thread blocked in a read of the
+    /// same socket holds that lock, and `close` must not wait for it.
+    consider_closed: core::sync::atomic::AtomicBool,
     /// `shutdown(SHUT_WR)` was requested while written data had not yet reached the wire: the
     /// FIN is sent once it has, never ahead of it.
     shutdown_wr_pending: bool,
@@ -936,12 +939,17 @@ where
                     }
                 }
             }
-            if socket_handle.consider_closed {
+            if socket_handle
+                .consider_closed
+                .load(core::sync::atomic::Ordering::Relaxed)
+            {
                 // See `socket_set_contains`'s doc comment: a stale handle (this descriptor's own
                 // socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
                 // elsewhere) has nothing left to close.
                 if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
-                    socket_handle.consider_closed = false;
+                    socket_handle
+                        .consider_closed
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 // check if there is pending data to be sent
@@ -969,7 +977,9 @@ where
                     },
                 );
                 if closed {
-                    socket_handle.consider_closed = false;
+                    socket_handle
+                        .consider_closed
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1218,7 +1228,7 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
-            consider_closed: false,
+            consider_closed: core::sync::atomic::AtomicBool::new(false),
             shutdown_wr_pending: false,
             handle,
             specific: match protocol {
@@ -1357,8 +1367,12 @@ where
                 // whole struct already went to real effort to remove (twenty-eighth pass).
             }
             super::fd::CloseResult::Deferred => {
-                let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
-                else {
+                let Some(()) = dt.with_entry(fd, |entry| {
+                    entry
+                        .entry
+                        .consider_closed
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                }) else {
                     unreachable!()
                 };
                 // `close_pending_sockets` now owns this socket: it closes once the TX ring and
@@ -2055,7 +2069,7 @@ where
                 drop(descriptor_table);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
-                    consider_closed: false,
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {

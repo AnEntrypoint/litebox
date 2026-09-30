@@ -528,7 +528,9 @@ fn reap_children(children: Vec<std::process::Child>) -> Result<i64> {
     for mut child in children {
         let pid = child.id();
         if let Err(e) = child.wait() {
-            first_err.get_or_insert_with(|| anyhow!("wait failed for concurrent session pid {pid}: {e}"));
+            first_err.get_or_insert_with(|| {
+                anyhow!("wait failed for concurrent session pid {pid}: {e}")
+            });
         }
     }
     Err(first_err.unwrap_or_else(|| {

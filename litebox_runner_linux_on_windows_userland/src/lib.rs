@@ -102,7 +102,11 @@ pub struct CliArgs {
     /// `litebox-packager --oci-image` + `--initial-files` two-step pipeline for the common case;
     /// that pipeline still works unchanged for callers that want a pre-built, reusable tar file.
     /// Only public (anonymous) registries are currently supported.
-    #[arg(long = "oci-image", value_name = "IMAGE_REF", conflicts_with = "initial_files")]
+    #[arg(
+        long = "oci-image",
+        value_name = "IMAGE_REF",
+        conflicts_with = "initial_files"
+    )]
     pub oci_image: Option<String>,
     /// After the program exits, export the writable upper layer (every file the guest created or
     /// modified during this run) to a tar archive at this path, so a later run can resume from it
@@ -274,8 +278,11 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
         // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
         // root-owned matches real Linux's own `/dev`.
-        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH)
-            .unwrap();
+        fs.mkdir(
+            "/dev",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::ROTH,
+        )
+        .unwrap();
         fs.mkdir(
             "/dev/shm",
             litebox::fs::Mode::RWXU
@@ -546,9 +553,8 @@ fn acquire_boot_lock() -> Result<BootLock> {
                 lock_path.display(),
             ))
         }
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to acquire boot lock at {}", lock_path.display()))
-        }
+        Err(e) => Err(e)
+            .with_context(|| format!("failed to acquire boot lock at {}", lock_path.display())),
     }
 }
 
@@ -612,10 +618,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )
     .is_none()
     {
-        let path = std::env::temp_dir().join(format!(
-            "litebox-container-fs-{}.tar",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("litebox-container-fs-{}.tar", std::process::id()));
         unsafe {
             std::env::set_var(
                 litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR,
@@ -675,9 +679,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // point, which is what answers "is the guest still page-flipping?" -- the
     // question that separates a compositor that stopped presenting from a client
     // presenting an empty buffer.
-    litebox_shim_linux::syscalls::set_drm_trace(
-        std::env::var_os("LITEBOX_DRM_TRACE").is_some(),
-    );
+    litebox_shim_linux::syscalls::set_drm_trace(std::env::var_os("LITEBOX_DRM_TRACE").is_some());
 
     litebox_shim_linux::syscalls::set_input_trace(
         std::env::var_os("LITEBOX_INPUT_TRACE").is_some(),
@@ -705,7 +707,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // below, so everything downstream of rootfs construction (in-mem upper layer, resume-from
     // import, guest boot) is identical regardless of which source was used.
     enum RootfsSource {
-        Tar { mmap: MmappedFile },
+        Tar {
+            mmap: MmappedFile,
+        },
         OciLayers {
             layers: Vec<std::borrow::Cow<'static, [u8]>>,
             resolved_layers_json: String,
@@ -893,7 +897,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     }
                     fs
                 }
-            }
+            },
         }
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
@@ -1092,7 +1096,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 program.process.wait()
             })
             .expect("failed to spawn initial guest thread");
-        let pty_id = pty_id_rx.recv().expect("guest thread dropped pty_id sender");
+        let pty_id = pty_id_rx
+            .recv()
+            .expect("guest thread dropped pty_id sender");
 
         // Two forwarding threads, mirroring `net_worker`'s existing "background thread pumping
         // shim-internal I/O" pattern above: one drains the pty master's output to this process's
@@ -1200,19 +1206,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // '<unknown>' has overflowed its stack" with zero indication of the real cause).
                 // Print the real error and exit cleanly instead of unwinding through whatever
                 // is fragile on this thread.
-                let program = match shim.load_program(
-                    initial_file_system,
-                    init_task,
-                    &prog_path,
-                    argv,
-                    envp,
-                ) {
-                    Ok(program) => program,
-                    Err(e) => {
-                        eprintln!("failed to load program {prog_path:?}: {e:?}");
-                        std::process::exit(1);
-                    }
-                };
+                let program =
+                    match shim.load_program(initial_file_system, init_task, &prog_path, argv, envp)
+                    {
+                        Ok(program) => program,
+                        Err(e) => {
+                            eprintln!("failed to load program {prog_path:?}: {e:?}");
+                            std::process::exit(1);
+                        }
+                    };
                 unsafe {
                     litebox_platform_windows_userland::run_thread(
                         program.entrypoints,
@@ -1527,8 +1529,7 @@ fn diag_process_fork_globalstate_probe_inner() {
                 shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, tar_layers, entries)
             }
             None => {
-                let (fs, freshly_built) =
-                    shim_builder.default_fs_multi_layer(in_mem, tar_layers);
+                let (fs, freshly_built) = shim_builder.default_fs_multi_layer(in_mem, tar_layers);
                 if let Some(entries) = &freshly_built {
                     write_merged_rootfs_index_cache(digests_json, entries);
                 }
@@ -1589,9 +1590,7 @@ fn diag_process_fork_globalstate_probe_inner() {
     if std::env::var_os("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE").is_some() {
         let before = shim.diag_unix_addr_presence_lookup(0, b"PRESENCE_PROBE_BEFORE");
         let after = shim.diag_unix_addr_presence_lookup(0, b"PRESENCE_PROBE_AFTER");
-        eprintln!(
-            "[unix_addr_presence_probe] child observed before={before:?} after={after:?}"
-        );
+        eprintln!("[unix_addr_presence_probe] child observed before={before:?} after={after:?}");
     }
     diag_elapsed!("GlobalState built, handing off to vmem-adopt-probe");
 
@@ -1683,7 +1682,10 @@ fn diag_process_fork_vmem_adopt_probe(
         Platform,
         { litebox::mm::linux::PAGE_SIZE },
     >::new_adopting_existing_memory(
-        litebox, expected.iter().cloned(), heap_top, group_spans.into_iter()
+        litebox,
+        expected.iter().cloned(),
+        heap_top,
+        group_spans.into_iter(),
     );
     diag_elapsed!("PageManager::new_adopting_existing_memory returned");
 
@@ -2165,7 +2167,9 @@ fn diag_process_fork_task_resume_probe(
         ctx.rip,
         ctx.rsp
     );
-    diag_elapsed!("fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification");
+    diag_elapsed!(
+        "fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification"
+    );
     // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
     // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
     // verification`, litebox_shim_linux/src/syscalls/process.rs) -- this cross-process child never
@@ -2360,7 +2364,10 @@ fn read_merged_rootfs_index_cache(
         .map(|n| n as usize)
     else {
         if diag {
-            eprintln!("[diag-mergedidx] MISS {}: truncated key_len", path.display());
+            eprintln!(
+                "[diag-mergedidx] MISS {}: truncated key_len",
+                path.display()
+            );
         }
         return None;
     };
@@ -2369,7 +2376,10 @@ fn read_merged_rootfs_index_cache(
         .and_then(|s| core::str::from_utf8(s).ok())
     else {
         if diag {
-            eprintln!("[diag-mergedidx] MISS {}: truncated/invalid stored key", path.display());
+            eprintln!(
+                "[diag-mergedidx] MISS {}: truncated/invalid stored key",
+                path.display()
+            );
         }
         return None;
     };
@@ -2643,7 +2653,8 @@ fn import_writable_layer(
                                     built.push('/');
                                 }
                                 built.push_str(&part.to_string_lossy());
-                                let _ = fs.mkdir(&*built, litebox::fs::Mode::from_bits_truncate(0o755));
+                                let _ =
+                                    fs.mkdir(&*built, litebox::fs::Mode::from_bits_truncate(0o755));
                             }
                             _ => {}
                         }

@@ -30,8 +30,6 @@ struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
     // The 'condition variable' to notify writers through.
     // Incremented on every signal.
     writer_notify: Platform::RawMutex,
-    // DIAG (temporary): thread id (+1) that took the lock from unlocked to read-locked.
-    diag_first_reader: Platform::RawMutex,
 }
 
 const READ_LOCKED: u32 = 1;
@@ -83,15 +81,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         Self {
             state: <Platform::RawMutex as RawMutex>::INIT,
             writer_notify: <Platform::RawMutex as RawMutex>::INIT,
-            diag_first_reader: <Platform::RawMutex as RawMutex>::INIT,
         }
-    }
-
-    #[inline]
-    fn diag_note_first_reader(&self) {
-        self.diag_first_reader
-            .underlying_atomic()
-            .store(crate::fs::ident::diag_thread_id(), Relaxed);
     }
 
     #[inline]
@@ -115,8 +105,6 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                 .is_err()
         {
             self.read_contended();
-        } else if is_unlocked(state) {
-            self.diag_note_first_reader();
         }
     }
 
@@ -151,12 +139,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
                     Acquire,
                     Relaxed,
                 ) {
-                    Ok(_) => {
-                        if is_unlocked(state) {
-                            self.diag_note_first_reader();
-                        }
-                        return; // Locked!
-                    }
+                    Ok(_) => return, // Locked!
                     Err(s) => {
                         state = s;
                         continue;

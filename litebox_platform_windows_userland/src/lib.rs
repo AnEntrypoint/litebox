@@ -37,12 +37,10 @@ use litebox::utils::TruncateExt as _;
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
     Foundation::GetLastError,
+    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING},
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS, EXCEPTION_RECORD,
-    },
-    Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
     },
     System::Memory::{
         self as Win32_Memory, CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER,
@@ -885,7 +883,8 @@ unsafe extern "system" fn vectored_exception_handler(
     // processing in this function, for exactly this one exception code -- restoring the
     // "non-interceptable" semantics real Windows code relies on and letting the fail-fast path
     // actually reach WER as intended.
-    if unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode } == 0xC000_0409_u32.cast_signed()
+    if unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode }
+        == 0xC000_0409_u32.cast_signed()
     {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -914,7 +913,8 @@ unsafe extern "system" fn vectored_exception_handler(
     // entered again after the first single-step" directly, independent of every other diagnostic
     // gate in this function (all of which run later and could themselves be skipped for reasons
     // unrelated to whether VEH fired at all).
-    static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
     if veh_gates().alloc_vec {
         let n = VEH_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
@@ -1029,8 +1029,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // directly from the raw Windows exception code instead of relying on the already-decoded
         // `cr2`, and query `rip` itself (not `cr2`, which is meaningless here) for its real
         // Windows memory-state at the moment of the fault.
-        let raw_exception_code =
-            unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
+        let raw_exception_code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
         // Both `EXCEPTION_ILLEGAL_INSTRUCTION` (a real `#UD`) AND `0xc0000096`
         // (`STATUS_PRIVILEGED_INSTRUCTION`, Windows' name for an unprivileged `hlt` -- the exact
         // trap musl's mallocng `a_crash()` deliberately executes on a heap-integrity assert, see
@@ -1052,7 +1051,12 @@ unsafe extern "system" fn vectored_exception_handler(
         // main diagnostic below stays silent for this exception class.
         if is_ud_fault {
             let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-            diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
+            diag_raw_print(
+                b"[diag-ud-entry] tid=0x",
+                tid0 as usize,
+                b" rip=0x",
+                rip as usize,
+            );
             // Encode the tri-state as 0/1/2 (not `this_is_in_guest as usize`'s collapsed 0/1):
             // 2 means "no TLS slot -- could not determine", never conflated with a confirmed 0.
             diag_raw_print(
@@ -1062,7 +1066,8 @@ unsafe extern "system" fn vectored_exception_handler(
                     Some(true) => 1usize,
                     None => 2usize,
                 },
-                b" raw_code=0x", raw_exception_code as usize as usize,
+                b" raw_code=0x",
+                raw_exception_code as usize as usize,
             );
         }
         let raw_cr2 =
@@ -1094,27 +1099,47 @@ unsafe extern "system" fn vectored_exception_handler(
                 ) != 0
             };
             let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-            diag_raw_print(b"[diag-fault-vq] tid=0x", tid as usize, b" rip=0x", rip as usize);
-            diag_raw_print(b"[diag-fault-vq]   is_ud_fault=0x", is_ud_fault as usize, b" raw_code=0x", raw_exception_code as usize as usize);
             diag_raw_print(
-                b"[diag-fault-vq]   cr2=0x", cr2 as usize,
-                b" queried=0x", cr2_queried as usize,
+                b"[diag-fault-vq] tid=0x",
+                tid as usize,
+                b" rip=0x",
+                rip as usize,
             );
             diag_raw_print(
-                b"[diag-fault-vq]   state=0x", cr2_mbi.State as usize,
-                b" type=0x", cr2_mbi.Type as usize,
+                b"[diag-fault-vq]   is_ud_fault=0x",
+                is_ud_fault as usize,
+                b" raw_code=0x",
+                raw_exception_code as usize as usize,
             );
             diag_raw_print(
-                b"[diag-fault-vq]   protect=0x", cr2_mbi.Protect as usize,
-                b" alloc_protect=0x", cr2_mbi.AllocationProtect as usize,
+                b"[diag-fault-vq]   cr2=0x",
+                cr2 as usize,
+                b" queried=0x",
+                cr2_queried as usize,
             );
             diag_raw_print(
-                b"[diag-fault-vq]   region_base=0x", cr2_mbi.BaseAddress as usize,
-                b" region_size=0x", cr2_mbi.RegionSize,
+                b"[diag-fault-vq]   state=0x",
+                cr2_mbi.State as usize,
+                b" type=0x",
+                cr2_mbi.Type as usize,
             );
             diag_raw_print(
-                b"[diag-fault-vq]   alloc_base=0x", cr2_mbi.AllocationBase as usize,
-                b" rsp=0x", rsp as usize,
+                b"[diag-fault-vq]   protect=0x",
+                cr2_mbi.Protect as usize,
+                b" alloc_protect=0x",
+                cr2_mbi.AllocationProtect as usize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   region_base=0x",
+                cr2_mbi.BaseAddress as usize,
+                b" region_size=0x",
+                cr2_mbi.RegionSize,
+            );
+            diag_raw_print(
+                b"[diag-fault-vq]   alloc_base=0x",
+                cr2_mbi.AllocationBase as usize,
+                b" rsp=0x",
+                rsp as usize,
             );
         }
 
@@ -1154,8 +1179,11 @@ unsafe extern "system" fn vectored_exception_handler(
                 };
                 eprintln!(
                     "[diag-fault-module] rip={rip:#x} GetModuleHandleExW FAILED (rip not in any loaded module -- JIT/generated code, or a bogus address); VirtualQuery: queried={rip_queried} state={:#x} type={:#x} protect={:#x} region_base={:#x} region_size={:#x}",
-                    rip_mbi.State, rip_mbi.Type, rip_mbi.Protect,
-                    rip_mbi.BaseAddress as u64, rip_mbi.RegionSize,
+                    rip_mbi.State,
+                    rip_mbi.Type,
+                    rip_mbi.Protect,
+                    rip_mbi.BaseAddress as u64,
+                    rip_mbi.RegionSize,
                 );
                 // A control transfer landed on an address in no loaded module at all -- the
                 // classic signature of a corrupted return address or a bad indirect call/jump
@@ -1198,7 +1226,11 @@ unsafe extern "system" fn vectored_exception_handler(
                     eprintln!(
                         "[diag-fault-stack] rsp+{:#x}={word:#x}{}",
                         i * 8,
-                        if word_resolved && !wmod.is_null() { " (in-module)" } else { "" },
+                        if word_resolved && !wmod.is_null() {
+                            " (in-module)"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -1236,15 +1268,30 @@ unsafe extern "system" fn vectored_exception_handler(
     // guest-address stack right now.
     if tls.host_sp.get().is_null() {
         let rec = unsafe { &*(*exception_info).ExceptionRecord };
-        diag_raw_print(b"[diag_null_host_sp] tid_hash=0x", std::process::id() as usize, b" code=0x", rec.ExceptionCode as usize);
+        diag_raw_print(
+            b"[diag_null_host_sp] tid_hash=0x",
+            std::process::id() as usize,
+            b" code=0x",
+            rec.ExceptionCode as usize,
+        );
     }
     if veh_gates().alloc_vec {
         let depth = tls.veh_depth.get();
         if depth > 1 {
             let rec = unsafe { &*(*exception_info).ExceptionRecord };
             let ctx = unsafe { &*(*exception_info).ContextRecord };
-            diag_raw_print(b"[diag_veh_depth] REENTRANT depth=0x", depth as usize, b" code=0x", rec.ExceptionCode as usize);
-            diag_raw_print(b"[diag_veh_depth]   rip=0x", ctx.Rip as usize, b" fault_addr=0x", rec.ExceptionInformation[1]);
+            diag_raw_print(
+                b"[diag_veh_depth] REENTRANT depth=0x",
+                depth as usize,
+                b" code=0x",
+                rec.ExceptionCode as usize,
+            );
+            diag_raw_print(
+                b"[diag_veh_depth]   rip=0x",
+                ctx.Rip as usize,
+                b" fault_addr=0x",
+                rec.ExceptionInformation[1],
+            );
         }
     }
     let (info, exception_record, context);
@@ -1336,7 +1383,10 @@ unsafe extern "system" fn vectored_exception_handler(
         // currently-COMMITTED floor, which grows on demand and looks deceptively small early in a
         // thread's life; `DeallocationStack` (TEB+0x1478) is the true bottom of the whole
         // reservation, set once at thread creation, and is what actually answers the question.
-        #[allow(clippy::cast_possible_truncation, reason = "diagnostic-only; x86_64 only")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "diagnostic-only; x86_64 only"
+        )]
         let rsp_now = context.Rsp;
         let stack_base: u64;
         let stack_limit: u64;
@@ -1606,12 +1656,21 @@ unsafe extern "system" fn vectored_exception_handler(
             diag_raw_print(b"[diag_ctx_probe] r9=0x", r9, b" sc(rdx)=0x", sc);
             #[allow(clippy::cast_possible_truncation)]
             let r8 = context.R8 as usize;
-            diag_raw_print(b"[diag_ctx_probe] g(r8)=0x", r8, b" active_base=0x", candidate);
+            diag_raw_print(
+                b"[diag_ctx_probe] g(r8)=0x",
+                r8,
+                b" active_base=0x",
+                candidate,
+            );
             for i in sc.saturating_sub(2)..=(sc + 2) {
                 let addr = candidate.wrapping_add(i * 8);
                 let mut buf8 = [0u8; 8];
                 let n = fork_verify::read_code_bytes_for_diagnostics(addr, &mut buf8);
-                let value = if n == 8 { usize::from_le_bytes(buf8) } else { usize::MAX };
+                let value = if n == 8 {
+                    usize::from_le_bytes(buf8)
+                } else {
+                    usize::MAX
+                };
                 diag_raw_print(b"[diag_ctx_probe]   idx=0x", i, b" value=0x", value);
             }
             // Directly read g's own next/prev/mem/masks fields (struct meta layout: prev+0x0,
@@ -1620,7 +1679,11 @@ unsafe extern "system" fn vectored_exception_handler(
                 let addr = r8.wrapping_add(off);
                 let mut buf8 = [0u8; 8];
                 let n = fork_verify::read_code_bytes_for_diagnostics(addr, &mut buf8);
-                let value = if n == 8 { usize::from_le_bytes(buf8) } else { usize::MAX };
+                let value = if n == 8 {
+                    usize::from_le_bytes(buf8)
+                } else {
+                    usize::MAX
+                };
                 diag_raw_print(b"[diag_ctx_probe] g_field off=0x", off, b" value=0x", value);
                 let _ = label_off;
             }
@@ -1862,8 +1925,10 @@ unsafe extern "system" fn vectored_exception_handler(
             // check. Report whether `rip` was even readable as its own field so a future
             // investigator sees "unreadable, inconclusive" rather than a false "not FS-relative".
             let mut probe = [0u8; 4];
-            let rip_readable =
-                fork_verify::read_code_bytes_for_diagnostics(context_snapshot.Rip.trunc(), &mut probe) > 0;
+            let rip_readable = fork_verify::read_code_bytes_for_diagnostics(
+                context_snapshot.Rip.trunc(),
+                &mut probe,
+            ) > 0;
             eprintln!(
                 "[diag-avfull] tid={:?} rip={:#x} fsbase={:#x} fault_addr={:#x} rip_readable={} has_fs_override={}",
                 std::thread::current().id(),
@@ -1984,9 +2049,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // never updated to use it.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && let Some(recover) =
-                litebox::mm::exception_table::search_exception_tables(
-                    context_snapshot.Rip.trunc(),
-                )
+                litebox::mm::exception_table::search_exception_tables(context_snapshot.Rip.trunc())
         {
             // Found a matching exception table entry.
             //
@@ -2220,12 +2283,12 @@ unsafe extern "system" fn vectored_exception_handler(
                         // its own -- arm the watchdog first as a backstop, same as the sibling
                         // unconditional-terminate path below.
                         FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
-            // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
-            // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
-            // block, so if it never returns the watchdog still terminates -- the dump attempt
-            // cannot turn a crash into a hang. See `write_crash_minidump` for why this uses the
-            // native API rather than a crate, and what it deliberately does not capture.
-            write_crash_minidump(exception_info);
+                        // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
+                        // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
+                        // block, so if it never returns the watchdog still terminates -- the dump attempt
+                        // cannot turn a crash into a hang. See `write_crash_minidump` for why this uses the
+                        // native API rather than a crate, and what it deliberately does not capture.
+                        write_crash_minidump(exception_info);
                         unsafe {
                             windows_sys::Win32::System::Threading::TerminateProcess(
                                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -2816,8 +2879,18 @@ unsafe extern "system" fn vectored_exception_handler(
                             b1 |= (*byte as usize) << ((i - 8) * 8);
                         }
                     }
-                    diag_raw_print(b"[diag_tf]   resume_rip=0x", resume_rip, b" bytes_lo=0x", b0);
-                    diag_raw_print(b"[diag_tf]   bytes_hi=0x", b1, b" eflags=0x", context.EFlags as usize);
+                    diag_raw_print(
+                        b"[diag_tf]   resume_rip=0x",
+                        resume_rip,
+                        b" bytes_lo=0x",
+                        b0,
+                    );
+                    diag_raw_print(
+                        b"[diag_tf]   bytes_hi=0x",
+                        b1,
+                        b" eflags=0x",
+                        context.EFlags as usize,
+                    );
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -3247,7 +3320,11 @@ impl WindowsUserland {
     /// # Panics
     ///
     /// Panics if an overlapping region is already registered.
-    pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<std::path::PathBuf>) {
+    pub fn register_cow_region(
+        &self,
+        data: &'static [u8],
+        file_path: impl Into<std::path::PathBuf>,
+    ) {
         let start = data.as_ptr() as usize;
         let info = CowRegionInfo {
             file_path: file_path.into(),
@@ -3889,7 +3966,8 @@ static LSEARCH_EXIT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// kernel protocol it is trying to escape. Zero (this default) means no fault is in flight;
 /// `AtomicU64` so the watchdog can also read WHEN the fault happened, for its bounded grace
 /// window.
-static FAULT_TERMINATE_ARMED_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FAULT_TERMINATE_ARMED_TICK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
@@ -4921,7 +4999,8 @@ unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
     // busy-livelock or mid-syscall corruption" explanation). Real Ctrl+C/Ctrl+Break deliver
     // SIGINT/SIGTSTP to an entire foreground process group, not one arbitrary thread of one
     // arbitrary guest process -- deliver to every active thread instead.
-    let threads: alloc::vec::Vec<ThreadHandle> = ACTIVE_THREADS.lock().unwrap().iter().cloned().collect();
+    let threads: alloc::vec::Vec<ThreadHandle> =
+        ACTIVE_THREADS.lock().unwrap().iter().cloned().collect();
     for thread in threads {
         thread.deliver_signal(signal);
     }
@@ -5246,7 +5325,12 @@ enum ClaimOwner {
 /// still-live sibling thread's -- see `release_all_claims_for_current_thread`'s doc comment), and
 /// a monotonically-increasing insertion sequence number used to find the single oldest entry for
 /// eviction when the registry is full (see `claim_range`). `None` means the slot is empty.
-type ClaimSlot = Option<(core::ops::Range<usize>, ClaimOwner, std::thread::ThreadId, u64)>;
+type ClaimSlot = Option<(
+    core::ops::Range<usize>,
+    ClaimOwner,
+    std::thread::ThreadId,
+    u64,
+)>;
 
 /// How many concurrently-live guest processes can each hold a `Replace`-mode claim at once (see
 /// [`CLAIMED_RANGES`]'s doc comment). A fixed, generous upper bound rather than a growable
@@ -5418,8 +5502,9 @@ fn find_foreign_claim(
 /// entry count is bounded by the number of concurrently-live real OS threads (tens, not the
 /// thousands of heap/mmap claims `CLAIMED_RANGES` churns through), so the `MAX_CLAIMS`-tuning
 /// latency history that governs the fixed-array design there does not apply here.
-static LIVE_THREAD_STACKS: Mutex<alloc::vec::Vec<(core::ops::Range<usize>, std::thread::ThreadId)>> =
-    Mutex::new(alloc::vec::Vec::new());
+static LIVE_THREAD_STACKS: Mutex<
+    alloc::vec::Vec<(core::ops::Range<usize>, std::thread::ThreadId)>,
+> = Mutex::new(alloc::vec::Vec::new());
 
 /// Records the CALLING thread's own real stack reservation into [`LIVE_THREAD_STACKS`], read via
 /// the TEB (`gs:[0x1478]` = `DeallocationStack`, the true bottom of the whole reservation;
@@ -5456,7 +5541,10 @@ fn register_current_thread_stack() {
 /// thread's stack is no longer live memory and must stop being reported as a foreign collision.
 fn unregister_current_thread_stack() {
     let tid = std::thread::current().id();
-    LIVE_THREAD_STACKS.lock().unwrap().retain(|(_, t)| *t != tid);
+    LIVE_THREAD_STACKS
+        .lock()
+        .unwrap()
+        .retain(|(_, t)| *t != tid);
 }
 
 /// Returns the range of any OTHER live thread's own real stack reservation overlapping `range`,
@@ -5717,8 +5805,9 @@ fn reclaim_ranges_for_fork_child(parent_owner: ClaimOwner) {
         claims
             .iter()
             .filter_map(|slot| {
-                slot.as_ref()
-                    .and_then(|(range, owner, _tid, _seq)| (*owner == parent_owner).then(|| range.clone()))
+                slot.as_ref().and_then(|(range, owner, _tid, _seq)| {
+                    (*owner == parent_owner).then(|| range.clone())
+                })
             })
             .collect()
     };
@@ -6467,11 +6556,7 @@ impl WaiterQueue {
     #[must_use]
     fn push_locked(&self, record: WaiterRecord) -> bool {
         for slot in &self.slots {
-            if slot
-                .pid
-                .load(core::sync::atomic::Ordering::Relaxed)
-                == WAITER_SLOT_EMPTY
-            {
+            if slot.pid.load(core::sync::atomic::Ordering::Relaxed) == WAITER_SLOT_EMPTY {
                 slot.event
                     .store(record.event, core::sync::atomic::Ordering::Relaxed);
                 slot.pid
@@ -6737,7 +6822,10 @@ impl RawMutex {
             return None;
         }
 
-        cache.lock().unwrap().push((self_addr, record, local as isize));
+        cache
+            .lock()
+            .unwrap()
+            .push((self_addr, record, local as isize));
         Some(local)
     }
 
@@ -6820,7 +6908,8 @@ impl RawMutex {
             if remaining == Some(Duration::ZERO) {
                 break self.finish_real_timeout(record, event);
             }
-            let chunk = remaining.map_or(LIVENESS_CHECK_INTERVAL, |r| r.min(LIVENESS_CHECK_INTERVAL));
+            let chunk =
+                remaining.map_or(LIVENESS_CHECK_INTERVAL, |r| r.min(LIVENESS_CHECK_INTERVAL));
             let chunk_ms = chunk
                 .as_millis()
                 .min(u128::from(Win32_Threading::INFINITE - 1))
@@ -7084,9 +7173,9 @@ impl RawMutex {
             .compare_exchange(val, 0, Ordering::AcqRel, Ordering::Relaxed);
         // Only clear `holder_pid` if it is still the same dead pid just confirmed -- never clobber
         // a DIFFERENT holder that may have legitimately acquired the lock in the interim.
-        let _ =
-            self.holder_pid
-                .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = self
+            .holder_pid
+            .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
         // Unconditional `store`, not a CAS: unlike `inner`/`holder_pid` above (which must not
         // clobber a legitimate new holder/value), poisoning is monotonic within one recovery
         // event -- once this recovery happened, the protected data really may be torn, and that
@@ -7698,7 +7787,8 @@ where
         // allocation then faults with no apparent cause, since nothing about the fault itself
         // points back to an unrelated `munmap()` call that already returned and moved on.
         let region_end_from_query_base = mbi.BaseAddress as usize + mbi.RegionSize;
-        let region_remaining_from_range_start = region_end_from_query_base.saturating_sub(range.start);
+        let region_remaining_from_range_start =
+            region_end_from_query_base.saturating_sub(range.start);
         let len = region_remaining_from_range_start.min(range.len());
         debug_assert!(
             len > 0,
@@ -7931,7 +8021,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             if ptr.is_null() && !maybe_already_reserved {
                 core::ptr::null_mut()
             } else {
-                let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
+                let commit_addr = if r.start == 0 {
+                    ptr
+                } else {
+                    r.start as *mut c_void
+                };
                 if diag_mm_enabled() {
                     litebox_util_log::debug!(
                         start:% = commit_addr as usize, end:% = commit_addr as usize + r.len(),
@@ -8096,65 +8190,62 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 // guest fixed-address load to exactly hit this process's own OS-chosen fallback
                 // address), unlike the `Hint`-mode case above.
                 return Err(AllocationError::AddressInUse);
-            } else if fixed_address_behavior == FixedAddressBehavior::Replace
-                && {
-                    // Checked regardless of `has_committed_page`: a foreign claim can cover a
-                    // range Windows currently reports as MEM_FREE or MEM_RESERVE (not yet
-                    // MEM_COMMIT) when the owning thread reserved-but-hasn't-yet-committed it, or
-                    // when this thread's own view of "committed" raced with the owner's. Only
-                    // checking `has_committed_page && Replace` (the prior condition) let a
-                    // `Replace`-mode caller's `MEM_FREE`/`MEM_RESERVE` branch below commit
-                    // straight over another thread's still-live claim with zero foreign-claim
-                    // check at all -- confirmed live via a weston + weston-desktop-shell repro:
-                    // one thread's own already-committed `mmap(NULL, 4096)` region was corrupted
-                    // by a sibling thread's `brk()`-driven `Replace`-mode growth landing on it,
-                    // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
-                    // at the moment this thread queried it, skipping this check entirely under the
-                    // old `has_committed_page &&` gate.
-                    //
-                    // AGENTS.md pass 216: retry this check a few times with a short sleep before
-                    // accepting a foreign-claim hit as final. Root-caused (passes 213-215) that a
-                    // `Replace`-mode collision here is very often a genuinely transient, both-
-                    // still-alive-for-a-moment race between an `ET_EXEC` binary's fixed load
-                    // address and a short-lived SIBLING process (e.g. a shell's own just-forked
-                    // child) that is already in the process of exiting -- not a long-lived,
-                    // truly-simultaneous conflict. Since pass 213's mmap-address-verification fix,
-                    // a caller whose fixed request gets silently relocated now correctly fails the
-                    // whole `mmap()`/`execve()` instead of continuing with corrupted address
-                    // bookkeeping -- but that means this collision, previously merely "unsafely
-                    // survived", now visibly BLOCKS ordinary concurrent execution of short-lived
-                    // programs unless the transient case is given a chance to clear first. Bounded
-                    // (5 attempts, 2ms apart -- 10ms worst case) and scoped to exactly this
-                    // already-rare, already-slow path so it cannot meaningfully regress the common
-                    // case; still holds `_fixed_addr_guard` throughout (only blocks OTHER threads'
-                    // own `Replace`-mode fixed allocations, never `Hint`-mode/ordinary growth).
-                    let mut collision = None;
-                    for attempt in 0..5u32 {
-                        let fc =
-                            find_foreign_claim(suggested_range.clone(), current_claim_owner());
-                        let stack_overlap = find_live_stack_overlap(suggested_range.clone());
-                        litebox_util_log::debug!(
-                            start:% = suggested_range.start, end:% = suggested_range.end,
-                            attempt:% = attempt,
-                            found:% = fc.is_some(), has_committed_page:% = has_committed_page,
-                            self_owner:? = current_claim_owner(),
-                            foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
-                            foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end)),
-                            stack_overlap:? = stack_overlap.as_ref().map(|r| (r.start, r.end));
-                            "allocate_pages: Replace-mode foreign-claim check"
-                        );
-                        if fc.is_none() && stack_overlap.is_none() {
-                            collision = None;
-                            break;
-                        }
-                        collision = Some(());
-                        if attempt + 1 < 5 {
-                            std::thread::sleep(core::time::Duration::from_millis(2));
-                        }
+            } else if fixed_address_behavior == FixedAddressBehavior::Replace && {
+                // Checked regardless of `has_committed_page`: a foreign claim can cover a
+                // range Windows currently reports as MEM_FREE or MEM_RESERVE (not yet
+                // MEM_COMMIT) when the owning thread reserved-but-hasn't-yet-committed it, or
+                // when this thread's own view of "committed" raced with the owner's. Only
+                // checking `has_committed_page && Replace` (the prior condition) let a
+                // `Replace`-mode caller's `MEM_FREE`/`MEM_RESERVE` branch below commit
+                // straight over another thread's still-live claim with zero foreign-claim
+                // check at all -- confirmed live via a weston + weston-desktop-shell repro:
+                // one thread's own already-committed `mmap(NULL, 4096)` region was corrupted
+                // by a sibling thread's `brk()`-driven `Replace`-mode growth landing on it,
+                // because `has_committed_page` observed the target range as not-yet-MEM_COMMIT
+                // at the moment this thread queried it, skipping this check entirely under the
+                // old `has_committed_page &&` gate.
+                //
+                // AGENTS.md pass 216: retry this check a few times with a short sleep before
+                // accepting a foreign-claim hit as final. Root-caused (passes 213-215) that a
+                // `Replace`-mode collision here is very often a genuinely transient, both-
+                // still-alive-for-a-moment race between an `ET_EXEC` binary's fixed load
+                // address and a short-lived SIBLING process (e.g. a shell's own just-forked
+                // child) that is already in the process of exiting -- not a long-lived,
+                // truly-simultaneous conflict. Since pass 213's mmap-address-verification fix,
+                // a caller whose fixed request gets silently relocated now correctly fails the
+                // whole `mmap()`/`execve()` instead of continuing with corrupted address
+                // bookkeeping -- but that means this collision, previously merely "unsafely
+                // survived", now visibly BLOCKS ordinary concurrent execution of short-lived
+                // programs unless the transient case is given a chance to clear first. Bounded
+                // (5 attempts, 2ms apart -- 10ms worst case) and scoped to exactly this
+                // already-rare, already-slow path so it cannot meaningfully regress the common
+                // case; still holds `_fixed_addr_guard` throughout (only blocks OTHER threads'
+                // own `Replace`-mode fixed allocations, never `Hint`-mode/ordinary growth).
+                let mut collision = None;
+                for attempt in 0..5u32 {
+                    let fc = find_foreign_claim(suggested_range.clone(), current_claim_owner());
+                    let stack_overlap = find_live_stack_overlap(suggested_range.clone());
+                    litebox_util_log::debug!(
+                        start:% = suggested_range.start, end:% = suggested_range.end,
+                        attempt:% = attempt,
+                        found:% = fc.is_some(), has_committed_page:% = has_committed_page,
+                        self_owner:? = current_claim_owner(),
+                        foreign_owner:? = fc.as_ref().map(|(_, owner)| *owner),
+                        foreign_range:? = fc.as_ref().map(|(r, _)| (r.start, r.end)),
+                        stack_overlap:? = stack_overlap.as_ref().map(|r| (r.start, r.end));
+                        "allocate_pages: Replace-mode foreign-claim check"
+                    );
+                    if fc.is_none() && stack_overlap.is_none() {
+                        collision = None;
+                        break;
                     }
-                    collision.is_some()
+                    collision = Some(());
+                    if attempt + 1 < 5 {
+                        std::thread::sleep(core::time::Duration::from_millis(2));
+                    }
                 }
-            {
+                collision.is_some()
+            } {
                 // A foreign claim used to be trusted outright here, on the reasoning that it
                 // "is another still-live guest process's real memory ... never a stale leftover
                 // safe to clobber". That is not true, and assuming it was is what made ld.so fail.
@@ -9316,9 +9407,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if diag_mm_enabled() {
             let sample_len = core::cmp::min(suggested_range.len(), 4096);
             let nz = if sample_len > 0 && suggested_range.len() <= 4 * 1024 * 1024 {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(view.Value.cast::<u8>(), sample_len)
-                };
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(view.Value.cast::<u8>(), sample_len) };
                 bytes.iter().filter(|b| **b != 0).count()
             } else {
                 usize::MAX // not sampled
@@ -9340,7 +9430,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // the compositor genuinely disagree about the buffer's contents -- which
             // would be a litebox shared-mapping bug rather than a compositing one.
             if nz != usize::MAX {
-                let mut live = ADV_SHM_VIEWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut live = ADV_SHM_VIEWS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 live.entry(handle as usize)
                     .or_insert_with(Vec::new)
                     .push((view.Value as usize, suggested_range.len()));
@@ -10345,12 +10437,7 @@ fn write_crash_minidump(exception_info: *mut EXCEPTION_POINTERS) {
     // the same reason the ring dump allocates nothing -- the heap is not trustworthy here, and on
     // a stack-exhaustion fault neither is a large frame.
     let mut path = [0u16; 320];
-    let temp_len = unsafe {
-        GetTempPathW(
-            path.len() as u32 - 64,
-            path.as_mut_ptr(),
-        )
-    } as usize;
+    let temp_len = unsafe { GetTempPathW(path.len() as u32 - 64, path.as_mut_ptr()) } as usize;
     // `GetTempPathW` returns 0 on failure; fall back to the current directory, which is always a
     // legal relative path, rather than giving up on the dump entirely.
     let mut pos = if temp_len == 0 || temp_len >= path.len() - 64 {
@@ -10534,7 +10621,10 @@ fn diag_raw_print(prefix: &[u8], a: usize, mid: &[u8], b: usize) {
 /// gate is true, before even `VehDiagBlockGuard::enter()` -- if thread-local access or heap
 /// allocation is what's re-faulting, guarding against re-entrancy after already attempting one of
 /// those is too late.
-#[allow(clippy::too_many_arguments, reason = "raw diagnostic dump, one field per register")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "raw diagnostic dump, one field per register"
+)]
 fn diag_raw_regdump(
     code: u32,
     addr: usize,
@@ -11552,9 +11642,7 @@ impl<T> SharedArc<T> {
     fn strong_count(&self) -> usize {
         // SAFETY: `self.ptr` always names a live `SharedArcInner<T>` for as long as `self` exists
         // (this handle itself holds one of the counted strong references).
-        unsafe { self.ptr.as_ref() }
-            .strong
-            .load(Ordering::Acquire)
+        unsafe { self.ptr.as_ref() }.strong.load(Ordering::Acquire)
     }
 }
 
@@ -11710,8 +11798,8 @@ impl litebox::platform::SharedKernelStateProvider for WindowsUserland {
         slot: litebox::platform::SharedKernelStateSlot,
         value: T,
     ) -> Self::Handle<T> {
-        let (arc, offset) =
-            SharedArc::new(value).expect("shared_kernel_state: arena_alloc failed (arena exhausted)");
+        let (arc, offset) = SharedArc::new(value)
+            .expect("shared_kernel_state: arena_alloc failed (arena exhausted)");
         let offset_cell = match slot {
             litebox::platform::SharedKernelStateSlot::LiteBoxX => &SHARED_LITEBOXX_OFFSET,
             litebox::platform::SharedKernelStateSlot::ShimGlobalState => &SHARED_GLOBALSTATE_OFFSET,
@@ -11809,8 +11897,10 @@ pub(crate) const FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR: &str =
 /// whole lifetime so `strong_count` stays meaningful across every child this parent forks during
 /// one diagnostic run (never dropped mid-run) -- created at most once (`OnceLock`), reused by
 /// every subsequent fork.
-static SHARED_ARC_PROBE_PARENT: OnceLock<(SharedArc<SharedArcProbeData>, SharedArc<SharedArcProbeData>)> =
-    OnceLock::new();
+static SHARED_ARC_PROBE_PARENT: OnceLock<(
+    SharedArc<SharedArcProbeData>,
+    SharedArc<SharedArcProbeData>,
+)> = OnceLock::new();
 
 /// Diagnostic-only (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`), called from the PARENT side of
 /// `process_fork::spawn_process_fork_child` right before spawning a real cross-process-fork child.
@@ -12339,9 +12429,9 @@ impl ThreadContext<'_> {
                     match self.shim.exception(self.ctx, &info) {
                         // The shim ran a guest signal handler and gave us a fresh context. Resume
                         // only if THAT one is sane; otherwise let the task end rather than loop.
-                        ContinueOperation::Resume if guest_context_is_plausible(self.ctx) => {
-                            unsafe { switch_to_guest(self.ctx) }
-                        }
+                        ContinueOperation::Resume if guest_context_is_plausible(self.ctx) => unsafe {
+                            switch_to_guest(self.ctx)
+                        },
                         _ => return,
                     }
                 }
@@ -12593,7 +12683,8 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // `GetProcessIdOfThread`, the thread-handle counterpart of the `GetProcessId` this used
         // to call.
         let raw_handle = handle.0 as windows_sys::Win32::Foundation::HANDLE;
-        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessIdOfThread(raw_handle) };
+        let pid =
+            unsafe { windows_sys::Win32::System::Threading::GetProcessIdOfThread(raw_handle) };
         if pid == 0 {
             return None;
         }
@@ -12614,10 +12705,11 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // the two sides silently disagree on the export filename's stem (child: `"oci-image"`;
         // parent: nothing, so it never even tries to read one) and every sibling fork's writes
         // are lost the moment that fork's process exits.
-        let tar_path = std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR).or_else(|| {
-            std::env::var_os(process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR)
-                .map(|_| std::ffi::OsString::from("oci-image"))
-        })?;
+        let tar_path =
+            std::env::var_os(process_fork::FORK_CHILD_TAR_PATH_ENV_VAR).or_else(|| {
+                std::env::var_os(process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR)
+                    .map(|_| std::ffi::OsString::from("oci-image"))
+            })?;
         let export_path =
             process_fork::cross_process_writable_export_path(std::path::Path::new(&tar_path), pid);
         let bytes = std::fs::read(&export_path).ok()?;
@@ -12883,7 +12975,8 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // pid-only name would let two of them share one file, each truncating/overwriting the
         // other's write mid-flight. Same pattern as `export_parent_writable_layer_for_child`'s
         // own `SEQ` for the identical reason.
-        static EXEC_COLLISION_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        static EXEC_COLLISION_SEQ: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
         let export_path = std::env::temp_dir().join(format!(
             "litebox-execwrite-{}-{}.tar",
             std::process::id(),
@@ -12985,9 +13078,11 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // `SIGSEGV`, which its own supervisor loop already respawns) is strictly better than an
         // unrecoverable, silent, whole-boot hang, and changes nothing for the overwhelmingly common
         // case where the child actually exits.
-        const EXEC_COLLISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const EXEC_COLLISION_POLL_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(500);
         const EXEC_COLLISION_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
-        const EXEC_COLLISION_ABSOLUTE_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+        const EXEC_COLLISION_ABSOLUTE_CAP: std::time::Duration =
+            std::time::Duration::from_secs(120);
 
         fn child_cpu_time_100ns(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
             let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
@@ -13307,7 +13402,12 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
             > = const { RefCell::new(std::vec::Vec::new()) };
         }
         VALUE_CACHE.with(|c| {
-            if let Some(v) = c.borrow().iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
+            if let Some(v) = c
+                .borrow()
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+            {
                 return v;
             }
             let v = std::env::var_os(name)
@@ -13364,13 +13464,17 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     /// tracks real pressure: report less when the host genuinely has less).
     fn memory_info_kb(&self) -> (u64, u64) {
         let mut status = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
-            dwLength: u32::try_from(core::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>())
-                .unwrap_or(64),
+            dwLength: u32::try_from(core::mem::size_of::<
+                windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX,
+            >())
+            .unwrap_or(64),
             ..Default::default()
         };
         // SAFETY: `status` is a correctly-sized, correctly-`dwLength`-tagged local, which is the
         // entire contract of `GlobalMemoryStatusEx`.
-        let ok = unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&raw mut status) };
+        let ok = unsafe {
+            windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&raw mut status)
+        };
         if ok == 0 {
             // Fall back to the trait's conservative default rather than reporting anything
             // invented: a failed query is not a reason to tell the guest it has memory.

@@ -191,13 +191,19 @@ pub fn hook_syscalls_in_elf_allow_trapped_sites(
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     match hook_syscalls_in_elf_impl(input_binary, trampoline, true)? {
         HookResult::Output(out) => Ok((out, Vec::new())),
-        HookResult::TrappedSites { output, skipped_addrs } => Ok((output, skipped_addrs)),
+        HookResult::TrappedSites {
+            output,
+            skipped_addrs,
+        } => Ok((output, skipped_addrs)),
     }
 }
 
 enum HookResult {
     Output(Vec<u8>),
-    TrappedSites { output: Vec<u8>, skipped_addrs: Vec<u64> },
+    TrappedSites {
+        output: Vec<u8>,
+        skipped_addrs: Vec<u64>,
+    },
 }
 
 fn hook_syscalls_in_elf_impl(
@@ -483,12 +489,10 @@ pub fn executable_section_file_ranges(
     if shentsize != core::mem::size_of::<object::elf::SectionHeader64<Endianness>>() {
         return ranges;
     }
-    let Ok((headers, _)) =
-        object::pod::slice_from_bytes::<object::elf::SectionHeader64<Endianness>>(
-            section_headers,
-            shnum,
-        )
-    else {
+    let Ok((headers, _)) = object::pod::slice_from_bytes::<object::elf::SectionHeader64<Endianness>>(
+        section_headers,
+        shnum,
+    ) else {
         return ranges;
     };
 
@@ -1142,7 +1146,6 @@ where
         .max()
 }
 
-
 /// The control-transfer targets of some code, as a sorted, deduplicated list.
 ///
 /// This replaced a `BTreeSet<u64>`, which is asked exactly one question -- `contains` -- and paid
@@ -1452,13 +1455,7 @@ fn append_decoded_instructions(
 
     let scratch_window = &scratch[scratch_offset..scratch_end];
     assert!(bytes_until_next_4g_boundary(scratch_window.as_ptr()) > scratch_window.len());
-    append_decoded_non_crossing_window(
-        bitness,
-        scratch_window,
-        chunk_start_ip,
-        chunk_end_ip,
-        sink,
-    )
+    append_decoded_non_crossing_window(bitness, scratch_window, chunk_start_ip, chunk_end_ip, sink)
 }
 
 fn append_decoded_non_crossing_window(
@@ -1683,9 +1680,11 @@ mod tests {
 
         let strict_output = hook_syscalls_in_elf(&elf, Some(0x9000_0000)).expect("strict API");
         let (lenient_output, skipped) =
-            hook_syscalls_in_elf_allow_trapped_sites(&elf, Some(0x9000_0000))
-                .expect("lenient API");
-        assert!(skipped.is_empty(), "a fully-patchable binary must report zero trapped sites");
+            hook_syscalls_in_elf_allow_trapped_sites(&elf, Some(0x9000_0000)).expect("lenient API");
+        assert!(
+            skipped.is_empty(),
+            "a fully-patchable binary must report zero trapped sites"
+        );
         assert_eq!(
             strict_output, lenient_output,
             "lenient API must match strict API's output exactly when nothing is trapped"

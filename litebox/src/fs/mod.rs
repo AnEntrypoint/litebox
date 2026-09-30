@@ -512,12 +512,6 @@ pub mod ident {
         Some(f().wrapping_add(1))
     }
 
-    /// Diagnostic: the calling thread's id as registered by the platform (0 if none).
-    #[must_use]
-    pub fn diag_thread_id() -> u32 {
-        current_thread().unwrap_or(0) as u32
-    }
-
     const ROOT_SLOTS: usize = 64;
     /// Threads currently inside a root guard (thread id + 1; 0 = free slot), one entry per guard.
     static ROOT_TIDS: [AtomicUsize; ROOT_SLOTS] = [const { AtomicUsize::new(0) }; ROOT_SLOTS];

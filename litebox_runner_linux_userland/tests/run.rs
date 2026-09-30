@@ -378,7 +378,9 @@ fn python_runner(unique_name: &str) -> Runner {
         .args(["which", "python3"])
         .output()
     {
-        let path_str = String::from_utf8_lossy(&pyenv_path.stdout).trim().to_string();
+        let path_str = String::from_utf8_lossy(&pyenv_path.stdout)
+            .trim()
+            .to_string();
         if !path_str.is_empty() && Path::new(&path_str).exists() {
             PathBuf::from(path_str)
         } else {

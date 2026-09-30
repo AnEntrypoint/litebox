@@ -79,7 +79,9 @@ pub fn pool_fd() -> Option<usize> {
         return None;
     }
     // SAFETY: `is_active()` implies the arena (and so its header) is mapped.
-    let fd = unsafe { &*(ARENA_BASE as *const Header) }.pool_fd.load(Ordering::Acquire);
+    let fd = unsafe { &*(ARENA_BASE as *const Header) }
+        .pool_fd
+        .load(Ordering::Acquire);
     (fd != usize::MAX).then_some(fd)
 }
 
@@ -112,7 +114,9 @@ pub fn pool_segment(key: usize, size: usize) -> Option<usize> {
             let slot = if key == 0 {
                 None
             } else {
-                h.pool_table.iter().find(|e| e.key.load(Ordering::Relaxed) == 0)
+                h.pool_table
+                    .iter()
+                    .find(|e| e.key.load(Ordering::Relaxed) == 0)
             };
             if key == 0 || slot.is_some() {
                 if let Some(e) = slot {
@@ -145,7 +149,11 @@ pub fn pool_offset(handle: usize) -> usize {
 /// state is ordinary per-process memory that `fork()` duplicates.
 pub fn private_scope(enter: bool) {
     let _ = PRIVATE_DEPTH.try_with(|d| {
-        d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) });
+        d.set(if enter {
+            d.get() + 1
+        } else {
+            d.get().saturating_sub(1)
+        });
     });
 }
 
@@ -233,17 +241,22 @@ impl SharedHeap {
                 // SAFETY: plain memfd_create/ftruncate on a NUL-terminated literal. A sparse
                 // memfd is this family's SysV-shm backing: every process inherits the fd, and
                 // segments are page-aligned ranges of it, found by key in the arena header.
-                let fd = unsafe { libc::memfd_create(c"litebox-shm-pool".as_ptr(), libc::MFD_CLOEXEC) };
-                let pool_fd = if fd >= 0 && unsafe { libc::ftruncate(fd, POOL_SIZE as libc::off_t) } == 0 {
-                    fd as usize
-                } else {
-                    usize::MAX
-                };
+                let fd =
+                    unsafe { libc::memfd_create(c"litebox-shm-pool".as_ptr(), libc::MFD_CLOEXEC) };
+                let pool_fd =
+                    if fd >= 0 && unsafe { libc::ftruncate(fd, POOL_SIZE as libc::off_t) } == 0 {
+                        fd as usize
+                    } else {
+                        usize::MAX
+                    };
                 Self::header().pool_fd.store(pool_fd, Ordering::Release);
                 result = READY;
                 ACTIVE.store(true, Ordering::Release);
                 // SAFETY: getenv on a NUL-terminated literal.
-                POISON.store(unsafe { !libc::getenv(c"LITEBOX_SHARED_HEAP_POISON".as_ptr()).is_null() }, Ordering::Release);
+                POISON.store(
+                    unsafe { !libc::getenv(c"LITEBOX_SHARED_HEAP_POISON".as_ptr()).is_null() },
+                    Ordering::Release,
+                );
             }
         }
         self.state.store(result, Ordering::Release);
@@ -361,7 +374,8 @@ impl<'a> Guard<'a> {
                 let owner = h.lock.load(Ordering::Relaxed);
                 if owner != 0 && owner != me {
                     // SAFETY: tkill with signal 0 only probes for the thread's existence.
-                    let gone = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) } == -1
+                    let gone = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) }
+                        == -1
                         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
                     if gone
                         && h.lock
@@ -374,9 +388,8 @@ impl<'a> Guard<'a> {
             }
             if spins == 200_000_000 {
                 let owner = h.lock.load(Ordering::Relaxed);
-                let msg = std::format!(
-                    "shared heap lock stuck: tid {me} waiting, owner tid {owner}\n"
-                );
+                let msg =
+                    std::format!("shared heap lock stuck: tid {me} waiting, owner tid {owner}\n");
                 // SAFETY: raw write of a stack buffer to stderr.
                 unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
                 // SAFETY: abort never returns.
@@ -451,11 +464,7 @@ unsafe impl GlobalAlloc for SharedHeap {
             // still exclusively ours; a later reuse simply reads zeros.
             // SAFETY: the range lies inside this block, which the caller has just given up.
             unsafe {
-                libc::madvise(
-                    ptr.add(4096).cast(),
-                    size - 4096,
-                    libc::MADV_REMOVE,
-                );
+                libc::madvise(ptr.add(4096).cast(), size - 4096, libc::MADV_REMOVE);
             }
         }
         let h = Self::header();

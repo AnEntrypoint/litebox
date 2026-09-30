@@ -767,7 +767,10 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
             builder
                 .append_link(&mut header, &entry.tar_path, target)
                 .with_context(|| {
-                    format!("failed to add symlink {} -> {target} to tar", entry.tar_path)
+                    format!(
+                        "failed to add symlink {} -> {target} to tar",
+                        entry.tar_path
+                    )
                 })?;
             // A symlink entry is header-only, no data blocks.
             offset += TAR_BLOCK;

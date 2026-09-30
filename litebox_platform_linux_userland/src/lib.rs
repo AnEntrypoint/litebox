@@ -34,11 +34,11 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+pub mod presentation;
 /// GUI application support (DRM/KMS dumb-buffer emulation's host-side presentation layer). See the
 /// module's own doc comment for the full design and how it differs from `litebox_platform_windows_
 /// userland::presentation`, the reference implementation this was ported from.
 pub mod shared_heap;
-pub mod presentation;
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
@@ -237,10 +237,16 @@ impl LinuxUserland {
         );
         register_exception_handlers();
         litebox::fs::clock::set_now_fn(|| {
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
             // SAFETY: clock_gettime writes one timespec through a valid pointer.
             unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
-            litebox::fs::Timestamp { sec: ts.tv_sec, nsec: ts.tv_nsec as u32 }
+            litebox::fs::Timestamp {
+                sec: ts.tv_sec,
+                nsec: ts.tv_nsec as u32,
+            }
         });
         litebox::fs::ident::set_thread_id_fn(|| {
             // SAFETY: gettid takes no arguments and cannot fail.
@@ -1991,9 +1997,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         GUEST_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
         if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
             // SAFETY: getpid/gettid take no arguments and cannot fail.
-            let (host_pid, host_tid) = unsafe {
-                (libc::getpid(), libc::syscall(libc::SYS_gettid))
-            };
+            let (host_pid, host_tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
             eprintln!("[diag-hostpid] host_pid={host_pid} host_tid={host_tid} guest_pid={pid}");
         }
     }
@@ -2269,14 +2273,19 @@ impl RawMutex {
                 let addr = &self.inner as *const AtomicU32 as usize;
                 let probe = |op: usize, ts: usize| -> isize {
                     // SAFETY: probes the same live futex word; a zero timeout pointer means none.
-                    match unsafe { syscalls::syscall6(syscalls::Sysno::futex, addr, op, val as usize, ts, 0, 0) } {
+                    match unsafe {
+                        syscalls::syscall6(syscalls::Sysno::futex, addr, op, val as usize, ts, 0, 0)
+                    } {
                         Ok(v) => v as isize,
                         Err(e) => -(e.into_raw() as isize),
                     }
                 };
                 let no_ts = probe(0, 0);
                 let private = probe(128, 0);
-                let ts = litebox_common_linux::Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+                let ts = litebox_common_linux::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
                 let with_ts = probe(0, core::ptr::from_ref(&ts) as usize);
                 let gettid = unsafe { libc::syscall(libc::SYS_gettid) };
                 let getpid = unsafe { libc::syscall(libc::SYS_getpid) };
@@ -3211,9 +3220,9 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
                 if let Some(old) = current.take() {
                     core::mem::forget(old);
                 }
-                *current = Some(ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(
-                    host_thread_ids(),
-                )))));
+                *current = Some(ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(
+                    Some(host_thread_ids()),
+                ))));
             });
         }
         if pid < 0 { None } else { Some(pid) }
@@ -3254,7 +3263,10 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
     // marker layout `decode_cross_process_wait_status` reads (high 16 bits `0xC0DE`, bit 15 =
     // signalled, low 8 bits = exit code or signal number) so the shim's one decoder serves both
     // this and the Windows path.
-    fn wait_for_cross_process_exit(&self, handle: litebox::platform::CrossProcessChildHandle) -> u32 {
+    fn wait_for_cross_process_exit(
+        &self,
+        handle: litebox::platform::CrossProcessChildHandle,
+    ) -> u32 {
         loop {
             if let Some(code) = native_fork_waitpid(handle, 0) {
                 return code;
@@ -3283,7 +3295,12 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
             loop {
                 let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
                 let r = unsafe {
-                    libc::waitid(libc::P_PID, pid, &raw mut info, libc::WEXITED | libc::WNOWAIT)
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &raw mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
                 };
                 if r == 0 {
                     break;
@@ -3459,8 +3476,7 @@ fn register_exception_handlers() {
                 // any non-interactive launch context). Only a genuine pre-existing custom handler
                 // is a conflict worth surfacing.
                 assert!(
-                    old_sa.sa_sigaction == libc::SIG_DFL
-                        || old_sa.sa_sigaction == libc::SIG_IGN,
+                    old_sa.sa_sigaction == libc::SIG_DFL || old_sa.sa_sigaction == libc::SIG_IGN,
                     "signal {sig} handler already installed",
                 );
             }

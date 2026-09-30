@@ -301,7 +301,6 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
     });
 }
 
-
 /// Prints the return addresses on the panicking thread's frame-pointer chain after the normal
 /// panic message. Unlike `RUST_BACKTRACE`, this works on guest-running threads (whose unwind info
 /// stops at the guest entry) and needs no file access, which the seccomp filter forbids. Only
