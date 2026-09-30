@@ -54,6 +54,43 @@ pub struct ProcSelfInfo {
     /// `dlopen`, and a closure is the only shape that can name the shim's per-process memory
     /// manager from this crate. Load-bearing for Rust std -- gm mutable `mut-1789043907427`.
     pub maps: Option<alloc::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>>,
+    /// Snapshot of the process's open descriptors as `(fd, readlink target)`, refreshed by the
+    /// shim whenever a path under `/proc/<pid>/fd` is resolved; backs the `fd` directory listing.
+    pub fds: Vec<(u32, String)>,
+}
+
+fn fd_dir_entries(fds: &[(u32, String)]) -> Vec<DirEntry> {
+    fds.iter()
+        .map(|(fd, _)| DirEntry {
+            name: format!("{fd}"),
+            file_type: FileType::Symlink,
+            ino_info: None,
+        })
+        .collect()
+}
+
+fn fd_link_target(fds: &[(u32, String)], name: &str) -> Result<Option<String>, OpenError> {
+    let fd = name
+        .parse::<u32>()
+        .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+    let (_, target) = fds
+        .iter()
+        .find(|(candidate, _)| *candidate == fd)
+        .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+    Ok(target.starts_with('/').then(|| target.clone()))
+}
+
+fn fd_dir_status(node_info: NodeInfo) -> FileStatus {
+    FileStatus {
+        file_type: FileType::Directory,
+        mode: Mode::RUSR | Mode::XUSR,
+        size: super::DEFAULT_DIRECTORY_SIZE,
+        owner: UserInfo::ROOT,
+        node_info,
+        blksize: super::DEFAULT_DIRECTORY_SIZE,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
 }
 
 /// Real `/proc/[pid]/stat`: 52 whitespace-separated fields, `comm` parenthesized so readers split
@@ -255,6 +292,7 @@ where
 pub enum ProcfsDirHandle {
     Root,
     Pid(i32),
+    PidFd(i32),
 }
 
 /// Parses a `/proc` path component as a pid directory name -- real Linux's own rule: an unsigned
@@ -407,9 +445,16 @@ where
         let mut current = from.into_typed::<Self>();
         let mut walked = Vec::with_capacity(components.len());
         for &component in components {
+            if let ProcfsDirHandle::Pid(pid) = current
+                && component == "fd"
+            {
+                walked.push(super::backend::WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                });
+                current = ProcfsDirHandle::PidFd(pid);
+                continue;
+            }
             if current != ProcfsDirHandle::Root {
-                // A pid directory is itself flat: `stat`/`status`/etc. are files, never a further
-                // subdirectory, matching real Linux.
                 return Ok(WalkOutcome {
                     components: walked,
                     last: WalkingDirHandle::from_typed::<Self>(current),
@@ -466,6 +511,9 @@ where
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
         let (kind, content) = match dir {
+            ProcfsDirHandle::PidFd(_) => {
+                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+            }
             ProcfsDirHandle::Root => {
                 let entry = ProcfsEntry::from_name(name)
                     .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
@@ -527,14 +575,45 @@ where
                 }));
                 Ok(entries)
             }
-            ProcfsDirHandle::Pid(_) => Ok(ProcPidEntry::ALL
-                .iter()
-                .map(|(n, _)| DirEntry {
-                    name: String::from(*n),
-                    file_type: FileType::RegularFile,
+            ProcfsDirHandle::Pid(_) => {
+                let mut entries: Vec<DirEntry> = ProcPidEntry::ALL
+                    .iter()
+                    .map(|(n, _)| DirEntry {
+                        name: String::from(*n),
+                        file_type: FileType::RegularFile,
+                        ino_info: None,
+                    })
+                    .collect();
+                entries.push(DirEntry {
+                    name: String::from("fd"),
+                    file_type: FileType::Directory,
                     ino_info: None,
-                })
-                .collect()),
+                });
+                Ok(entries)
+            }
+            ProcfsDirHandle::PidFd(pid) => Ok(self
+                .proc_self_info
+                .read()
+                .get(pid)
+                .map(|info| fd_dir_entries(&info.fds))
+                .unwrap_or_default()),
+        }
+    }
+
+    fn read_link_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<Option<String>, OpenError> {
+        match dir.into_typed::<Self>() {
+            ProcfsDirHandle::PidFd(pid) => {
+                let table = self.proc_self_info.read();
+                let info = table
+                    .get(pid)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                fd_link_target(&info.fds, name)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -600,6 +679,13 @@ where
 
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let node_info = match *h.get_typed::<Self>() {
+            ProcfsDirHandle::PidFd(pid) => {
+                return Ok(fd_dir_status(NodeInfo {
+                    dev: 8,
+                    ino: (pid as i64).unsigned_abs() as usize * 8 + 101,
+                    rdev: None,
+                }));
+            }
             ProcfsDirHandle::Root => self.root_inode.clone(),
             ProcfsDirHandle::Pid(pid) => NodeInfo {
                 dev: 8,
@@ -704,6 +790,7 @@ impl ProcSelfTable {
         };
         info.pid = child;
         info.maps = None;
+        info.fds = Vec::new();
         self.by_pid.insert(child, info);
     }
 
@@ -716,6 +803,17 @@ impl ProcSelfTable {
         if self.most_recent == Some(pid) {
             self.most_recent = None;
         }
+    }
+
+    /// Replaces `pid`'s descriptor snapshot, creating a bare entry when the process has none yet.
+    pub fn set_fds(&mut self, pid: i32, fds: Vec<(u32, String)>) {
+        self.by_pid
+            .entry(pid)
+            .or_insert_with(|| ProcSelfInfo {
+                pid,
+                ..ProcSelfInfo::default()
+            })
+            .fds = fds;
     }
 
     /// The entry `/proc/self` should serve to a caller whose pid is `caller`.
@@ -786,9 +884,12 @@ where
     }
 }
 
-/// Directory handle: only the backend's mount root exists (a flat namespace).
-#[derive(Debug, Clone, Copy)]
-pub struct ProcSelfDirHandle;
+/// Directory handle: the backend's mount root, or its `fd` subdirectory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSelfDirHandle {
+    Root,
+    Fd,
+}
 
 /// Which of the flat files this handle names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -902,7 +1003,7 @@ where
     Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(ProcSelfDirHandle)
+        WalkingDirHandle::from_typed::<Self>(ProcSelfDirHandle::Root)
     }
 
     fn walk_directories<'a>(
@@ -910,20 +1011,29 @@ where
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let from = from.into_typed::<Self>();
-        if let Some(&component) = components.first() {
-            if ProcSelfEntry::from_name(component).is_none() {
+        let mut current = from.into_typed::<Self>();
+        let mut walked = vec![];
+        for &component in components {
+            if current == ProcSelfDirHandle::Root && component == "fd" {
+                walked.push(super::backend::WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                });
+                current = ProcSelfDirHandle::Fd;
+                continue;
+            }
+            if current == ProcSelfDirHandle::Root && ProcSelfEntry::from_name(component).is_none()
+            {
                 return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
             }
             return Ok(WalkOutcome {
-                components: vec![],
-                last: WalkingDirHandle::from_typed::<Self>(from),
+                components: walked,
+                last: WalkingDirHandle::from_typed::<Self>(current),
                 stop_reason: WalkStopReason::StoppedAtNonDirectory,
             });
         }
         Ok(WalkOutcome {
-            components: vec![],
-            last: WalkingDirHandle::from_typed::<Self>(from),
+            components: walked,
+            last: WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
@@ -950,7 +1060,9 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
+        if dir.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        }
         let entry = ProcSelfEntry::from_name(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
         if flags.contains(OFlags::DIRECTORY) {
@@ -987,7 +1099,15 @@ where
         dir: WalkingDirHandle<'_>,
         name: &str,
     ) -> Result<Option<String>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
+        if dir.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+            let info = self
+                .current()
+                .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+            return fd_link_target(&info.fds, name);
+        }
+        if name == "fd" {
+            return Ok(None);
+        }
         match ProcSelfEntry::from_name(name) {
             Some(ProcSelfEntry::Exe) => Ok(self.current().map(|info| info.exe_path)),
             Some(_) => Ok(None),
@@ -996,8 +1116,13 @@ where
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let _handle = handle.into_typed::<Self>();
-        Ok(ProcSelfEntry::ALL
+        if handle.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+            return Ok(self
+                .current()
+                .map(|info| fd_dir_entries(&info.fds))
+                .unwrap_or_default());
+        }
+        let mut entries: Vec<DirEntry> = ProcSelfEntry::ALL
             .iter()
             .map(|(n, e)| DirEntry {
                 name: String::from(*n),
@@ -1009,7 +1134,13 @@ where
                 },
                 ino_info: None,
             })
-            .collect())
+            .collect();
+        entries.push(DirEntry {
+            name: String::from("fd"),
+            file_type: FileType::Directory,
+            ino_info: None,
+        });
+        Ok(entries)
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -1065,7 +1196,14 @@ where
         })
     }
 
-    fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        if *h.get_typed::<Self>() == ProcSelfDirHandle::Fd {
+            return Ok(fd_dir_status(NodeInfo {
+                dev: 7,
+                ino: 100,
+                rdev: None,
+            }));
+        }
         Ok(FileStatus {
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,

@@ -747,6 +747,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.fs.borrow().umask()
     }
 
+    fn proc_fd_target(&self, files: &FilesState<Platform, FS>, fd: usize) -> String {
+        let stdio_default = match fd {
+            0 => Some("/dev/stdin"),
+            1 => Some("/dev/stdout"),
+            2 => Some("/dev/stderr"),
+            _ => None,
+        };
+        files
+            .lookup_fd_path(fd)
+            .and_then(|p| p.into_string().ok())
+            .unwrap_or_else(|| match stdio_default {
+                Some(default) => default.to_string(),
+                None => alloc::format!("anon_inode:[fd{fd}]"),
+            })
+    }
+
+    /// Publishes this process's open descriptors to the `/proc/<pid>/fd` directory backend
+    /// whenever `path` names something under it.
+    fn refresh_proc_fd_snapshot(&self, path: &str) {
+        let Some(rest) = path.strip_prefix("/proc/") else {
+            return;
+        };
+        let Some((owner, tail)) = rest.split_once('/') else {
+            return;
+        };
+        let own_pid = self.pid.get().to_string();
+        if owner != "self" && owner != "thread-self" && owner != own_pid {
+            return;
+        }
+        if tail != "fd" && !tail.starts_with("fd/") {
+            return;
+        }
+        let snapshot: alloc::vec::Vec<(u32, String)> = {
+            let files = self.files.borrow();
+            let alive: alloc::vec::Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+            alive
+                .into_iter()
+                .filter_map(|raw| {
+                    let fd = u32::try_from(raw).ok()?;
+                    Some((fd, self.proc_fd_target(&files, raw)))
+                })
+                .collect()
+        };
+        self.global
+            .proc_self_info
+            .write()
+            .set_fds(self.pid.get(), snapshot);
+    }
+
     /// Resolve a path against the current working directory.
     pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
@@ -754,6 +803,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::ENOENT);
         }
         if path_str.starts_with('/') {
+            self.refresh_proc_fd_snapshot(path_str);
             CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
         } else {
             let mut cwd = self.fs.borrow().cwd.read().clone();
@@ -788,14 +838,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => Ok(path),
-            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+        let resolved = match fs_path {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
-                Self::join_dir_relative_path(&dir_path, &path)
+                Self::join_dir_relative_path(&dir_path, &path)?
             }
+        };
+        if let Ok(resolved_str) = resolved.to_str() {
+            self.refresh_proc_fd_snapshot(resolved_str);
         }
+        Ok(resolved)
     }
 
     pub(crate) fn do_open(
@@ -3204,6 +3258,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
         if let Ok(path_str) = pathname.as_rust_str() {
+            self.refresh_proc_fd_snapshot(path_str);
             self.refresh_from_spill(path_str);
         }
         let status = match self.files.borrow().fs.file_status(&pathname) {
@@ -3293,43 +3348,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            let stdio_default = match fd {
-                0 => Some("/dev/stdin"),
-                1 => Some("/dev/stdout"),
-                2 => Some("/dev/stderr"),
-                _ => None,
-            };
-            match stdio_default {
-                // A stdio fd `dup2`'d over by a real file or pty slave (a terminal emulator's
-                // child) names that target, which is what `ttyname()`/`tty` read back.
-                Some(default) => {
-                    return Ok(self
-                        .files
-                        .borrow()
-                        .lookup_fd_path(fd as usize)
-                        .and_then(|p| p.into_string().ok())
-                        .unwrap_or_else(|| default.to_string()));
-                }
-                None => {
-                    // Any other fd: this used to unconditionally panic, crashing the whole
-                    // runner on something as ordinary as Python's
-                    // `os.readlink(f"/proc/self/fd/{fd}")` (used by e.g. introspection/sandboxing
-                    // libraries to see what a descriptor points to) or a shell's `<()` process
-                    // substitution. If the fd was opened from a real path, return that path (the
-                    // common case: a plain file); otherwise -- a pipe/socket/eventfd/pty/etc,
-                    // none of which have a filesystem path -- fall back to a synthetic
-                    // descriptor string, matching the *spirit* of real Linux's
-                    // "pipe:[12345]"/"socket:[12345]"/"anon_inode:[eventfd]" (without trying to
-                    // replicate its exact per-kind naming or inode numbers).
-                    self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
-                    return Ok(self
-                        .files
-                        .borrow()
-                        .lookup_fd_path(fd as usize)
-                        .and_then(|p| p.into_string().ok())
-                        .unwrap_or_else(|| alloc::format!("anon_inode:[fd{fd}]")));
-                }
+            if fd > 2 {
+                self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
             }
+            return Ok(self.proc_fd_target(&self.files.borrow(), fd as usize));
         }
 
         self.files
@@ -3621,6 +3643,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
             return Ok(T::from(status));
         }
+        self.refresh_proc_fd_snapshot(normalized_path.as_str());
         self.refresh_from_spill(normalized_path.as_str());
         let lookup_path = if follow_symlink {
             self.resolve_final_symlinks(normalized_path)?
@@ -7163,6 +7186,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .lookup_fd_path(fd)
             .and_then(|path| path.into_string().ok());
         if let Some(directory) = listed_directory {
+            self.refresh_proc_fd_snapshot(&directory);
             self.refresh_spilled_directory(&directory);
         }
         let files = self.files.borrow();

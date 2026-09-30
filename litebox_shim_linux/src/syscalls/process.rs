@@ -7469,6 +7469,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // installed against this process's page manager once it exists.
                     auxv: alloc::vec::Vec::new(),
                     maps: None,
+                    fds: alloc::vec::Vec::new(),
                 },
             );
         }
