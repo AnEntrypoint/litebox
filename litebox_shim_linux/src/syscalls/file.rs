@@ -2304,6 +2304,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         if let Ok(n) = res
+            && n > 0
+            && self.has_shared_file_mappings()
+        {
+            let start = match offset {
+                Some(explicit) => Some(explicit),
+                None => self
+                    .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .ok()
+                    .and_then(|end| end.checked_sub(n)),
+            };
+            if let Some(start) = start {
+                self.shared_file_write_through(raw_fd, start, &buf[..n]);
+            }
+        }
+        if let Ok(n) = res
             && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
         {
             let published = self.global.shared_file_publish.publish_at(

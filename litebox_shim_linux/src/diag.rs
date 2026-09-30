@@ -273,7 +273,7 @@ static SYSCALL_TIMELINE_PIDS_INIT: core::sync::atomic::AtomicBool =
 /// investigator-supplied pid list, not "every process", so the original OOM concern doesn't recur).
 ///
 /// - unset or empty -> off (no pids traced by this filter)
-/// - a comma-separated list of pids, e.g. `51,53`
+/// - a comma-separated list of pids or inclusive ranges, e.g. `51,53,60-80`
 pub fn init_syscall_timeline_pids(value: impl FnOnce() -> Option<String>) {
     if SYSCALL_TIMELINE_PIDS_INIT.load(Ordering::Acquire) {
         return;
@@ -284,7 +284,13 @@ pub fn init_syscall_timeline_pids(value: impl FnOnce() -> Option<String>) {
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
+            .flat_map(|s| match s.split_once('-') {
+                Some((lo, hi)) => match (lo.parse::<i32>(), hi.parse::<i32>()) {
+                    (Ok(lo), Ok(hi)) if lo <= hi && hi - lo < 4096 => (lo..=hi).collect(),
+                    _ => Vec::new(),
+                },
+                None => s.parse().ok().into_iter().collect(),
+            })
             .collect(),
     };
     if !pids.is_empty() {

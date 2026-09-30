@@ -2529,6 +2529,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
         let mut written_fds = alloc::vec::Vec::new();
         for fd in fds {
+            let carried_spec = match &fd {
+                AnyDupFd::Carried(spec) => Some(spec.clone()),
+                _ => None,
+            };
             let inserted = match fd {
                 AnyDupFd::Carried(spec) => self.rebuild_carried_fd(&spec, cloexec),
                 other => other.insert_into(&self.global.litebox, &self.files.borrow(), cloexec),
@@ -2536,7 +2540,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             match inserted {
                 Ok(raw_fd) => written_fds.push(raw_fd),
                 Err(Errno::EMFILE) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(spec) = carried_spec {
+                        litebox_util_log::warn!("recvmsg: rebuilding a carried SCM_RIGHTS fd failed errno={e:?} spec={spec}");
+                    }
+                    return Err(e);
+                }
             }
         }
 

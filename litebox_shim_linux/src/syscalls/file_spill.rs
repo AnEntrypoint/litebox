@@ -7,8 +7,15 @@ use litebox::{
 
 use crate::{ShimFS, ShimPlatform, Task};
 
-const SPILLED_PREFIXES: &[&str] = &["/var/lib/apt/", "/var/cache/apt/"];
-const SLOT_COUNT: usize = 256;
+const SPILLED_PREFIXES: &[&str] = &[
+    "/var/lib/apt/",
+    "/var/cache/apt/",
+    "/tmp/.config/chromium",
+    "/tmp/.cache/chromium",
+    "/root/.config/chromium",
+    "/root/.cache/chromium",
+];
+const SLOT_COUNT: usize = 1024;
 const PATH_CAPACITY: usize = 192;
 const TRANSFER_CHUNK: usize = 256 * 1024;
 const LOCK_SPIN_LIMIT: u32 = 400_000_000;

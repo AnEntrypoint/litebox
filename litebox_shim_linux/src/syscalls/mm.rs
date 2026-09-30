@@ -1148,6 +1148,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///    `rename()` over the top -- what dconf-service itself does with the database, and the
     ///    normal atomic-replace idiom -- is unaffected, because the replacement is a different
     ///    inode and therefore a different key, hence a fresh object seeded from the new contents.
+    pub(crate) fn has_shared_file_mappings(&self) -> bool {
+        !self.global.shared_files.lock().is_empty()
+    }
+
+    pub(crate) fn shared_file_write_through(&self, raw_fd: usize, start: usize, bytes: &[u8]) {
+        let key = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let status = files.fs.fd_file_status(typed_fd).ok()?;
+                        Some((status.node_info.dev, status.node_info.ino))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None)
+                .ok()
+                .flatten()
+        };
+        let Some(key) = key else {
+            return;
+        };
+        let (handle, size) = match self.global.shared_files.lock().get(&key) {
+            Some(entry) => (entry.handle, entry.size),
+            None => return,
+        };
+        let end = start.saturating_add(bytes.len()).min(size);
+        if start >= end {
+            return;
+        }
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(align_up(end, PAGE_SIZE)) else {
+            return;
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let _ = ptr.write_slice_at_offset(start as isize, &bytes[..end - start]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(
+                &self.process().pm(),
+                user_ptr,
+                align_up(end, PAGE_SIZE),
+            );
+        }
+    }
+
     fn try_shared_file_mmap(
         &self,
         addr: usize,
