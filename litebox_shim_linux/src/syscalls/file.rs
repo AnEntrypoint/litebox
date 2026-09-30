@@ -1568,6 +1568,133 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         usize::try_from(raw).map_err(|_| Errno::EINVAL)
     }
 
+    /// Content of a regular file that has no name left (unlinked temporary files Chromium hands to
+    /// its children), copied into a fresh named shared object so the receiving process can rebuild
+    /// a private copy: `T|<flags>|<size>|<object name>`. A read-only handoff is exact; writes made
+    /// afterwards by either side are not shared.
+    fn snapshot_nameless_file_for_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
+        const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+        let (flags, bytes) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        let status = files.fs.fd_file_status(fd).ok()?;
+                        if status.file_type != litebox::fs::FileType::RegularFile
+                            || status.size > SNAPSHOT_MAX_BYTES
+                        {
+                            return None;
+                        }
+                        let flags = files.fs.open_flags(fd)?;
+                        let mut buf = alloc::vec![0u8; status.size];
+                        let n = files.fs.read(fd, &mut buf, Some(0)).ok()?;
+                        buf.truncate(n);
+                        Some((flags.bits(), buf))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()?
+        };
+        let name = alloc::format!(
+            "Local\\litebox_snap_{}_{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let aligned = bytes.len().next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(&name, aligned)
+            .ok()?;
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned)?;
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        let ptr = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        }
+        .ok()?;
+        let written = ptr.write_slice_at_offset(0, &bytes);
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
+        written?;
+        Some(alloc::format!("T|{flags}|{}|{name}", bytes.len()))
+    }
+
+    fn rebuild_snapshot_file(
+        &self,
+        flags: u32,
+        size: usize,
+        name: &str,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        let aligned = size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(name, aligned)
+            .map_err(|_| Errno::ENOMEM)?;
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned).ok_or(Errno::EINVAL)?;
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        let ptr = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        }
+        .map_err(|_| Errno::ENOMEM)?;
+        let mut bytes = alloc::vec![0u8; size];
+        for (offset, slot) in bytes.iter_mut().enumerate() {
+            if let Some(v) = ptr.read_at_offset(isize::try_from(offset).unwrap_or(0)) {
+                *slot = v;
+            }
+        }
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
+        let path = alloc::format!(
+            "/dev/shm/.litebox-snapshot-{}-{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let creator = self.sys_openat(
+            AT_FDCWD,
+            path.as_str(),
+            OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let creator = i32::try_from(creator).map_err(|_| Errno::EINVAL)?;
+        let written = self.sys_write(creator, &bytes, None);
+        let _ = self.sys_close(creator);
+        if let Err(e) = written {
+            let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+            return Err(e);
+        }
+        let mut reopen =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        if cloexec {
+            reopen |= OFlags::CLOEXEC;
+        }
+        let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen, Mode::empty());
+        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        raw.map(|fd| fd as usize)
+    }
+
     /// Fork-child form of [`Self::install_shm_file`]: `spec` is `<cloexec 0|1>|<flags>|<size>|<name>`,
     /// installed at exactly `target_fd`.
     pub(crate) fn install_shm_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
@@ -7125,7 +7252,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             return Some(alloc::format!("F|{}|0|{path}", flags.bits()));
         }
-        None
+        self.snapshot_nameless_file_for_carry(raw_fd)
     }
 
     /// Receiving half of [`Self::scm_carry_spec`]: builds the descriptor in this process and
@@ -7177,6 +7304,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     cloexec,
                 )
                 .and_then(|fd| u32::try_from(fd).map_err(|_| Errno::EINVAL))?
+            }
+            "T" => {
+                let size: usize = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let name = parts.next().ok_or(Errno::EINVAL)?;
+                let raw = self.rebuild_snapshot_file(
+                    u32::try_from(first).map_err(|_| Errno::EINVAL)?,
+                    size,
+                    name,
+                    cloexec,
+                )?;
+                return Ok(raw);
             }
             "E" => {
                 let flags: u32 = parts

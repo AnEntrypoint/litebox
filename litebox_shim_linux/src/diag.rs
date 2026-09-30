@@ -278,7 +278,12 @@ pub fn init_syscall_timeline_pids(value: impl FnOnce() -> Option<String>) {
     if SYSCALL_TIMELINE_PIDS_INIT.load(Ordering::Acquire) {
         return;
     }
-    let pids: Vec<i32> = match value() {
+    let value = value();
+    if value.as_deref().map(str::trim) == Some("ipc") {
+        SYSCALL_TIMELINE_IPC_ALL.store(true, Ordering::Release);
+        SYSCALL_TIMELINE_ENABLED.store(true, Ordering::Release);
+    }
+    let pids: Vec<i32> = match value {
         None => Vec::new(),
         Some(v) => v
             .split(',')
@@ -298,6 +303,34 @@ pub fn init_syscall_timeline_pids(value: impl FnOnce() -> Option<String>) {
     }
     *SYSCALL_TIMELINE_PIDS.lock() = pids;
     SYSCALL_TIMELINE_PIDS_INIT.store(true, Ordering::Release);
+}
+
+static SYSCALL_TIMELINE_IPC_ALL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// `LITEBOX_DIAG_SYSCALL_TIMELINE_PID=ipc`: every process, but only the socket, fd-plumbing and
+/// process-lifetime syscalls, so a child that dies or times out before its pid is known is still
+/// traced at a volume a full browser run survives.
+pub fn is_ipc_timeline_syscall(number: usize) -> bool {
+    SYSCALL_TIMELINE_IPC_ALL.load(Ordering::Acquire)
+        && matches!(
+            syscall_name_pub(number).as_str(),
+            "recvmsg"
+                | "sendmsg"
+                | "sendto"
+                | "recvfrom"
+                | "socketpair"
+                | "socket"
+                | "connect"
+                | "dup2"
+                | "dup3"
+                | "execve"
+                | "exit_group"
+                | "epoll_ctl"
+                | "shutdown"
+                | "clone"
+                | "clone3"
+        )
 }
 
 /// Whether `pid` is one [`init_syscall_timeline_pids`]'s own list is aimed at.

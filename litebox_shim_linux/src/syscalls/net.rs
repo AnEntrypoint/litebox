@@ -2035,7 +2035,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let spec = self.scm_carry_spec(raw_fd);
                     if spec.is_none() {
                         litebox_util_log::warn!(
-                            fd:% = raw_fd, kind:% = self.raw_fd_subsystem_name(raw_fd);
+                            fd:% = raw_fd, kind:% = self.raw_fd_subsystem_name(raw_fd),
+                            path:% = self.files.borrow().lookup_fd_path(raw_fd).and_then(|p| p.to_str().ok().map(alloc::string::String::from)).unwrap_or_default();
                             "SCM_RIGHTS: this fd kind cannot cross a process boundary"
                         );
                     }

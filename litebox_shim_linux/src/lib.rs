@@ -2001,7 +2001,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let comm_bytes = self.comm.get();
         let is_target = crate::diag::syscall_timeline_enabled()
             && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
-                || crate::diag::is_syscall_timeline_target_pid(self.pid.get()));
+                || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
+                || crate::diag::is_ipc_timeline_syscall(syscall_number));
         if is_target {
             // Straight to stderr, not through `litebox_util_log` -- see
             // `diag::emit_timeline_line` for why (the log macros are gated on `LITEBOX_LOG`,
@@ -2119,6 +2120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // buffer) could otherwise produce a huge line.
         if crate::diag::is_syscall_timeline_target_comm(&self.comm.get())
             || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
+            || crate::diag::is_ipc_timeline_syscall(syscall_number)
         {
             let debug_str = alloc::format!("{request:?}");
             let truncated = if debug_str.len() > 200 {

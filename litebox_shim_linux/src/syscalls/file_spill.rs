@@ -14,6 +14,7 @@ const SPILLED_PREFIXES: &[&str] = &[
     "/tmp/.cache/chromium",
     "/root/.config/chromium",
     "/root/.cache/chromium",
+    "/tmp/org.chromium.",
 ];
 const SLOT_COUNT: usize = 1024;
 const PATH_CAPACITY: usize = 192;
