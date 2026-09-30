@@ -103,14 +103,16 @@ Fixed this pass (all committed, newest first):
 1b. Chrome (the user's own, ~6GB) and other host apps leave 0.3-2GB free, which makes full-stack runs die on
    the driver's `KILL low memory` guard (`avail<120`) before `DE_UP`; check `Get-Counter '\Memory\Available MBytes'`
    first. The gate in `pass118_full_err.ps1` is 1000MB.
-2. Thunar: launching `thunar &` from the terminal printed `The connection is closed` then `Terminated`
-   (D-Bus client to the already-running session Thunar); not root-caused. Run it alone and read stderr.
-3. `at-spi` still warns `GetRegisteredEvents ... unknown signature` in GTK apps (registryd itself now
-   stays up after `0cda0ec`); check whether the reply signature is truncated on the a11y bus.
-4. `/proc/self/fd/` lists as empty (`ls`), only `readlink` of one entry works.
-5. Selkies: one client per instance, no slot reclaim on reload; the playButton/videoCanvas gate
+2. Fixed 119th pass (verify in the full stack, not yet seen in a browser): `3e1ef47` SCM_RIGHTS over a
+   cross-process unix connection (thunar's D-Bus call passes a dup of stdin; the refusal made GDBus close the bus =
+   `The connection is closed` + SIGTERM). Only regular files, pty slaves, stdio, eventfds cross (spec text in
+   `RingFdMail`, rebuilt by name); pipes/sockets/pty masters still get EOPNOTSUPP. `b012910` lazy file map filled
+   stale entries over an execve'd fork child's libraries (registryd died in ld.so, source of the at-spi
+   `unknown signature` warning). `08ae94f` `/proc/<pid>/fd` lists (own pid only, snapshot).
+   Repro scripts: `.wfgy/th1.ps1 -Run th1|th2|th3` (+ `th*.sh`; env `TL`=timeline comms, `LZ`=lazy 0/1, `LZD`).
+3. Selkies: one client per instance, no slot reclaim on reload; the playButton/videoCanvas gate
    (archive) no longer blocks (video shows after `Control+Alt+t`-driven session start).
-6. Native kernel-COW fork on Windows (`.gm/prd.yml` `native-kernel-cow-fork`), writable layer shared
+4. Native kernel-COW fork on Windows (`.gm/prd.yml` `native-kernel-cow-fork`), writable layer shared
    across processes (`shared-writable-layer-across-processes`), AF_UNIX exhaustion silent
    (`SharedUnixAddrPresenceTable` 256 slots, keys >108 bytes), `flock_registry`/`drm`/`evdev` per-process,
    `timerfd`/`signalfd` uncarriable, fixed-address (non-PIE) exec from a same-process vfork child collides
