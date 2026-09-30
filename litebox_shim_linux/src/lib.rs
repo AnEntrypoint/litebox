@@ -2335,6 +2335,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 behavior,
             } => syscall!(sys_madvise(addr, length, behavior)),
+            SyscallRequest::Msync {
+                addr,
+                length,
+                flags,
+            } => syscall!(sys_msync(addr, length, flags)),
             SyscallRequest::Dup {
                 oldfd,
                 newfd,

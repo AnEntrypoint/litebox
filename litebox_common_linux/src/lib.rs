@@ -3777,6 +3777,11 @@ pub enum SyscallRequest {
         length: usize,
         behavior: MadviseBehavior,
     },
+    Msync {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        flags: u32,
+    },
     Dup {
         oldfd: i32,
         newfd: Option<i32>,
@@ -4631,6 +4636,7 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,

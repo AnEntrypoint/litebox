@@ -1731,6 +1731,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_common_linux::mm::sys_mprotect(&self.process().pm(), addr, len, prot)
     }
 
+    /// `msync`: mappings here are coherent with their backing file at write time (see
+    /// `propagate_write_to_shared_mapping`), so there is nothing left to flush.
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        _length: usize,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        const MS_ASYNC: u32 = 1;
+        const MS_INVALIDATE: u32 = 2;
+        const MS_SYNC: u32 = 4;
+        if addr.as_usize() % litebox::mm::linux::PAGE_SIZE != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn sys_mremap(
         &self,

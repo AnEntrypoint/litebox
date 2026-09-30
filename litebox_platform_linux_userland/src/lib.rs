@@ -3941,7 +3941,7 @@ unsafe extern "C" fn exception_signal_handler(
     if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
         let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
         let addr = unsafe { info.si_addr() } as u64;
-        let mut buf = [0u8; 96];
+        let mut buf = [0u8; 128];
         let mut n = 0;
         let mut put = |b: &[u8]| {
             for &c in b {
@@ -3966,6 +3966,21 @@ unsafe extern "C" fn exception_signal_handler(
         put(b" addr=0x");
         hex(addr, &mut h);
         put(&h);
+        put(b" pid=");
+        let mut pid = GUEST_PID.load(core::sync::atomic::Ordering::Relaxed).max(0) as u32;
+        let mut digits = [0u8; 10];
+        let mut nd = 0;
+        loop {
+            digits[nd] = b'0' + (pid % 10) as u8;
+            nd += 1;
+            pid /= 10;
+            if pid == 0 {
+                break;
+            }
+        }
+        for i in (0..nd).rev() {
+            put(&[digits[i]]);
+        }
         put(b"\n");
         unsafe { libc::write(2, buf.as_ptr().cast(), n) };
         // Frame-pointer walk (Chromium and most distro binaries keep frame pointers): the
