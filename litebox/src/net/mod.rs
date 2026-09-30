@@ -26,18 +26,18 @@ pub mod socket_channel;
 mod tests;
 
 use errors::{
-    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError, ShutdownError,
-    RemoteAddrError, SendError, SocketError,
+    AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
+    RemoteAddrError, SendError, ShutdownError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
 /// IP address for LiteBox interface
 // TODO: Make this configurable
-const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+pub const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
 /// IP address for the gateway
 // TODO: Make this configurable
-const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+pub const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
@@ -105,8 +105,10 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 /// to set up a proxy for each socket created, so that events can be notified properly.
 pub struct Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     litebox: LiteBox<Platform>,
     /// The set of sockets
@@ -158,8 +160,10 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Construct a new `Network` instance
     ///
@@ -568,8 +572,10 @@ impl PlatformInteractionReinvocationAdvice {
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
@@ -1126,8 +1132,10 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform:
-        platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider + platform::SharedKernelStateProvider,
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + sync::RawSyncPrimitivesProvider
+        + platform::SharedKernelStateProvider,
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
@@ -1941,7 +1949,9 @@ where
                     // those are equivalent placeholders with no client-visible state yet.
                     let new_backlog_usize: usize = backlog.into();
                     if server_socket.socket_set_handles.len() > new_backlog_usize {
-                        for handle in server_socket.socket_set_handles.split_off(new_backlog_usize)
+                        for handle in server_socket
+                            .socket_set_handles
+                            .split_off(new_backlog_usize)
                         {
                             // Stale-handle guard (see `socket_set_contains`'s own doc comment) --
                             // a handle already wiped by a dead-holder `reset_after_poisoning()`
@@ -2046,7 +2056,7 @@ where
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: false,
-            shutdown_wr_pending: false,
+                    shutdown_wr_pending: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,

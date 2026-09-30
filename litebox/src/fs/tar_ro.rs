@@ -658,7 +658,10 @@ struct TarIndex {
 /// the same path).
 enum RawEntry {
     /// An explicit directory entry (`DIRTYPE`), kept so empty directories exist.
-    Dir { path: String, owner: UserInfo },
+    Dir {
+        path: String,
+        owner: UserInfo,
+    },
     File {
         path: String,
         file_idx: usize,
@@ -670,10 +673,14 @@ enum RawEntry {
     /// `.wh.<name>`: delete the single sibling entry `<name>` (file, symlink, or whole directory
     /// subtree) contributed by any earlier layer. Never removes an entry a later layer in the
     /// same merge re-creates, since whiteouts are applied strictly in bottom-to-top layer order.
-    Whiteout { path: String },
+    Whiteout {
+        path: String,
+    },
     /// `.wh..wh..opq`: clear every entry earlier layers contributed under this entry's own
     /// parent directory (but not the directory itself), per the OCI opaque-whiteout spec.
-    OpaqueWhiteout { parent: String },
+    OpaqueWhiteout {
+        parent: String,
+    },
     /// A POSIX hard link (`tar_no_std::TypeFlag::LINK`): `path` aliases whatever `link_target`
     /// resolves to once every layer is folded. Must be indexed (busybox's official image ships
     /// `bin/busybox` itself as a hard link) and must stay deferred -- see gm mutable
@@ -781,9 +788,7 @@ impl TarIndex {
             // flag, so `.wh.<name>` / `.wh..wh..opq` must be detected by basename -- see gm
             // mutable fs-tarro-whiteout-basename.
             {
-                let (parent, basename) = path
-                    .rsplit_once('/')
-                    .unwrap_or(("", path.as_str()));
+                let (parent, basename) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
                 if basename == ".wh..wh..opq" {
                     let payload_blocks = header.payload_block_count().unwrap_or(0);
                     block_index += payload_blocks;
@@ -960,7 +965,13 @@ impl TarIndex {
                 RawLiveEntry::Dir(owner) => {
                     let mut probe = path.clone();
                     probe.push_str("/x");
-                    ensure_ancestors(&mut dirs, &mut dirs_by_path, &probe, owner, &inode_allocator);
+                    ensure_ancestors(
+                        &mut dirs,
+                        &mut dirs_by_path,
+                        &probe,
+                        owner,
+                        &inode_allocator,
+                    );
                     if let Some(&idx) = dirs_by_path.get(path.as_str()) {
                         dirs[idx].owner = Some(owner);
                     }
@@ -1141,7 +1152,13 @@ impl TarIndex {
                 MergedLiveEntryKind::Dir { owner } => {
                     let mut probe = entry.path.clone();
                     probe.push_str("/x");
-                    ensure_ancestors(&mut dirs, &mut dirs_by_path, &probe, owner, &inode_allocator);
+                    ensure_ancestors(
+                        &mut dirs,
+                        &mut dirs_by_path,
+                        &probe,
+                        owner,
+                        &inode_allocator,
+                    );
                     if let Some(&idx) = dirs_by_path.get(entry.path.as_str()) {
                         dirs[idx].owner = Some(owner);
                     }
@@ -1200,7 +1217,10 @@ enum RawLiveEntry {
 /// whiteout (`.wh.<name>`, which may target a whole directory subtree in an earlier layer) and
 /// before inserting a fresh file/symlink at `path` (a later layer's file may replace what was
 /// previously a directory at the same path, or vice versa).
-fn remove_path_and_descendants(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, path: &str) {
+fn remove_path_and_descendants(
+    live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>,
+    path: &str,
+) {
     live.remove(path);
     remove_descendants_of(live, path);
 }
@@ -1208,7 +1228,10 @@ fn remove_path_and_descendants(live: &mut alloc::collections::BTreeMap<String, R
 /// Remove every currently-live entry nested strictly under `parent` (not `parent` itself). Used
 /// by opaque-whiteout handling, and as the subtree-removal half of
 /// [`remove_path_and_descendants`].
-fn remove_descendants_of(live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>, parent: &str) {
+fn remove_descendants_of(
+    live: &mut alloc::collections::BTreeMap<String, RawLiveEntry>,
+    parent: &str,
+) {
     if parent.is_empty() {
         // An empty parent means "everything" would match `starts_with("")` unconditionally --
         // only reachable via a root-level opaque whiteout, which legitimately does mean "clear

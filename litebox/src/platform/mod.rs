@@ -416,7 +416,11 @@ pub trait SharedKernelStateProvider {
     /// a platform that supports it. Mirrors `alloc::sync::Arc<T>`'s ergonomics (`Clone`,
     /// `Deref`) exactly, so call sites need no further changes beyond swapping which type
     /// constructs the handle.
-    type Handle<T: Send + Sync + 'static>: Clone + core::ops::Deref<Target = T> + Send + Sync + 'static;
+    type Handle<T: Send + Sync + 'static>: Clone
+        + core::ops::Deref<Target = T>
+        + Send
+        + Sync
+        + 'static;
 
     /// Whether the CALLING process should [`Self::attach_shared_kernel_state`] to an ancestor's
     /// already-existing shared allocation for `slot`, rather than
@@ -430,7 +434,10 @@ pub trait SharedKernelStateProvider {
     /// platform with a real native `fork()` (which already gives correct, isolated per-process
     /// state for free, see [`Self::create_shared_kernel_state`]'s own doc comment), or an
     /// attach attempt that could not be confirmed safe -- returns `false`, the default.
-    #[expect(unused_variables, reason = "slot unused by the correct-but-unshared default")]
+    #[expect(
+        unused_variables,
+        reason = "slot unused by the correct-but-unshared default"
+    )]
     fn is_shared_kernel_state_attach_child(&self, slot: SharedKernelStateSlot) -> bool {
         false
     }
@@ -960,7 +967,9 @@ pub trait ForkChildVerificationProvider {
     /// thread that is not itself under verification (the common case: a top-level, non-nested
     /// fork), which is exactly when no merge is needed. The default implementation returns
     /// `None`, matching every other member's "correct-but-unverified" default.
-    fn current_thread_fork_relocations(&self) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
+    fn current_thread_fork_relocations(
+        &self,
+    ) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
         None
     }
 

@@ -6,10 +6,10 @@
 //! construction, and the owned (not `&'static`) table also admits values fixed once per boot, while
 //! live-changing content belongs in [`super::procfs`]. See gm mutable mut-1789043521509.
 
+use alloc::borrow::ToOwned as _;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::borrow::ToOwned as _;
 
 use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;

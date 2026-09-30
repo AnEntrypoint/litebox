@@ -83,7 +83,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // meminfo agree.
         let (total_kb, avail_kb) = self.global.platform.memory_info_kb();
         let total = usize::try_from(total_kb.saturating_mul(1024)).unwrap_or(usize::MAX);
-        let avail = usize::try_from(avail_kb.min(total_kb).saturating_mul(1024)).unwrap_or(usize::MAX);
+        let avail =
+            usize::try_from(avail_kb.min(total_kb).saturating_mul(1024)).unwrap_or(usize::MAX);
         litebox_common_linux::Sysinfo {
             uptime: now.duration_since(&self.global.boot_time).as_secs().trunc(),
             // TODO: Populate these fields with actual values
@@ -129,7 +130,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
-                return if data.is_none() { Ok(()) } else { Err(Errno::EINVAL) };
+                return if data.is_none() {
+                    Ok(())
+                } else {
+                    Err(Errno::EINVAL)
+                };
             }
         };
         let Some(data_ptr) = data else { return Ok(()) };
@@ -164,7 +169,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let data = data.ok_or(Errno::EFAULT)?;
         let (mut eff, mut perm, mut inh) = (0u64, 0u64, 0u64);
         for i in 0..words {
-            let d = data.read_at_offset::<Platform>(i as isize).ok_or(Errno::EFAULT)?;
+            let d = data
+                .read_at_offset::<Platform>(i as isize)
+                .ok_or(Errno::EFAULT)?;
             let shift = 32 * i;
             eff |= u64::from(d.effective) << shift;
             perm |= u64::from(d.permitted) << shift;

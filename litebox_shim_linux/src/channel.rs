@@ -142,7 +142,11 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
         let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
         let guard = self.endpoint.rb.lock();
         if guard.is_empty() {
-            return Err(if is_shutdown { Errno::ESHUTDOWN } else { Errno::EAGAIN });
+            return Err(if is_shutdown {
+                Errno::ESHUTDOWN
+            } else {
+                Errno::EAGAIN
+            });
         }
         Ok(f(&mut guard.iter()))
     }

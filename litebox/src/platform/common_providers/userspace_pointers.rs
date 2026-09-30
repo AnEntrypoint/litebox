@@ -329,7 +329,11 @@ fn diag_near_null_write(dst: usize) {
     while v > 0 {
         hpos -= 1;
         let nib = (v & 0xf) as u8;
-        hexbuf[hpos] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        hexbuf[hpos] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
         v >>= 4;
     }
     let hex = &hexbuf[hpos..];

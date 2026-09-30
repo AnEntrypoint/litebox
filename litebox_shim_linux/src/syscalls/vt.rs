@@ -54,9 +54,7 @@ pub(crate) fn open_qry<Platform: ShimPlatform>(ptr: UserPtrMut<i32>) -> Result<u
 /// `VT_GETSTATE` on `/dev/tty0`. Real Linux answers this on ANY open VT fd (not just `tty0`),
 /// but `seatd`'s own call sequence only ever issues it against `tty0` (see this module's doc
 /// comment), so that is the only path wired up here.
-pub(crate) fn get_state<Platform: ShimPlatform>(
-    ptr: UserPtrMut<VtStat>,
-) -> Result<u32, Errno> {
+pub(crate) fn get_state<Platform: ShimPlatform>(ptr: UserPtrMut<VtStat>) -> Result<u32, Errno> {
     let st = VtStat {
         v_active: ACTIVE_VT,
         // Real Linux reports the bitmask of allocated/signal-registered VTs here; this device
@@ -66,7 +64,8 @@ pub(crate) fn get_state<Platform: ShimPlatform>(
         v_signal: 0,
         v_state: 1 << ACTIVE_VT,
     };
-    ptr.write_at_offset::<Platform>(0, st).ok_or(Errno::EFAULT)?;
+    ptr.write_at_offset::<Platform>(0, st)
+        .ok_or(Errno::EFAULT)?;
     Ok(0)
 }
 

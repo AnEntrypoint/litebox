@@ -8,8 +8,8 @@ pub(crate) mod drm;
 /// `no_std` crate) can turn DRM ioctl tracing on without widening the module.
 pub use drm::{set_dirty_fb_enabled, set_drm_trace};
 pub(crate) mod epoll;
-pub(crate) mod eventfd;
 pub(crate) mod evdev;
+pub(crate) mod eventfd;
 pub(crate) mod inotify;
 /// Re-exported so the runner (which can read the environment, unlike this
 /// `no_std` crate) can turn evdev `SYN_REPORT` tracing on without widening the module.

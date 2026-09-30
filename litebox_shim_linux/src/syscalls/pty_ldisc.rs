@@ -262,7 +262,8 @@ impl LineDiscipline {
             }
         }
 
-        let is_eol = b == b'\n' || (!literal && ((b == cc[VEOL] && b != 0) || (b == cc[VEOL2] && b != 0)));
+        let is_eol =
+            b == b'\n' || (!literal && ((b == cc[VEOL] && b != 0) || (b == cc[VEOL2] && b != 0)));
         if self.line.len() >= MAX_LINE && !is_eol {
             return;
         }

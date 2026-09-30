@@ -317,7 +317,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 flags.remove(OFlags::DIRECTORY);
                 parent.perms.mtime = super::clock::now();
                 parent.perms.mtime = super::clock::now();
-        let old = parent.children.insert(
+                let old = parent.children.insert(
                     path.components().unwrap().last().unwrap().into(),
                     FileType::RegularFile,
                 );
@@ -610,7 +610,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -618,7 +619,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -629,7 +631,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 // recurse, and a symlink's own mode bits are never consulted, so writing them is
                 // harmless where erroring would not be. See gm mutable mut-1789044090865.
                 let perms = &mut symlink.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -651,7 +654,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match entry {
             Descriptor::File { file, .. } => {
                 let perms = &mut file.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -659,7 +663,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Descriptor::Dir { dir } => {
                 let perms = &mut dir.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -683,7 +688,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -696,7 +702,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -709,7 +716,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Symlink(symlink) => {
                 let perms = &mut symlink.write().perms;
-                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user) {
+                if !(self.acting_user().user == 0 || self.acting_user().user == perms.userinfo.user)
+                {
                     return Err(ChownError::NotTheOwner);
                 }
                 if let Some(new_user) = user {
@@ -739,7 +747,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Entry::File(file) => {
                 apply_times(&mut file.write().perms, self.acting_user(), atime, mtime)
             }
-            Entry::Dir(dir) => apply_times(&mut dir.write().perms, self.acting_user(), atime, mtime),
+            Entry::Dir(dir) => {
+                apply_times(&mut dir.write().perms, self.acting_user(), atime, mtime)
+            }
             Entry::Symlink(symlink) => {
                 apply_times(&mut symlink.write().perms, self.acting_user(), atime, mtime)
             }

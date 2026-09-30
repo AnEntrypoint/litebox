@@ -269,7 +269,8 @@ fn test_vmm_mapping() {
     // `MAPPING_GUARD_GAP`'s own doc comment for the glibc `sysmalloc` chunk-header overrun
     // (`+0x8`/`+0x18` past the end) that it converts from silent corruption of a neighbour into a
     // clean fault on an unmapped hole. This expectation predates that gap.
-    let top = DummyVmemBackend::TASK_ADDR_MAX - Vmem::<DummyVmemBackend, PAGE_SIZE>::MAPPING_GUARD_GAP;
+    let top =
+        DummyVmemBackend::TASK_ADDR_MAX - Vmem::<DummyVmemBackend, PAGE_SIZE>::MAPPING_GUARD_GAP;
     assert_eq!(
         unsafe {
             vmm.create_mapping(

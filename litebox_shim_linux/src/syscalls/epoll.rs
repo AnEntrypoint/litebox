@@ -354,7 +354,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // never again, leaving the guest's on-screen framebuffer permanently stuck). Folding
             // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
-            let has_bounded_repoll_interest = self.has_unready_stdin_or_armed_timerfd_interest(global);
+            let has_bounded_repoll_interest =
+                self.has_unready_stdin_or_armed_timerfd_interest(global);
             // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
             // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
             // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
@@ -421,7 +422,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// its read side, and the cost of an unnecessary 15ms-interval re-check for an ordinary
     /// same-process Unix socket (which still gets its real wake immediately; this only adds an
     /// upper bound) is the same accepted tradeoff already established for timerfd/stdin.
-    fn has_unready_stdin_or_armed_timerfd_interest(&self, global: &GlobalStateHandle<Platform, FS>) -> bool {
+    fn has_unready_stdin_or_armed_timerfd_interest(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> bool {
         self.interests.lock().values().any(|entry| {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 return false;
@@ -578,7 +582,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             };
             let (mask, flags, data) = {
                 let inner = old.inner.lock();
-                (inner.mask, EpollFlags::from_bits_truncate(inner.flags.bits()), inner.data)
+                (
+                    inner.mask,
+                    EpollFlags::from_bits_truncate(inner.flags.bits()),
+                    inner.data,
+                )
             };
             let entry = EpollEntry::new(
                 DescriptorRef::from(&file),
@@ -1133,17 +1141,17 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                     .is_ok_and(|desc| {
                         matches!(&desc, EpollDescriptor::Unix(_))
                             || matches!(&desc, EpollDescriptor::File(file)
-                        if global.litebox.descriptor_table().with_metadata(
-                            file,
-                            |_: &crate::syscalls::file::EvdevFd| (),
-                        ).is_ok()
-                        || matches!(
-                            global.litebox.descriptor_table().with_metadata(
+                            if global.litebox.descriptor_table().with_metadata(
                                 file,
-                                |stream: &litebox::platform::StdioStream| *stream,
-                            ),
-                            Ok(litebox::platform::StdioStream::Stdin)
-                        ))
+                                |_: &crate::syscalls::file::EvdevFd| (),
+                            ).is_ok()
+                            || matches!(
+                                global.litebox.descriptor_table().with_metadata(
+                                    file,
+                                    |stream: &litebox::platform::StdioStream| *stream,
+                                ),
+                                Ok(litebox::platform::StdioStream::Stdin)
+                            ))
                     })
         });
         let mut register = true;
@@ -1254,6 +1262,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1340,6 +1349,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1357,6 +1367,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1521,6 +1532,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1538,6 +1550,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1707,6 +1720,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1722,6 +1736,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1816,7 +1831,12 @@ mod test {
                         .litebox
                         .descriptor_table()
                         .with_entry(&writer_typed, |entry| {
-                            entry.sendto(&task, b"x", litebox_common_linux::SendFlags::empty(), None)
+                            entry.sendto(
+                                &task,
+                                b"x",
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                            )
                         })
                         .unwrap();
                 }
@@ -1852,6 +1872,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 

@@ -95,7 +95,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         &self.upper
     }
 
-
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
     /// propagate the relevant error.
     fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
@@ -131,7 +130,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 let dir = current.rsplit_once('/').map_or("", |(dir, _)| dir);
                 alloc::format!("{dir}/{target}")
             };
-            current = joined.normalized().map_err(|_| PathError::InvalidPathname)?;
+            current = joined
+                .normalized()
+                .map_err(|_| PathError::InvalidPathname)?;
             followed = true;
         }
         Err(PathError::TooManySymlinkHops)
@@ -184,7 +185,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink | FileType::Fifo)
+                Ok(
+                    FileType::RegularFile
+                    | FileType::CharacterDevice
+                    | FileType::Symlink
+                    | FileType::Fifo,
+                )
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
@@ -353,14 +359,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 }
                 match &*e.entry.entry {
                     EntryX::Upper { fd: _ } => None,
-                    EntryX::Lower { fd: _ } => {
-                        Some((
-                            internal_fd,
-                            e.entry.position.load(SeqCst),
-                            e.entry.flags,
-                            Arc::clone(&e.entry.entry),
-                        ))
-                    }
+                    EntryX::Lower { fd: _ } => Some((
+                        internal_fd,
+                        e.entry.position.load(SeqCst),
+                        e.entry.flags,
+                        Arc::clone(&e.entry.entry),
+                    )),
                     EntryX::Tombstone => unreachable!(),
                 }
             })
@@ -396,16 +400,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // may have reused this `internal_fd`'s slot for an unrelated file since
                     // `to_migrate` was collected -- gm mutable
                     // `layered-migrate-concurrency-root-lock`.
-                    let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
-                        internal_fd,
-                        |slot| {
+                    let old_entry = self
+                        .litebox
+                        .descriptor_table()
+                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |slot| {
                             if Arc::ptr_eq(&slot.entry.entry, &entry) {
                                 Some(core::mem::replace(&mut slot.entry.entry, upper_entry))
                             } else {
                                 None
                             }
-                        },
-                    );
+                        });
                     let Some(Some(old_entry)) = old_entry else {
                         continue;
                     };
@@ -426,16 +430,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     // Other fds still share this file, so a future fd does the closing. Same
                     // compare-and-skip for the same slot-reuse race -- gm mutable
                     // `layered-migrate-concurrency-root-lock`.
-                    let old_entry = self.litebox.descriptor_table().with_entry_mut_via_internal_fd::<Self, _, _>(
-                        internal_fd,
-                        |slot| {
+                    let old_entry = self
+                        .litebox
+                        .descriptor_table()
+                        .with_entry_mut_via_internal_fd::<Self, _, _>(internal_fd, |slot| {
                             if Arc::ptr_eq(&slot.entry.entry, &entry) {
                                 Some(core::mem::replace(&mut slot.entry.entry, upper_entry))
                             } else {
                                 None
                             }
-                        },
-                    );
+                        });
                     let Some(Some(old_entry)) = old_entry else {
                         continue;
                     };
@@ -844,10 +848,7 @@ impl<
         // both ends and does not rest on this check alone -- gm mutable
         // `layered-migrate-refuses-non-regular`.
         let truncate_applies = original_flags.contains(OFlags::TRUNC)
-            && matches!(
-                self.ensure_lower_contains(&path),
-                Ok(FileType::RegularFile)
-            );
+            && matches!(self.ensure_lower_contains(&path), Ok(FileType::RegularFile));
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
@@ -1057,7 +1058,10 @@ impl<
                 // read-only -- and a device (`/dev/null`) can never migrate into the upper layer, so
                 // a later writer would fail with `EISDIR`. Write through a fresh write-capable
                 // lower fd instead; only regular files migrate.
-                if !matches!(self.ensure_lower_contains(path.as_str()), Ok(FileType::RegularFile)) {
+                if !matches!(
+                    self.ensure_lower_contains(path.as_str()),
+                    Ok(FileType::RegularFile)
+                ) {
                     let write_fd = self
                         .lower
                         .open(path.as_str(), OFlags::WRONLY, Mode::empty())
@@ -1262,7 +1266,9 @@ impl<
         // file -- gm mutable `layered-open-flags-xkbcomp-fdopen`.
         self.litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| descriptor.entry.flags & OFlags::STATUS_FLAGS_MASK)
+            .with_entry(fd, |descriptor| {
+                descriptor.entry.flags & OFlags::STATUS_FLAGS_MASK
+            })
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
@@ -1899,7 +1905,7 @@ impl<
             return self.file_status(resolved);
         }
         let FileStatus {
-                nlink,
+            nlink,
             file_type,
             mode,
             size,
@@ -1999,7 +2005,7 @@ impl<
             },
         }
         let FileStatus {
-                nlink,
+            nlink,
             file_type,
             mode,
             size,
@@ -2032,7 +2038,7 @@ impl<
             .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
             .ok_or(FileStatusError::ClosedFd)?;
         let FileStatus {
-                nlink,
+            nlink,
             file_type,
             mode,
             size,

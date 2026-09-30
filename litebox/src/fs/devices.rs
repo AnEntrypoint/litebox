@@ -424,12 +424,7 @@ impl Device {
                 // Real /dev/tty is `crw-rw-rw-` (mode 0666) -- world-writable/readable since
                 // any process's own controlling terminal is meant to always be reachable via
                 // this path regardless of the tty's own group-restricted permissions.
-                mode: Mode::RUSR
-                    | Mode::WUSR
-                    | Mode::RGRP
-                    | Mode::WGRP
-                    | Mode::ROTH
-                    | Mode::WOTH,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: TTY_NODE_INFO,
@@ -823,8 +818,10 @@ pub enum DriDevice {
 }
 
 impl DriDevice {
-    const ALL: &'static [(&'static str, DriDevice)] =
-        &[("card0", DriDevice::Card0), ("renderD128", DriDevice::RenderD128)];
+    const ALL: &'static [(&'static str, DriDevice)] = &[
+        ("card0", DriDevice::Card0),
+        ("renderD128", DriDevice::RenderD128),
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
@@ -1554,7 +1551,6 @@ where
     }
 }
 
-
 /// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- exactly the set a real
 /// `libudev`/`libdrm` enumeration walk falls back to reading when no `udevd` database exists,
 /// which in litebox is always.
@@ -1762,9 +1758,7 @@ where
                 if components.len() == 1 {
                     return Ok(WalkOutcome {
                         components: walked,
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
@@ -1774,9 +1768,7 @@ where
                 if components.len() == 2 && SysDrmFile::from_name(components[1]).is_some() {
                     return Ok(WalkOutcome {
                         components: walked,
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
                     });
                 }
@@ -1809,18 +1801,14 @@ where
                 let Some(&component) = components.first() else {
                     return Ok(WalkOutcome {
                         components: vec![],
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 };
                 if SysDrmFile::from_name(component).is_some() {
                     return Ok(WalkOutcome {
                         components: vec![],
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
                     });
                 }
@@ -1869,9 +1857,7 @@ where
                         });
                     }
                     let mut outcome = self.walk_directories(
-                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(
-                            device,
-                        )),
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(device)),
                         &components[1..],
                     )?;
                     // Prepend the `drm` component this arm consumed -- same walk-length
@@ -1904,9 +1890,9 @@ where
                 let Some(&component) = components.first() else {
                     return Ok(WalkOutcome {
                         components: vec![],
-                        last: WalkingDirHandle::from_typed::<Self>(
-                            SysDrmDirHandle::DeviceDrmOf(device),
-                        ),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(
+                            device,
+                        )),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 };
@@ -1919,9 +1905,7 @@ where
                 if components.len() == 1 {
                     return Ok(WalkOutcome {
                         components: walked,
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            target,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(target)),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
@@ -3114,4 +3098,3 @@ where
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 }
-

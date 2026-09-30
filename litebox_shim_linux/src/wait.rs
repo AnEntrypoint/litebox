@@ -24,7 +24,10 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns a wait context to use to perform interruptible waits.
     pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
-        (*self.wait_state).0.context().with_check_for_interrupt(self)
+        (*self.wait_state)
+            .0
+            .context()
+            .with_check_for_interrupt(self)
     }
 
     /// Marks that the task has just returned from running guest code.

@@ -875,7 +875,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         inner.exit_status = ExitStatus::Exit(code);
-        self.thread.borrow().remote.is_exiting.store(true, Ordering::Relaxed);
+        self.thread
+            .borrow()
+            .remote
+            .is_exiting
+            .store(true, Ordering::Relaxed);
         litebox_util_log::debug!(tid:% = self.tid.get(); "sys_exit: is_exiting set, thread will unwind to prepare_for_exit");
     }
 
@@ -1026,7 +1030,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             let _ = self.thread.borrow().process.nr_threads.block(n);
         }
-        self.thread.borrow().process.inner.lock().is_killing_other_threads = false;
+        self.thread
+            .borrow()
+            .process
+            .inner
+            .lock()
+            .is_killing_other_threads = false;
         litebox_util_log::debug!(tid:% = self.tid.get(); "kill_other_threads: done");
         true
     }
@@ -1034,7 +1043,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns true if the task is exiting and should not continue running
     /// guest code.
     pub fn is_exiting(&self) -> bool {
-        self.thread.borrow().remote.is_exiting.load(Ordering::Relaxed)
+        self.thread
+            .borrow()
+            .remote
+            .is_exiting
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -1277,7 +1290,6 @@ fn futex_compare_exchange<Platform: ShimPlatform>(
         .compare_exchange_at_offset(0, current, new)
         .ok_or(Errno::EFAULT)
 }
-
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Process a single robust-futex-list entry belonging to a dying thread: if the futex word
@@ -1904,7 +1916,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // process, for which this is already a guaranteed no-op (`vfork_done` is only ever
         // nonzero for a `CLONE_VFORK` child's OWN initial thread, between `clone()` and its own
         // first `execve`/`exit`).
-        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
+        let _ = self
+            .process()
+            .detach_pm_for_vfork_execve(&self.global.litebox);
         // Deferred: do NOT wake `wait4`/`wait_for_exit` waiters yet. See
         // `Process::detach_thread`'s doc comment -- a parent's `wait4()` must never be allowed to
         // return before this process's fds are released below, mirroring real Linux's `do_exit()`
@@ -2162,16 +2176,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         crate::diag::print_strace_summary(|s| {
-            let _ = self.global.platform.write_to(
-                litebox::platform::StdioOutStream::Stderr,
-                s.as_bytes(),
-            );
+            let _ = self
+                .global
+                .platform
+                .write_to(litebox::platform::StdioOutStream::Stderr, s.as_bytes());
         });
         crate::diag::print_process_tree(|s| {
-            let _ = self.global.platform.write_to(
-                litebox::platform::StdioOutStream::Stderr,
-                s.as_bytes(),
-            );
+            let _ = self
+                .global
+                .platform
+                .write_to(litebox::platform::StdioOutStream::Stderr, s.as_bytes());
         });
     }
 
@@ -2513,7 +2527,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // of an unrelated signal, which `ready()` below simply reports not-ready-yet and loops
         // again).
         let (child_pid, exit_status) = if pid == -1 {
-            if process.children.lock().is_empty() && process.cross_process_children.lock().is_empty()
+            if process.children.lock().is_empty()
+                && process.cross_process_children.lock().is_empty()
             {
                 return Err(Errno::ECHILD);
             }
@@ -2682,7 +2697,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     }
                 }
-                exit_status.expect("loop only exits Ok/break-with-Interrupted once exit_status is set")
+                exit_status
+                    .expect("loop only exits Ok/break-with-Interrupted once exit_status is set")
             };
             (child_pid, exit_status)
         };
@@ -2904,7 +2920,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // branch exists solely to reconstruct, by hand and imperfectly, what a real `fork()`
         // syscall already does completely.
         if self.global.platform.has_native_fork() {
-            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal, vfork, child_sp);
+            return self.try_native_cross_process_fork(
+                ctx,
+                child_tid,
+                exit_signal,
+                vfork,
+                child_sp,
+            );
         }
 
         // Xvfb/dbus-daemon used to be excluded here by name, unconditionally, before the
@@ -3407,7 +3429,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // between regions); this classification instead sums each individual per-VMA `layout`
         // length, so `file_ro_bytes + file_rw_bytes + anon_bytes` undercounts `total_bytes` by
         // exactly that padding, not by double-counting or missing a region.
-        if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN")
+        {
             let mut file_ro_bytes: u64 = 0;
             let mut file_ro_regions: u64 = 0;
             let mut file_rw_bytes: u64 = 0;
@@ -3416,7 +3442,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             for (range, flag_bits, is_file_backed) in &layout {
                 let len = (range.end - range.start) as u64;
                 let f = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
-                if f.intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS).is_empty() {
+                if f.intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
+                    .is_empty()
+                {
                     guard_bytes += len;
                 } else if *is_file_backed && !f.contains(litebox::mm::linux::VmFlags::VM_WRITE) {
                     file_ro_bytes += len;
@@ -3454,8 +3482,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             })
             .collect();
         let flags: alloc::vec::Vec<u32> = layout.iter().map(|(_, f, _)| *f).collect();
-        let is_file_backed: alloc::vec::Vec<bool> =
-            layout.iter().map(|(_, _, fb)| *fb).collect();
+        let is_file_backed: alloc::vec::Vec<bool> = layout.iter().map(|(_, _, fb)| *fb).collect();
         let executable: alloc::vec::Vec<bool> = layout
             .iter()
             .map(|(_, f, _)| f & litebox::mm::linux::VmFlags::VM_EXEC.bits() != 0)
@@ -3561,11 +3588,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .env_flag("LITEBOX_DIAG_GLOBALSTATE_SHARE_PROBE")
         {
             const POST_SPAWN_SENTINEL_DELTA: i32 = 7;
-            let after = self
-                .global
-                .next_thread_id
-                .fetch_add(POST_SPAWN_SENTINEL_DELTA, core::sync::atomic::Ordering::SeqCst)
-                + POST_SPAWN_SENTINEL_DELTA;
+            let after = self.global.next_thread_id.fetch_add(
+                POST_SPAWN_SENTINEL_DELTA,
+                core::sync::atomic::Ordering::SeqCst,
+            ) + POST_SPAWN_SENTINEL_DELTA;
             litebox_util_log::warn!(
                 after:% = after;
                 "[globalstate_share_probe] parent bumped next_thread_id AGAIN, strictly after spawn_cross_process_fork_child returned"
@@ -3666,12 +3692,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .insert(child_tid, gate.clone());
             gate
         });
-        let result = self
-            .global
-            .with_shimwide_locks_held(
-                || unsafe { self.global.platform.native_fork() },
-                |forked| *forked == Some(0),
-            );
+        let result = self.global.with_shimwide_locks_held(
+            || unsafe { self.global.platform.native_fork() },
+            |forked| *forked == Some(0),
+        );
         match result {
             None => {
                 litebox_util_log::debug!(
@@ -3736,8 +3760,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // A real pid from a real `fork()` is always > 0 here (the `Some(0)` arm above
                 // already took the only case that isn't), so this always fits.
                 Some(litebox::platform::CrossProcessChildHandle(
-                    usize::try_from(child_pid)
-                        .expect("a real fork() child pid is always positive"),
+                    usize::try_from(child_pid).expect("a real fork() child pid is always positive"),
                 ))
             }
         }
@@ -3959,10 +3982,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.global.platform.spawn_cross_process_exit_notifier(
             handle,
             alloc::boxed::Box::new(move || {
-                process
-                    .shared_pending
-                    .lock()
-                    .push(&process.limits, signal, super::signal::siginfo_kill(signal));
+                process.shared_pending.lock().push(
+                    &process.limits,
+                    signal,
+                    super::signal::siginfo_kill(signal),
+                );
                 process.interrupt_all_threads();
             }),
         );
@@ -4272,7 +4296,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     return Ok(0);
                 }
-                self.process().register_cross_process_child(child_tid, handle);
+                self.process()
+                    .register_cross_process_child(child_tid, handle);
                 self.arm_cross_process_exit_notifier(handle, cross_process_exit_signal);
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
@@ -4399,7 +4424,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // everything else (`file_backed && VM_WRITE` -- ELF `.data`/`.got`/`.bss`; and
             // anonymous -- heap/stack/thread-arena) is memory this fork must keep copying
             // regardless of any such fix.
-            if self.global.platform.env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN") {
+            if self
+                .global
+                .platform
+                .env_flag("LITEBOX_DIAG_FORK_VMA_BREAKDOWN")
+            {
                 let mut file_ro_bytes: u64 = 0;
                 let mut file_ro_regions: u64 = 0;
                 let mut file_rw_bytes: u64 = 0;
@@ -5097,17 +5126,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.reserve_cross_process_fork_slot();
                     true
                 }
-                && let Some(handle) = self
-                    .global
-                    .platform
-                    .spawn_cross_process_fork_child(
-                        &relocations,
-                        full_gprs,
-                        alloc::vec::Vec::new(),
-                        alloc::vec::Vec::new(),
-                        alloc::vec::Vec::new(),
-                        self.sigreturn_trampoline_addr(),
-                    )
+                && let Some(handle) = self.global.platform.spawn_cross_process_fork_child(
+                    &relocations,
+                    full_gprs,
+                    alloc::vec::Vec::new(),
+                    alloc::vec::Vec::new(),
+                    alloc::vec::Vec::new(),
+                    self.sigreturn_trampoline_addr(),
+                )
             {
                 self.process()
                     .register_cross_process_child(child_tid, handle);
@@ -5206,7 +5232,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(child_shared_pending),
             )
         } else {
-            let thread = self.thread.borrow().new_thread(child_tid).ok_or(Errno::EBUSY)?;
+            let thread = self
+                .thread
+                .borrow()
+                .new_thread(child_tid)
+                .ok_or(Errno::EBUSY)?;
             (
                 thread,
                 ThreadInitState::NewThread {
@@ -5265,7 +5295,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        wait_state: crate::ReplaceableWaitState::new(crate::wait::WaitState::new(self.global.platform)),
+                        wait_state: crate::ReplaceableWaitState::new(crate::wait::WaitState::new(
+                            self.global.platform,
+                        )),
                         thread: RefCell::new(thread),
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
@@ -5277,7 +5309,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: make_fs().into(),
                         files: make_files().into(),
                         signals: RefCell::new({
-                            let signals = self.signals.borrow().clone_for_new_task(child_shared_pending);
+                            let signals = self
+                                .signals
+                                .borrow()
+                                .clone_for_new_task(child_shared_pending);
                             // `CLONE_CLEAR_SIGHAND`: the child starts with default dispositions.
                             // Applied to the CHILD's freshly-cloned state, never the caller's.
                             if flags.contains(CloneFlags::CLEAR_SIGHAND) {
@@ -5388,7 +5423,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `try_native_cross_process_fork`. Idempotent, and a no-op for every process that was not
     /// created by a native `vfork()`.
     fn signal_native_vfork_gate(&self) {
-        let gate = self.global.native_vfork_gates.lock().remove(&self.pid.get());
+        let gate = self
+            .global
+            .native_vfork_gates
+            .lock()
+            .remove(&self.pid.get());
         if let Some(gate) = gate {
             gate.underlying_atomic().store(1, Ordering::Release);
             gate.wake_all();
@@ -5550,7 +5589,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // without making ordinary `ulimit -c 0`/`ulimit -s ...` calls
             // panic the whole runner.
             let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-            self.thread.borrow().process.limits.set_rlimit(resource, new_limit);
+            self.thread
+                .borrow()
+                .process
+                .limits
+                .set_rlimit(resource, new_limit);
             if let litebox_common_linux::RlimitResource::NOFILE = resource {
                 self.files.borrow().set_max_fd(new_max_fd);
             }
@@ -5966,7 +6009,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let process = self.process();
                 let alarm = process.alarm_timer.lock();
                 let now = self.global.platform.now();
-                (alarm.remaining(now), alarm.interval.unwrap_or(Duration::ZERO))
+                (
+                    alarm.remaining(now),
+                    alarm.interval.unwrap_or(Duration::ZERO),
+                )
             }
             IntervalTimer::Virtual | IntervalTimer::Prof => {
                 log_unsupported!("getitimer: ITIMER_VIRTUAL/PROF not supported");
@@ -5974,7 +6020,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         curr_value
-            .write_at_offset::<Platform>(0, ItimerVal::new(TimeVal::from(interval), TimeVal::from(value)))
+            .write_at_offset::<Platform>(
+                0,
+                ItimerVal::new(TimeVal::from(interval), TimeVal::from(value)),
+            )
             .ok_or(Errno::EFAULT)
     }
 
@@ -6113,7 +6162,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         let c = self.creds();
         for (ptr, value) in [(ruid, c.uid), (euid, c.euid), (suid, c.suid)] {
-            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, value)
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
@@ -6127,7 +6177,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         let c = self.creds();
         for (ptr, value) in [(rgid, c.gid), (egid, c.egid), (sgid, c.sgid)] {
-            ptr.write_at_offset::<Platform>(0, value).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, value)
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(0)
     }
@@ -6278,7 +6329,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let mut groups = alloc::vec::Vec::with_capacity(size);
         for i in 0..size {
-            groups.push(list.read_at_offset::<Platform>(i as isize).ok_or(Errno::EFAULT)?);
+            groups.push(
+                list.read_at_offset::<Platform>(i as isize)
+                    .ok_or(Errno::EFAULT)?,
+            );
         }
         c.groups = groups;
         self.set_creds(c);
@@ -6378,7 +6432,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// implementing real scheduling semantics.
     pub(crate) fn sys_sched_setparam(&self, _pid: Option<i32>, sched_priority: i32) {
         let (policy, _) = self.thread.borrow().sched_policy_priority.get();
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
@@ -6396,7 +6451,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         policy: i32,
         sched_priority: i32,
     ) {
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .sched_policy_priority
             .set((policy, sched_priority));
     }
@@ -6416,7 +6472,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         macro_rules! warn_shared_futex {
             ($flag:ident) => {
                 if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    litebox_util_log::debug!("futex: shared futex treated as private (correct in a single address space)");
+                    litebox_util_log::debug!(
+                        "futex: shared futex treated as private (correct in a single address space)"
+                    );
                 }
             };
         }
@@ -6659,7 +6717,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         None,
                     ) {
                         Ok(()) => {}
-                        Err(litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch) => {}
+                        Err(
+                            litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch,
+                        ) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -6772,10 +6832,26 @@ fn render_proc_maps<Platform: ShimPlatform>(
 ",
                 range.start,
                 range.end,
-                if flags.contains(VmFlags::VM_READ) { "r" } else { "-" },
-                if flags.contains(VmFlags::VM_WRITE) { "w" } else { "-" },
-                if flags.contains(VmFlags::VM_EXEC) { "x" } else { "-" },
-                if flags.contains(VmFlags::VM_SHARED) { "s" } else { "p" },
+                if flags.contains(VmFlags::VM_READ) {
+                    "r"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_WRITE) {
+                    "w"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_EXEC) {
+                    "x"
+                } else {
+                    "-"
+                },
+                if flags.contains(VmFlags::VM_SHARED) {
+                    "s"
+                } else {
+                    "p"
+                },
             ),
         );
     }
@@ -7030,17 +7106,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `execve("/proc/self/exe")` (Chromium re-executes itself this way) means "the binary I am
         // running", not a file named that: substitute its real path so the new image records the
         // right `/proc/self/exe` and finds its resources next to it.
-        let path = if path == "/proc/self/exe"
-            || path == alloc::format!("/proc/{}/exe", self.pid.get())
-        {
-            self.global
-                .proc_self_info
-                .read()
-                .get_exe_path(self.pid.get())
-                .unwrap_or(path)
-        } else {
-            path
-        };
+        let path =
+            if path == "/proc/self/exe" || path == alloc::format!("/proc/{}/exe", self.pid.get()) {
+                self.global
+                    .proc_self_info
+                    .read()
+                    .get_exe_path(self.pid.get())
+                    .unwrap_or(path)
+            } else {
+                path
+            };
         let path = self
             .resolve_path(path.as_str())
             .ok()
@@ -7080,7 +7155,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // swap, and nothing else in this now-execve'ing child needs the old address space's
         // contents (real vfork's own POSIX contract already requires the child not to rely on
         // anything it wrote there surviving past this point).
-        let _ = self.process().detach_pm_for_vfork_execve(&self.global.litebox);
+        let _ = self
+            .process()
+            .detach_pm_for_vfork_execve(&self.global.litebox);
 
         // Close CLOEXEC descriptors
         self.close_on_exec();
@@ -7162,11 +7239,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_common_linux::loader::ElfLoadError::Map(Errno::EEXIST)
                 )
             ) && let Some(result) = self.global.platform.spawn_exec_collision_child(
-                    &path,
-                    &argv_for_collision_retry,
-                    &envp_for_collision_retry,
-                )
-            {
+                &path,
+                &argv_for_collision_retry,
+                &envp_for_collision_retry,
+            ) {
                 litebox_util_log::warn!(
                     tid:% = self.tid.get(), path:% = path, raw_status:% = result.raw_status;
                     "sys_execve: load_program hit a fixed-address collision, but a fresh process \
@@ -7188,9 +7264,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 self.exit_group(ExitStatus::Exit(result.raw_status.clamp(0, 255) as u8 as i8));
                 {
-                self.process().signal_vfork_done();
-                self.signal_native_vfork_gate();
-            }
+                    self.process().signal_vfork_done();
+                    self.signal_native_vfork_gate();
+                }
                 return Ok(0);
             }
             // The old program image is already torn down (memory released, other threads killed,
@@ -7241,9 +7317,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // because waking the suspended grandparent let it resume concurrently on its own real OS
         // thread while this thread's own new-program register/stack state was still mid-setup.
         {
-                self.process().signal_vfork_done();
-                self.signal_native_vfork_gate();
-            }
+            self.process().signal_vfork_done();
+            self.signal_native_vfork_gate();
+        }
         Ok(0)
     }
 
@@ -7340,7 +7416,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.set_task_comm(loader.comm());
 
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .init_state
             .set(ThreadInitState::NewProcess(load_info));
         Ok(())
@@ -7349,7 +7426,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
-        self.thread.borrow()
+        self.thread
+            .borrow()
             .remote
             .handle
             .set(Box::new(self.wait_state.thread_handle()))

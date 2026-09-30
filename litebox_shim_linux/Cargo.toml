@@ -24,6 +24,7 @@ spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] 
 alarm_fallback = []
 
 [dev-dependencies]
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 libc = "0.2.177"
 tempfile = "3"
 

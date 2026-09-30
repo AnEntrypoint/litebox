@@ -636,7 +636,11 @@ impl Backend for Composer {
                 // Only the mount points themselves exist under a virtual directory; any other
                 // name is absent (`ENOENT`), which a layered caller must be able to tell apart
                 // from "exists but is not a symlink" (`EINVAL`) so it can consult the next layer.
-                if self.immediate_mount_children(&path).iter().any(|child| child == name) {
+                if self
+                    .immediate_mount_children(&path)
+                    .iter()
+                    .any(|child| child == name)
+                {
                     Ok(None)
                 } else {
                     Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))

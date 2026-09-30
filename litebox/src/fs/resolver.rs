@@ -539,7 +539,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                                 v
                             };
                         new_components.extend(
-                            component_refs[walked + 1..].iter().map(|c| (*c).to_string()),
+                            component_refs[walked + 1..]
+                                .iter()
+                                .map(|c| (*c).to_string()),
                         );
                         components = new_components;
                         continue;
@@ -1032,12 +1034,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // `resolver-symlinkmetadata-readlink-before-open`.
         let context = default_context_pre_context_management_changes();
         let resolved = context.resolve(path)?;
-        let Some((parent, name)) = self.parent_dir_and_name(&context, &resolved).map_err(
-            |error| match error {
-                WalkError::Io => FileStatusError::Io,
-                WalkError::PathError(error) => error.into(),
-            },
-        )?
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &resolved)
+                .map_err(|error| match error {
+                    WalkError::Io => FileStatusError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
         else {
             // The root itself was requested; it is always a directory, never a symlink.
             return self.file_status("/");

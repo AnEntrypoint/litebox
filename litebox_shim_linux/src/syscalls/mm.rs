@@ -603,7 +603,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = if let Some(cow_result) = cow_attempt {
             cow_result?
         } else {
-            let memcpy_result = self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
+            let memcpy_result =
+                self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
             litebox_util_log::debug!(
                 fd:% = fd, len:% = len, offset:% = offset,
                 memcpy_ok:% = memcpy_result.is_ok(),
@@ -696,7 +697,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()??;
         // DIAG (AGENTS.md pass 223/224): confirm empirically whether this CoW mapping path is
         // even reached for the calls that end up EEXIST-failing, since pass 223's own code
@@ -784,9 +786,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .find_map(|candidate| {
                         let start = addr.checked_sub(candidate)?;
                         let ptr = litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(start)?;
-                        let size = litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(
-                            candidate,
-                        )?;
+                        let size =
+                            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(candidate)?;
                         let perms = self.process().pm().get_memory_permissions(ptr, size)?;
                         // `PROT_NONE` == no permission bits set at all -- anything else (even a
                         // READ-only mapping) is real content this call must not overwrite.
@@ -983,7 +984,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()
             .flatten()?;
         let mut memfds = self.global.memfds.lock();
@@ -1058,8 +1060,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let copy_len = current_bytes.len().min(aligned_len);
                 let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
                 let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-                let _ =
-                    litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned_len);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    aligned_len,
+                );
             }
         }
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
@@ -1092,9 +1097,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // section); no separate digest is needed here.
         Some(
             unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )
@@ -1276,7 +1284,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
-                |_| None)
+                |_| None,
+            )
             .ok()
             .flatten()?;
         drop(files);
@@ -1365,9 +1374,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         Some(
             unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )
@@ -1505,14 +1517,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ok = false;
                     break;
                 }
-                if ptr.write_slice_at_offset(at as isize, &chunk[..n]).is_none() {
+                if ptr
+                    .write_slice_at_offset(at as isize, &chunk[..n])
+                    .is_none()
+                {
                     ok = false;
                     break;
                 }
                 at += n;
             }
             let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-            let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, object_len);
+            let _ =
+                litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, object_len);
             if !ok {
                 shared.remove(&key);
                 return None;
@@ -1622,7 +1638,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok()
             .flatten();
         let effective_offset = prime_map_offset.unwrap_or(offset as u64);
-        let (shared_handle, buffer_size) = self.global.drm.lookup_by_map_offset(effective_offset)?;
+        let (shared_handle, buffer_size) =
+            self.global.drm.lookup_by_map_offset(effective_offset)?;
         let aligned_len = align_up(len, PAGE_SIZE);
         if aligned_len > buffer_size.next_multiple_of(PAGE_SIZE) {
             // Guest asked to map more than the buffer actually holds -- real Linux rejects an
@@ -1654,9 +1671,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let _ = prot;
         let result = unsafe {
-            self.process()
-                .pm()
-                .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
+            self.process().pm().map_existing_shared_pages(
+                suggested_addr,
+                length,
+                create_flags,
+                shared_handle,
+            )
         };
         // Log the GUEST-visible address this dumb buffer lands at -- unlike the host
         // presentation thread's own transient per-flip mapping (a fresh address every
@@ -2328,7 +2348,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
             return (false, 0, 0, 0);
         };
-        (true, header.file_offset, header.vaddr, header.trampoline_size)
+        (
+            true,
+            header.file_offset,
+            header.vaddr,
+            header.trampoline_size,
+        )
     }
 
     /// Probe for a free address within JMP rel32 range (`0x7FFF_0000`) of a code segment
@@ -2829,17 +2854,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
             let template = match cached {
                 Some(template) => Ok(template),
-                None => litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
-                    .map(|scanned| {
-                        let scanned = alloc::sync::Arc::new(scanned);
-                        if let Some(key) = scan_key {
-                            self.global
-                                .segment_scan_cache
-                                .lock()
-                                .insert(key, alloc::sync::Arc::clone(&scanned));
-                        }
-                        scanned
-                    }),
+                None => {
+                    litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
+                        .map(|scanned| {
+                            let scanned = alloc::sync::Arc::new(scanned);
+                            if let Some(key) = scan_key {
+                                self.global
+                                    .segment_scan_cache
+                                    .lock()
+                                    .insert(key, alloc::sync::Arc::clone(&scanned));
+                            }
+                            scanned
+                        })
+                }
             };
             let outcome = template.and_then(|template| {
                 litebox_syscall_rewriter::patch_code_segment_scanned(
@@ -3012,13 +3039,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut section_headers = alloc::vec![0u8; total];
         self.read_exact_at(fd, &mut section_headers, usize::try_from(e_shoff).ok()?)?;
 
-        let ranges = alloc::sync::Arc::new(
-            litebox_syscall_rewriter::executable_section_file_ranges(
+        let ranges =
+            alloc::sync::Arc::new(litebox_syscall_rewriter::executable_section_file_ranges(
                 &section_headers,
                 e_shentsize,
                 e_shnum,
-            ),
-        );
+            ));
         if ranges.is_empty() {
             return None;
         }
@@ -3511,10 +3537,7 @@ mod tests {
 
         task.sys_ftruncate(fd, 0x1000).unwrap();
         let content = [0xDD_u8, 0xCC, 0xBB, 0xAA].repeat(4);
-        assert_eq!(
-            task.sys_write(fd, &content, None).unwrap(),
-            content.len()
-        );
+        assert_eq!(task.sys_write(fd, &content, None).unwrap(), content.len());
 
         let addr = task
             .sys_mmap(

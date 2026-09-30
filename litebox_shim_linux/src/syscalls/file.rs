@@ -21,9 +21,9 @@ use litebox::{
 use litebox_common_linux::{
     AccessFlags, AtFlags, DrmPrimeHandle, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec,
-    MfdFlags, SfdFlags, TfdFlags, TfdSettimeFlags, Statx, StatxMask, TimeParam,
+    MfdFlags, SfdFlags, Statx, StatxMask, TfdFlags, TfdSettimeFlags, TimeParam,
     errno::Errno,
-    signal::{Signal, SigSet},
+    signal::{SigSet, Signal},
 };
 use thiserror::Error;
 
@@ -160,20 +160,34 @@ impl SharedFilePublishTable {
     /// `false` -- never panics, this is a guest-reachable path -- if `path` exceeds this table's
     /// fixed bounds or every slot is occupied by a DIFFERENT path; either only degrades this side
     /// channel, never the real per-process write a caller already performed first.
-    pub(crate) fn publish_at(&self, path: &[u8], offset: usize, bytes: &[u8], owner_pid: u32) -> bool {
+    pub(crate) fn publish_at(
+        &self,
+        path: &[u8],
+        offset: usize,
+        bytes: &[u8],
+        owner_pid: u32,
+    ) -> bool {
         if path.len() > FILE_PUBLISH_PATH_MAX || offset > FILE_PUBLISH_CONTENT_MAX {
             return false;
         }
-        let end = offset.saturating_add(bytes.len()).min(FILE_PUBLISH_CONTENT_MAX);
+        let end = offset
+            .saturating_add(bytes.len())
+            .min(FILE_PUBLISH_CONTENT_MAX);
         let bytes = &bytes[..end.saturating_sub(offset)];
         for slot in &self.slots {
-            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED && slot.matches_path(path) {
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED
+                && slot.matches_path(path)
+            {
                 slot.state.store(FILE_PUBLISH_WRITING, Ordering::Release);
                 for (i, b) in bytes.iter().enumerate() {
                     slot.content[offset + i].store(*b, Ordering::Relaxed);
                 }
                 let existing_len = slot.content_len.load(Ordering::Relaxed) as usize;
-                let new_len = if offset == 0 { end } else { existing_len.max(end) };
+                let new_len = if offset == 0 {
+                    end
+                } else {
+                    existing_len.max(end)
+                };
                 slot.content_len.store(new_len as u32, Ordering::Relaxed);
                 slot.owner_pid.store(owner_pid, Ordering::Relaxed);
                 slot.state.store(FILE_PUBLISH_OCCUPIED, Ordering::Release);
@@ -214,8 +228,11 @@ impl SharedFilePublishTable {
             return None;
         }
         for slot in &self.slots {
-            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED && slot.matches_path(path) {
-                let len = (slot.content_len.load(Ordering::Relaxed) as usize).min(FILE_PUBLISH_CONTENT_MAX);
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED
+                && slot.matches_path(path)
+            {
+                let len = (slot.content_len.load(Ordering::Relaxed) as usize)
+                    .min(FILE_PUBLISH_CONTENT_MAX);
                 let mut out = alloc::vec::Vec::with_capacity(len);
                 for slot_byte in &slot.content[..len] {
                     out.push(slot_byte.load(Ordering::Relaxed));
@@ -1028,9 +1045,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .strip_prefix("/proc/self/fd/")
             .or_else(|| path_str.strip_prefix("/dev/fd/"))
             .or_else(|| {
-                path_str
-                    .strip_prefix("/proc/")
-                    .and_then(|rest| rest.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str()))
+                path_str.strip_prefix("/proc/").and_then(|rest| {
+                    rest.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str())
+                })
             })
             && let Ok(fd) = fd_str.parse::<usize>()
         {
@@ -1038,9 +1055,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_err(|_| Errno::ENOENT)?;
             let target = self.files.borrow().lookup_fd_path(fd);
             return match target {
-                Some(target) if target != path => {
-                    self.do_open_resolved(target, flags & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC), mode)
-                }
+                Some(target) if target != path => self.do_open_resolved(
+                    target,
+                    flags & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC),
+                    mode,
+                ),
                 // An unnamed file (a memfd, or an unlinked file) or a pipe end: the new descriptor
                 // shares the underlying object, which is all a reopen means for these.
                 None => {
@@ -1171,7 +1190,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             let registry = self.global.fifo_registry.read();
             if let Some(fifo) = registry.get(&key) {
-                let end = if want_write { &fifo.writer } else { &fifo.reader };
+                let end = if want_write {
+                    &fifo.writer
+                } else {
+                    &fifo.reader
+                };
                 let dup = self
                     .global
                     .litebox
@@ -1191,7 +1214,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             reader: ends.reader,
             writer: ends.writer,
         });
-        let end = if want_write { &fifo.writer } else { &fifo.reader };
+        let end = if want_write {
+            &fifo.writer
+        } else {
+            &fifo.reader
+        };
         let dup = self
             .global
             .litebox
@@ -1322,7 +1349,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten();
         if result.is_ok() {
             self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
@@ -1428,8 +1456,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let old_entry = old_entry.map(|(handle, size, _)| (handle, size));
         let mut carry_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         if let Some((old_handle, old_size)) = old_entry
-            && let Some(old_len) =
-                litebox::mm::linux::NonZeroPageSize::new(old_size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
+            && let Some(old_len) = litebox::mm::linux::NonZeroPageSize::new(
+                old_size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE),
+            )
         {
             // SAFETY: a fresh, private, non-fixed, read-only-intent mapping of `old_handle` --
             // no guest code has ever observed this address; read and unmap immediately.
@@ -1550,10 +1579,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map_err(Errno::from)?;
             }
             // TODO: socket, block and char files are not supported
-            InodeType::Socket
-            | InodeType::BlockDevice
-            | InodeType::CharDevice
-            | InodeType::Dir => return Err(Errno::EPERM),
+            InodeType::Socket | InodeType::BlockDevice | InodeType::CharDevice | InodeType::Dir => {
+                return Err(Errno::EPERM);
+            }
             InodeType::SymLink => return Err(Errno::EINVAL),
         }
         Ok(())
@@ -1572,7 +1600,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let path = self.resolve_path_at(dirfd, pathname)?;
         let result = if flags.contains(AtFlags::AT_REMOVEDIR) {
-            self.files.borrow().fs.rmdir(path.clone()).map_err(Errno::from)
+            self.files
+                .borrow()
+                .fs
+                .rmdir(path.clone())
+                .map_err(Errno::from)
         } else {
             // Capture the about-to-be-unlinked file's `(dev, ino)` BEFORE calling `unlink` (the
             // path won't resolve afterwards) so a successful unlink can tag any fd(s) still open
@@ -1587,7 +1619,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok()
                 .filter(|status| status.file_type == litebox::fs::FileType::RegularFile)
                 .map(|status| status.node_info);
-            let result = self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from);
+            let result = self
+                .files
+                .borrow()
+                .fs
+                .unlink(path.clone())
+                .map_err(Errno::from);
             if result.is_ok()
                 && let Some(node_info) = node_info
             {
@@ -2046,7 +2083,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
                     handle.with_entry(|end| {
-                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.shared_pty)
+                        end.read(
+                            &self.wait_cx(),
+                            &mut buf.borrow_mut(),
+                            &self.global.shared_pty,
+                        )
                     })
                 },
                 |fd| {
@@ -2077,7 +2118,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Ok(size_of::<u64>())
                     })
                 },
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten()?;
         // For datagrams, the returned size represents the actual size of the message,
         // which may be larger than the buffer size.
@@ -2149,7 +2191,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let files = self.files.borrow();
             files.lookup_fd_path(raw_fd).and_then(|p| {
                 let path = p.to_str().ok()?;
-                SHARED_PUBLISH_PATHS.contains(&path).then(|| path.to_string())
+                SHARED_PUBLISH_PATHS
+                    .contains(&path)
+                    .then(|| path.to_string())
             })
         };
         let publish_offset = match (&publish_target, offset) {
@@ -2257,7 +2301,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten();
         drop(files);
         if let Some(n) = wrote_file {
@@ -2323,7 +2368,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten()
     }
 
@@ -2379,7 +2425,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
-                |_fd| Err(non_fs_err))
+                        |_fd| Err(non_fs_err),
+                    )
                     .flatten()
             };
             let read_n = match read_result {
@@ -2516,8 +2563,10 @@ fn is_dri_path(path: &CString) -> bool {
 /// that can hold arbitrarily-named files (see `initialize_root_in_mem_layer`'s doc comment), so
 /// this checks a prefix rather than an exact match.
 fn is_dev_shm_path(path: &CString) -> bool {
-    path.to_str()
-        .is_ok_and(|p| p.strip_prefix("/dev/shm/").is_some_and(|rest| !rest.is_empty()))
+    path.to_str().is_ok_and(|p| {
+        p.strip_prefix("/dev/shm/")
+            .is_some_and(|rest| !rest.is_empty())
+    })
 }
 
 const SEEK_SET: i16 = 0;
@@ -2575,7 +2624,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE))
+                |_| Err(Errno::ESPIPE),
+            )
             .flatten()
     }
 
@@ -2714,7 +2764,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn do_chown_path(&self, path: alloc::string::String, owner: u32, group: u32) -> Result<(), Errno> {
+    fn do_chown_path(
+        &self,
+        path: alloc::string::String,
+        owner: u32,
+        group: u32,
+    ) -> Result<(), Errno> {
         // `-1` means "leave unchanged"; ids beyond the file system's 16-bit range are clamped.
         let clamp = |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX));
         self.files
@@ -2733,7 +2788,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         group: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        let pathname = self.resolve_final_symlinks(alloc::string::String::from(pathname.to_str().map_err(|_| Errno::EINVAL)?))?;
+        let pathname = self.resolve_final_symlinks(alloc::string::String::from(
+            pathname.to_str().map_err(|_| Errno::EINVAL)?,
+        ))?;
         self.do_chown_path(pathname, owner, group)
     }
 
@@ -2808,7 +2865,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             use super::inotify::{IN_CLOSE_NOWRITE, IN_CLOSE_WRITE};
             self.inotify_path(
                 &path,
-                if writable { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE },
+                if writable {
+                    IN_CLOSE_WRITE
+                } else {
+                    IN_CLOSE_NOWRITE
+                },
                 false,
             );
         }
@@ -2874,16 +2935,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     rds.fd_consume_raw_integer::<super::pty::PtySubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Pty(fd)
-                } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem<Platform>>(
-                        raw_fd,
-                    )
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Signalfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(
-                        raw_fd,
-                    )
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Timerfd(fd)
                 } else if let Ok(fd) =
@@ -3041,9 +3098,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let store = files.raw_descriptor_store.read();
             store
                 .iter_alive()
-                .filter(|raw| {
-                    u32::try_from(*raw).is_ok_and(|raw| raw >= first && raw <= last)
-                })
+                .filter(|raw| u32::try_from(*raw).is_ok_and(|raw| raw >= first && raw <= last))
                 .collect()
         };
 
@@ -3082,10 +3137,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Close-on-exec is a property of the descriptor table entry, not of the file behind it, so
     /// this is identical for every fd type -- which is why it is written once here instead of ten
     /// times at each `run_on_raw_fd` arm that needs it.
-    fn set_cloexec_on<S: litebox::fd::FdEnabledSubsystem>(
-        &self,
-        fd: &litebox::fd::TypedFd<S>,
-    ) {
+    fn set_cloexec_on<S: litebox::fd::FdEnabledSubsystem>(&self, fd: &litebox::fd::TypedFd<S>) {
         let _old = self
             .global
             .litebox
@@ -3649,12 +3701,13 @@ where
                     0,
                 )))
             },
-                |_fd| {
+            |_fd| {
                 Ok(T::from(synthetic(
                     litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
                     0,
                 )))
-            })
+            },
+        )
         .flatten()
 }
 
@@ -3686,7 +3739,8 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd))
+        |fd| get_flags(global, fd),
+    )
 }
 
 fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
@@ -3717,7 +3771,8 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags))?;
+        |fd| set_flags(global, fd, flags),
+    )?;
     Ok(())
 }
 
@@ -3795,7 +3850,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = self.sys_open(
             path,
             OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
-            Mode::RUSR.union(Mode::WUSR).union(Mode::RGRP).union(Mode::ROTH),
+            Mode::RUSR
+                .union(Mode::WUSR)
+                .union(Mode::RGRP)
+                .union(Mode::ROTH),
         ) else {
             return false;
         };
@@ -3831,7 +3889,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     normalized_path
                         .as_str()
                         .strip_prefix("/proc/")
-                        .and_then(|r| r.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str()))
+                        .and_then(|r| {
+                            r.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str())
+                        })
                 })
             && let Ok(n) = rest.parse::<usize>()
         {
@@ -3960,13 +4020,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(_) => match component.as_str() {
                     "." => {}
                     ".." => {
-                        current = current.rsplit_once('/').map_or(String::new(), |(d, _)| String::from(d));
+                        current = current
+                            .rsplit_once('/')
+                            .map_or(String::new(), |(d, _)| String::from(d));
                     }
                     _ => current = candidate,
                 },
             }
         }
-        Ok(if current.is_empty() { String::from("/") } else { current })
+        Ok(if current.is_empty() {
+            String::from("/")
+        } else {
+            current
+        })
     }
 
     /// Handle syscall `stat`
@@ -3979,7 +4045,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
                 litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_stat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error")
+            }
         }
         result
     }
@@ -4006,7 +4074,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
                 litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error")
+            }
         }
         result
     }
@@ -4065,7 +4135,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
                 );
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error")
+            }
         }
         result
     }
@@ -4302,7 +4374,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 .descriptor_table()
                                 .with_metadata(fd, |ReopenedAccess(a)| *a)
                             {
-                                open_flags = (open_flags & ACCESS_MODE_MASK.complement()) | narrowed;
+                                open_flags =
+                                    (open_flags & ACCESS_MODE_MASK.complement()) | narrowed;
                             }
                             let set = self
                                 .global
@@ -4326,7 +4399,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
-                |fd| getfl_from_handle!(fd))
+                        |fd| getfl_from_handle!(fd),
+                    )
                     .flatten()?
                     .bits())
             }
@@ -4467,10 +4541,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
-                |fd| {
+                    |fd| {
                         toggle_flags!(fd);
                         Ok(())
-                    })??;
+                    },
+                )??;
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
@@ -4565,7 +4640,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
-                |_fd| Err(Errno::EBADF))
+                        |_fd| Err(Errno::EBADF),
+                    )
                     .flatten()
             }
             FcntlArg::SETOWN(_) | FcntlArg::GETOWN => {
@@ -4633,7 +4709,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok((start, start.saturating_add(flock.len as u64)))
         } else {
             let len = flock.len.unsigned_abs() as u64;
-            start.checked_sub(len).map(|s| (s, start)).ok_or(Errno::EINVAL)
+            start
+                .checked_sub(len)
+                .map(|s| (s, start))
+                .ok_or(Errno::EINVAL)
         }
     }
 
@@ -4662,17 +4741,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             for l in locks.iter() {
                 if l.key == key && l.pid == me && l.overlaps(start, end) {
                     if l.start < start {
-                        next.push(RecordLock { end: start, ..l.clone() });
+                        next.push(RecordLock {
+                            end: start,
+                            ..l.clone()
+                        });
                     }
                     if l.end > end {
-                        next.push(RecordLock { start: end, ..l.clone() });
+                        next.push(RecordLock {
+                            start: end,
+                            ..l.clone()
+                        });
                     }
                 } else {
                     next.push(l.clone());
                 }
             }
             if !unlock {
-                next.push(RecordLock { key, pid: me, write, start, end });
+                next.push(RecordLock {
+                    key,
+                    pid: me,
+                    write,
+                    start,
+                    end,
+                });
             }
             *locks = next;
             Ok(())
@@ -5011,7 +5102,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                     },
                     |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL))
+                    |_fd| Err(Errno::EINVAL),
+                )
                 .flatten()?;
             Ok(fd.try_into().unwrap())
         }
@@ -5096,11 +5188,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_value: UserPtr<ItimerSpec>,
         old_value: Option<UserPtrMut<ItimerSpec>>,
     ) -> Result<(), Errno> {
-        if flags.intersects((TfdSettimeFlags::TIMER_ABSTIME | TfdSettimeFlags::TIMER_CANCEL_ON_SET).complement())
-        {
+        if flags.intersects(
+            (TfdSettimeFlags::TIMER_ABSTIME | TfdSettimeFlags::TIMER_CANCEL_ON_SET).complement(),
+        ) {
             return Err(Errno::EINVAL);
         }
-        let new = new_value.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let new = new_value
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
         let interval = core::time::Duration::try_from(new.it_interval)?;
         let value = core::time::Duration::try_from(new.it_value)?;
         litebox_util_log::debug!(
@@ -5138,7 +5233,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let now = self.global.platform.now();
                         let deadline = if value.is_zero() {
                             None
-                        } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME) && !file.is_realtime() {
+                        } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME)
+                            && !file.is_realtime()
+                        {
                             // `value` is an absolute deadline against this fd's own `CLOCK_MONOTONIC`
                             // (or equivalent) domain -- i.e. a duration since the same monotonic
                             // reference point `self.global.boot_time` anchors (see
@@ -5168,7 +5265,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Ok(file.set_time(deadline, interval))
                     })
                 },
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten()?;
 
         if let Some(out) = old_value {
@@ -5214,7 +5312,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     Ok(handle.with_entry(super::timerfd::TimerfdFile::get_time))
                 },
-                |_fd| Err(Errno::EINVAL))
+                |_fd| Err(Errno::EINVAL),
+            )
             .flatten()?;
         curr_value
             .write_at_offset::<Platform>(
@@ -5654,10 +5753,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             match existing {
                                 Ok(()) => Ok(()),
                                 Err(MetadataError::NoSuchMetadata) => {
-                                    let mut flags = files
-                                        .fs
-                                        .open_flags(file_fd)
-                                        .unwrap_or(OFlags::empty());
+                                    let mut flags =
+                                        files.fs.open_flags(file_fd).unwrap_or(OFlags::empty());
                                     flags.set(OFlags::NONBLOCK, val != 0);
                                     self.global
                                         .litebox
@@ -5768,7 +5865,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             });
                             Ok(())
                         },
-                |fd| {
+                        |fd| {
                             let handle = self
                                 .global
                                 .litebox
@@ -5779,7 +5876,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 file.set_status(OFlags::NONBLOCK, val != 0);
                             });
                             Ok(())
-                        })
+                        },
+                    )
                     .flatten()?;
                 Ok(0)
             }
@@ -5806,11 +5904,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EFAULT)?;
                     return Ok(0);
                 }
-                let n = files
-                    .with_socket(&self.global, u32::try_from(desc).map_err(|_| Errno::EBADF)?, |fd| {
+                let n = files.with_socket(
+                    &self.global,
+                    u32::try_from(desc).map_err(|_| Errno::EBADF)?,
+                    |fd| {
                         let proxy = self.global.get_proxy(fd)?;
                         Ok(proxy.pending_rx_bytes())
-                    }, |_unix| Err(Errno::EINVAL))?;
+                    },
+                    |_unix| Err(Errno::EINVAL),
+                )?;
                 out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
@@ -5915,7 +6017,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                })?,
+                },
+            )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
@@ -5973,7 +6076,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))?,
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             IoctlArg::DrmModeGetResources(..)
             | IoctlArg::DrmModeGetCrtc(..)
             | IoctlArg::DrmModeSetCrtc(..)
@@ -6020,7 +6124,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))?,
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             IoctlArg::VtOpenQry(..)
             | IoctlArg::VtGetMode(..)
             | IoctlArg::VtSetMode(..)
@@ -6045,7 +6150,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))?,
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             IoctlArg::EvdevRevoke => files.run_on_raw_fd(
                 desc,
                 |fd| {
@@ -6065,7 +6171,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))?,
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             IoctlArg::EvdevGetVersion(ptr) => {
                 files.run_on_raw_fd(
                     desc,
@@ -6084,7 +6191,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 ptr.write_at_offset::<Platform>(0, litebox_common_linux::EV_VERSION)
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
@@ -6107,14 +6215,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 let id = litebox_common_linux::InputId {
                     bustype: litebox_common_linux::BUS_VIRTUAL,
                     vendor: 0,
                     product: 0,
                     version: 0,
                 };
-                ptr.write_at_offset::<Platform>(0, id).ok_or(Errno::EFAULT)?;
+                ptr.write_at_offset::<Platform>(0, id)
+                    .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::EvdevGetBits { ev, len, arg: ptr } => {
@@ -6135,7 +6245,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // The device only ever emits `EV_KEY`/`EV_REL` events (see
                 // `EvdevSubsystem::push_key`/`push_rel`) -- report exactly that supported-types
                 // set for `ev == 0`, the real code ranges for `EV_KEY`/`EV_REL` themselves
@@ -6198,7 +6309,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // `EVIOCGNAME` failing is unconditionally fatal to `libevdev_new_from_fd()`
                 // (unlike `EVIOCGPHYS`/`EVIOCGUNIQ`, which tolerate `ENOENT`) -- a real,
                 // non-empty name string is mandatory, not optional. The kernel does NOT
@@ -6229,7 +6341,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // This synthetic device has no physical-location/unique-ID string, matching real
                 // uinput/virtual-device behavior -- `ENOENT` here is what `libevdev_new_from_fd()`
                 // specifically tolerates, not a stub.
@@ -6253,7 +6366,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // A plain keyboard+mouse device has no `INPUT_PROP_*` bits set (only
                 // touchpads/pointing-sticks/direct-input devices set any) -- an all-zero
                 // bitmap is the correct, real answer for this synthetic device, not a stub.
@@ -6282,7 +6396,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // No keys are currently held down on this synthetic device -- an all-zero
                 // bitmap is the correct, real answer, matching real hardware at attach time.
                 // Real `EVIOCGKEY` returns the byte count written, same as `EVIOCGBIT`/
@@ -6310,7 +6425,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // No LEDs are lit on this synthetic device -- an all-zero bitmap is the
                 // correct, real answer, matching real hardware at attach time.
                 let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
@@ -6336,7 +6452,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY))??;
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
                 // No switches are active on this synthetic device -- an all-zero bitmap is
                 // the correct, real answer, matching real hardware at attach time.
                 let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
@@ -6381,9 +6498,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
-            IoctlArg::DrmModeSetCrtc(ptr) => {
-                self.global.drm.set_crtc(self.global.platform, *ptr)
-            }
+            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(self.global.platform, *ptr),
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
             IoctlArg::DrmModeCreateDumb(ptr) => {
@@ -6466,7 +6581,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None,
         )?;
         req.fd = i32::try_from(new_fd).map_err(|_| Errno::EMFILE)?;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -6509,7 +6625,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .lookup_handle_by_map_offset(map_offset)
             .ok_or(Errno::ENOENT)?;
         req.handle = handle;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -6588,7 +6705,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event, self.pid.get()))
+        handle.with_entry(|entry| {
+            entry.epoll_ctl(
+                &self.global,
+                op,
+                fd,
+                &file_descriptor,
+                event,
+                self.pid.get(),
+            )
+        })
     }
 
     /// Handle syscall `epoll_pwait`
@@ -7257,8 +7383,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         offset: u64,
     ) -> Option<()> {
         const AT_FDCWD: i32 = -100;
-        let flags = OFlags::from_bits_truncate(flags)
-            & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        let flags =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
         let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty()).ok()?;
         let raw = i32::try_from(raw).ok()?;
         if raw != target_fd {
@@ -7555,7 +7681,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
-                |_fd| Err(Errno::ENOTDIR))?
+            |_fd| Err(Errno::ENOTDIR),
+        )?
     }
 }
 
@@ -8181,10 +8308,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         let target = task
-            .sys_readlink(
-                "/sys/class/drm/card0/subsystem",
-                &mut [0u8; 64],
-            )
+            .sys_readlink("/sys/class/drm/card0/subsystem", &mut [0u8; 64])
             .is_ok();
         assert!(target, "test harness invariant: the symlink must exist");
 
@@ -8213,8 +8337,12 @@ mod tests {
     fn lstat_on_dangling_symlink_succeeds_but_stat_returns_enoent() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        task.sys_symlinkat("/does/not/exist", litebox_common_linux::AT_FDCWD, "/dangling")
-            .unwrap();
+        task.sys_symlinkat(
+            "/does/not/exist",
+            litebox_common_linux::AT_FDCWD,
+            "/dangling",
+        )
+        .unwrap();
 
         let lstat = task.sys_lstat("/dangling").unwrap();
         assert_eq!(
@@ -8779,12 +8907,8 @@ mod tests {
         // distinguishes "closed the range" from "closed everything".
         let (low, high) = (b.min(c), b.max(c));
 
-        task.sys_close_range(
-            u32::try_from(low).unwrap(),
-            u32::try_from(high).unwrap(),
-            0,
-        )
-        .expect("close_range over open fds must succeed");
+        task.sys_close_range(u32::try_from(low).unwrap(), u32::try_from(high).unwrap(), 0)
+            .expect("close_range over open fds must succeed");
 
         for fd in [low, high] {
             assert_eq!(
@@ -8803,12 +8927,8 @@ mod tests {
         // Re-closing an already-closed range is success, not `EBADF`: a descriptor in the range
         // that is not open is explicitly not an error on Linux, and the whole point of the
         // `0..=u32::MAX` idiom is that almost nothing in the range is open.
-        task.sys_close_range(
-            u32::try_from(low).unwrap(),
-            u32::try_from(high).unwrap(),
-            0,
-        )
-        .expect("a range with nothing open in it must still succeed");
+        task.sys_close_range(u32::try_from(low).unwrap(), u32::try_from(high).unwrap(), 0)
+            .expect("a range with nothing open in it must still succeed");
     }
 
     #[test]
@@ -8881,18 +9001,20 @@ mod tests {
             v_state: 0,
         };
         let st_ptr = UserPtrMut::from_usize((&raw mut st).expose_provenance());
-        assert_eq!(
-            task.sys_ioctl(tty0_fd, IoctlArg::VtGetState(st_ptr)),
-            Ok(0)
+        assert_eq!(task.sys_ioctl(tty0_fd, IoctlArg::VtGetState(st_ptr)), Ok(0));
+        assert_ne!(
+            st.v_active, 0,
+            "VT_GETSTATE must report a real (non-zero) active VT"
         );
-        assert_ne!(st.v_active, 0, "VT_GETSTATE must report a real (non-zero) active VT");
         task.sys_close(tty0_fd).unwrap();
 
         // -- vt_open(cur_vt): open /dev/tty<cur_vt>, VT_SETMODE + KDSKBMODE + KDSETMODE --
         let vt_path = alloc::format!("/dev/tty{}", st.v_active);
         let vt_fd = task
             .sys_open(&vt_path, OFlags::RDWR, Mode::empty())
-            .unwrap_or_else(|_| panic!("{vt_path} (the VT_GETSTATE-reported active VT) must exist and be openable"));
+            .unwrap_or_else(|_| {
+                panic!("{vt_path} (the VT_GETSTATE-reported active VT) must exist and be openable")
+            });
         let vt_fd = i32::try_from(vt_fd).unwrap();
 
         let mode = VtMode {

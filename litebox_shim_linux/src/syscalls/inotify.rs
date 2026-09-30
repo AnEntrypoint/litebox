@@ -128,26 +128,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn inotify_instance_of(&self, fd: i32) -> Result<u32, Errno> {
         let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         let files = self.files.borrow();
-        files
-            .run_on_raw_fd(
-                raw,
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |pipe_fd| {
-                    self.global
-                        .litebox
-                        .descriptor_table()
-                        .with_metadata(pipe_fd, |id: &InotifyId| id.0)
-                        .map_err(|_| Errno::EINVAL)
-                },
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-                |_| Err(Errno::EINVAL),
-            )?
+        files.run_on_raw_fd(
+            raw,
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |pipe_fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(pipe_fd, |id: &InotifyId| id.0)
+                    .map_err(|_| Errno::EINVAL)
+            },
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+        )?
     }
 
     pub(crate) fn sys_inotify_add_watch(
@@ -163,7 +162,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let path = pathname.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
         let abs = self.resolve_path(path.as_c_str())?;
-        let abs = abs.to_str().map_err(|_| Errno::EINVAL)?.trim_end_matches('/');
+        let abs = abs
+            .to_str()
+            .map_err(|_| Errno::EINVAL)?
+            .trim_end_matches('/');
         let abs = if abs.is_empty() { "/" } else { abs };
         // The path must exist (and be a directory under `IN_ONLYDIR`).
         let status = self
@@ -261,7 +263,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             instance.watches.retain(|w| !gone.contains(&w.wd));
             let removed = before - instance.watches.len();
             if removed > 0 {
-                self.global.inotify_watching.fetch_sub(removed, Ordering::Relaxed);
+                self.global
+                    .inotify_watching
+                    .fetch_sub(removed, Ordering::Relaxed);
             }
             for bytes in writes {
                 match instance.writer.write(&self.wait_cx(), &bytes) {

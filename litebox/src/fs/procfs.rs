@@ -110,27 +110,74 @@ fn cpu_flags() -> String {
     add(
         l1.edx,
         &[
-            (0, "fpu"), (1, "vme"), (2, "de"), (3, "pse"), (4, "tsc"), (5, "msr"), (6, "pae"),
-            (7, "mce"), (8, "cx8"), (9, "apic"), (11, "sep"), (12, "mtrr"), (13, "pge"),
-            (14, "mca"), (15, "cmov"), (16, "pat"), (17, "pse36"), (19, "clflush"), (23, "mmx"),
-            (24, "fxsr"), (25, "sse"), (26, "sse2"), (28, "ht"),
+            (0, "fpu"),
+            (1, "vme"),
+            (2, "de"),
+            (3, "pse"),
+            (4, "tsc"),
+            (5, "msr"),
+            (6, "pae"),
+            (7, "mce"),
+            (8, "cx8"),
+            (9, "apic"),
+            (11, "sep"),
+            (12, "mtrr"),
+            (13, "pge"),
+            (14, "mca"),
+            (15, "cmov"),
+            (16, "pat"),
+            (17, "pse36"),
+            (19, "clflush"),
+            (23, "mmx"),
+            (24, "fxsr"),
+            (25, "sse"),
+            (26, "sse2"),
+            (28, "ht"),
         ],
     );
-    add(e1.edx, &[(11, "syscall"), (20, "nx"), (26, "pdpe1gb"), (27, "rdtscp"), (29, "lm")]);
+    add(
+        e1.edx,
+        &[
+            (11, "syscall"),
+            (20, "nx"),
+            (26, "pdpe1gb"),
+            (27, "rdtscp"),
+            (29, "lm"),
+        ],
+    );
     add(
         l1.ecx,
         &[
-            (0, "pni"), (1, "pclmulqdq"), (9, "ssse3"), (12, "fma"), (13, "cx16"), (17, "pcid"),
-            (19, "sse4_1"), (20, "sse4_2"), (21, "x2apic"), (22, "movbe"), (23, "popcnt"),
-            (25, "aes"), (26, "xsave"), (28, "avx"), (29, "f16c"), (30, "rdrand"),
+            (0, "pni"),
+            (1, "pclmulqdq"),
+            (9, "ssse3"),
+            (12, "fma"),
+            (13, "cx16"),
+            (17, "pcid"),
+            (19, "sse4_1"),
+            (20, "sse4_2"),
+            (21, "x2apic"),
+            (22, "movbe"),
+            (23, "popcnt"),
+            (25, "aes"),
+            (26, "xsave"),
+            (28, "avx"),
+            (29, "f16c"),
+            (30, "rdrand"),
         ],
     );
     add(e1.ecx, &[(0, "lahf_lm"), (5, "abm")]);
     add(
         l7.ebx,
         &[
-            (3, "bmi1"), (5, "avx2"), (8, "bmi2"), (9, "erms"), (16, "avx512f"), (18, "rdseed"),
-            (19, "adx"), (29, "sha_ni"),
+            (3, "bmi1"),
+            (5, "avx2"),
+            (8, "bmi2"),
+            (9, "erms"),
+            (16, "avx512f"),
+            (18, "rdseed"),
+            (19, "adx"),
+            (29, "sha_ni"),
         ],
     );
     out.join(" ")
@@ -182,7 +229,7 @@ nodev	devtmpfs
 nodev	tmpfs
 nodev	devpts
 "
-        .to_vec()
+    .to_vec()
 }
 
 /// Real `/proc/stat`: a `cpu` aggregate line, one `cpuN` line per logical CPU, then the
@@ -190,19 +237,25 @@ nodev	devpts
 /// honestly zero (litebox does not schedule guest threads); the `cpuN` count is the real payload
 /// `nproc` and GLib read. See gm mutable `mut-1789043865374`.
 fn format_stat_global(cpu_count: usize) -> Vec<u8> {
-    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0
-");
+    let mut out = String::from(
+        "cpu  0 0 0 0 0 0 0 0 0 0
+",
+    );
     for cpu in 0..cpu_count {
-        out.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0
-"));
+        out.push_str(&format!(
+            "cpu{cpu} 0 0 0 0 0 0 0 0 0 0
+"
+        ));
     }
-    out.push_str("intr 0
+    out.push_str(
+        "intr 0
 ctxt 0
 btime 0
 processes 0
 procs_running 1
 procs_blocked 0
-");
+",
+    );
     out.into_bytes()
 }
 
@@ -211,7 +264,8 @@ procs_blocked 0
 /// mount rather than an empty command line. See gm mutable `mut-1789043872060`.
 fn format_kernel_cmdline() -> Vec<u8> {
     b"BOOT_IMAGE=/litebox root=/dev/root rw
-".to_vec()
+"
+    .to_vec()
 }
 
 /// Real `/proc/[pid]/mountinfo`: 10+ space-separated fields per line with a literal ` - ` before
@@ -226,8 +280,10 @@ fn format_mountinfo() -> Vec<u8> {
 /// save-and-restore it around every spawn, and absence is a failure to report where `0` is simply
 /// "nothing to restore". See gm mutable `mut-1789043876626`.
 fn format_oom_score_adj() -> Vec<u8> {
-    Vec::from(&b"0
-"[..])
+    Vec::from(
+        &b"0
+"[..],
+    )
 }
 
 /// Real `/proc/[pid]/cgroup`, unified (v2) form: `hierarchy-ID:controller-list:cgroup-path` per
@@ -235,8 +291,10 @@ fn format_oom_score_adj() -> Vec<u8> {
 /// than `ENOENT` -- glib's `g_get_user_runtime_dir` and systemd's `sd_pid_get_unit` read a missing
 /// file as "cgroups not mounted at all". See gm mutable `mut-1789043885409`.
 fn format_cgroup() -> Vec<u8> {
-    Vec::from(&b"0::/
-"[..])
+    Vec::from(
+        &b"0::/
+"[..],
+    )
 }
 
 /// Real `/proc/uptime`: two space-separated float seconds (uptime, summed idle), `\n`-terminated.
@@ -611,13 +669,17 @@ where
                         ino_info: None,
                     })
                     .collect();
-                entries.extend(self.proc_self_info.read().pids().into_iter().map(|pid| {
-                    DirEntry {
-                        name: format!("{pid}"),
-                        file_type: FileType::Directory,
-                        ino_info: None,
-                    }
-                }));
+                entries.extend(
+                    self.proc_self_info
+                        .read()
+                        .pids()
+                        .into_iter()
+                        .map(|pid| DirEntry {
+                            name: format!("{pid}"),
+                            file_type: FileType::Directory,
+                            ino_info: None,
+                        }),
+                );
                 Ok(entries)
             }
             ProcfsDirHandle::Pid(_) => {
@@ -667,7 +729,9 @@ where
         // The OOM-killer knobs are accepted and ignored: nothing here ever OOM-kills, and the
         // callers (Chromium's zygote host) only log a failure to set them.
         match h.get_typed::<Self>().kind {
-            ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj) => Ok(buf.len()),
+            ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj) => {
+                Ok(buf.len())
+            }
             _ => Err(WriteError::NotForWriting),
         }
     }
@@ -873,7 +937,9 @@ impl ProcSelfTable {
     /// [`Self::resolve`] which answers `/proc/self` for whichever process is asking.
     /// The `exe` path recorded for `pid`, if that process is known.
     pub fn get_exe_path(&self, pid: i32) -> Option<String> {
-        self.get(pid).map(|i| i.exe_path.clone()).filter(|p| !p.is_empty())
+        self.get(pid)
+            .map(|i| i.exe_path.clone())
+            .filter(|p| !p.is_empty())
     }
 
     fn get(&self, pid: i32) -> Option<&ProcSelfInfo> {

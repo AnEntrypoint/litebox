@@ -630,7 +630,9 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     }
 
     pub(crate) fn get_termios(&self, id: u32) -> Termios {
-        self.find(id).map(|s| s.termios.lock().clone()).unwrap_or_default()
+        self.find(id)
+            .map(|s| s.termios.lock().clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn set_termios(&self, id: u32, v: Termios) {
@@ -640,7 +642,9 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     }
 
     pub(crate) fn get_winsize(&self, id: u32) -> Winsize {
-        self.find(id).map(|s| s.winsize.lock().clone()).unwrap_or_default()
+        self.find(id)
+            .map(|s| s.winsize.lock().clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn set_winsize(&self, id: u32, v: Winsize) {
@@ -650,7 +654,9 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     }
 
     pub(crate) fn get_fg_pgid(&self, id: u32) -> i32 {
-        self.find(id).map(|s| s.fg_pgid.load(Ordering::Relaxed)).unwrap_or(0)
+        self.find(id)
+            .map(|s| s.fg_pgid.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub(crate) fn set_fg_pgid(&self, id: u32, v: i32) {
@@ -686,7 +692,12 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     /// [`LinuxShim::pty_master_read`]/a `PtyEnd::SharedMaster` end consumes. `for_master=false`:
     /// read what the MASTER wrote (synthetic keyboard input) -- the direction a
     /// `PtyEnd::SharedSlave` end consumes.
-    pub(crate) fn try_read_side(&self, id: u32, for_master: bool, buf: &mut [u8]) -> Result<usize, Errno> {
+    pub(crate) fn try_read_side(
+        &self,
+        id: u32,
+        for_master: bool,
+        buf: &mut [u8],
+    ) -> Result<usize, Errno> {
         let slot = self.find(id).ok_or(Errno::ENXIO)?;
         let ring = if for_master {
             &slot.slave_to_master
@@ -707,7 +718,12 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
     /// (consumed by the slave side); `for_master=false` writes the slave's own bytes (consumed by
     /// the master side). Also used, best-effort, to mirror an ordinary LOCAL `PtyHalf` write --
     /// see this module's own doc comment.
-    pub(crate) fn try_write_side(&self, id: u32, for_master: bool, buf: &[u8]) -> Result<usize, Errno> {
+    pub(crate) fn try_write_side(
+        &self,
+        id: u32,
+        for_master: bool,
+        buf: &[u8],
+    ) -> Result<usize, Errno> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -721,11 +737,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
             return Err(Errno::EPIPE);
         }
         let n = ring.try_write(buf);
-        if n > 0 {
-            Ok(n)
-        } else {
-            Err(Errno::EAGAIN)
-        }
+        if n > 0 { Ok(n) } else { Err(Errno::EAGAIN) }
     }
 }
 
@@ -867,7 +879,9 @@ pub(crate) fn poll_shared<Platform: ShimPlatform, R>(
         if has_real_deadline && remaining.is_none() {
             return Err(Errno::EAGAIN);
         }
-        let this_iter = remaining.map_or(SHARED_PTY_POLL_INTERVAL, |d| d.min(SHARED_PTY_POLL_INTERVAL));
+        let this_iter = remaining.map_or(SHARED_PTY_POLL_INTERVAL, |d| {
+            d.min(SHARED_PTY_POLL_INTERVAL)
+        });
         match cx.with_timeout(this_iter).sleep() {
             litebox::event::wait::WaitError::Interrupted => return Err(Errno::EINTR),
             litebox::event::wait::WaitError::TimedOut => {}
@@ -929,7 +943,11 @@ impl<Platform: ShimPlatform> PtySharedHalf<Platform> {
 }
 
 impl<Platform: ShimPlatform> IOPollable for PtySharedHalf<Platform> {
-    fn register_observer(&self, _observer: alloc::sync::Weak<dyn Observer<Events>>, _filter: Events) {
+    fn register_observer(
+        &self,
+        _observer: alloc::sync::Weak<dyn Observer<Events>>,
+        _filter: Events,
+    ) {
         // No genuine cross-process wakeup exists for a shared-transport pty end (matching
         // `ConnTransport::Shared`'s own documented scope limit in `syscalls::unix`) -- epoll/ppoll
         // on this fd relies entirely on the caller's own bounded re-poll driving `check_io_events`
@@ -993,7 +1011,10 @@ impl<Platform: ShimPlatform> PtyEnd<Platform> {
 
     /// Abstracts over this end's control-state storage (LOCAL `Arc<PtyPair>` vs. a
     /// [`SharedPtyTable`] slot) -- see [`PtyStateRef`].
-    pub(crate) fn pty_state<'a>(&'a self, shared: &'a SharedPtyTable<Platform>) -> PtyStateRef<'a, Platform> {
+    pub(crate) fn pty_state<'a>(
+        &'a self,
+        shared: &'a SharedPtyTable<Platform>,
+    ) -> PtyStateRef<'a, Platform> {
         match self {
             PtyEnd::Master(h) | PtyEnd::Slave(h) => PtyStateRef::Local(&h.pair, shared),
             PtyEnd::SharedMaster(h) | PtyEnd::SharedSlave(h) => PtyStateRef::Shared(h.id, shared),
@@ -1211,7 +1232,7 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalStateHandle<Platfor
         (master, id)
     }
 
-/// Is `id` a currently-allocated pty, i.e. does `/dev/pts/<id>` exist right now?
+    /// Is `id` a currently-allocated pty, i.e. does `/dev/pts/<id>` exist right now?
     ///
     /// Exists so `stat`/`access` on a pty slave path can be answered from the SAME registry that
     /// `pts_open` consults, rather than approximated. glibc's `ptsname_r` issues `TIOCGPTN`, builds
@@ -1258,7 +1279,9 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalStateHandle<Platfor
                     .descriptor_table()
                     .entry_handle(slave)
                     .ok_or(Errno::ENXIO)?
-                    .with_entry(|end: &PtyEnd<Platform>| end.pty_state(&self.shared_pty).is_locked());
+                    .with_entry(|end: &PtyEnd<Platform>| {
+                        end.pty_state(&self.shared_pty).is_locked()
+                    });
                 if locked {
                     return Err(Errno::EIO);
                 }

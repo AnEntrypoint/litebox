@@ -102,9 +102,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         inet_op: impl FnOnce(&SocketFd<Platform>) -> Result<R, Errno>,
         unix_op: impl FnOnce(&UnixSocket<Platform, FS>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        self.with_socket_netlink(global, sockfd, inet_op, unix_op, |_| {
-            Err(Errno::EOPNOTSUPP)
-        })
+        self.with_socket_netlink(global, sockfd, inet_op, unix_op, |_| Err(Errno::EOPNOTSUPP))
     }
 
     /// Same dispatch as [`Self::with_socket`], with an additional `netlink_op` arm for the
@@ -132,8 +130,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
             .raw_descriptor_store
             .read()
             .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(
-                raw_fd,
-            );
+            raw_fd,
+        );
         match unix_result {
             Ok(unix) => {
                 let handle = global
@@ -189,8 +187,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
             global,
             raw_fd_u32,
             |_inet| Ok(false),
-            |unix| Ok(unix.get_local_addr() == UnixSocketAddr::Unnamed
-                && unix.get_peer_addr() == Some(UnixSocketAddr::Unnamed)),
+            |unix| {
+                Ok(unix.get_local_addr() == UnixSocketAddr::Unnamed
+                    && unix.get_peer_addr() == Some(UnixSocketAddr::Unnamed))
+            },
             |_netlink| Ok(false),
         )
         .unwrap_or(false)
@@ -580,7 +580,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     );
                     return Ok(());
                 }
-                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => return Ok(()),
+                SocketOption::PRIORITY | SocketOption::REUSEPORT | SocketOption::PASSCRED => {
+                    return Ok(());
+                }
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
@@ -1142,12 +1144,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         result
     }
-    fn do_sys_socket(
-        &self,
-        domain: u32,
-        type_and_flags: u32,
-        protocol: u8,
-    ) -> Result<u32, Errno> {
+    fn do_sys_socket(&self, domain: u32, type_and_flags: u32, protocol: u8) -> Result<u32, Errno> {
         let (ty, flags) = parse_type_and_flags(type_and_flags)?;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
             log_unsupported!("socket(domain = {domain})");
@@ -1257,7 +1254,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })?
             }
             AddressFamily::NETLINK => {
-                let socket = crate::syscalls::netlink::NetlinkSocket::new(flags);
+                let socket =
+                    crate::syscalls::netlink::NetlinkSocket::new_with_protocol(flags, protocol);
                 let typed = self
                     .global
                     .litebox
@@ -1599,7 +1597,12 @@ fn as_v6_view(addr: SocketAddress) -> SocketAddress {
             } else {
                 v4.ip().to_ipv6_mapped()
             };
-            SocketAddress::Inet(SocketAddr::V6(core::net::SocketAddrV6::new(ip, v4.port(), 0, 0)))
+            SocketAddress::Inet(SocketAddr::V6(core::net::SocketAddrV6::new(
+                ip,
+                v4.port(),
+                0,
+                0,
+            )))
         }
         other => other,
     }
@@ -1731,7 +1734,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
+        let sockaddr =
+            self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
         self.do_connect(fd, sockaddr)
     }
     /// Gives a filesystem-path `AF_UNIX` address its canonical spelling: made absolute against the
@@ -1797,7 +1801,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let fam = ptr.read_at_offset::<Platform>(0);
             if addrlen >= 2
                 && fam.is_some_and(|f| {
-                    matches!(AddressFamily::try_from(u32::from(f)), Ok(AddressFamily::INET6))
+                    matches!(
+                        AddressFamily::try_from(u32::from(f)),
+                        Ok(AddressFamily::INET6)
+                    )
                 })
             {
                 litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = sockfd;
@@ -1805,7 +1812,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Ok(());
             }
         }
-        let sockaddr = self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
+        let sockaddr =
+            self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?)?;
         self.do_bind(sockfd, sockaddr)
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
@@ -1886,7 +1894,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let res = self.files.borrow().with_socket(
+        let res = self.files.borrow().with_socket_netlink(
             &self.global,
             sockfd,
             |fd| {
@@ -1904,6 +1912,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .transpose()?;
                 file.sendto(self, buf, flags, addr)
             },
+            |netlink| netlink.send(buf),
         );
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
@@ -2068,10 +2077,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
-            Some(self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(
-                UserPtr::from_usize(msg_name.as_usize()),
-                msg.msg_namelen as usize,
-            )?)?)
+            Some(
+                self.canonicalize_unix_addr(read_sockaddr_from_user::<Platform>(
+                    UserPtr::from_usize(msg_name.as_usize()),
+                    msg.msg_namelen as usize,
+                )?)?,
+            )
         } else {
             None
         };
@@ -2122,7 +2133,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             |netlink| {
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                netlink.send(data.len())
+                netlink.send(&data)
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -2278,7 +2289,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-            files.with_socket(
+            files.with_socket_netlink(
                 &self.global,
                 raw_fd.trunc(),
                 |fd| {
@@ -2304,6 +2315,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let src_addr = addr.map(SocketAddress::Unix);
                     Ok((size, src_addr))
                 },
+                |netlink| {
+                    let size = netlink.recv(&mut buf.borrow_mut())?;
+                    Ok((size, Some(SocketAddress::Netlink { pid: 0, groups: 0 })))
+                },
             )?
         };
 
@@ -2321,7 +2336,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
-    ) -> Result<(usize, AnyDupFds<Platform, FS>, Option<litebox_common_linux::Ucred>), Errno> {
+    ) -> Result<
+        (
+            usize,
+            AnyDupFds<Platform, FS>,
+            Option<litebox_common_linux::Ucred>,
+        ),
+        Errno,
+    > {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
@@ -2357,8 +2379,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Ok((size, src_addr, fds))
                 },
                 |netlink| {
-                    let size = netlink.recv()?;
-                    Ok((size, None, alloc::vec::Vec::new()))
+                    let size = netlink.recv(&mut buf.borrow_mut())?;
+                    Ok((
+                        size,
+                        Some(SocketAddress::Netlink { pid: 0, groups: 0 }),
+                        alloc::vec::Vec::new(),
+                    ))
                 },
             )?
         };
@@ -4462,7 +4488,11 @@ mod unix_tests {
         let n = task
             .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
             .expect("first recvfrom failed");
-        assert_eq!(&buf[..n], b"first", "first recv should return only the first message");
+        assert_eq!(
+            &buf[..n],
+            b"first",
+            "first recv should return only the first message"
+        );
 
         let n = task
             .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)

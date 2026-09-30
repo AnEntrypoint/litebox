@@ -229,7 +229,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 // this table cannot resolve (see this function's own doc comment) -- both skip
                 // identically; there is no way, or need, to tell them apart from here.
                 let Some(idx) = fd.x.as_usize() else { continue };
-                let Some(Some(entry)) = self.entries.get(idx) else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
                 if !entry.read().matches_subsystem::<Subsystem>() {
                     continue;
                 }

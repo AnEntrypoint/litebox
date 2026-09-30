@@ -43,19 +43,18 @@ use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     DRM_AUTH_MAGIC_VALUE, DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_CURSOR_HEIGHT,
     DRM_CAP_CURSOR_WIDTH, DRM_CAP_DUMB_BUFFER, DRM_CAP_PRIME, DRM_CAP_TIMESTAMP_MONOTONIC,
-    DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE,
-    DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR,
-    DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
-    DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap,
-    DrmModeCardRes, DrmModeConnectorSetProperty, DrmModeCreateDumb, DrmModeCrtc,
-    DrmModeCrtcPageFlip, DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeFbDirtyCmd,
-    DrmModeGetBlob,
-    DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty,
-    DrmModeMapDumb,
-    DrmModeModeinfo, DrmModeObjGetProperties, DrmModeObjSetProperty, DrmModePropertyEnum, DrmModeSetPlane,
-    DrmSetClientCap, DrmVersion, VIRTUAL_CONNECTOR_DPMS_PROP_ID, VIRTUAL_CONNECTOR_DPMS_VALUE,
-    VIRTUAL_CONNECTOR_EDID_BLOB_ID, VIRTUAL_CONNECTOR_EDID_PROP_ID, VIRTUAL_PLANE_TYPE_PROP_ID,
-    VIRTUAL_PLANE_TYPE_VALUE, errno::Errno,
+    DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_EVENT_FLIP_COMPLETE, DRM_MODE_CONNECTOR_VIRTUAL,
+    DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_PLANE,
+    DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM, DRM_PRIME_CAP_EXPORT,
+    DRM_PRIME_CAP_IMPORT, DrmAuth, DrmEvent, DrmEventVblank, DrmGetCap, DrmModeCardRes,
+    DrmModeConnectorSetProperty, DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip,
+    DrmModeDestroyDumb, DrmModeFbCmd, DrmModeFbCmd2, DrmModeFbDirtyCmd, DrmModeGetBlob,
+    DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane, DrmModeGetPlaneRes,
+    DrmModeGetProperty, DrmModeMapDumb, DrmModeModeinfo, DrmModeObjGetProperties,
+    DrmModeObjSetProperty, DrmModePropertyEnum, DrmModeSetPlane, DrmSetClientCap, DrmVersion,
+    VIRTUAL_CONNECTOR_DPMS_PROP_ID, VIRTUAL_CONNECTOR_DPMS_VALUE, VIRTUAL_CONNECTOR_EDID_BLOB_ID,
+    VIRTUAL_CONNECTOR_EDID_PROP_ID, VIRTUAL_PLANE_TYPE_PROP_ID, VIRTUAL_PLANE_TYPE_VALUE,
+    errno::Errno,
 };
 use zerocopy::IntoBytes;
 
@@ -96,9 +95,7 @@ pub fn set_dirty_fb_enabled(enabled: bool) {
 
 /// Defaults to `true`: DIRTYFB presenting is the intended behaviour, and the env var only
 /// turns it OFF. A default of `false` would make an unset runner silently disable it.
-static DIRTY_FB_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
+static DIRTY_FB_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// The virtual display's fixed mode. 1920x1080@60 is a reasonable, widely-compatible default
 /// for a single software display with no real monitor to query.
@@ -383,9 +380,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             // at byte 0 (see `create_dumb`). A future double-buffered upgrade (design doc section
             // 2.2's own noted future step) is the only case that would ever make this non-zero.
             offset: 0,
-            seq: self
-                .frame_seq
-                .load(core::sync::atomic::Ordering::Acquire),
+            seq: self.frame_seq.load(core::sync::atomic::Ordering::Acquire),
         })
     }
 
@@ -495,14 +490,12 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.max_width = VIRTUAL_WIDTH;
         req.min_height = VIRTUAL_HEIGHT;
         req.max_height = VIRTUAL_HEIGHT;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
-    pub(crate) fn get_connector(
-        &self,
-        ptr: UserPtrMut<DrmModeGetConnector>,
-    ) -> Result<u32, Errno> {
+    pub(crate) fn get_connector(&self, ptr: UserPtrMut<DrmModeGetConnector>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.connector_id != 0 && req.connector_id != VIRTUAL_CONNECTOR_ID {
             return Err(Errno::ENOENT);
@@ -537,7 +530,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             connector_type:? = req.connector_type;
             "drm-ioctl: GETCONNECTOR reply"
         );
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -556,7 +550,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // Bit 0 set = "can drive CRTC index 0", the only CRTC this device has.
         req.possible_crtcs = 0b1;
         req.possible_clones = 0;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -584,7 +579,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             vdisplay:? = req.mode.vdisplay;
             "drm-ioctl: GETCRTC reply"
         );
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -632,7 +628,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             count_connectors:? = req.count_connectors;
             "drm-ioctl: SETCRTC request"
         );
-        *self.crtc_fb.lock() = if req.fb_id == 0 { None } else { Some(req.fb_id) };
+        *self.crtc_fb.lock() = if req.fb_id == 0 {
+            None
+        } else {
+            Some(req.fb_id)
+        };
         // Track mode-configured state independent of `fb_id` -- see [`Self::crtc_mode_set`]'s
         // own doc comment for why conflating the two previously misreported `GETCRTC` during a
         // legitimate empty-buffer modeset transition.
@@ -756,7 +756,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                     // presentation-path bug instead). Counting only a bounded prefix keeps this
                     // cheap enough to run on every flip while `LITEBOX_DRM_TRACE=1` is set.
                     let sample_len = bytes.len().min(4096);
-                    let non_zero_in_sample = bytes[..sample_len].iter().filter(|b| **b != 0).count();
+                    let non_zero_in_sample =
+                        bytes[..sample_len].iter().filter(|b| **b != 0).count();
                     litebox_util_log::debug!(
                         fb_id:% = fb_id, handle:? = handle, addr:% = addr, size:% = size,
                         sample_len:% = sample_len, non_zero_in_sample:% = non_zero_in_sample;
@@ -795,7 +796,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 .ok_or(Errno::EFAULT)?;
         }
         req.count_planes = 1;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -820,7 +822,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.possible_crtcs = 0b1;
         req.gamma_size = 0;
         req.count_format_types = 1;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -879,7 +882,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.name_len = fill_field::<Platform>(req.name, req.name_len, NAME)?;
         req.date_len = fill_field::<Platform>(req.date, req.date_len, DATE)?;
         req.desc_len = fill_field::<Platform>(req.desc, req.desc_len, DESC)?;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -906,8 +910,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             || req.capability == DRM_CAP_CRTC_IN_VBLANK_EVENT
         {
             1
-        } else if req.capability == DRM_CAP_CURSOR_WIDTH
-            || req.capability == DRM_CAP_CURSOR_HEIGHT
+        } else if req.capability == DRM_CAP_CURSOR_WIDTH || req.capability == DRM_CAP_CURSOR_HEIGHT
         {
             64
         } else if req.capability == DRM_CAP_PRIME {
@@ -922,7 +925,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         } else {
             0
         };
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1049,7 +1053,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                     .ok_or(Errno::EFAULT)?;
             }
             req.count_props = 1;
-            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, req)
+                .ok_or(Errno::EFAULT)?;
             return Ok(0);
         }
         if req.obj_type == DRM_MODE_OBJECT_CONNECTOR
@@ -1078,11 +1083,13 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                     .ok_or(Errno::EFAULT)?;
             }
             req.count_props = 2;
-            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, req)
+                .ok_or(Errno::EFAULT)?;
             return Ok(0);
         }
         req.count_props = 0;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1172,7 +1179,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             }
         }
         req.length = VIRTUAL_EDID_BLOB.len() as u32;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1224,7 +1232,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             }
             req.count_values = 1;
             req.count_enum_blobs = 1;
-            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, req)
+                .ok_or(Errno::EFAULT)?;
             return Ok(0);
         }
         if req.prop_id == VIRTUAL_CONNECTOR_EDID_PROP_ID {
@@ -1242,7 +1251,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             }
             req.count_values = 1;
             req.count_enum_blobs = 0;
-            ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+            ptr.write_at_offset::<Platform>(0, req)
+                .ok_or(Errno::EFAULT)?;
             return Ok(0);
         }
         if req.prop_id != VIRTUAL_PLANE_TYPE_PROP_ID {
@@ -1276,7 +1286,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         }
         req.count_values = 1;
         req.count_enum_blobs = 1;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1327,7 +1338,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         req.handle = handle;
         req.pitch = pitch;
         req.size = size;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1344,7 +1356,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             u64::from(self.next_map_offset.fetch_add(1, Ordering::Relaxed)) << 12
         });
         req.offset = offset;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1431,7 +1444,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             },
         );
         req.fb_id = fb_id;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
@@ -1462,7 +1476,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             },
         );
         req.fb_id = fb_id;
-        ptr.write_at_offset::<Platform>(0, req).ok_or(Errno::EFAULT)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
