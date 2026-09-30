@@ -367,6 +367,7 @@ enum ProcPidEntry {
     Comm,
     OomScoreAdj,
     OomAdj,
+    Environ,
 }
 
 impl ProcPidEntry {
@@ -377,6 +378,7 @@ impl ProcPidEntry {
         ("comm", ProcPidEntry::Comm),
         ("oom_score_adj", ProcPidEntry::OomScoreAdj),
         ("oom_adj", ProcPidEntry::OomAdj),
+        ("environ", ProcPidEntry::Environ),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -584,6 +586,7 @@ where
                     ProcPidEntry::Cmdline => info.cmdline.clone(),
                     ProcPidEntry::Comm => format!("{}\n", info.comm).into_bytes(),
                     ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj => b"0\n".to_vec(),
+                    ProcPidEntry::Environ => info.environ.clone(),
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
             }
