@@ -349,7 +349,7 @@ impl super::backend::Backend for TarRo {
             walked_components.push(super::backend::WalkedComponent {
                 permissions: super::backend::PermissionCheck::ByResolver(
                     super::backend::PermissionInfo {
-                        mode: DEFAULT_DIR_MODE,
+                        mode: child.mode.unwrap_or(DEFAULT_DIR_MODE),
                         owner: child.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
                     },
                 ),
@@ -519,7 +519,7 @@ impl super::backend::Backend for TarRo {
         Ok(super::FileStatus {
             nlink: 1,
             file_type: FileType::Directory,
-            mode: DEFAULT_DIR_MODE,
+            mode: dir.mode.unwrap_or(DEFAULT_DIR_MODE),
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
             node_info: dir.node_info.clone(),
@@ -645,6 +645,8 @@ struct IndexedDir {
     owner: Option<UserInfo>,
     /// Modification time from the directory's own tar entry; 0 for implied directories.
     mtime: i64,
+    /// Permission bits from the directory's own tar entry; `None` for implied directories.
+    mode: Option<Mode>,
     node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
@@ -679,6 +681,7 @@ enum RawEntry {
         path: String,
         owner: UserInfo,
         mtime: i64,
+        mode: Mode,
     },
     File {
         path: String,
@@ -885,6 +888,10 @@ impl TarIndex {
                         path: path.trim_end_matches('/').into(),
                         owner: owner_from_posix_header(header),
                         mtime: tar_mtime_seconds(header),
+                        mode: header
+                            .mode
+                            .to_flags()
+                            .map_or(DEFAULT_DIR_MODE, mode_of_modeflags),
                     });
                 }
                 _ => {
@@ -935,7 +942,7 @@ impl TarIndex {
 
         for raw_entry in raw_entries {
             match raw_entry {
-                RawEntry::Dir { path, owner, mtime } => {
+                RawEntry::Dir { path, owner, mtime, mode } => {
                     if path.is_empty() {
                         continue;
                     }
@@ -943,7 +950,7 @@ impl TarIndex {
                     if !matches!(live.get(path.as_str()), Some(RawLiveEntry::Dir(..))) {
                         live.remove(path.as_str());
                     }
-                    live.insert(path, RawLiveEntry::Dir(owner, mtime));
+                    live.insert(path, RawLiveEntry::Dir(owner, mtime, mode));
                 }
                 RawEntry::File { path, file_idx } => {
                     remove_path_and_descendants(&mut live, &path);
@@ -976,6 +983,7 @@ impl TarIndex {
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
             mtime: 0,
+            mode: None,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
@@ -983,7 +991,7 @@ impl TarIndex {
 
         for (path, entry) in live {
             match entry {
-                RawLiveEntry::Dir(owner, mtime) => {
+                RawLiveEntry::Dir(owner, mtime, mode) => {
                     let mut probe = path.clone();
                     probe.push_str("/x");
                     ensure_ancestors(
@@ -996,6 +1004,7 @@ impl TarIndex {
                     if let Some(&idx) = dirs_by_path.get(path.as_str()) {
                         dirs[idx].owner = Some(owner);
                         dirs[idx].mtime = mtime;
+                        dirs[idx].mode = Some(mode);
                     }
                 }
                 RawLiveEntry::File(file_idx) => {
@@ -1103,6 +1112,7 @@ impl TarIndex {
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
             mtime: 0,
+            mode: None,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
@@ -1231,7 +1241,7 @@ impl TarIndex {
 /// fold, exactly as the pre-multi-layer single-tar builder already worked.
 #[derive(Clone, Copy)]
 enum RawLiveEntry {
-    Dir(UserInfo, i64),
+    Dir(UserInfo, i64, Mode),
     File(usize),
     Symlink(usize),
 }
@@ -1349,6 +1359,7 @@ fn ensure_ancestors(
             dirs.push(IndexedDir {
                 owner: Some(owner),
                 mtime: 0,
+                mode: None,
                 node_info: inode_allocator.next(),
                 children: HashMap::new(),
             });
