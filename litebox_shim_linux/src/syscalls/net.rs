@@ -607,7 +607,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         },
                     )?;
                 }
-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
+                TcpOption::KEEPCNT | TcpOption::KEEPIDLE => {
+                    // smoltcp keeps a single keep-alive interval (TCP_KEEPINTVL); the idle time
+                    // and probe count are validated and otherwise not modelled.
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, size_of::<u32>())?;
+                    if val == 0 || val > 32767 {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+                TcpOption::INFO => {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {

@@ -5577,7 +5577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EINVAL)?;
+                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -5587,7 +5587,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(old_rlim) = old_rlim {
             old_rlim
                 .write_at_offset::<Platform>(0, old_limit)
-                .ok_or(Errno::EINVAL)?;
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(())
     }
@@ -5600,7 +5600,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset::<Platform>(0, old_limit)
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `setrlimit`.
