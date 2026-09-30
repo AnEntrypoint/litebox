@@ -315,7 +315,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 // file specified by pathname does not exist, open() will create a
                 // regular file (i.e., O_DIRECTORY is ignored).
                 flags.remove(OFlags::DIRECTORY);
-                let old = parent.children.insert(
+                parent.perms.mtime = super::clock::now();
+                parent.perms.mtime = super::clock::now();
+        let old = parent.children.insert(
                     path.components().unwrap().last().unwrap().into(),
                     FileType::RegularFile,
                 );
@@ -324,8 +326,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     perms: Permissions {
                         mode,
                         userinfo: self.acting_user(),
-                        atime: super::Timestamp::default(),
-                        mtime: super::Timestamp::default(),
+                        atime: super::clock::now(),
+                        mtime: super::clock::now(),
                     },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
@@ -500,6 +502,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             0
         };
         file.data.to_mut().extend(&buf[start..]);
+        file.perms.mtime = super::clock::now();
         // Update the file position for positional writes (not pwrite)
         if offset.is_none() {
             *position = end_position;
@@ -590,6 +593,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             core::cmp::Ordering::Equal => (),
             core::cmp::Ordering::Greater => file_data.data.to_mut().resize(length, 0),
         }
+        file_data.perms.mtime = super::clock::now();
         if reset_offset {
             *position = 0;
         }
@@ -761,6 +765,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
         }
+        parent.perms.mtime = super::clock::now();
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
@@ -853,6 +858,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             if !self.acting_user().can_write(&parent.perms) {
                 return Err(RenameError::NoWritePerms);
             }
+            parent.perms.mtime = super::clock::now();
             let Some(ft) = parent.children.remove(&from_name) else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
@@ -865,6 +871,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             let ft = {
                 let mut from_parent = from_parent.write();
+                from_parent.perms.mtime = super::clock::now();
                 from_parent
                     .children
                     .remove(&from_name)
@@ -872,6 +879,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             };
             {
                 let mut to_parent = to_parent.write();
+                to_parent.perms.mtime = super::clock::now();
                 to_parent.children.insert(to_name, ft);
             }
         }
@@ -940,6 +948,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&new_parent.perms) {
             return Err(LinkError::NoWritePerms);
         }
+        new_parent.perms.mtime = super::clock::now();
         let old = new_parent.children.insert(
             newpath.components().unwrap().last().unwrap().into(),
             FileType::RegularFile,
@@ -968,6 +977,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
+        parent.perms.mtime = super::clock::now();
         let old = parent.children.insert(
             path.components().unwrap().last().unwrap().into(),
             FileType::Fifo,
@@ -1012,6 +1022,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&parent.perms) {
             return Err(SymlinkError::NoWritePerms);
         }
+        parent.perms.mtime = super::clock::now();
         let old = parent.children.insert(
             linkpath.components().unwrap().last().unwrap().into(),
             FileType::Symlink,
@@ -1023,8 +1034,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms: Permissions {
                     mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
                     userinfo: self.acting_user(),
-                    atime: super::Timestamp::default(),
-                    mtime: super::Timestamp::default(),
+                    atime: super::clock::now(),
+                    mtime: super::clock::now(),
                 },
                 target,
                 unique_id: self.fresh_id(),
@@ -1063,6 +1074,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         }
+        parent.perms.mtime = super::clock::now();
         let old = parent.children.insert(
             path.components().unwrap().last().unwrap().into(),
             FileType::Directory,
@@ -1074,8 +1086,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms: Permissions {
                     mode,
                     userinfo: self.acting_user(),
-                    atime: super::Timestamp::default(),
-                    mtime: super::Timestamp::default(),
+                    atime: super::clock::now(),
+                    mtime: super::clock::now(),
                 },
                 children: HashMap::default(),
                 unique_id: self.fresh_id(),
@@ -1107,6 +1119,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !self.acting_user().can_write(&parent.perms) {
             return Err(RmdirError::NoWritePerms);
         }
+        parent.perms.mtime = super::clock::now();
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
@@ -1338,8 +1351,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
-                        atime: super::Timestamp::default(),
-                        mtime: super::Timestamp::default(),
+                        atime: super::clock::now(),
+                        mtime: super::clock::now(),
                     },
                     children: HashMap::default(),
                     unique_id: 0,

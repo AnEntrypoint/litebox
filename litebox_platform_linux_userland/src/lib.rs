@@ -236,6 +236,12 @@ impl LinuxUserland {
             core::sync::atomic::Ordering::Relaxed,
         );
         register_exception_handlers();
+        litebox::fs::clock::set_now_fn(|| {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: clock_gettime writes one timespec through a valid pointer.
+            unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+            litebox::fs::Timestamp { sec: ts.tv_sec, nsec: ts.tv_nsec as u32 }
+        });
         litebox::fs::ident::set_thread_id_fn(|| {
             // SAFETY: gettid takes no arguments and cannot fail.
             (unsafe { libc::syscall(libc::SYS_gettid) }) as usize

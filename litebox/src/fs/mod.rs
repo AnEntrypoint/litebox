@@ -445,6 +445,34 @@ pub struct Timestamp {
     pub nsec: u32,
 }
 
+/// The wall clock file timestamps are taken from.
+///
+/// The in-memory file system is generic over a platform that need not know about time, so the
+/// platform registers a plain function once at startup instead. Unset, every timestamp stays `0`.
+pub mod clock {
+    use super::Timestamp;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static NOW_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers the function that returns the current wall-clock time.
+    pub fn set_now_fn(f: fn() -> Timestamp) {
+        NOW_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// The current time, or the epoch when no clock was registered.
+    #[must_use]
+    pub fn now() -> Timestamp {
+        let raw = NOW_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return Timestamp::default();
+        }
+        // SAFETY: only `set_now_fn` stores here, and it stores a `fn() -> Timestamp`.
+        let f: fn() -> Timestamp = unsafe { core::mem::transmute(raw) };
+        f()
+    }
+}
+
 /// The identity every file-system permission check acts as, per host process.
 ///
 /// A `static` is deliberate: each native-`fork()`ed guest process has its own copy of this
