@@ -3643,6 +3643,21 @@ pub enum SyscallRequest {
         oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
+    RtSigtimedwait {
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<signal::Siginfo>>,
+        timeout: Option<UserPtr<Timespec>>,
+        sigsetsize: usize,
+    },
+    RtTgsigqueueinfo {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    },
+    RtSigqueueinfo {
+        pid: i32,
+        sig: i32,
+    },
     RtSigsuspend {
         mask: Option<UserPtr<SigSet>>,
         sigsetsize: usize,
@@ -4442,6 +4457,11 @@ impl SyscallRequest {
                 oldset:*,
                 sigsetsize,
             }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout:*, sigsetsize })
+            }
+            Sysno::rt_tgsigqueueinfo => sys_req!(RtTgsigqueueinfo { tgid, tid, sig }),
+            Sysno::rt_sigqueueinfo => sys_req!(RtSigqueueinfo { pid, sig }),
             Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::rt_sigaction => sys_req!(RtSigaction {
                 signum:?,

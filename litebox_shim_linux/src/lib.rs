@@ -2327,6 +2327,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 oldset,
                 sigsetsize,
             } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
+            SyscallRequest::RtTgsigqueueinfo { tgid, tid, sig } => {
+                self.sys_rt_tgsigqueueinfo(tgid, tid, sig)
+            }
+            SyscallRequest::RtSigqueueinfo { pid, sig } => self.sys_rt_sigqueueinfo(pid, sig),
             SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
                 self.sys_rt_sigsuspend(ctx, mask, sigsetsize)
             }

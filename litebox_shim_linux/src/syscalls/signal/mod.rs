@@ -768,6 +768,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// `rt_sigtimedwait(2)`: synchronously consumes one pending signal from `set`. The signals in
+    /// `set` are normally blocked, so a blocked wake-up is not delivered as an interrupt; the wait
+    /// therefore re-checks the queues in short slices until the timeout.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<Siginfo>>,
+        timeout: Option<UserPtr<litebox_common_linux::Timespec>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let set = set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let deadline = match timeout {
+            None => None,
+            Some(t) => {
+                let ts = t.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                Some(core::time::Duration::try_from(ts)?)
+            }
+        };
+        let slice = core::time::Duration::from_millis(2);
+        let mut waited = core::time::Duration::ZERO;
+        loop {
+            let taken = {
+                let thread = self.signals.borrow();
+                let mut own = thread.pending.borrow_mut();
+                if let Some(sig) = own.next_matching(set) {
+                    Some((sig, own.remove(sig)))
+                } else {
+                    let mut shared = thread.shared_pending.lock();
+                    shared
+                        .next_matching(set)
+                        .map(|sig| (sig, shared.remove(sig)))
+                }
+            };
+            if let Some((sig, siginfo)) = taken {
+                if let Some(info) = info {
+                    info.write_at_offset::<Platform>(0, siginfo)
+                        .ok_or(Errno::EFAULT)?;
+                }
+                return Ok(usize::try_from(sig.as_i32()).unwrap());
+            }
+            if self.has_pending_signals() {
+                return Err(Errno::EINTR);
+            }
+            let step = match deadline {
+                Some(d) if waited >= d => return Err(Errno::EAGAIN),
+                Some(d) => slice.min(d - waited),
+                None => slice,
+            };
+            let _ = self.wait_cx().with_timeout(step).sleep();
+            waited += step;
+        }
+    }
+
+    /// `rt_tgsigqueueinfo(2)`/`rt_sigqueueinfo(2)`: delivered as a plain `tgkill`/`kill`; the
+    /// caller-supplied `siginfo` payload (`si_value`) is not carried through.
+    pub(crate) fn sys_rt_tgsigqueueinfo(
+        &self,
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    ) -> Result<usize, Errno> {
+        self.do_kill(Some(tgid), Some(tid), sig)
+    }
+
+    pub(crate) fn sys_rt_sigqueueinfo(&self, pid: i32, sig: i32) -> Result<usize, Errno> {
+        self.do_kill(Some(pid), None, sig)
+    }
+
     pub(crate) fn sys_sigaltstack(
         &self,
         ss_ptr: Option<UserPtr<SigAltStack>>,
