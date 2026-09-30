@@ -5267,6 +5267,27 @@ impl SyscallRequest {
             // return can conclude the fd is unusable, and there is no upside to refusing a hint
             // whose entire contract is that it may be disregarded.
             Sysno::fadvise64 => SyscallRequest::Fadvise64,
+            // The guest file systems carry no extended attributes: listing them yields an empty
+            // list (returned as length 0, which is what `SchedYield` answers), reading one is
+            // "no such attribute", and setting one is "not supported here" -- what a tmpfs
+            // without xattr support says. GIO asks for the list of every file it inspects
+            // (thousands of calls); failing them as unimplemented is only noise.
+            // Scheduling priority has no meaning here (every guest thread is an ordinary host
+            // thread, and the host scheduler is not the guest's to tune); accepting the request
+            // is what an unprivileged `nice` that happens to succeed looks like.
+            Sysno::setpriority => SyscallRequest::SchedYield,
+            Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => SyscallRequest::SchedYield,
+            Sysno::getxattr
+            | Sysno::lgetxattr
+            | Sysno::fgetxattr
+            | Sysno::removexattr
+            | Sysno::lremovexattr
+            | Sysno::fremovexattr => {
+                return Err(errno::Errno::ENODATA);
+            }
+            Sysno::setxattr | Sysno::lsetxattr | Sysno::fsetxattr => {
+                return Err(errno::Errno::EOPNOTSUPP);
+            }
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
