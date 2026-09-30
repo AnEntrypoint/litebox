@@ -802,9 +802,21 @@ impl<
         // not-yet-cached path both arrive here with their own fd; the loser must discard its own
         // and reuse the winner's entry, never overwrite it -- gm mutable
         // `layered-open-lower-race-loser-closes-fd`.
-        let our_entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
-        });
+        // The lower fd cached here serves every later descriptor for this path, whatever access
+        // THEY asked for, so a write-only first opener must not leave a fd nobody else can read
+        // through: widen WRONLY to RDWR, falling back to the exact request when that is refused.
+        let lower_fd = if flags.contains(OFlags::WRONLY) {
+            let mut wide = flags;
+            wide.remove(OFlags::WRONLY);
+            wide.insert(OFlags::RDWR);
+            match self.lower.open(path.as_str(), wide, mode) {
+                Ok(fd) => fd,
+                Err(_) => self.lower.open(path.as_str(), flags, mode)?,
+            }
+        } else {
+            self.lower.open(path.as_str(), flags, mode)?
+        };
+        let our_entry = Arc::new(EntryX::Lower { fd: lower_fd });
         let entry = {
             let mut root = self.root.write();
             if let Some(existing) = root.entries.get(&path) {
