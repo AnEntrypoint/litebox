@@ -29,11 +29,12 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
-    PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery, VirtualUnlock,
 };
 
 const CHUNK_SHIFT: usize = 16;
 const CHUNK_SIZE: usize = 1 << CHUNK_SHIFT;
+const PAGE_BYTES: usize = 4096;
 const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
 const ACCESS_KIND_WRITE: usize = 1;
 const ACCESS_KIND_EXECUTE: usize = 8;
@@ -320,6 +321,9 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
             span.start as *mut u8,
             copy_len,
         );
+        let source_begin = (range.source + offset) & !(PAGE_BYTES - 1);
+        let source_end = (range.source + offset + copy_len).next_multiple_of(PAGE_BYTES);
+        VirtualUnlock(source_begin as *const _, source_end - source_begin);
         if range.protection != PAGE_READWRITE {
             VirtualProtect(
                 span.start as *const _,

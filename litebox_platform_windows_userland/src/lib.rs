@@ -8,6 +8,7 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod ctxwatch;
+mod idle_trim;
 mod fork_verify;
 mod lazy_file_map;
 pub mod lazy_fork_commit;
@@ -3181,6 +3182,7 @@ impl WindowsUserland {
         // ordinary startup code. See [`VehGates`] for why doing it later -- lazily, from inside
         // the handler -- is not merely slower but unsafe.
         let _ = veh_gates();
+        idle_trim::start();
 
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);

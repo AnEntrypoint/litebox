@@ -104,8 +104,12 @@ Fixed this pass (all committed, newest first):
    (`MemoryProvider::release_pages`); a partial `mprotect`/remap of a lazy file mapping filled the WHOLE library (libLLVM text = 117MB resident in each
    dlopen'er), now only edge chunks. Full stack at t=150s: private resident 2246MB -> 1222MB over 20 processes. Diagnose with
    `LITEBOX_DIAG_ALLOC_STACK=1` (stack RVAs of every >=1MB host allocation; symbolize with `llvm-symbolizer`) and `LITEBOX_DIAG_MEM_BREAKDOWN=1`.
-   Still open: each child rebuilds its rootfs index privately (~20MB resident on webtop; needs an mmap-able index), the root keeps ~30MB of regex garbage
-   (parses the OCI reference once), selkies/Xvfb/GTK apps 100-230MB resident each, guest `PROT_NONE` reservations are committed (commit charge only).
+   Round 2 (f271ed2 + idle trim): the rootfs index is a flat pointer-free image (`TarRo::flat_index`/`from_flat_index`, cache file `mergedidx_*_v3`) that
+   children mmap read-only (webtop child 26MB -> 6MB resident); the OCI reference is parsed without the Unicode regex (`parse_reference`, root 76 -> 40MB);
+   `idle_trim.rs` empties the working set of a host process that used <6% CPU over 4s (`LITEBOX_IDLE_TRIM=0` disables), so idle daemons' pages go to
+   standby: full stack WSsum 2.8GB -> ~0.4GB with the desktop in use (private WS 1.5GB -> 0.3GB). `.wfgy/memsamp.ps1` samples WS/private WS/avail;
+   `.wfgy/wsmap.ps1 -ProcId` splits one process's resident pages by region type. Remaining: selkies/Xvfb heaps (150-250MB private RW, legitimate guest
+   memory), guest `PROT_NONE` reservations are committed (commit charge only), an idle process still burns 1-3% CPU (poll threads).
    Beware: a heap layout that differs between root and child exposes latent shared-struct host pointers (`bootstrap_process` was one; 6fd27b7).
 1b. Chrome (the user's own, ~6GB) and other host apps leave 0.3-2GB free, which makes full-stack runs die on
    the driver's `KILL low memory` guard (`avail<120`) before `DE_UP`; check `Get-Counter '\Memory\Available MBytes'`

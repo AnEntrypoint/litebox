@@ -7651,6 +7651,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ppid = %self.ppid.get(),
             comm = ?self.comm.get(),
             argv0 = %path,
+            host_pid = %self.global.platform.current_host_pid(),
             "DIAG_TIMELINE execve"
         );
         crate::diag::record_process(
