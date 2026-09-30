@@ -90,16 +90,16 @@ Fixed this pass (all committed, newest first):
 
 ## Open, in rough priority order
 
-1. **Host memory is the binding constraint, not a litebox logic bug.** 24 host processes = ~4.5GB
-   working set on a 15GB box; with Chrome/Defender/etc. free RAM falls to 300-500MB, pages/sec hits
-   5000, and then input is dropped or delayed (`selkies: Input X connection was unresponsive`, `Client
-   stall: no ACK`, bash `sleep 30` taking minutes) and the page can die (`ERR_EMPTY_RESPONSE`). Every
-   cross-process fork child starts at 74MB private / 50MB resident BEFORE guest code (172 heap regions of
-   ~8MB: per-process rootfs index + tables; `LITEBOX_DIAG_MEM_BREAKDOWN=1` prints it); selkies ~1.2GB,
-   Xvfb ~600MB. Biggest lever: make the merged rootfs index shared/mmap-able instead of a private heap
-   copy per process; then fewer/lighter processes. `MAX_TIMEOUT` of a fork child's `net_worker` was raised
-   1ms -> 25ms (25 processes polling the one cross-process network lock at 1kHz was a lock convoy);
-   root stays 1ms. Re-verify the effect on a quiet host.
+1. **Host memory is the binding constraint, not a litebox logic bug.** Fixed (b11f674, 6fd27b7, d07a7f9): a fork child was 72MB committed / 41MB resident
+   before guest code (slim; 61/58MB on webtop), now 34/8MB (webtop 61/26MB): the regex-based `EnvFilter` and the child's `Reference::parse`+tokio+client
+   compiled a 30MB Unicode regex NFA into the never-shrinking buddy heap (`pull_layers_with_known_digests` now returns straight from the layer cache);
+   `copy_one_group` wrote the parent's 8MB all-zero guest stack into every child (zero pages skipped); frees >=256KB now `DiscardVirtualMemory` their pages
+   (`MemoryProvider::release_pages`); a partial `mprotect`/remap of a lazy file mapping filled the WHOLE library (libLLVM text = 117MB resident in each
+   dlopen'er), now only edge chunks. Full stack at t=150s: private resident 2246MB -> 1222MB over 20 processes. Diagnose with
+   `LITEBOX_DIAG_ALLOC_STACK=1` (stack RVAs of every >=1MB host allocation; symbolize with `llvm-symbolizer`) and `LITEBOX_DIAG_MEM_BREAKDOWN=1`.
+   Still open: each child rebuilds its rootfs index privately (~20MB resident on webtop; needs an mmap-able index), the root keeps ~30MB of regex garbage
+   (parses the OCI reference once), selkies/Xvfb/GTK apps 100-230MB resident each, guest `PROT_NONE` reservations are committed (commit charge only).
+   Beware: a heap layout that differs between root and child exposes latent shared-struct host pointers (`bootstrap_process` was one; 6fd27b7).
 1b. Chrome (the user's own, ~6GB) and other host apps leave 0.3-2GB free, which makes full-stack runs die on
    the driver's `KILL low memory` guard (`avail<120`) before `DE_UP`; check `Get-Counter '\Memory\Available MBytes'`
    first. The gate in `pass118_full_err.ps1` is 1000MB.
