@@ -614,21 +614,22 @@ fn acquire_boot_lock() -> Result<BootLock> {
 const DEFAULT_LOG_FILTER: &str = "warn,litebox_platform_windows_userland::fork_verify=error";
 
 pub fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(FlushingStderr::default)
-        .with_timer(tracing_subscriber::fmt::time::uptime())
-        .with_level(true)
-        .with_env_filter(
-            // Read `LITEBOX_LOG` here rather than via `with_env_var`/`from_env_lossy`, because
-            // the default is a MULTI-directive filter (see `DEFAULT_LOG_FILTER`) and
-            // `with_default_directive` accepts only a single `Directive`. An empty value is
-            // treated as unset, so `LITEBOX_LOG=` does not silence everything by accident.
-            tracing_subscriber::EnvFilter::builder().parse_lossy(
-                std::env::var("LITEBOX_LOG")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned()),
-            ),
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    let requested = std::env::var("LITEBOX_LOG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
+    let targets = requested
+        .parse::<tracing_subscriber::filter::Targets>()
+        .or_else(|_| DEFAULT_LOG_FILTER.parse())
+        .unwrap_or_default();
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(FlushingStderr::default)
+                .with_timer(tracing_subscriber::fmt::time::uptime())
+                .with_level(true)
+                .with_filter(targets),
         )
         .try_init();
 }

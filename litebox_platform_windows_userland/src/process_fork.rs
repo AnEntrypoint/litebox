@@ -4563,6 +4563,10 @@ fn copy_one_group(
                 }
             }
         }
+        if bytes.iter().all(|b| *b == 0) {
+            cursor = page_end;
+            continue;
+        }
         let mut written = 0usize;
         let dest = (reserved as usize + (cursor - source_group.start)) as *mut c_void;
         let ok = unsafe {

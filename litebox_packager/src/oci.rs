@@ -809,6 +809,18 @@ pub fn pull_layers_with_known_digests(
 ) -> anyhow::Result<PulledLayers> {
     let known_layers: Vec<oci_client::manifest::OciDescriptor> = serde_json::from_str(layers_json)
         .context("failed to parse pre-resolved OCI layer digest list")?;
+    let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
+    let mut cached_layers: Vec<Cow<'static, [u8]>> = Vec::with_capacity(known_layers.len());
+    for layer_desc in &known_layers {
+        match cache::read_cached_layer(&layer_desc.digest, rewriter_version, verbose) {
+            Some(cached) => cached_layers.push(cached),
+            None => break,
+        }
+    }
+    if cached_layers.len() == known_layers.len() {
+        return Ok(PulledLayers { layers: cached_layers });
+    }
+    drop(cached_layers);
     pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose).map(|(pulled, _)| pulled)
 }
 

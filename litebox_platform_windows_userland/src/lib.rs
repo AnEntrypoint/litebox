@@ -12391,6 +12391,35 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         }
         let size = result.map_or(size, |(_, actual_size)| actual_size);
 
+        if size >= (1 << 20) && raw_env_is_set(b"LITEBOX_DIAG_ALLOC_STACK\0") {
+            let mut frames = [core::ptr::null_mut::<c_void>(); 14];
+            let n = unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+                    1,
+                    frames.len() as u32,
+                    frames.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                )
+            } as usize;
+            let image = unsafe {
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(core::ptr::null())
+            } as usize;
+            diag_raw_print(
+                b"[alloc_stack] BEGIN pid=0x",
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() } as usize,
+                b" size=0x",
+                size,
+            );
+            for f in &frames[..n] {
+                diag_raw_print(
+                    b"[alloc_stack] rva=0x",
+                    (*f as usize).wrapping_sub(image),
+                    b" n=0x",
+                    n,
+                );
+            }
+        }
+
         if diag_alloc_enabled() {
             if let Some((addr, _)) = result {
                 let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
