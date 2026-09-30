@@ -48,6 +48,8 @@ pub const POOL_HANDLE_TAG: usize = 1 << 62;
 const POOL_OFFSET_MASK: usize = (1 << 48) - 1;
 
 const HEADER_SIZE: usize = 4096;
+/// Freed blocks at least this big give their pages back to the host.
+const RELEASE_MIN: usize = 1 << 20;
 
 const UNINIT: u8 = 0;
 const BUSY: u8 = 1;
@@ -277,6 +279,67 @@ impl Default for SharedHeap {
     }
 }
 
+/// `LITEBOX_DIAG_BIGALLOC=1`: name (by return-address chain) every arena allocation of 32 MiB or
+/// more on stderr; resolve with `addr2line` against `litebox-exe-base`.
+pub static BIG_DIAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline(never)]
+fn report_big_alloc(size: usize) {
+    let mut buf = [0u8; 512];
+    let mut n = 0;
+    let mut put = |b: &[u8], buf: &mut [u8; 512], n: &mut usize| {
+        for &c in b {
+            if *n < buf.len() {
+                buf[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    let hex = |mut v: usize, out: &mut [u8; 16]| {
+        for i in (0..16).rev() {
+            out[i] = b"0123456789abcdef"[v & 0xf];
+            v >>= 4;
+        }
+    };
+    let mut h = [0u8; 16];
+    put(b"[diag-bigalloc] size_mb=", &mut buf, &mut n);
+    let mb = size >> 20;
+    let mut digits = [0u8; 8];
+    let mut nd = 0;
+    let mut v = mb;
+    loop {
+        digits[nd] = b'0' + (v % 10) as u8;
+        nd += 1;
+        v /= 10;
+        if v == 0 || nd == 8 {
+            break;
+        }
+    }
+    for i in (0..nd).rev() {
+        put(&[digits[i]], &mut buf, &mut n);
+    }
+    let mut rbp: usize;
+    // SAFETY: reads the frame-pointer register only.
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+    for _ in 0..12 {
+        if rbp < 0x1000 || rbp % 8 != 0 {
+            break;
+        }
+        // SAFETY: best-effort frame-pointer walk on the calling thread's own stack.
+        let (next, ret) = unsafe { (*(rbp as *const usize), *((rbp + 8) as *const usize)) };
+        put(b" 0x", &mut buf, &mut n);
+        hex(ret, &mut h);
+        put(&h, &mut buf, &mut n);
+        if next <= rbp {
+            break;
+        }
+        rbp = next;
+    }
+    put(b"\n", &mut buf, &mut n);
+    // SAFETY: raw write of a stack buffer to stderr.
+    unsafe { libc::write(2, buf.as_ptr().cast(), n) };
+}
+
 struct Guard<'a>(&'a Header);
 
 impl<'a> Guard<'a> {
@@ -340,6 +403,9 @@ unsafe impl GlobalAlloc for SharedHeap {
         let Some((class, size)) = Self::class_of(layout) else {
             return unsafe { System.alloc(layout) };
         };
+        if size >= (32 << 20) && BIG_DIAG.load(Ordering::Relaxed) {
+            report_big_alloc(size);
+        }
         let h = Self::header();
         let _g = Guard::lock(h);
         let head = h.free[class].load(Ordering::Relaxed);
@@ -377,7 +443,21 @@ unsafe impl GlobalAlloc for SharedHeap {
         if !Self::in_arena(ptr) {
             return unsafe { System.dealloc(ptr, layout) };
         }
-        let (class, _) = Self::class_of(layout).expect("arena block has a size class");
+        let (class, size) = Self::class_of(layout).expect("arena block has a size class");
+        if size >= RELEASE_MIN {
+            // A freed big block would otherwise stay resident in the shared arena forever: the
+            // free list keeps it for reuse but nothing returns its pages. Hand every page except
+            // the first (which holds the free-list link) back to the host now, while the block is
+            // still exclusively ours; a later reuse simply reads zeros.
+            // SAFETY: the range lies inside this block, which the caller has just given up.
+            unsafe {
+                libc::madvise(
+                    ptr.add(4096).cast(),
+                    size - 4096,
+                    libc::MADV_REMOVE,
+                );
+            }
+        }
         let h = Self::header();
         let _g = Guard::lock(h);
         if POISON.load(Ordering::Relaxed) {

@@ -231,6 +231,10 @@ impl LinuxUserland {
             std::env::var_os("LITEBOX_DIAG_FAULT").is_some_and(|v| !v.is_empty()),
             core::sync::atomic::Ordering::Relaxed,
         );
+        shared_heap::BIG_DIAG.store(
+            std::env::var_os("LITEBOX_DIAG_BIGALLOC").is_some_and(|v| !v.is_empty()),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         register_exception_handlers();
         litebox::fs::ident::set_thread_id_fn(|| {
             // SAFETY: gettid takes no arguments and cannot fail.

@@ -965,16 +965,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         // Captures both the memfd identity key AND (if this fd is one) the file's CURRENT bytes
         // in one lookup, so the sync step below never needs a second, separate fd resolution.
-        let (key, current_bytes) = files
+        // Only the identity is looked up here: reading the file's bytes for every mmap of every
+        // file (to find out afterwards that it is not a memfd) copied whole libraries and locale
+        // archives through a buffer of the file's size on each call.
+        let key = files
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| {
                     let status = files.fs.fd_file_status(typed_fd).ok()?;
-                    let key = (status.node_info.dev, status.node_info.ino);
-                    let mut buf = alloc::vec![0u8; status.size];
-                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
-                    buf.truncate(n);
-                    Some((key, buf))
+                    Some((status.node_info.dev, status.node_info.ino))
                 },
                 |_| None,
                 |_| None,
@@ -1006,6 +1005,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let already_mapped = entry.mapped;
         entry.mapped = true;
         drop(memfds);
+        // The bytes are only needed for the first mapping's one-time sync (below).
+        let current_bytes: alloc::vec::Vec<u8> = if already_mapped {
+            alloc::vec::Vec::new()
+        } else {
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let size = files.fs.fd_file_status(typed_fd).map_or(0, |s| s.size);
+                        let mut buf = alloc::vec![0u8; size];
+                        let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
+                        buf.truncate(n);
+                        buf
+                    },
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                    |_| alloc::vec::Vec::new(),
+                )
+                .unwrap_or_default()
+        };
         drop(files);
         // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
         // before ever mmapping (the real Wayland `wl_shm` pattern this bridges: `ftruncate` then
