@@ -239,11 +239,45 @@ fn chunk_span(start: usize, range: &LazyRange, chunk: usize) -> Range<usize> {
     start.max(chunk << CHUNK_SHIFT)..range.end.min((chunk + 1) << CHUNK_SHIFT)
 }
 
+/// An unfilled chunk is `PAGE_NOACCESS` end to end (that is how [`register`] arms it). A span
+/// whose pages carry any other protection is memory some later mapping now owns: the entry is
+/// stale (its image was torn down by `execve`, or replaced, without this table hearing of it), and
+/// copying the old source over it would overwrite that live mapping.
+fn span_is_still_unfilled_lazy_memory(span: &Range<usize>) -> bool {
+    [span.start, span.end - 1].into_iter().all(|addr| {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        // SAFETY: querying an arbitrary address is always sound.
+        let queried = unsafe {
+            VirtualQuery(
+                addr as *const _,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        queried != 0 && info.Protect == PAGE_NOACCESS
+    })
+}
+
+/// Drops every lazy entry (or the part of one) overlapping `range` without filling it. Only for
+/// memory that was just created: anything the table still remembers there is stale.
+fn discard_stale(map: &mut BTreeMap<usize, LazyRange>, range: &Range<usize>) {
+    split_at(map, range.start);
+    split_at(map, range.end);
+    let inside: Vec<usize> = map.range(range.clone()).map(|(&s, _)| s).collect();
+    for start in inside {
+        map.remove(&start);
+    }
+}
+
 fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
     if range.is_filled(chunk) {
         return;
     }
     let span = chunk_span(start, range, chunk);
+    if !span_is_still_unfilled_lazy_memory(&span) {
+        range.filled[chunk - range.first_chunk] = true;
+        return;
+    }
     let offset = span.start - start;
     let copy_len = range.source_len.saturating_sub(offset).min(span.len());
     let mut previous = 0;
@@ -460,7 +494,9 @@ pub(crate) fn register(range: Range<usize>, source: &'static [u8]) -> bool {
     }
     let first_chunk = range.start >> CHUNK_SHIFT;
     let last_chunk = (range.end - 1) >> CHUNK_SHIFT;
-    table().insert(
+    let mut map = table();
+    discard_stale(&mut map, &range);
+    map.insert(
         range.start,
         LazyRange {
             end: range.end,
