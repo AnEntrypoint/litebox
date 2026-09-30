@@ -122,14 +122,80 @@ fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
     .into_bytes()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn push_flags(flags: &mut Vec<&'static str>, register: u32, table: &[(u32, &'static str)]) {
+    for &(bit, name) in table {
+        if register & (1 << bit) != 0 {
+            flags.push(name);
+        }
+    }
+}
+
+/// The host CPU's feature flags in `/proc/cpuinfo` spelling, read from the host's own CPUID (the
+/// guest executes natively, so these are exactly what it can use). Programs gate on them:
+/// Chromium's launcher refuses to start when `sse3` (matched inside `ssse3`) is absent.
+#[cfg(target_arch = "x86_64")]
+fn host_cpu_flags() -> String {
+    use core::arch::x86_64::__cpuid;
+    // SAFETY: `cpuid` exists on every x86_64 CPU; leaves above the maximum are read only after
+    // checking the maximum leaf the CPU reports.
+    let (max_basic, max_extended) = unsafe { (__cpuid(0).eax, __cpuid(0x8000_0000).eax) };
+    let leaf1 = unsafe { __cpuid(1) };
+    let mut flags: Vec<&'static str> = Vec::new();
+    push_flags(
+        &mut flags,
+        leaf1.edx,
+        &[
+            (0, "fpu"), (1, "vme"), (2, "de"), (3, "pse"), (4, "tsc"), (5, "msr"), (6, "pae"),
+            (7, "mce"), (8, "cx8"), (9, "apic"), (11, "sep"), (12, "mtrr"), (13, "pge"),
+            (14, "mca"), (15, "cmov"), (16, "pat"), (17, "pse36"), (19, "clflush"), (23, "mmx"),
+            (24, "fxsr"), (25, "sse"), (26, "sse2"), (28, "ht"),
+        ],
+    );
+    if max_extended >= 0x8000_0001 {
+        let extended = unsafe { __cpuid(0x8000_0001) };
+        push_flags(&mut flags, extended.edx, &[(11, "syscall"), (20, "nx"), (29, "lm")]);
+    }
+    flags.extend(["constant_tsc", "nopl", "cpuid"]);
+    push_flags(
+        &mut flags,
+        leaf1.ecx,
+        &[
+            (0, "pni"), (1, "pclmulqdq"), (9, "ssse3"), (12, "fma"), (13, "cx16"),
+            (19, "sse4_1"), (20, "sse4_2"), (22, "movbe"), (23, "popcnt"), (25, "aes"),
+            (26, "xsave"), (28, "avx"), (29, "f16c"), (30, "rdrand"),
+        ],
+    );
+    flags.push("hypervisor");
+    if max_extended >= 0x8000_0001 {
+        let extended = unsafe { __cpuid(0x8000_0001) };
+        push_flags(&mut flags, extended.ecx, &[(0, "lahf_lm"), (5, "abm")]);
+    }
+    if max_basic >= 7 {
+        let leaf7 = unsafe { __cpuid(7) };
+        push_flags(
+            &mut flags,
+            leaf7.ebx,
+            &[(3, "bmi1"), (5, "avx2"), (8, "bmi2"), (9, "erms"), (18, "rdseed"), (19, "adx")],
+        );
+    }
+    flags.join(" ")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn host_cpu_flags() -> String {
+    String::new()
+}
+
 /// Real `/proc/cpuinfo`: one blank-line-terminated `key\t: value` stanza per logical CPU, and the
 /// stanza count must match the real host core count -- GLib's `g_get_num_processors()` counts
 /// `processor\t:` lines. See gm mutable `mut-1789043826779`.
 fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
     let mut s = String::new();
+    let flags = host_cpu_flags();
     for i in 0..cpu_count.max(1) {
         s.push_str(&format!(
-            "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t: 158\nmodel name\t: LiteBox Virtual CPU\nstepping\t: 0\ncpu MHz\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: {cpu_count}\ncore id\t: {i}\ncpu cores\t: {cpu_count}\nfpu\t: yes\nflags\t:\nbogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n"
+            "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t: 158\nmodel name\t: LiteBox Virtual CPU\nstepping\t: 0\ncpu MHz\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: {cpu_count}\ncore id\t: {i}\ncpu cores\t: {cpu_count}\nfpu\t: yes\nflags\t: {flags}\nbogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n"
         ));
     }
     s.into_bytes()
