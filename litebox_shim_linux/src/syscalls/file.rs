@@ -1387,11 +1387,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        let handle = self
+        let object_name = alloc::format!(
+            "Local\\litebox_memfd_{}_{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let (handle, object_name) = match self
             .global
             .platform
-            .create_shared_memory(page_aligned_size)
-            .map_err(|_| Errno::ENOMEM)?;
+            .create_named_shared_memory(&object_name, page_aligned_size)
+        {
+            Ok(handle) => (handle, Some(object_name)),
+            Err(_) => (
+                self.global
+                    .platform
+                    .create_shared_memory(page_aligned_size)
+                    .map_err(|_| Errno::ENOMEM)?,
+                None,
+            ),
+        };
         if !carry_bytes.is_empty()
             && let Some(new_len) = litebox::mm::linux::NonZeroPageSize::new(page_aligned_size)
         {
@@ -1435,9 +1449,142 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // correct/needed, so the eventual first `mmap` still runs the ordinary
                 // `write()`-then-`mmap()` sync path once.
                 mapped: old_was_mapped,
+                name: object_name,
             },
         );
         Ok(())
+    }
+
+    /// `(host-wide object name, size, open flags)` of a `memfd_create`/`/dev/shm` fd whose shared
+    /// backing is a named object, else `None`. Such a descriptor can be handed to another host
+    /// process, which opens the same object by name and so shares the memory rather than a copy.
+    pub(crate) fn carriable_shm_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, usize, u32)> {
+        let files = self.files.borrow();
+        let (key, flags) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &MemfdMarker| ())
+                        .ok()?;
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let flags = files.fs.open_flags(fd)?;
+                    Some(((status.node_info.dev, status.node_info.ino), flags.bits()))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        drop(files);
+        let memfds = self.global.memfds.lock();
+        let entry = memfds.get(&key)?;
+        Some((entry.name.clone()?, entry.size, flags))
+    }
+
+    /// Builds a descriptor for the named shared object `name` in this process and returns its raw
+    /// fd. The backing file is an anonymous `/dev/shm` file (created then unlinked, exactly what
+    /// `memfd_create` does here) sized to `size` without allocating a new object, and its registry
+    /// entry points at the existing object, marked as already mapped so the first `mmap` here
+    /// never overwrites the live shared contents with this file's empty bytes.
+    pub(crate) fn install_shm_file(
+        &self,
+        name: &str,
+        size: usize,
+        flags: u32,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        let path = alloc::format!(
+            "/dev/shm/.litebox-carried-{}-{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(name, size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
+            .map_err(|_| Errno::ENOMEM)?;
+        let create_flags = OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC;
+        let creator =
+            self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)?;
+        let key = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    creator as usize,
+                    |fd| {
+                        files.fs.truncate(fd, size, false).ok()?;
+                        let status = files.fs.fd_file_status(fd).ok()?;
+                        Some((status.node_info.dev, status.node_info.ino))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()
+        };
+        let mut reopen_flags =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        if cloexec {
+            reopen_flags |= OFlags::CLOEXEC;
+        }
+        let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen_flags, Mode::empty());
+        let _ = self.sys_close(i32::try_from(creator).map_err(|_| Errno::EINVAL)?);
+        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        let raw = raw?;
+        let key = key.ok_or_else(|| {
+            let _ = i32::try_from(raw).map(|fd| self.sys_close(fd));
+            Errno::EBADF
+        })?;
+        self.global.memfds.lock().insert(
+            key,
+            super::mm::MemfdEntry {
+                handle,
+                size,
+                mapped: true,
+                name: Some(alloc::string::String::from(name)),
+            },
+        );
+        usize::try_from(raw).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Fork-child form of [`Self::install_shm_file`]: `spec` is `<cloexec 0|1>|<flags>|<size>|<name>`,
+    /// installed at exactly `target_fd`.
+    pub(crate) fn install_shm_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let mut parts = spec.splitn(4, '|');
+        let cloexec = parts.next()? == "1";
+        let flags: u32 = parts.next()?.parse().ok()?;
+        let size: usize = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        let raw = i32::try_from(self.install_shm_file(name, size, flags, cloexec).ok()?).ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
     }
 
     /// Handle syscall `mknodat` — create a filesystem node.
@@ -2367,6 +2514,8 @@ pub(crate) struct DriFd;
 /// must never register a `memfds` entry -- this tag is what keeps the two cases apart.
 #[derive(Clone, Copy)]
 pub(crate) struct MemfdMarker;
+
+static MEMFD_OBJECT_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Per-fd metadata (see [`litebox::fd::Descriptors::set_fd_metadata`]'s fd-vs-entry distinction)
 /// tagged onto a fd freshly opened by `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- carries the fake
@@ -3634,6 +3783,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         true
     }
 
+    /// The descriptor number when `path` is `/proc/self/fd/N`, `/proc/thread-self/fd/N` or this
+    /// process's own `/proc/<pid>/fd/N`. `stat` of such a magic link describes the open file itself
+    /// (a socket, pipe or anonymous file has no path the link could resolve to), which Chromium's
+    /// sandbox helpers rely on when they `fstatat` every entry of `/proc/self/fd`.
+    fn own_proc_fd_number(&self, path: &str) -> Option<usize> {
+        let rest = path.strip_prefix("/proc/")?;
+        let (owner, tail) = rest.split_once('/')?;
+        if owner != "self" && owner != "thread-self" && owner != self.pid.get().to_string() {
+            return None;
+        }
+        tail.strip_prefix("fd/")?.parse().ok()
+    }
+
     fn do_stat<T: From<litebox::fs::FileStatus>>(
         &self,
         pathname: impl path::Arg,
@@ -3774,6 +3936,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
+            FsPath::Absolute { path }
+                if !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW)
+                    && path
+                        .normalized()
+                        .ok()
+                        .and_then(|p| self.own_proc_fd_number(p.as_str()))
+                        .is_some() =>
+            {
+                let fd = path
+                    .normalized()
+                    .ok()
+                    .and_then(|p| self.own_proc_fd_number(p.as_str()))
+                    .ok_or(Errno::ENOENT)?;
+                descriptor_stat(fd, self)
+            }
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
@@ -3787,6 +3964,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
                 let joined = Self::join_dir_relative_path(&dir_path, &path)?;
+                if !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW)
+                    && let Some(fd) = joined
+                        .normalized()
+                        .ok()
+                        .and_then(|p| self.own_proc_fd_number(p.as_str()))
+                {
+                    return descriptor_stat(fd, self);
+                }
                 self.do_stat(joined, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
         }
@@ -6892,6 +7077,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some((count, flags)) = self.carriable_eventfd_for_raw_fd(raw_fd) {
             return Some(alloc::format!("E|{count}|{flags}"));
         }
+        if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(raw_fd) {
+            return Some(alloc::format!("S|{flags}|{size}|{name}"));
+        }
         if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
             let (path, flags) = match raw_fd {
                 0 => ("/dev/stdin", OFlags::RDONLY),
@@ -6935,6 +7123,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )?;
                 }
                 raw
+            }
+            "S" => {
+                let size: usize = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let name = parts.next().ok_or(Errno::EINVAL)?;
+                self.install_shm_file(
+                    name,
+                    size,
+                    u32::try_from(first).map_err(|_| Errno::EINVAL)?,
+                    cloexec,
+                )
+                .and_then(|fd| u32::try_from(fd).map_err(|_| Errno::EINVAL))?
             }
             "E" => {
                 let flags: u32 = parts

@@ -408,7 +408,11 @@ impl From<litebox::fs::FileStatus> for FileStat {
         Self {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
-            st_nlink: 1,
+            st_nlink: if file_type == litebox::fs::FileType::Directory {
+                3
+            } else {
+                1
+            },
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),

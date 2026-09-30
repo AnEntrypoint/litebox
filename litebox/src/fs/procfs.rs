@@ -93,23 +93,23 @@ fn fd_dir_status(node_info: NodeInfo) -> FileStatus {
     }
 }
 
+/// The uptime `/proc/uptime` reports and the process start times in `/proc/[pid]/stat` are measured
+/// against. Chromium derives a process creation time from `btime` plus `starttime`, so both must be
+/// plausible rather than zero.
+pub const FAKE_BOOT_UPTIME_SECS: u64 = 3600;
+
 /// Real `/proc/[pid]/stat`: 52 whitespace-separated fields, `comm` parenthesized so readers split
 /// on the LAST `)`. `libgtop` parses it positionally -- see gm mutable `mut-1789043806784`.
 fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
-    // field 3 is state; 'R' (running) is always accurate enough for a process that is alive to
-    // read its own /proc/self/stat.
-    let mut s = format!("{} ({}) R", info.pid, info.comm);
-    // Fields 4-52 (ppid, pgrp, session, tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt,
-    // utime, stime, cutime, cstime, priority, nice, num_threads, itrealvalue, starttime, vsize,
-    // rss, rsslim, startcode, endcode, startstack, kstkesp, kstkeip, signal, blocked, sigignore,
-    // sigcatch, wchan, nswap, cnswap, exit_signal, processor, rt_priority, policy, delayacct_
-    // blkio_ticks, guest_time, cguest_time, start_data, end_data, start_brk, arg_start, arg_end,
-    // env_start, env_end, exit_code) -- 49 remaining fields, all conservative zeros/placeholders.
-    for _ in 0..49 {
-        s.push_str(" 0");
-    }
-    s.push('\n');
-    s.into_bytes()
+    let ppid = if info.pid == 1 { 0 } else { 1 };
+    let start_ticks = FAKE_BOOT_UPTIME_SECS.saturating_sub(5) * 100;
+    format!(
+        "{pid} ({comm}) R {ppid} {pid} {pid} 0 -1 4194560 100 0 0 0 50 20 0 0 20 0 1 0 {start_ticks}          1073741824 20000 18446744073709551615 4194304 4194305 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0          4194304 4194305 4194305 0 0 0 0 0
+",
+        pid = info.pid,
+        comm = info.comm,
+    )
+    .into_bytes()
 }
 
 /// Real `/proc/[pid]/status`: a `Key:\tvalue` listing read by key, never by position, so unknown
@@ -238,20 +238,20 @@ nodev	devpts
 /// `intr`/`ctxt`/`btime`/`processes`/`procs_running`/`procs_blocked` counters. Counters are
 /// honestly zero (litebox does not schedule guest threads); the `cpuN` count is the real payload
 /// `nproc` and GLib read. See gm mutable `mut-1789043865374`.
-fn format_stat_global(cpu_count: usize) -> Vec<u8> {
+fn format_stat_global(cpu_count: usize, boot_unix_secs: u64) -> Vec<u8> {
     let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0
 ");
     for cpu in 0..cpu_count {
         out.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0
 "));
     }
-    out.push_str("intr 0
+    out.push_str(&format!("intr 0
 ctxt 0
-btime 0
+btime {boot_unix_secs}
 processes 0
 procs_running 1
 procs_blocked 0
-");
+"));
     out.into_bytes()
 }
 
@@ -313,6 +313,7 @@ where
     mem_total_kb: u64,
     mem_avail_kb: u64,
     boot_uptime_secs: u64,
+    boot_unix_secs: u64,
     /// The SAME table `/proc/self` reads through, keyed by pid -- lets `/proc/<pid>/*` answer for
     /// any pid this process's `execve`/`clone` history has recorded, not just the caller's own.
     proc_self_info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
@@ -336,6 +337,7 @@ where
         mem_total_kb: u64,
         mem_avail_kb: u64,
         boot_uptime_secs: u64,
+        boot_unix_secs: u64,
         proc_self_info: alloc::sync::Arc<RwLock<Platform, ProcSelfTable>>,
     ) -> Self {
         let root_inode = allocator.next();
@@ -347,6 +349,7 @@ where
             mem_total_kb,
             mem_avail_kb,
             boot_uptime_secs,
+            boot_unix_secs,
             proc_self_info,
         }
     }
@@ -589,7 +592,7 @@ where
                     ProcfsEntry::Mounts => format_mounts(),
                     ProcfsEntry::Uptime => format_uptime(self.boot_uptime_secs),
                     ProcfsEntry::Filesystems => format_filesystems(),
-                    ProcfsEntry::Stat => format_stat_global(self.cpu_count),
+                    ProcfsEntry::Stat => format_stat_global(self.cpu_count, self.boot_unix_secs),
                     ProcfsEntry::Cmdline => format_kernel_cmdline(),
                 };
                 (ProcfsFileKind::Global(entry), content)
@@ -899,6 +902,16 @@ impl ProcSelfTable {
         self.by_pid.get(&pid)
     }
 
+    /// A copy of `pid`'s entry without its process-bound parts (`maps` closes over a page manager,
+    /// `fds` is a live snapshot), for handing a process's identity to a cross-process fork child.
+    #[must_use]
+    pub fn portable_snapshot(&self, pid: i32) -> Option<ProcSelfInfo> {
+        let mut info = self.by_pid.get(&pid)?.clone();
+        info.maps = None;
+        info.fds = Vec::new();
+        Some(info)
+    }
+
     /// Every pid this table currently has an entry for, for `/proc`'s own directory listing.
     fn pids(&self) -> Vec<i32> {
         self.by_pid.keys().copied().collect()
@@ -955,6 +968,7 @@ where
 pub enum ProcSelfDirHandle {
     Root,
     Fd,
+    Task,
 }
 
 /// Which of the flat files this handle names.
@@ -1087,6 +1101,13 @@ where
                 current = ProcSelfDirHandle::Fd;
                 continue;
             }
+            if current == ProcSelfDirHandle::Root && component == "task" {
+                walked.push(super::backend::WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                });
+                current = ProcSelfDirHandle::Task;
+                continue;
+            }
             if current == ProcSelfDirHandle::Root && ProcSelfEntry::from_name(component).is_none()
             {
                 return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
@@ -1126,7 +1147,10 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        if dir.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+        if matches!(
+            dir.into_typed::<Self>(),
+            ProcSelfDirHandle::Fd | ProcSelfDirHandle::Task
+        ) {
             return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
         let entry = ProcSelfEntry::from_name(name)
@@ -1171,7 +1195,7 @@ where
                 .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
             return fd_link_target(&info.fds, name);
         }
-        if name == "fd" {
+        if name == "fd" || name == "task" {
             return Ok(None);
         }
         match ProcSelfEntry::from_name(name) {
@@ -1182,10 +1206,23 @@ where
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        if handle.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+        let handle = handle.into_typed::<Self>();
+        if handle == ProcSelfDirHandle::Fd {
             return Ok(self
                 .current()
                 .map(|info| fd_dir_entries(&info.fds))
+                .unwrap_or_default());
+        }
+        if handle == ProcSelfDirHandle::Task {
+            return Ok(self
+                .current()
+                .map(|info| {
+                    vec![DirEntry {
+                        name: format!("{}", info.pid),
+                        file_type: FileType::Directory,
+                        ino_info: None,
+                    }]
+                })
                 .unwrap_or_default());
         }
         let mut entries: Vec<DirEntry> = ProcSelfEntry::ALL
@@ -1203,6 +1240,11 @@ where
             .collect();
         entries.push(DirEntry {
             name: String::from("fd"),
+            file_type: FileType::Directory,
+            ino_info: None,
+        });
+        entries.push(DirEntry {
+            name: String::from("task"),
             file_type: FileType::Directory,
             ino_info: None,
         });
@@ -1267,6 +1309,13 @@ where
             return Ok(fd_dir_status(NodeInfo {
                 dev: 7,
                 ino: 100,
+                rdev: None,
+            }));
+        }
+        if *h.get_typed::<Self>() == ProcSelfDirHandle::Task {
+            return Ok(fd_dir_status(NodeInfo {
+                dev: 7,
+                ino: 101,
                 rdev: None,
             }));
         }

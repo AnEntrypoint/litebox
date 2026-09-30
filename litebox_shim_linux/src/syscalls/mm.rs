@@ -435,6 +435,10 @@ pub(crate) struct MemfdEntry<Platform: PageManagementProvider<{ litebox::mm::lin
     /// surface that painted once and then waited for damage got mmap-wiped back to black the
     /// moment the compositor mapped the client's pool.
     pub(crate) mapped: bool,
+    /// The host-wide name of `handle` when it was created by `create_named_shared_memory`, so a
+    /// descriptor for this memfd can be passed to another host process (fork, `SCM_RIGHTS`) which
+    /// opens the same object by name. `None` for an anonymous object that cannot leave this process.
+    pub(crate) name: Option<alloc::string::String>,
 }
 pub(crate) type MemfdRegistry<Platform> = BTreeMap<(usize, usize), MemfdEntry<Platform>>;
 
@@ -1216,6 +1220,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         handle,
                         size: aligned_len,
                         mapped: true,
+                        name: None,
                     },
                 );
                 (handle, false)

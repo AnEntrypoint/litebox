@@ -3263,6 +3263,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // pty fds deliberately left behind rather than refused. See the arm below.
         let mut dropped_pty = 0usize;
         let mut pty_masters_to_carry: alloc::vec::Vec<(usize, u32, bool)> = alloc::vec::Vec::new();
+        let mut shm_to_carry: alloc::vec::Vec<(usize, alloc::string::String, usize, u32, bool)> =
+            alloc::vec::Vec::new();
+        let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
             let carried = i32::try_from(*raw_fd)
                 .ok()
@@ -3334,6 +3337,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok()
                     .zip(self.carriable_file_for_raw_fd(*raw_fd))
                 {
+                    _ if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(*raw_fd) => {
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = raw_fd, name:% = name, size:% = size;
+                            "clone: carrying a shared-memory file into the cross-process child by object name"
+                        );
+                        shm_to_carry.push((
+                            *raw_fd,
+                            name,
+                            size,
+                            flags,
+                            self.raw_fd_is_cloexec(*raw_fd),
+                        ));
+                    }
                     Some((fd, (path, flags, offset))) => {
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(), fd:% = fd, path:% = path, offset:% = offset;
@@ -3480,6 +3496,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `dup2` of stdio and the exec itself -- and a child that does not exec at all
                     // is already outside what the cross-process path can serve, since it is a
                     // different Windows process with none of the parent's live shim state.
+                    None if matches!(self.raw_fd_subsystem_name(*raw_fd), "epoll" | "netlink") => {
+                        dropped_process_local += 1;
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(),
+                            fd:% = raw_fd,
+                            subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
+                            "clone: dropping a process-local event/netlink fd rather than refusing the fork; a child that execs never uses it"
+                        );
+                    }
                     None if self.raw_fd_is_cloexec(*raw_fd) => {
                         dropped_cloexec += 1;
                         litebox_util_log::debug!(
@@ -3830,6 +3855,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
                 fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
                 spec: alloc::format!("pty-master:{}|{id}", u8::from(cloexec)),
+            });
+        }
+        for (raw_fd, name, size, flags, cloexec) in shm_to_carry {
+            inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                spec: alloc::format!("shm:{}|{flags}|{size}|{name}", u8::from(cloexec)),
             });
         }
         for raw_fd in unix_to_carry {
@@ -6368,13 +6399,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn task_state_spec(&self) -> alloc::string::String {
-        alloc::format!("task-state:{}\t{}", self.fs.borrow().cwd.read().clone(), self.credentials.to_spec())
+        let identity = self
+            .global
+            .proc_self_info
+            .read()
+            .portable_snapshot(self.pid.get())
+            .map(|info| {
+                let hex = |bytes: &[u8]| {
+                    bytes.iter().fold(alloc::string::String::new(), |mut out, b| {
+                        out.push_str(&alloc::format!("{b:02x}"));
+                        out
+                    })
+                };
+                alloc::format!(
+                    "\t{}\t{}\t{}\t{}",
+                    hex(info.exe_path.as_bytes()),
+                    hex(info.comm.as_bytes()),
+                    hex(&info.cmdline),
+                    hex(&info.environ),
+                )
+            })
+            .unwrap_or_default();
+        alloc::format!(
+            "task-state:{}\t{}{identity}",
+            self.fs.borrow().cwd.read().clone(),
+            self.credentials.to_spec()
+        )
     }
 
     pub(crate) fn install_task_state(&self, spec: &str) -> Option<()> {
-        let (cwd, credentials) = spec.split_once('\t')?;
+        let mut parts = spec.splitn(6, '\t');
+        let cwd = parts.next()?;
+        let credentials = parts.next()?;
         self.credentials.restore_from_spec(credentials)?;
         *self.fs.borrow().cwd.write() = alloc::string::String::from(cwd);
+        let unhex = |text: &str| -> Option<alloc::vec::Vec<u8>> {
+            if text.len() % 2 != 0 {
+                return None;
+            }
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+                .collect()
+        };
+        if let (Some(exe), Some(comm), Some(cmdline), Some(environ)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            self.global.proc_self_info.write().set(
+                self.pid.get(),
+                litebox::fs::procfs::ProcSelfInfo {
+                    exe_path: alloc::string::String::from_utf8(unhex(exe)?).ok()?,
+                    cmdline: unhex(cmdline)?,
+                    environ: unhex(environ)?,
+                    pid: self.pid.get(),
+                    comm: alloc::string::String::from_utf8(unhex(comm)?).ok()?,
+                    auxv: alloc::vec::Vec::new(),
+                    maps: None,
+                    fds: alloc::vec::Vec::new(),
+                },
+            );
+        }
         Some(())
     }
 
@@ -7246,6 +7330,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+        let path = {
+            let own_exe = alloc::format!("/proc/{}/exe", self.pid.get());
+            if path == "/proc/self/exe" || path == own_exe {
+                self.global
+                    .proc_self_info
+                    .read()
+                    .portable_snapshot(self.pid.get())
+                    .map(|info| info.exe_path)
+                    .filter(|exe| !exe.is_empty())
+                    .unwrap_or(path)
+            } else {
+                path
+            }
+        };
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 

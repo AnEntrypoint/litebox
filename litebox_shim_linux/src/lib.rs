@@ -402,6 +402,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         if let Some(pty) = spec.strip_prefix("pty-master:") {
             return self.task.install_pty_master_at_fd(target_fd, pty);
         }
+        if let Some(shm) = spec.strip_prefix("shm:") {
+            return self.task.install_shm_at_fd(target_fd, shm);
+        }
         self.task.install_unix_at_fd(target_fd, spec)
     }
 
@@ -1334,7 +1337,14 @@ fn default_fs<Platform: ShimPlatform>(
     // No live wall-clock uptime source is reachable from this `no_std` shim at `default_fs` time
     // (before `GlobalState::boot_time` exists) -- a fixed placeholder is fine, see
     // `format_uptime`'s doc comment.
-    const BOOT_UPTIME_SECS: u64 = 0;
+    const BOOT_UPTIME_SECS: u64 = litebox::fs::procfs::FAKE_BOOT_UPTIME_SECS;
+    let boot_unix_secs = {
+        use litebox::platform::SystemTime as _;
+        <Platform as litebox::platform::TimeProvider>::current_time(platform)
+            .duration_since(&<Platform as litebox::platform::TimeProvider>::SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+            .saturating_sub(BOOT_UPTIME_SECS)
+    };
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -1466,6 +1476,7 @@ fn default_fs<Platform: ShimPlatform>(
                     mem_total_kb,
                     mem_avail_kb,
                     BOOT_UPTIME_SECS,
+                    boot_unix_secs,
                     proc_self_info.clone(),
                 )
             })
@@ -2106,7 +2117,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // answers "which file/library" a hanging `open`->`dlopen` sequence was for, not just
         // that some `open` happened. Truncated: some variants (e.g. a `write` with a large
         // buffer) could otherwise produce a huge line.
-        if crate::diag::is_syscall_timeline_target_comm(&self.comm.get()) {
+        if crate::diag::is_syscall_timeline_target_comm(&self.comm.get())
+            || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
+        {
             let debug_str = alloc::format!("{request:?}");
             let truncated = if debug_str.len() > 200 {
                 alloc::format!("{}...", &debug_str[..200])
