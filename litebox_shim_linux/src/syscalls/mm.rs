@@ -1946,6 +1946,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// `msync`: mappings here are coherent with their backing file at write time (see
     /// `propagate_write_to_shared_mapping`), so there is nothing left to flush.
+    pub(crate) fn sys_mincore(
+        &self,
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    ) -> Result<(), Errno> {
+        let page = litebox::mm::linux::PAGE_SIZE;
+        if addr.as_usize() % page != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pages = length.div_ceil(page);
+        // Every mapped page is reported resident: guest memory is backed by shared
+        // memfd/anonymous pages that are never swapped out.
+        let resident = alloc::vec![1u8; pages];
+        vec.write_slice_at_offset::<Platform>(0, &resident)
+            .ok_or(Errno::EFAULT)
+    }
+
     pub(crate) fn sys_msync(
         &self,
         addr: UserPtrMut<u8>,

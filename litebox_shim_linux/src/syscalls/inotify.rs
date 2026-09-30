@@ -14,7 +14,6 @@ use core::sync::atomic::Ordering;
 
 use litebox::fs::OFlags;
 use litebox::pipes::{DetachedPipeEnd, Flags};
-use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::errno::Errno;
 
 use crate::{ShimFS, ShimPlatform, Task, UserPtr};

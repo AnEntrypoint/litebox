@@ -2345,6 +2345,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 syscall!(sys_inotify_add_watch(fd, pathname, mask))
             }
             SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
+            SyscallRequest::Mincore { addr, length, vec } => {
+                syscall!(sys_mincore(addr, length, vec))
+            }
             SyscallRequest::Msync {
                 addr,
                 length,

@@ -3789,6 +3789,11 @@ pub enum SyscallRequest {
         fd: i32,
         wd: i32,
     },
+    Mincore {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    },
     Msync {
         addr: UserPtrMut<u8>,
         length: usize,
@@ -4652,6 +4657,7 @@ impl SyscallRequest {
             Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
             Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
             Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
+            Sysno::mincore => sys_req!(Mincore { addr:*, length, vec:* }),
             Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
