@@ -1005,6 +1005,10 @@ mod utimensat_tests {
             tv_sec: 0,
             tv_nsec: u64::try_from(UTIME_OMIT).unwrap(),
         };
+        let mtime_before = task
+            .sys_stat("/utimensat_sentinel_now.txt")
+            .unwrap()
+            .st_mtime;
         task.sys_utimensat(
             libc_at_fdcwd(),
             "/utimensat_sentinel_now.txt",
@@ -1016,7 +1020,10 @@ mod utimensat_tests {
         let stat = task.sys_stat("/utimensat_sentinel_now.txt").unwrap();
         let (st_atime, st_mtime) = (stat.st_atime, stat.st_mtime);
         assert!(st_atime > 0, "UTIME_NOW should resolve to a nonzero time");
-        assert_eq!(st_mtime, 0, "UTIME_OMIT should leave mtime untouched");
+        assert_eq!(
+            st_mtime, mtime_before,
+            "UTIME_OMIT should leave mtime untouched"
+        );
     }
 
     #[test]

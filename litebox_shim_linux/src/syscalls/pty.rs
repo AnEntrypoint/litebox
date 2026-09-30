@@ -1616,10 +1616,27 @@ mod tests {
         );
     }
 
+    /// A fresh pty starts in canonical mode with ECHO (Linux's default), so a partial line written
+    /// to the master is neither readable on the slave nor silent on the master; tests of the raw
+    /// byte path switch to a zeroed termios first.
+    fn set_raw(
+        task: &crate::Task<
+            crate::syscalls::tests::TestPlatform,
+            crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
+        >,
+        master: i32,
+    ) {
+        let mut termios = litebox_common_linux::Termios::default();
+        let set_ptr = UserPtr::from_usize((&raw mut termios).expose_provenance());
+        task.sys_ioctl(master, IoctlArg::TCSETS(set_ptr))
+            .expect("TCSETS failed");
+    }
+
     #[test]
     fn master_and_slave_are_independently_readable_and_writable() {
         let task = crate::syscalls::tests::init_platform(None);
         let (master, slave) = open_unlocked_pty_pair(&task);
+        set_raw(&task, master);
 
         let n = task
             .sys_write(master, b"hello from master", None)
@@ -1685,6 +1702,7 @@ mod tests {
     fn pts_can_be_reopened_after_all_slave_fds_close() {
         let task = crate::syscalls::tests::init_platform(None);
         let (master, slave1) = open_unlocked_pty_pair(&task);
+        set_raw(&task, master);
         task.sys_close(slave1)
             .expect("closing first slave open failed");
 
@@ -1709,9 +1727,9 @@ mod tests {
     }
 
     #[test]
-    fn echo_is_off_by_default() {
-        // ECHO is never set by default (see `new_pty_pair`'s termios default), so writing to the
-        // master must not produce anything on the master's own read side.
+    fn echo_is_on_by_default() {
+        // A fresh pty carries Linux's default termios (ECHO set), so bytes written to the
+        // master are reflected back on the master's own read side.
         let task = crate::syscalls::tests::init_platform(None);
         let (master, _slave) = open_unlocked_pty_pair(&task);
 
@@ -1725,11 +1743,10 @@ mod tests {
             .expect("write to master failed");
 
         let mut buf = [0u8; 64];
-        assert_eq!(
-            task.sys_read(master, &mut buf, None),
-            Err(Errno::EAGAIN),
-            "no echo must appear on the master's read side when ECHO is unset"
-        );
+        let n = task
+            .sys_read(master, &mut buf, None)
+            .expect("echo expected");
+        assert_eq!(&buf[..n], b"typed");
     }
 
     #[test]

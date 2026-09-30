@@ -3238,18 +3238,24 @@ where
     // real deadline exists up front, before it can have expired, resolves the ambiguity: `None`
     // afterward can only mean "expired", never "never had one".
     let has_real_deadline = cx.deadline().is_some();
+    // The operation is always attempted at least once, even when the deadline has already passed
+    // (a zero timeout is a poll, not a refusal to look): only a LATER iteration may report
+    // `TimedOut` from an expired deadline.
+    let mut first_attempt = true;
     loop {
         let remaining = cx.remaining_timeout();
-        if has_real_deadline && remaining.is_none() {
+        if has_real_deadline && remaining.is_none() && !first_attempt {
             return Err(TryOpError::WaitError(
                 litebox::event::wait::WaitError::TimedOut,
             ));
         }
         let this_iter_timeout = match remaining {
+            None if has_real_deadline => core::time::Duration::ZERO,
             None => SHARED_UNIX_POLL_INTERVAL,
             Some(d) => d.min(SHARED_UNIX_POLL_INTERVAL),
         };
         let bounded = cx.with_timeout(this_iter_timeout);
+        first_attempt = false;
         match bounded.wait_on_events(nonblock, events, &mut register_observer, &mut try_op) {
             Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut))
                 if !has_real_deadline || remaining.is_some_and(|d| d > this_iter_timeout) =>

@@ -2981,8 +2981,8 @@ mod tests {
     /// result of DNS resolution on many systems, or a mismatched sockaddr passed to an unrelated
     /// fd). `AddressFamily` is a closed, 4-variant enum (any other wire value already correctly
     /// fails with `EAFNOSUPPORT` above the old panic site), so `INET6` is the only variant that
-    /// reaches the shim but is genuinely unimplemented; it must fail cleanly with `EAFNOSUPPORT`,
-    /// not panic.
+    /// reaches the shim but is genuinely unimplemented; IPv6 is now served (v4-mapped), so a truncated `sockaddr_in6`
+    /// must fail cleanly with `EINVAL`, not panic.
     #[test]
     fn read_sockaddr_from_user_rejects_unsupported_families_instead_of_panicking() {
         let mut buf = [0u8; core::mem::size_of::<CSockInetAddr>()];
@@ -2993,8 +2993,8 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err(),
-            Errno::EAFNOSUPPORT,
-            "AF_INET6 must fail cleanly, not panic"
+            Errno::EINVAL,
+            "a truncated AF_INET6 sockaddr must fail cleanly, not panic"
         );
     }
 
@@ -4167,7 +4167,7 @@ mod unix_tests {
             client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
         );
-        assert_eq!(result.unwrap_err(), Errno::ECONNREFUSED);
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
         close_socket(&task, client_fd);
 
         let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
