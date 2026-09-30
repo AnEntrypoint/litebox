@@ -12436,6 +12436,12 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
         result
     }
 
+    unsafe fn release_pages(addr: usize, len: usize) {
+        unsafe {
+            windows_sys::Win32::System::Memory::DiscardVirtualMemory(addr as *mut c_void, len);
+        }
+    }
+
     unsafe fn free(addr: usize) {
         // `addr` is guaranteed by the `MemoryProvider` contract to be a base address
         // previously returned by `alloc`, i.e. the base of a whole `VirtualAlloc2`

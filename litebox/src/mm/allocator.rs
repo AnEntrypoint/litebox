@@ -32,6 +32,15 @@ pub trait MemoryProvider {
     ///
     /// The caller must ensure that the `addr` is valid and was allocated by [`Self::alloc`].
     unsafe fn free(addr: usize);
+
+    /// Hands the physical pages of a block that just became free back to the host while keeping
+    /// the address range reserved.
+    ///
+    /// # Safety
+    ///
+    /// `addr..addr + len` must be page aligned and lie inside memory previously returned by
+    /// [`Self::alloc`] that nothing will read again before it is reallocated.
+    unsafe fn release_pages(_addr: usize, _len: usize) {}
 }
 
 /// Allocator that uses buddy allocator for pages and slab allocator for small objects.
@@ -56,6 +65,7 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     const BASE_PAGE_SIZE: usize = 4096;
     /// 2 MiB
     const LARGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+    const RELEASE_MIN_SIZE: usize = 256 * 1024;
     const BASE_PAGE_SIZE_ORDER: u32 = (Self::BASE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
     const LARGE_PAGE_SIZE_ORDER: u32 = (Self::LARGE_PAGE_SIZE / Self::PAGE_SIZE).trailing_zeros();
 
@@ -349,6 +359,7 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
             Self::BASE_PAGE_SIZE | Self::LARGE_PAGE_SIZE => unsafe {
                 self.buddy_allocator.dealloc(ptr, layout);
             },
+
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 if let Some(ptr) = NonNull::new(ptr) {
                     // Static-only `panic!`, not `.expect("Failed to deallocate")` -- see this
@@ -364,7 +375,11 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                 // TODO: An proper reclamation strategy could be implemented here
                 // to release empty pages back from the ZoneAllocator to the buddy allocator.
             }
-            _ => unsafe {
+            size => unsafe {
+                if size >= Self::RELEASE_MIN_SIZE {
+                    let block = size.next_power_of_two();
+                    M::release_pages(ptr as usize + Self::PAGE_SIZE, block - Self::PAGE_SIZE);
+                }
                 self.buddy_allocator.dealloc(ptr, layout);
             },
         }

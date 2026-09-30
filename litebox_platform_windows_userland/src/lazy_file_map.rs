@@ -369,7 +369,17 @@ fn fill_partial_overlaps(map: &mut BTreeMap<usize, LazyRange>, range: &Range<usi
         .collect();
     for start in cut {
         if let Some(lazy) = map.get_mut(&start) {
-            fill_all(start, lazy);
+            let indices = lazy.chunk_indices();
+            let edges = [
+                range.start >> CHUNK_SHIFT,
+                (range.end - 1) >> CHUNK_SHIFT,
+                range.end >> CHUNK_SHIFT,
+            ];
+            for chunk in edges {
+                if indices.contains(&chunk) {
+                    fill_chunk(start, lazy, chunk);
+                }
+            }
         }
     }
 }
