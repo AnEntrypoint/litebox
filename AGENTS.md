@@ -62,11 +62,14 @@ named processes/threads (path arguments decoded); `LITEBOX_DIAG_BIGALLOC=1` name
 `gdb -p <root runner> -batch -ex "thread apply all bt"` and read the futex word a waiter sleeps on (`/proc/<pid>/task/<tid>/syscall`).
 The cgroup memory limit of the dev container is ~14 GB; watch `memory.usage_in_bytes` while booting.
 
-Known gaps (not yet fixed): `inotify_init` (ENOSYS), netlink `RTM_GETLINK/GETADDR` (Chromium's address tracker),
-`ptrace`/`rt_sigtimedwait`/`rt_tgsigqueueinfo`, `MSG_PEEK` on AF_UNIX `recv*`, `O_TMPFILE` and `O_DIRECT` pipes,
-IPv6, `/dev/shm` statfs, `/proc/<pid>/fd` for other processes, HTTPS :3001, dconf-service, a leaked per-descriptor
-`RwLock` reader still blocks that descriptor's writers (only the network worker is protected), lib unit tests of
-`litebox_shim_linux` do not compile (pre-existing `add_interest` signature drift).
+Done since: inotify (real watches, events from every fs syscall), `MSG_PEEK` on AF_UNIX, xattr stubs, file
+timestamps (platform-registered clock), `mincore`, `/proc/<pid>/environ`.
+Known gaps (not yet fixed): netlink `RTM_GETLINK/GETADDR` (Chromium's address tracker),
+`ptrace`/`rt_sigtimedwait`/`rt_tgsigqueueinfo`, `copy_file_range`/`pidfd_open`/`splice`, `O_TMPFILE` and
+`O_DIRECT` pipes, IPv6, `/dev/shm` statfs, `/proc/<pid>/fd` for other processes, HTTPS :3001, dconf-service,
+tar-layer file timestamps are 1970, a leaked per-descriptor `RwLock` reader still blocks that descriptor's
+writers (only the network worker is protected), lib unit tests of `litebox_shim_linux` do not compile
+(pre-existing `add_interest` signature drift).
 
 ## Linux runner (`litebox_runner_linux_userland`) native fork -- 108th pass
 
