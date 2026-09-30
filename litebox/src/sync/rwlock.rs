@@ -11,7 +11,10 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex;
+use crate::platform::{RawMutex, UnblockedOrTimedOut};
+
+/// How long a blocked lock waiter sleeps before checking whether the write holder is still alive.
+const RECOVERY_INTERVAL: core::time::Duration = core::time::Duration::from_secs(2);
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockType, LockedWitness};
@@ -30,6 +33,9 @@ struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
     // The 'condition variable' to notify writers through.
     // Incremented on every signal.
     writer_notify: Platform::RawMutex,
+    // Token (see `fs::ident::thread_token`) of the thread that write-locked this lock; 0 when
+    // unlocked or unknown. Lets a waiter recover the lock if that thread died holding it.
+    writer_owner: core::sync::atomic::AtomicU32,
 }
 
 const READ_LOCKED: u32 = 1;
@@ -81,6 +87,7 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         Self {
             state: <Platform::RawMutex as RawMutex>::INIT,
             writer_notify: <Platform::RawMutex as RawMutex>::INIT,
+            writer_owner: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -168,7 +175,12 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
             // Wait for the state to change.
             // ignore the error code as it is non-interruptible
-            let _ = self.state.block(state | READERS_WAITING);
+            if let Ok(UnblockedOrTimedOut::TimedOut) = self
+                .state
+                .block_or_timeout(state | READERS_WAITING, RECOVERY_INTERVAL)
+            {
+                self.recover_dead_writer();
+            }
 
             // Spin again after waking up.
             state = self.spin_read();
@@ -177,12 +189,46 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
     #[inline]
     fn try_write(&self) -> bool {
-        self.state
+        let locked = self
+            .state
             .underlying_atomic()
             .fetch_update(Acquire, Relaxed, |s| {
                 is_unlocked(s).then(|| s + WRITE_LOCKED)
             })
+            .is_ok();
+        if locked {
+            self.note_writer();
+        }
+        locked
+    }
+
+    #[inline]
+    fn note_writer(&self) {
+        self.writer_owner
+            .store(crate::fs::ident::thread_token(), Relaxed);
+    }
+
+    /// Called by a waiter that has been blocked for a while: if the lock is write-held by a thread
+    /// that no longer exists (its process was killed or aborted mid-hold, and this lock lives in
+    /// memory shared across processes), release it on that thread's behalf.
+    #[cold]
+    fn recover_dead_writer(&self) {
+        let state = self.state.underlying_atomic().load(Relaxed);
+        if !is_write_locked(state) {
+            return;
+        }
+        let owner = self.writer_owner.load(Relaxed);
+        if owner == 0 || crate::fs::ident::thread_token_alive(owner) {
+            return;
+        }
+        if self
+            .writer_owner
+            .compare_exchange(owner, 0, Relaxed, Relaxed)
             .is_ok()
+        {
+            // SAFETY: the write lock is held by a dead thread, so nobody will release it.
+            unsafe { self.write_unlock_raw() };
+        }
     }
 
     #[inline]
@@ -195,10 +241,18 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         {
             self.write_contended();
         }
+        self.note_writer();
     }
 
     #[inline]
     unsafe fn write_unlock(&self) {
+        self.writer_owner.store(0, Relaxed);
+        // SAFETY: forwarded.
+        unsafe { self.write_unlock_raw() };
+    }
+
+    #[inline]
+    unsafe fn write_unlock_raw(&self) {
         let state = self
             .state
             .underlying_atomic()
@@ -265,7 +319,11 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 
             // Wait for the state to change.
             // ignore the error code as it is non-interruptible
-            let _ = self.writer_notify.block(seq);
+            if let Ok(UnblockedOrTimedOut::TimedOut) =
+                self.writer_notify.block_or_timeout(seq, RECOVERY_INTERVAL)
+            {
+                self.recover_dead_writer();
+            }
 
             // Spin again after waking up.
             state = self.spin_write();
@@ -739,3 +797,69 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platfo
 // writer can transfer `T` between threads, but the `Sync` bound is necessary,
 // too, since readers on multiple threads can share `T` simultaneously.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::cell::Cell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use crate::platform::mock::MockPlatform;
+
+    use super::RwLock;
+
+    const DEAD_THREAD: usize = 999_001;
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+
+    std::thread_local! {
+        static ID: Cell<usize> = Cell::new(NEXT.fetch_add(1, Ordering::Relaxed));
+    }
+
+    /// A write holder that vanished without releasing must not wedge the lock forever.
+    #[test]
+    fn write_lock_is_recovered_from_a_dead_holder() {
+        crate::fs::ident::set_thread_id_fn(|| ID.with(Cell::get));
+        crate::fs::ident::set_thread_alive_fn(|tid| tid != DEAD_THREAD);
+
+        let lock = alloc::sync::Arc::new(RwLock::<MockPlatform, u32>::new(7));
+        {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                ID.with(|id| id.set(DEAD_THREAD));
+                core::mem::forget(lock.write());
+            })
+            .join()
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        *lock.write() += 1;
+        assert!(started.elapsed() >= core::time::Duration::from_secs(1));
+        assert_eq!(*lock.read(), 8);
+    }
+
+    /// A live holder is never stolen from.
+    #[test]
+    fn write_lock_is_not_recovered_from_a_live_holder() {
+        crate::fs::ident::set_thread_id_fn(|| ID.with(Cell::get));
+        crate::fs::ident::set_thread_alive_fn(|tid| tid != DEAD_THREAD);
+
+        let lock = alloc::sync::Arc::new(RwLock::<MockPlatform, u32>::new(0));
+        let guard = lock.write();
+        let waiter = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                *lock.write() += 1;
+            })
+        };
+        thread::sleep(core::time::Duration::from_millis(2500));
+        assert!(
+            !waiter.is_finished(),
+            "waiter must still be blocked on a live holder"
+        );
+        drop(guard);
+        waiter.join().unwrap();
+        assert_eq!(*lock.read(), 1);
+    }
+}

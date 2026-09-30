@@ -502,6 +502,34 @@ pub mod ident {
         THREAD_ID_FN.store(f as usize, Ordering::Relaxed);
     }
 
+    static THREAD_ALIVE_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to test whether a thread id (as returned by the function given to
+    /// [`set_thread_id_fn`]) still names a live thread. Locks in memory shared between processes
+    /// use it to recover from a holder that died without releasing.
+    pub fn set_thread_alive_fn(f: fn(usize) -> bool) {
+        THREAD_ALIVE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Non-zero token naming the calling thread, or 0 when the platform registered no id function.
+    #[must_use]
+    pub fn thread_token() -> u32 {
+        current_thread().map_or(0, |t| t as u32)
+    }
+
+    /// Whether the thread named by `token` (from [`thread_token`]) is still alive; `true` when
+    /// that cannot be determined.
+    #[must_use]
+    pub fn thread_token_alive(token: u32) -> bool {
+        let raw = THREAD_ALIVE_FN.load(Ordering::Relaxed);
+        if raw == 0 || token == 0 {
+            return true;
+        }
+        // SAFETY: only `set_thread_alive_fn` stores here, and it stores a `fn(usize) -> bool`.
+        let f: fn(usize) -> bool = unsafe { core::mem::transmute(raw) };
+        f((token as usize).wrapping_sub(1))
+    }
+
     fn current_thread() -> Option<usize> {
         let raw = THREAD_ID_FN.load(Ordering::Relaxed);
         if raw == 0 {

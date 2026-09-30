@@ -116,6 +116,8 @@ impl MockRawMutex {
                 None => None,
                 Some(timeout) => match timeout.checked_sub(start.elapsed()) {
                     None => {
+                        // Leave the waiter count as if this thread had never blocked.
+                        self.internal_state.write().unwrap().number_blocked -= 1;
                         break Ok(UnblockedOrTimedOut::TimedOut);
                     }
                     Some(remaining_time) => Some(remaining_time),

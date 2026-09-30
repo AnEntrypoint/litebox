@@ -248,9 +248,11 @@ impl LinuxUserland {
                 nsec: ts.tv_nsec as u32,
             }
         });
-        litebox::fs::ident::set_thread_id_fn(|| {
-            // SAFETY: gettid takes no arguments and cannot fail.
-            (unsafe { libc::syscall(libc::SYS_gettid) }) as usize
+        litebox::fs::ident::set_thread_id_fn(cached_host_tid);
+        litebox::fs::ident::set_thread_alive_fn(|tid| {
+            // SAFETY: signal 0 only probes for existence.
+            let r = unsafe { libc::syscall(libc::SYS_tkill, tid as libc::c_long, 0) };
+            r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
         });
 
         let tun_socket_fd = tun_device_name
@@ -1995,6 +1997,8 @@ impl ThreadHandle {
 impl litebox::platform::ThreadProvider for LinuxUserland {
     fn set_process_guest_pid(&self, pid: i32) {
         GUEST_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        // A forked child keeps its parent's thread-local copy; drop the stale cached id.
+        HOST_TID.with(|t| t.set(0));
         if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
             // SAFETY: getpid/gettid take no arguments and cannot fail.
             let (host_pid, host_tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
@@ -2230,13 +2234,46 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
     inner: AtomicU32,
+    // Token of the thread that holds this mutex (set by `note_locked`, cleared by
+    // `note_unlocked`; 0 when free or unknown). This mutex lives in memory shared between guest
+    // processes, so a process that dies mid-critical-section (a panic, a kill, an OOM) leaves it
+    // locked forever; a long-blocked waiter uses this to notice the holder is gone and reopen it.
+    owner: AtomicU32,
 }
+
+/// How long a waiter on a held mutex sleeps before checking whether the holder still exists.
+const HOLDER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 impl RawMutex {
     const fn new() -> Self {
         Self {
             inner: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
         }
+    }
+
+    /// If the holder of this mutex is dead, forces it open and returns whether it did.
+    #[cold]
+    fn reopen_if_holder_dead(&self) -> bool {
+        let owner = self.owner.load(core::sync::atomic::Ordering::Relaxed);
+        if owner == 0 || litebox::fs::ident::thread_token_alive(owner) {
+            return false;
+        }
+        if self
+            .owner
+            .compare_exchange(
+                owner,
+                0,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.inner.store(0, core::sync::atomic::Ordering::Release);
+        futex_val2(&self.inner, FutexOperation::Wake, 1, 0, None).ok();
+        true
     }
 
     fn block_or_maybe_timeout(
@@ -2321,9 +2358,15 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
+        // Only a mutex with a recorded holder can be recovered, so only then wake up periodically.
+        let timeout = (self.owner.load(core::sync::atomic::Ordering::Relaxed) != 0)
+            .then_some(HOLDER_CHECK_INTERVAL);
+        match self.block_or_maybe_timeout(val, timeout) {
             Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+            Ok(UnblockedOrTimedOut::TimedOut) => {
+                self.reopen_if_holder_dead();
+                Ok(())
+            }
             Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
         }
     }
@@ -2334,6 +2377,17 @@ impl litebox::platform::RawMutex for RawMutex {
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(timeout))
+    }
+
+    fn note_locked(&self) {
+        self.owner.store(
+            litebox::fs::ident::thread_token(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn note_unlocked(&self) {
+        self.owner.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4707,4 +4761,23 @@ mod tests {
             };
         }
     }
+}
+
+thread_local! {
+    static HOST_TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The calling thread's kernel tid, cached per thread (a fresh syscall on every lock acquisition
+/// would be far too costly). Cleared in a forked child by `set_process_guest_pid`.
+fn cached_host_tid() -> usize {
+    HOST_TID.with(|t| {
+        let cached = t.get();
+        if cached != 0 {
+            return cached;
+        }
+        // SAFETY: gettid takes no arguments and cannot fail.
+        let tid = (unsafe { libc::syscall(libc::SYS_gettid) }) as usize;
+        t.set(tid);
+        tid
+    })
 }
