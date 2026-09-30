@@ -761,6 +761,8 @@ impl ProcSelfTable {
         };
         info.pid = child;
         info.maps = None;
+        info.tids = None;
+        info.fds = None;
         self.by_pid.insert(child, info);
     }
 

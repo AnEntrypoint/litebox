@@ -3742,7 +3742,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })
             && let Ok(n) = rest.parse::<usize>()
         {
-            return descriptor_stat(n, self).map_err(|_| Errno::ENOENT);
+            return descriptor_stat(n, self).map_err(|e| {
+                let kind = self.files.borrow().run_on_raw_fd(
+                    n,
+                    |_| "fs",
+                    |_| "net",
+                    |_| "pipe",
+                    |_| "eventfd",
+                    |_| "epoll",
+                    |_| "unix",
+                    |_| "pty",
+                    |_| "signalfd",
+                    |_| "timerfd",
+                    |_| "netlink",
+                );
+                litebox_util_log::warn!(fd = n, errno:? = e, kind:? = kind; "stat of /proc/self/fd entry failed");
+                Errno::ENOENT
+            });
         }
         let lookup_path = if follow_symlink {
             self.resolve_final_symlinks(normalized_path)?

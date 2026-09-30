@@ -158,6 +158,14 @@ pub trait ThreadProvider: RawPointerProvider {
         None
     }
 
+    /// Records that the WHOLE calling host process now is guest process `pid`, for platforms where
+    /// a guest process is a host process of its own (a native `fork()` child) rather than an OS
+    /// thread that [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)
+    /// tags. Backs [`current_guest_pid`](Self::current_guest_pid). Default: nothing.
+    fn set_process_guest_pid(&self, pid: i32) {
+        let _ = pid;
+    }
+
     /// Temporarily attributes any host-memory-ownership bookkeeping this platform performs
     /// (see [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)'s
     /// doc comment for why such bookkeeping exists at all -- `litebox_platform_windows_userland`'s

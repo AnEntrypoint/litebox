@@ -3902,6 +3902,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
         // something a freshly forked child inherits.
         self.attached_pty_id.set(None);
+        self.global.platform.set_process_guest_pid(new_pid);
+        self.install_proc_live_views();
+    }
+
+    /// Points this process's `/proc/self/{task,fd}` views at ITS OWN thread list and fd table.
+    ///
+    /// The closures capture the `Process`/`FilesState` current at the call, so a forked child
+    /// must re-install them: the entry it inherits still names the parent's tables, which made
+    /// `/proc/self/fd` list descriptors the child had closed (and `stat` of them fail).
+    pub(crate) fn install_proc_live_views(&self) {
+        let process = self.process();
+        let files = self.files.borrow().clone();
+        self.global
+            .proc_self_info
+            .write()
+            .with_mut(self.pid.get(), |info| {
+                info.tids = Some(alloc::sync::Arc::new(move || process.tids()));
+                info.fds = Some(alloc::sync::Arc::new(move || {
+                    let alive: alloc::vec::Vec<usize> =
+                        files.raw_descriptor_store.read().iter_alive().collect();
+                    alive
+                        .into_iter()
+                        .filter_map(|fd| {
+                            let target = files.lookup_fd_path(fd).map_or_else(
+                                || alloc::format!("anon_inode:[{fd}]"),
+                                |c| c.to_string_lossy().into_owned(),
+                            );
+                            Some((i32::try_from(fd).ok()?, target))
+                        })
+                        .collect()
+                }));
+            });
     }
 
     /// Bridges a `LITEBOX_PROCESS_FORK=1` cross-process child's real OS-level exit into this
@@ -7243,6 +7275,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Keyed by THIS process's pid, not written over a single global cell. See
             // `litebox::fs::procfs::ProcSelfTable`'s doc comment: the cell meant every other
             // live process read this one's `exe`/`cmdline`/`auxv`/`maps` as its own.
+            self.global.platform.set_process_guest_pid(self.pid.get());
             self.global.proc_self_info.write().set(
                 self.pid.get(),
                 litebox::fs::procfs::ProcSelfInfo {
@@ -7274,28 +7307,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .with_mut(self.pid.get(), |info| {
                     info.maps = Some(alloc::sync::Arc::new(move || render_proc_maps(&pm)));
                 });
-            let process = self.process();
-            let files = self.files.borrow().clone();
-            self.global
-                .proc_self_info
-                .write()
-                .with_mut(self.pid.get(), |info| {
-                    info.tids = Some(alloc::sync::Arc::new(move || process.tids()));
-                    info.fds = Some(alloc::sync::Arc::new(move || {
-                        let alive: alloc::vec::Vec<usize> =
-                            files.raw_descriptor_store.read().iter_alive().collect();
-                        alive
-                            .into_iter()
-                            .filter_map(|fd| {
-                                let target = files.lookup_fd_path(fd).map_or_else(
-                                    || alloc::format!("anon_inode:[{fd}]"),
-                                    |c| c.to_string_lossy().into_owned(),
-                                );
-                                Some((i32::try_from(fd).ok()?, target))
-                            })
-                            .collect()
-                    }));
-                });
+            self.install_proc_live_views();
         }
 
         let load_info = loader.load(argv, envp, self.init_auxv())?;

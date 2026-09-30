@@ -1972,6 +1972,17 @@ impl ThreadHandle {
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
+    fn set_process_guest_pid(&self, pid: i32) {
+        GUEST_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn current_guest_pid(&self) -> Option<i32> {
+        match GUEST_PID.load(core::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
@@ -3901,6 +3912,11 @@ fn aarch64_proxy_host_syscall_if_applicable(context: &mut libc::ucontext_t) -> b
     context.uc_mcontext.regs[0] = result.cast_unsigned();
     true
 }
+
+/// Guest pid of THIS host process (0 = not yet recorded). A native-fork child is a host process
+/// of its own, so a plain static (COW-private after `fork()`) is the per-process identity
+/// `/proc/self` needs.
+static GUEST_PID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
 /// Whether `LITEBOX_DIAG_FAULT` was set at startup (see [`exception_signal_handler`]).
 static DIAG_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
