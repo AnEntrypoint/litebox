@@ -8254,9 +8254,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // this (parent, pre-fork) thread's own sigreturn trampoline address so an
                 // implementor can exclude it from stale-pointer healing -- see that parameter's
                 // own doc comment.
-                self.global
-                    .platform
-                    .begin_fork_child_verification(relocations, self.sigreturn_trampoline_addr());
+                if !relocations.is_empty() {
+                    self.global
+                        .platform
+                        .begin_fork_child_verification(relocations, self.sigreturn_trampoline_addr());
+                }
             }
         }
     }

@@ -6342,7 +6342,8 @@ impl ThreadHandle {
         // Get the current register context.
         let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
             ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64,
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_FLOATING_POINT_AMD64,
             ..Default::default()
         };
         let r = unsafe {
@@ -6403,7 +6404,7 @@ impl ThreadHandle {
             // Case 1: jump to interrupt callback without saving the guest
             // context, since it's already saved.
             true
-        } else if is_in_ntdll_or_this(context.Rip.trunc()) {
+        } else if is_in_ntdll_or_this(context.Rip.trunc()) || !rip_in_guest_range(context.Rip.trunc()) {
             // Case 2/3: we can't distinguish between them. For case 2 we don't
             // need to do anything, but for case 3 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
@@ -6428,9 +6429,30 @@ impl ThreadHandle {
                 );
             }
             save_guest_context(unsafe { &mut *guest_context }, &context);
+            // The guest was cut off mid-instruction-stream, so its xmm0-xmm5 are still live in the
+            // suspended thread's register file. The resume path reloads them from
+            // `guest_xmm0_5` (filled at syscall entry), so without capturing them here every
+            // asynchronous interrupt handed the guest the values of the last syscall instead.
+            {
+                // SAFETY: the context was fetched with `CONTEXT_FLOATING_POINT_AMD64`, so the
+                // `Anonymous` view of the XMM registers is populated.
+                let regs = unsafe { &context.Anonymous.Anonymous };
+                let pack = |reg: &windows_sys::Win32::System::Diagnostics::Debug::M128A| {
+                    (u128::from(reg.High as u64) << 64) | u128::from(reg.Low)
+                };
+                target_tls.guest_xmm0_5.set([
+                    pack(&regs.Xmm0),
+                    pack(&regs.Xmm1),
+                    pack(&regs.Xmm2),
+                    pack(&regs.Xmm3),
+                    pack(&regs.Xmm4),
+                    pack(&regs.Xmm5),
+                ]);
+            }
             true
         };
         if run_interrupt_callback {
+            context.ContextFlags &= !0x8;
             set_context_to_interrupt_callback(target_tls, &mut context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
@@ -6457,6 +6479,13 @@ fn set_context_to_interrupt_callback(
 }
 
 /// Returns true if the given instruction pointer is in ntdll.dll or this module.
+fn rip_in_guest_range(rip: usize) -> bool {
+    use litebox::platform::PageManagementProvider;
+    (<WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MIN
+        ..<WindowsUserland as PageManagementProvider<0x1000>>::TASK_ADDR_MAX)
+        .contains(&rip)
+}
+
 fn is_in_ntdll_or_this(ip: usize) -> bool {
     static BOUNDS: OnceLock<[std::ops::Range<usize>; 2]> = const { OnceLock::new() };
 
@@ -12637,6 +12666,9 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     }
 
     unsafe fn release_pages(addr: usize, len: usize) {
+        if raw_env_is_set(b"LITEBOX_NO_RELEASE_PAGES ") {
+            return;
+        }
         unsafe {
             windows_sys::Win32::System::Memory::DiscardVirtualMemory(addr as *mut c_void, len);
         }

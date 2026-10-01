@@ -98,6 +98,12 @@ pub struct AddressRelocations {
 }
 
 impl AddressRelocations {
+    /// Whether no address was moved, as for a `vfork` child that shares its parent's address space.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     /// Reconstructs an [`AddressRelocations`] from its raw parallel-vector parts.
     ///
     /// Diagnostic-only (pass 122 of `scratchpad/jqrepro/FINDINGS.txt`'s investigation): the real
