@@ -174,6 +174,15 @@ Fixed this pass (all committed, newest first):
   unrecoverable kinds refuse. `live_cross_process_fork_children` caps concurrent children at 6. Proving a run
   took this path needs `[process_fork_diag] task-resume-probe` lines. Cross-process `kill()` goes through
   `GlobalState::process_table` (`syscalls/signal/xproc.rs`). `fork_verify.rs` healing is Windows-only.
+  The env var is **presence-checked** (`std::env::var_os("LITEBOX_PROCESS_FORK")?`, `litebox_shim_linux/src/lib.rs:13424`):
+  `LITEBOX_PROCESS_FORK=0` still ENABLES it -- unset the variable to get the same-process path.
+- **`chroot(2)` is real (e608959)**: `FsState.root` (next to `cwd`) is shared by `CLONE_FS`, so a chroot on any
+  task sharing that state -- a pthread, a `CLONE_FS` clone -- roots every one of them, parent included; `cwd`
+  is stored in root-space, dirfd-relative paths stay unrooted (an fd opened before the chroot still escapes).
+  Do NOT test `CLONE_FS` with a raw `clone(CLONE_VM|CLONE_VFORK|CLONE_FS)` from CPython: the child runs but the
+  parent never resumes and the process dies 139 (reproduced with a child that only `_exit`s, no chroot at all);
+  a plain `clone(CLONE_FS|SIGCHLD)` either goes cross-process (nothing can propagate) or segfaults on the
+  same-process eager-duplicate path. Use pthreads, which pass `CLONE_FS`.
 - **Logs**: default `warn,...fork_verify=error`; prefer the dedicated low-overhead targets over blanket module
   debug (`syscalls::file=debug` floods 50MB/s). A boot whose log stops is usually a dead root runner (a
   cross-process child has the bare 77-char command line).
