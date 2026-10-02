@@ -1086,7 +1086,9 @@ pub enum ProcSelfDirHandle {
     Task,
     /// `/proc/self/fd`: one symlink per open descriptor.
     Fd,
-    /// `/proc/self/ns`: holds `user` only.
+    /// `/proc/self/fdinfo`: one regular file per open descriptor, mirroring `fd`.
+    FdInfo,
+    /// `/proc/self/ns`: holds `user` and `pid`.
     Ns,
 }
 
@@ -1109,6 +1111,11 @@ enum ProcSelfEntry {
     /// `/proc/self/ns/user`. Not in [`Self::ALL`]: it lives one directory down, so a flat name
     /// lookup must never reach it.
     NsUser,
+    /// `/proc/self/ns/pid`. Not in [`Self::ALL`], for the same reason as [`Self::NsUser`].
+    NsPid,
+    /// One `/proc/self/fdinfo/<fd>` file. Not in [`Self::ALL`]: it lives one directory down, and
+    /// its name is a descriptor number rather than a fixed entry name.
+    FdInfoFile,
 }
 
 impl ProcSelfEntry {
@@ -1214,12 +1221,25 @@ const PROC_SELF_NS_USER_NODE_INFO: NodeInfo = NodeInfo {
     ino: 14,
     rdev: None,
 };
+const PROC_SELF_NS_PID_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 15,
+    rdev: None,
+};
+const PROC_SELF_FDINFO_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 16,
+    rdev: None,
+};
 
-/// The single namespace link `/proc/self/ns` exposes. Chromium asks for `CLONE_NEWPID` and
-/// `CLONE_NEWNET` only when `ns/pid` and `ns/net` exist, so neither is listed: litebox implements
-/// no namespace, and claiming one it cannot honour turns a clean `ENOSYS` into a sandbox that
-/// silently isolates nothing.
+/// The namespace links `/proc/self/ns` exposes. `user` is there because litebox really implements
+/// user namespaces (`clone(CLONE_NEWUSER)`/`unshare`) and Chromium probes it. `pid` is listed too
+/// because `Credentials::DropFileSystemAccess` needs a `chroot` target with no subdirectory --
+/// `/proc/self/fdinfo` -- and a process that checks its own pid namespace first has to find one.
+/// `net` is deliberately absent: litebox implements no network namespace, and claiming one it
+/// cannot honour turns a clean `ENOSYS` into a sandbox that silently isolates nothing.
 const PROC_SELF_NS_USER_CONTENT: &[u8] = b"user:[4026531837]\n";
+const PROC_SELF_NS_PID_CONTENT: &[u8] = b"pid:[4026531836]\n";
 
 /// Owned file handle; identifies which entry this fd is, and carries its (computed-once, at open
 /// time -- a fresh snapshot of the shared cell) content.
@@ -1263,6 +1283,7 @@ where
                 ProcSelfDirHandle::Root => match component {
                     "task" => Some(ProcSelfDirHandle::Task),
                     "fd" => Some(ProcSelfDirHandle::Fd),
+                    "fdinfo" => Some(ProcSelfDirHandle::FdInfo),
                     "ns" => Some(ProcSelfDirHandle::Ns),
                     _ => None,
                 },
@@ -1281,6 +1302,9 @@ where
                 }
                 ProcSelfDirHandle::Fd => None,
                 ProcSelfDirHandle::Ns => None,
+                // `fdinfo/<fd>` is always a file, never a directory: it has no subdirectory, which
+                // is what makes it usable as a `chroot` target.
+                ProcSelfDirHandle::FdInfo => None,
             };
             if let Some(next) = next {
                 walked.push(super::backend::WalkedComponent {
@@ -1292,8 +1316,9 @@ where
             // Not a subdirectory: it must name a file of this directory (or not exist).
             let exists = match current {
                 ProcSelfDirHandle::Root => ProcSelfEntry::from_name(component).is_some(),
-                ProcSelfDirHandle::Ns => component == "user",
+                ProcSelfDirHandle::Ns => matches!(component, "user" | "pid"),
                 ProcSelfDirHandle::Fd => component.parse::<i32>().is_ok(),
+                ProcSelfDirHandle::FdInfo => component.parse::<i32>().is_ok(),
                 ProcSelfDirHandle::Task => false,
             };
             if !exists {
@@ -1340,8 +1365,26 @@ where
                 .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?,
             ProcSelfDirHandle::Ns => match name {
                 "user" => ProcSelfEntry::NsUser,
+                "pid" => ProcSelfEntry::NsPid,
                 _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
             },
+            // `/proc/self/fdinfo/<fd>`: one regular file per live descriptor, mirroring `fd`'s
+            // symlinks. Named by fd number exactly like Linux, and (unlike `fd`) a regular file --
+            // a directory containing only regular files is what makes `fdinfo` usable as the
+            // `chroot` target `Credentials::DropFileSystemAccess` needs.
+            ProcSelfDirHandle::FdInfo => {
+                let fd: i32 = name
+                    .parse()
+                    .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                let live = self
+                    .current()
+                    .and_then(|i| i.fds.map(|f| f()))
+                    .is_some_and(|l| l.iter().any(|(n, _)| *n == fd));
+                if !live {
+                    return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+                }
+                ProcSelfEntry::FdInfoFile
+            }
             ProcSelfDirHandle::Task | ProcSelfDirHandle::Fd => {
                 return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
@@ -1378,6 +1421,11 @@ where
                 crate::fs::ident::read_id_map_file(crate::fs::ident::IdMapFile::Setgroups)
             }
             ProcSelfEntry::NsUser => PROC_SELF_NS_USER_CONTENT.to_vec(),
+            ProcSelfEntry::NsPid => PROC_SELF_NS_PID_CONTENT.to_vec(),
+            // Real Linux reports the descriptor's file offset and status flags here. litebox's
+            // per-fd status flags live in the descriptor table, not in this backend, so this stays
+            // a well-formed stub: the file's EXISTENCE and type are what a consumer checks.
+            ProcSelfEntry::FdInfoFile => alloc::format!("pos:\t0\nflags:\t0\n").into_bytes(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -1404,10 +1452,10 @@ where
                 .map(|(_, target)| Some(target))
                 .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
-        if dir_handle == ProcSelfDirHandle::Ns && name == "user" {
+        if dir_handle == ProcSelfDirHandle::Ns && matches!(name, "user" | "pid") {
             return Ok(None);
         }
-        if matches!(name, "task" | "fd" | "ns") {
+        if matches!(name, "task" | "fd" | "fdinfo" | "ns") {
             return Ok(None);
         }
         match ProcSelfEntry::from_name(name) {
@@ -1435,7 +1483,7 @@ where
                         ino_info: None,
                     })
                     .collect();
-                for dir in ["task", "fd", "ns"] {
+                for dir in ["task", "fd", "fdinfo", "ns"] {
                     entries.push(DirEntry {
                         name: String::from(dir),
                         file_type: FileType::Directory,
@@ -1444,11 +1492,18 @@ where
                 }
                 Ok(entries)
             }
-            ProcSelfDirHandle::Ns => Ok(alloc::vec![DirEntry {
-                name: String::from("user"),
-                file_type: FileType::RegularFile,
-                ino_info: None,
-            }]),
+            ProcSelfDirHandle::Ns => Ok(alloc::vec![
+                DirEntry {
+                    name: String::from("user"),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                },
+                DirEntry {
+                    name: String::from("pid"),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                },
+            ]),
             ProcSelfDirHandle::Task => Ok(info
                 .tids
                 .map(|f| f())
@@ -1468,6 +1523,19 @@ where
                 .map(|(fd, _)| DirEntry {
                     name: alloc::format!("{fd}"),
                     file_type: FileType::Symlink,
+                    ino_info: None,
+                })
+                .collect()),
+            // Same names as `fd`, but regular files: Chromium's `DropFileSystemAccess` needs a
+            // `chroot` target with no subdirectory, and checks that with `getdents`' own `d_type`.
+            ProcSelfDirHandle::FdInfo => Ok(info
+                .fds
+                .map(|f| f())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(fd, _)| DirEntry {
+                    name: alloc::format!("{fd}"),
+                    file_type: FileType::RegularFile,
                     ino_info: None,
                 })
                 .collect()),
@@ -1551,6 +1619,8 @@ where
                 ProcSelfEntry::GidMap => PROC_SELF_GID_MAP_NODE_INFO,
                 ProcSelfEntry::Setgroups => PROC_SELF_SETGROUPS_NODE_INFO,
                 ProcSelfEntry::NsUser => PROC_SELF_NS_USER_NODE_INFO,
+                ProcSelfEntry::NsPid => PROC_SELF_NS_PID_NODE_INFO,
+                ProcSelfEntry::FdInfoFile => PROC_SELF_FDINFO_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
@@ -1569,8 +1639,10 @@ where
                     .and_then(|i| i.tids.map(|f| f().len()))
                     .unwrap_or(1)
             }
-            ProcSelfDirHandle::Root => 4,
+            // `.`, plus one for each subdirectory (`task`, `fd`, `fdinfo`, `ns`).
+            ProcSelfDirHandle::Root => 5,
             ProcSelfDirHandle::Fd => 2,
+            ProcSelfDirHandle::FdInfo => 2,
             ProcSelfDirHandle::Ns => 2,
         };
         Ok(FileStatus {

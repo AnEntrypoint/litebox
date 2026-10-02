@@ -2444,6 +2444,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
             SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
+        SyscallRequest::Chroot { pathname } => pathname
+            .to_cstring::<Platform>()
+            .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chroot(path))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,

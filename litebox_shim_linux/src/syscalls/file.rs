@@ -326,7 +326,21 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     /// The current working directory
     ///
     /// Must end with a '/'.
+    ///
+    /// An absolute path in ROOT-space -- the way the guest spells it, so `/` means the chroot
+    /// root, not the backend's own root -- which is what `getcwd` reports verbatim and what
+    /// [`join_root`] turns into a backend path. `sys_chdir`/`sys_fchdir` therefore translate the
+    /// path they validated back into this space with [`strip_root`].
     pub(crate) cwd: litebox::sync::RwLock<Platform, String>,
+    /// The process's root directory (`chroot(2)`), as an absolute path that must end with '/'.
+    ///
+    /// Every guest-visible absolute path is resolved inside it (see [`join_root`]), so `"/"` means
+    /// "no chroot in effect" and is the only value this ever holds until a `chroot` succeeds.
+    /// Lives here, next to `cwd`, because `CLONE_FS` shares this whole struct's `Arc` between
+    /// parent and child: a `clone(CLONE_FS)` child's `chroot` therefore changes its parent's root
+    /// too, which is exactly what Chromium's zygote relies on when it drops filesystem access in a
+    /// `CLONE_FS|CLONE_VFORK` child and then expects the parent to be rooted as well.
+    pub(crate) root: litebox::sync::RwLock<Platform, String>,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
@@ -334,6 +348,7 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            root: litebox::sync::RwLock::new(self.root.read().clone()),
         }
     }
 }
@@ -343,12 +358,66 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            root: litebox::sync::RwLock::new(String::from("/")),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }
+}
+
+/// Resolve the guest-visible absolute path `abs` inside the chroot `root` (which ends with '/'),
+/// returning the path the fs backend actually sees.
+///
+/// `root == "/"` is the common case (no `chroot` in effect) and returns `abs` as-is -- every path
+/// resolution in the whole shim goes through here, so that case must stay a plain copy.
+///
+/// Lexically normalised (`.` dropped, `..` popping one component) and clamped at the root: `..`
+/// can never walk out of the chroot, matching the kernel, which resolves `..` against the root
+/// vfsmount and so turns `/..` into `/` for a `chroot`ed process.
+fn join_root(root: &str, abs: &str) -> String {
+    if root == "/" {
+        return String::from(abs);
+    }
+    let mut components: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in abs.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    let mut joined = String::from(root);
+    joined.push_str(&components.join("/"));
+    joined
+}
+
+/// The inverse of [`join_root`]: the guest-visible spelling of a path the backend holds, i.e. the
+/// chroot `root` prefix taken off.
+///
+/// A path that is not inside the root -- a directory reached by a relative `chdir` from a CWD the
+/// `chroot` left outside it, or through an `fchdir` to an fd opened before the `chroot` -- has no
+/// spelling in that view, which is [`Errno::ENOENT`].
+fn strip_root(root: &str, abs: &str) -> Result<String, Errno> {
+    if root == "/" {
+        return Ok(String::from(abs));
+    }
+    // `root` always ends in '/', but a path that has been through `normalized()` need not: the
+    // root directory itself comes back as `/tmp/jail`, with no trailing slash of its own.
+    let Some(rest) = abs.strip_prefix(root.trim_end_matches('/')) else {
+        return Err(Errno::ENOENT);
+    };
+    if rest.is_empty() {
+        return Ok(String::from("/"));
+    }
+    if !rest.starts_with('/') {
+        // `/tmp/jail3` is NOT inside `/tmp/jail`, however much their prefixes agree.
+        return Err(Errno::ENOENT);
+    }
+    Ok(String::from(rest))
 }
 
 /// Task state shared by `CLONE_FILES`.
@@ -740,17 +809,28 @@ impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
     /// CWD-relative paths are resolved immediately to absolute paths.
+    ///
+    /// `root` is the calling task's chroot (see [`join_root`]); it is applied to every path that
+    /// is NOT resolved through a `dirfd`, because a `dirfd`-relative lookup starts from a directory
+    /// an earlier `open` already reached, and on real Linux such an fd keeps reaching outside a
+    /// later `chroot` (the fd predates the root change, and `*at` resolution is relative to the
+    /// fd's own dentry, not to the process root).
     fn new(
         dirfd: i32,
         path: impl path::Arg,
         get_cwd: impl FnOnce() -> String,
+        root: &str,
     ) -> Result<Self, Errno> {
         let path_str = path.as_rust_str()?;
         if path_str.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         let fs_path = if path_str.starts_with('/') {
-            let cpath = path.to_c_str()?.into_owned();
+            let cpath = if root == "/" {
+                path.to_c_str()?.into_owned()
+            } else {
+                CString::new(join_root(root, path_str)).map_err(|_| Errno::EINVAL)?
+            };
             FsPath::Absolute { path: cpath }
         } else if dirfd >= 0 {
             let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
@@ -767,9 +847,12 @@ impl FsPath {
             if path_str.is_empty() {
                 FsPath::Cwd
             } else {
-                // Resolve CWD-relative path to absolute.
+                // Resolve CWD-relative path to absolute. The CWD is itself an absolute path in
+                // root-space (after `chroot` + `chdir("/")` it is "/"), so the result needs the
+                // same root prefix any other guest-visible absolute path gets.
                 let mut abs = get_cwd();
                 abs.push_str(path_str);
+                let abs = join_root(root, &abs);
                 let cpath = CString::new(abs).map_err(|_| Errno::EINVAL)?;
                 FsPath::Absolute { path: cpath }
             }
@@ -814,7 +897,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if owner != "self" && owner != "thread-self" && owner != own_pid {
             return;
         }
-        if tail != "fd" && !tail.starts_with("fd/") {
+        // `fdinfo` needs the same snapshot `fd` does: it is the same list of live descriptors.
+        if !matches!(tail, "fd" | "fdinfo")
+            && !tail.starts_with("fd/")
+            && !tail.starts_with("fdinfo/")
+        {
             return;
         }
         let snapshot: alloc::vec::Vec<(u32, String)> = {
@@ -840,20 +927,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
     }
 
-    /// Resolve a path against the current working directory.
+    /// Resolve a path against the current working directory and the current chroot.
+    ///
+    /// Both spellings get the root prefix: the CWD is kept in root-space too (see
+    /// [`FsState::cwd`]), so it is a guest-visible absolute path exactly like the other branch.
     pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
         if path_str.is_empty() {
             return Err(Errno::ENOENT);
         }
+        let root = self.fs.borrow().root.read().clone();
         if path_str.starts_with('/') {
+            // The `/proc/<pid>/fd` snapshot is published under the path the GUEST named, so it is
+            // refreshed with the pre-root path: what the guest can see through `/proc/self/fd` is
+            // its own namespace's view, not the backend's.
             self.refresh_proc_fd_snapshot(path_str);
-            CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
+            CString::new(join_root(&root, path_str)).map_err(|_| Errno::EINVAL)
         } else {
             let mut cwd = self.fs.borrow().cwd.read().clone();
             cwd.push_str(path_str);
-            CString::new(cwd).map_err(|_| Errno::EINVAL)
+            CString::new(join_root(&root, &cwd)).map_err(|_| Errno::EINVAL)
         }
+    }
+
+    /// The one place a `dirfd` + pathname pair becomes an [`FsPath`] with the caller's chroot
+    /// applied, so no syscall has to remember to do it itself.
+    fn fs_path(&self, dirfd: i32, pathname: impl path::Arg) -> Result<FsPath, Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        // Held only for the duration of the classification below: `FsPath::new` reads it, and
+        // every caller goes on to call into the fs backend (which may block) without it.
+        let root = self.fs.borrow().root.read().clone();
+        FsPath::new(dirfd, pathname, get_cwd, &root)
+    }
+
+    /// The current working directory as a path the fs backend can resolve: the CWD is an absolute
+    /// path in root-space, so it takes the same root prefix as any other guest-visible one.
+    fn rooted_cwd(&self) -> String {
+        let fs = self.fs.borrow();
+        let root = fs.root.read().clone();
+        let cwd = fs.cwd.read().clone();
+        join_root(&root, &cwd)
     }
 
     /// Join a directory's absolute path with a path given relative to it, matching the semantics
@@ -880,8 +993,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
     fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         let resolved = match fs_path {
             FsPath::Absolute { path } => path,
             FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
@@ -4031,12 +4143,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         match fs_path {
             FsPath::Absolute { path } => self.do_access(path, mode, caller),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let cwd = get_cwd();
+                let cwd = self.rooted_cwd();
                 self.do_access(cwd, mode, caller)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -4591,14 +4702,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         T: From<litebox::fs::FileStatus> + From<FileStat>,
     {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         match fs_path {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                Ok(T::from(self.files.borrow().fs.file_status(get_cwd())?))
+                Ok(T::from(self.files.borrow().fs.file_status(self.rooted_cwd())?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 descriptor_stat(fd as usize, self)
@@ -4752,8 +4862,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some((a, m)) => self.resolve_utimes_pair(a, m)?,
         };
 
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         let path = match fs_path {
             FsPath::Absolute { path } => path,
             // Unlike most `*at` syscalls, `utimensat` does NOT require `AT_EMPTY_PATH` for the
@@ -4761,7 +4870,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `fd` itself, and is exactly what musl's `futimens(fd, times)` compiles down to
             // (see this function's own doc comment). Gating it on `AT_EMPTY_PATH` made every
             // such call return `ENOENT`. The flag is still accepted, it is just not required.
-            FsPath::Cwd => get_cwd().as_str().to_c_str()?.into_owned(),
+            FsPath::Cwd => self.rooted_cwd().as_str().to_c_str()?.into_owned(),
             FsPath::Fd(fd) => self.resolve_dirfd_path(fd)?,
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
@@ -5402,6 +5511,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `getcwd`
+    ///
+    /// The CWD is an absolute path in root-space already (see [`FsState::cwd`]), so this is it
+    /// verbatim: inside a chroot, the root directory reads as "/".
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut cwd = self.fs.borrow().cwd.read().clone();
         if cwd.len() > 1 && cwd.ends_with('/') {
@@ -5451,13 +5563,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Ensure the CWD ends with '/'.
-        let mut new_cwd = abs_path;
+        // The fs backend sees the root prefix; the CWD is stored the way the GUEST spells it, so
+        // it is translated back here (inside a chroot, the root directory itself is "/"). A path
+        // that is not inside the root at all -- reachable only through a relative `chdir` from a
+        // CWD the `chroot` left outside it -- has no guest spelling, hence `ENOENT`.
+        let root = self.fs.borrow().root.read().clone();
+        let mut new_cwd = strip_root(&root, &abs_path)?;
         if !new_cwd.ends_with('/') {
             new_cwd.push('/');
         }
 
         *self.fs.borrow().cwd.write() = new_cwd;
+        Ok(())
+    }
+
+    /// Handle syscall `chroot`
+    ///
+    /// The root is kept on [`FsState`], which `CLONE_FS` shares by `Arc`, so a `clone(CLONE_FS)`
+    /// child's `chroot` changes the root of every task sharing that state -- parent included. That
+    /// is the whole point for Chromium, whose zygote drops filesystem access by `chroot`-ing inside
+    /// a `CLONE_FS | CLONE_VFORK` child and then carrying on, rooted, in the parent.
+    pub fn sys_chroot(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::path::Arg as _;
+
+        // `CAP_SYS_CHROOT` is capability 18. Root in the initial user namespace holds it; so does
+        // the owner of a user namespace, which holds every capability inside its own namespace.
+        const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
+        let creds = self.creds();
+        let permitted =
+            creds.cap_eff & CAP_SYS_CHROOT_BIT != 0 || (creds.uid_map.is_none() && creds.euid == 0);
+        if !permitted {
+            return Err(Errno::EPERM);
+        }
+
+        // Resolved against the CURRENT root, exactly as `chdir` is: the target of a `chroot` is
+        // looked up the way the caller can see the filesystem right now, not in the backend's own
+        // coordinates.
+        let resolved = self.resolve_path(pathname)?;
+        let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        let abs_path = self.resolve_final_symlinks(abs_path)?;
+
+        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+            Ok(status) => {
+                if status.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                return Err(Errno::ENOENT);
+            }
+            Err(FileStatusError::PathError(_)) => {
+                return Err(Errno::EACCES);
+            }
+            Err(_) => {
+                return Err(Errno::ENOENT);
+            }
+        }
+
+        // Ensure the root ends with '/', so `join_root` can concatenate onto it directly.
+        let mut new_root = abs_path;
+        if !new_root.ends_with('/') {
+            new_root.push('/');
+        }
+
+        *self.fs.borrow().root.write() = new_root;
         Ok(())
     }
 
@@ -5494,7 +5665,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        let mut new_cwd = abs_path;
+        // The fs backend sees the root prefix; the CWD is stored the way the GUEST spells it, so
+        // it is translated back here -- a directory reached through an fd opened before a `chroot`
+        // lies outside the root and has no guest spelling, hence `ENOENT`.
+        let root = self.fs.borrow().root.read().clone();
+        let mut new_cwd = strip_root(&root, &abs_path)?;
         if !new_cwd.ends_with('/') {
             new_cwd.push('/');
         }
@@ -8670,41 +8845,57 @@ mod tests {
     #[test]
     fn fspath_new() {
         // Absolute paths should never invoke the get_cwd closure.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", || {
-            panic!("get_cwd should not be called for absolute paths")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "/usr/bin",
+            || {
+                panic!("get_cwd should not be called for absolute paths")
+            },
+            "/",
+        )
         .unwrap();
         assert!(matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/usr/bin"));
 
         // Relative path resolves against CWD.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", || {
-            String::from("/home/")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "foo/bar",
+            || String::from("/home/"),
+            "/",
+        )
         .unwrap();
         assert!(
             matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/home/foo/bar")
         );
 
         // Empty path at AT_FDCWD → Cwd variant.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
-            panic!("get_cwd should not be called for empty Cwd path")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "",
+            || {
+                panic!("get_cwd should not be called for empty Cwd path")
+            },
+            "/",
+        )
         .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
 
         // Positive fd + empty path → Fd variant.
-        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        let fp = FsPath::new(5, "", || panic!("should not be called"), "/").unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
         // Invalid dirfd → EBADF.
-        let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
+        let err = FsPath::new(-1, "file.txt", || panic!("should not be called"), "/").unwrap_err();
         assert_eq!(err, Errno::EBADF);
 
         // Path exceeding PATH_MAX → ENAMETOOLONG.
         let long_path = "a".repeat(PATH_MAX + 1);
-        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), || {
-            String::from("/")
-        })
+        let err = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            long_path.as_str(),
+            || String::from("/"),
+            "/",
+        )
         .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);
     }

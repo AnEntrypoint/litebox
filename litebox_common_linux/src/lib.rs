@@ -3649,6 +3649,9 @@ pub enum SyscallRequest {
     Chdir {
         pathname: UserPtr<c_char>,
     },
+    Chroot {
+        pathname: UserPtr<c_char>,
+    },
     Fchdir {
         fd: u32,
     },
@@ -4530,6 +4533,7 @@ impl SyscallRequest {
             Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group }),
             Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::chroot => sys_req!(Chroot { pathname:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
