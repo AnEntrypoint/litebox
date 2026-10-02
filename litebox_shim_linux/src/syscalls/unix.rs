@@ -22,6 +22,7 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
+    platform::SharedKernelStateProvider as _,
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
@@ -3656,36 +3657,46 @@ where
     }
 }
 
-/// Realistic upper bound on simultaneously OPEN cross-process AF_UNIX stream connections in one
-/// guest session (X11 rarely has more than a handful of concurrent clients; D-Bus system+session
-/// bus each accept a modest number) -- same sizing philosophy as [`UNIX_ADDR_PRESENCE_CAPACITY`]/
+/// Simultaneously-OPEN cross-process AF_UNIX stream connections one guest session can hold.
+/// Same bounded-capacity-over-dynamic-growth sizing philosophy as [`UNIX_ADDR_PRESENCE_CAPACITY`]/
 /// `MAX_SOCKETS`.
 ///
-/// Sized small on purpose, together with [`SHARED_UNIX_CONN_BUF`] below -- learned live,
-/// 2026-09-18: `GlobalState` (which embeds this table) is constructed as an ordinary Rust value
-/// and passed BY VALUE through `create_shared_kernel_state`/`SharedArc::new` before being placed
-/// in the shared arena, so an oversized field here blows the constructing thread's stack before
-/// ever reaching the arena at all (`thread 'main' has overflowed its stack`, live-reproduced with
-/// this table at 8 MiB total). [`UnixAddrPresenceSlot`]'s own proven-safe table is ~31 KiB total
-/// (256 slots x ~124 bytes) -- this table's total footprint is kept in that same order of
-/// magnitude rather than sized generously the way a heap-backed collection could be.
+/// **Raised 64 -> 1024, 2026-10-03, for one measured reason** (`.wfgy/chr16.err`, run `chr16`):
+/// all 1265 of that run's `SCM_RIGHTS: this fd cannot cross a process boundary` refusals carried
+/// `reason=shared unix connection table full` -- not one other reason. Chromium establishes each
+/// child's Mojo IPC channel by sending it an unnamed `socketpair` endpoint over a unix socket, and
+/// carrying one needs a slot here, so with 64 slots no channel is ever established and
+/// `--dump-dom` never emits a page. A `LITEBOX_PROCESS_FORK=1` Chromium runs ~20 host processes
+/// and opens far more than 64 concurrent channels; 1024 leaves an order of magnitude of headroom
+/// over that.
 ///
-/// Raised from 8 to 64 (matching [`SHARED_UNIX_CONNECT_QUEUE_CAPACITY`]'s own scale; still well
-/// under an order of magnitude below the 8 MiB stack-overflow threshold above at ~256 KiB total)
-/// as a mitigation for a real, live-caught leak this same pass also adds proper (bounded)
-/// reclaim for -- see [`SharedUnixConnTable::alloc`]'s doc comment: a slot's only release path is
-/// a cooperative `Drop` that never runs when its owning process is killed externally rather than
-/// exiting normally, which every `sys_ppoll`-stuck client caught and killed during this
-/// investigation did. A bigger pool buys more time before that leak (now partially, safely
-/// recovered by `alloc`'s own dead-holder reclaim) can exhaust it entirely.
-pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 64;
+/// **Sized for the shared arena now, not for the stack.** The 64 was a stack-overflow workaround,
+/// not a judgement about connection counts: `GlobalState` (which embeds this table) is constructed
+/// as an ordinary Rust value and passed BY VALUE through `create_shared_kernel_state`/
+/// `SharedArc::new` before being placed in the shared arena, so an oversized inline field here
+/// blows the constructing thread's stack before ever reaching the arena at all
+/// (`thread 'main' has overflowed its stack`, live-reproduced with this table at 8 MiB total;
+/// `syscalls::pty::SHARED_PTY_CAPACITY`'s doc comment records the same hazard reproducing a real
+/// `STATUS_STACK_OVERFLOW` at just 32 pty slots / ~214 KiB). 1024 inline slots would be ~15 MiB.
+/// [`SharedUnixConnTable`] no longer holds an inline array at all -- it holds one
+/// `shared_kernel_arena_alloc_bytes` region of `1024 * size_of::<SharedConnSlot<Platform>>()`
+/// (~15 MiB, rounded up to 16 MiB by that allocator's power-of-two sizing, out of a 64 MiB arena),
+/// initialized IN PLACE one slot at a time, so no stack value of that size is ever constructed and
+/// `GlobalState`'s own by-value footprint DROPS by ~0.9 MiB. The region is shared by the whole
+/// fork family, so this is ~15 MiB once per session, not per host process.
+///
+/// The leak that originally motivated the small-but-bounded pool is still handled by
+/// [`SharedUnixConnTable::alloc`]'s dead-holder reclaim pass, and the capacity raise is the
+/// complementary mitigation for the case that pass still cannot recover -- see that doc comment.
+pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 1024;
 
 /// Per-direction shared ring buffer capacity. Bounded like a real kernel AF_UNIX socket's own
 /// finite send/receive buffer: this is control-plane protocol traffic (X11/D-Bus requests and
 /// replies), not bulk pixel data (MIT-SHM already carries that over System V shared memory, never
-/// through this socket). Total shared-arena footprint:
-/// `SHARED_UNIX_CONN_CAPACITY * 2 * SHARED_UNIX_CONN_BUF` = 32 KiB -- see
-/// [`SHARED_UNIX_CONN_CAPACITY`]'s doc comment for why this is deliberately small, not generous.
+/// through this socket). Shared-arena footprint: `SHARED_UNIX_CONN_CAPACITY` slots x
+/// `2 * SHARED_UNIX_CONN_BUF` of ring bytes each -- ~15 MiB at 1024 slots, which is
+/// [`SHARED_UNIX_CONN_CAPACITY`]'s 16 MiB arena allocation, not `GlobalState`'s own size (the
+/// slots are no longer inline there).
 /// A single write larger than this never hangs regardless (see [`SharedByteRing::try_write`] and
 /// its call site in `SharedView::send`): it degrades to a real short write
 /// of the first `SHARED_UNIX_CONN_BUF` bytes, matching a real kernel socket's own short-write
@@ -4243,14 +4254,91 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
 /// Fixed pool of [`SharedConnSlot`]s -- the shared-arena-native backing for every currently-open
 /// cross-process AF_UNIX stream connection, allocated by a listener's `accept()` and released
 /// when the last side referencing it drops.
+///
+/// # The slots live in the shared kernel arena, not inline in `GlobalState`
+///
+/// A `[SharedConnSlot; SHARED_UNIX_CONN_CAPACITY]` field would be ~15 MiB at the current capacity,
+/// and `GlobalState` (which embeds this table) is built BY VALUE on the constructing thread's stack
+/// before `create_shared_kernel_state` moves it into the arena -- see
+/// [`SHARED_UNIX_CONN_CAPACITY`]'s doc comment for the live-reproduced `STATUS_STACK_OVERFLOW`
+/// that constrains it. So the pool is one `shared_kernel_arena_alloc_bytes` region instead, held
+/// here as a `&'static mut` slice over it -- the same shape `litebox::net` already uses for
+/// `Network::socket_set`'s own `&'static mut [SocketStorage]`, and sound for the same reasons:
+///
+/// - **Same address in every host process.** That allocator hands back memory from the fixed-base
+///   shared arena, so the pointer value is directly valid in every process of the fork family (a
+///   cross-process-fork child ATTACHES to this already-built `GlobalState` rather than calling
+///   [`Self::new`] at all, so the pointer the family shares is the one this process stored).
+/// - **Never reclaimed**, per that allocator's own contract, so `'static` is honest.
+/// - **Flat and pointer-free**, like every other shared struct here: `SharedConnSlot` is atomics
+///   plus two [`SharedByteRing`]s, no heap, so a second process dereferencing these bytes sees the
+///   same objects the first one does (the `GlobalState`-pointer-sharing defect class).
+///
+/// The one cost of moving it out of `GlobalState`'s inline bytes is that the region must be
+/// initialized through the pointer -- which [`Self::new`] does one slot at a time, so the largest
+/// value ever built on the stack is a single ~14.5 KiB slot.
 pub(crate) struct SharedUnixConnTable<Platform: ShimPlatform> {
-    slots: [SharedConnSlot<Platform>; SHARED_UNIX_CONN_CAPACITY],
+    slots: &'static mut [SharedConnSlot<Platform>],
+    /// `false` only when the arena allocation itself failed and [`Self::new`] fell back to a
+    /// process-private one: such a table can never serve a genuinely cross-process connection
+    /// (another process has no way to reach those bytes), so [`Self::alloc`] refuses everything
+    /// instead of handing out indices into memory no peer can see. Degrades every cross-process
+    /// AF_UNIX attempt to its ordinary errno path; never a panic.
+    arena_backed: bool,
 }
 
 impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
-    pub(crate) fn new() -> Self {
+    /// Allocates the pool in the cross-process SHARED kernel arena and initializes every slot.
+    ///
+    /// Runs exactly once per fork family, from `LinuxShimBuilder::build`'s create branch -- every
+    /// other process in the family attaches to the already-built `GlobalState` and never calls
+    /// this (the same create-vs-attach split `litebox::net::alloc_shared_socket_storage`'s own doc
+    /// comment describes for `Network::socket_set`).
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout =
+            core::alloc::Layout::array::<SharedConnSlot<Platform>>(SHARED_UNIX_CONN_CAPACITY)
+                .expect("SHARED_UNIX_CONN_CAPACITY slot-array layout computation cannot overflow");
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let arena_backed = arena.is_some();
+        let ptr = arena
+            .unwrap_or_else(|| {
+                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+                // process IS the whole guest session). Fall back to a leaked process-private
+                // allocation so every later `get`/`free` stays memory-safe, and let `alloc`
+                // refuse everything via `arena_backed`.
+                litebox_util_log::error!(
+                    capacity:% = SHARED_UNIX_CONN_CAPACITY,
+                    bytes:% = layout.size();
+                    "shared unix connection table: shared kernel arena exhausted; cross-process \
+                     AF_UNIX is disabled in this process"
+                );
+                // SAFETY: `layout` has a non-zero size (`SHARED_UNIX_CONN_CAPACITY` slots).
+                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                    .expect("shared unix connection table: fallback allocation failed")
+            })
+            .cast::<SharedConnSlot<Platform>>();
+        for i in 0..SHARED_UNIX_CONN_CAPACITY {
+            // SAFETY: `ptr` names `SHARED_UNIX_CONN_CAPACITY` contiguous, uninitialized
+            // `SharedConnSlot`s per `layout`, so `add(i)` stays inside that region for every
+            // `i < SHARED_UNIX_CONN_CAPACITY`, and `write`-ing a freshly built value into
+            // uninitialized memory (rather than dropping a prior one) is exactly what `write` is
+            // for. Writing them ONE AT A TIME through the pointer is the entire point of this
+            // function: `SharedConnSlot::new_empty()` is ~14.5 KiB of stack at a time, where a
+            // `[SharedConnSlot; SHARED_UNIX_CONN_CAPACITY]` value would be ~15 MiB of it.
+            unsafe {
+                ptr.as_ptr().add(i).write(SharedConnSlot::new_empty());
+            }
+        }
         Self {
-            slots: core::array::from_fn(|_| SharedConnSlot::new_empty()),
+            // SAFETY: `ptr` is non-null, aligned per `layout`, and all `SHARED_UNIX_CONN_CAPACITY`
+            // slots at it were just initialized by the loop above. `'static` is sound because this
+            // allocation is arena-backed and never reclaimed (or, on the fallback path, a leaked
+            // global-allocator allocation), and nothing else holds a reference to it, so handing
+            // out an exclusive `&'static mut` is sound.
+            slots: unsafe {
+                core::slice::from_raw_parts_mut(ptr.as_ptr(), SHARED_UNIX_CONN_CAPACITY)
+            },
+            arena_backed,
         }
     }
 
@@ -4259,9 +4347,14 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
     /// panics).
     ///
     /// `platform` is used only for the dead-holder reclaim pass below (see [`Self::
-    /// reclaim_dead_slot`]) -- never for the ordinary fast path, which stays exactly as cheap as
-    /// before.
+    /// reclaim_dead_slot`]) and its failure-path occupancy census ([`Self::log_full`]) -- never for
+    /// the ordinary fast path, which stays exactly as cheap as before.
     fn alloc(&self, platform: &Platform, client_cred: &Ucred, server_cred: &Ucred) -> Option<u32> {
+        if !self.arena_backed {
+            // [`Self::new`] could not place the pool in the shared arena, so no index this table
+            // could hand out would name memory another host process can see.
+            return None;
+        }
         if let Some(idx) = self.try_claim_empty(client_cred, server_cred) {
             return Some(idx);
         }
@@ -4285,14 +4378,75 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         // [`SHARED_UNIX_CONN_CAPACITY`]'s own doc comment for why the capacity was also raised, as
         // the complementary mitigation for exactly that remaining case), but is unconditionally
         // safe: it never disrupts a slot either endpoint might still be using.
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             if self.reclaim_dead_slot(slot, platform)
                 && let Some(idx) = self.try_claim_empty(client_cred, server_cred)
             {
                 return Some(idx);
             }
         }
+        // Still nothing: log a strided occupancy census so the next session can tell genuine
+        // saturation from a leak (see [`Self::log_full`]).
+        self.log_full(platform);
         None
+    }
+
+    /// How many failed [`Self::alloc`] calls go by between two occupancy censuses
+    /// ([`Self::log_full`]). A Chromium-scale flood emits thousands of these per run (1265 in
+    /// `chr16`), so logging each one would produce a gigabyte of log carrying one line's worth of
+    /// information -- the same sampling discipline this codebase already applies to repeated heals
+    /// (`MAX_AV_PATH_HEALS`/`AV_HEAL_LOG_SAMPLE_STRIDE`).
+    const FULL_LOG_STRIDE: u64 = 64;
+
+    /// Occupancy census on [`Self::alloc`]'s failure path, in three buckets:
+    ///
+    /// - `held_live`: occupied, and at least one side is still held by a live host process.
+    /// - `orphaned`: occupied, every holder is dead -- i.e. reclaimable. Normally 0 here, since the
+    ///   reclaim pass above already freed those.
+    /// - `unheld`: occupied but NO side was ever held. These are the permanently lost ones:
+    ///   [`SharedConnSlot::side_gone`] deliberately reports "not gone" for a side that was never
+    ///   held, so [`Self::reclaim_dead_slot`] can never free them. A process that died between
+    ///   `try_claim_empty` setting `OCCUPIED` and its own `hold()` leaves exactly one of these.
+    ///
+    /// Without this, the only evidence a full table leaves is
+    /// `reason=shared unix connection table full` repeated thousands of times, which says nothing
+    /// about WHY: `chr16` (2026-10-02) logged 1265 identical refusals and left the next session
+    /// unable to distinguish "1024 genuinely open connections" from "1024 leaked slots" -- two
+    /// cases with completely different fixes.
+    fn log_full(&self, platform: &Platform) {
+        static STRIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        if STRIDE.fetch_add(1, Ordering::Relaxed) % Self::FULL_LOG_STRIDE != 0 {
+            return;
+        }
+        let mut occupied = 0usize;
+        let mut held_live = 0usize;
+        let mut orphaned = 0usize;
+        let mut unheld = 0usize;
+        for slot in self.slots.iter() {
+            if slot.state.load(Ordering::Acquire) != CONN_SLOT_OCCUPIED {
+                continue;
+            }
+            occupied += 1;
+            if !slot.side_ever_held[0].load(Ordering::Acquire)
+                && !slot.side_ever_held[1].load(Ordering::Acquire)
+            {
+                unheld += 1;
+            } else if slot.side_gone(true, platform) && slot.side_gone(false, platform) {
+                orphaned += 1;
+            } else {
+                held_live += 1;
+            }
+        }
+        litebox_util_log::warn!(
+            capacity:% = SHARED_UNIX_CONN_CAPACITY,
+            slot_bytes:% = core::mem::size_of::<SharedConnSlot<Platform>>(),
+            arena_backed:% = self.arena_backed,
+            occupied:% = occupied,
+            held_live:% = held_live,
+            orphaned:% = orphaned,
+            unheld:% = unheld;
+            "shared unix connection table full"
+        );
     }
 
     /// Fast-path claim: atomically takes the first `EMPTY` slot found and fills it in for a new
@@ -4376,10 +4530,18 @@ const REQ_PENDING: u32 = 2;
 const REQ_CLAIMED: u32 = 3;
 const REQ_ACCEPTED: u32 = 4;
 
-/// Realistic upper bound on simultaneously in-flight cross-process `connect()` attempts (bounded
-/// like every other fixed-capacity table in this file; a full queue degrades a connect attempt to
-/// a retry, never a panic).
-pub(crate) const SHARED_UNIX_CONNECT_QUEUE_CAPACITY: usize = 64;
+/// Upper bound on simultaneously in-flight cross-process `connect()` attempts (bounded like every
+/// other fixed-capacity table in this file; a full queue degrades a connect attempt to a retry,
+/// never a panic).
+///
+/// **Raised 64 -> 256, 2026-10-03**, together with [`SHARED_UNIX_CONN_CAPACITY`]'s own raise: this
+/// queue is the rendezvous every one of those connections is created through, so with hundreds of
+/// concurrent channels a 64-deep queue would become the next wall behind the (measured) conn-table
+/// one. Not itself a measured blocker in `chr16` -- that run's 1265 refusals were all
+/// `shared unix connection table full`, none from here -- so this is headroom, not a fix. Still
+/// inline in `GlobalState` by value on purpose: 256 slots is ~35 KiB total, two orders of magnitude
+/// below the by-value size [`SHARED_UNIX_CONN_CAPACITY`]'s move into the shared arena just removed.
+pub(crate) const SHARED_UNIX_CONNECT_QUEUE_CAPACITY: usize = 256;
 
 struct PendingConnectRequest {
     state: AtomicU32,

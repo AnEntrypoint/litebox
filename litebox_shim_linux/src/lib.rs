@@ -685,7 +685,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
-                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(),
+                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(&platform),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
                         shared_file_publish: syscalls::file::SharedFilePublishTable::new(),
                         shared_file_spill: syscalls::file_spill::SharedFileSpill::new(),
