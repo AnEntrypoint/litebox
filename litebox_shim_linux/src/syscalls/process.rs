@@ -281,6 +281,10 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// (see `do_kill`'s remote-child case), which needs no signal-specific plumbing at all --
     /// `ThreadRemote::interrupt` and `has_pending_signals` already existed for exactly this.
     pub(crate) shared_pending: Arc<Mutex<Platform, super::signal::PendingSignals>>,
+    /// This thread group's seccomp mode, `no_new_privs` bit and installed filter stack. Lives on
+    /// the `Process` (not the `Task`) because every thread of a group shares it, which is what
+    /// `SECCOMP_FILTER_FLAG_TSYNC` asks for and what makes the state survive `execve`.
+    pub(crate) seccomp: super::seccomp::SeccompState<Platform>,
     /// The signal to deliver to this process's parent when this process's last thread exits --
     /// real Linux's `clone()`'s low byte of `flags` / `clone3`'s `exit_signal` field, already
     /// validated (bounded by `MAX_SIGNAL_NUMBER`) but previously discarded by `do_clone`. Almost
@@ -482,6 +486,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             sid: core::sync::atomic::AtomicI32::new(pid),
             shared_pending,
             exit_signal,
+            seccomp: super::seccomp::SeccompState::new(),
         }
     }
 
@@ -1450,22 +1455,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(1)
             }
             PrctlArg::SetNoNewPrivs(value) => {
-                // PR_SET_NO_NEW_PRIVS: once set, the calling thread and its descendants can
-                // never gain more privileges via execve (used by sandboxing tools like bwrap
-                // before entering a mount/user namespace). LiteBox has no real privilege
-                // escalation path (no setuid execution, no real capabilities) for this to
-                // guard against, so accepting it unconditionally is safe. The only real
-                // constraint from the kernel's prctl(2) man page is that `value` must be 1;
-                // anything else is EINVAL.
                 if value != 1 {
                     return Err(Errno::EINVAL);
                 }
+                self.set_no_new_privs();
                 Ok(0)
             }
-            // PR_GET_NO_NEW_PRIVS: report the bit as always set. Nothing in LiteBox actually
-            // tracks per-thread no_new_privs state (see SetNoNewPrivs above), and sandboxing
-            // tools only use this to confirm the bit stuck, so reporting 1 unconditionally is
-            // consistent with SetNoNewPrivs always succeeding.
             PrctlArg::SetDumpable(value) => {
                 // Linux accepts only `SUID_DUMP_DISABLE` (0) and `SUID_DUMP_USER` (1) from
                 // userspace; `SUID_DUMP_ROOT` (2) is kernel-internal and `EINVAL` here.
@@ -1479,7 +1474,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             PrctlArg::GetDumpable => Ok(self.dumpable.get() as usize),
-            PrctlArg::GetNoNewPrivs => Ok(1),
+            PrctlArg::GetNoNewPrivs => Ok(usize::from(self.seccomp_no_new_privs())),
+            PrctlArg::GetSeccomp => Ok(self.seccomp_mode() as usize),
+            PrctlArg::SetSeccomp { mode, prog } => self.sys_prctl_set_seccomp(mode, prog),
             // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
             // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
             PrctlArg::SetPDeathSig(_) => Ok(0),
@@ -5766,6 +5763,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .proc_self_info
                 .write()
                 .inherit(self.pid.get(), pid);
+            // A child inherits its parent's seccomp filters and `no_new_privs`, as on real Linux.
+            // `/proc/self/status`'s `Seccomp:`/`NoNewPrivs:` lines came along with `inherit`.
+            thread.process.seccomp.inherit_from(&self.process().seccomp);
         }
 
         let r = unsafe {
@@ -6812,6 +6812,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     maps: None,
                     tids: None,
                     fds: None,
+                    // A cross-process fork child cannot inherit the parent's BPF programs (no
+                    // `Arc` crosses the OS process boundary), so it really does start unfiltered.
+                    no_new_privs: false,
+                    seccomp_mode: 0,
                 },
             );
         }
@@ -7987,8 +7991,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     maps: None,
                     tids: None,
                     fds: None,
+                    no_new_privs: false,
+                    seccomp_mode: 0,
                 },
             );
+            // `execve` keeps the thread group's seccomp mode and `no_new_privs` (both survive on
+            // real Linux), so the fresh `/proc/self` entry is re-stamped from the live state
+            // rather than left at the defaults just written.
+            self.publish_proc_seccomp();
         }
 
         // A live `/proc/self/maps` renderer over THIS process's page manager. Installed here

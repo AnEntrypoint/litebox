@@ -1447,15 +1447,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.force_signal_with_info(signal, force_exit, siginfo);
     }
 
-    fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
+    pub(crate) fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
         // `handle_exception_request` maps every architectural trap (not just page faults) through
         // this path: SIGFPE (`#DE`), SIGTRAP (`#BP`), SIGILL (`#UD` -- notably reachable via
         // Windows' `STATUS_PRIVILEGED_INSTRUCTION`/`hlt` mapping in
         // `litebox_platform_windows_userland`, which is how musl mallocng's `a_crash()` abort
         // primitive is delivered to the guest), alongside the original SIGKILL/SIGSEGV callers.
+        // SIGSYS joins this set as a seccomp verdict's kill/trap/trace delivery (see
+        // `syscalls::seccomp`), which is a forced signal like any other architectural trap.
         assert!(matches!(
             signal,
-            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGFPE
+                | Signal::SIGTRAP
+                | Signal::SIGILL
+                | Signal::SIGSYS
         ));
 
         self.signals

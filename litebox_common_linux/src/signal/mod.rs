@@ -399,4 +399,17 @@ impl SiginfoData {
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
         Self { pad }
     }
+
+    /// The `SIGSYS` arm of `_sifields`: `si_call_addr`, `si_syscall`, `si_arch` -- the three fields
+    /// a seccomp `SECCOMP_RET_TRAP` handler reads (`SYS_SECCOMP`).
+    pub fn new_sigsys(call_addr: usize, syscall: i32, arch: u32) -> Self {
+        let mut pad = [0u32; 28];
+        let bytes = pad.as_mut_bytes();
+        bytes[..core::mem::size_of::<usize>()].copy_from_slice(&call_addr.to_ne_bytes());
+        let mut off = core::mem::size_of::<usize>();
+        bytes[off..off + 4].copy_from_slice(&syscall.to_ne_bytes());
+        off += 4;
+        bytes[off..off + 4].copy_from_slice(&arch.to_ne_bytes());
+        Self { pad }
+    }
 }

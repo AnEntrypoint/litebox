@@ -275,3 +275,10 @@ or lazier copy is the lever; (2) `--single-process` dies on a Chromium CHECK in
 occasionally (`--disable-features=GwpAsan*` avoids); (4) SCM_RIGHTS of file fds whose path no longer resolves;
 (5) the desktop-typed `chromium --no-sandbox &` was not verified (typing dropped on the starved host).
 Repro scripts: `.wfgy/chromium_headless.ps1 -Run <n> -Secs N -Extra "<flags>"`.
+- `seccomp(2)`/`prctl(PR_SET_SECCOMP)` are real now: a classic-BPF interpreter
+  (`litebox_shim_linux/src/syscalls/seccomp.rs`) evaluated on the raw syscall number at the top of
+  `Task::do_syscall`, before `SyscallRequest::try_from_raw` -- ALLOW/LOG run it, ERRNO returns it,
+  TRAP/KILL/TRACE deliver SIGSYS via the existing fatal-signal path. Mode, `no_new_privs` and the
+  filter stack live on `Process` (TSYNC is free, all three survive clone and execve); a cross-process
+  fork child starts unfiltered, and `/proc/self/status` gained `Seccomp:`/`NoNewPrivs:`.
+  Sandbox-enabled repro: `.wfgy/chromium_sandbox.ps1 -Run <n> -Secs N -Extra "<flags>"` (no `--no-sandbox`).

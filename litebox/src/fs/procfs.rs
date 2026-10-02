@@ -58,6 +58,10 @@ pub struct ProcSelfInfo {
     pub tids: Option<alloc::sync::Arc<dyn Fn() -> Vec<i32> + Send + Sync>>,
     /// Lists this process's open raw file descriptors, for `/proc/self/fd`.
     pub fds: Option<alloc::sync::Arc<dyn Fn() -> Vec<(i32, String)> + Send + Sync>>,
+    /// `NoNewPrivs:` in `/proc/[pid]/status`: `PR_SET_NO_NEW_PRIVS` state.
+    pub no_new_privs: bool,
+    /// `Seccomp:` in `/proc/[pid]/status`: 0 disabled, 1 strict, 2 filter -- Linux's own encoding.
+    pub seccomp_mode: u8,
 }
 
 /// The uptime `/proc/uptime` reports and the process start times in `/proc/[pid]/stat` are measured
@@ -83,8 +87,12 @@ fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
 /// keys are omitted rather than guessed -- see gm mutable `mut-1789043822948`.
 fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
     format!(
-        "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n",
-        info.comm, info.pid, info.pid
+        "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nNoNewPrivs:\t{}\nSeccomp:\t{}\n",
+        info.comm,
+        info.pid,
+        info.pid,
+        u8::from(info.no_new_privs),
+        info.seccomp_mode
     )
     .into_bytes()
 }

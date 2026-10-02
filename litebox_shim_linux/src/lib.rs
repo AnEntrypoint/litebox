@@ -2223,6 +2223,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
+        // seccomp is evaluated on the RAW syscall number, before `try_from_raw` decodes it: a
+        // filter must also see the syscalls this shim has no request type for, exactly as Linux
+        // runs its filters before `sys_call_table` dispatch.
+        let verdict = self.seccomp_verdict(ctx, syscall_number as i32);
+        if let Some(verdict) = verdict {
+            match verdict {
+                crate::syscalls::seccomp::Verdict::Allow => {}
+                crate::syscalls::seccomp::Verdict::Log => litebox_util_log::debug!(
+                    nr:% = syscall_number, pid:% = self.pid.get();
+                    "seccomp: SECCOMP_RET_LOG"
+                ),
+                other => {
+                    return self.apply_seccomp_verdict(other, syscall_number as i32, ctx.get_ip())
+                }
+            }
+        }
         let request = match SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt) {
             Ok(r) => r,
             Err(e) => {
@@ -2676,6 +2692,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
+            SyscallRequest::Seccomp {
+                operation,
+                flags,
+                args,
+            } => self.sys_seccomp(operation, flags, args),
             SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
             SyscallRequest::Readlink {
                 pathname,

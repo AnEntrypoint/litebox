@@ -3336,11 +3336,16 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
-    /// PR_SET_NO_NEW_PRIVS: set the calling thread's no_new_privs bit. LiteBox has no real
-    /// privilege escalation to prevent, so this is tracked but is always a safe no-op to accept.
+    /// PR_SET_NO_NEW_PRIVS: set the calling thread's no_new_privs bit, which a `seccomp` filter
+    /// install requires and which no `execve` may afterwards clear.
     SetNoNewPrivs(usize),
     /// PR_GET_NO_NEW_PRIVS: get the calling thread's no_new_privs bit.
     GetNoNewPrivs,
+    /// PR_SET_SECCOMP: `SECCOMP_MODE_STRICT` (1) or `SECCOMP_MODE_FILTER` (2) with a
+    /// `struct sock_fprog *`. The legacy form of `seccomp(2)`: no flags, no `TSYNC`.
+    SetSeccomp { mode: u32, prog: usize },
+    /// PR_GET_SECCOMP: the calling thread's seccomp mode (0/1/2).
+    GetSeccomp,
     /// `PR_SET_PDEATHSIG`: request a signal when the parent dies. Accepted, not delivered.
     SetPDeathSig(i32),
     /// `PR_SET_DUMPABLE`: whether this process may be core-dumped and ptrace-attached.
@@ -4342,6 +4347,12 @@ pub enum SyscallRequest {
     Prctl {
         args: PrctlArg,
     },
+    Seccomp {
+        operation: u32,
+        flags: u32,
+        /// Guest address of the `struct sock_fprog` for `SECCOMP_SET_MODE_FILTER`.
+        args: usize,
+    },
     Alarm {
         seconds: u32,
     },
@@ -4362,6 +4373,16 @@ pub enum SyscallRequest {
         mask: StatxMask,
         statxbuf: UserPtrMut<Statx>,
     },
+}
+
+/// The syscalls `seccomp(SECCOMP_SET_MODE_STRICT)` leaves callable: Linux's
+/// `__secure_computing_strict` allows `read`, `write`, `_exit`/`exit_group` and `sigreturn`, and
+/// kills the thread with `SIGSYS` on anything else.
+pub fn seccomp_strict_allows(syscall_number: usize) -> bool {
+    matches!(
+        Sysno::new(syscall_number),
+        Some(Sysno::read | Sysno::write | Sysno::exit | Sysno::exit_group | Sysno::rt_sigreturn)
+    )
 }
 
 impl SyscallRequest {
@@ -4970,6 +4991,11 @@ impl SyscallRequest {
                     sigsetpack:*,
                 })
             }
+            Sysno::seccomp => SyscallRequest::Seccomp {
+                operation: ctx.sys_req_arg(0),
+                flags: ctx.sys_req_arg(1),
+                args: ctx.sys_req_arg(2),
+            },
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
@@ -4988,6 +5014,15 @@ impl SyscallRequest {
                         },
                         PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
                             args: PrctlArg::GetNoNewPrivs,
+                        },
+                        PrctlOption::SetSeccomp => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSeccomp {
+                                mode: ctx.sys_req_arg(1),
+                                prog: ctx.sys_req_arg(2),
+                            },
+                        },
+                        PrctlOption::GetSeccomp => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSeccomp,
                         },
                         // `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` control whether a process may be
                         // core-dumped and ptrace-attached. Both are read and written by ordinary
