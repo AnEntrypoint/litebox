@@ -86,6 +86,26 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Default implementation does nothing, so platforms with no such bookkeeping are unaffected.
     fn release_mapping_claim(&self, _range: core::ops::Range<usize>) {}
 
+    /// Reserve `range` in this process's address space WITHOUT committing any of it.
+    ///
+    /// The point is to own the address range -- so a later guest `mprotect` over it can commit
+    /// pages into it, and so nothing else can be handed that address in the meantime -- while
+    /// paying no memory for it yet. That is exactly the state a `PROT_NONE` mapping is in on a
+    /// platform with reserve/commit separation (Windows): real Linux `mmap(PROT_NONE)` is a
+    /// reservation too, and `mprotect` on it later is what makes it real.
+    ///
+    /// Returns whether `range` ended up backed by real (reserved or committed) memory at its own
+    /// address. `true` includes the case where something had already reserved it, which is the
+    /// common case for a `fork()` child adopting a `PROT_NONE` region that sits inside a span the
+    /// fork's own copy already reserved.
+    ///
+    /// The default answers `false`: a platform that cannot hold reserved-but-uncommitted guest
+    /// address space cannot provide what a caller asked for, and every caller treats `false` as
+    /// "leave this range untracked".
+    fn reserve_pages_without_commit(&self, _range: Range<usize>) -> bool {
+        false
+    }
+
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.

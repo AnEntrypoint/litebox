@@ -1768,18 +1768,32 @@ fn diag_process_fork_vmem_adopt_probe(
     // correctly-filtered `tracked` set against a stale, unfiltered `expected` set. Filtering
     // `PROT_NONE` out here too makes the comparison match what the real adoption code actually
     // does, instead of reporting a phantom mismatch on every boot.
+    //
+    // Chromium pass (2026-10-02): that is no longer "adoption never tracks a `PROT_NONE` region"
+    // -- a `PROT_NONE` region whose address range this process can reserve is now adopted like any
+    // other (see `Vmem::new_adopting_existing_memory`'s "PROT_NONE regions are reserved here now"
+    // paragraph). Whether a given one was reservable depends on this process's own address space,
+    // so the only comparison that stays meaningful is apples-to-apples: drop `PROT_NONE` from BOTH
+    // sides, and report the ones this child did adopt separately below.
+    let none_filter = |flag_bits: &u32| {
+        let flags = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
+        !flags.contains(litebox::mm::linux::VmFlags::VM_SHARED)
+            && !flags
+                .intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
+                .is_empty()
+    };
     let mut sorted_expected: Vec<_> = expected
         .iter()
-        .filter(|(_, flag_bits, _)| {
-            let flags = litebox::mm::linux::VmFlags::from_bits_truncate(*flag_bits);
-            !flags.contains(litebox::mm::linux::VmFlags::VM_SHARED)
-                && !flags
-                    .intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
-                    .is_empty()
-        })
+        .filter(|(_, flag_bits, _)| none_filter(flag_bits))
         .cloned()
         .collect();
     sorted_expected.sort_by_key(|(r, _, _)| r.start);
+    let tracked_count_all = tracked.len();
+    let tracked: Vec<_> = tracked
+        .into_iter()
+        .filter(|(_, flag_bits, _)| none_filter(flag_bits))
+        .collect();
+    let adopted_none = tracked_count_all - tracked.len();
     let layout_matches = tracked == sorted_expected;
     let mismatches = sorted_expected
         .iter()
@@ -1788,8 +1802,10 @@ fn diag_process_fork_vmem_adopt_probe(
         .count();
 
     eprintln!(
-        "[process_fork_diag] vmem-adopt-probe (child): adopted={adopted} (of which VM_SHARED={shared}), \
-         tracked={tracked_count}, expected={}, brk={tracked_brk:#x} (expected {heap_top:#x})",
+        "[process_fork_diag] vmem-adopt-probe (child): adopted={adopted} (skipped={shared}, \
+         PROT_NONE reserved and tracked={adopted_none}), tracked={tracked_count} (of which \
+         comparable={}), expected={}, brk={tracked_brk:#x} (expected {heap_top:#x})",
+        tracked.len(),
         sorted_expected.len()
     );
     if layout_matches && tracked_brk == heap_top {
@@ -1922,6 +1938,7 @@ fn diag_process_fork_task_resume_probe(
             comm,
             sigreturn_trampoline,
             identity.map(|id| id.pgid),
+            identity.map(|id| (id.pid_ns as u32, id.ns_pid, id.ns_tid)),
         );
 
     // Reopen the regular-file fds the parent held.

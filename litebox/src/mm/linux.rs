@@ -941,8 +941,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// cross-process fork.
     ///
     /// Returns the `Vmem` plus the number of regions adopted and the number of `VM_SHARED`
-    /// (+ `PROT_NONE`, see below) regions seen and deliberately skipped (never inserted into
-    /// `vmas`).
+    /// (+ `PROT_NONE` whose address range could not be reserved here, see below) regions seen and
+    /// deliberately skipped (never inserted into `vmas`).
     ///
     /// # `PROT_NONE` regions get the SAME treatment as `VM_SHARED` -- 46th pass, 2026-09-22
     ///
@@ -971,6 +971,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// the same way the `VM_SHARED` fix does: a later guest touch faults honestly (no VMA found,
     /// same outcome `do_clone`'s own comment already says is "exactly as it should" happen for an
     /// inaccessible region), and teardown finds nothing tracked to route into a real Windows call.
+    ///
+    /// # `PROT_NONE` regions are reserved here now -- Chromium pass (2026-10-02)
+    ///
+    /// That 46th-pass reasoning was right about the CRASH but wrong about the consequence: a
+    /// `PROT_NONE` region that is merely untracked is a region whose reservation the child has
+    /// lost, and guest software uses those reservations by `mprotect`-ing pages into them. Live
+    /// evidence (`.wfgy/mres1.sh`, a 1 GiB / 8 MiB / 64 KiB `PROT_NONE` `mmap` followed by a
+    /// cross-process `fork()`): the parent's `mprotect` succeeds and the child's returns `ENOMEM`
+    /// at every size, because `protect_mapping` finds no VMA covering the range. In Chromium that
+    /// `ENOMEM` is a failed `CHECK` (`int3`) ~0.09s into every renderer's life. Reserving the range
+    /// (no commit, `PAGE_NOACCESS`) restores the reservation instead of the phantom: the region is
+    /// tracked, access still faults, `mprotect` commits into it, and a later `munmap` has real
+    /// memory to release. A range Windows will not reserve (it can be reserved already by a
+    /// fork-copy group, which is fine, or genuinely unmappable) still falls back to the 46th-pass
+    /// skip, so this only ever adds coverage.
     pub(super) fn new_adopting_existing_memory(
         platform: &'static Platform,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
@@ -1070,16 +1085,33 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
-            if !keep_all
-                && (flags.contains(VmFlags::VM_SHARED)
-                    || flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty())
-            {
-                // See this function's own doc comment (both the `VM_SHARED` paragraph and the
-                // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into `vmas`
-                // -- there is no real backing for either kind in this (adopting) process, and
-                // pretending otherwise is what produced a live, reproducible host-process panic.
-                shared += 1;
-                continue;
+            let is_shared = flags.contains(VmFlags::VM_SHARED);
+            let is_inaccessible = flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty();
+            if !keep_all && (is_shared || is_inaccessible) {
+                // A `PROT_NONE` region CAN be given real backing in this process after all:
+                // reserving its address range without committing anything (`PageManagementProvider::
+                // reserve_pages_without_commit`) reproduces exactly the state it has on the source
+                // side -- address space owned, no memory behind it, any access still faulting --
+                // and leaves a later guest `mprotect` over it free to commit pages into it. That
+                // is not a workaround: without it, a `fork()` child of a process whose allocator
+                // reserved a big `PROT_NONE` range (Chromium's renderers, V8, PartitionAlloc) got
+                // `ENOMEM` from the very `mprotect` that makes the reservation usable, and died.
+                // Repro: `.wfgy/mres1.sh` (every size, parent succeeds / child fails ENOMEM).
+                //
+                // `VM_SHARED` still cannot: its bytes are another process's live mapping, and
+                // nothing here duplicates the backing handle.
+                let reserved_here = !is_shared
+                    && is_inaccessible
+                    && platform.reserve_pages_without_commit(range.clone());
+                if !reserved_here {
+                    // See this function's own doc comment (both the `VM_SHARED` paragraph and the
+                    // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into
+                    // `vmas` -- there is no real backing for either kind in this (adopting)
+                    // process, and pretending otherwise is what produced a live, reproducible
+                    // host-process panic.
+                    shared += 1;
+                    continue;
+                }
             }
             vmem.vmas.insert(
                 range,

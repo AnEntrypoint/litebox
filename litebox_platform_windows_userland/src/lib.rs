@@ -9074,6 +9074,128 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         unclaim_range(range);
     }
 
+    fn reserve_pages_without_commit(&self, range: core::ops::Range<usize>) -> bool {
+        if range.start == 0 || range.start >= range.end {
+            return false;
+        }
+        // `MEM_RESERVE` only accepts allocation-granularity bounds, so the reservation is rounded
+        // outward exactly as `allocate_pages`'s own reserve-and-commit helper does. That can
+        // swallow up to one granule of address space on either side; nothing is committed there,
+        // so the cost is address space, not memory.
+        let aligned_start = self.round_down_to_granu(range.start);
+        let aligned_end = self.round_up_to_granu(range.end);
+        // Same lock, same reason as `allocate_pages`'s fixed-address path: the query-then-act
+        // sequence below is not atomic against another guest thread's own `VirtualAlloc2`/
+        // `VirtualFree` on a neighbouring address, and Windows' VAD tree can span a query
+        // boundary.
+        let _fixed_addr_guard = ALLOCATE_PAGES_FIXED_ADDR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                aligned_start as *mut c_void,
+                aligned_end - aligned_start,
+                Win32_Memory::MEM_RESERVE,
+                Win32_Memory::PAGE_NOACCESS,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        // A null return is not failure on its own: the granule may already be reserved -- by this
+        // process's own fork-copy groups, which reserve whole granule-aligned spans, so a
+        // `PROT_NONE` region inside one is already covered. What matters is only whether Windows
+        // ends up reporting every page of `range` as reserved or committed, which is what makes a
+        // later guest `mprotect` over it able to commit into it.
+        let mut address = range.start;
+        while address < range.end {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let queried = unsafe {
+                Win32_Memory::VirtualQuery(
+                    address as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            if !queried {
+                return false;
+            }
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if mbi.State == Win32_Memory::MEM_FREE {
+                let free_start = address.max(mbi.BaseAddress as usize);
+                let free_end = range.end.min(region_end);
+                // First try the whole granule-rounded span, so the partial granules at the two
+                // ends are covered too when they are free.
+                let outer_start = self.round_down_to_granu(free_start);
+                let outer_end = self.round_up_to_granu(free_end);
+                let reserved = unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        outer_start as *mut c_void,
+                        outer_end - outer_start,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if reserved.is_null() {
+                    // `MEM_RESERVE` only accepts granularity-aligned bounds, so one occupied
+                    // neighbouring granule is enough to refuse the whole rounded span even when
+                    // the interior is completely free. Reserve that granule-aligned interior
+                    // instead -- a reservation only has to cover the pages the guest will
+                    // actually `mprotect`.
+                    let inner_start = self.round_up_to_granu(free_start);
+                    let inner_end = self.round_down_to_granu(free_end);
+                    if inner_start < inner_end {
+                        unsafe {
+                            VirtualAlloc2(
+                                GetCurrentProcess(),
+                                inner_start as *mut c_void,
+                                inner_end - inner_start,
+                                Win32_Memory::MEM_RESERVE,
+                                Win32_Memory::PAGE_NOACCESS,
+                                core::ptr::null_mut(),
+                                0,
+                            )
+                        };
+                    }
+                }
+            }
+            if region_end <= address {
+                return false;
+            }
+            address = region_end;
+        }
+        let mut address = range.start;
+        while address < range.end {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let queried = unsafe {
+                Win32_Memory::VirtualQuery(
+                    address as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            if !queried {
+                return false;
+            }
+            if mbi.State == Win32_Memory::MEM_FREE {
+                litebox_util_log::warn!(
+                    start:% = range.start, end:% = range.end, free_at:% = address;
+                    "diag-reserve-none: a PROT_NONE fork-child region could not be reserved, leaving it untracked"
+                );
+                return false;
+            }
+            let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if next <= address {
+                return false;
+            }
+            address = next;
+        }
+        true
+    }
+
     unsafe fn deallocate_pages(
         &self,
         range: core::ops::Range<usize>,
