@@ -120,6 +120,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         false
     }
 
+    /// Whether the bytes reachable through `path` exist ONLY in this process's own writable
+    /// layer, i.e. no other host process would find them by reopening that path.
+    ///
+    /// This is the question an fd handoff across a process boundary has to answer: `"reopen this
+    /// path"` (`F|`, see `Task::scm_carry_spec`) is right for rootfs content -- both sides land on
+    /// the same stored bytes -- and wrong for a file one process created in a layer it does not
+    /// share, where the receiver's `open` answers `ENOENT`. A `true` here means the sender must
+    /// carry CONTENT instead. `false` unless overridden; see [`layered::FileSystem`].
+    fn only_in_own_writable_layer(&self, _path: &str) -> bool {
+        false
+    }
+
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 

@@ -185,7 +185,15 @@ Fixed this pass (all committed, newest first):
   same-process eager-duplicate path. Use pthreads, which pass `CLONE_FS`.
 - **Logs**: default `warn,...fork_verify=error`; prefer the dedicated low-overhead targets over blanket module
   debug (`syscalls::file=debug` floods 50MB/s). A boot whose log stops is usually a dead root runner (a
-  cross-process child has the bare 77-char command line).
+  cross-process child has the bare 77-char command line). **Log verbosity comes from `LITEBOX_LOG`,
+  not `RUST_LOG`.** Disk hygiene: a Chromium run with `--enable-logging=stderr --v=1` produced a
+  1GB log in 2.5 minutes from one duplicated warn -- sample repeated messages (a stride counter) or
+  cap them (see `MAX_AV_PATH_HEALS`, `AV_HEAL_LOG_SAMPLE_STRIDE`) before re-running.
+- Cheap guest repro without a file in the guest: `.wfgy/guest2.ps1 -Script <sh> -Run <name> -Secs <n>`
+  (base64's the script onto the command line; sets LITEBOX_PROCESS_FORK=1, LITEBOX_LAZY_FILE_MAP=1,
+  LITEBOX_OCI_USE_LAST_RESOLVED=1; `-ExtraEnv "K=V;K2=V2"` overrides). Build only
+  `cargo build --release -p litebox_runner_linux_on_windows_userland` (~1m); the whole workspace
+  does not build on Windows.
 - **Run dbus-daemon non-forking** (`dbus-launch` daemonizing breaks connects); for XFCE use `xfce4-session`.
   `.wfgy/webtop_stack.sh` is embedded in `webtop_seed.tar` (re-tar after edits). Readbacks inside a boot
   script use `$( )`/pipes, not `cmd > /tmp/f` + a sibling's read (writable-layer visibility gap).
@@ -231,6 +239,12 @@ private-heap nodes, so shared registries are fixed-slot, lock-free, atomic table
   `GlobalState.shared_file_spill`, per-slot generation); open/stat/access/getdents/unlink/rename refresh the
   local copy. Fixes `apt-get update` (http method writes InRelease, sqv/apt-get read it). Extend the prefix list,
   not the mechanism, for the next such directory.
+- Direction matters: a cross-process fork child receives the parent's exported writable layer AT SPAWN (its
+  `[process_fork_diag] task-resume-probe (child): guest fd N reopened on /tmp/...` lines are that layer being
+  readable), while a child's own writes reach the parent only when it exits and `wait4` imports them
+  (`litebox-forkwrite-*.tar`). So a fork carry of a fresh `/tmp` fd works, and the same fd handed back the
+  other way over SCM_RIGHTS does not. `only_in_own_writable_layer` (see the Chromium section) is how the carry
+  path tells those apart.
 - The fs layers check permissions against the calling task's fsuid/fsgid (`litebox::fs::set_effective_identity`,
   set at every syscall entry); root bypasses rwx bits. `chown` is real, export/import carry owner and full mode.
   Anything that walks the fs outside a syscall (export/import) must run inside `litebox::fs::with_root_identity`.
@@ -289,8 +303,90 @@ Repro scripts: `.wfgy/chromium_headless.ps1 -Run <n> -Secs N -Extra "<flags>"`.
   `Task::do_syscall`, before `SyscallRequest::try_from_raw` -- ALLOW/LOG run it, ERRNO returns it,
   TRAP/KILL/TRACE deliver SIGSYS via the existing fatal-signal path. Mode, `no_new_privs` and the
   filter stack live on `Process` (TSYNC is free, all three survive clone and execve); a cross-process
-  fork child starts unfiltered, and `/proc/self/status` gained `Seccomp:`/`NoNewPrivs:`.
+  fork child rebuilds the parent's mode, `no_new_privs` and filter programs from the `task-state`
+  spec (`SeccompState::restore_from_spec`, so it is NO LONGER unfiltered), and `/proc/self/status`
+  gained `Seccomp:`/`NoNewPrivs:`. A filter
+  that traps/kills logs `seccomp: SECCOMP_RET_*` with the syscall name (errno verdicts are not
+  logged -- Chromium takes hundreds of those per second on purpose).
   Sandbox-enabled repro: `.wfgy/chromium_sandbox.ps1 -Run <n> -Secs N -Extra "<flags>"` (no `--no-sandbox`).
+- Chromium must run as a NON-ROOT uid (`setpriv --reuid 911 --regid 911 --init-groups`) or the
+  browser refuses to start its sandbox, and `--user-data-dir` must be `chmod 777` when a root shell
+  created it (otherwise `Failed to create .../SingletonLock: Permission denied` = exit 21). Current
+  repro: `.wfgy/chr12.sh` via `.wfgy/guest2.ps1 -Script .wfgy/chr12.sh -Run <n> -Secs N` (add
+  `-ExtraEnv "LITEBOX_LAZY_FILE_MAP=0"` to test without the lazy file map).
+- With seccomp real, Chromium's own sandbox ACTIVATES (`Activated seccomp-bpf sandbox for process
+  type: renderer/utility`), no "No usable sandbox!" FATAL. The renderer then dies ~0.15s in: every
+  renderer (guest pids 57/66/72) faults identically, `Exception(14) error_code=0x4`, `rip` inside
+  the chromium binary, `cr2=0x2c15064` in `0x1e60000..0x3e50000`, whose VMA is
+  `VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC|VM_OWN_FORK_PADDING` -- a fork-padding placeholder with no
+  access bit, i.e. that range got no real mapping in the fork child. `.wfgy/mres2.sh` (mmap
+  PROT_NONE, mprotect a subrange, fork, child reads/writes/mprotects) passes, so the plain
+  reservation-inheritance path is not it. The log also shows Chromium's own
+  `Unexpected SIGSYS received.` -- check whether a filter trapped a syscall before chasing the
+  memory fault.
+- **That renderer fault is FIXED (uncommitted; verified by the `chr14` run, 2026-10-02).** Root
+  cause: `VM_OWN_FORK_PADDING` ranges carry no access bit, so `do_clone`'s copy-group filter
+  (`syscalls/process.rs`) skipped them and `Vmem::adopt` (`litebox/src/mm/linux.rs`) re-created
+  them as reserve-only `PROT_NONE` -- a cross-process fork child lost committed pages its parent
+  had (`error_code=0x4` = not-present, not a protection violation). Fix: admit
+  `VM_OWN_FORK_PADDING` in the copy-group filter, and keep padding ranges committed in `adopt`.
+  Same blind spot still open in `Vmem::duplicate` (`linux.rs` ~1901, the SAME-process fork: it
+  treats padding as "PROT_NONE, nothing to copy" and cannot read the source bytes). After the fix
+  `chr14` shows: sandbox activated for 1 utility + 2 renderers, no renderer AV at all, real
+  network traffic (GCM registration to android.clients.google.com), Blink loading pages.
+  Still open from that run: no `--dump-dom` output; `/proc/57/status`, `/proc/41/task`,
+  `/proc/57/task` ENOENT; one process (pid 38) killed by our own
+  `implausible guest context on resume ... rip=0` SIGSEGV path; and 14 `SECCOMP_RET_TRAP`
+  SIGSYS deliveries (sched_getaffinity/newfstatat/sched_getparam/sched_getscheduler, all in
+  pid 57) after which Chromium logs `Unexpected SIGSYS received.` and continues.
+- **Why no page yet (`chr15`, also true with `--no-sandbox`, so NOT a sandbox problem): Mojo IPC
+  cannot hand a socket to another process.** One 300s run produced 1264 `cannot cross a process
+  boundary ... kind=unix-socket` + 1261 `EOPNOTSUPP` refusals and 2527 `SCM_RIGHTS` lines total
+  (`syscalls/file.rs:8161` `scm_carry_spec` -> `unix.rs` refusal): Chromium sends an unnamed
+  `socketpair` endpoint over a unix socket to each child and we refuse, so the Mojo channel is
+  never established. `U|` carry already exists for the FORK path, so the fix is to reuse it for
+  SCM_RIGHTS. Secondary, now FIXED: a carried `F|...` file fd rebuilt ENOENT when the file lived in
+  the SENDER's own writable layer (`chr16`: `spec=F|1|0|/tmp/cu3/Default/Local Storage/leveldb/LOG`,
+  a `--user-data-dir` fd handed to a process that never received that layer). Predicate:
+  `litebox::fs::FileSystem::only_in_own_writable_layer` (default `false`; `layered::FileSystem`
+  answers "in `upper` and not in `lower`", so a copied-up rootfs file and a copied-up ancestor dir
+  still count as shared), reached as `Task::path_only_in_own_writable_layer` and used by
+  `Task::carriable_file_spec_for_raw_fd`: those go out as `T|` (`snapshot_nameless_file_for_carry`),
+  everything else keeps `F|` -- a rootfs file must stay the SAME inode on both sides. No snapshot
+  form (a directory, or >64MB) falls back to `F|`: today's errno, never a panic. Do NOT fix this
+  class by adding `/tmp/` to `SPILLED_PREFIXES`: it write-throughs EVERY guest temp write to
+  `%TEMP%` and refreshes on every open/stat/getdents. Repro, NOT yet run: `.wfgy/scmrights_tmp.sh`
+  via `.wfgy/guest2.ps1 -Script .wfgy/scmrights_tmp.sh -Run scm1`. For the repro alone, adding
+  `/tmp/cu3/` to the prefix list is legitimate -- the reasoning that put `/tmp/.config/chromium`
+  there. Residual: a fork child adopts the parent's layer into its own `in_mem`, so an inherited
+  file also answers "mine alone" and goes out as `T|` (right bytes, but unlinked, no path).
+- **SCM_RIGHTS and a cross-process fork now share ONE carry path (2026-10-02).** `scm_carry_spec`
+  (`syscalls/file.rs`) used to return `Option<String>`, so "refused" and "no rebuild for this
+  kind" were the same value and the reason never reached a log; it now returns
+  `Result<Option<String>, &'static str>` and `net.rs` logs `reason=` with every refusal -- read
+  that field in the next `chr` run's `.err` before assuming WHICH state Chromium's sockets are
+  in, since this pass was written without it. `scm_carry_spec` calls `UnixSocket::fork_carry`
+  with `child_pid == 0`, now documented as the SCM_RIGHTS flavour: a listener is no longer
+  advertised under a pid no process has (that is what used to force the carry to be abandoned --
+  it now registers nothing and the RECEIVER registers the address under its own pid, flagged by
+  a trailing `,1` on the `L` spec, which a fork's 7-field spec reads as absent = "do not"), so a
+  listener carries as well. A connected endpoint, an unbound socket and a listener now cross; a
+  bound-but-unconnected socket, a connect in progress and a bound or connected DATAGRAM socket
+  are still refused with EOPNOTSUPP on purpose (`SharedView::send` says which).
+  Repro (a socketpair end and a listener, both created AFTER the fork, so only the carry can
+  deliver them; the parent closes its listener copy, so its `connect()` has to reach the child's):
+  `.wfgy/guest2.ps1 -Script .wfgy/scmring.sh -Run scmring1 -Secs 90` -> `SCMRING PASS|FAIL`. Also seen: `Failed to adjust
+  OOM score of renderer with pid 87: No such file or directory` = `/proc/<pid>/oom_score_adj` for
+  a pid in another host process.
+- **`/proc/<pid>` for other host processes (chr14's `/proc/57/status`, `/proc/41/task`,
+  `/proc/57/task` ENOENT)**: `ProcSelfTable` is per host process, so a pid running in a sibling
+  Windows process never had a row. `/proc` now resolves a pid directory when it has a local row,
+  when it is the caller's own pid, or when `GlobalState::process_table` has it -- the last via
+  `litebox::fs::procfs::set_pid_known_fn`, a plain `fn` pointer hook (set in `LinuxShimBuilder::build`) because `/proc` is mounted by `default_fs` BEFORE `GlobalState` exists and must hold
+  nothing process-relative. Added `/proc/[pid]/statm` (there was no `statm` anywhere) and
+  `/proc/self/statm`, rendered by a new `ProcSelfInfo::statm` closure over the same page manager
+  `maps` uses (nulled in `inherit`/`portable_snapshot`); `install_task_state` now publishes a
+  pid-only row plus one warn instead of silently nothing when the carried identity is absent.
 - Next sandbox blocker is NOT seccomp: `zygote_host_impl_linux.cc:117` requires
   `Credentials::CanCreateProcessInNewUserNS()`, and the webtop image ships no `chrome_sandbox` SUID helper, so
   it FATALs "No usable sandbox!" (as root it dies earlier at :102, crbug 638180). Measured: `unshare` accepts

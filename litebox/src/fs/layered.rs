@@ -1244,6 +1244,20 @@ impl<
         self.upper.services_own_writes(path) || self.lower.services_own_writes(path)
     }
 
+    /// Present in the writable layer and absent from everything below it: this process is the
+    /// only one holding these bytes, so a sibling reopening the path gets `ENOENT` (in the
+    /// shim's stack, `upper` is the per-process `in_mem` overlay and `lower` is the shared
+    /// rootfs plus whatever layer a fork parent exported into this process).
+    ///
+    /// Both halves matter. A file created here is in `upper` only; a rootfs file copied up for a
+    /// write, and every ancestor directory `mkdir_migrating_ancestor_dirs` copied up, is in
+    /// `upper` too -- and a sibling can still open those by name, which is exactly why a carry
+    /// must keep reopening them. So the lower lookup is what separates "mine alone" from "also
+    /// down there".
+    fn only_in_own_writable_layer(&self, path: &str) -> bool {
+        self.upper.file_status(path).is_ok() && self.lower.file_status(path).is_err()
+    }
+
     fn truncate(
         &self,
         fd: &FileFd<Platform, Upper, Lower>,

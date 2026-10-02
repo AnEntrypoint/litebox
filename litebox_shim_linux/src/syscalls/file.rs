@@ -11,7 +11,7 @@ use alloc::{
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{Mode, OFlags, SeekWhence},
+    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, StdioStream, TimeProvider},
@@ -7985,6 +7985,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// Cross-process carry spec for a regular-file fd, or `None` if `raw_fd` is not one.
+    ///
+    /// `F|<flags>|<offset>|<path>` says "reopen this path", which is right for rootfs content --
+    /// both sides then hold the same stored bytes -- and wrong for a file that exists only in
+    /// this process's own writable layer: the writable layer is per host process, so the
+    /// receiver's `open` answers `ENOENT`. Chromium hit exactly that handing a
+    /// `--user-data-dir` fd back out of `/tmp/cu3` (`.wfgy/chr16.err`:
+    /// `spec=F|1|0|/tmp/cu3/Default/Local Storage/leveldb/LOG`). Those are carried as `T|`, a
+    /// byte-level [`Self::snapshot_nameless_file_for_carry`], so the receiver gets the real
+    /// bytes rather than a name it cannot resolve.
+    ///
+    /// The two are not interchangeable the other way: a rootfs file MUST stay `F|`, because two
+    /// processes that each hold a private snapshot of it would silently stop sharing writes.
+    ///
+    /// A file only in this layer that has no snapshot form -- a directory, or one over the
+    /// 64 MiB snapshot cap -- falls back to `F|`, which is the reopen that already fails there
+    /// today. Wrong, and unchanged, but it is an errno the receiver sees and reports; nothing
+    /// here panics, since the host process is the whole guest session.
+    ///
+    /// Known over-application: a cross-process fork child ADOPTS the parent's writable layer into
+    /// its own `in_mem` (`import_writable_layer`), so a file it merely inherited also answers
+    /// "mine alone" and goes out as `T|`. That is still the sender's bytes, which is closer to
+    /// real `SCM_RIGHTS` (one shared open file description) than a reopen landing on a copy that
+    /// has since diverged; what the receiver loses is the path, its fd being unlinked under
+    /// `/dev/shm`.
+    pub(crate) fn carriable_file_spec_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
+        let (path, flags, offset) = self.carriable_file_for_raw_fd(raw_fd)?;
+        if self.path_only_in_own_writable_layer(&path)
+            && let Some(spec) = self.snapshot_nameless_file_for_carry(raw_fd)
+        {
+            return Some(spec);
+        }
+        Some(alloc::format!("F|{flags}|{offset}|{path}"))
+    }
+
+    /// Whether `path` resolves only inside this process's own writable layer, so that another
+    /// host process reopening it would not find these bytes.
+    ///
+    /// Thin wrapper: the answer comes from the fs itself (`FileSystem::only_in_own_writable_layer`,
+    /// answered by the layered fs, the only thing that knows which layer holds the entry).
+    fn path_only_in_own_writable_layer(&self, path: &str) -> bool {
+        self.files.borrow().fs.only_in_own_writable_layer(path)
+    }
+
     /// An eventfd's carryable state, if `raw_fd` names one.
     ///
     /// Counterpart to [`Self::carriable_file_for_raw_fd`] for the cheapest subsystem that was
@@ -8170,13 +8217,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `Ok(None)` is the ordinary "this kind has no cross-process rebuild" case (pipes, epoll,
     /// inet sockets, pty masters ...); `Err(reason)` is a unix socket we COULD have carried had it
     /// been in a reachable state, which is the one worth reading in a log.
+    ///
+    /// A regular file whose bytes live only in THIS process's writable layer is carried as `T|`,
+    /// not `F|` -- see [`Self::carriable_file_spec_for_raw_fd`].
     pub(crate) fn scm_carry_spec(
         &self,
         raw_fd: usize,
     ) -> Result<Option<alloc::string::String>, &'static str> {
         let mut unix_refusal: Option<&'static str> = None;
-        if let Some((path, flags, offset)) = self.carriable_file_for_raw_fd(raw_fd) {
-            return Ok(Some(alloc::format!("F|{flags}|{offset}|{path}")));
+        if let Some(spec) = self.carriable_file_spec_for_raw_fd(raw_fd) {
+            return Ok(Some(spec));
         }
         if let Some((path, flags)) = self.carriable_pty_slave_for_raw_fd(raw_fd) {
             return Ok(Some(alloc::format!("F|{flags}|0|{path}")));
