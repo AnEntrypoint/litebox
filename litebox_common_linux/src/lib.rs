@@ -4353,6 +4353,9 @@ pub enum SyscallRequest {
         /// Guest address of the `struct sock_fprog` for `SECCOMP_SET_MODE_FILTER`.
         args: usize,
     },
+    Unshare {
+        flags: u64,
+    },
     Alarm {
         seconds: u32,
     },
@@ -5413,22 +5416,22 @@ impl SyscallRequest {
                 mask,
                 statxbuf:*,
             }),
-            // Namespace creation is genuinely not permitted here, and the DISTINCTION between
-            // "not permitted" (EPERM) and "broken/unknown" (EINVAL/ENOSYS) is load-bearing for
-            // callers. Sandboxing libraries probe for namespace support and degrade gracefully
-            // when refused: glycin (the image decoder modern Alpine's gdk-pixbuf delegates ALL
-            // PNG/JPEG decoding to) string-matches bwrap's stderr for "No permissions to create
-            // a new namespace" / "Permission denied" and then proceeds unsandboxed, logging
-            // "Glycin running without sandbox". Returning ENOSYS/EINVAL instead reads to such a
-            // caller as "something is broken" rather than "you may not", so it propagates a hard
-            // failure -- which is what made xfce4-panel abort on GTK's fallback icon decode.
-            //
-            // EPERM is also what real Linux returns for unprivileged namespace creation when it
-            // is administratively disabled, so this is closer to Linux behaviour, not further
-            // from it. Deliberately NOT a fake namespace implementation: pretending to isolate
-            // would be far worse than an honest refusal, because callers would believe they are
-            // sandboxed when they are not.
-            Sysno::unshare | Sysno::setns => {
+            // `unshare(CLONE_NEWUSER)` creates a real user namespace: the caller keeps its ids but
+            // gains every capability inside the new one, and declares what its ids map to by
+            // writing `/proc/self/{uid_map,gid_map,setgroups}` (see
+            // `litebox_shim_linux::syscalls::process::Task::sys_unshare`). Chromium's sandbox
+            // needs exactly this and nothing else, and refuses to start without it.
+            Sysno::unshare => sys_req!(Unshare { flags }),
+            // `setns` joins an existing namespace and the remaining `unshare` namespace flags
+            // (mount, pid, net, ...) are not modelled: EPERM, not EINVAL/ENOSYS, because that
+            // DISTINCTION is load-bearing for callers. Sandboxing libraries probe for namespace
+            // support and degrade gracefully when REFUSED: glycin (which modern Alpine's
+            // gdk-pixbuf delegates all PNG/JPEG decoding to) string-matches bwrap's stderr for
+            // "No permissions to create a new namespace" and then proceeds unsandboxed, while
+            // EINVAL reads to it as "something is broken" and fails hard -- which is what made
+            // xfce4-panel abort on GTK's fallback icon decode. EPERM is also what real Linux
+            // reports for unprivileged namespace creation that is administratively disabled.
+            Sysno::setns => {
                 return Err(errno::Errno::EPERM);
             }
             // `membarrier` asks the kernel to establish memory ordering across all threads of

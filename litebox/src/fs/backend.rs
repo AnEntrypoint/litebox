@@ -137,6 +137,16 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// adding `\0`s.
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
 
+    /// Whether a write to `path` is answered by this backend itself rather than being a byte change
+    /// to a file a layering filesystem could copy into its own upper layer: a `/proc` control file
+    /// whose write changes the calling process (`/proc/self/uid_map` remaps its ids) is the case
+    /// that matters. Copying such a file up produces an ordinary file that shadows the backend, so
+    /// the write succeeds and its effect never happens. `false` unless overridden.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn services_own_writes(&self, path: &str) -> bool {
+        false
+    }
+
     /// Change the permissions of an already-open file handle, matching `fchmod(2)`.
     /// Must operate on `h` directly, never re-resolve by path: wlroots' `util/shm.c`
     /// `allocate_shm_file_pair` unlinks before `fchmod` (gm mut-1789043689150). Scoped to

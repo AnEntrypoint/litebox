@@ -112,6 +112,14 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         reset_offset: bool,
     ) -> Result<(), TruncateError>;
 
+    /// Whether a write to `path` must reach this filesystem's own backend instead of being copied
+    /// into some layer above it: true for a file whose write is an action on the caller (`/proc/
+    /// self/uid_map` remaps its ids) rather than a byte change to stored contents. `false` unless
+    /// overridden. See [`backend::Backend::services_own_writes`].
+    fn services_own_writes(&self, _path: &str) -> bool {
+        false
+    }
+
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
@@ -509,6 +517,54 @@ pub mod ident {
     /// use it to recover from a holder that died without releasing.
     pub fn set_thread_alive_fn(f: fn(usize) -> bool) {
         THREAD_ALIVE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// A guest-writable id-map control file: `/proc/self/{uid_map,gid_map,setgroups}`. Writing one
+    /// is how a process in a new user namespace declares which outer ids it maps (`setgroups`
+    /// instead takes `deny`/`allow`).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum IdMapFile {
+        UidMap,
+        GidMap,
+        Setgroups,
+    }
+
+    static ID_MAP_WRITE_FN: AtomicUsize = AtomicUsize::new(0);
+    static ID_MAP_READ_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how a write to one of those files is applied to the calling process. Takes the
+    /// file and the bytes written; returns `Ok(())` or an errno.
+    pub fn set_id_map_write_fn(f: fn(IdMapFile, &[u8]) -> Result<(), u32>) {
+        ID_MAP_WRITE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Registers how the current contents of one of those files are rendered.
+    pub fn set_id_map_read_fn(f: fn(IdMapFile) -> alloc::vec::Vec<u8>) {
+        ID_MAP_READ_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Applies `buf` to `file`; `EPERM` when no guest process model registered a handler (and
+    /// `EIO` when the caller is not a guest thread at all).
+    pub fn write_id_map_file(file: IdMapFile, buf: &[u8]) -> Result<(), u32> {
+        let raw = ID_MAP_WRITE_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return Err(1);
+        }
+        // SAFETY: only `set_id_map_write_fn` stores here, and it stores its own fn type.
+        let f: fn(IdMapFile, &[u8]) -> Result<(), u32> = unsafe { core::mem::transmute(raw) };
+        f(file, buf)
+    }
+
+    /// Current contents of `file`, empty when nothing registered a renderer.
+    #[must_use]
+    pub fn read_id_map_file(file: IdMapFile) -> alloc::vec::Vec<u8> {
+        let raw = ID_MAP_READ_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return alloc::vec::Vec::new();
+        }
+        // SAFETY: only `set_id_map_read_fn` stores here, and it stores its own fn type.
+        let f: fn(IdMapFile) -> alloc::vec::Vec<u8> = unsafe { core::mem::transmute(raw) };
+        f(file)
     }
 
     /// Non-zero token naming the calling thread, or 0 when the platform registered no id function.

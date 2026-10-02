@@ -785,6 +785,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
+    fn services_own_writes(&self, path: &str) -> bool {
+        self.backend.services_own_writes(path)
+    }
+
     fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError> {
         let entry = self
             .litebox

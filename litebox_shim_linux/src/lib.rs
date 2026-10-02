@@ -707,6 +707,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                     },
                 )
             });
+        // `/proc/self/{uid_map,gid_map,setgroups}` and the user namespaces they describe are
+        // credentials, not files: the fs layer owns the paths, so it calls back into the shim,
+        // which owns the task those files belong to. Registered per process (each fork child runs
+        // `build()` too) because the fs module stores them as plain function pointers.
+        litebox::fs::ident::set_id_map_write_fn(syscalls::process::apply_id_map_write);
+        litebox::fs::ident::set_id_map_read_fn(syscalls::process::read_id_map_file);
         LinuxShim(GlobalStateHandle {
             inner,
             litebox: my_litebox,
@@ -2079,6 +2085,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let start = timed.then(|| self.global.platform.now());
         litebox::fs::set_effective_identity(self.creds().fsuid, self.creds().fsgid);
+        // A write to `/proc/self/uid_map` is a credentials change, so the fs layer hands it to the
+        // shim, which needs to know WHOSE syscall is running to answer it. Published for this
+        // dispatch only (restored on drop), and only the id-map files read it.
+        let _current_credentials =
+            crate::syscalls::process::publish_current_credentials(&self.credentials);
 
         // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`: log syscall ENTRY (before dispatch, so a syscall
         // that blocks forever still shows up -- `LITEBOX_STRACE_SUMMARY`'s aggregate-only
@@ -2692,6 +2703,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
+            SyscallRequest::Unshare { flags } => syscall!(sys_unshare(flags)),
             SyscallRequest::Seccomp {
                 operation,
                 flags,

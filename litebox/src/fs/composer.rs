@@ -707,6 +707,21 @@ impl Backend for Composer {
             .truncate(&h.handle, length)
     }
 
+    /// Answered by whichever mount owns `path`: the deepest mount whose path is a prefix of it,
+    /// which is the same mount [`Self::write`] would reach for an open handle on that path.
+    fn services_own_writes(&self, path: &str) -> bool {
+        let components: Vec<String> = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        self.mounts
+            .iter()
+            .filter(|mount| components.starts_with(&mount.path[..]))
+            .max_by_key(|mount| mount.path.len())
+            .is_some_and(|mount| mount.backend.services_own_writes(path))
+    }
+
     fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.chmod(&h.handle, mode)

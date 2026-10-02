@@ -1153,6 +1153,80 @@ impl Drop for SourceBridgeRegistration {
         }
     }
 }
+/// One extent of an id map: `count` consecutive ids starting at `inner` inside a user namespace
+/// are the ids starting at `outer` as the kernel (and every enclosing namespace) knows them.
+#[derive(Clone, Copy)]
+pub(crate) struct IdExtent {
+    inner: u32,
+    outer: u32,
+    count: u32,
+}
+
+/// What an id with no mapping into the caller's user namespace reads back as
+/// (`/proc/sys/kernel/overflowuid`, `overflowgid`).
+const OVERFLOW_ID: u32 = 65534;
+
+/// Parses the content of `/proc/self/{uid_map,gid_map}`: whitespace-separated
+/// `inner outer count` triples, as the kernel accepts them.
+fn parse_id_extents(buf: &[u8]) -> Option<alloc::vec::Vec<IdExtent>> {
+    let text = core::str::from_utf8(buf).ok()?;
+    let mut extents = alloc::vec::Vec::new();
+    let mut numbers = text.split_whitespace();
+    while let Some(inner) = numbers.next() {
+        let (outer, count) = (numbers.next()?, numbers.next()?);
+        let (inner, outer, count) = (
+            inner.parse::<u32>().ok()?,
+            outer.parse::<u32>().ok()?,
+            count.parse::<u32>().ok()?,
+        );
+        if count == 0 || inner.checked_add(count).is_none() || outer.checked_add(count).is_none() {
+            return None;
+        }
+        extents.push(IdExtent {
+            inner,
+            outer,
+            count,
+        });
+    }
+    Some(extents)
+}
+
+/// `None` (the initial namespace) encodes as `-`; a user namespace encodes as `;`-joined
+/// `inner.outer.count` extents, empty when nothing is mapped yet.
+fn encode_id_map(map: &Option<alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
+    let Some(extents) = map else {
+        return alloc::string::String::from("-");
+    };
+    let encoded: alloc::vec::Vec<alloc::string::String> = extents
+        .iter()
+        .map(|extent| alloc::format!("{}.{}.{}", extent.inner, extent.outer, extent.count))
+        .collect();
+    encoded.join(";")
+}
+
+fn decode_id_map(field: &str) -> Option<Option<alloc::vec::Vec<IdExtent>>> {
+    if field == "-" {
+        return Some(None);
+    }
+    if field.is_empty() {
+        return Some(Some(alloc::vec::Vec::new()));
+    }
+    let mut extents = alloc::vec::Vec::new();
+    for extent in field.split(';') {
+        let mut numbers = extent.split('.');
+        let (inner, outer, count) = (numbers.next()?, numbers.next()?, numbers.next()?);
+        if numbers.next().is_some() {
+            return None;
+        }
+        extents.push(IdExtent {
+            inner: inner.parse().ok()?,
+            outer: outer.parse().ok()?,
+            count: count.parse().ok()?,
+        });
+    }
+    Some(Some(extents))
+}
+
 /// Credentials of a process: real/effective/saved/filesystem user and group ids, supplementary
 /// groups, capability sets and the nice value.
 ///
@@ -1169,6 +1243,24 @@ pub(crate) struct Credentials {
     pub fsuid: u32,
     pub fsgid: u32,
     pub groups: alloc::vec::Vec<u32>,
+    /// Translation between the ids this task sees and the ids the kernel -- the file system, and
+    /// every enclosing namespace -- knows them by. `None` is the initial namespace, where every
+    /// id maps to itself; `Some` is a user namespace, and an EMPTY one (a namespace created but
+    /// not mapped yet) maps nothing, so every id reads back as [`OVERFLOW_ID`].
+    ///
+    /// Guest-visible getters translate kernel ids to inner ids; everything that decides access
+    /// uses the kernel id, which is what stops `unshare -Ur` from granting real root.
+    pub uid_map: Option<alloc::vec::Vec<IdExtent>>,
+    pub gid_map: Option<alloc::vec::Vec<IdExtent>>,
+    /// `/proc/self/setgroups` was written with `deny`, which is what lets a task with no
+    /// `CAP_SETGID` in the parent namespace map its own gid.
+    pub setgroups_denied: bool,
+    /// Whether the caller holds `CAP_SETUID`/`CAP_SETGID` in the namespace ENCLOSING the one it is
+    /// in -- the capability the kernel checks before letting someone map an id that is not their
+    /// own. In the initial namespace that means root; the owner of a user namespace always holds
+    /// every capability INSIDE it, but that is not what this records, which is what stops
+    /// `unshare -Ur` from mapping -- and so owning -- anyone else's id.
+    pub setuid_in_parent_ns: bool,
     /// Effective, permitted and inheritable capability sets (bit N = capability N).
     pub cap_eff: u64,
     pub cap_perm: u64,
@@ -1197,6 +1289,10 @@ impl Credentials {
             fsuid: euid,
             fsgid: egid,
             groups: alloc::vec![gid],
+            uid_map: None,
+            gid_map: None,
+            setgroups_denied: false,
+            setuid_in_parent_ns: euid == 0,
             cap_eff: if euid == 0 { CAP_FULL } else { 0 },
             cap_perm: if euid == 0 { CAP_FULL } else { 0 },
             cap_inh: 0,
@@ -1212,11 +1308,162 @@ impl Credentials {
         self.euid == 0 || self.cap_perm & CAP_SETUID_BIT != 0
     }
 
+    /// What a kernel id (`self.uid` and friends, ids as every namespace enclosing this one knows
+    /// them) reads back as INSIDE this namespace: [`OVERFLOW_ID`] when there is no mapping for it,
+    /// which is exactly why `unshare -Ur` reports `nobody` instead of root.
+    fn visible_id(map: &Option<alloc::vec::Vec<IdExtent>>, kernel: u32) -> u32 {
+        let Some(extents) = map else {
+            return kernel;
+        };
+        extents
+            .iter()
+            .find_map(|extent| {
+                kernel
+                    .checked_sub(extent.outer)
+                    .filter(|offset| *offset < extent.count)
+                    .map(|offset| extent.inner + offset)
+            })
+            .unwrap_or(OVERFLOW_ID)
+    }
+
+    /// What `inner` (an id as the namespace itself names it) is outside it: `None` when nothing
+    /// maps it, which is what makes an unmapped id unsettable and unownable.
+    fn kernel_id(map: &Option<alloc::vec::Vec<IdExtent>>, inner: u32) -> Option<u32> {
+        let Some(extents) = map else {
+            return Some(inner);
+        };
+        extents.iter().find_map(|extent| {
+            inner
+                .checked_sub(extent.inner)
+                .filter(|offset| *offset < extent.count)
+                .map(|offset| extent.outer + offset)
+        })
+    }
+
+    pub(crate) fn visible_uid(&self) -> u32 {
+        Self::visible_id(&self.uid_map, self.uid)
+    }
+
+    pub(crate) fn visible_euid(&self) -> u32 {
+        Self::visible_id(&self.uid_map, self.euid)
+    }
+
+    pub(crate) fn visible_suid(&self) -> u32 {
+        Self::visible_id(&self.uid_map, self.suid)
+    }
+
+    pub(crate) fn visible_gid(&self) -> u32 {
+        Self::visible_id(&self.gid_map, self.gid)
+    }
+
+    pub(crate) fn visible_egid(&self) -> u32 {
+        Self::visible_id(&self.gid_map, self.egid)
+    }
+
+    pub(crate) fn visible_sgid(&self) -> u32 {
+        Self::visible_id(&self.gid_map, self.sgid)
+    }
+
+    /// These credentials as they look the instant the task creates a new user namespace: the same
+    /// kernel ids (nothing about the task changed outside), an EMPTY map, and every capability --
+    /// the owner of a new namespace always holds all of them inside it, which is what lets a
+    /// sandbox map its own id and then drop them.
+    pub(crate) fn in_new_user_namespace(&self) -> Self {
+        let mut creds = self.clone();
+        creds.uid_map = Some(alloc::vec::Vec::new());
+        creds.gid_map = Some(alloc::vec::Vec::new());
+        creds.setgroups_denied = false;
+        creds.cap_eff = CAP_FULL;
+        creds.cap_perm = CAP_FULL;
+        creds.setuid_in_parent_ns = self.holds_setuid_here();
+        creds
+    }
+
+    /// Whether the caller holds `CAP_SETUID` in the namespace it is in right now: root in the
+    /// initial namespace, or -- inside a user namespace -- the namespace's owner, which holds every
+    /// capability there. This is what the task keeps in the namespace IT goes on to create.
+    fn holds_setuid_here(&self) -> bool {
+        self.cap_eff & CAP_SETUID_BIT != 0 || (self.uid_map.is_none() && self.euid == 0)
+    }
+
+    /// Whether the caller may map ids other than its own; see [`Self::setuid_in_parent_ns`].
+    fn can_map_arbitrary_ids(&self) -> bool {
+        self.setuid_in_parent_ns
+    }
+
+    /// Applies a write to `/proc/self/{uid_map,gid_map,setgroups}`, following the kernel's rules:
+    /// a map is writable once only, an unprivileged caller maps only its own id 1:1, and
+    /// `gid_map` additionally requires `setgroups` to have been denied.
+    pub(crate) fn apply_id_map(
+        &mut self,
+        file: litebox::fs::ident::IdMapFile,
+        buf: &[u8],
+    ) -> Result<(), Errno> {
+        match file {
+            litebox::fs::ident::IdMapFile::Setgroups => {
+                // No `setgroups` file in the initial namespace: every id is already mapped.
+                if self.uid_map.is_none() {
+                    return Err(Errno::EPERM);
+                }
+                let deny = match core::str::from_utf8(buf).map(str::trim) {
+                    Ok("deny") => true,
+                    Ok("allow") => false,
+                    _ => return Err(Errno::EINVAL),
+                };
+                if !deny && !self.can_map_arbitrary_ids() {
+                    return Err(Errno::EPERM);
+                }
+                self.setgroups_denied = deny;
+                Ok(())
+            }
+            litebox::fs::ident::IdMapFile::GidMap
+                if !self.setgroups_denied && !self.can_map_arbitrary_ids() =>
+            {
+                Err(Errno::EPERM)
+            }
+            litebox::fs::ident::IdMapFile::UidMap => self.write_id_map(buf, true),
+            litebox::fs::ident::IdMapFile::GidMap => self.write_id_map(buf, false),
+        }
+    }
+
+    fn write_id_map(&mut self, buf: &[u8], uid: bool) -> Result<(), Errno> {
+        if self.uid_map.is_none() {
+            return Err(Errno::EPERM);
+        }
+        let mapped = if uid { &self.uid_map } else { &self.gid_map }
+            .as_ref()
+            .is_some_and(|extents| !extents.is_empty());
+        if mapped {
+            return Err(Errno::EPERM);
+        }
+        let extents = parse_id_extents(buf).ok_or(Errno::EINVAL)?;
+        if !self.can_map_arbitrary_ids() {
+            // Unprivileged: a single one-id extent, and it must be the caller's own id.
+            let (own, extent) = if uid {
+                (self.euid, extents.first())
+            } else {
+                (self.egid, extents.first())
+            };
+            let Some(extent) = extent else {
+                return Err(Errno::EINVAL);
+            };
+            if extents.len() != 1 || extent.count != 1 || extent.outer != own {
+                return Err(Errno::EPERM);
+            }
+        }
+        if uid {
+            self.uid_map = Some(extents);
+        } else {
+            self.gid_map = Some(extents);
+        }
+        Ok(())
+    }
+
     fn to_spec(&self) -> alloc::string::String {
         let groups: alloc::vec::Vec<alloc::string::String> =
             self.groups.iter().map(|g| alloc::format!("{g}")).collect();
         alloc::format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.uid,
             self.euid,
             self.suid,
@@ -1232,6 +1479,10 @@ impl Credentials {
             self.cap_perm,
             self.cap_inh,
             groups.join(":"),
+            u8::from(self.setgroups_denied),
+            u8::from(self.setuid_in_parent_ns),
+            encode_id_map(&self.uid_map),
+            encode_id_map(&self.gid_map),
         )
     }
 
@@ -1252,6 +1503,10 @@ impl Credentials {
             .filter(|group| !group.is_empty())
             .map(|group| group.parse().ok())
             .collect::<Option<_>>()?;
+        let setgroups_denied = next()? == "1";
+        let setuid_in_parent_ns = next()? == "1";
+        let uid_map = decode_id_map(next()?)?;
+        let gid_map = decode_id_map(next()?)?;
         Some(Self {
             uid: ids[0],
             euid: ids[1],
@@ -1262,6 +1517,10 @@ impl Credentials {
             fsuid: ids[6],
             fsgid: ids[7],
             groups,
+            uid_map,
+            gid_map,
+            setgroups_denied,
+            setuid_in_parent_ns,
             cap_eff,
             cap_perm,
             cap_inh,
@@ -1278,6 +1537,13 @@ impl Credentials {
         let allowed = |v: u32| v == u32::MAX || holds(v);
         if !self.is_privileged() && !(allowed(ruid) && allowed(euid) && allowed(suid)) {
             return Err(Errno::EPERM);
+        }
+        // Inside a user namespace an id with no mapping into it does not exist at all, so naming
+        // one is `EINVAL` rather than `EPERM`.
+        for value in [ruid, euid, suid] {
+            if value != u32::MAX && Self::kernel_id(&self.uid_map, value).is_none() {
+                return Err(Errno::EINVAL);
+            }
         }
         if ruid != u32::MAX {
             self.uid = ruid;
@@ -1298,6 +1564,11 @@ impl Credentials {
         let allowed = |v: u32| v == u32::MAX || holds(v);
         if !self.is_privileged() && !(allowed(rgid) && allowed(egid) && allowed(sgid)) {
             return Err(Errno::EPERM);
+        }
+        for value in [rgid, egid, sgid] {
+            if value != u32::MAX && Self::kernel_id(&self.gid_map, value).is_none() {
+                return Err(Errno::EINVAL);
+            }
         }
         if rgid != u32::MAX {
             self.gid = rgid;
@@ -3089,6 +3360,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_clone(ctx, &args, true)
     }
 
+    /// Handle syscall `unshare`. `CLONE_NEWUSER` is the one flag with a real implementation: the
+    /// caller keeps its kernel ids and gains every capability, but inside a namespace whose map is
+    /// still empty -- every id reads back as `OVERFLOW_ID` until the caller maps it by writing
+    /// `/proc/self/{uid_map,gid_map,setgroups}`. Chromium's sandbox (and bwrap, and `unshare -U`)
+    /// all start exactly here.
+    ///
+    /// The other flags stay refused with EPERM rather than silently "succeeding": litebox models no
+    /// mount/pid/net/uts/ipc/cgroup namespace, and claiming one would be a lie a sandbox would
+    /// rely on. `/proc/self/ns/` only contains `user`, so namespace-aware callers (Chromium reads
+    /// that directory to decide which flags to ask for) never get here for the others.
+    pub(crate) fn sys_unshare(&self, flags: u64) -> Result<usize, Errno> {
+        const UNSHAREABLE: CloneFlags = CloneFlags::THREAD
+            .union(CloneFlags::SIGHAND)
+            .union(CloneFlags::VM);
+        // Every namespace but user: none of them is implemented, so a caller asking for one gets a
+        // refusal rather than a success that isolates nothing.
+        const UNIMPLEMENTED_NAMESPACES: CloneFlags = CloneFlags::NEWNS
+            .union(CloneFlags::NEWPID)
+            .union(CloneFlags::NEWNET)
+            .union(CloneFlags::NEWIPC)
+            .union(CloneFlags::NEWUTS)
+            .union(CloneFlags::NEWCGROUP);
+        let flags = CloneFlags::from_bits_retain(flags);
+        if flags.is_empty() {
+            return Ok(0);
+        }
+        if flags.intersects(UNSHAREABLE) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.intersects(UNIMPLEMENTED_NAMESPACES) {
+            log_unsupported!("unshare with unimplemented namespace flags: {flags:?}");
+            return Err(Errno::EPERM);
+        }
+        if flags.contains(CloneFlags::NEWUSER) {
+            // The caller keeps its kernel ids and gains every capability, but inside a namespace
+            // whose map is still empty: every id reads back as `OVERFLOW_ID` until it is mapped.
+            self.set_creds(self.creds().in_new_user_namespace());
+            return Ok(0);
+        }
+        log_unsupported!("unshare with unsupported flags: {flags:?}");
+        Err(Errno::EPERM)
+    }
+
     /// Creates a new thread or process.
     ///
     /// The address-space decision is keyed on `CLONE_VM` alone, not on the historical
@@ -4508,6 +4822,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | CloneFlags::CHILD_CLEARTID
             | CloneFlags::CHILD_SETTID
             | CloneFlags::VFORK
+            // `CLONE_NEWUSER` is implemented, not faked: the child gets a real user namespace of
+            // its own (see `Credentials::in_new_user_namespace` and `sys_unshare`), which is the
+            // one namespace litebox models and the only one `/proc/self/ns/` advertises.
+            | CloneFlags::NEWUSER
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM
             // `CLONE_CLEAR_SIGHAND` resets the child's signal handlers to their defaults. This is
@@ -4532,7 +4850,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Deliberately NOT a fake namespace implementation: claiming isolation we do not
         // provide would be far worse than an honest refusal.
         const NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWNS
-            .union(CloneFlags::NEWUSER)
             .union(CloneFlags::NEWPID)
             .union(CloneFlags::NEWNET)
             .union(CloneFlags::NEWIPC)
@@ -4544,6 +4861,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags & NAMESPACE_FLAGS
             );
             return Err(Errno::EPERM);
+        }
+        // `CLONE_NEWUSER` may not be combined with a flag that SHARES the very thing a new user
+        // namespace is supposed to own: the caller's thread group, signal-handler table or address
+        // space, or its fs context (which cannot cross a user namespace boundary).
+        if flags.contains(CloneFlags::NEWUSER)
+            && flags.intersects(CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM)
+            || flags.contains(CloneFlags::NEWUSER | CloneFlags::FS)
+        {
+            log_unsupported!("clone with CLONE_NEWUSER and a flag it cannot share: {flags:?}");
+            return Err(Errno::EINVAL);
         }
         // Linux rejects this pair outright: one asks to SHARE the handler table, the other to
         // reset it, and there is no coherent meaning for both.
@@ -5781,7 +6108,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
                         ppid: Cell::new(ppid),
-                        credentials: RefCell::new(self.creds()),
+                        // A `CLONE_NEWUSER` child starts in its own user namespace: same kernel
+                        // ids, empty id map, all capabilities inside it.
+                        credentials: RefCell::new(if flags.contains(CloneFlags::NEWUSER) {
+                            Arc::new(self.creds().in_new_user_namespace())
+                        } else {
+                            self.creds()
+                        }),
                         comm: self.comm.clone(),
                         // A child inherits `PR_SET_DUMPABLE`, as on real Linux.
                         dumpable: self.dumpable.clone(),
@@ -6639,9 +6972,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process().sid.load(Ordering::Relaxed) == self.pid.get()
     }
 
-    /// Handle syscall `getuid`.
+    /// Handle syscall `getuid`. Reports the id as this task's user namespace names it, not the
+    /// kernel id: inside a namespace that has not mapped the caller, that is `OVERFLOW_ID`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.creds().uid
+        self.creds().visible_uid()
     }
 
     /// Handle syscall `getresuid`.
@@ -6652,7 +6986,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         suid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
         let c = self.creds();
-        for (ptr, value) in [(ruid, c.uid), (euid, c.euid), (suid, c.suid)] {
+        for (ptr, value) in [
+            (ruid, c.visible_uid()),
+            (euid, c.visible_euid()),
+            (suid, c.visible_suid()),
+        ] {
             ptr.write_at_offset::<Platform>(0, value)
                 .ok_or(Errno::EFAULT)?;
         }
@@ -6667,7 +7005,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         sgid: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
         let c = self.creds();
-        for (ptr, value) in [(rgid, c.gid), (egid, c.egid), (sgid, c.sgid)] {
+        for (ptr, value) in [
+            (rgid, c.visible_gid()),
+            (egid, c.visible_egid()),
+            (sgid, c.visible_sgid()),
+        ] {
             ptr.write_at_offset::<Platform>(0, value)
                 .ok_or(Errno::EFAULT)?;
         }
@@ -6676,17 +7018,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.creds().euid
+        self.creds().visible_euid()
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.creds().gid
+        self.creds().visible_gid()
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.creds().egid
+        self.creds().visible_egid()
     }
 
     /// This task's own credentials, as reported to a peer via `SO_PEERCRED`.
@@ -6775,10 +7117,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
             })
             .unwrap_or_default();
+        let creds_spec = self.creds().to_spec();
         alloc::format!(
             "task-state:{}\t{}{identity}",
             self.fs.borrow().cwd.read().clone(),
-            self.creds().to_spec()
+            creds_spec
         )
     }
 
@@ -6786,7 +7129,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut parts = spec.splitn(6, '\t');
         let cwd = parts.next()?;
         let credentials = parts.next()?;
-        self.set_creds(Credentials::from_spec(credentials)?);
+        let parsed = Credentials::from_spec(credentials)?;
+        self.set_creds(parsed);
         *self.fs.borrow().cwd.write() = alloc::string::String::from(cwd);
         let unhex = |text: &str| -> Option<alloc::vec::Vec<u8>> {
             if text.len() % 2 != 0 {
@@ -6894,7 +7238,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
         if !c.groups.is_empty() {
-            list.copy_from_slice::<Platform>(0, &c.groups)
+            // Supplementary groups are ids too, so inside a user namespace they are reported as
+            // that namespace names them (an unmapped one as `OVERFLOW_ID`).
+            let visible: alloc::vec::Vec<u32> = c
+                .groups
+                .iter()
+                .map(|group| Credentials::visible_id(&c.gid_map, *group))
+                .collect();
+            list.copy_from_slice::<Platform>(0, &visible)
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(c.groups.len() as u32)
@@ -9446,4 +9797,96 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, Errno::ESRCH);
     }
+}
+
+/// Credentials cell of the task whose syscall this host process is dispatching. Process-wide
+/// rather than per-task (this crate is `#![no_std]`, so there are no thread locals): it is
+/// published only for the duration of one syscall dispatch, and the only thing that ever reads it
+/// is a read or write of `/proc/self/{uid_map,gid_map,setgroups}` -- which a real caller does from
+/// the single-threaded child that just created its namespace, before it does anything else.
+static CURRENT_CREDENTIALS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Restores the credentials cell that was published before this dispatch.
+pub(crate) struct CurrentCredentialsGuard {
+    previous: usize,
+}
+
+impl Drop for CurrentCredentialsGuard {
+    fn drop(&mut self) {
+        CURRENT_CREDENTIALS.store(self.previous, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn publish_current_credentials(
+    cell: &RefCell<Arc<Credentials>>,
+) -> CurrentCredentialsGuard {
+    let previous = CURRENT_CREDENTIALS.swap(
+        cell as *const RefCell<Arc<Credentials>> as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    CurrentCredentialsGuard { previous }
+}
+
+/// Runs `f` against a copy of the current task's credentials and installs the copy back, which is
+/// how a write to one of the id-map files changes them. `None` when no dispatch is running.
+fn with_current_credentials<R>(f: impl FnOnce(&mut Credentials) -> R) -> Option<R> {
+    let raw = CURRENT_CREDENTIALS.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the published pointer is the `credentials` field of the task whose syscall this host
+    // process is dispatching, cleared again when that dispatch ends, so the task -- and this field
+    // of it -- is alive for exactly as long as the pointer is published.
+    let cell = unsafe { &*(raw as *const RefCell<Arc<Credentials>>) };
+    let mut borrowed = cell.try_borrow_mut().ok()?;
+    let mut creds = (**borrowed).clone();
+    let result = f(&mut creds);
+    *borrowed = Arc::new(creds);
+    Some(result)
+}
+
+/// Answers a guest write to `/proc/self/{uid_map,gid_map,setgroups}`; registered with
+/// [`litebox::fs::ident::set_id_map_write_fn`]. Those files live in the fs layer, but what they
+/// change is the calling task's credentials, which only the shim knows about.
+pub(crate) fn apply_id_map_write(
+    file: litebox::fs::ident::IdMapFile,
+    buf: &[u8],
+) -> Result<(), u32> {
+    let result = match with_current_credentials(|creds| creds.apply_id_map(file, buf)) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(errno)) => Err(i32::from(errno) as u32),
+        None => Err(i32::from(Errno::EPERM) as u32),
+    };
+    result
+}
+
+/// Answers a guest read of the same three files; registered with
+/// [`litebox::fs::ident::set_id_map_read_fn`].
+pub(crate) fn read_id_map_file(file: litebox::fs::ident::IdMapFile) -> alloc::vec::Vec<u8> {
+    let rendered = with_current_credentials(|creds| match file {
+        litebox::fs::ident::IdMapFile::Setgroups => alloc::format!(
+            "{}\n",
+            if creds.setgroups_denied { "deny" } else { "allow" }
+        ),
+        litebox::fs::ident::IdMapFile::UidMap => render_id_map(&creds.uid_map),
+        litebox::fs::ident::IdMapFile::GidMap => render_id_map(&creds.gid_map),
+    });
+    rendered.unwrap_or_else(|| render_id_map(&None)).into_bytes()
+}
+
+/// Renders an id map the way the kernel does: right-aligned columns, one extent per line. `None`
+/// is the initial namespace, where every id maps to itself.
+fn render_id_map(map: &Option<alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
+    let Some(extents) = map else {
+        return alloc::format!("{:>10} {:>10} {:>10}\n", 0, 0, u32::MAX);
+    };
+    let mut rendered = alloc::string::String::new();
+    for extent in extents {
+        rendered.push_str(&alloc::format!(
+            "{:>10} {:>10} {:>10}\n",
+            extent.inner, extent.outer, extent.count
+        ));
+    }
+    rendered
 }

@@ -793,6 +793,13 @@ where
         }
     }
 
+    /// The OOM-killer knobs are the only writable entries here, and their write is
+    /// accepted-and-ignored rather than stored: copying one into an upper layer would fabricate a
+    /// file that answers every later read with whatever was last written to it.
+    fn services_own_writes(&self, path: &str) -> bool {
+        path.ends_with("/oom_score_adj") || path.ends_with("/oom_adj")
+    }
+
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
     }
@@ -1079,6 +1086,8 @@ pub enum ProcSelfDirHandle {
     Task,
     /// `/proc/self/fd`: one symlink per open descriptor.
     Fd,
+    /// `/proc/self/ns`: holds `user` only.
+    Ns,
 }
 
 /// Which of the flat files this handle names.
@@ -1094,6 +1103,12 @@ enum ProcSelfEntry {
     OomScoreAdj,
     Auxv,
     Maps,
+    UidMap,
+    GidMap,
+    Setgroups,
+    /// `/proc/self/ns/user`. Not in [`Self::ALL`]: it lives one directory down, so a flat name
+    /// lookup must never reach it.
+    NsUser,
 }
 
 impl ProcSelfEntry {
@@ -1108,10 +1123,24 @@ impl ProcSelfEntry {
         ("oom_score_adj", ProcSelfEntry::OomScoreAdj),
         ("auxv", ProcSelfEntry::Auxv),
         ("maps", ProcSelfEntry::Maps),
+        ("uid_map", ProcSelfEntry::UidMap),
+        ("gid_map", ProcSelfEntry::GidMap),
+        ("setgroups", ProcSelfEntry::Setgroups),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
+    }
+
+    /// The `/proc/self/{uid_map,gid_map,setgroups}` control file this entry is, if any: those three
+    /// are the only writable entries in this backend.
+    fn as_id_map_file(self) -> Option<crate::fs::ident::IdMapFile> {
+        match self {
+            Self::UidMap => Some(crate::fs::ident::IdMapFile::UidMap),
+            Self::GidMap => Some(crate::fs::ident::IdMapFile::GidMap),
+            Self::Setgroups => Some(crate::fs::ident::IdMapFile::Setgroups),
+            _ => None,
+        }
     }
 }
 
@@ -1165,6 +1194,32 @@ const PROC_SELF_MAPS_NODE_INFO: NodeInfo = NodeInfo {
     ino: 10,
     rdev: None,
 };
+const PROC_SELF_UID_MAP_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 11,
+    rdev: None,
+};
+const PROC_SELF_GID_MAP_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 12,
+    rdev: None,
+};
+const PROC_SELF_SETGROUPS_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 13,
+    rdev: None,
+};
+const PROC_SELF_NS_USER_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 14,
+    rdev: None,
+};
+
+/// The single namespace link `/proc/self/ns` exposes. Chromium asks for `CLONE_NEWPID` and
+/// `CLONE_NEWNET` only when `ns/pid` and `ns/net` exist, so neither is listed: litebox implements
+/// no namespace, and claiming one it cannot honour turns a clean `ENOSYS` into a sandbox that
+/// silently isolates nothing.
+const PROC_SELF_NS_USER_CONTENT: &[u8] = b"user:[4026531837]\n";
 
 /// Owned file handle; identifies which entry this fd is, and carries its (computed-once, at open
 /// time -- a fresh snapshot of the shared cell) content.
@@ -1208,6 +1263,7 @@ where
                 ProcSelfDirHandle::Root => match component {
                     "task" => Some(ProcSelfDirHandle::Task),
                     "fd" => Some(ProcSelfDirHandle::Fd),
+                    "ns" => Some(ProcSelfDirHandle::Ns),
                     _ => None,
                 },
                 ProcSelfDirHandle::Task => {
@@ -1224,6 +1280,7 @@ where
                     Some(ProcSelfDirHandle::Root)
                 }
                 ProcSelfDirHandle::Fd => None,
+                ProcSelfDirHandle::Ns => None,
             };
             if let Some(next) = next {
                 walked.push(super::backend::WalkedComponent {
@@ -1235,6 +1292,7 @@ where
             // Not a subdirectory: it must name a file of this directory (or not exist).
             let exists = match current {
                 ProcSelfDirHandle::Root => ProcSelfEntry::from_name(component).is_some(),
+                ProcSelfDirHandle::Ns => component == "user",
                 ProcSelfDirHandle::Fd => component.parse::<i32>().is_ok(),
                 ProcSelfDirHandle::Task => false,
             };
@@ -1276,11 +1334,18 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        if dir.into_typed::<Self>() != ProcSelfDirHandle::Root {
-            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
-        }
-        let entry = ProcSelfEntry::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let dir = dir.into_typed::<Self>();
+        let entry = match dir {
+            ProcSelfDirHandle::Root => ProcSelfEntry::from_name(name)
+                .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?,
+            ProcSelfDirHandle::Ns => match name {
+                "user" => ProcSelfEntry::NsUser,
+                _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
+            },
+            ProcSelfDirHandle::Task | ProcSelfDirHandle::Fd => {
+                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+        };
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
@@ -1301,6 +1366,18 @@ where
             ProcSelfEntry::OomScoreAdj => format_oom_score_adj(),
             ProcSelfEntry::Auxv => snapshot.auxv.clone(),
             ProcSelfEntry::Maps => snapshot.maps.as_ref().map_or_else(Vec::new, |f| f()),
+            // The id-map control files are the only entries here a guest may write, and their
+            // contents come from the caller's own process, not from the `/proc/self` snapshot.
+            ProcSelfEntry::UidMap => {
+                crate::fs::ident::read_id_map_file(crate::fs::ident::IdMapFile::UidMap)
+            }
+            ProcSelfEntry::GidMap => {
+                crate::fs::ident::read_id_map_file(crate::fs::ident::IdMapFile::GidMap)
+            }
+            ProcSelfEntry::Setgroups => {
+                crate::fs::ident::read_id_map_file(crate::fs::ident::IdMapFile::Setgroups)
+            }
+            ProcSelfEntry::NsUser => PROC_SELF_NS_USER_CONTENT.to_vec(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -1315,7 +1392,8 @@ where
         dir: WalkingDirHandle<'_>,
         name: &str,
     ) -> Result<Option<String>, OpenError> {
-        if dir.into_typed::<Self>() == ProcSelfDirHandle::Fd {
+        let dir_handle = dir.into_typed::<Self>();
+        if dir_handle == ProcSelfDirHandle::Fd {
             let fd: i32 = name
                 .parse()
                 .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
@@ -1326,7 +1404,10 @@ where
                 .map(|(_, target)| Some(target))
                 .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
-        if matches!(name, "task" | "fd") {
+        if dir_handle == ProcSelfDirHandle::Ns && name == "user" {
+            return Ok(None);
+        }
+        if matches!(name, "task" | "fd" | "ns") {
             return Ok(None);
         }
         match ProcSelfEntry::from_name(name) {
@@ -1354,7 +1435,7 @@ where
                         ino_info: None,
                     })
                     .collect();
-                for dir in ["task", "fd"] {
+                for dir in ["task", "fd", "ns"] {
                     entries.push(DirEntry {
                         name: String::from(dir),
                         file_type: FileType::Directory,
@@ -1363,6 +1444,11 @@ where
                 }
                 Ok(entries)
             }
+            ProcSelfDirHandle::Ns => Ok(alloc::vec![DirEntry {
+                name: String::from("user"),
+                file_type: FileType::RegularFile,
+                ino_info: None,
+            }]),
             ProcSelfDirHandle::Task => Ok(info
                 .tids
                 .map(|f| f())
@@ -1400,12 +1486,32 @@ where
         Ok(n)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
-        Err(WriteError::NotForWriting)
+    /// Only the id-map control files accept a write; every other entry keeps refusing it.
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        let Some(id_map) = h.get_typed::<Self>().entry.as_id_map_file() else {
+            return Err(WriteError::NotForWriting);
+        };
+        crate::fs::ident::write_id_map_file(id_map, buf)
+            .map(|()| buf.len())
+            .map_err(|errno| match errno {
+                // `WriteError` carries no errno, so a refusal can only take the shape every other
+                // fs refusal takes (`NotForWriting`, rendered as `EBADF`, as `nine_p`'s own errno
+                // conversion does for `EPERM`/`EACCES`); a malformed map (`EINVAL`) is `Io`.
+                1 | 13 => WriteError::NotForWriting,
+                _ => WriteError::Io,
+            })
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
+    }
+
+    /// The id-map control files: a write to one remaps the calling process's ids, so it has to
+    /// reach this backend. Copied up, `echo 1000 0 1 > /proc/self/uid_map` would succeed against an
+    /// ordinary file in the guest's writable layer and leave `getuid()` still reporting `nobody` --
+    /// the mapping would look applied and would not be.
+    fn services_own_writes(&self, path: &str) -> bool {
+        path.ends_with("/uid_map") || path.ends_with("/gid_map") || path.ends_with("/setgroups")
     }
 
     fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
@@ -1421,7 +1527,13 @@ where
         Ok(FileStatus {
             nlink: 1,
             file_type: FileType::RegularFile,
-            mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+            // Real Linux's id-map control files are owner-writable; a guest that checks `W_OK`
+            // before writing (instead of just writing) has to see that here.
+            mode: if h.entry.as_id_map_file().is_some() {
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
+            } else {
+                Mode::RUSR | Mode::RGRP | Mode::ROTH
+            },
             size: h.content.len(),
             owner: UserInfo::ROOT,
             node_info: match h.entry {
@@ -1435,6 +1547,10 @@ where
                 ProcSelfEntry::OomScoreAdj => PROC_SELF_OOM_SCORE_ADJ_NODE_INFO,
                 ProcSelfEntry::Auxv => PROC_SELF_AUXV_NODE_INFO,
                 ProcSelfEntry::Maps => PROC_SELF_MAPS_NODE_INFO,
+                ProcSelfEntry::UidMap => PROC_SELF_UID_MAP_NODE_INFO,
+                ProcSelfEntry::GidMap => PROC_SELF_GID_MAP_NODE_INFO,
+                ProcSelfEntry::Setgroups => PROC_SELF_SETGROUPS_NODE_INFO,
+                ProcSelfEntry::NsUser => PROC_SELF_NS_USER_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
@@ -1455,6 +1571,7 @@ where
             }
             ProcSelfDirHandle::Root => 4,
             ProcSelfDirHandle::Fd => 2,
+            ProcSelfDirHandle::Ns => 2,
         };
         Ok(FileStatus {
             nlink: nlink as _,

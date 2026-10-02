@@ -221,6 +221,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     ///
     /// `copy_data` copies the lower bytes up; `false` leaves the upper file empty, as if truncated.
     /// Generally you want `true`.
+    /// Writes `buf` at `path` through a FRESH write-capable lower-layer fd: the cached lower fd
+    /// carries the flags of whoever opened the path first (often read-only), so a writer arriving
+    /// later cannot reuse it. `NotForWriting` is the lower layer saying it has no write of its own
+    /// for this path, which is the signal to copy the file up instead.
+    fn write_through_lower(
+        &self,
+        path: &str,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        let write_fd = self
+            .lower
+            .open(path, OFlags::WRONLY, Mode::empty())
+            .map_err(|_| WriteError::NotForWriting)?;
+        let result = self.lower.write(&write_fd, buf, offset);
+        let _ = self.lower.close(&write_fd);
+        result
+    }
+
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
         // Held for the whole call, not just the swap -- gm mutable
         // `layered-migrate-lock-serializes-whole-migration`.
@@ -665,6 +684,21 @@ impl<
             return Err(OpenError::PathError(PathError::InvalidPathname));
         }
         let path = self.absolute_path(path)?;
+        // A path the lower layer answers writes for itself -- a `/proc` control file such as
+        // `/proc/self/uid_map` -- must be opened on the lower layer, not from this fs's upper: an
+        // upper entry is an ordinary file that silently shadows the backend, so
+        // `echo 1000 0 1 > /proc/self/uid_map` succeeded against a copy and left `getuid()` still
+        // reporting `nobody`. Opening the lower directly also keeps every later read on the
+        // backend, whose contents are per-process and change as the guest changes them.
+        if self.lower.services_own_writes(&path) {
+            let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
+            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                path,
+                flags,
+                entry: Arc::new(EntryX::Lower { fd: lower_fd }),
+                position: 0.into(),
+            }));
+        }
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
@@ -848,7 +882,12 @@ impl<
         // both ends and does not rest on this check alone -- gm mutable
         // `layered-migrate-refuses-non-regular`.
         let truncate_applies = original_flags.contains(OFlags::TRUNC)
-            && matches!(self.ensure_lower_contains(&path), Ok(FileType::RegularFile));
+            && matches!(self.ensure_lower_contains(&path), Ok(FileType::RegularFile))
+            // A file the lower layer writes itself is never copied up, so it is never truncated
+            // here either: migrating it first is what made `echo deny > /proc/self/setgroups` (and
+            // every other write to a `/proc` control file) land in an ordinary file that shadowed
+            // the backend, leaving the caller's credentials unchanged.
+            && !self.lower.services_own_writes(&path);
         let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
             path,
             flags: original_flags,
@@ -1059,6 +1098,13 @@ impl<
                                 }
                                 return Ok(num_bytes);
                             }
+                            Err(WriteError::NotForWriting)
+                                if self.lower.services_own_writes(path.as_str()) =>
+                            {
+                                // The lower layer owns this write and refused it: copying the file
+                                // up would only fabricate a file that shadows the refusal.
+                                return Err(WriteError::NotForWriting);
+                            }
                             Err(WriteError::NotForWriting) => {
                                 // fallthrough to migrate into this fs's own upper
                             }
@@ -1066,26 +1112,37 @@ impl<
                         }
                     }
                 }
-                // The cached lower fd was opened by whoever touched the path first -- often
-                // read-only -- and a device (`/dev/null`) can never migrate into the upper layer, so
-                // a later writer would fail with `EISDIR`. Write through a fresh write-capable
-                // lower fd instead; only regular files migrate.
+                // A file the lower layer answers writes for itself -- a `/proc` control file such as
+                // `/proc/self/uid_map`, or a device -- must be written through, not copied up: the
+                // copy would be an ordinary file silently shadowing the backend, and the backend's
+                // own effect (a credentials change, in the id-map case) would never happen. Write
+                // through a fresh write-capable lower fd, because the cached one carries the flags
+                // of whoever opened the path first (often read-only). Only a lower that REFUSES
+                // the write falls through to migration.
+                match self.write_through_lower(path.as_str(), buf, offset) {
+                    Ok(num_bytes) => {
+                        if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
+                            e.entry.position.fetch_add(num_bytes, SeqCst);
+                        }
+                        return Ok(num_bytes);
+                    }
+                    Err(WriteError::NotForWriting)
+                        if self.lower.services_own_writes(path.as_str()) =>
+                    {
+                        return Err(WriteError::NotForWriting);
+                    }
+                    Err(WriteError::NotForWriting) => {}
+                    Err(e) => return Err(e),
+                }
+                // Only a regular file has byte contents whose copy is the same object: migrating a
+                // device fabricates an empty regular file shadowing it, which is how `/dev/null`
+                // was destroyed -- gm mutable `layered-migrate-refuses-non-regular`. It was already
+                // written through above when the lower layer accepted the write.
                 if !matches!(
                     self.ensure_lower_contains(path.as_str()),
                     Ok(FileType::RegularFile)
                 ) {
-                    let write_fd = self
-                        .lower
-                        .open(path.as_str(), OFlags::WRONLY, Mode::empty())
-                        .map_err(|_| WriteError::NotForWriting)?;
-                    let result = self.lower.write(&write_fd, buf, offset);
-                    let _ = self.lower.close(&write_fd);
-                    if let Ok(n) = result
-                        && let Some(e) = self.litebox.descriptor_table().get_entry(fd)
-                    {
-                        e.entry.position.fetch_add(n, SeqCst);
-                    }
-                    return result;
+                    return Err(WriteError::NotForWriting);
                 }
             }
             EntryX::Tombstone => unreachable!(),
@@ -1177,6 +1234,16 @@ impl<
         Ok(position)
     }
 
+    /// `true` when writing `path` must reach the backend that owns it instead of being copied into
+    /// a layer above: `/proc/self/uid_map` is answered by a `/proc/self` mount sitting in THIS fs's
+    /// UPPER (`dev_stdio` in the shim's stack) or in its lower, and either way a copy-up above
+    /// would replace it with an ordinary file whose write succeeds and does nothing. Both sides
+    /// are asked, never just the lower: a mount table is per layer, and the mount that owns a path
+    /// can live in either one.
+    fn services_own_writes(&self, path: &str) -> bool {
+        self.upper.services_own_writes(path) || self.lower.services_own_writes(path)
+    }
+
     fn truncate(
         &self,
         fd: &FileFd<Platform, Upper, Lower>,
@@ -1236,6 +1303,11 @@ impl<
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
+                                    if self.lower.services_own_writes(path.as_str()) {
+                                        // The lower layer owns writes to this path (a `/proc`
+                                        // control file), so it owns the refusal too.
+                                        return Err(TruncateError::NotForWriting);
+                                    }
                                     match self.migrate_file_up(&path, false) {
                                         Ok(()) => Ok(()),
                                         // `NotForWriting` is the signal an outer fs composing this
