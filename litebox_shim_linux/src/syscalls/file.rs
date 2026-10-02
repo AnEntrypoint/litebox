@@ -8156,45 +8156,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Text spec another process can rebuild `raw_fd` from, for `SCM_RIGHTS` over a cross-process
     /// connection: `F|<open flags>|<offset>|<path>` for a regular file, pty slave or plain stdio
-    /// device, `E|<count>|<efd flags>` for an eventfd; `None` for anything that needs shared
-    /// state (pipes, sockets, epoll, pty masters).
-    pub(crate) fn scm_carry_spec(&self, raw_fd: usize) -> Option<alloc::string::String> {
+    /// device, `E|<count>|<efd flags>` for an eventfd, `S|<flags>|<size>|<name>` for a
+    /// memfd/shm named section, `T|<flags>|<size>|<name>` for a snapshot of a nameless file, and
+    /// `U|<unix spec>` for a unix socket -- the last is `UnixSocket::fork_carry`'s own spec
+    /// (`unix.rs`), so an `SCM_RIGHTS` carry and a cross-process fork carry are ONE code path. It
+    /// rebuilds a connected endpoint (the `C` kind: same shared slot, same side, same peer,
+    /// whatever was queued already moved into the slot's ring), an unbound stream/datagram
+    /// socket, and a listener (`L`); `fork_carry` refuses the states it genuinely cannot
+    /// describe -- a bound-but-unconnected socket, a connect in progress, and a bound or
+    /// connected DATAGRAM socket -- and this returns that reason as `Err` rather than a fd the
+    /// receiver would silently have to drop.
+    ///
+    /// `Ok(None)` is the ordinary "this kind has no cross-process rebuild" case (pipes, epoll,
+    /// inet sockets, pty masters ...); `Err(reason)` is a unix socket we COULD have carried had it
+    /// been in a reachable state, which is the one worth reading in a log.
+    pub(crate) fn scm_carry_spec(
+        &self,
+        raw_fd: usize,
+    ) -> Result<Option<alloc::string::String>, &'static str> {
+        let mut unix_refusal: Option<&'static str> = None;
         if let Some((path, flags, offset)) = self.carriable_file_for_raw_fd(raw_fd) {
-            return Some(alloc::format!("F|{flags}|{offset}|{path}"));
+            return Ok(Some(alloc::format!("F|{flags}|{offset}|{path}")));
         }
         if let Some((path, flags)) = self.carriable_pty_slave_for_raw_fd(raw_fd) {
-            return Some(alloc::format!("F|{flags}|0|{path}"));
+            return Ok(Some(alloc::format!("F|{flags}|0|{path}")));
         }
         if let Some((count, flags)) = self.carriable_eventfd_for_raw_fd(raw_fd) {
-            return Some(alloc::format!("E|{count}|{flags}"));
+            return Ok(Some(alloc::format!("E|{count}|{flags}")));
         }
         if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(raw_fd) {
-            return Some(alloc::format!("S|{flags}|{size}|{name}"));
+            return Ok(Some(alloc::format!("S|{flags}|{size}|{name}")));
         }
-        if self.raw_fd_subsystem_name(raw_fd) == "unix-socket"
-            && let Ok((spec, hold)) = self.raw_fd_unix_carry(raw_fd, 0, false)
-        {
-            match hold {
-                Some(crate::syscalls::unix::UnixCarryHold::Presence { .. }) => {
+        if self.raw_fd_subsystem_name(raw_fd) == "unix-socket" {
+            match self.raw_fd_unix_carry(raw_fd, 0, false) {
+                Ok((spec, hold)) => {
+                    // `child_pid == 0` means this is not a fork, and a non-fork carry hands back
+                    // no hold at all -- a listener's presence entry is registered by the RECEIVER,
+                    // the only process that knows its own pid. Should a hold ever appear here,
+                    // undoing it is the only safe answer: it would advertise the address under a
+                    // pid no process has, and `connect()` would find a listener nobody can accept.
                     if let Some(hold) = hold {
                         crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
                             &self.global,
                             hold,
                         );
+                        unix_refusal = Some("unix-socket(listener; carried presence entry)");
+                    } else {
+                        return Ok(Some(alloc::format!("U|{spec}")));
                     }
                 }
-                _ => return Some(alloc::format!("U|{spec}")),
+                Err(reason) => unix_refusal = Some(reason),
             }
         }
-        if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
+        let spec = if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
             let (path, flags) = match raw_fd {
                 0 => ("/dev/stdin", OFlags::RDONLY),
                 1 => ("/dev/stdout", OFlags::WRONLY),
                 _ => ("/dev/stderr", OFlags::WRONLY),
             };
-            return Some(alloc::format!("F|{}|0|{path}", flags.bits()));
+            Some(alloc::format!("F|{}|0|{path}", flags.bits()))
+        } else {
+            self.snapshot_nameless_file_for_carry(raw_fd)
+        };
+        match spec {
+            Some(spec) => Ok(Some(spec)),
+            None => Err(unix_refusal.unwrap_or("fd kind has no cross-process rebuild")),
         }
-        self.snapshot_nameless_file_for_carry(raw_fd)
     }
 
     /// Receiving half of [`Self::scm_carry_spec`]: builds the descriptor in this process and

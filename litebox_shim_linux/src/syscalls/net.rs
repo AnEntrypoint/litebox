@@ -2129,12 +2129,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .map_err(|_| Errno::EBADF)?
                         .ok_or(Errno::EBADF)?;
                     drop(files);
-                    let spec = self.scm_carry_spec(raw_fd);
+                    let (spec, refusal) = match self.scm_carry_spec(raw_fd) {
+                        Ok(spec) => (spec, None),
+                        Err(reason) => (None, Some(reason)),
+                    };
                     if spec.is_none() {
                         litebox_util_log::warn!(
                             fd:% = raw_fd, kind:% = self.raw_fd_subsystem_name(raw_fd),
-                            path:% = self.files.borrow().lookup_fd_path(raw_fd).and_then(|p| p.to_str().ok().map(alloc::string::String::from)).unwrap_or_default();
-                            "SCM_RIGHTS: this fd kind cannot cross a process boundary"
+                            path:% = self.files.borrow().lookup_fd_path(raw_fd).and_then(|p| p.to_str().ok().map(alloc::string::String::from)).unwrap_or_default(),
+                            reason:% = refusal.unwrap_or("this fd kind has no cross-process rebuild");
+                            "SCM_RIGHTS: this fd cannot cross a process boundary"
                         );
                     }
                     specs.push(spec);

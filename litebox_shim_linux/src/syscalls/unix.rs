@@ -940,8 +940,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 litebox_util_log::warn!(
                     slot:% = self.slot, n_fds:% = msg.fds.len();
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
-                     files, pty slaves and eventfds; refusing the send with EOPNOTSUPP rather \
-                     than dropping the fds"
+                     files, pty slaves, eventfds, shm/memfd snapshots and unix sockets that \
+                     `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound \
+                     socket, or a listener); a bound-but-unconnected socket, a connect in \
+                     progress and a bound or connected DATAGRAM socket are refused -- refusing \
+                     the send with EOPNOTSUPP rather than dropping the fds"
                 );
                 return Err((msg, Errno::EOPNOTSUPP));
             };
@@ -4663,6 +4666,15 @@ impl SharedUnixConnectQueue {
 // - Everything else (a bound but unconnected socket, a connect in progress, a bound or connected
 //   datagram socket including a datagram socketpair) is refused, and the fork stays on the
 //   thread-based path.
+//
+// The very same specs carry a unix socket over `SCM_RIGHTS` between two host processes:
+// `Task::scm_carry_spec` calls `Self::fork_carry` with `child_pid == 0` and ships the result as a
+// `U|` spec next to the message's bytes in the shared ring; `Task::rebuild_carried_unix` rebuilds
+// it with `Self::from_fork_spec`. So the two carries share ONE code path, and the differences are
+// only the two the sender's ignorance of the receiver forces: an `SCM_RIGHTS` connection keeps the
+// SENDER's host pid as the holder the receiver releases on adoption (`fork_carry`'s `carried_me`),
+// and an `SCM_RIGHTS` listener's presence entry is registered by the RECEIVER (a fork child's is
+// registered by the parent, which knows the child's pid).
 
 fn encode_unix_addr(addr: &UnixSocketAddr) -> String {
     let hex = |bytes: &[u8]| bytes.iter().map(|b| alloc::format!("{b:02x}")).collect::<String>();
@@ -4737,6 +4749,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     /// A listener is advertised under `child_pid` right away, so a connect made after the parent
     /// closes its own copy but before the child is running still finds it (and waits in the shared
     /// queue for the child's `accept()`), as it would on Linux, where the socket never went away.
+    ///
+    /// `child_pid == 0` is the SCM_RIGHTS flavour of the same carry (`Task::scm_carry_spec` is its
+    /// only caller that passes 0): the receiver is a DIFFERENT task whose pid the sender cannot
+    /// know, so anything the spec would have to record under the receiver's pid is left for the
+    /// receiver to do itself when it rebuilds (see `Self::from_fork_spec`'s `L` branch). A real
+    /// fork always names a real tid, so 0 is unambiguous.
+    ///
+    /// An SCM_RIGHTS listener is NOT advertised here: `sendmsg` hands over a duplicate, so the
+    /// sender keeps its own copy and its own presence entry stays valid; the receiver registers
+    /// its own entry instead (so the address survives the sender closing its copy later), which
+    /// is also the only option available -- the sender does not know the receiver's pid.
     pub(super) fn fork_carry(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
@@ -4757,20 +4780,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         let cred = backlog.listener_cred;
                         let key = backlog.addr.to_key();
                         let owner_pid = child_pid.cast_unsigned();
-                        let (kind, bytes) = presence_kind_and_bytes(&key);
-                        if !global.unix_addr_presence.insert(kind, bytes, owner_pid) {
-                            return Err("unix-socket(listener; shared presence table full)");
+                        // `child_pid == 0`: SCM_RIGHTS, not a fork -- see this fn's doc comment.
+                        // Nothing is registered here; the receiver registers the address under
+                        // its own pid when it rebuilds (`from_fork_spec`), and the spec's last
+                        // field tells it to.
+                        let receiver_registers_presence = child_pid == 0;
+                        if !receiver_registers_presence {
+                            let (kind, bytes) = presence_kind_and_bytes(&key);
+                            if !global.unix_addr_presence.insert(kind, bytes, owner_pid) {
+                                return Err("unix-socket(listener; shared presence table full)");
+                            }
                         }
                         Ok((
                             alloc::format!(
-                                "L,{seq},{},{},{},{},{}",
+                                "L,{seq},{},{},{},{},{},{}",
                                 backlog.state.lock().limit,
                                 cred.pid,
                                 cred.uid,
                                 cred.gid,
-                                encode_unix_addr(&UnixSocketAddr::from(backlog.addr.as_ref()))
+                                encode_unix_addr(&UnixSocketAddr::from(backlog.addr.as_ref())),
+                                u8::from(receiver_registers_presence)
                             ),
-                            Some(UnixCarryHold::Presence { key, owner_pid }),
+                            if receiver_registers_presence {
+                                None
+                            } else {
+                                Some(UnixCarryHold::Presence { key, owner_pid })
+                            },
                         ))
                     }
                     UnixStreamState::Connected(conn) => {
@@ -4909,6 +4944,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     // table under this process's pid (see `fork_carry`), so cross-process connects
                     // keep reaching this listener after the parent closes its copy.
                     let addr = decode_unix_addr(fields.next()?)?;
+                    // Trailing field, absent in a spec written before it existed (and always
+                    // absent for a fork carry): `1` when the CARRIER could not register this
+                    // address (SCM_RIGHTS -- it does not know this process's pid), so this
+                    // process registers it itself, under its own pid, right here. Both entries
+                    // can coexist: `SharedUnixAddrPresenceTable::insert` takes any EMPTY slot, so
+                    // the same address under two pids gets two slots, and
+                    // `Backlog::try_accept_shared` claims a pending cross-process connect by
+                    // ADDRESS alone (`SharedUnixConnectQueue::try_claim`), never by owner pid --
+                    // so either copy of the listener can accept it, the same sharing a
+                    // fork-carried listener already has with its parent.
+                    let register_own_presence = fields.next() == Some("1");
                     let addr = match (addr.clone().bind(task, false), addr) {
                         (Ok(bound), _) => bound,
                         (Err(err), UnixSocketAddr::Path(path)) => {
@@ -4921,6 +4967,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         (Err(_), _) => return None,
                     };
                     let owner_pid = task.pid.get().cast_unsigned();
+                    if register_own_presence {
+                        let key = addr.to_key();
+                        let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
+                        let inserted = task
+                            .global
+                            .unix_addr_presence
+                            .insert(presence_kind, presence_bytes, owner_pid);
+                        if !inserted {
+                            // Degrade, never panic: the address simply is not visible to a
+                            // cross-process `connect()` that misses this process's own address
+                            // table either, exactly as before this carry existed.
+                            litebox_util_log::warn!(
+                                owner_pid:% = owner_pid;
+                                "carried unix listener: shared presence table full, address not \
+                                 advertised cross-process"
+                            );
+                        }
+                    }
                     UnixStreamState::Listen(UnixListenStream {
                         backlog: Arc::new(Backlog::new(addr, limit, Pollee::new(), cred)),
                         global: task.global.clone(),
