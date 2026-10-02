@@ -3545,6 +3545,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         exit_signal: u64,
         vfork: bool,
         child_sp: Option<usize>,
+        clone_flags: CloneFlags,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // A platform with a REAL `fork()` needs none of what follows below in this function: no
         // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
@@ -3560,6 +3561,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 exit_signal,
                 vfork,
                 child_sp,
+                clone_flags.contains(CloneFlags::NEWUSER),
             );
         }
 
@@ -4011,6 +4013,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return None;
         }
+        // A `clone()` that supplies an explicit child stack starts that child with `rsp` = the
+        // supplied stack, NOT with a copy of the parent's stack pointer -- real Linux does this in
+        // `copy_thread` (`childregs->sp = newsp`), and glibc's own `clone()` wrapper depends on it:
+        // its child path pops the entry function and its argument off the TOP of the new stack
+        // (`xorl %ebp,%ebp; popq %rax; popq %rdi; call *%rax`) after stashing them at `stack-16`
+        // and `stack-8`. Resuming such a child on the parent's `rsp` instead pops the PARENT's own
+        // frame and calls whatever value happens to sit there. Confirmed live: Chromium's
+        // `base::ForkWithFlags(CLONE_NEWUSER|SIGCHLD)` (its `CanCreateProcessInNewUserNS` probe)
+        // died with SIGSEGV at a stack-canary epilogue with `rbp=0` exactly this way, which made
+        // the probe report `false` and Chromium abort with "No usable sandbox!".
+        if let Some(explicit_sp) = child_sp {
+            source_ctx.rsp = explicit_sp;
+        }
         let full_gprs = litebox::platform::ForkFullGprSnapshot {
             r15: source_ctx.r15,
             r14: source_ctx.r14,
@@ -4262,7 +4277,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut unix_holds = alloc::vec::Vec::new();
         inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
             fd: TASK_STATE_SHIM_FD,
-            spec: self.task_state_spec(),
+            spec: self.task_state_spec(clone_flags.contains(CloneFlags::NEWUSER)),
         });
         for (raw_fd, id, cloexec) in pty_masters_to_carry {
             inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
@@ -4385,13 +4400,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         exit_signal: u64,
         vfork: bool,
         child_sp: Option<usize>,
+        clone_flags: CloneFlags,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // The Windows-shaped reconstruction path above (GPR injection, VMA relocation) is only
         // wired up for x86_64 -- but native `fork()` needs none of that machinery at all (see
         // `try_native_cross_process_fork`'s doc comment), so it is exactly as available here as
         // it is on x86_64: a real `fork()` doesn't care what architecture the guest is.
         if self.global.platform.has_native_fork() {
-            return self.try_native_cross_process_fork(ctx, child_tid, exit_signal);
+            return self.try_native_cross_process_fork(
+                ctx,
+                child_tid,
+                exit_signal,
+                vfork,
+                child_sp,
+                clone_flags.contains(CloneFlags::NEWUSER),
+            );
         }
         None
     }
@@ -4416,6 +4439,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         exit_signal: u64,
         vfork: bool,
         child_sp: Option<usize>,
+        new_user_namespace: bool,
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_native_cross_process_fork entry");
         // SAFETY: no `RefCell`/lock guard local to this function is held across the call. Every
@@ -4476,7 +4500,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // place, before anything else runs on this thread again.
                 // This frame's copy of the gate `Arc` is the parent's reference, not the child's.
                 core::mem::forget(vfork_gate);
-                self.reinit_as_native_fork_child(child_tid, exit_signal, child_state, child_sp);
+                self.reinit_as_native_fork_child(
+                    child_tid,
+                    exit_signal,
+                    child_state,
+                    child_sp,
+                    new_user_namespace,
+                );
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
                     "clone: native fork() succeeded -- this thread is now the child, resuming in place"
@@ -4529,7 +4559,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// already builds correctly for the thread-based fork path's BRAND NEW `Task`, reused here
     /// verbatim rather than re-derived, just installed into the SAME `Task` instead of a new one.
     ///
-    /// Deliberately does NOT touch `credentials`, `comm`, `dumpable`, `fs`, `files`, or
+    /// Deliberately does NOT touch `comm`, `dumpable`, `fs`, `files`, or
     /// `wait_state`: a real `fork()` already gives this process's own copy of that memory
     /// correct, independently-mutable content for every one of them (real Linux `fork()`
     /// inherits credentials and `PR_SET_DUMPABLE` unchanged, and gives an independent COPY of
@@ -4546,6 +4576,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Arc<super::file::FsState<Platform>>,
         )>,
         child_sp: Option<usize>,
+        new_user_namespace: bool,
     ) {
         if let Some(sp) = child_sp {
             NATIVE_CHILD_SP.store(sp, Ordering::Relaxed);
@@ -4555,6 +4586,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // owning a reference count of its own; take one so that replacing or dropping it here
         // never frees memory the parent still uses.
         core::mem::forget(self.creds());
+        // A `CLONE_NEWUSER` `clone()` is the one case where a child's credentials are NOT what
+        // `fork()` copied: the kernel puts the child in a brand-new user namespace (empty id map,
+        // every capability inside it). Missing this made Chromium's `CanCreateProcessInNewUserNS`
+        // probe child refuse its own `setgroups` write with EPERM and abort -- "No usable
+        // sandbox!". See `Credentials::in_new_user_namespace`.
+        if new_user_namespace {
+            self.set_creds(self.creds().in_new_user_namespace());
+        }
         // Futex waiters are pinned on their own thread's stack; whatever the parent's threads had
         // queued in this (private, copy-on-write) manager means nothing in this process. Start
         // it empty.
@@ -5064,7 +5103,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // cross-process path exists to solve. It has nothing to hand a separate address space.
             if (!vforked || self.global.platform.has_native_fork())
                 && let Some(handle) =
-                    self.try_cross_process_fork(ctx, child_tid, exit_signal, vforked, sp)
+                    self.try_cross_process_fork(ctx, child_tid, exit_signal, vforked, sp, flags)
             {
                 // `handle.0 == 0` is the reserved sentinel `try_native_cross_process_fork`
                 // documents: this very call is returning in the CHILD's own copy of this exact
@@ -5556,6 +5595,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     sanitized,
                     "forked child's rip/rsp left the user address range"
                 );
+                // Same rule as `try_cross_process_fork`'s snapshot above and the thread-based
+                // path's `if let Some(explicit_sp) = sp` block: an explicit child stack replaces
+                // the child's `rsp` (see that block's comment for the glibc `clone()` wrapper
+                // mechanism this is load-bearing for).
+                if let Some(explicit_sp) = sp {
+                    source_ctx.rsp = explicit_sp;
+                }
                 Some(litebox::platform::ForkFullGprSnapshot {
                     r15: source_ctx.r15,
                     r14: source_ctx.r14,
@@ -7095,7 +7141,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.update_creds(|c| c.set_re_gid(rgid, egid))
     }
 
-    fn task_state_spec(&self) -> alloc::string::String {
+    fn task_state_spec(&self, new_user_namespace: bool) -> alloc::string::String {
         let identity = self
             .global
             .proc_self_info
@@ -7117,7 +7163,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
             })
             .unwrap_or_default();
-        let creds_spec = self.creds().to_spec();
+        // The child's own credentials are the parent's, EXCEPT for `CLONE_NEWUSER`, which puts it
+        // in a brand-new user namespace -- without this, the child's id map stays `None` (the
+        // initial namespace) and every write to `/proc/self/{uid_map,gid_map,setgroups}` is
+        // refused with EPERM, which is how Chromium's sandbox probe concluded it had no usable
+        // sandbox. The Windows cross-process path has no COW copy to inherit here: this spec is
+        // the ONLY thing the child's credentials come from.
+        let creds_spec = if new_user_namespace {
+            self.creds().in_new_user_namespace().to_spec()
+        } else {
+            self.creds().to_spec()
+        };
         alloc::format!(
             "task-state:{}\t{}{identity}",
             self.fs.borrow().cwd.read().clone(),

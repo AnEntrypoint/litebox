@@ -1042,7 +1042,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             vmem.vmas.insert(
                 group,
                 VmArea {
-                    flags: VmFlags::VM_OWN_FORK_PADDING,
+                    // No access bit is set (this range is untouched padding, not guest data), but
+                    // every `VM_MAY*` one is: this is the child's OWN anonymous-ish memory, so
+                    // `mprotect` over it must behave as it does over ordinary anonymous memory.
+                    // Without the `VM_MAY*` bits, `protect_mapping` refuses every request to turn
+                    // an access bit on -- confirmed live as a guest `mprotect` returning EACCES on
+                    // a VMA whose only flag was `VM_OWN_FORK_PADDING`, which killed crashpad's
+                    // intermediate process (a reservation it had just made could not be made
+                    // writable). `VM_MAY*` is the "what may EVER be turned on" record, so granting
+                    // all three here is a statement about the memory, not about its current state.
+                    flags: VmFlags::VM_OWN_FORK_PADDING | VmFlags::VM_MAY_ACCESS_FLAGS,
                     is_file_backed: false,
                     shared_handle: None,
                     view_base: 0,
@@ -1712,8 +1721,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // individual regions placed within it via `Replace` below are tracked in `dest.vmas`
             // (each `insert_mapping` call replaces this placeholder's tracking for its own
             // sub-range).
-            let placeholder_vma =
-                VmArea::<DestPlatform, ALIGN>::new(VmFlags::VM_OWN_FORK_PADDING, false);
+            let placeholder_vma = VmArea::<DestPlatform, ALIGN>::new(
+                // `VM_MAY_ACCESS_FLAGS` for the same reason `new_adopting_inherited_memory` gives
+                // its own padding placeholders every `VM_MAY*` bit: whatever of this span no real
+                // region goes on to replace stays a tracked, owned, unmapped VMA of this child,
+                // and `mprotect` over it has to behave as it does over anonymous memory.
+                VmFlags::VM_OWN_FORK_PADDING | VmFlags::VM_MAY_ACCESS_FLAGS,
+                false,
+            );
             let base_ptr = unsafe {
                 dest.insert_mapping(
                     span_page_range,
@@ -2485,6 +2500,24 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // flags >> 4 shift VM_MAY% in place of VM_%
             // turning on VM_% requires VM_MAY%
             if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
+                // Warn, not debug: this is a real `mprotect()` refusal (EACCES to the guest) and
+                // it is per-call, not per-VMA-per-call the way the "found overlapping tracked
+                // vma" line above is. The raw `VmFlags` bits are printed because the whole
+                // question is which of `VM_MAY{READ,WRITE,EXEC}` this VMA was created without --
+                // a guest later makes writable (e.g. Chromium's PartitionAlloc recommit) must have been given `VM_MAYWRITE` at
+                // `mmap` time, since `mprotect` may only ever turn on what `VM_MAY*` allows.
+                litebox_util_log::warn!(
+                    caller:% = caller,
+                    requested_start:% = range.start,
+                    requested_end:% = range.end,
+                    vma_start:% = start,
+                    vma_end:% = end,
+                    vma_flags_bits:% = vma.flags.bits(),
+                    vma_file_backed:% = vma.is_file_backed,
+                    vma_shared:% = vma.shared_handle.is_some(),
+                    requested_flags_bits:% = flags.bits();
+                    "diag-protect-mapping: refusing mprotect, VMA lacks the matching VM_MAY* permission"
+                );
                 return Err(VmemProtectError::NoAccess {
                     old: vma.flags,
                     new: flags,
