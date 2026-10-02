@@ -282,3 +282,8 @@ Repro scripts: `.wfgy/chromium_headless.ps1 -Run <n> -Secs N -Extra "<flags>"`.
   filter stack live on `Process` (TSYNC is free, all three survive clone and execve); a cross-process
   fork child starts unfiltered, and `/proc/self/status` gained `Seccomp:`/`NoNewPrivs:`.
   Sandbox-enabled repro: `.wfgy/chromium_sandbox.ps1 -Run <n> -Secs N -Extra "<flags>"` (no `--no-sandbox`).
+- Next sandbox blocker is NOT seccomp: `zygote_host_impl_linux.cc:117` requires
+  `Credentials::CanCreateProcessInNewUserNS()`, and the webtop image ships no `chrome_sandbox` SUID helper, so
+  it FATALs "No usable sandbox!" (as root it dies earlier at :102, crbug 638180). Measured: `unshare` accepts
+  CLONE_NEWUSER alone, EPERMs CLONE_NEWPID/NEWNS/NEWUTS/NEWIPC/NEWNET/NEWCGROUP and every combined mask;
+  `/proc/self/{uid_map,gid_map,setgroups}` exist, `/proc/<pid>/uid_map` does not (ENOENT).
