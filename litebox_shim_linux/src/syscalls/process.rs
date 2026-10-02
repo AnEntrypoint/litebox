@@ -1275,6 +1275,8 @@ pub(crate) struct Credentials {
 /// Every capability the kernel defines (0..=40).
 const CAP_FULL: u64 = (1 << 41) - 1;
 const CAP_SETUID_BIT: u64 = 1 << 7;
+const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
+const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
@@ -1384,6 +1386,14 @@ impl Credentials {
     /// capability there. This is what the task keeps in the namespace IT goes on to create.
     fn holds_setuid_here(&self) -> bool {
         self.cap_eff & CAP_SETUID_BIT != 0 || (self.uid_map.is_none() && self.euid == 0)
+    }
+
+    /// Whether the caller holds one specific capability in the namespace it is in right now --
+    /// root in the initial namespace has all of them; inside a user namespace it is whatever
+    /// `cap_eff` grants there, which is what `capset` sets and what a sandbox keeps (`CAP_SYS_ADMIN`
+    /// to go on creating PID namespaces, `CAP_SYS_CHROOT` to `chroot`).
+    pub(crate) fn holds_capability(&self, bit: u64) -> bool {
+        self.cap_eff & bit != 0 || (self.uid_map.is_none() && self.euid == 0)
     }
 
     /// Whether the caller may map ids other than its own; see [`Self::setuid_in_parent_ns`].
@@ -1751,6 +1761,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
             // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
             PrctlArg::SetPDeathSig(_) => Ok(0),
+            // Yama's ptrace permission: nothing here restricts ptrace in the first place, so
+            // accepting it is the truthful answer, not a workaround.
+            PrctlArg::SetPtracer(_) => Ok(0),
             PrctlArg::SetKeepCaps(value) => {
                 if value > 1 {
                     return Err(Errno::EINVAL);
@@ -2554,12 +2567,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     "DIAG prepare_for_exit: calling parent.interrupt_all_threads()"
                 );
                 let status = self.process().inner.lock().exit_status;
+                // `si_pid` names this child as the PARENT sees it, not as it sees itself: a
+                // `CLONE_NEWPID` namespace's init is pid 1 to itself and something else entirely
+                // to the process that cloned it. Every other task of a namespace was created by
+                // another task OF that namespace, so its parent is in it -- which leaves the init
+                // (pid 1 of a non-initial namespace) as the only case whose parent sits outside.
+                let own_ns = self.pid_ns.get();
+                let parent_ns = if own_ns != crate::syscalls::pidns::INITIAL_NS
+                    && self.guest_pid() == 1
+                {
+                    self.global.pid_namespaces.parent_of(own_ns)
+                } else {
+                    own_ns
+                };
                 parent.shared_pending.lock().push(
                     &parent.limits,
                     signal,
                     super::signal::siginfo_child(
                         signal,
-                        self.pid.get(),
+                        self.global
+                            .pid_namespaces
+                            .pid_in(self.pid.get(), parent_ns)
+                            .unwrap_or(self.guest_pid()),
                         self.creds().uid,
                         status,
                     ),
@@ -2591,6 +2620,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: wake_robust_list start");
             let _ = self.wake_robust_list(robust_list);
             litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: wake_robust_list done");
+        }
+        if !process_exited {
+            // A dying THREAD's own tid is free immediately -- every namespace above it had a pid
+            // for it. A PROCESS's rows are released when its parent reaps it (`sys_wait4`), not
+            // here: the parent still has to be told the pid it knew that child by.
+            self.global.pid_namespaces.release(self.tid.get());
         }
         if process_exited {
             // Real Linux's own `do_exit()` -> `exit_mm()` releases the whole address space once
@@ -2832,6 +2867,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(Errno::ECHILD);
             }
         };
+        // Same translation `sys_wait4` does: a `P_PID` id is a pid in the CALLER's namespace, and
+        // every registry below keys on the internal one. `P_ALL` (`-1`) needs none.
+        let target_pid = if target_pid > 0 {
+            self.resolve_guest_pid(target_pid).unwrap_or(i32::MAX)
+        } else {
+            target_pid
+        };
 
         // A child forked as a separate OS process is not in `children`; `wait4` already knows how to
         // wait for one, so borrow it and translate the packed status back into a `waitid` result.
@@ -2841,6 +2883,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             process.find_cross_process_child(target_pid).is_some()
         };
         let cross_process_result = if cross_process_target {
+            // `sys_wait4` reaps the child and, with it, releases the pids every namespace had for
+            // it -- so the internal pid this needs for its own bookkeeping has to be known before
+            // the call can be translated back from the guest pid it returns. A targeted wait names
+            // it directly; `P_ALL` takes whichever one the call removed from the registry.
+            let cross_before: alloc::vec::Vec<i32> = if target_pid == -1 {
+                process
+                    .cross_process_children
+                    .lock()
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect()
+            } else {
+                alloc::vec::Vec::new()
+            };
             let mut packed: i32 = 0;
             let packed_ptr = UserPtrMut::from_usize((&raw mut packed).expose_provenance());
             let wait_options = if no_hang { WNOHANG } else { 0 };
@@ -2861,7 +2917,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Err(_) => ExitStatus::Exit(0),
                 }
             };
-            Some((i32::try_from(reaped).unwrap_or(target_pid), status))
+            // A targeted wait names the child directly; `P_ALL` took whichever one is no longer
+            // registered now that `sys_wait4` has reaped it.
+            let internal_pid = if target_pid > 0 {
+                target_pid
+            } else {
+                let after: alloc::vec::Vec<i32> = process
+                    .cross_process_children
+                    .lock()
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect();
+                cross_before
+                    .iter()
+                    .copied()
+                    .find(|p| !after.contains(p))
+                    .unwrap_or(target_pid)
+            };
+            Some((internal_pid, status))
         } else {
             None
         };
@@ -2938,6 +3011,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !no_reap {
             process.children.lock().retain(|(p, _)| *p != child_pid);
             self.xproc_unregister(child_pid);
+            self.global.pid_namespaces.release(child_pid);
         }
 
         // `siginfo_t` on x86-64: si_signo, si_errno, si_code are the first three 32-bit words,
@@ -2957,7 +3031,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = infop.write_at_offset::<Platform>(1, 0);
             let _ = infop.write_at_offset::<Platform>(2, code);
             let _ = infop.write_at_offset::<Platform>(3, 0);
-            let _ = infop.write_at_offset::<Platform>(4, child_pid);
+            // `si_pid`: the pid the CALLER knows this child by, exactly like `wait4`'s return
+            // value -- not the internal pid.
+            let _ = infop.write_at_offset::<Platform>(
+                4,
+                self.guest_pid_of(child_pid).unwrap_or(child_pid),
+            );
             let _ = infop.write_at_offset::<Platform>(5, 0);
             let _ = infop.write_at_offset::<Platform>(6, status);
         }
@@ -3003,6 +3082,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // support, and a caller cannot distinguish it from a real usage error. Same
         // errno-as-API problem as namespace clone flags returning EINVAL instead of EPERM.
         let pid = if pid == 0 { -1 } else { pid };
+
+        // A guest names the child it wants by the pid IT sees, in ITS OWN namespace -- the pid a
+        // `CLONE_NEWPID` child was given at birth (1, for the namespace's first task), not the
+        // internal pid every registry below keys on. `0`/`-1`/`< -1` are the namespace-independent
+        // "my group"/"any child"/"group `-pid`" encodings and pass through untouched. A pid this
+        // namespace cannot see becomes one no lookup can match, which is Linux's `ECHILD` for
+        // waiting on a child you cannot name -- never the internal pid that number spells for
+        // somebody else.
+        let pid = if pid > 0 {
+            self.resolve_guest_pid(pid).unwrap_or(i32::MAX)
+        } else {
+            pid
+        };
+        // ...and the pid `wait4` RETURNS is spelled the same way: a parent that just reaped its
+        // `CLONE_NEWPID` child must be told the pid it knows that child by.
+        let reported_pid = |internal: i32| self.guest_pid_of(internal).unwrap_or(internal);
 
         if !(pid > 0 || pid == -1) {
             // A wait for a DIFFERENT process group (pid < -1) genuinely cannot be answered: we
@@ -3068,11 +3163,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             process.reap_cross_process_child(pid);
             self.xproc_unregister(pid);
             self.release_cross_process_fork_slot();
+            // Forget this child's per-namespace pids NOW that it has been reaped -- not before:
+            // `reported_pid` above is the last thing that still needs them, and once the parent
+            // has been told the pid it knew this child by, no namespace can name it again.
+            let reported = reported_pid(pid);
+            self.global.pid_namespaces.release(pid);
             let encoded = decode_cross_process_wait_status(raw_exit);
             if let Some(wstatus) = wstatus {
                 let _ = wstatus.write_at_offset::<Platform>(0, encoded);
             }
-            return Ok(usize::try_from(pid).unwrap());
+            return Ok(usize::try_from(reported).unwrap_or(0));
         }
 
         // `wait4(-1, ...)` ("any child") must poll BOTH registries uniformly. An earlier, narrower
@@ -3222,11 +3322,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process.reap_cross_process_child(cross_pid);
                     self.xproc_unregister(cross_pid);
                     self.release_cross_process_fork_slot();
+                    let reported = reported_pid(cross_pid);
+                    self.global.pid_namespaces.release(cross_pid);
                     let encoded = decode_cross_process_wait_status(raw_exit);
                     if let Some(wstatus) = wstatus {
                         let _ = wstatus.write_at_offset::<Platform>(0, encoded);
                     }
-                    return Ok(usize::try_from(cross_pid).unwrap());
+                    return Ok(usize::try_from(reported).unwrap_or(0));
                 }
                 AnyChildExit::Thread(p, status) => (p, status),
             }
@@ -3299,6 +3401,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         process.children.lock().retain(|(p, _)| *p != child_pid);
             self.xproc_unregister(child_pid);
 
+        let reported = reported_pid(child_pid);
+        self.global.pid_namespaces.release(child_pid);
+
         let encoded = match exit_status {
             // Linux wait status encoding: normal exit is (exit_code & 0xff) << 8.
             ExitStatus::Exit(code) => (i32::from(code) & 0xff) << 8,
@@ -3310,7 +3415,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = wstatus.write_at_offset::<Platform>(0, encoded);
         }
 
-        Ok(usize::try_from(child_pid).unwrap())
+        Ok(usize::try_from(reported).unwrap_or(0))
     }
 }
 
@@ -3546,6 +3651,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         vfork: bool,
         child_sp: Option<usize>,
         clone_flags: CloneFlags,
+        child_ns: (u32, i32, i32),
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // A platform with a REAL `fork()` needs none of what follows below in this function: no
         // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
@@ -3562,6 +3668,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 vfork,
                 child_sp,
                 clone_flags.contains(CloneFlags::NEWUSER),
+                child_ns,
             );
         }
 
@@ -4292,17 +4399,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
         }
         for raw_fd in unix_to_carry {
-            match self.raw_fd_unix_carry(raw_fd, child_tid) {
+            match self.raw_fd_unix_carry(raw_fd, child_tid, true) {
                 Ok((spec, hold)) => {
                     litebox_util_log::debug!(
                         tid:% = self.tid.get(), fd:% = raw_fd, spec:% = spec;
                         "clone: carrying a unix socket into the cross-process child"
                     );
+                    let carried_at = inherited_shim_fds.len();
                     inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
                         fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
                         spec,
                     });
-                    unix_holds.extend(hold);
+                    if let Some(hold) = hold {
+                        unix_holds.push((carried_at, hold));
+                    }
                 }
                 Err(reason) => {
                     litebox_util_log::warn!(
@@ -4310,7 +4420,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fd:% = raw_fd, reason:% = reason;
                         "clone: cross-process fork() not eligible -- a unix socket could not be carried"
                     );
-                    for hold in unix_holds {
+                    for (_, hold) in unix_holds {
                         crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
                             &self.global,
                             hold,
@@ -4330,17 +4440,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inherited_shim_fds,
             self.comm.get(),
             self.sigreturn_trampoline_addr(),
-            self.prepare_fork_child_identity(child_tid),
+                        self.prepare_fork_child_identity(child_tid, child_ns),
         );
         if handle.is_none() {
             // No child was actually created -- undo the optimistic reservation immediately
             // rather than leaving it held until some future reap that will never come, and the
             // holders counted for the child on carried unix sockets.
             self.release_cross_process_fork_slot();
-            for hold in unix_holds {
+            for (_, hold) in unix_holds.drain(..) {
                 crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
                     &self.global,
                     hold,
+                );
+            }
+        }
+        // The child exists now, so every unix connection holder counted for it moves off this
+        // process's pid onto the child's own: the child boots for about a second before it can
+        // adopt the fd, and a parent that exits first would otherwise leave that side of the
+        // connection with no live holder -- an EOF the peer must not see. See
+        // `UnixSocket::fork_carry`'s comment.
+        if let Some(child) = handle
+            && let Some(child_host) = self.global.platform.cross_process_child_host_pid(child)
+        {
+            for (_, hold) in &mut unix_holds {
+                crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_move_to_child(
+                    &self.global,
+                    hold,
+                    child_host,
                 );
             }
         }
@@ -4401,6 +4527,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         vfork: bool,
         child_sp: Option<usize>,
         clone_flags: CloneFlags,
+        child_ns: (u32, i32, i32),
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         // The Windows-shaped reconstruction path above (GPR injection, VMA relocation) is only
         // wired up for x86_64 -- but native `fork()` needs none of that machinery at all (see
@@ -4414,6 +4541,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 vfork,
                 child_sp,
                 clone_flags.contains(CloneFlags::NEWUSER),
+                child_ns,
             );
         }
         None
@@ -4440,6 +4568,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         vfork: bool,
         child_sp: Option<usize>,
         new_user_namespace: bool,
+        child_ns: (u32, i32, i32),
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
         litebox_util_log::debug!(tid:% = self.tid.get(); "clone: try_native_cross_process_fork entry");
         // SAFETY: no `RefCell`/lock guard local to this function is held across the call. Every
@@ -4506,6 +4635,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     child_state,
                     child_sp,
                     new_user_namespace,
+                    child_ns,
                 );
                 litebox_util_log::debug!(
                     tid:% = self.tid.get();
@@ -4577,6 +4707,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )>,
         child_sp: Option<usize>,
         new_user_namespace: bool,
+        child_ns: (u32, i32, i32),
     ) {
         if let Some(sp) = child_sp {
             NATIVE_CHILD_SP.store(sp, Ordering::Relaxed);
@@ -4702,6 +4833,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid.set(old_pid);
         self.pid.set(new_pid);
         self.tid.set(new_pid);
+        // The parent allocated this child's chain of per-namespace pids in the shared namespace
+        // table BEFORE the `fork()` ran (see `do_clone`), so this process adopts those numbers
+        // rather than allocating again -- allocating here would add a second row per level for
+        // what is one process, and would give it a different pid than the parent was told.
+        self.pid_ns.set(child_ns.0);
+        self.ns_pid.set(child_ns.1);
+        self.ns_tid.set(child_ns.2);
         // A forked child inherits its parent's process group.
         self.process()
             .pgid
@@ -4768,13 +4906,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// The identity a cross-process fork child comes up with (see
     /// [`litebox::platform::ForkChildIdentity`]), pre-registering the child in the cross-process
     /// registry so signals sent before it is running wait in its slot.
-    fn prepare_fork_child_identity(&self, child_tid: i32) -> litebox::platform::ForkChildIdentity {
+    fn prepare_fork_child_identity(
+        &self,
+        child_tid: i32,
+        pid_namespace: (u32, i32, i32),
+    ) -> litebox::platform::ForkChildIdentity {
         let pgid = self.sys_getpgid(0).unwrap_or(self.pid.get());
         self.xproc_preregister_child(child_tid, pgid);
         litebox::platform::ForkChildIdentity {
             pid: child_tid,
             ppid: self.pid.get(),
             pgid,
+            pid_ns: pid_namespace.0 as i32,
+            ns_pid: pid_namespace.1,
+            ns_tid: pid_namespace.2,
         }
     }
 
@@ -4787,6 +4932,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(signal) = signal else { return };
         let process = self.process();
         let uid = self.creds().uid;
+        // Spelled in the parent's namespace (the parent is who gets this signal) and computed OUT
+        // HERE, not inside the closure: that closure must be `Send` (it runs on a host thread of
+        // its own), and all it ever needs is this one number.
+        let si_pid = self.guest_pid_of(child_pid).unwrap_or(child_pid);
         self.global.platform.spawn_cross_process_exit_notifier(
             handle,
             alloc::boxed::Box::new(move |raw_exit_code| {
@@ -4794,7 +4943,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 process.shared_pending.lock().push(
                     &process.limits,
                     signal,
-                    super::signal::siginfo_child(signal, child_pid, uid, status),
+                    super::signal::siginfo_child(signal, si_pid, uid, status),
                 );
                 process.interrupt_all_threads();
             }),
@@ -4865,6 +5014,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // its own (see `Credentials::in_new_user_namespace` and `sys_unshare`), which is the
             // one namespace litebox models and the only one `/proc/self/ns/` advertises.
             | CloneFlags::NEWUSER
+            // `CLONE_NEWPID` is implemented, not faked: the child becomes pid 1 of a brand-new PID
+            // namespace, and still holds a pid in every namespace above it (see
+            // `syscalls::pidns`), which is what its parent's `wait4`/`kill` name it by.
+            | CloneFlags::NEWPID
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM
             // `CLONE_CLEAR_SIGHAND` resets the child's signal handlers to their defaults. This is
@@ -4889,7 +5042,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Deliberately NOT a fake namespace implementation: claiming isolation we do not
         // provide would be far worse than an honest refusal.
         const NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWNS
-            .union(CloneFlags::NEWPID)
             .union(CloneFlags::NEWNET)
             .union(CloneFlags::NEWIPC)
             .union(CloneFlags::NEWUTS)
@@ -4915,6 +5067,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // reset it, and there is no coherent meaning for both.
         if flags.contains(CloneFlags::CLEAR_SIGHAND | CloneFlags::SIGHAND) {
             return Err(Errno::EINVAL);
+        }
+        // A new PID namespace is the CHILD's, so it cannot be combined with anything that would make
+        // the child share this thread group's identity: Linux rejects all four (a thread has no pid
+        // of its own to be 1, and an address space shared with its parent's is not a new process).
+        if flags.contains(CloneFlags::NEWPID)
+            && flags.intersects(
+                CloneFlags::THREAD | CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::PARENT,
+            )
+        {
+            log_unsupported!("clone with CLONE_NEWPID and a flag it cannot share: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+        // Creating a PID namespace requires `CAP_SYS_ADMIN` in the user namespace that will OWN it:
+        // root in the initial one, or the owner of a user namespace -- which is exactly what
+        // Chromium's zygote keeps (`Credentials::SetCapabilities`) so it can put every renderer in
+        // a namespace of its own.
+        //
+        // `CLONE_NEWUSER` in the same clone is the unprivileged way in, and needs no capability at
+        // all: the caller creates the user namespace that owns the new PID namespace, so it is its
+        // owner by construction (Linux validates against the NEW user namespace, not the old one).
+        // Chromium's zygote relies on precisely this -- it runs as an unprivileged uid and passes
+        // `CLONE_NEWUSER|CLONE_NEWPID` in one clone.
+        if flags.contains(CloneFlags::NEWPID)
+            && !flags.contains(CloneFlags::NEWUSER)
+            && !self.creds().holds_capability(CAP_SYS_ADMIN_BIT)
+        {
+            log_unsupported!("clone with CLONE_NEWPID without CAP_SYS_ADMIN");
+            return Err(Errno::EPERM);
         }
         if flags.intersects(!supported_clone_flags) {
             log_unsupported!(
@@ -5054,8 +5234,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // Where the child lands in the PID-namespace tree, and the pid/tid it is given there.
+        // Allocated HERE -- before any of the three ways this clone can actually produce a child
+        // (cross-process `CreateProcessW`, native `fork()`, same-process thread) -- because all
+        // three must end up with the SAME chain: the shared table is the only thing a parent in
+        // one namespace and a child in another, possibly in another host process, agree on.
+        //
+        // A thread clone stays in this task's namespace and keeps this process's pid; only its TID
+        // is fresh. A process clone without `CLONE_NEWPID` also just joins this namespace. Only
+        // `CLONE_NEWPID` creates one, whose first task is pid 1 there (and gets a pid in every
+        // ancestor too, which is what lets the parent still `wait4` for it).
+        let child_ns_id = if flags.contains(CloneFlags::NEWPID) {
+            self.global
+                .pid_namespaces
+                .create(self.pid_ns.get())
+                .ok_or(Errno::EAGAIN)?
+        } else {
+            self.pid_ns.get()
+        };
+        let child_ns_tid = self
+            .global
+            .pid_namespaces
+            .allocate(child_ns_id, child_tid)
+            .ok_or(Errno::EAGAIN)?;
+        let child_ns: (u32, i32, i32) = if is_process_clone {
+            (child_ns_id, child_ns_tid, child_ns_tid)
+        } else {
+            (child_ns_id, self.ns_pid.get(), child_ns_tid)
+        };
         if let Some(parent_tid_ptr) = set_parent_tid {
-            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
+            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_ns_tid);
         }
 
         if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
@@ -5097,13 +5305,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Cross-process fork(), decided BEFORE any duplication -- see
             // `try_cross_process_fork`'s doc comment for why the ordering is the whole point.
             //
-            // Never for a vfork: a `CLONE_VFORK` child deliberately SHARES the parent's
-            // `PageManager` for the window until its own `execve`/`_exit`, which is both correct
-            // Linux semantics and already litebox's own answer to the fixed-address collision the
-            // cross-process path exists to solve. It has nothing to hand a separate address space.
-            if (!vforked || self.global.platform.has_native_fork())
-                && let Some(handle) =
-                    self.try_cross_process_fork(ctx, child_tid, exit_signal, vforked, sp, flags)
+            // A `CLONE_VFORK` child goes cross-process too, even though real `vfork()` shares the
+            // caller's address space until the child's `execve`/`_exit`. Sharing is an
+            // optimization there, not the contract: the contract is "the child either execs or
+            // exits, and the parent stays suspended until it does". Handing the child a full copy
+            // instead of a share satisfies that contract for every guest that obeys it, and buys
+            // the thing sharing could never give here -- a child in its OWN host process, which
+            // therefore survives its parent's exit. That is not a nicety: a same-process vfork
+            // child lives in its launcher's host process, so the moment the launcher exited (the
+            // ordinary `fork()`+`exec()` shape, and Chromium's namespace-setup child, which
+            // `posix_spawn`s the zygote and then `_exit`s) the child was torn down with it, and
+            // the unix connection it held went EOF/EPIPE under a holder host pid that had just
+            // died -- Chromium's `zygote_linux.cc:138 Check failed: . Sending zygote magic
+            // failed: Broken pipe (32)`. It also removes the remaining fixed-address exec
+            // collision (a non-PIE ET_EXEC, e.g. gcc's `cc1`, from a same-process vfork child).
+            //
+            // The one observable difference left: a vfork child that reports a failed `execve` by
+            // writing into the parent's stack (glibc's `posix_spawn` error hand-off) now writes
+            // into its own copy, so `posix_spawn` reports success for a child that failed to
+            // exec. Preferable to a child killed by its parent's exit.
+            //
+            // `CLONE_FS`/`CLONE_FILES` are the exception: those flags promise the child SHARES this
+            // task's `FsState` (root, cwd, umask) or descriptor table rather than copying them, and
+            // a separate host process cannot share either -- nothing a child process does there can
+            // be observed by the parent. Guests rely on exactly that sharing: Chromium's sandbox
+            // setup spawns `CLONE_VM|CLONE_FS|CLONE_VFORK` child that only `chroot`s to
+            // `/proc/self/fdinfo/` and `_exit`s, purely so the chroot lands on the PARENT (the zygote
+            // it was forked from), then stats `/proc` to confirm it took effect and
+            // `IMMEDIATE_CRASH`es (guest `int3` -> SIGTRAP, no message) when it has not. So those
+            // clones stay in-process, where `make_fs`/`make_files` hand out the parent's own `Arc`.
+            let shares_with_parent = flags.contains(CloneFlags::FS) || flags.contains(CloneFlags::FILES);
+            if !shares_with_parent && let Some(handle) =
+                self.try_cross_process_fork(
+                    ctx, child_tid, exit_signal, vforked, sp, flags, child_ns,
+                )
             {
                 // `handle.0 == 0` is the reserved sentinel `try_native_cross_process_fork`
                 // documents: this very call is returning in the CHILD's own copy of this exact
@@ -5125,7 +5360,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
                 );
-                return Ok(usize::try_from(child_tid).unwrap());
+                // The pid the CALLER asked about, not the child's own: a `CLONE_NEWPID` child is
+                // pid 1 in its new namespace but must come back as the pid it has HERE.
+                return Ok(usize::try_from(self.guest_pid_of(child_tid).unwrap_or(child_tid))
+                    .unwrap_or(0));
             }
 
             litebox_util_log::warn!(
@@ -5972,7 +6210,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         alloc::vec::Vec::new(),
                         self.comm.get(),
                         self.sigreturn_trampoline_addr(),
-                        self.prepare_fork_child_identity(child_tid),
+                        self.prepare_fork_child_identity(child_tid, child_ns),
                     )
             {
                 self.process()
@@ -6001,7 +6239,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global
                     .platform
                     .with_fork_duplicate_claim_owner(child_tid, || drop(thread));
-                return Ok(usize::try_from(child_tid).unwrap());
+                return Ok(usize::try_from(self.guest_pid_of(child_tid).unwrap_or(child_tid))
+                    .unwrap_or(0));
             }
             if fork_slot_reserved {
                 // The chain above reserved a slot but did not reach (or did not take) the
@@ -6154,6 +6393,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pid: Cell::new(pid),
                         tid: Cell::new(child_tid),
                         ppid: Cell::new(ppid),
+                        pid_ns: Cell::new(child_ns.0),
+                        ns_pid: Cell::new(child_ns.1),
+                        ns_tid: Cell::new(child_ns.2),
                         // A `CLONE_NEWUSER` child starts in its own user namespace: same kernel
                         // ids, empty id map, all capabilities inside it.
                         credentials: RefCell::new(if flags.contains(CloneFlags::NEWUSER) {
@@ -6273,7 +6515,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             vfork_child_process.wait_for_vfork_done();
         }
 
-        Ok(usize::try_from(child_tid).unwrap())
+        // `clone`/`fork` report the child's pid as the CALLER sees it: pid 1 of a `CLONE_NEWPID`
+        // namespace to the child itself, but the pid it holds in THIS task's namespace to the
+        // caller that is about to `wait4` for it.
+        Ok(usize::try_from(self.guest_pid_of(child_tid).unwrap_or(child_tid)).unwrap_or(0))
     }
 
     /// Handle syscall `set_tid_address`.
@@ -6294,12 +6539,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.borrow().clear_child_tid.set(Some(tidptr));
-        self.tid.get()
+        self.guest_tid()
     }
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid.get()
+        self.guest_tid()
     }
 }
 
@@ -6894,12 +7139,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `getpid`.
+    ///
+    /// Reports the pid this task holds in its own PID namespace -- `1` for the first task of a
+    /// `clone(CLONE_NEWPID)` namespace, not the internal pid every cross-process registry keys on.
+    /// Chromium's zygote `CHECK_EQ(1, getpid())`s exactly this.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        self.pid.get()
+        self.guest_pid()
     }
 
+    /// Handle syscall `getppid`.
+    ///
+    /// `0` when the parent lives outside this task's namespace, which is what Linux reports: only
+    /// a parent visible in the caller's own namespace has a pid there to report.
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.ppid.get()
+        self.guest_pid_of(self.ppid.get()).unwrap_or(0)
     }
 
     /// Handle syscall `getpgid`.
@@ -7084,6 +7337,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             pid: self.pid.get() as u32,
             uid: c.euid,
             gid: c.egid,
+        }
+    }
+
+    /// This task's own credentials, as `SCM_CREDENTIALS` reports them to a receiver whose socket
+    /// has `SO_PASSCRED` enabled. Linux's `scm_set_cred` stamps `current_uid()`/`current_gid()`
+    /// -- the REAL ids -- not the EFFECTIVE ones [`Self::peer_cred`] carries, so the two are not
+    /// interchangeable for a task that has changed its effective ids (`setuid` binaries, `su`).
+    /// The pid is the same value both report.
+    pub(crate) fn scm_cred(&self) -> litebox_common_linux::Ucred {
+        let c = self.creds();
+        litebox_common_linux::Ucred {
+            pid: self.pid.get() as u32,
+            uid: c.visible_uid(),
+            gid: c.visible_gid(),
         }
     }
 
@@ -8561,8 +8828,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 if let Some(child_tid_ptr) = set_child_tid {
-                    // Set the child TID if requested.
-                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid.get());
+                    // Set the child TID if requested -- as THIS task's `gettid()` reports it, which
+                    // is the value a caller compares against (`CLONE_CHILD_SETTID` is how
+                    // `pthread_create` learns its own new thread's id).
+                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.guest_tid());
                 }
 
                 // Diagnostic logging (pthread_create/clone stall investigation, sub-session 36),
@@ -8656,7 +8925,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     match child_ctid {
                         Some(addr) => {
                             let slot = UserPtrMut::<i32>::from_usize(addr);
-                            let _ = slot.write_at_offset::<Platform>(0, self.tid.get());
+                            let _ = slot.write_at_offset::<Platform>(0, self.guest_tid());
                         }
                         None => litebox_util_log::debug!(
                             ctid:% = ctid.as_usize(), child_tid:% = self.tid.get();

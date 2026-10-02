@@ -699,6 +699,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
                         process_table: syscalls::signal::xproc::SharedProcessTable::new(),
+                        pid_namespaces: syscalls::pidns::PidNamespaceTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
@@ -960,6 +961,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
+                pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
                 credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
@@ -1132,6 +1136,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         comm: [u8; litebox_common_linux::TASK_COMM_LEN],
         sigreturn_trampoline: usize,
         pgid: Option<i32>,
+        // The PID namespace this child was born into and the pid/tid it holds there, as the parent
+        // that forked it computed them (its rows in the shared namespace table are already
+        // registered by then -- see `syscalls::pidns`). `None` for the initial namespace, where a
+        // task's guest pid is its internal one.
+        pid_namespace: Option<(u32, i32, i32)>,
     ) -> LinuxShimEntrypoints<Platform, FS> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -1173,6 +1182,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid: Cell::new(pid),
                 ppid: Cell::new(ppid),
                 tid: Cell::new(pid),
+                pid_ns: Cell::new(pid_namespace.map_or(syscalls::pidns::INITIAL_NS, |ns| ns.0)),
+                ns_pid: Cell::new(pid_namespace.map_or(pid, |ns| ns.1)),
+                ns_tid: Cell::new(pid_namespace.map_or(pid, |ns| ns.2)),
                 credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
                 comm: comm.into(),
                 dumpable: Cell::new(1),
@@ -1525,6 +1537,19 @@ fn default_fs<Platform: ShimPlatform>(
                             b"1048576
 "
                         ),
+                        // Yama's ptrace restriction level, `0` = the classic "any process may
+                        // ptrace any other with the usual uid checks" (a kernel built without
+                        // Yama, and what a Yama build reports until something raises it).
+                        // Chromium's crashpad reads this while deciding whether a crash handler
+                        // it has just started will be able to attach to the browser process,
+                        // and `IMMEDIATE_CRASH`es (`int3`, no log line) when the file is absent
+                        // -- the whole browser dies 3s into a sandbox-enabled start. `0` is also
+                        // the honest answer here: litebox has no LSM to restrict ptrace with.
+                        litebox::fs::static_files::file(
+                            "kernel/yama/ptrace_scope",
+                            b"0
+"
+                        ),
                     ],
                 )
             })
@@ -1568,6 +1593,12 @@ fn default_fs<Platform: ShimPlatform>(
                 let mut entries = alloc::vec![
                     litebox::fs::static_files::file("online", range.as_bytes()),
                     litebox::fs::static_files::file("possible", range.as_bytes()),
+                    // Same range as `online`: CPUs that are present but offline exist in
+                    // `present` too, and nothing here is ever offlined, so all three agree.
+                    litebox::fs::static_files::file("present", range.as_bytes()),
+                    // `NR_CPUS - 1` of a distro kernel, i.e. the highest CPU index the kernel's
+                    // static tables admit -- unrelated to how many are actually present.
+                    litebox::fs::static_files::file("kernel_max", b"8191\n"),
                 ];
                 // One `cpuN/cpu_capacity` per CPU, not just `cpu0`. Declaring only `cpu0` was a
                 // real gap, not a simplification: a live session was observed reading
@@ -2443,10 +2474,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Chroot { pathname } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chroot(path))),
             SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
-        SyscallRequest::Chroot { pathname } => pathname
-            .to_cstring::<Platform>()
-            .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chroot(path))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -3920,6 +3951,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// shared across host processes along with the rest of this struct. See
     /// [`syscalls::signal::xproc`].
     pub(crate) process_table: syscalls::signal::xproc::SharedProcessTable,
+    /// Every PID namespace in the fork family and the pid each process has in each of them.
+    /// Pointer-free, so it is shared across host processes along with the rest of this struct --
+    /// which is what lets a parent in one host process wait for and signal a child running in
+    /// another while both name it by the pid they see. See [`syscalls::pidns`].
+    pub(crate) pid_namespaces: syscalls::pidns::PidNamespaceTable,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
     /// The live pipe behind each open FIFO, keyed by the FIFO's `(dev, ino)`.
@@ -4137,6 +4173,19 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     ppid: Cell<i32>,
     /// Thread ID. `Cell` for the same reason as [`Self::pid`].
     tid: Cell<i32>,
+    /// The PID namespace this task belongs to: [`syscalls::pidns::INITIAL_NS`] unless it (or an
+    /// ancestor) was created by a `clone(CLONE_NEWPID)`. Shared by every thread of a process, and
+    /// inherited by its children, exactly as on Linux.
+    ///
+    /// `Cell` for the same reason as [`Self::pid`].
+    pid_ns: Cell<u32>,
+    /// This task's pid as THE GUEST sees it: the pid it holds in [`Self::pid_ns`], which is what
+    /// Linux's `getpid()` reports and what `fork()` returns to this task's parent -- not the
+    /// internal pid in [`Self::pid`], which is the one every cross-process registry keys on.
+    ns_pid: Cell<i32>,
+    /// [`Self::ns_pid`] for this task's thread id (identical to it for a process's initial thread,
+    /// which is what makes a fresh namespace's first task `pid == tid == 1`).
+    ns_tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
     credentials: RefCell<Arc<syscalls::process::Credentials>>,
@@ -4176,6 +4225,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
     }
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// The PID namespace this task belongs to: [`syscalls::pidns::INITIAL_NS`] unless a
+    /// `clone(CLONE_NEWPID)` created the one it lives in.
+    pub(crate) fn pid_namespace(&self) -> u32 {
+        self.pid_ns.get()
+    }
+
+    /// Linux's `getpid()`: the pid this task holds in its own PID namespace, not the internal pid.
+    pub(crate) fn guest_pid(&self) -> i32 {
+        self.ns_pid.get()
+    }
+
+    /// Linux's `gettid()`: [`Self::guest_pid`] for a process's initial thread.
+    pub(crate) fn guest_tid(&self) -> i32 {
+        self.ns_tid.get()
+    }
+
+    /// Which internal pid a caller in this task's namespace means by `guest`: `None` when this
+    /// namespace cannot see that pid at all, which is Linux's `ESRCH` for `kill`/`wait4`.
+    pub(crate) fn resolve_guest_pid(&self, guest: i32) -> Option<i32> {
+        self.global.pid_namespaces.translate(guest, self.pid_ns.get())
+    }
+
+    /// How `internal` is spelled in this task's namespace -- `wait4`'s return value, `siginfo`'s
+    /// `si_pid` and `SCM_CREDENTIALS`' `pid` all report this rather than the internal pid.
+    pub(crate) fn guest_pid_of(&self, internal: i32) -> Option<i32> {
+        self.global.pid_namespaces.pid_in(internal, self.pid_ns.get())
+    }
+
+    /// How `internal` (a thread id) is spelled in this task's namespace.
+    pub(crate) fn guest_tid_of(&self, internal: i32) -> Option<i32> {
+        self.guest_pid_of(internal)
+    }
+}
+
 #[cfg(test)]
 mod test_utils {
     extern crate std;
@@ -4205,6 +4289,9 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(0),
                 tid: Cell::new(pid),
+                pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
                 credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 dumpable: Cell::new(1),
@@ -4231,6 +4318,9 @@ mod test_utils {
                 pid: Cell::new(self.pid.get()),
                 ppid: Cell::new(self.ppid.get()),
                 tid: Cell::new(tid),
+                pid_ns: self.pid_ns.clone(),
+                ns_pid: self.ns_pid.clone(),
+                ns_tid: Cell::new(tid),
                 credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),
@@ -4276,6 +4366,9 @@ mod test_utils {
                 pid: Cell::new(pid),
                 ppid: Cell::new(self.pid.get()),
                 tid: Cell::new(pid),
+                pid_ns: self.pid_ns.clone(),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
                 credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
                 dumpable: self.dumpable.clone(),

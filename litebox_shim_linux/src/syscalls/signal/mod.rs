@@ -994,6 +994,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let signal = (signal != 0)
             .then(|| Signal::try_from(signal))
             .transpose()?;
+        // A pid/tid a guest hands us is the one IT sees, in ITS OWN namespace -- the pid a
+        // `CLONE_NEWPID` child was given at birth, not the internal pid every registry here keys
+        // on. Translate both up front so every comparison and lookup below stays in internal
+        // terms. The non-positive encodings are namespace-independent by definition (`0` and `-1`
+        // are "my group"/"everything", `-n` is "group n"), so they pass through untouched. A pid
+        // this namespace cannot see becomes a value no lookup can ever match, which is exactly
+        // Linux's `ESRCH` for signalling outside your own namespace -- never the internal pid that
+        // number happens to spell for somebody else.
+        let unseen = i32::MAX;
+        let pid = pid.map(|p| {
+            if p > 0 {
+                self.resolve_guest_pid(p).unwrap_or(unseen)
+            } else {
+                p
+            }
+        });
+        let tid = tid.map(|t| {
+            if t > 0 {
+                self.resolve_guest_pid(t).unwrap_or(unseen)
+            } else {
+                t
+            }
+        });
         // A `tkill`/`tgkill` targeting a DIFFERENT thread of THIS SAME process (the overwhelmingly
         // common real-world case: glibc/musl's NPTL uses exactly this to signal one specific
         // sibling thread for internal cross-thread synchronization handshakes, e.g. dlopen's

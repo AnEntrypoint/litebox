@@ -880,17 +880,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// One holder of this side is gone. Once none remains, this side's write direction ends;
     /// once neither side is held, the slot returns to the pool.
     fn release_holder(&self) {
+        self.release_holder_for(self.platform().current_host_pid())
+    }
+
+    /// [`Self::release_holder`] for a holder counted under `host` rather than this process: the
+    /// one [`UnixSocket::fork_carry`] counted for a child that never came up to adopt it.
+    fn release_holder_for(&self, host: u32) {
         litebox_util_log::__private::tracing::event!(
             target: "litebox_diag::unix_conn_teardown",
             litebox_util_log::__private::tracing::Level::DEBUG,
             slot = %self.slot,
             is_client = %self.is_client,
-            host_pid = %self.platform().current_host_pid(),
+            host_pid = %host,
             before = %self.slot_ref().holder_dump(),
             "DIAG unix shared conn: release_holder"
         );
         let slot_ref = self.slot_ref();
-        slot_ref.release(self.is_client, self.platform().current_host_pid());
+        slot_ref.release(self.is_client, host);
         if slot_ref.side_gone(self.is_client, self.platform()) {
             // 118th-pass investigation: root-causing a session-client death cascade (AGENTS.md
             // "Where things stand") to a genuine EOF on each client's own unix-domain connection
@@ -906,7 +912,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 litebox_util_log::__private::tracing::Level::DEBUG,
                 slot = %self.slot,
                 is_client = %self.is_client,
-                host_pid = %self.platform().current_host_pid(),
+                host_pid = %host,
                 "DIAG unix shared conn: last holder of this side released, shutting down write ring (peer will see EOF)"
             );
             let (_, write_ring) = self.rings();
@@ -2382,6 +2388,10 @@ struct DatagramMessage {
     // TODO: add control messages
     // cmsgs: Option<Vec<Cmsg>>,
     source: UnixSocketAddr,
+    /// The sending task's credentials, stamped at send time so a receiver with `SO_PASSCRED` can
+    /// report them as `SCM_CREDENTIALS` -- Linux records them on the skb while it is still in the
+    /// sender's context, so a later `setuid` by the sender cannot change a queued message's cred.
+    cred: Ucred,
 }
 
 impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
@@ -2427,6 +2437,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         peek: bool,
+        mut sender_cred: Option<&mut Option<Ucred>>,
     ) -> Result<usize, TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
@@ -2434,6 +2445,9 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
             buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
             if let Some(source_addr) = source_addr.as_deref_mut() {
                 *source_addr = Some(msg.source.clone());
+            }
+            if let Some(sender_cred) = sender_cred.as_deref_mut() {
+                *sender_cred = Some(msg.cred);
             }
             // Always consume the entire message to preserve boundaries (unless only peeking).
             Ok((!peek, msg.data.len()))
@@ -2473,6 +2487,11 @@ struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     read_shutdown: bool,
     write_shutdown: bool,
     pollee: Arc<Pollee<Platform>>,
+    /// Credentials of the task that sent the last message this socket read, for a receiver with
+    /// `SO_PASSCRED` (see [`UnixSocket::passcred_ucred`]). `None` until a message arrives: unlike
+    /// a stream, a datagram socket has no single peer to fall back on, so nothing is reported
+    /// until something is actually received -- which is also all Linux can do.
+    last_sender: Option<Ucred>,
 }
 /// Represents a Unix datagram socket.
 struct UnixDatagram<Platform: ShimPlatform, FS: ShimFS> {
@@ -2563,6 +2582,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                 read_shutdown: false,
                 write_shutdown: false,
                 pollee: Arc::new(Pollee::new()),
+                last_sender: None,
             }),
         }
     }
@@ -2584,6 +2604,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     read_shutdown: false,
                     write_shutdown: false,
                     pollee: pollee1,
+                    last_sender: None,
                 }),
             },
             UnixDatagram {
@@ -2594,9 +2615,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     read_shutdown: false,
                     write_shutdown: false,
                     pollee: pollee2,
+                    last_sender: None,
                 }),
             },
         )
+    }
+
+    /// Remembers the credentials of the task that sent the last message this socket read, for
+    /// [`UnixSocket::passcred_ucred`] to hand out as `SCM_CREDENTIALS`.
+    fn note_last_sender(&self, cred: Ucred) {
+        self.inner.write().last_sender = Some(cred);
+    }
+
+    /// [`Self::note_last_sender`]'s read side: `None` before this socket has received anything.
+    fn last_sender(&self) -> Option<Ucred> {
+        self.inner.read().last_sender
     }
 
     /// Binds this socket to the given address.
@@ -2647,6 +2680,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         is_nonblocking: bool,
         peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+        mut sender_cred: Option<&mut Option<Ucred>>,
     ) -> Result<usize, Errno> {
         let res = cx
             .with_timeout(timeout)
@@ -2662,7 +2696,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut(), peek)
+                    recv_channel.try_read(buf, source_addr.as_deref_mut(), peek, sender_cred.as_deref_mut())
                 },
             )
             .map_err(Errno::from);
@@ -2714,6 +2748,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             DatagramMessage {
                 data: buf.to_vec(),
                 source,
+                // Same real-ids snapshot a stream send records for `SCM_CREDENTIALS`.
+                cred: task.scm_cred(),
             },
             is_nonblocking,
         )?;
@@ -2902,7 +2938,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.note_sender(&task.peer_cred());
+                // `SCM_CREDENTIALS` carries the sender's REAL ids, which is what `scm_cred`
+                // reports; `peer_cred` is the effective-ids snapshot `SO_PEERCRED` uses.
+                stream.note_sender(&task.scm_cred());
                 stream.sendto(
                     &task.wait_cx(),
                     timeout,
@@ -2931,8 +2969,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
     /// read (always empty for a datagram socket or a message with no attached fds).
-    /// The credentials to attach as `SCM_CREDENTIALS` to data this socket receives: the peer's,
-    /// when `SO_PASSCRED` is on and the socket is a connected stream.
+    /// The credentials to attach as `SCM_CREDENTIALS` to data this socket receives: those of the
+    /// task that last sent, when `SO_PASSCRED` is on. A connected stream falls back to the peer
+    /// it was established with until that peer sends; a datagram socket reports nothing until it
+    /// has actually received a message.
     pub(super) fn passcred_ucred(&self) -> Option<Ucred> {
         if !self.options.lock().passcred {
             return None;
@@ -2960,7 +3000,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 }),
                 _ => None,
             }),
-            UnixSocketInner::Datagram(_) => None,
+            UnixSocketInner::Datagram(datagram) => datagram.last_sender(),
         }
     }
 
@@ -2989,9 +3029,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             UnixSocketInner::Stream(stream) => {
                 stream.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
             }
-            UnixSocketInner::Datagram(datagram) => datagram
-                .recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
-                .map(|n| (n, Vec::new())),
+            UnixSocketInner::Datagram(datagram) => {
+                let mut sender = None;
+                datagram
+                    .recvfrom(
+                        cx,
+                        timeout,
+                        buf,
+                        is_nonblocking,
+                        peek,
+                        source_addr,
+                        Some(&mut sender),
+                    )
+                    .map(|n| {
+                        if let Some(cred) = sender {
+                            datagram.note_last_sender(cred);
+                        }
+                        (n, Vec::new())
+                    })
+            }
         };
         match ret {
             Err(Errno::ESHUTDOWN) => Ok((0, Vec::new())),
@@ -4636,8 +4692,18 @@ fn decode_unix_addr(s: &str) -> Option<UnixSocketAddr> {
 /// happen: the connection holder it counted, or the listener presence it advertised, on the
 /// child's behalf.
 pub(crate) enum UnixCarryHold {
-    Conn { slot: u32, is_client: bool },
-    Presence { key: UnixSocketAddrKey, owner_pid: u32 },
+    /// The connection holder counted for the child on `slot`'s `is_client` side. `host` is the
+    /// host pid it is registered under right now: the carrying process's own until
+    /// [`UnixSocket::fork_carry_move_to_child`] moves it onto the child's, once the child exists.
+    Conn {
+        slot: u32,
+        is_client: bool,
+        host: u32,
+    },
+    Presence {
+        key: UnixSocketAddrKey,
+        owner_pid: u32,
+    },
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
@@ -4676,6 +4742,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         global: &GlobalStateHandle<Platform, FS>,
         own_cred: Ucred,
         child_pid: i32,
+        for_spawn: bool,
     ) -> Result<(String, Option<UnixCarryHold>), &'static str> {
         self.fork_carry_check()?;
         let status = self.get_status().bits();
@@ -4710,6 +4777,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         let (slot, is_client) =
                             conn.promote_for_fork(global, own_cred, stream.preserve_boundaries)?;
                         let me = global.platform.current_host_pid();
+                        // A spawned child adopts its inherited fds only after its whole host
+                        // process has booted (about a second here: rootfs, shared arena, VMA
+                        // layout), while its parent -- typically a `fork()`+`exec()` launcher --
+                        // may exit at any instant in between. Counting this hold under the
+                        // parent's pid would leave the slot's side with no LIVE holder for that
+                        // whole window, and a reader on the other side then sees EOF even though
+                        // the child is alive: the `Broken pipe` Chromium's zygote reports when
+                        // its launcher exits first (`zygote_linux.cc:138`). The hold is therefore
+                        // moved onto the child's own pid as soon as the child exists
+                        // (`Self::fork_carry_move_to_child`), and the spec's `me` field is left
+                        // 0 to tell the adopter to release its own pid rather than the parent's.
+                        // An fd handed over by `SCM_RIGHTS` has no such window -- the sender
+                        // holds it until the receiver adopts -- so it keeps the sender's pid.
+                        let carried_me = if for_spawn { 0 } else { me };
                         litebox_util_log::__private::tracing::event!(
                             target: "litebox_diag::unix_conn_teardown",
                             litebox_util_log::__private::tracing::Level::DEBUG,
@@ -4725,7 +4806,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         let peer = conn.peer_cred;
                         Ok((
                             alloc::format!(
-                                "C,{seq},{slot},{},{me},{},{},{},{},{}",
+                                "C,{seq},{slot},{},{carried_me},{},{},{},{},{}",
                                 u8::from(is_client),
                                 peer.pid,
                                 peer.uid,
@@ -4733,7 +4814,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                                 encode_unix_addr(&conn.get_local_addr()),
                                 encode_unix_addr(&conn.get_peer_addr())
                             ),
-                            Some(UnixCarryHold::Conn { slot, is_client }),
+                            Some(UnixCarryHold::Conn {
+                                slot,
+                                is_client,
+                                host: me,
+                            }),
                         ))
                     }
                     UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
@@ -4743,15 +4828,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         Ok((alloc::format!("{status:x};{}", body.0), body.1))
     }
 
+    /// Moves the connection holder [`Self::fork_carry`] counted for a child off the carrying
+    /// process's host pid and onto the child's real one, as soon as the child's host process
+    /// exists. See the comment at that call site for the launcher-exits-first window this closes.
+    pub(super) fn fork_carry_move_to_child(
+        global: &GlobalStateHandle<Platform, FS>,
+        hold: &mut UnixCarryHold,
+        child_host: u32,
+    ) {
+        let UnixCarryHold::Conn {
+            slot,
+            is_client,
+            host,
+        } = hold
+        else {
+            return;
+        };
+        if *host == child_host {
+            return;
+        }
+        let slot_ref = global.unix_shared_conn_table.get(*slot);
+        slot_ref.hold(*is_client, child_host);
+        slot_ref.release(*is_client, *host);
+        litebox_util_log::__private::tracing::event!(
+            target: "litebox_diag::unix_conn_teardown",
+            litebox_util_log::__private::tracing::Level::DEBUG,
+            slot = %*slot,
+            is_client = %*is_client,
+            from_host_pid = %*host,
+            child_host_pid = %child_host,
+            after = %slot_ref.holder_dump(),
+            "DIAG unix shared conn: carried hold moved onto the child's own host pid"
+        );
+        *host = child_host;
+    }
+
     /// Undoes a [`Self::fork_carry`] whose fork did not happen.
     pub(super) fn fork_carry_abandon(global: &GlobalStateHandle<Platform, FS>, hold: UnixCarryHold) {
         match hold {
-            UnixCarryHold::Conn { slot, is_client } => SharedView {
+            UnixCarryHold::Conn {
+                slot,
+                is_client,
+                host,
+            } => SharedView {
                 global,
                 slot,
                 is_client,
             }
-            .release_holder(),
+            .release_holder_for(host),
             UnixCarryHold::Presence { key, owner_pid } => {
                 let (kind, bytes) = presence_kind_and_bytes(&key);
                 global.unix_addr_presence.remove(kind, bytes, owner_pid);
@@ -4826,12 +4950,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         peer_addr,
                         peer_cred,
                     );
+                    // The holder the parent counted for this child now lives here. A spawned
+                    // child's spec names no parent pid (`fork_carry` writes 0 there) because the
+                    // hold was moved onto the child's own pid the moment the child existed --
+                    // before this adoption, which is far too late to keep the connection alive.
+                    let release_host = if parent_host == 0 {
+                        task.global.platform.current_host_pid()
+                    } else {
+                        parent_host
+                    };
                     litebox_util_log::__private::tracing::event!(
                         target: "litebox_diag::unix_conn_teardown",
                         litebox_util_log::__private::tracing::Level::DEBUG,
                         slot = %slot,
                         is_client = %is_client,
                         parent_host = %parent_host,
+                        release_host = %release_host,
                         child_host = %task.global.platform.current_host_pid(),
                         "DIAG unix shared conn: child adopted, releasing the parent's extra hold"
                     );
@@ -4839,7 +4973,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     task.global
                         .unix_shared_conn_table
                         .get(slot)
-                        .release(is_client, parent_host);
+                        .release(is_client, release_host);
                     litebox_util_log::__private::tracing::event!(
                         target: "litebox_diag::unix_conn_teardown",
                         litebox_util_log::__private::tracing::Level::DEBUG,

@@ -1727,6 +1727,16 @@ pub struct ForkChildIdentity {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
+    /// The PID namespace the child was born into: `0` for the initial namespace, whose pids are the
+    /// internal ones, otherwise the id [`crate::fs`]-level code never sees and only the shim's
+    /// namespace table interprets.
+    pub pid_ns: i32,
+    /// The pid the child holds in `pid_ns` -- its `getpid()`, and what its parent's `wait4`/`kill`
+    /// call it. Equals `pid` for the initial namespace.
+    pub ns_pid: i32,
+    /// [`Self::ns_pid`] for the child's initial thread (its `gettid()`), equal to `ns_pid` because a
+    /// fresh process's main thread has `pid == tid`.
+    pub ns_tid: i32,
 }
 
 /// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process

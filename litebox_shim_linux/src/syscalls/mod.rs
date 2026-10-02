@@ -21,6 +21,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod netlink;
 pub(crate) mod pipe;
+pub(crate) mod pidns;
 pub mod process;
 pub(crate) mod pty;
 mod pty_ldisc;

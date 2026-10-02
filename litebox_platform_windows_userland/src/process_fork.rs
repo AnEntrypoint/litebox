@@ -935,9 +935,12 @@ pub const FORK_CHILD_COMM_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_COMM";
 /// Path of the descriptor file a fork child re-arms its demand-paged file mappings from.
 pub const FORK_CHILD_LAZY_FILE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_LAZY_FILE";
 
-/// Carries the child's guest identity as `pid:ppid:pgid` (decimal): the pid the parent's `fork()`
-/// returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/`kill()` view of it
-/// instead of being the child's unrelated Windows process id. Never guest-visible.
+/// Carries the child's guest identity as `pid:ppid:pgid:pidns:nspid:nstid` (decimal): the pid the
+/// parent's `fork()` returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/
+/// `kill()` view of it instead of being the child's unrelated Windows process id, plus the PID
+/// namespace the child was born into and the pid/tid it holds there (a `clone(CLONE_NEWPID)` child
+/// is pid 1 even though its parent knows it by a different number). The last three are absent from
+/// an older parent's line, which parses as the initial namespace. Never guest-visible.
 pub const FORK_CHILD_GUEST_IDENTITY_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY";
 
 /// Carries shim-level fds (unix sockets) a cross-process fork child must rebuild, as
@@ -952,7 +955,17 @@ pub fn fork_child_guest_identity() -> Option<litebox::platform::ForkChildIdentit
     let pid = parts.next()?.ok()?;
     let ppid = parts.next()?.ok()?;
     let pgid = parts.next()?.ok()?;
-    (pid > 0).then_some(litebox::platform::ForkChildIdentity { pid, ppid, pgid })
+    let pid_ns = parts.next().and_then(Result::ok).unwrap_or(0);
+    let ns_pid = parts.next().and_then(Result::ok).unwrap_or(pid);
+    let ns_tid = parts.next().and_then(Result::ok).unwrap_or(ns_pid);
+    (pid > 0).then_some(litebox::platform::ForkChildIdentity {
+        pid,
+        ppid,
+        pgid,
+        pid_ns,
+        ns_pid,
+        ns_tid,
+    })
 }
 
 /// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
@@ -1899,7 +1912,15 @@ pub fn spawn_process_fork_child(
         (FORK_CHILD_COMM_ENV_VAR, hex_encode(&comm)),
         (
             FORK_CHILD_GUEST_IDENTITY_ENV_VAR,
-            format!("{}:{}:{}", identity.pid, identity.ppid, identity.pgid),
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                identity.pid,
+                identity.ppid,
+                identity.pgid,
+                identity.pid_ns,
+                identity.ns_pid,
+                identity.ns_tid
+            ),
         ),
         (
             FORK_CHILD_SHIM_FDS_ENV_VAR,

@@ -3328,6 +3328,10 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    /// `PR_SET_PTRACER` (`0x59616d61`): Yama's "this process may be attached to by that pid".
+    /// Chromium's crashpad sets it on the browser so the crash handler it just started can
+    /// attach later, and logs `prctl: Invalid argument` on every launch without it.
+    SetPtracer = 0x59616d61,
 }
 
 #[non_exhaustive]
@@ -3360,6 +3364,10 @@ pub enum PrctlArg {
     GetSecureBits,
     /// `PR_SET_SECUREBITS`.
     SetSecureBits(usize),
+    /// `PR_SET_PTRACER`: the pid allowed to ptrace this process (Yama). Accepted, not enforced:
+    /// this guest reports `ptrace_scope` 0 (no LSM restricting ptrace), which is exactly the
+    /// configuration where real Linux also accepts this without changing anything.
+    SetPtracer(usize),
     /// `PR_CAP_AMBIENT` with its sub-operation (`PR_CAP_AMBIENT_IS_SET`/`RAISE`/`LOWER`/`CLEAR_ALL`).
     CapAmbient(usize),
 }
@@ -5080,6 +5088,14 @@ impl SyscallRequest {
                         },
                         PrctlOption::CapAmbient => SyscallRequest::Prctl {
                             args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
+                        },
+                        // `PR_SET_PTRACER` names a pid permitted to ptrace this process. Real
+                        // Linux accepts it even where it changes nothing (no Yama, or Yama in
+                        // `ptrace_scope` 0), and a hard `EINVAL` here is a caller-visible refusal
+                        // rather than a no-op -- crashpad treats it as "the handler will not be
+                        // able to attach to us" and warns on every single launch.
+                        PrctlOption::SetPtracer => SyscallRequest::Prctl {
+                            args: PrctlArg::SetPtracer(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));

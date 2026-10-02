@@ -186,13 +186,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         raw_fd: usize,
         own_cred: litebox_common_linux::Ucred,
         child_pid: i32,
+        for_spawn: bool,
     ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str> {
         let raw_fd = u32::try_from(raw_fd).map_err(|_| "fd out of range")?;
         self.with_socket_netlink(
             global,
             raw_fd,
             |_inet| Err(Errno::ENOTSOCK),
-            |unix| Ok(unix.fork_carry(global, own_cred, child_pid)),
+            |unix| Ok(unix.fork_carry(global, own_cred, child_pid, for_spawn)),
             |_netlink| Err(Errno::ENOTSOCK),
         )
         .map_err(|_| "not a unix socket")?
@@ -2696,18 +2697,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             out.extend_from_slice(&cred.uid.to_ne_bytes());
             out.extend_from_slice(&cred.gid.to_ne_bytes());
         }
+        // A caller with `SO_PASSCRED` on but no control buffer (`msg_control` NULL) must still get
+        // its bytes: Linux drops the ancillary data and raises `MSG_CTRUNC`, it does not fail the
+        // read. Without this the first `recvmsg` after `SO_PASSCRED` started taking effect would
+        // fault writing the cmsg through a NULL pointer.
+        let control_capacity = if msg_control.as_usize() == 0 {
+            0
+        } else {
+            msg_controllen
+        };
         if out.is_empty() {
             controllen_ptr
                 .write_at_offset::<Platform>(0, 0)
                 .ok_or(Errno::EFAULT)?;
         } else {
-            let written = out.len().min(msg_controllen);
+            let written = out.len().min(control_capacity);
             if written < out.len() {
                 ret_flags.insert(ReceiveFlags::CTRUNC);
             }
-            UserPtrMut::<u8>::from_usize(msg_control.as_usize())
-                .copy_from_slice::<Platform>(0, &out[..written])
-                .ok_or(Errno::EFAULT)?;
+            if written > 0 {
+                UserPtrMut::<u8>::from_usize(msg_control.as_usize())
+                    .copy_from_slice::<Platform>(0, &out[..written])
+                    .ok_or(Errno::EFAULT)?;
+            }
             controllen_ptr
                 .write_at_offset::<Platform>(0, written)
                 .ok_or(Errno::EFAULT)?;
@@ -2850,10 +2862,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         // `ENOPROTOOPT`, not `EINVAL` -- same contract as `sys_getsockopt`, whose own comment
         // records the failure that exposed it.
+        // `SO_PASSCRED` only has meaning on `AF_UNIX`, where `unix.rs` stores the flag and
+        // `recvmsg` then attaches an `SCM_CREDENTIALS` cmsg carrying the sender's credentials.
+        // Dispatching it there is what makes the option take effect; returning `Ok(())` here
+        // without dispatching is what kept it a no-op, leaving `passcred` false forever so a
+        // receiver that enabled it -- Chromium's crashpad handler -- never received the cmsg it
+        // asked for and gave up with "missing credentials".
+        //
+        // Every other family has no credential passing to turn on, so it keeps accepting the
+        // option while ignoring it: inet's own `setsockopt` answers `Ok(())` for it, and netlink
+        // (which reaches neither arm) must keep doing the same rather than start failing.
         const SOL_SOCKET: u32 = 1;
         const SO_PASSCRED: u32 = 16;
         if level == SOL_SOCKET && optname == SO_PASSCRED {
-            return Ok(());
+            return match self.do_setsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::PASSCRED),
+                optval,
+                optlen,
+            ) {
+                Err(Errno::EOPNOTSUPP) | Err(Errno::ENOPROTOOPT) => Ok(()),
+                other => other,
+            };
         }
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");

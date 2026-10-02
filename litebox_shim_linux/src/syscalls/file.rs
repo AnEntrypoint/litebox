@@ -8172,7 +8172,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(alloc::format!("S|{flags}|{size}|{name}"));
         }
         if self.raw_fd_subsystem_name(raw_fd) == "unix-socket"
-            && let Ok((spec, hold)) = self.raw_fd_unix_carry(raw_fd, 0)
+            && let Ok((spec, hold)) = self.raw_fd_unix_carry(raw_fd, 0, false)
         {
             match hold {
                 Some(crate::syscalls::unix::UnixCarryHold::Presence { .. }) => {
@@ -8417,13 +8417,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         raw_fd: usize,
         child_pid: i32,
+        for_spawn: bool,
     ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str>
     {
         let cloexec = self.raw_fd_is_cloexec(raw_fd);
         let (spec, hold) = self
             .files
             .borrow()
-            .raw_fd_unix_carry(&self.global, raw_fd, self.peer_cred(), child_pid)?;
+            .raw_fd_unix_carry(&self.global, raw_fd, self.peer_cred(), child_pid, for_spawn)?;
         Ok((alloc::format!("{}|{spec}", u8::from(cloexec)), hold))
     }
 
