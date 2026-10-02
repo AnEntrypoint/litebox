@@ -251,7 +251,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         // faulting instruction address to investigate instead of just "Signal(11)".
         #[cfg(target_arch = "x86_64")]
         {
+            let comm = self.task.comm.get();
+            let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            let comm = core::str::from_utf8(&comm[..comm_end]).unwrap_or("?");
             litebox_util_log::warn!(
+                pid:% = self.task.pid.get(), tid:% = self.task.tid.get(), comm:% = comm,
                 exception:? = info.exception, kernel_mode:% = info.kernel_mode,
                 rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
                 cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code),
@@ -267,6 +271,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 rdi:% = format_args!("{:#x}", ctx.rdi);
                 "diag-guest-exception: pre-signal snapshot"
             );
+            for (i, entry) in crate::diag::syscall_trail_oldest_first().iter().enumerate() {
+                litebox_util_log::warn!(
+                    i:% = i,
+                    syscall:% = crate::diag::syscall_name_pub(entry.number),
+                    arg0:% = format_args!("{:#x}", entry.args[0]),
+                    arg1:% = format_args!("{:#x}", entry.args[1]),
+                    arg2:% = format_args!("{:#x}", entry.args[2]),
+                    arg0_as_path:? = UserPtr::<core::ffi::c_char>::from_usize(entry.args[0] as usize)
+                        .to_cstring::<Platform>()
+                        .map(|c| c.to_string_lossy().into_owned());
+                    "diag-guest-exception: syscall trail (oldest first)"
+                );
+            }
             // AGENTS.md pass 257 follow-up: distinguish "genuine weston bug jumping to a real
             // but corrupted pointer value" from "litebox emulation gap leaving cr2 unmapped
             // when it should be mapped" -- dump every guest mapping overlapping a window around
@@ -310,14 +327,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // the crash" entries for the full trace. (`rip_mapped`'s dump below is NOT subject to
             // this: `rip`'s fault-free execution up to this instruction is a live guarantee it's
             // genuinely mapped, not an assumption resting on possibly-stale tracking.)
-            let rip_mapped = self
+            let rip_range = self
                 .process()
                 .0
                 .pm()
                 .mappings()
                 .into_iter()
-                .any(|(r, _)| r.contains(&(ctx.rip as usize)));
-            if rip_mapped {
+                .find(|(r, _)| r.contains(&(ctx.rip as usize)));
+            if let Some((r, flags)) = &rip_range {
+                litebox_util_log::warn!(
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    range_start:% = format_args!("{:#x}", r.start),
+                    range_end:% = format_args!("{:#x}", r.end),
+                    flags:? = flags;
+                    "diag-guest-exception: mapping containing rip"
+                );
+            }
+            if rip_range.is_some() {
                 let dump = unsafe { core::slice::from_raw_parts(ctx.rip as *const u8, 64) };
                 litebox_util_log::warn!(
                     rip:% = format_args!("{:#x}", ctx.rip),
@@ -338,12 +364,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             );
         }
         #[cfg(target_arch = "aarch64")]
-        litebox_util_log::warn!(
-            exception:? = info.exception, kernel_mode:% = info.kernel_mode,
-            pc:% = format_args!("{:#x}", ctx.pc), sp:% = format_args!("{:#x}", ctx.sp),
-            fault_address:% = format_args!("{:#x}", info.fault_address);
-            "diag-guest-exception: pre-signal snapshot"
-        );
+        {
+            let comm = self.task.comm.get();
+            let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            let comm = core::str::from_utf8(&comm[..comm_end]).unwrap_or("?");
+            litebox_util_log::warn!(
+                pid:% = self.task.pid.get(), tid:% = self.task.tid.get(), comm:% = comm,
+                exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+                pc:% = format_args!("{:#x}", ctx.pc), sp:% = format_args!("{:#x}", ctx.sp),
+                fault_address:% = format_args!("{:#x}", info.fault_address);
+                "diag-guest-exception: pre-signal snapshot"
+            );
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
@@ -521,10 +553,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_layers: Vec<Cow<'static, [u8]>>,
-    ) -> (
-        DefaultFS<Platform>,
-        Option<Cow<'static, [u8]>>,
-    ) {
+    ) -> (DefaultFS<Platform>, Option<Cow<'static, [u8]>>) {
         default_fs(
             &self.litebox,
             self.platform,
@@ -656,11 +685,15 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // comment. The genuine cross-process capability these two fields' ORIGINAL doc comments
         // (also preserved there) actually need is restored separately by `GlobalState::
         // shared_pty` below, not by these per-process copies.
-        let my_pty_registry =
-            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
-        let my_daemon_pty_masters =
-            Arc::new(litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()));
-        let my_xproc_local = Arc::new(litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()));
+        let my_pty_registry = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_daemon_pty_masters = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_xproc_local = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -714,6 +747,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // `build()` too) because the fs module stores them as plain function pointers.
         litebox::fs::ident::set_id_map_write_fn(syscalls::process::apply_id_map_write);
         litebox::fs::ident::set_id_map_read_fn(syscalls::process::read_id_map_file);
+        // Same shape, for `/proc/<pid>`: whether a pid exists is a fact only the process model
+        // owns, and under `LITEBOX_PROCESS_FORK=1` the pid may be running in a DIFFERENT host
+        // process than the one asking. `proc_self_info` is per host process, so it cannot answer
+        // that -- the cross-process table can, and it lives in `GlobalState`, which `/proc` (built
+        // by `default_fs`, before `GlobalState` exists) can only reach through a hook like this.
+        syscalls::signal::xproc::publish_process_table(&inner.process_table);
+        litebox::fs::procfs::set_pid_known_fn(syscalls::signal::xproc::pid_is_known);
         LinuxShim(GlobalStateHandle {
             inner,
             litebox: my_litebox,
@@ -964,7 +1004,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
                 ns_pid: Cell::new(pid),
                 ns_tid: Cell::new(pid),
-                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    uid, euid, gid, egid,
+                ))),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1054,7 +1096,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 end.read(&cx, buf, &self.0.pty_io())
             }),
             None => syscalls::pty::poll_shared(&cx, false, || {
-                self.0.shared_pty.try_read_side(pty_id, true, buf, &self.0.pty_io())
+                self.0
+                    .shared_pty
+                    .try_read_side(pty_id, true, buf, &self.0.pty_io())
             }),
         }
     }
@@ -1073,12 +1117,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
         match handle {
-            Some(handle) => handle
-                .with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
-                    end.write(&cx, buf, &self.0.pty_io(), &|pgid, sig| {
-                        self.0.xproc_signal_group(pgid, sig)
-                    })
-                }),
+            Some(handle) => handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                end.write(&cx, buf, &self.0.pty_io(), &|pgid, sig| {
+                    self.0.xproc_signal_group(pgid, sig)
+                })
+            }),
             None => syscalls::pty::poll_shared(&cx, false, || {
                 self.0
                     .shared_pty
@@ -1185,7 +1228,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid_ns: Cell::new(pid_namespace.map_or(syscalls::pidns::INITIAL_NS, |ns| ns.0)),
                 ns_pid: Cell::new(pid_namespace.map_or(pid, |ns| ns.1)),
                 ns_tid: Cell::new(pid_namespace.map_or(pid, |ns| ns.2)),
-                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(uid, euid, gid, egid))),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    uid, euid, gid, egid,
+                ))),
                 comm: comm.into(),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1369,10 +1414,7 @@ fn default_fs<Platform: ShimPlatform>(
     merge_input: MergeInput,
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
-) -> (
-    LinuxFS<Platform>,
-    Option<Cow<'static, [u8]>>,
-) {
+) -> (LinuxFS<Platform>, Option<Cow<'static, [u8]>>) {
     // Populated as a side effect of the `/`-mount closure below, ONLY on the
     // `BuildFresh { capture_for_caller: true }` branch -- `Composer::builder().mount`'s closure
     // must return just the backend itself (`TarRo`), so there is no direct return path for this;
@@ -1380,9 +1422,8 @@ fn default_fs<Platform: ShimPlatform>(
     // closure whose signature the caller (`Composer`) fixes. Read back once, immediately after
     // `.build()` below returns (single-threaded, synchronous -- the closure has already run by
     // then), never touched concurrently.
-    let freshly_built_entries: core::cell::RefCell<
-        Option<Cow<'static, [u8]>>,
-    > = core::cell::RefCell::new(None);
+    let freshly_built_entries: core::cell::RefCell<Option<Cow<'static, [u8]>>> =
+        core::cell::RefCell::new(None);
     // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
     // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
     let cpu_count = platform.cpu_count();
@@ -2160,9 +2201,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // comment) -- necessary because `comm` is never inherited at fork time in this codebase,
         // so a forked child's own pre-`execve` syscalls can never match a comm-based target.
         crate::diag::init_syscall_timeline_pids(|| {
-            self.global.platform.env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
         });
         let comm_bytes = self.comm.get();
+        crate::diag::record_syscall_trail(
+            syscall_number,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
         let is_target = crate::diag::syscall_timeline_enabled()
             && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
                 || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
@@ -2230,7 +2281,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn decode_path_arguments(request_debug: &str) -> alloc::string::String {
-        const PATH_FIELDS: [&str; 3] = ["pathname: UserPtr(", "oldpath: UserPtr(", "newpath: UserPtr("];
+        const PATH_FIELDS: [&str; 3] = [
+            "pathname: UserPtr(",
+            "oldpath: UserPtr(",
+            "newpath: UserPtr(",
+        ];
         let mut decoded = alloc::string::String::new();
         for field in PATH_FIELDS {
             let Some(start) = request_debug.find(field) else {
@@ -2248,7 +2303,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .to_cstring::<Platform>()
                 .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| alloc::string::String::from("<unreadable>"));
-            decoded.push_str(&alloc::format!("{}={path:?} ", field.split(':').next().unwrap_or("")));
+            decoded.push_str(&alloc::format!(
+                "{}={path:?} ",
+                field.split(':').next().unwrap_or("")
+            ));
         }
         decoded
     }
@@ -2277,7 +2335,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     "seccomp: SECCOMP_RET_LOG"
                 ),
                 other => {
-                    return self.apply_seccomp_verdict(other, syscall_number as i32, ctx.get_ip())
+                    return self.apply_seccomp_verdict(other, syscall_number as i32, ctx.get_ip());
                 }
             }
         }
@@ -2321,7 +2379,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 debug_str.clone()
             };
-            let truncated = alloc::format!("{truncated} {}", Self::decode_path_arguments(&debug_str));
+            let truncated =
+                alloc::format!("{truncated} {}", Self::decode_path_arguments(&debug_str));
             crate::diag::emit_timeline_line(
                 self.global.platform,
                 &alloc::format!(
@@ -3513,7 +3572,8 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// This process's own record-lock table and waiter list, used where processes do not share one
     /// kernel heap (a `Vec` buffer and a `Pollee`'s observers live on the private heap of the
     /// process that touched them, so they cannot sit in `GlobalState` there).
-    record_locks_local: Arc<litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>>,
+    record_locks_local:
+        Arc<litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>>,
     record_lock_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
     bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
@@ -3616,7 +3676,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// of the process that inserted them, so it is only sound where every process shares one kernel
     /// heap (a native-`fork()` platform). Elsewhere the cross-process registry (`xproc`) is
     /// authoritative and these helpers see an empty registry.
-    pub(crate) fn registry_insert(&self, pid: i32, process: Arc<syscalls::process::Process<Platform>>) {
+    pub(crate) fn registry_insert(
+        &self,
+        pid: i32,
+        process: Arc<syscalls::process::Process<Platform>>,
+    ) {
         if self.platform.has_native_fork() {
             self.process_registry.lock().insert(pid, process);
         }
@@ -3628,18 +3692,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         }
     }
 
-    pub(crate) fn registry_get(&self, pid: i32) -> Option<Arc<syscalls::process::Process<Platform>>> {
+    pub(crate) fn registry_get(
+        &self,
+        pid: i32,
+    ) -> Option<Arc<syscalls::process::Process<Platform>>> {
         if !self.platform.has_native_fork() {
             return None;
         }
         self.process_registry.lock().get(&pid).cloned()
     }
 
-    pub(crate) fn registry_entries(&self) -> alloc::vec::Vec<(i32, Arc<syscalls::process::Process<Platform>>)> {
+    pub(crate) fn registry_entries(
+        &self,
+    ) -> alloc::vec::Vec<(i32, Arc<syscalls::process::Process<Platform>>)> {
         if !self.platform.has_native_fork() {
             return alloc::vec::Vec::new();
         }
-        self.process_registry.lock().iter().map(|(p, q)| (*p, q.clone())).collect()
+        self.process_registry
+            .lock()
+            .iter()
+            .map(|(p, q)| (*p, q.clone()))
+            .collect()
     }
 
     /// The shared `Pipes`, paired with THIS process's own `LiteBox`. `Pipes` itself holds no
@@ -3665,7 +3738,10 @@ impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
         capacity: usize,
         flags: litebox::pipes::Flags,
         atomic_slice_guarantee_size: Option<core::num::NonZeroUsize>,
-    ) -> (litebox::pipes::PipeFd<Platform>, litebox::pipes::PipeFd<Platform>) {
+    ) -> (
+        litebox::pipes::PipeFd<Platform>,
+        litebox::pipes::PipeFd<Platform>,
+    ) {
         self.pipes
             .create_pipe(self.litebox, capacity, flags, atomic_slice_guarantee_size)
     }
@@ -3698,7 +3774,8 @@ impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
     pub(crate) fn detach_end(
         &self,
         fd: &litebox::pipes::PipeFd<Platform>,
-    ) -> Result<litebox::pipes::DetachedPipeEnd<Platform>, litebox::pipes::errors::ClosedError> {
+    ) -> Result<litebox::pipes::DetachedPipeEnd<Platform>, litebox::pipes::errors::ClosedError>
+    {
         self.pipes.detach_end(self.litebox, fd)
     }
 
@@ -4245,13 +4322,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Which internal pid a caller in this task's namespace means by `guest`: `None` when this
     /// namespace cannot see that pid at all, which is Linux's `ESRCH` for `kill`/`wait4`.
     pub(crate) fn resolve_guest_pid(&self, guest: i32) -> Option<i32> {
-        self.global.pid_namespaces.translate(guest, self.pid_ns.get())
+        self.global
+            .pid_namespaces
+            .translate(guest, self.pid_ns.get())
     }
 
     /// How `internal` is spelled in this task's namespace -- `wait4`'s return value, `siginfo`'s
     /// `si_pid` and `SCM_CREDENTIALS`' `pid` all report this rather than the internal pid.
     pub(crate) fn guest_pid_of(&self, internal: i32) -> Option<i32> {
-        self.global.pid_namespaces.pid_in(internal, self.pid_ns.get())
+        self.global
+            .pid_namespaces
+            .pid_in(internal, self.pid_ns.get())
     }
 
     /// How `internal` (a thread id) is spelled in this task's namespace.
@@ -4292,7 +4373,9 @@ mod test_utils {
                 pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
                 ns_pid: Cell::new(pid),
                 ns_tid: Cell::new(pid),
-                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(0, 0, 0, 0))),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    0, 0, 0, 0,
+                ))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),

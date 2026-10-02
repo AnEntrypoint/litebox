@@ -2764,6 +2764,26 @@ unsafe extern "system" fn vectored_exception_handler(
         // don't reach -- skip straight to the deeper GOT/PLT-slot and register-indirect healers
         // instead of repeating the same ineffective fixup forever.
         const AV_RIP_LIVELOCK_THRESHOLD: u32 = 8;
+        /// Stride at which the sampled `fork_verify` livelock warnings re-log: an unhealable loop
+        /// re-enters this path millions of times, so one line per pass is a disk-filling flood, not
+        /// a log.
+        const AV_HEAL_LOG_SAMPLE_STRIDE: u32 = 8192;
+        // Budget: [`on_single_step`]'s step bounds count only single-step traps, so a child that
+        // keeps re-faulting on one pointer no healer can fix would stay in this path forever (one
+        // Windows exception round-trip per pass, 99,455 passes observed in 2.5 minutes). Past the
+        // cap, verification ends for this thread and the fault falls through to the normal
+        // dispatch -- a real SIGSEGV instead of an unbounded loop.
+        if tls.fork_verify_av_heal_count.get() >= fork_verify::MAX_AV_PATH_HEALS {
+            litebox_util_log::warn!(
+                host_pid:? = std::process::id(),
+                thread:? = std::thread::current().id(),
+                heals:? = tls.fork_verify_av_heal_count.get(),
+                rip:? = rip,
+                fault_addr:? = exception_record.ExceptionInformation[1];
+                "fork_verify: AV-path heal budget exhausted, ending verification so this fault dispatches normally"
+            );
+            *tls.fork_verify.borrow_mut() = None;
+        }
         let prior_repeat = tls.fork_verify_av_rip_repeat.get();
         let skip_shallow_heal = matches!(
             prior_repeat,
@@ -2813,13 +2833,31 @@ unsafe extern "system" fn vectored_exception_handler(
             {
                 context.Rip = translated_rip as u64;
             }
+            tls.fork_verify_av_heal_count
+                .set(tls.fork_verify_av_heal_count.get() + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if skip_shallow_heal {
-            litebox_util_log::warn!(
-                rip:? = rip;
-                "fork_verify: AV-path stale rip livelock detected (same rip repeated), falling through to deeper slot healers"
-            );
+            // Keep counting past the threshold: without this the count freezes at
+            // `AV_RIP_LIVELOCK_THRESHOLD` and the sample below logs on every single iteration --
+            // which on a real Chromium run wrote 99,455 identical lines (1.0 GB) in 2.5 minutes and
+            // filled the disk mid-run.
+            let (_, prev_translated, count) = prior_repeat.unwrap_or((rip, 0, 0));
+            let next_count = count + 1;
+            tls.fork_verify_av_rip_repeat
+                .set(Some((rip, prev_translated, next_count)));
+            if next_count == AV_RIP_LIVELOCK_THRESHOLD + 1
+                || next_count % AV_HEAL_LOG_SAMPLE_STRIDE == 0
+            {
+                litebox_util_log::warn!(
+                    host_pid:? = std::process::id(),
+                    thread:? = std::thread::current().id(),
+                    rip:? = rip,
+                    fault_addr:? = exception_record.ExceptionInformation[1],
+                    repeat:? = next_count;
+                    "fork_verify: AV-path stale rip livelock detected (same rip repeated), falling through to deeper slot healers"
+                );
+            }
         }
         // `rip` itself was not stale -- the data-pointer counterpart to the code-pointer case
         // just above. A raw AV whose fault address is explained by a stale base/index register
@@ -2844,10 +2882,29 @@ unsafe extern "system" fn vectored_exception_handler(
                     std::thread::current().id(),
                 );
             }
-            litebox_util_log::warn!(
-                rip:? = rip;
-                "fork_verify: stale DATA pointer register detected via raw access violation (no #DB delivered), translating and retrying"
-            );
+            // Sampled, not per-event: a guest loop that re-supplies the same stale register value
+            // every iteration re-faults here forever, and one line per pass filled the disk (see
+            // `fork_verify_av_data_repeat`). `fault_addr` is logged for the same reason as the
+            // code-pointer case above: it is what actually faulted, so it shows whether the healed
+            // register is even the one that formed this address.
+            let occurrences = match tls.fork_verify_av_data_repeat.get() {
+                Some((prev_rip, count)) if prev_rip == rip => count + 1,
+                _ => 1,
+            };
+            tls.fork_verify_av_data_repeat
+                .set(Some((rip, occurrences)));
+            if occurrences <= 2 || occurrences % AV_HEAL_LOG_SAMPLE_STRIDE as u64 == 0 {
+                litebox_util_log::warn!(
+                    host_pid:? = std::process::id(),
+                    thread:? = std::thread::current().id(),
+                    rip:? = rip,
+                    fault_addr:? = exception_record.ExceptionInformation[1],
+                    repeat:? = occurrences;
+                    "fork_verify: stale DATA pointer register detected via raw access violation (no #DB delivered), translating and retrying"
+                );
+            }
+            tls.fork_verify_av_heal_count
+                .set(tls.fork_verify_av_heal_count.get() + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // The GOT/PLT-style counterpart to the two cases above: `rip` itself is not stale (already
@@ -2869,6 +2926,8 @@ unsafe extern "system" fn vectored_exception_handler(
                     std::thread::current().id(),
                 );
             }
+            tls.fork_verify_av_heal_count
+                .set(tls.fork_verify_av_heal_count.get() + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // The register-indirect counterpart to the slot-based case just above: `rip` is a
@@ -2884,6 +2943,8 @@ unsafe extern "system" fn vectored_exception_handler(
                     std::thread::current().id(),
                 );
             }
+            tls.fork_verify_av_heal_count
+                .set(tls.fork_verify_av_heal_count.get() + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -3752,6 +3813,18 @@ struct TlsState {
     /// `translate_stale_source_rip` itself keeps reporting success. Confirmed live: 266,408
     /// identical `(rip, translated_rip)` AV events in 8.4s during a real XFCE `--gui` launch.
     fork_verify_av_rip_repeat: Cell<Option<(usize, usize, u32)>>,
+    /// `(rip, occurrences)` for the AV-path stale-DATA-pointer healer
+    /// (`translate_stale_source_memory_operand_registers`). A guest loop that re-supplies an
+    /// identical stale register value every iteration re-faults at the same `rip` forever, and
+    /// each pass logged its own `warn!` -- measured at 99,455 identical lines in 2.5 minutes
+    /// (1.0 GB, which filled the disk mid-run). Used to log a bounded sample: the first few
+    /// occurrences plus the running total.
+    fork_verify_av_data_repeat: Cell<Option<(usize, u64)>>,
+    /// How many heals the AV path has performed on this thread since [`fork_verify::begin`].
+    /// Bounded by [`fork_verify::MAX_AV_PATH_HEALS`]: [`on_single_step`]'s step bounds only count
+    /// single-step traps, so a child that keeps re-faulting on one unfixable stale pointer could
+    /// loop in the AV path indefinitely -- measured at 99,455 heals in 2.5 minutes on Chromium.
+    fork_verify_av_heal_count: Cell<u64>,
     /// The single-step-path counterpart to [`Self::fork_verify_av_rip_repeat`]: tracks
     /// `(rip, translated_rip)` and a repeat count for [`fork_verify::on_single_step`]'s own case
     /// (1) (the stale-CODE-pointer-in-`rip` heal reached via `EXCEPTION_SINGLE_STEP`, not the raw
@@ -4039,6 +4112,8 @@ impl TlsState {
             fork_verify: RefCell::new(None),
             fork_verify_step_count: Cell::new(0),
             fork_verify_av_rip_repeat: Cell::new(None),
+            fork_verify_av_data_repeat: Cell::new(None),
+            fork_verify_av_heal_count: Cell::new(0),
             fork_verify_step_rip_repeat: Cell::new(None),
             fork_verify_last_load: Cell::new(None),
             codewatch: fork_verify::CodewatchState::new(),

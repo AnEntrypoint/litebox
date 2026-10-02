@@ -1086,8 +1086,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
             let is_shared = flags.contains(VmFlags::VM_SHARED);
+            let is_padding = flags.contains(VmFlags::VM_OWN_FORK_PADDING);
             let is_inaccessible = flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty();
-            if !keep_all && (is_shared || is_inaccessible) {
+            // A padding range is owned, already-committed memory (that flag's own doc comment),
+            // and `do_clone`'s copy groups now carry it, so the bytes are here already -- turning
+            // it into a bare reserve-only reservation here is what silently dropped them: the
+            // child ended up with address space claimed but no host page behind it, so a read the
+            // PARENT served from committed memory faulted as a genuine AV in the child.
+            if !keep_all && !is_padding && (is_shared || is_inaccessible) {
                 // A `PROT_NONE` region CAN be given real backing in this process after all:
                 // reserving its address range without committing anything (`PageManagementProvider::
                 // reserve_pages_without_commit`) reproduces exactly the state it has on the source

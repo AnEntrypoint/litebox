@@ -58,6 +58,11 @@ pub struct ProcSelfInfo {
     pub tids: Option<alloc::sync::Arc<dyn Fn() -> Vec<i32> + Send + Sync>>,
     /// Lists this process's open raw file descriptors, for `/proc/self/fd`.
     pub fds: Option<alloc::sync::Arc<dyn Fn() -> Vec<(i32, String)> + Send + Sync>>,
+    /// Renders `/proc/[pid]/statm` for the CURRENT process, or `None` when this entry describes a
+    /// process whose page manager this host process cannot reach -- a `portable_snapshot` handed
+    /// to a cross-process fork child, or a pid that only exists in another host process. A
+    /// callback for the same reason as `maps`: the counts change with every `mmap`.
+    pub statm: Option<alloc::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>>,
     /// `NoNewPrivs:` in `/proc/[pid]/status`: `PR_SET_NO_NEW_PRIVS` state.
     pub no_new_privs: bool,
     /// `Seccomp:` in `/proc/[pid]/status`: 0 disabled, 1 strict, 2 filter -- Linux's own encoding.
@@ -95,6 +100,20 @@ fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
         info.seccomp_mode
     )
     .into_bytes()
+}
+
+/// Real `/proc/[pid]/statm`: seven space-separated PAGE counts -- size, resident, shared, text,
+/// lib, data, dt -- newline-terminated. `lib` and `dt` are 0 on every modern kernel (`lib` has
+/// been unused since 2.6, `dt` only ever counted dirty pages) and stay 0 here.
+///
+/// Rendered by [`ProcSelfInfo::statm`], a callback over that process's own page manager. A pid
+/// this host process cannot measure -- one running in another host process, or one with no row of
+/// its own -- gets a zeroed line rather than `ENOENT`: a real kernel always answers this file for
+/// a pid that exists, and Chromium reads it while sizing its own memory.
+fn format_statm(info: &ProcSelfInfo) -> Vec<u8> {
+    info.statm
+        .as_ref()
+        .map_or_else(|| b"0 0 0 0 0 0 0\n".to_vec(), |f| f())
 }
 
 /// Real `/proc/cpuinfo`: one blank-line-terminated `key\t: value` stanza per logical CPU, and the
@@ -309,16 +328,51 @@ fn format_uptime(uptime_secs: u64) -> Vec<u8> {
     format!("{uptime_secs}.00 {uptime_secs}.00\n").into_bytes()
 }
 
+/// How to ask whether guest `pid` exists ANYWHERE in this fork family -- something
+/// [`ProcSelfTable`] cannot answer, because it only holds the pids of THIS host process. Under
+/// `LITEBOX_PROCESS_FORK=1` a pid running in a sibling Windows process is therefore invisible to
+/// `/proc/<pid>`, which answered `ENOENT` for a process that was plainly alive (live Chromium
+/// run: `/proc/57/status`, `/proc/41/task`, `/proc/57/task` all `errno=2`).
+///
+/// A plain `fn` pointer rather than a closure, for the same reason `crate::fs::ident` registers
+/// its callbacks this way: this module is compiled into every host process of the fork family, so
+/// it must hold nothing process-relative. The shim registers the one function that can reach the
+/// cross-process table. Unset, every lookup is `false` and `/proc/<pid>` behaves as it did.
+static PID_KNOWN_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Registers how to test whether guest `pid` names a live process in this fork family.
+pub fn set_pid_known_fn(f: fn(i32) -> bool) {
+    PID_KNOWN_FN.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `pid` names a process somewhere in this fork family; `false` when no shim registered a
+/// source, which leaves `/proc/<pid>` at `ENOENT` instead of inventing a process.
+fn pid_known(pid: i32) -> bool {
+    let raw = PID_KNOWN_FN.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: only `set_pid_known_fn` stores here, and it stores exactly this fn type. The
+    // function itself is a plain item of the shim binary, so the pointer is valid in every host
+    // process of the fork family (which all run that same binary).
+    let f: fn(i32) -> bool = unsafe { core::mem::transmute(raw) };
+    f(pid)
+}
+
 /// A [`Backend`] serving the static/host-derived `/proc` flat files that need no per-process state
 /// -- the exact set is `ProcfsEntry::ALL`, PLUS one subdirectory per pid [`ProcSelfTable`] tracks
-/// (`stat`/`status`/`cmdline`/`comm`, reusing the same renderers `/proc/self` uses -- see
-/// [`ProcfsDirHandle::Pid`]). Mounted at `/proc`; still not a GENERAL procfs -- only pids this
-/// table knows about are visible, real Linux's full `/proc/<pid>` file set is not reproduced (no
-/// `exe`/`fd`/`maps`/`environ`). Real Linux's own `ps`/`procps` library needs at minimum its own
+/// (`stat`/`status`/`cmdline`/`comm`/`statm`, reusing the same renderers `/proc/self` uses -- see
+/// [`ProcfsDirHandle::Pid`]). Mounted at `/proc`; still not a GENERAL procfs -- real Linux's full
+/// `/proc/<pid>` file set is not reproduced (no `exe`/`fd`/`maps`/`environ`). A pid directory
+/// exists when this host process's [`ProcSelfTable`] has a row for it, when it is the caller's
+/// own pid, or when the shim's cross-process table says some host process in this fork family runs
+/// it (see [`set_pid_known_fn`]) -- the last of those is what makes `/proc/<pid>` answer at all
+/// under `LITEBOX_PROCESS_FORK=1`, where the pid's row lives in a different host process.
+/// Real Linux's own `ps`/`procps` library needs at minimum its own
 /// `/proc/<self-pid>/stat` to open successfully -- see gm mutable `mut-1789043963534`.
 pub struct Procfs<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     _litebox: LiteBox<Platform>,
     root_inode: NodeInfo,
@@ -335,7 +389,7 @@ where
 
 impl<Platform> Procfs<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     /// Construct a new `Procfs` backend.
     ///
@@ -365,6 +419,54 @@ where
             boot_uptime_secs,
             boot_unix_secs,
             proc_self_info,
+        }
+    }
+
+    /// The pid of the guest process whose syscall is being dispatched -- the same pid `/proc/self`
+    /// resolves for this caller. `None` when the platform cannot name it.
+    fn caller_pid(&self) -> Option<i32> {
+        crate::platform::ThreadProvider::current_guest_pid(self._litebox.x.platform)
+    }
+
+    /// Whether `/proc/<pid>` should exist for this caller: the pid has a row in this host
+    /// process's own table, or it IS the caller (a process with no row -- a nested cross-process
+    /// fork child whose carried identity was dropped -- still sees itself), or the shim's
+    /// cross-process table says some host process in this fork family runs it.
+    fn pid_resolvable(&self, pid: i32) -> bool {
+        if self.proc_self_info.read().get(pid).is_some() {
+            return true;
+        }
+        self.caller_pid() == Some(pid) || pid_known(pid)
+    }
+
+    /// The [`ProcSelfInfo`] `/proc/<pid>/*` renders from: this host process's own row when there
+    /// is one, otherwise a pid-only shell for a pid that exists elsewhere in the fork family.
+    /// `None` only when the pid is in neither, which is the one case a real kernel also `ENOENT`s.
+    fn pid_info(&self, pid: i32) -> Option<ProcSelfInfo> {
+        if let Some(info) = self.proc_self_info.read().get(pid).cloned() {
+            return Some(info);
+        }
+        (self.caller_pid() == Some(pid) || pid_known(pid)).then(|| ProcSelfInfo {
+            pid,
+            ..ProcSelfInfo::default()
+        })
+    }
+
+    /// The thread ids `/proc/<pid>/task` lists. Falls back to `pid` itself when the process
+    /// publishes no list: every process has at least its main thread, and a pid running in
+    /// another host process (or one with no row) publishes nothing at all -- reporting its own
+    /// pid keeps that directory non-empty for a caller that enumerates it and then opens
+    /// `/proc/<pid>/task/<tid>/...`, which is what Chromium does.
+    fn task_ids(&self, pid: i32) -> Vec<i32> {
+        let tids = self
+            .proc_self_info
+            .read()
+            .thread_ids(pid)
+            .unwrap_or_default();
+        if tids.is_empty() {
+            alloc::vec![pid]
+        } else {
+            tids
         }
     }
 }
@@ -435,6 +537,7 @@ enum ProcPidEntry {
     OomScoreAdj,
     OomAdj,
     Environ,
+    Statm,
 }
 
 impl ProcPidEntry {
@@ -446,6 +549,7 @@ impl ProcPidEntry {
         ("oom_score_adj", ProcPidEntry::OomScoreAdj),
         ("oom_adj", ProcPidEntry::OomAdj),
         ("environ", ProcPidEntry::Environ),
+        ("statm", ProcPidEntry::Statm),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -508,13 +612,13 @@ pub struct ProcfsFileHandle {
 }
 
 impl<Platform> super::backend::private::Sealed for Procfs<Platform> where
-    Platform: RawSyncPrimitivesProvider + 'static
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static
 {
 }
 
 impl<Platform> BackendHandles for Procfs<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     type WalkingDirHandle<'a> = ProcfsDirHandle;
     type FileHandle = ProcfsFileHandle;
@@ -523,7 +627,7 @@ where
 
 impl<Platform> Backend for Procfs<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(ProcfsDirHandle::Root)
@@ -553,12 +657,8 @@ where
                     continue;
                 }
                 ProcfsDirHandle::PidTask(pid) => {
-                    let known = parse_pid_component(component).is_some_and(|tid| {
-                        self.proc_self_info
-                            .read()
-                            .thread_ids(pid)
-                            .is_some_and(|t| t.contains(&tid))
-                    });
+                    let known = parse_pid_component(component)
+                        .is_some_and(|tid| self.task_ids(pid).contains(&tid));
                     if !known {
                         return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                     }
@@ -580,7 +680,7 @@ where
                 });
             }
             if let Some(pid) = parse_pid_component(component) {
-                if self.proc_self_info.read().get(pid).is_some() {
+                if self.pid_resolvable(pid) {
                     walked.push(super::backend::WalkedComponent {
                         permissions: PermissionCheck::ByBackend,
                     });
@@ -650,12 +750,11 @@ where
                 let entry = ProcPidEntry::from_name(name)
                     .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
                 // The process may have exited between the `readdir` that found this pid and this
-                // `open` -- real Linux reports the same ENOENT for that race.
+                // `open` -- real Linux reports the same ENOENT for that race. A pid this host
+                // process has no row for still resolves when it is the caller's own or the shim
+                // says another host process runs it; otherwise it really does not exist here.
                 let info = self
-                    .proc_self_info
-                    .read()
-                    .get(pid)
-                    .cloned()
+                    .pid_info(pid)
                     .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
                 let content = match entry {
                     ProcPidEntry::Stat => format_stat(&info),
@@ -664,6 +763,7 @@ where
                     ProcPidEntry::Comm => format!("{}\n", info.comm).into_bytes(),
                     ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj => b"0\n".to_vec(),
                     ProcPidEntry::Environ => info.environ.clone(),
+                    ProcPidEntry::Statm => format_statm(&info),
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
             }
@@ -756,10 +856,7 @@ where
                 })
                 .collect()),
             ProcfsDirHandle::PidTask(pid) => Ok(self
-                .proc_self_info
-                .read()
-                .thread_ids(pid)
-                .unwrap_or_default()
+                .task_ids(pid)
                 .into_iter()
                 .map(|tid| DirEntry {
                     name: format!("{tid}"),
@@ -971,6 +1068,7 @@ impl ProcSelfTable {
         info.maps = None;
         info.tids = None;
         info.fds = None;
+        info.statm = None;
         self.by_pid.insert(child, info);
     }
 
@@ -1023,6 +1121,7 @@ impl ProcSelfTable {
         info.maps = None;
         info.tids = None;
         info.fds = None;
+        info.statm = None;
         Some(info)
     }
 
@@ -1108,6 +1207,8 @@ enum ProcSelfEntry {
     UidMap,
     GidMap,
     Setgroups,
+    /// `/proc/self/statm`, the same seven page counts `/proc/<pid>/statm` reports.
+    Statm,
     /// `/proc/self/ns/user`. Not in [`Self::ALL`]: it lives one directory down, so a flat name
     /// lookup must never reach it.
     NsUser,
@@ -1133,6 +1234,7 @@ impl ProcSelfEntry {
         ("uid_map", ProcSelfEntry::UidMap),
         ("gid_map", ProcSelfEntry::GidMap),
         ("setgroups", ProcSelfEntry::Setgroups),
+        ("statm", ProcSelfEntry::Statm),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -1214,6 +1316,11 @@ const PROC_SELF_GID_MAP_NODE_INFO: NodeInfo = NodeInfo {
 const PROC_SELF_SETGROUPS_NODE_INFO: NodeInfo = NodeInfo {
     dev: 7,
     ino: 13,
+    rdev: None,
+};
+const PROC_SELF_STATM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 7,
+    ino: 17,
     rdev: None,
 };
 const PROC_SELF_NS_USER_NODE_INFO: NodeInfo = NodeInfo {
@@ -1409,6 +1516,7 @@ where
             ProcSelfEntry::OomScoreAdj => format_oom_score_adj(),
             ProcSelfEntry::Auxv => snapshot.auxv.clone(),
             ProcSelfEntry::Maps => snapshot.maps.as_ref().map_or_else(Vec::new, |f| f()),
+            ProcSelfEntry::Statm => format_statm(&snapshot),
             // The id-map control files are the only entries here a guest may write, and their
             // contents come from the caller's own process, not from the `/proc/self` snapshot.
             ProcSelfEntry::UidMap => {
@@ -1618,6 +1726,7 @@ where
                 ProcSelfEntry::UidMap => PROC_SELF_UID_MAP_NODE_INFO,
                 ProcSelfEntry::GidMap => PROC_SELF_GID_MAP_NODE_INFO,
                 ProcSelfEntry::Setgroups => PROC_SELF_SETGROUPS_NODE_INFO,
+                ProcSelfEntry::Statm => PROC_SELF_STATM_NODE_INFO,
                 ProcSelfEntry::NsUser => PROC_SELF_NS_USER_NODE_INFO,
                 ProcSelfEntry::NsPid => PROC_SELF_NS_PID_NODE_INFO,
                 ProcSelfEntry::FdInfoFile => PROC_SELF_FDINFO_NODE_INFO,

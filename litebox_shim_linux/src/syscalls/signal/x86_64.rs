@@ -83,6 +83,20 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         } else {
             return Err(DeliverFault);
         };
+        // A zero restorer means the handler's own `ret` jumps to address 0, which faults as a
+        // user-mode instruction fetch from unmapped memory and is then indistinguishable from a
+        // wild jump in the guest's own code -- live-caught 2026-10-02 (Chromium pid 41:
+        // `Exception(14) error_code=0x14 rip=0x0 cr2=0x0`). Refusing the delivery turns it into
+        // the synchronous `SIGSEGV` `DeliverFault` already produces, with the refusal on record,
+        // instead of silently resuming the guest at 0.
+        if restorer == 0 {
+            litebox_util_log::warn!(
+                sigreturn_trampoline:? = sigreturn_trampoline,
+                has_restorer:? = action.flags.contains(SaFlags::RESTORER);
+                "write_signal_frame: no usable sigreturn restorer, refusing to deliver"
+            );
+            return Err(DeliverFault);
+        }
 
         let last_exception = self.last_exception.get();
 

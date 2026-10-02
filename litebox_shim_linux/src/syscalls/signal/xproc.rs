@@ -20,7 +20,7 @@
 //! target then applies whatever it does for them in-process, and this module adds no
 //! job-control stop semantics of its own.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use litebox_common_linux::errno::Errno;
@@ -215,6 +215,38 @@ impl SharedProcessTable {
         self.slot(index, pid)
             .map_or(0, |s| s.pending.swap(0, Ordering::AcqRel))
     }
+}
+
+/// The fork family's table, published once per host process by [`publish_process_table`] so a
+/// caller with no `GlobalStateHandle` -- `/proc`, which is mounted by `default_fs` before
+/// `GlobalState` exists -- can still ask whether a pid is live. A raw pointer rather than a
+/// reference because the hook that consumes it is a plain `fn` and can carry no state; it is valid
+/// in every host process of the family because the table lives inside `GlobalState`, which is
+/// allocated in the cross-process shared arena at one fixed address in all of them.
+static PUBLISHED_PROCESS_TABLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Hands `/proc` (via `litebox::fs::procfs::set_pid_known_fn`) the only cross-process answer to
+/// "does guest `pid` exist": [`pid_is_known`]. Called from `LinuxShimBuilder::build`, so every
+/// host process of the fork family -- including each cross-process fork child -- publishes its own
+/// view of the one shared table.
+pub(crate) fn publish_process_table(table: &SharedProcessTable) {
+    PUBLISHED_PROCESS_TABLE.store(table as *const SharedProcessTable as usize, Ordering::Release);
+}
+
+/// Whether some host process in this fork family is running guest `pid`. False before
+/// [`publish_process_table`] runs, which leaves `/proc/<pid>` at `ENOENT` rather than inventing a
+/// process.
+pub(crate) fn pid_is_known(pid: i32) -> bool {
+    let raw = PUBLISHED_PROCESS_TABLE.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: `PUBLISHED_PROCESS_TABLE` only ever holds the address stored by
+    // `publish_process_table`, which is the `SharedProcessTable` inside this fork family's
+    // `GlobalState`; that allocation outlives every caller here, and the shared arena is mapped at
+    // the same address in each host process, so the reference is valid in whichever one runs this.
+    let table = unsafe { &*(raw as *const SharedProcessTable) };
+    table.find(pid).is_some()
 }
 
 const GRACEFUL_SIGKILL_EXIT_LIMIT_MS: u32 = 1000;

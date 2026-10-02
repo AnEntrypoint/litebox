@@ -9,9 +9,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use litebox::sync::Mutex;
+use litebox_common_linux::PtRegs;
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
-use litebox_common_linux::PtRegs;
 use zerocopy::FromBytes;
 
 pub(crate) const SECCOMP_MODE_DISABLED: u8 = 0;
@@ -20,14 +20,17 @@ pub(crate) const SECCOMP_MODE_FILTER: u8 = 2;
 
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
 const SECCOMP_SET_MODE_FILTER: u32 = 1;
+const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
 const SECCOMP_FILTER_FLAG_LOG: u32 = 2;
 const SECCOMP_FILTER_FLAG_SPEC_ALLOW: u32 = 4;
 
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_KILL_THREAD: u32 = 0x0000_0000;
 const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
 const SECCOMP_RET_LOG: u32 = 0x7fd0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
@@ -122,7 +125,13 @@ pub(crate) enum Verdict {
     Log,
     Trace,
     Errno(u16),
-    Trap,
+    /// The 16-bit `SECCOMP_RET_DATA` payload. Linux's `seccomp_send_sigsys` hands it to the
+    /// SIGSYS handler as `si_errno`, and it is the ONLY way that handler knows which trap it is:
+    /// Chromium's sandbox encodes a trap id there and looks it up in its own handler, so dropping
+    /// it (this used to be a bare `Trap`) makes every trap unrecognizable -- Chromium logged
+    /// `Unexpected SIGSYS received.` 21 times in one run while our decoding was otherwise
+    /// faithful, and each trapped syscall then stayed un-emulated.
+    Trap(u16),
     KillThread,
     KillProcess,
 }
@@ -134,7 +143,7 @@ impl Verdict {
             SECCOMP_RET_LOG => Self::Log,
             SECCOMP_RET_TRACE => Self::Trace,
             SECCOMP_RET_ERRNO => Self::Errno((ret & SECCOMP_RET_DATA) as u16),
-            SECCOMP_RET_TRAP => Self::Trap,
+            SECCOMP_RET_TRAP => Self::Trap((ret & SECCOMP_RET_DATA) as u16),
             x if x == SECCOMP_RET_KILL_PROCESS => Self::KillProcess,
             _ => Self::KillThread,
         }
@@ -147,7 +156,7 @@ impl Verdict {
             Self::Log => 1,
             Self::Trace => 2,
             Self::Errno(_) => 3,
-            Self::Trap => 4,
+            Self::Trap(_) => 4,
             Self::KillThread => 5,
             Self::KillProcess => 6,
         }
@@ -323,7 +332,10 @@ fn validate(prog: &[SockFilter]) -> Result<(), Errno> {
                         _ => return Err(Errno::EINVAL),
                     };
                     let start = usize::try_from(insn.k).unwrap_or(usize::MAX);
-                    if start.checked_add(width).map_or(true, |end| end > SECCOMP_DATA_LEN) {
+                    if start
+                        .checked_add(width)
+                        .map_or(true, |end| end > SECCOMP_DATA_LEN)
+                    {
                         return Err(Errno::EINVAL);
                     }
                 }
@@ -437,19 +449,83 @@ impl<Platform: ShimPlatform> SeccompState<Platform> {
         filters.extend(parent.filters.lock().iter().cloned());
     }
 
+    /// Serializes this thread group's seccomp state for a cross-process fork child.
+    ///
+    /// A fork child MUST inherit all three of these on real Linux: the mode, `no_new_privs` and
+    /// the whole filter stack survive `fork()`. Losing `no_new_privs` is not a cosmetic drift --
+    /// Chromium's renderer is a fork of the zygote, and its
+    /// `SandboxBPF::KernelSupportsSeccompBPF()` probe is
+    /// `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, nullptr)`, which Linux answers `EFAULT` and
+    /// Chromium reads as "this kernel has seccomp-bpf". Without the inherited bit the same call
+    /// answers `EACCES`, the probe reports "not supported", and Chromium's sandbox
+    /// initialization `IMMEDIATE_CRASH`es -- a bare `int3`, SIGTRAP, no message -- about 0.1s
+    /// into every renderer's life. `Arc` cannot cross the OS process boundary, but a filter
+    /// program is plain bytes, so it can.
+    pub(crate) fn to_spec(&self) -> alloc::string::String {
+        let mut out = alloc::format!("{:02x}{:02x}", self.mode(), u8::from(self.no_new_privs()));
+        let filters = self.filters.lock();
+        out.push_str(&alloc::format!("{:04x}", filters.len()));
+        for prog in filters.iter() {
+            out.push_str(&alloc::format!("{:08x}", prog.len()));
+            for insn in prog.iter() {
+                out.push_str(&alloc::format!(
+                    "{:04x}{:02x}{:02x}{:08x}",
+                    insn.code,
+                    insn.jt,
+                    insn.jf,
+                    insn.k
+                ));
+            }
+        }
+        out
+    }
+
+    /// Restores a [`Self::to_spec`] payload onto this (fresh, unfiltered) seccomp state. `None`
+    /// on a malformed spec, which leaves this state exactly as it was -- a child that cannot be
+    /// given its parent's filters is better off unfiltered than half-filtered.
+    pub(crate) fn restore_from_spec(&self, spec: &str) -> Option<()> {
+        let mode = u8::from_str_radix(spec.get(0..2)?, 16).ok()?;
+        let no_new_privs = u8::from_str_radix(spec.get(2..4)?, 16).ok()? != 0;
+        let count = usize::from_str_radix(spec.get(4..8)?, 16).ok()?;
+        let mut rest = spec.get(8..)?;
+        let mut filters = Vec::new();
+        for _ in 0..count {
+            let len = usize::from_str_radix(rest.get(0..8)?, 16).ok()?;
+            rest = rest.get(8..)?;
+            let mut prog = Vec::new();
+            for _ in 0..len {
+                let code = u16::from_str_radix(rest.get(0..4)?, 16).ok()?;
+                let jt = u8::from_str_radix(rest.get(4..6)?, 16).ok()?;
+                let jf = u8::from_str_radix(rest.get(6..8)?, 16).ok()?;
+                let k = u32::from_str_radix(rest.get(8..16)?, 16).ok()?;
+                rest = rest.get(16..)?;
+                prog.push(SockFilter { code, jt, jf, k });
+            }
+            filters.push(prog.into_boxed_slice());
+        }
+        self.mode.store(mode, Ordering::Relaxed);
+        self.no_new_privs.store(no_new_privs, Ordering::Relaxed);
+        let mut slot = self.filters.lock();
+        slot.clear();
+        slot.extend(filters);
+        Some(())
+    }
+
     fn evaluate(&self, nr: i32, ip: usize, args: [u64; 6]) -> Option<Verdict> {
         let mode = self.mode();
         if mode == SECCOMP_MODE_DISABLED {
             return None;
         }
         if mode == SECCOMP_MODE_STRICT {
-            return Some(if litebox_common_linux::seccomp_strict_allows(
-                usize::try_from(nr).unwrap_or(usize::MAX),
-            ) {
-                Verdict::Allow
-            } else {
-                Verdict::KillThread
-            });
+            return Some(
+                if litebox_common_linux::seccomp_strict_allows(
+                    usize::try_from(nr).unwrap_or(usize::MAX),
+                ) {
+                    Verdict::Allow
+                } else {
+                    Verdict::KillThread
+                },
+            );
         }
         let mut data = [0u8; SECCOMP_DATA_LEN];
         data[0..4].copy_from_slice(&nr.to_ne_bytes());
@@ -480,9 +556,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         for (i, arg) in args.iter_mut().enumerate() {
             *arg = ctx.syscall_arg(i) as u64;
         }
-        self.process()
-            .seccomp
-            .evaluate(nr, ctx.get_ip(), args)
+        self.process().seccomp.evaluate(nr, ctx.get_ip(), args)
     }
 
     /// Applies a verdict the syscall must not survive: `Errno` skips the syscall and returns it,
@@ -493,24 +567,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         nr: i32,
         ip: usize,
     ) -> Result<usize, Errno> {
+        // Trap and kill verdicts are rare and always fatal-ish for the guest thread, so they are
+        // worth one line each: which syscall a filter refused is the only way to tell an
+        // intentional Chromium trap (it installs SIGSYS handlers for those) from a filter our
+        // BPF interpreter evaluated wrongly. `Errno` verdicts are deliberately NOT logged --
+        // Chromium's baseline policy answers hundreds of them per second with EPERM/ENOSYS and
+        // expects every one, so logging them drowns the log (a 1GB log in 2.5 minutes earlier
+        // this pass).
+        let name = crate::diag::syscall_name_pub(usize::try_from(nr).unwrap_or(usize::MAX));
+        match verdict {
+            Verdict::Trap(data) => {
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip, trap_id:? = data; "seccomp: SECCOMP_RET_TRAP, delivering SIGSYS")
+            }
+            Verdict::Trace => {
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_TRACE with no tracer, delivering SIGSYS")
+            }
+            Verdict::KillThread => {
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_THREAD, delivering SIGSYS")
+            }
+            Verdict::KillProcess => {
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_PROCESS, delivering SIGSYS")
+            }
+            Verdict::Allow | Verdict::Log | Verdict::Errno(_) => {}
+        }
         match verdict {
             Verdict::Errno(data) => Err(errno_from_ret_data(data)),
-            Verdict::Trap => {
-                self.deliver_sigsys(false, nr, ip);
+            Verdict::Trap(data) => {
+                // `data` is the trap id the filter chose; the guest's SIGSYS handler reads it from
+                // `si_errno` (see `deliver_sigsys`), exactly as Linux's `seccomp_send_sigsys`
+                // does. Without it a handler that emulates trapped syscalls cannot tell which one
+                // it was asked to emulate.
+                self.deliver_sigsys(false, nr, ip, data);
                 Err(Errno::ENOSYS)
             }
             Verdict::Trace | Verdict::KillThread | Verdict::KillProcess => {
-                self.deliver_sigsys(true, nr, ip);
+                self.deliver_sigsys(true, nr, ip, 0);
                 Err(Errno::ENOSYS)
             }
             Verdict::Allow | Verdict::Log => Ok(0),
         }
     }
 
-    fn deliver_sigsys(&self, force_exit: bool, nr: i32, ip: usize) {
+    /// `trap_id` becomes the delivered `siginfo`'s `si_errno`, matching Linux's
+    /// `seccomp_send_sigsys` (`info->si_errno = SECCOMP_RET_DATA`): a SIGSYS handler that emulates
+    /// trapped syscalls (which is what Chromium's sandbox installs one for) has no other way to
+    /// learn which trap fired -- the syscall number alone is not enough when one filter traps
+    /// several syscalls for different reasons.
+    fn deliver_sigsys(&self, force_exit: bool, nr: i32, ip: usize, trap_id: u16) {
         let siginfo = Siginfo {
             signo: Signal::SIGSYS.as_i32(),
-            errno: 0,
+            errno: i32::from(trap_id),
             code: SYS_SECCOMP,
             __pad: 0,
             data: SiginfoData::new_sigsys(ip, nr, AUDIT_ARCH),
@@ -582,18 +688,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SECCOMP_SET_MODE_FILTER => {
                 // `NEW_LISTENER` (8) is the only defined flag not modelled here: it hands out an
                 // fd for userspace notification, which has no counterpart in this shim.
-                if flags & !(SECCOMP_FILTER_FLAG_TSYNC
-                    | SECCOMP_FILTER_FLAG_LOG
-                    | SECCOMP_FILTER_FLAG_SPEC_ALLOW)
+                if flags
+                    & !(SECCOMP_FILTER_FLAG_TSYNC
+                        | SECCOMP_FILTER_FLAG_LOG
+                        | SECCOMP_FILTER_FLAG_SPEC_ALLOW)
                     != 0
                 {
                     return Err(Errno::EINVAL);
                 }
-                self.check_can_install()?;
+                // Linux's `seccomp_set_mode_filter` copies `args` out of userspace BEFORE it checks
+                // `no_new_privs`, so a caller that passes a bogus pointer gets EFAULT whether or not
+                // it could ever have installed a filter. Chromium's `KernelSupportsSeccompBPF()`
+                // probes exactly that: it calls `seccomp(SECCOMP_SET_MODE_FILTER, 0, nullptr)` and
+                // reads EFAULT as "the kernel has seccomp-bpf" and anything else as "it does not".
+                // Checking the privilege first turned that probe into EINVAL and made Chromium
+                // conclude the sandbox was unsupported and silently run unsandboxed.
                 let prog = self.read_fprog(args)?;
+                self.check_can_install()?;
                 self.process().seccomp.add_filter(prog);
                 self.publish_proc_seccomp();
                 Ok(0)
+            }
+            // `SECCOMP_GET_NOTIF_SIZES` is deliberately absent: it exists only for the user-
+            // notification feature, which this shim does not model (`NEW_LISTENER` is rejected
+            // above for the same reason), so answering it with sizes would be a lie.
+            SECCOMP_GET_ACTION_AVAIL => {
+                if flags != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let action = UserPtr::<u32>::from_usize(args)
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                match action {
+                    SECCOMP_RET_KILL_PROCESS
+                    | SECCOMP_RET_KILL_THREAD
+                    | SECCOMP_RET_TRAP
+                    | SECCOMP_RET_ERRNO
+                    | SECCOMP_RET_USER_NOTIF
+                    | SECCOMP_RET_TRACE
+                    | SECCOMP_RET_LOG
+                    | SECCOMP_RET_ALLOW => Ok(action as usize),
+                    _ => Err(Errno::EINVAL),
+                }
             }
             _ => Err(Errno::EINVAL),
         }
@@ -619,10 +755,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Installing a filter requires `no_new_privs` or `CAP_SYS_ADMIN`. Linux reports `EPERM` for
-    /// both failures; the missing-`no_new_privs` case is the one `prctl(2)` documents as `EINVAL`
-    /// and the one every real caller (Chromium's sandbox, bwrap) hits, so it is what is
-    /// distinguished here.
+    /// Installing a filter requires `no_new_privs` or `CAP_SYS_ADMIN`. Linux reports `EACCES`
+    /// (not `EINVAL`, which is reserved for an unknown mode, bad flags or an invalid program) both
+    /// from `seccomp(2)` and from `prctl(PR_SET_SECCOMP)`, so that is what is returned here --
+    /// callers such as Chromium's sandbox treat any other failure as "the kernel has no seccomp
+    /// at all" and silently drop to running unsandboxed.
     fn check_can_install(&self) -> Result<(), Errno> {
         if self.seccomp_no_new_privs() {
             return Ok(());
@@ -630,6 +767,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.creds().cap_eff & litebox_common_linux::CapSet::SYS_ADMIN.bits() != 0 {
             return Ok(());
         }
-        Err(Errno::EINVAL)
+        Err(Errno::EACCES)
     }
 }

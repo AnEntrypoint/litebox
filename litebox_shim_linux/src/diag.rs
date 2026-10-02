@@ -458,6 +458,70 @@ pub fn syscall_name_pub(number: usize) -> String {
     syscall_name(number)
 }
 
+/// How many of a task's most recent syscalls the fatal-exception trail keeps.
+///
+/// Chromium's `IMMEDIATE_CRASH()` is a bare `int3`, so a renderer that hits one dies on SIGTRAP
+/// with no message of its own anywhere in the log -- the run's only clue about what it was
+/// doing is the syscall trail leading up to it. `LITEBOX_DIAG_SYSCALL_TIMELINE` cannot answer
+/// this: it has to be armed for a comm or a pid in advance, and every renderer here is a fresh
+/// fork with a pid nobody could have named. 24 entries covers the whole ~0.1s of life a
+/// crashing renderer gets.
+const SYSCALL_TRAIL_LEN: usize = 24;
+
+#[derive(Clone, Copy, Default)]
+pub struct SyscallTrailEntry {
+    pub number: usize,
+    pub args: [u64; 3],
+}
+
+struct SyscallTrail {
+    entries: [SyscallTrailEntry; SYSCALL_TRAIL_LEN],
+    next: usize,
+    filled: usize,
+}
+
+impl SyscallTrail {
+    const EMPTY: SyscallTrailEntry = SyscallTrailEntry {
+        number: 0,
+        args: [0; 3],
+    };
+}
+
+/// One per HOST PROCESS, which is the right granularity: the processes this trail is for are
+/// cross-process fork children, each of which hosts exactly one guest task, so the trail is
+/// unambiguously that task's. (The root process hosts many guest tasks and its trail
+/// interleaves them -- read it as "what this process was doing", not "what one task did".)
+static SYSCALL_TRAIL: spin::Mutex<SyscallTrail> = spin::Mutex::new(SyscallTrail {
+    entries: [SyscallTrail::EMPTY; SYSCALL_TRAIL_LEN],
+    next: 0,
+    filled: 0,
+});
+
+/// Remembers the syscall a task just entered. Cheap enough to run unconditionally: one
+/// uncontended spin-lock round trip per syscall dispatch, no allocation.
+pub fn record_syscall_trail(number: usize, args: [u64; 3]) {
+    let mut trail = SYSCALL_TRAIL.lock();
+    let slot = trail.next;
+    trail.entries[slot] = SyscallTrailEntry { number, args };
+    trail.next = (slot + 1) % SYSCALL_TRAIL_LEN;
+    if trail.filled < SYSCALL_TRAIL_LEN {
+        trail.filled += 1;
+    }
+}
+
+/// The trail's entries, oldest first, for the fatal-exception diagnostic.
+pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
+    let trail = SYSCALL_TRAIL.lock();
+    let start = if trail.filled == SYSCALL_TRAIL_LEN {
+        trail.next
+    } else {
+        0
+    };
+    (0..trail.filled)
+        .map(|i| trail.entries[(start + i) % SYSCALL_TRAIL_LEN])
+        .collect()
+}
+
 fn syscall_name(number: usize) -> String {
     #[cfg(target_arch = "x86_64")]
     {

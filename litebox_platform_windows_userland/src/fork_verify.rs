@@ -256,6 +256,18 @@ const MAX_INSTRUCTION_LEN: usize = 15;
 /// evidence execution has moved well past any pointer that could plausibly still be stale.
 const MAX_IDENTITY_VERIFICATION_STEPS: u64 = 4096;
 
+/// The maximum number of raw-access-violation heals the AV path in `vectored_exception_handler`
+/// may perform on one thread before it ends verification and lets faults dispatch normally.
+///
+/// [`MAX_IDENTITY_VERIFICATION_STEPS`]/[`MAX_THREAD_VERIFICATION_STEPS`] only bound
+/// [`on_single_step`], which counts `EXCEPTION_SINGLE_STEP` traps. A child that keeps faulting on
+/// the same stale pointer instead re-enters the AV path, which never incremented any counter, so
+/// verification stayed armed forever: measured live on a Chromium run, 99,455 heals of one
+/// `(rip, fault_addr)` pair in 2.5 minutes with no forward progress and no end in sight. A heal
+/// that has to be repeated this many times is not fixing the pointer (the slot re-supplying it is
+/// beyond every healer's reach), so continuing only burns CPU and, at one `warn!` per pass, disk.
+pub(crate) const MAX_AV_PATH_HEALS: u64 = 4096;
+
 /// The same kind of proactive step bound as [`MAX_IDENTITY_VERIFICATION_STEPS`], but for the
 /// THREAD-based `fork()` path (non-identity relocations). Originally this path had NO bound at
 /// all: the reasoning was that `is_in_source(rip)` hits are rare there (disjoint source/destination
@@ -621,6 +633,12 @@ pub(crate) fn translate_stale_source_rip(
         return None;
     }
     let translated = relocations.translate(rip)?;
+    // Not a heal if it leaves `rip` unchanged -- see `translate_memory_operand_registers`'s own
+    // check. Resuming at the same `rip` with every slot and GPR below also rewritten to the same
+    // value re-faults identically, forever.
+    if translated == rip {
+        return None;
+    }
     #[allow(clippy::cast_possible_truncation)]
     let rsp = context.Rsp as usize;
     // Try `[rsp - 8]` first (the `ret`-just-popped case; see the doc comment above), then `[rsp]`
@@ -1796,12 +1814,22 @@ fn translate_memory_operand_registers(
             if matches!(reg, Register::None | Register::RIP | Register::EIP) {
                 continue;
             }
-            let Some(value) = register_value(reg, context) else {
-                continue;
+            let value = match register_value(reg, context) {
+                Some(value) => value,
+                None => continue,
             };
             let Some(translated) = relocations.translate(value) else {
                 continue;
             };
+            // A translation that leaves the value unchanged is not a heal. Writing it back and
+            // resuming (what this did before) re-executes the identical faulting instruction with
+            // the identical register, forever: the caller sees "success" and retries, the CPU
+            // faults again on the same address, and nothing ever changes -- an infinite loop that
+            // presents as a hang, never as the real fault. Declining here lets the fault dispatch
+            // normally instead.
+            if translated == value {
+                continue;
+            }
             write_register_value(reg, translated, context);
             translated_any = true;
         }
@@ -2828,6 +2856,7 @@ pub(crate) fn begin(
         let tls = unsafe { &*tls };
         if !crate::veh_gates().forkverify_off {
             tls.fork_verify_step_count.set(0);
+            tls.fork_verify_av_heal_count.set(0);
             tls.fork_verify_step_rip_repeat.set(None);
             // Stamp this thread with its OWN current generation before arming the map, so
             // `current_map_is_valid` can later detect a leftover map that survived this same

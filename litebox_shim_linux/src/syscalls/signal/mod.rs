@@ -571,6 +571,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             -1,
             0,
         ) else {
+            // Silent `0` here used to be indistinguishable from "not needed yet": the caller
+            // (`write_signal_frame`) then falls back to the guest's own `action.restorer`, and if
+            // that is 0 too the handler returns to address 0 -- see the `restorer == 0` refusal
+            // there. Say so, so the two are never confused again.
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get();
+                "ensure_sigreturn_trampoline: no guest page for the sigreturn trampoline (mmap failed)"
+            );
             return 0;
         };
         let addr = page.as_usize();
@@ -658,6 +666,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             -1,
             0,
         ) else {
+            // Silent `0` here used to be indistinguishable from "not needed yet": the caller
+            // (`write_signal_frame`) then falls back to the guest's own `action.restorer`, and if
+            // that is 0 too the handler returns to address 0 -- see the `restorer == 0` refusal
+            // there. Say so, so the two are never confused again.
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get();
+                "ensure_sigreturn_trampoline: no guest page for the sigreturn trampoline (mmap failed)"
+            );
             return 0;
         };
         let addr = page.as_usize();
@@ -674,6 +690,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .is_ok();
         if !write_ok || !mprotect_ok {
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get(), addr:? = addr,
+                write_ok:? = write_ok, mprotect_ok:? = mprotect_ok;
+                "ensure_sigreturn_trampoline: trampoline page unusable, falling back to the guest's restorer"
+            );
             return 0;
         }
         self.signals.borrow().sigreturn_trampoline.set(addr);
@@ -895,6 +916,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Restore the alternate signal stack, ignoring errors.
         self.signals.borrow().set_sigaltstack(uctx.stack).ok();
+
+        // `restore_sigcontext` below copies every GPR out of the guest's `mcontext` verbatim,
+        // `rip` included, so a ucontext that was never written (or was clobbered by the handler)
+        // resumes the task at `rip == 0` -- and by then the only thing that can still catch it is
+        // the platform's resume guard, which turns the resulting instruction-fetch fault into a
+        // SIGSEGV with no clue where the bad context came from. Diagnose it here, where the
+        // ucontext's address is still known, and refuse the restore instead. Live-caught on
+        // Chromium's sandboxed processes (guest pid 41 died exactly this way: `Exception(14)
+        // error_code=0x14` at `rip=0x0 cr2=0x0`, i.e. a user-mode instruction fetch from
+        // unmapped address 0, whose ucontext this handler returned through 36s later).
+        //
+        // `rsp == 0` gets the same treatment: it is equally unresumable and equally invisible
+        // later. Both are logged rather than silently corrected because either value is evidence
+        // about WHO wrote the frame, which is what has to be fixed -- see the `restorer == 0`
+        // refusal in `write_signal_frame` for the one path that could hand the guest a zero
+        // return address.
+        if uctx.mcontext.rip == 0 || uctx.mcontext.rsp == 0 {
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get(), uctx_addr:? = uctx_addr,
+                rip:? = uctx.mcontext.rip, rsp:? = uctx.mcontext.rsp, rax:? = uctx.mcontext.rax,
+                err:? = uctx.mcontext.err, trapno:? = uctx.mcontext.trapno,
+                fpstate:? = uctx.mcontext.fpstate;
+                "rt_sigreturn: guest ucontext carries a zero rip or rsp, refusing the restore"
+            );
+            self.force_signal(Signal::SIGSEGV, false);
+            return Err(Errno::EFAULT);
+        }
 
         self.signals.borrow().set_signal_mask(uctx.sigmask);
 
