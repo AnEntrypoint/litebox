@@ -2542,6 +2542,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     espipe_for_non_seekable_offset(offset)?;
                     let result = handle.with_entry(|file| {
                         file.recvfrom(
+                            &self.global,
                             &self.wait_cx(),
                             &mut buf.borrow_mut(),
                             litebox_common_linux::ReceiveFlags::empty(),
@@ -8365,8 +8366,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `carried` is `<cloexec 0|1>|<fork spec>` as produced by [`Self::raw_fd_unix_carry`].
     fn rebuild_carried_unix(&self, carried: &str, cloexec: bool) -> Result<usize, Errno> {
         let (sender_cloexec, spec) = carried.split_once('|').ok_or(Errno::EINVAL)?;
-        let socket =
-            crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec).ok_or(Errno::EINVAL)?;
+        let socket = match crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec) {
+            Some(socket) => socket,
+            None => {
+                // A spec this process cannot rebuild still carries the sender's counted hold;
+                // without this the shared connection slot stays occupied (see
+                // `UnixSocket::release_unadopted_carry`).
+                crate::syscalls::unix::UnixSocket::release_unadopted_carry(&self.global, spec);
+                return Err(Errno::EINVAL);
+            }
+        };
         let typed = self
             .global
             .litebox

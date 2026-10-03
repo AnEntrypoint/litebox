@@ -52,6 +52,12 @@ use crate::{
 /// Ring buffer capacity for each direction of a pty pair.
 const PTY_BUF_SIZE: usize = 8192;
 
+/// The pty data plane's own [`crate::syscalls::unix::SharedByteRing`] instantiation: a terminal
+/// carries bulk output, so it keeps the bigger ring the AF_UNIX control plane gave up to buy
+/// connection slots (`crate::syscalls::unix::PTY_RING_BYTES` vs `SHARED_UNIX_CONN_BUF`).
+type PtyRing<Platform> =
+    crate::syscalls::unix::SharedByteRing<Platform, { crate::syscalls::unix::PTY_RING_BYTES }>;
+
 pub(crate) struct PtySubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
 impl<Platform: ShimPlatform> FdEnabledSubsystem for PtySubsystem<Platform> {
     type Entry = PtyEnd<Platform>;
@@ -456,9 +462,9 @@ struct SharedPtySlot<Platform: ShimPlatform> {
     locked: AtomicBool,
     packet_mode: AtomicBool,
     /// What the master writes (synthetic keyboard input); the slave side reads this.
-    master_to_slave: crate::syscalls::unix::SharedByteRing<Platform>,
+    master_to_slave: PtyRing<Platform>,
     /// What the slave writes (guest program output); the master side reads this.
-    slave_to_master: crate::syscalls::unix::SharedByteRing<Platform>,
+    slave_to_master: PtyRing<Platform>,
     /// Open master file descriptions, counted per host process exactly like the slaves below: the
     /// master is held by the process that opened `/dev/ptmx`, and also by a cross-process fork
     /// child that inherited it (VTE/GLib's child setup issues `TIOCGPTPEER` on the inherited
@@ -935,7 +941,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
 /// Writes as much of `buf` as fits into `ring`, translating `\n` to `\r\n` when `onlcr`; returns
 /// the number of `buf` bytes consumed.
 fn write_translated<Platform: ShimPlatform>(
-    ring: &crate::syscalls::unix::SharedByteRing<Platform>,
+    ring: &PtyRing<Platform>,
     buf: &[u8],
     onlcr: bool,
 ) -> usize {

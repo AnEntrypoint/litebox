@@ -810,7 +810,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     }
 
     /// `(ring this side reads from, ring this side writes to)`.
-    fn rings(&self) -> (&SharedByteRing<Platform>, &SharedByteRing<Platform>) {
+    fn rings(&self) -> (&SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>, &SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>) {
         let slot_ref = self.slot_ref();
         if self.is_client {
             (&slot_ref.server_to_client, &slot_ref.client_to_server)
@@ -2961,14 +2961,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
     }
 
+    /// A `recvfrom` that cannot hand out ancillary data still consumes any `SCM_RIGHTS` fds the
+    /// message carried, so the sender's placeholder hold on the shared connection slot has to be
+    /// dropped here or it outlives the message (`read`/`recv`/`recvfrom` all reach this).
     pub(super) fn recvfrom(
         &self,
+        global: &GlobalStateHandle<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        self.recvmsg(cx, buf, flags, source_addr).map(|(n, _)| n)
+        let (n, fds) = self.recvmsg(cx, buf, flags, source_addr)?;
+        for fd in fds {
+            if let AnyDupFd::Carried(spec) = fd {
+                Self::release_unadopted_carry(global, &spec);
+            }
+        }
+        Ok(n)
     }
 
     /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
@@ -3683,7 +3693,19 @@ where
 /// and opens far more than 64 concurrent channels; 1024 leaves an order of magnitude of headroom
 /// over that.
 ///
-/// **Sized for the shared arena now, not for the stack.** The 64 was a stack-overflow workaround,
+/// **Measured demand, not a guess (chr20, 2026-10-03).** Chromium fills 1024 slots in ~7.4s and
+/// then refuses every further socket carry (`305` `SCM_RIGHTS` refusals, all
+/// `reason=shared unix connection table full`); the census's per-slot sample
+/// (`slot 0 client_pid=8 server_pid=8 holders="client[103368x1 132720x1 53696x1 96676x2 43816x1 ]
+/// server[42820x1 ]"`) is the shape that demand takes -- ONE connection whose client side is held
+/// by SIX host processes, because every cross-process fork hands each process another holder of the
+/// same endpoint. So this is saturation by inheritance fan-out, not the never-adopted-carry leak
+/// the census was built to detect (that one shows up as the SAME pid counted twice on one side).
+/// 4096 is 4x the measured floor and still fits the arena because the slot shrank with it (see
+/// [`SHARED_UNIX_CONN_BUF`] and [`RING_FD_MAIL_ENTRIES`]): ~29 MiB of one 128 MiB reservation.
+///
+/// **Sized for the shared arena now, not for the stack.** The original 64 was a stack-overflow
+/// workaround,
 /// not a judgement about connection counts: `GlobalState` (which embeds this table) is constructed
 /// as an ordinary Rust value and passed BY VALUE through `create_shared_kernel_state`/
 /// `SharedArc::new` before being placed in the shared arena, so an oversized inline field here
@@ -3701,9 +3723,9 @@ where
 /// The leak that originally motivated the small-but-bounded pool is still handled by
 /// [`SharedUnixConnTable::alloc`]'s dead-holder reclaim pass, and the capacity raise is the
 /// complementary mitigation for the case that pass still cannot recover -- see that doc comment.
-pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 1024;
+pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 4096;
 
-/// Per-direction shared ring buffer capacity. Bounded like a real kernel AF_UNIX socket's own
+/// Per-direction shared ring buffer capacity for a cross-process AF_UNIX connection. Bounded like a real kernel AF_UNIX socket's own
 /// finite send/receive buffer: this is control-plane protocol traffic (X11/D-Bus requests and
 /// replies), not bulk pixel data (MIT-SHM already carries that over System V shared memory, never
 /// through this socket). Shared-arena footprint: `SHARED_UNIX_CONN_CAPACITY` slots x
@@ -3713,8 +3735,18 @@ pub(crate) const SHARED_UNIX_CONN_CAPACITY: usize = 1024;
 /// A single write larger than this never hangs regardless (see [`SharedByteRing::try_write`] and
 /// its call site in `SharedView::send`): it degrades to a real short write
 /// of the first `SHARED_UNIX_CONN_BUF` bytes, matching a real kernel socket's own short-write
-/// behavior on an over-sized single `write(2)`, rather than looping on `EAGAIN` forever.
-const SHARED_UNIX_CONN_BUF: usize = 4096;
+/// behaviour on an over-sized single `write(2)`, rather than looping on `EAGAIN` forever.
+///
+/// Halved from 4096 so that 4096 slots (see [`SHARED_UNIX_CONN_CAPACITY`]) still fit one 32 MiB
+/// power-of-two arena region: the ring bytes are the slot's whole footprint, and this is a
+/// control-plane buffer whose only cost when too small is more event-driven short-write round
+/// trips (the writer registers `blocked_need` and the reader wakes it -- never a fixed poll).
+const SHARED_UNIX_CONN_BUF: usize = 2048;
+
+/// The pty data plane's own ring size: `syscalls::pty` reuses [`SharedByteRing`] verbatim, and a
+/// terminal carries bulk output (a `cat` of a large file, a full-screen redraw), so it keeps the
+/// bigger buffer the AF_UNIX control plane gave up to buy connection slots.
+pub(crate) const PTY_RING_BYTES: usize = 4096;
 
 const CONN_SLOT_EMPTY: u32 = 0;
 const CONN_SLOT_OCCUPIED: u32 = 1;
@@ -3730,9 +3762,9 @@ const CONN_SLOT_OCCUPIED: u32 = 1;
 /// convention) by `syscalls::pty::SharedPtyTable` for the cross-process pty master<->slave byte
 /// data plane -- the exact same shape (a fixed ring plus cross-process `RawMutex`-backed cursor)
 /// AF_UNIX already proved sound here, just keyed by pty id instead of a connection slot.
-pub(crate) struct SharedByteRing<Platform: ShimPlatform> {
+pub(crate) struct SharedByteRing<Platform: ShimPlatform, const RING_BYTES: usize> {
     cursor: Mutex<Platform, RingCursor>,
-    buf: [AtomicU8; SHARED_UNIX_CONN_BUF],
+    buf: [AtomicU8; RING_BYTES],
 }
 
 #[derive(Clone, Copy)]
@@ -3761,7 +3793,7 @@ impl Default for RingCursor {
     }
 }
 
-const RING_FD_MAIL_ENTRIES: usize = 4;
+const RING_FD_MAIL_ENTRIES: usize = 2;
 const RING_FD_MAIL_SPEC_BYTES: usize = 640;
 
 /// Separates the per-descriptor specs inside one [`RingFdMail`]; never occurs in a path.
@@ -3828,7 +3860,7 @@ impl RingCursor {
     }
 }
 
-impl<Platform: ShimPlatform> SharedByteRing<Platform> {
+impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, RING_BYTES> {
     pub(crate) fn new_empty() -> Self {
         Self {
             cursor: Mutex::new(RingCursor::default()),
@@ -3856,7 +3888,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             return false;
         }
         let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
-        let free = SHARED_UNIX_CONN_BUF - used;
+        let free = RING_BYTES - used;
         if data.len() > free {
             cursor.blocked_need = data.len();
             cursor.blocked_fd = fd_specs.is_some();
@@ -3871,7 +3903,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             }
         }
         for (i, b) in data.iter().enumerate() {
-            self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES]
                 .store(*b, Ordering::Relaxed);
         }
         cursor.write_pos = cursor.write_pos.wrapping_add(data.len());
@@ -3882,7 +3914,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 
     pub(crate) fn writable(&self) -> bool {
         let cursor = self.cursor.lock();
-        let free = SHARED_UNIX_CONN_BUF - cursor.write_pos.wrapping_sub(cursor.read_pos);
+        let free = RING_BYTES - cursor.write_pos.wrapping_sub(cursor.read_pos);
         free > 0
             && free >= cursor.blocked_need
             && (!cursor.blocked_fd || cursor.fd_mail.iter().any(|m| !m.used))
@@ -3892,7 +3924,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
     /// count (which may be `0` if the ring is full or shut down -- never blocks, never panics).
     /// Only used for the one case [`Self::try_write_all`] can never resolve no matter how empty
     /// the ring is -- a single message bigger than the whole ring -- see
-    /// [`SHARED_UNIX_CONN_BUF`]'s doc comment.
+    /// [`RING_BYTES`]'s doc comment.
     pub(crate) fn try_write(&self, data: &[u8]) -> usize {
         self.try_write_with_fds(data, None)
     }
@@ -3907,7 +3939,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             return 0;
         }
         let used = cursor.write_pos.wrapping_sub(cursor.read_pos);
-        let free = SHARED_UNIX_CONN_BUF - used;
+        let free = RING_BYTES - used;
         let n = data.len().min(free);
         if n == 0 {
             return 0;
@@ -3919,7 +3951,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             }
         }
         for (i, b) in data.iter().take(n).enumerate() {
-            self.buf[(cursor.write_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES]
                 .store(*b, Ordering::Relaxed);
         }
         cursor.write_pos = cursor.write_pos.wrapping_add(n);
@@ -3932,7 +3964,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
         for (i, slot) in out.iter_mut().take(n).enumerate() {
-            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES]
                 .load(Ordering::Relaxed);
         }
         n
@@ -3953,7 +3985,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
         for (i, slot) in out.iter_mut().take(n).enumerate() {
-            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF]
+            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES]
                 .load(Ordering::Relaxed);
         }
         let start = cursor.read_pos;
@@ -3973,7 +4005,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 
     pub(crate) fn free_space(&self) -> usize {
         let cursor = self.cursor.lock();
-        SHARED_UNIX_CONN_BUF - cursor.write_pos.wrapping_sub(cursor.read_pos)
+        RING_BYTES - cursor.write_pos.wrapping_sub(cursor.read_pos)
     }
 
     /// Writes `data` as one record -- a 4-byte little-endian length, then the bytes -- all or
@@ -4006,7 +4038,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             return None;
         }
         let at = |cursor: &RingCursor, i: usize| {
-            self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF].load(Ordering::Relaxed)
+            self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES].load(Ordering::Relaxed)
         };
         let len = u32::from_le_bytes([at(&cursor, 0), at(&cursor, 1), at(&cursor, 2), at(&cursor, 3)])
             as usize;
@@ -4031,7 +4063,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
             return None;
         }
         let at = |i: usize| {
-            self.buf[(cursor.read_pos.wrapping_add(i)) % SHARED_UNIX_CONN_BUF].load(Ordering::Relaxed)
+            self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES].load(Ordering::Relaxed)
         };
         let len = u32::from_le_bytes([at(0), at(1), at(2), at(3)]) as usize;
         if avail < 4 + len {
@@ -4046,7 +4078,7 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 
     pub(crate) fn is_full(&self) -> bool {
         let cursor = self.cursor.lock();
-        cursor.write_pos.wrapping_sub(cursor.read_pos) >= SHARED_UNIX_CONN_BUF
+        cursor.write_pos.wrapping_sub(cursor.read_pos) >= RING_BYTES
     }
 
     pub(crate) fn shutdown(&self) {
@@ -4064,8 +4096,8 @@ impl<Platform: ShimPlatform> SharedByteRing<Platform> {
 /// so the whole slot's live state is its own inline bytes.
 struct SharedConnSlot<Platform: ShimPlatform> {
     state: AtomicU32,
-    client_to_server: SharedByteRing<Platform>,
-    server_to_client: SharedByteRing<Platform>,
+    client_to_server: SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>,
+    server_to_client: SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>,
     client_pid: AtomicU32,
     client_uid: AtomicU32,
     client_gid: AtomicU32,
@@ -5138,6 +5170,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 global.unix_addr_presence.remove(kind, bytes, owner_pid);
             }
         }
+    }
+
+    /// Releases the connection hold [`Self::fork_carry`] counted for a receiver that will never
+    /// adopt this spec -- the read consumed the bytes but the fd is never rebuilt (no ancillary
+    /// buffer, `EMFILE`, a rebuild that fails, a message dropped outright). Without this that hold
+    /// is counted under the sender's host pid until the sender's whole process exits, because
+    /// "gone" is decided by host-process liveness, not by whether the fd is still open
+    /// (`SharedConnSlot::side_gone`), so every such message leaks one slot for the session.
+    ///
+    /// Parses only the fields [`Self::from_fork_spec`]'s `C` branch needs, and stays silent on
+    /// anything else: a spec that describes no shared connection has no hold to release.
+    pub(super) fn release_unadopted_carry(
+        global: &GlobalStateHandle<Platform, FS>,
+        spec: &str,
+    ) {
+        let Some((_status, body)) = spec.split_once(';') else {
+            return;
+        };
+        let mut fields = body.split(',');
+        let Some(kind) = fields.next() else {
+            return;
+        };
+        // `D` (datagram) has no seq field and no connection; `I`/`L` (init/listen) hold nothing
+        // but presence, which `fork_carry_abandon` undoes.
+        if kind != "C" {
+            return;
+        }
+        let _seq = fields.next();
+        let (Some(slot), Some(is_client), Some(host)) = (
+            fields.next().and_then(|s| s.parse::<u32>().ok()),
+            fields.next().map(|s| s == "1"),
+            fields.next().and_then(|s| s.parse::<u32>().ok()),
+        ) else {
+            return;
+        };
+        if slot as usize >= SHARED_UNIX_CONN_CAPACITY {
+            return;
+        }
+        // `0` means the hold was already moved onto the receiving process's own pid (a spawned
+        // fork child), so that pid is what has to release it -- see `from_fork_spec`.
+        let release_host = if host == 0 {
+            global.platform.current_host_pid()
+        } else {
+            host
+        };
+        SharedView {
+            global,
+            slot,
+            is_client,
+        }
+        .release_holder_for(release_host);
     }
 
     /// Rebuilds, in a cross-process fork child, the socket a parent's [`Self::fork_carry`]

@@ -387,8 +387,64 @@ Repro scripts: `.wfgy/chromium_headless.ps1 -Run <n> -Secs N -Extra "<flags>"`.
   `/proc/self/statm`, rendered by a new `ProcSelfInfo::statm` closure over the same page manager
   `maps` uses (nulled in `inherit`/`portable_snapshot`); `install_task_state` now publishes a
   pid-only row plus one warn instead of silently nothing when the carried identity is absent.
+- **`chr16` (2026-10-02) pinned "no page yet" to ONE number.** 1265 of 1265 `SCM_RIGHTS: this fd
+  cannot cross a process boundary ... kind=unix-socket` refusals carry `reason=shared unix
+  connection table full` -- not one other reason: `SHARED_UNIX_CONN_CAPACITY` was 64, and Chromium
+  opens far more than 64 concurrent Mojo channels across its ~20 host processes. Raised to **1024**
+  (2026-10-03). The slots are no longer a by-value `[SharedConnSlot; N]` field of `GlobalState` --
+  that is what forced 64, since a ~15 MiB inline array blows the constructing thread's stack (the
+  same hazard `pty.rs:429` records at 32 pty slots / ~214 KiB) -- but one
+  `shared_kernel_arena_alloc_bytes` region (~15 MiB of the 64 MiB arena, 16 MiB after its
+  power-of-two rounding, shared by the whole fork family), held as a `&'static mut` slice and
+  initialized IN PLACE one slot at a time, which also cuts `GlobalState`'s by-value size by ~0.9 MiB.
+  `SHARED_UNIX_CONNECT_QUEUE_CAPACITY` 64 -> 256 as headroom (NOT a measured blocker). `alloc`'s
+  failure path now logs a 1-in-64 census (`capacity/arena_backed/held_live/orphaned/unheld`), so a
+  future full table says saturation vs leak; `unheld > 0` means slots no reclaim pass can free
+  (`side_gone` reports "not gone" for a side that was never held). Slot indices still travel as
+  decimal `u32` in the `C|` fork spec, bounds-checked against the same constant.
+- **That 1265-count had a second cause too, now FIXED (2026-10-03): `scm_carry_spec` threw away
+  the carry's own hold.** `Task::scm_carry_spec` (`syscalls/file.rs`) treated ANY
+  `UnixCarryHold` from `UnixSocket::fork_carry` as an anomaly and abandoned it -- but only the
+  LISTENER branch returns none (`child_pid == 0` makes it skip presence registration). A
+  CONNECTED endpoint always returns `UnixCarryHold::Conn`, and that hold IS the mechanism: it
+  counts this host pid on the shared slot so it cannot be reclaimed between `sendmsg` and
+  adoption, and the receiver releases exactly that pid when it rebuilds (`from_fork_spec`'s `C`
+  branch reads the spec's `me` field, which `fork_carry` set to the sender because `for_spawn`
+  is false). So every socketpair end was refused with `EOPNOTSUPP`, reason
+  `unix-socket(listener; carried presence entry)` -- a message that named the wrong branch. Now
+  only a `Presence` hold is abandoned+refused; a `Conn` hold ships with the spec. Verified by
+  `.wfgy/scmring.sh`: before, `FAIL phase1: parent raised OSError(95)` and one refusal line;
+  after, ZERO `SCM_RIGHTS` refusal lines and the child receives the fd. The repro then fails on
+  `getsockopt(SOL_SOCKET, 38)` = `SO_PROTOCOL` (unsupported -> ENOPROTOOPT), which Python's
+  `socket.socket(fileno=...)` probes to validate a carried fd -- being added. Residual: if the
+  receiver never adopts (message dropped), the counted hold leaks and the slot is never freed.
 - Next sandbox blocker is NOT seccomp: `zygote_host_impl_linux.cc:117` requires
   `Credentials::CanCreateProcessInNewUserNS()`, and the webtop image ships no `chrome_sandbox` SUID helper, so
   it FATALs "No usable sandbox!" (as root it dies earlier at :102, crbug 638180). Measured: `unshare` accepts
   CLONE_NEWUSER alone, EPERMs CLONE_NEWPID/NEWNS/NEWUTS/NEWIPC/NEWNET/NEWCGROUP and every combined mask;
   `/proc/self/{uid_map,gid_map,setgroups}` exist, `/proc/<pid>/uid_map` does not (ENOENT).
+- **MILESTONE (chr21, 2026-10-03): a page renders with Chromium's OWN sandbox active.**
+  `.wfgy/guest2.ps1 -Script .wfgy/chr15.sh -Run chr21 -Secs 240` (webtop, `LITEBOX_PROCESS_FORK=1`),
+  NO `--no-sandbox`: `--dump-dom` printed
+  `<html><head></head><body><h1>hello from litebox</h1><p>sandboxed chromium rendered this</p></body></html>`,
+  `CHROME_PIPELINE_DONE rc=0`, 6x `Activated seccomp-bpf`, `Linux.SandboxStatus` bitfield 106
+  (UserNS+NetNS+TSYNC+AMD64), `ZygoteMain: initializing 0 fork delegates`, ZERO `No usable sandbox!`,
+  ZERO `Sanity checks are failing`. The zygote check above does NOT fire for a non-root uid
+  (`setpriv --reuid 911`); only the root path still dies (crbug 638180).
+  What unblocked it: `SHARED_UNIX_CONN_CAPACITY` 1024 -> **4096**. chr20's census read
+  `capacity=1024 slot_bytes=14824 occupied=1024 held_live=1024 one_host=1009 multi_host=15
+  orphaned=0 unheld=0` with 303 refusals, ALL `reason=shared unix connection table full`; chr21 has
+  ZERO `cannot cross a process boundary` lines. To fit one power-of-two arena region the slot shrank:
+  `SHARED_UNIX_CONN_BUF` 4096->2048 and `RING_FD_MAIL_ENTRIES` 4->2 (slot ~14.8KB -> ~7KB),
+  `SharedByteRing` is const-generic over `RING_BYTES` and the pty keeps its 4096 ring via
+  `PTY_RING_BYTES` + the `PtyRing<Platform>` alias (a const generic argument must be a type or a
+  BRACED const -- `crate::...::PTY_RING_BYTES` unbraced is E0573), and `SHARED_KERNEL_HEAP_SIZE`
+  64->128MiB costs nothing real (SEC_RESERVE, committed on demand by `shared_kernel_arena_alloc`).
+- **Unadopted carries now released on every discard path**: `UnixSocket::release_unadopted_carry`,
+  called from `net.rs` (EMFILE, any rebuild error, and fds dropped by MSG_CTRUNC are closed),
+  `file.rs::rebuild_carried_unix` (rebuild failure), and `UnixSocket::recvfrom` -- a
+  read/recv/recvfrom cannot hand out ancillary data yet still consumed the message, so it now takes
+  `global` and releases every `AnyDupFd::Carried` it drops. Residual: ~1 per run
+  `rebuilding a carried SCM_RIGHTS fd failed errno=ENOENT spec=F|.../Local Storage/leveldb/LOG`
+  (file gone, not a layer-visibility miss), and 19 `SECCOMP_RET_TRAP` SIGSYS on
+  `sched_getaffinity` = Chromium's own trap handler, expected and harmless.

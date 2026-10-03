@@ -11318,7 +11318,13 @@ const SHARED_KERNEL_HEAP_BASE: usize = 0x7FF8_0000_0000;
 /// cross-process-visible kernel singletons (`LiteBoxX`+`GlobalState`, a handful of allocations
 /// total, each at most low-KB). 64 MiB is generous headroom for that bounded set while remaining
 /// nowhere near open-ended -- the exact failure mode this shrink exists to prevent recurring.
-const SHARED_KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024;
+///
+/// **Doubled to 128 MiB, 2026-10-03**: `SharedUnixConnTable` alone now reserves 4096 slots
+/// (~29 MiB, a 32 MiB power-of-two region -- see `SHARED_UNIX_CONN_CAPACITY`), and this reservation
+/// costs NOTHING in memory: `init_shared_kernel_heap` leaves it reserved-not-committed
+/// (`SEC_RESERVE`) and `shared_kernel_arena_alloc` commits each allocation's own range on demand, so
+/// raising the ceiling only spends virtual address space, never RAM or commit.
+const SHARED_KERNEL_HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 const SHARED_KERNEL_HEAP_STATE_UNINIT: u8 = 0;
 const SHARED_KERNEL_HEAP_STATE_INITIALIZING: u8 = 1;

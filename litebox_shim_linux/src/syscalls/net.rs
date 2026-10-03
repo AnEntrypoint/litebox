@@ -2413,6 +2413,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |entry| {
                     let mut addr = None;
                     let size = entry.recvfrom(
+                        &self.global,
                         &self.wait_cx(),
                         &mut buf.borrow_mut(),
                         flags,
@@ -2685,10 +2686,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             match inserted {
                 Ok(raw_fd) => written_fds.push(raw_fd),
-                Err(Errno::EMFILE) => {}
+                Err(Errno::EMFILE) => {
+                    // Linux closes an over-limit donated fd and reports `MSG_CTRUNC` rather than
+                    // failing the read. Closing it also matters here for a carried unix socket:
+                    // the hold its sender counted is only released when this fd is adopted or
+                    // dropped, so an unrebuilt spec leaks its shared connection slot for the
+                    // whole session.
+                    if let Some(spec) = carried_spec {
+                        crate::syscalls::unix::UnixSocket::release_unadopted_carry(
+                            &self.global,
+                            &spec,
+                        );
+                    }
+                }
                 Err(e) => {
                     if let Some(spec) = carried_spec {
                         litebox_util_log::warn!("recvmsg: rebuilding a carried SCM_RIGHTS fd failed errno={e:?} spec={spec}");
+                        crate::syscalls::unix::UnixSocket::release_unadopted_carry(
+                            &self.global,
+                            &spec,
+                        );
                     }
                     return Err(e);
                 }
@@ -2743,6 +2760,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let written = out.len().min(control_capacity);
             if written < out.len() {
                 ret_flags.insert(ReceiveFlags::CTRUNC);
+                // Linux's `scm_detach_fds` installs only the fds that FIT and closes the rest;
+                // leaving them open leaks one descriptor per truncated message, and for a carried
+                // unix socket it also keeps the sender's shared-connection hold counted (a hold
+                // only goes away when the fd is adopted or dropped), so the slot never frees.
+                let delivered = control_capacity.saturating_sub(size_of::<CmsgHdr>()) / size_of::<i32>();
+                for raw_fd in written_fds.iter().skip(delivered) {
+                    if let Ok(fd) = i32::try_from(*raw_fd) {
+                        let _ = self.sys_close(fd);
+                    }
+                }
             }
             if written > 0 {
                 UserPtrMut::<u8>::from_usize(msg_control.as_usize())
