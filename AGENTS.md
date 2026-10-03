@@ -1,374 +1,110 @@
-# litebox -- current state (2026-10-03, compacted; 121st pass)
+# litebox -- current state (2026-10-03, recompacted from the 121st pass)
 
-CURRENT-STATE: what works, what is broken, what to do next. Every claim carries a commit sha or `file:line`;
-a claim nobody can point at, or one a later commit superseded, is deleted. Detail (4th-120th passes) is in
-`docs/AGENTS_ARCHIVE_*.md` -- a trail, never a starting point. Single source of truth for standing rules.
+CURRENT-STATE index: what works, what is broken, what to do next. Every claim carries commit sha or `file:line`; claim nobody can point at, or one later commit superseded, is deleted. Long form in `docs/AGENTS_ARCHIVE_*.md`; trail not start; this file wins.
 
 ## Where things stand
 
-**A real XFCE desktop runs and is usable**: `Xvfb` + `xfce4-session` + `selkies`, host proxy
-`--publish 8081:8081`, `DE_UP` in 25-40s. Verified via real Chrome CDP (2026-09-30, `.wfgy/pass118_fin11.*`):
-Applications menu, xfce4-terminal (prompt, `tty`, job control, pipelines, `su`, DNS), Mousepad, Settings,
-Thunar, `ls /proc/self/fd`, `apt-get update`+`install`; 12+ min soak, 30s probes 200, 24 host processes,
-3.3GB WS. Typing drops chars when the host is starved; chrome-devtools `click` cannot hit injected overlays
--- use `Alt+Tab`/keyboard.
+A real XFCE desktop runs, is usable, and STREAMS TO A HOST BROWSER (chrD8, with `463dc29`): selkies binds 8081 (`SELK_WAIT code=200` at t=10s), logs `Client ('10.0.0.1', 49155) connected`, `Client 'primary' is active. Starting its capture`, `{'backend':'x11','capture':'XShm','encoder':'x264'}` then `[X11] Res: 1346x832 EncFPS: 33-45` for minutes; browser `<video>` holds live 1346x832 track (`readyState=4`, `currentTime` advancing), decoded frame 84 distinct colours. Earlier real-CDP (2026-09-30, `.wfgy/pass118_fin11.*`): menu, terminal, desktop apps, `apt-get update`+`install`, 12+ min soak, 24 host processes, `DE_UP` in 25-40s. Typing drops chars when host is starved; `click` can't hit injected overlays.
 
-Fixed (newest first; mechanism in the archive unless noted):
-- `a1423ee` a carried "child writes" pipe is a local pipe + a pump, so `write(2)` returns before the bytes
-  reach the parent -- a bulk producer that exits at once lost its tail (`dd bs=1024 count=200 | wc -c` =
-  151552 of 204800). The child's exit now waits for its write pumps to drain (bounded 5s).
-- `30d8f43` a `Source` pipe bridge waited for `owners()==1`, but HOLDING an end is not READING it: a wrapper
-  (`timeout`/`env`/`nohup`/`setpriv`) keeps stdin open for the child it forks -- deadlock (`printf x |
-  timeout 12 sh -s` rc=124 25/25). `ForkPipeBridge::pending_bytes` (FIONREAD) breaks the wait when a
-  non-zero count sits unchanged 500ms.
-- `7d2a6a7` `SHARED_UNIX_CONN_CAPACITY` 1024->4096, and every unadopted-carry discard path releases the
-  sender's slot hold: **chromium renders a page with its OWN sandbox active**. `ad2659f` `SECCOMP_RET_TRAP`
-  returns the syscall number; a connected endpoint's `Conn` hold ships with the carry spec.
-- `067367b` fork children keep committed fork padding (`VM_OWN_FORK_PADDING`); cross-process `/proc/<pid>`;
-  no-restorer frames refused; AV heals bounded (`MAX_AV_PATH_HEALS`).
-- `a2f3eb9`+`7d2a6a7` unix conn capacity 64->4096 (`unix.rs`, arena-backed). `9412184` writable-layer-only
-  file carries by content (`T|`). `6beb669` SCM_RIGHTS + fork share one unix carry path.
-- `19eab93` PID namespaces; crashpad (`yama/ptrace_scope`, `PR_SET_PTRACER`, SCM_CREDENTIALS);
-  `CLONE_FS`/`CLONE_FILES` clones stay same-process. `8478b15` fork children keep `PROT_NONE` reservations.
-- `3bfe283` `CLONE_NEWUSER` credentials cross fork; `VM_MAY_ACCESS_FLAGS`. `883cab4` user namespaces (id
-  maps, `setgroups` first) + `Backend::services_own_writes`. `e608959` real `chroot(2)`. `2bb71cb` real
-  `seccomp(2)` (classic-BPF on the raw nr at the top of `Task::do_syscall`).
-- `668d084` `idle_trim.rs` (`LITEBOX_IDLE_TRIM=0` off). `f271ed2` flat rootfs index. `d428acd`
-  `with_root_identity` takes the per-thread root guard too. `a2ebff6` CLOEXEC survives a pipe-end fork
-  carry. `748c4e5` registry + record locks out of the shared arena.
-- `9014df7` unix `EPOLLOUT` only when the blocked message fits -- **reports "chromium headless prints
-  example.com"**, not reproduced since. `582cc4b` chromium profile dirs use the shared spill. `f36621a` one
-  `VirtualQuery` per region: fork 3-5s -> ~0.5s.
-- Older: `a42d9d0` pipeline EOF; `d944c66` net_lock not orphaned on exit; `f594693` mutable `Credentials` +
-  `IP_RECVERR`; `2b7d7df` TCP `mark_peer_closed()`; `88f632f` device write; `f0ecbb0` `getsockname`;
-  `290d4d4` `mprotect` rounding; `3ee1ce7`/`bff1d0b`/`a61ed74` lock dead-holder recovery; `0cda0ec` lazy
-  range + `epoll` re-poll; `d383f90`/`d1dae93` pty; `820c2d6` watchdog arming; `bb518ca` per-fork env vars
-  consumed by `take_fork_env` -- **any new per-child env var needs a remove after adoption**.
-- Memory (`b11f674`, `6fd27b7`, `d07a7f9`, `f271ed2`, `668d084`): fork child 41MB->8MB resident; stack
-  private resident 2246MB->1222MB; idle trim WSsum 2.8GB->~0.4GB. Beware root-vs-child heap layout
-  differences exposing shared-struct host pointers (`bootstrap_process`).
+Fixed, newest first (mechanism in archive):
+- `1732ad9` carried-pipe pump could outlive its child. `ForkPipeBridge::Source` pump blocked in `end.read()` with no deadline, so a child exiting while its stdin pump waited parked a host thread + OS handle forever (one per child). Plain timeout can't fix it: `Option<usize>` collapsed "nothing yet" into EOF, and closing on that closes child's read end while guest may still write. Reads now three-way `ForkPipeRead { Bytes, Empty, Eof }`; 500ms `WaitContext` deadline, deadline/`WouldBlock`->`Empty`, `Ok(0)`/closed fd->`Eof`; pump re-checks `process_has_exited` on every `Empty`. Measured by `.wfgy/sub18.sh`: 20 children with stdin=PIPE whose write end stays open log exactly 20 "child exited before the guest pipe produced anything more"; 5 reading stdin still print `got=hello`.
+- `463dc29` 8-pass "a parent's event loop stops when its spawned child exits" freeze, root-caused. `ForkPipeBridge::Source` pump forwarded bytes in parent's pipe whenever count sat unchanged 500ms (`30d8f43`), EMPTYING any inherited read end guest still meant to read; "stagnant" only means read has not happened yet. libuv's GLOBAL SIGNAL LOCK has that shape: pipe holding ONE byte, `uv__signal_lock() == read(pipefd[0],&c,1)`; one carried fork empties it, next SIGCHLD hangs in `uv_run` forever. Forwarding now only for carried end that is CHILD'S STDIN (`fd == 0`). Measured: sub15 (zero-timeout `select()` on fd 5) `readable=True` at wall 3.0/6.0, `False` from 9.0 on, main parked in `read(5, buf, 1)`; sub16: `True` on all 37 ticks, both arms complete. Lock pipe created lazily at first signal use, so FIRST fork can't carry it -- why sub6's lone spawn ran 419 clean ticks. Adds `LITEBOX_DIAG_LOCKSTALL_TRACE` (operands from `orig_rax`; `rax` holds prior return).
+- `5b7ff62` `ShimTransport::connect` drops `net_lock` before its `spin_loop` (`match` kept temporary guard alive, so spin held cross-process lock with no timeout). `16f3e76` whole-guest freeze (next section) + platform wait chunk clamped to >=1ms (0 chunk makes `WaitForSingleObject(h,0)` return `WAIT_TIMEOUT` without blocking->busy spin).
+- `42c6099` queued bytes reach smoltcp before `close(2)` can defer: TX ring lives in exiting process's own heap, so write-then-exit delivered nothing.
+- `a1423ee` carried "child writes" pipe: local pipe + pump, so `write(2)` returns before bytes reach parent; child's exit now drains its pumps (bounded 5s). `30d8f43` Source pump waited for `owners()==1`, but holding end isn't reading it -- wrapper (`timeout`/`env`/`nohup`/`setpriv`) keeps stdin open for child it forks; `pending_bytes` (FIONREAD) breaks that wait at 500ms unchanged.
+- `7d2a6a7` `SHARED_UNIX_CONN_CAPACITY` 1024->4096 (`unix.rs:3726`) + every unadopted-carry discard releases sender's slot hold: chromium renders with its OWN sandbox active. `ad2659f` `SECCOMP_RET_TRAP` returns syscall number; connected endpoint's `Conn` hold ships with carry spec.
+- Earlier (`067367b`, `19eab93`, `3bfe283`, `883cab4`, `e608959` `chroot(2)`, `2bb71cb` `seccomp(2)`, `8478b15`, `668d084` idle trim, `f271ed2`, `9412184`, `6beb669`, `d428acd`, `a2ebff6`, `748c4e5`, `f36621a`, `582cc4b`, `9014df7`, `a42d9d0`, `d944c66`, `f594693`, `2b7d7df`, `290d4d4`, `3ee1ce7`/`bff1d0b`/`a61ed74`, `0cda0ec`, `d383f90`/`d1dae93`, `820c2d6`): mechanism per sha in archive; standing rules: `bb518ca` (any new per-child env var needs remove after adoption), memory (fork child 41MB->8MB, stack private resident 2246MB->1222MB, idle trim 2.8->0.4GB), and beware root-vs-child heap layout exposing shared-struct host pointers.
+
+## The net_lock freeze (root-caused `16f3e76`, verified chrD7)
+
+16+ processes parked `val=2` on one arena mutex whose `holder_pid` was ALIVE, holder's net_worker blocked in `RawRwLock::read_contended`. CAUSE: `perform_network_interaction` (`litebox_shim_linux/src/lib.rs:1280`) holds arena-resident `net_lock` across `internal_perform_platform_interaction` (`litebox/src/net/mod.rs:862`), which took descriptor table/entry locks BLOCKINGLY; `litebox::sync::RwLock` writer-preferring (`rwlock.rs:74-82`), so merely QUEUED writer blocks reader. FIX: net-worker maintenance best-effort -- `try_descriptor_table_mut` + `drain_entries_full_covered_by_nowait` in `attempt_to_close_queued`, `try_descriptor_table` in `close_pending_sockets`/`drain_all_socket_channel_buffers`. Rule: no path holding `net_lock` may block. `5b7ff62` same rule guest-side. Lock tooling: `holder_tid` = `GetCurrentThreadId()` (match cdb `~*kb` TIDs); `commit_wait` parks `val=1 holder_pid=0` (LOST-WAKE, not deadlock), silent without `LITEBOX_DIAG_LOCKSTALL=1`; mutex at/above `SHARED_KERNEL_HEAP_BASE` `0x7FF8_0000_0000` cross-process; `chunk_ms=2000` = UNBOUNDED park.
 
 ## Open, in rough priority order
 
-1. **The whole-guest freeze: threads across many host processes parked in `sys_close`** (chrD3/chrD4/chrD5;
-   live `cdb` + `[diag-lockstall]`). Not yet root-caused -- "Frozen-in-`close(2)`" below IS the live
-   investigation.
-1b. **Host memory is the binding constraint, not a litebox bug.** Left: selkies/Xvfb heaps (150-250MB private
-   RW, legitimate), guest `PROT_NONE` reservations are committed, an idle process burns 1-3% CPU. Diagnose
-   with `LITEBOX_DIAG_ALLOC_STACK=1` (symbolize with `llvm-symbolizer`) and `LITEBOX_DIAG_MEM_BREAKDOWN=1`;
-   sample with `.wfgy/memsamp.ps1`, `.wfgy/wsmap.ps1 -ProcId`.
-1c. Chrome (the user's own, ~6GB) leaves 0.3-2GB free, so runs die on the driver's `KILL low memory` guard
-   (`avail<120`); check `Get-Counter '\Memory\Available MBytes'` first (gate 2500MB in `chrdesk_lock.ps1`,
-   1000MB in `pass118_full_err.ps1`).
-2. Verify in the full stack (committed, not yet seen in a browser): `3e1ef47` SCM_RIGHTS over a
-   cross-process unix connection (thunar's D-Bus call passes a dup of stdin); `b012910` lazy file map stale
-   entries over an execve'd fork child's libraries; `08ae94f` `/proc/<pid>/fd`. Repro `.wfgy/th1.ps1 -Run
-   th1|th2|th3`.
-3. Selkies: one client per instance, no slot reclaim on reload.
-4. Native kernel-COW fork on Windows (`.gm/prd.yml` `native-kernel-cow-fork`); writable layer shared across
-   processes; AF_UNIX exhaustion silent (`SharedUnixAddrPresenceTable` 256 slots, keys >108 bytes);
-   `flock_registry`/`drm`/`evdev` per-process; `timerfd`/`signalfd` uncarriable; fixed-address (non-PIE) exec
-   from a same-process vfork child collides (gcc). macOS/Linux builds unverifiable here.
+1. No captured frame has yet shown sandboxed chromium's OWN page inside streamed desktop. chrD8 proved desktop streams (`x11`/`XShm`/`x264`, 1346x832, EncFPS 33-45, live `<video>`); chrD9 proved sized window mapped (`0x1a00004 "Untitled - Chromium" 1024x720+40+40` -- its 10x10 class-`chromium` stub window decoy: never conclude "chromium came up tiny" from `xwininfo` alone). chrD10 joins them: connect host browser to :8081 mid-run, capture with JS `drawImage(video)`; selkies captures only once a client connects, so a browser-less run shows no `EncFPS`.
+2. Host memory binding constraint, not litebox bug. Left: selkies/Xvfb heaps (150-250MB private RW, legitimate), committed guest `PROT_NONE` reservations, 1-3% CPU idle. Diagnose with `LITEBOX_DIAG_ALLOC_STACK=1` (symbolize with `llvm-symbolizer`), `LITEBOX_DIAG_MEM_BREAKDOWN=1`; sample with `.wfgy/memsamp.ps1`, `.wfgy/wsmap.ps1 -ProcId`.
+2b. User's own Chrome (~6GB) leaves 0.3-2GB free, so runs die on driver's `KILL low memory` guard; check `Get-Counter '\Memory\Available MBytes'` first (gate 2500MB in `chrdesk_lock.ps1`).
+3. Verify in full stack (committed, unseen in browser): `3e1ef47` SCM_RIGHTS over cross-process unix connection; `b012910` lazy file map stale entries over execve'd fork child's libraries; `08ae94f` `/proc/<pid>/fd`. Repro `.wfgy/th1.ps1 -Run th1|th2|th3`.
+4. Native kernel-COW fork on Windows (`.gm/prd.yml` `native-kernel-cow-fork`); writable layer shared across processes; AF_UNIX exhaustion silent (256 slots, keys >108 bytes); `flock_registry`/`drm`/`evdev` per-process; `timerfd`/`signalfd` uncarriable; fixed-address (non-PIE) exec from same-process vfork child collides (gcc); macOS/Linux builds unverifiable here.
 
 ## How to run and drive it (harness lessons that cost sessions)
 
-- Cheap repro: `target/release/litebox_runner_linux_on_windows_userland.exe -Z --oci-image docker.io/
-  library/debian:stable-slim -- /bin/bash -c '<script>'` (or the cached `webtop:debian-xfce`).
-  **PowerShell, never Git Bash** for guest paths (it rewrites `/abs/guest/paths`); single quotes only inside
-  `-c`; redirect with `cmd /c "... < script.sh > out 2> err"` (`Start-Process` redirection kills the runner;
-  `*>` logs are UTF-16LE). Confirm the exe mtime postdates the newest commit. **Build only `cargo build
-  --release -p litebox_runner_linux_on_windows_userland`; the whole workspace does not build on Windows.**
-- Full stack: `.wfgy/pass118_full.ps1 -Run <name> -MaxSeconds N` (+`.sh`); waits for 2.5GB free RAM (the log
-  appears late) and **terminates every `litebox_runner` at its cap -- a stale older driver kills a newer
-  run** (cost two sessions). Kill leftover driver powershells first; give a cap longer than needed. Variants
-  `pass118_full_err.ps1` (adds `litebox_diag::stderr_capture=debug`), `pass118_full_a11y.ps1`.
-  `acquire_boot_lock()` refuses a second boot while an orphaned run lives.
-- Browser: `mcp__chrome-devtools__*` for real CDP input. `click` needs a uid, so inject a fixed
-  `pointer-events:none`, opacity .01 `<button id=probe>` at the wanted x,y and click that (the real mouse
-  event lands on the video). `Control+Alt+t` opens Terminal (allow 30s); gm `cdp` is JS-eval only.
-- **Guest scripts must be LF.** A CRLF `.wfgy/*.sh` turns every `\`-continued line into its own command
-  (`/bin/bash: line 55: +iglx: command not found`, boot exits 127) -- looks like a litebox bug and is not
-  one. Git's `core.autocrlf` reintroduces it.
-- Cheap guest repro, no file in the guest: `.wfgy/guest2.ps1 -Script <sh> -Run <name> -Secs <n>` (base64's
-  the script onto the command line; sets LITEBOX_PROCESS_FORK=1, LITEBOX_LAZY_FILE_MAP=1,
-  LITEBOX_OCI_USE_LAST_RESOLVED=1; `-ExtraEnv "K=V;K2=V2"`). **It kills every `litebox_runner*` at start, so
-  runs must be sequential.**
-- Diagnostics: `cdb -pv -p <pid> -xd av -xd sse -c "~*kb 25; qd"` (NOT on PATH: use
-  `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`; `-pv`/`qd`, never bare `q`), symbolized
-  with `llvm-symbolizer --obj=<exe> --relative-address` (`.wfgy/symstk.py`; `symstk2.py` does 30 frames;
-  release ICF mislabels callers); `litebox_diag::{process_timeline,socket_read,unix_conn_teardown,
-  stderr_capture}=debug`; `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1`/`LITEBOX_DIAG_NO_FAULT_WATCHDOG=1`
-  before any attach. A cross-process child whose exit code lacks the `0xC0DE` marker decodes as SIGKILL, so
-  `rc=137` also means "host process died some other way".
-- **Before blaming litebox for a death or stall, correlate with the harness's own time caps, kill loops and
-  the host's free RAM first.**
-- **The image's `Xvfb` is XLibre now and ABORTS when `/tmp/.X11-unix` already exists with the wrong mode**
-  (`BUG: ../os/log.c:620 in vpnprintf()`; every X client then fails `unable to open display :1`). So
-  `mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix` BEFORE Xvfb (in
-  `.wfgy/{xv1,chrdesk,pass118_full}.sh`). A dead X server looks exactly like a litebox unix socket bug --
-  check the server's own output first.
-- **Run dbus-daemon non-forking** (`dbus-launch` daemonizing breaks connects); for XFCE use
-  `xfce4-session`. `.wfgy/webtop_stack.sh` is embedded in `.wfgy/webtop_seed.tar` (re-tar after edits).
-  Readbacks inside a boot script use `$( )`/pipes, not `cmd > /tmp/f` + a sibling's read.
-- **Repo hygiene**: layer tars, frame dumps, debug logs never in git (`.wfgy/` is ignored); no test files;
-  commit as lanmower only.
-
-## Frozen-in-`close(2)`: the live investigation (chrD3/chrD4/chrD5, 2026-10-03)
-
-A full desktop run wedges right after `DE_UP` (55s): selkies is launched (`SELKIES_LAUNCHED_INSTRUMENTED`,
-one `DEBUG:ws:Legacy Mode ENABLED` line) and never prints `Selkies server running`; the guest's own `curl`
-probes never print either -- the WHOLE guest freezes, not just selkies.
-
-chrD5's `LITEBOX_DIAG_LOCKSTALL=1` split it in two:
-- **The freeze (49 waits)**: 16+ processes parked `val=2` on ONE arena mutex `0x7ff803061028` (>=
-  `SHARED_KERNEL_HEAP_BASE` `0x7FF8_0000_0000`, `lib.rs:11370`, so genuinely cross-process), whose
-  `holder_pid` is the process hosting guest pid 20 (selkies) and is ALIVE -- 295 "RawMutex held by a live
-  process" warnings, ZERO recoveries. A live thread sitting on a shared lock is the freeze;
-  `try_recover_from_dead_holder` rightly refuses to steal from a live holder.
-- **A separate spin (83 waits)**: `val=1 now=1 holder_pid=0 occupied=1 queued=true pending_wake=false`
-  (each its own per-thread waker condvar) where `chunks` climbs to 960 while `wall_ms` stays 14 -- i.e.
-  `WaitForSingleObject` returns `WAIT_TIMEOUT` without ever blocking, so the loop busy-spins (236k diag
-  lines in one run). Not the freeze, but it burns CPU. `chunk_ms` and `rc` are logged too as of chrD6.
-
-`cdb` of the holder process (`.wfgy/chrD5_cdb_135856.txt`, 10 threads): guest pid 20's threads blocked in
-`Pipes::read` -> `RawMutex::block`, `RawRwLock::write_contended` (`Pipes::create_pipe`,
-`in_mem::FileSystem::new`), `RawRwLock::read_contended` (`read_dir`, `Network::perform_platform_
-interaction`); two `spawn_fork_child_pipe_pump` threads (one in `Pipes::read`, one in `sleep`). Release
-ICF mislabels callers -- `sys_close` appears in stacks it is not part of.
-
-Ruled out earlier: the `close(2)` HUP/linger wait (`wait_on_events` runs `try_op` FIRST, `polling.rs:59`;
-only `GracefulIfNoPendingData` can park, `net/mod.rs:1471`; `close_socket` now warns when it defers -- 0
-hits); the TUN thread; panics/resets; waiter-queue overflow; dropped cross-process wakes.
-
-`holder_tid` (chrD6) names the actual thread: `RawMutex::note_locked` stores `GetCurrentThreadId()`
-alongside `holder_pid`, and both long-wait warnings print it -- match it against cdb's `~*kb` TIDs.
-
-Why it was silent before: `WaitState::commit_wait` (`wait.rs:417`) parks with `val=1 holder_pid=0`, the warn
-gate is `(holder != 0 || val == 2)`, and dead-holder recovery refuses `holder_pid == 0` ("never guess").
-
-Reading the logs: `chrD*.err.log` is BINARY to gm codesearch (NULs) -- use `.wfgy/logscan.py <file>
-<term...>` or inline python; `.wfgy/scan_waiters.py` parses an arena `dd` dump for `WaiterQueue` slots.
+- Cheap repro: `target/release/litebox_runner_linux_on_windows_userland.exe -Z --oci-image docker.io/library/debian:stable-slim -- /bin/bash -c '<script>'` (or cached `webtop:debian-xfce`). PowerShell, never Git Bash, for guest paths (it rewrites `/abs/guest/paths`); single quotes only inside `-c`; redirect with `cmd /c "... < script.sh > out 2> err"` (`Start-Process` redirection kills runner; `*>` logs UTF-16LE). Confirm exe mtime postdates newest commit. Build only `cargo build --release -p litebox_runner_linux_on_windows_userland`; workspace doesn't build on Windows. Never pipe build through `tail`; hides non-zero exit (failed build then ran old binary).
+- Full stack: `.wfgy/pass118_full.ps1 -Run <name> -MaxSeconds N` (+`.sh`); waits for 2.5GB free RAM and terminates every `litebox_runner` at its cap -- stale older driver kills newer run. Kill leftover driver powershells first; give cap longer than needed. Variants `pass118_full_err.ps1`, `pass118_full_a11y.ps1`, `chrdesk_lock.ps1` (`+LITEBOX_DIAG_LOCKSTALL=1`,`_WAIT_DUR=1`); `acquire_boot_lock()` refuses second boot while orphaned run lives.
+- Browser: `mcp__chrome-devtools__*` for real CDP input. `click` needs uid, so inject fixed `pointer-events:none`, opacity .01 `<button id=probe>` at wanted x,y and click that; `Control+Alt+t` opens Terminal (allow 30s); gm `cdp` JS-eval only.
+- Pipe guest holds for itself (libuv's signal lock, canonical one) must be probed with zero-timeout `select()`, never `read` -- `read` consumes byte under test. Run it from ticker thread on 3s cadence so its waits differ from loop's 1000ms; confirm fd with `os.fstat` + `stat.S_ISFIFO` (`/proc/<pid>/fd` shows non-path fds as `anon_inode:[fdN]`, so cannot). `faulthandler.dump_traceback_later(15, repeat=True, exit=False)` shows freeze in `uv_run`, not python.
+- asyncio closes child's stdin the instant it exits (`BaseSubprocessTransport._check_proc`), so any probe needing pipe to stay open -- sub18's parked-pump repro -- must use `subprocess.Popen` and keep `p.stdin`, never `create_subprocess_exec` (why sub17 showed nothing).
+- Launching `.ps1` from bash mangles `\` in its arguments (`-File .\.wfgy\x.ps1` arrives as `..wfgyx.ps1`, exit 127); use absolute forward-slash paths or PowerShell tool.
+- Guest scripts must be LF. CRLF `.wfgy/*.sh` turns every `\`-continued line into its own command (`/bin/bash: line 55: +iglx: command not found`, boot exits 127); looks like litebox bug, isn't one. Git's `core.autocrlf` reintroduces it.
+- Cheap guest repro, no file in guest: `.wfgy/guest2.ps1 -Script <sh> -Run <name> -Secs <n>` (base64's script onto command line; sets `LITEBOX_PROCESS_FORK=1`, `LITEBOX_LAZY_FILE_MAP=1`, `LITEBOX_OCI_USE_LAST_RESOLVED=1`; `-ExtraEnv "K=V;K2=V2"`; writes `.wfgy/<Run>.out`/`.err`; python probe output belongs on stderr). Kills every `litebox_runner*` at start, so runs must be sequential. Cap kill `taskkill /F /T` taking Xvfb and every fork child with it; `rc=137`/`Killed` at END of run harness, not bug.
+- Diagnostics: `cdb -pv -p <pid> -xd av -xd sse -c "~*kb 25; qd"` (NOT on PATH: `C:\Program Files (x86)\ Windows Kits\10\Debuggers\x64\cdb.exe`; `-pv`/`qd`, never bare `q`), symbolized with `llvm-symbolizer --obj=<exe> --relative-address` (`.wfgy/symstk.py`); `litebox_diag::{process_timeline,socket_read, unix_conn_teardown,stderr_capture}=debug`; `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1`/`LITEBOX_DIAG_NO_FAULT_WATCHDOG=1` before any attach.
+- Before blaming litebox for death or stall, correlate with harness's own caps, kill loops, host free RAM first.
+- The image's `Xvfb` is XLibre now, ABORTS when `/tmp/.X11-unix` already exists with wrong mode (`BUG: ../os/log.c:620 in vpnprintf()`; every X client then fails `unable to open display :1`). So `mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix` BEFORE Xvfb (in `.wfgy/{xv1,chrdesk}.sh`). Dead X server looks exactly like litebox unix socket bug; check server's own output first.
+- Run dbus-daemon non-forking (`dbus-launch` daemonizing breaks connects); for XFCE use `xfce4-session`. `.wfgy/webtop_stack.sh` embedded in `.wfgy/webtop_seed.tar` (re-tar after edits).
+- Repo hygiene: layer tars, frame dumps, debug logs never in git (`.wfgy/` ignored); no test files; commit as lanmower only, no `Co-Authored-By`. Never `git push` to `origin` (github.com/AnEntrypoint/litebox) without explicit per-instance confirmation -- sessions share that remote; subagent once rebased and pushed unapproved. Local commits expected and fine.
 
 ## Standing lessons and hard constraints
 
-- **No WSL/hypervisor ever.** Never `bcdedit /debug on` without a kernel debugger. A process that resists
-  `Stop-Process` needs WMI `Terminate`.
-- **Never run two full-stack verifications concurrently**; watch `Available MBytes`, kill on a falling trend.
-- **Guest-reachable code returns an errno, never a panic** (the host process IS the whole guest session).
-  Refusal errno is API contract: EPERM lets callers degrade, EINVAL/ENOSYS fails them hard.
-- **`LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check.** Never time litebox with one host
-  process per datapoint (spawn costs 1.6-2.3s). Never trust a container tag name for its contents.
-- **A `TypedFd` index is valid only against the `Descriptors` that inserted it**; shared-memory structs must
-  hold no process-relative pointers (`Network`, `Pipes`, `FutexManager` were all this bug). A mutable table
-  on the `SharedUnixAddrPresenceTable` pattern needs every write path mirrored to the shared side.
-- **Cross-process fork (`LITEBOX_PROCESS_FORK=1`)**: a genuine `D==0` fork (`spawn_cross_process_fork_child`,
-  `litebox_platform_windows_userland/src/lib.rs:13609`); pipes/regular files/eventfds/pty/unix sockets
-  carried, cloexec+pty fds dropped; `live_cross_process_fork_children` caps concurrent children at 6. A run
-  took this path only if `[process_fork_diag] task-resume-probe` lines exist. Cross-process `kill()` goes
-  through `GlobalState::process_table` (`syscalls/signal/xproc.rs`). **The env var is PRESENCE-CHECKED**
-  (`std::env::var_os`): `LITEBOX_PROCESS_FORK=0` still ENABLES it -- unset it for the same-process path. A
-  `socketpair` fd is carried. A child's guest pid is the parent's `child_tid`; its Windows pid is `winpid=`.
-- **`chroot(2)` is real (e608959)**: `FsState.root` is shared by `CLONE_FS`, so a chroot on any task sharing
-  that state roots all of them, parent included; `cwd` is root-space, dirfd-relative paths stay unrooted.
-  Do NOT test `CLONE_FS` with a raw `clone(CLONE_VM|CLONE_VFORK|CLONE_FS)` from CPython: the parent never
-  resumes, the process dies 139; use pthreads.
-- **Logs**: default `warn,...fork_verify=error`; prefer dedicated low-overhead targets over blanket module
-  debug (`syscalls::file=debug` floods 50MB/s). A boot whose log stops is usually a dead root runner.
-  **Verbosity comes from `LITEBOX_LOG`, not `RUST_LOG`.** Disk hygiene: sample or cap repeated messages
-  (`MAX_AV_PATH_HEALS`, `AV_HEAL_LOG_SAMPLE_STRIDE`) -- one duplicated warn made a 1GB log in 2.5 min, and
-  an ungated per-wait warn made 190MB in one run.
+- No WSL/hypervisor ever. Never `bcdedit /debug on` without kernel debugger. Process resisting `Stop-Process` needs WMI `Terminate`. Never run two full-stack verifications concurrently; watch `Available MBytes`, kill on falling trend.
+- Guest-reachable code returns errno, never panic (host process IS whole guest session). Refusal errno API contract: EPERM lets callers degrade, EINVAL/ENOSYS fails them hard.
+- `LITEBOX_DUMP_FRAMES=1` only trustworthy `--gui` visual check. Never time litebox with one host process per datapoint (spawn costs 1.6-2.3s).
+- `TypedFd` index valid only against `Descriptors` inserting it; shared-memory structs must hold no process-relative pointers. Mutable table on `SharedUnixAddrPresenceTable` pattern needs every write path mirrored to shared side.
+- Cross-process fork (`LITEBOX_PROCESS_FORK=1`): genuine `D==0` fork (`spawn_cross_process_fork_child`, `litebox_platform_windows_userland/src/lib.rs:13609`); carried: pipes/regular files/eventfds/pty/unix sockets; dropped: cloexec+pty fds. `CROSS_PROCESS_FORK_CONCURRENCY_CAP` = 6, reserved with 8s bound then fails open (`process.rs:3600`). Took this path only if `[process_fork_diag] task-resume-probe` lines exist. Cross-process `kill()` via `GlobalState::process_table` (`syscalls/signal/xproc.rs`). Env var PRESENCE-CHECKED (`var_os`): `=0` still ENABLES it; unset for same-process path. Child with fds beyond stdio or vfork falls back to thread-based fork (`process.rs:6229`), whose SIGCHLD comes from `prepare_for_exit`.
+- `chroot(2)` real (e608959): `FsState.root` shared by `CLONE_FS`, so chroot on any task sharing that state roots all of them, parent included; `cwd` root-space, dirfd-relative paths stay unrooted. Do NOT test `CLONE_FS` with raw `clone(CLONE_VM|CLONE_VFORK|CLONE_FS)` from CPython: parent never resumes, process dies 139; use pthreads.
+- Logs: default `warn,...fork_verify=error`; prefer dedicated low-overhead targets over blanket module debug (`syscalls::file=debug` floods 50MB/s). Verbosity comes from `LITEBOX_LOG`, not `RUST_LOG`.
+- Env vars: `LITEBOX_PROCESS_FORK` (presence-checked), `LITEBOX_LAZY_FILE_MAP`, `LITEBOX_IDLE_TRIM=0`, `LITEBOX_OCI_USE_LAST_RESOLVED`, `LITEBOX_DUMP_FRAMES`; `LITEBOX_DIAG_LOCKSTALL`, `_WAIT_DUR`, `_LOCKSTALL_TRACE`, `_ALLOC_STACK`, `_MEM_BREAKDOWN`, `_FORK_TIMING`, `_BIGALLOC`, `_FAULT`, `_WATCHDOG`, `_NO_FAULT_WATCHDOG`, `_NO_EXTERNAL_FAULT_WATCHDOG`, `LITEBOX_PRINT_EXE_BASE`.
+- Dispatched subagents: Sonnet, not Opus (omit `model` or pass `model: "sonnet"`). Web search: Google, not DuckDuckGo; if Google is blocked/bot-detected fall back to camoufox, never to DDG.
 
-## Linux runner (`litebox_runner_linux_userland`, merged from `claude/modest-feynman-3zpzop`)
+## Child exit: how a parent learns (and how it can fail)
 
-Cloud sessions are Linux; there `webtop:debian-xfce` (`--initial-files rootfs.tar --rewrite-syscalls --uid 0
---gid 0 --pid1 --tun-device-name tun0 ... /bin/sh /init`) boots: s6, Xvfb, xfwm4/panel/xfdesktop, nginx,
-pulseaudio, dbus, Selkies; a host browser at `http://10.0.0.2:3000` (TUN, host 10.0.0.1) drives it. Harness
-`tools/webtop/`. Not re-verified after the merge.
-- Native fork (`has_native_fork()==true`): shared-arena fork, pool-backed shared memory; hooks `waitpid`/
-  `waitid(WNOWAIT)`; `SYS_wait4`/`SYS_waitid` seccomp-allowed (a blocked host syscall answers EINVAL and
-  looks like a hang); `exit_native_fork_child` ends the child with the guest status. A native-fork child
-  COW-copies every private kernel structure, so shared state must live in the arena. The thread-based fork
-  corrupts guest memory on Linux -- not a substitute.
-- Per-process `/proc/self` identity, `/proc/<pid>/{task,oom_score_adj,environ,fd}`; real pty line
-  discipline; SCM_CREDENTIALS; shared-mapping coherence; per-thread fs "act as root" guard; the network
-  worker never blocks on a per-descriptor lock (`iter_nowait`); runner panic = `_exit(134)`; big read-only
-  private file maps are ONE shared object; freed heap >=1MiB returns pages (`MADV_REMOVE`). Plateau ~9GB.
-- Added: inotify, `MSG_PEEK` on unix+inet (used to consume bytes; broke TLS), xattr stubs, tar mtimes,
-  `mincore`, `copy_file_range`, `splice`, `rt_sigtimedwait`, `rt_(tg)sigqueueinfo`, `O_TMPFILE`,
-  NETLINK_ROUTE dumps, `pidfd_open`/`waitid(P_PIDFD)` (also reaps cross-process children), `getrusage`/
-  `mlock`, ptrace answers EPERM.
-- Dead-holder recovery for `RwLock` and platform `RawMutex`: a waiter blocked 2s checks `tkill(tid,0)`; up
-  to 4 readers tracked. A panic holding the layered-fs root write lock hangs every later `open`. Debug kit:
-  `LITEBOX_DIAG_FAULT=1 LITEBOX_PRINT_EXE_BASE=1` + frame-pointer build; `LITEBOX_DIAG_BIGALLOC=1`; stalled
-  boot `gdb -p <root> -batch -ex "thread apply all bt"`. Shim unit tests: `RUST_MIN_STACK=64M`, `--skip tun`.
-  Gaps: IPv6 rides the IPv4 machinery; `/proc/<pid>/fd` shows non-path fds as `anon_inode:[N]`.
+- `arm_cross_process_exit_notifier` (`litebox_shim_linux/src/syscalls/process.rs:4957`) spawns host thread (`litebox-xproc-exit-notifier`, `lib.rs:13483`) blocking on child's initiating thread handle, then pushes SIGCHLD into `process.shared_pending` + `interrupt_all_threads()`. Waits on THREAD, not process, because extra OS threads can outlive task (`process_fork.rs:4833`).
+- `sys_wait4` (`process.rs:3062`) re-polls every 15ms (`WAIT4_REPOLL_INTERVAL`) instead of trusting notify, so can't hang on lost wake; on reap runs `import_cross_process_writable_layer` (`process.rs:3175`). `waitpid(-1)` only sees entries registered in THIS host process, so grandchild is invisible->`ECHILD` (`process.rs:3232`); shared `process_table` for cross-process `kill` only.
+- SIGCHLD dispatched only when thread passes `check_for_interrupt`/`prepare_to_run_guest` (`wait.rs:41-64`), so anything driving reaping off SIGCHLD alone (glib) can miss it. `signalfd` worse: nothing calls `pollee.notify_observers()` from push path, so blocking read/epoll never wakes (`signalfd.rs:185-191,218-225`); `pidfd_open` does wake (`inotify.rs:353-380`).
+- External fault watchdog (`process_fork.rs:5236-5336`) LATENT false positive, not observed killer: armed only by two VEH self-terminate paths (`lib.rs:2319`, `:2623`); NULL `OpenEventW` handle means ALWAYS ARMED (`:5243`). Detail in archive.
 
-## Cross-process shared memory and locks (all DONE; mechanism in the archive)
+## Linux runner (`litebox_runner_linux_userland`) -- merged, not re-verified
 
-`RawMutex` = manual wait queue (32 slots, pointer-free) + cross-process `Event`s with `holder_pid`
-dead-holder recovery (`bff1d0b`); waits are chunked to `LIVENESS_CHECK_INTERVAL` (2s) even for an infinite
-wait, so recovery can ever run. A 128MiB (`SHARED_KERNEL_HEAP_SIZE`) `shared_kernel_arena_alloc` backs
-`SharedArc<T>` (`GlobalState`, `Network`, pty/unix tables); `SLAB_ALLOC` stays per-process. `SharedArc::new`
-shares only `T`'s inline bytes -- a `BTreeMap` has private-heap nodes, so shared registries are fixed-slot,
-lock-free, atomic tables. Still per-process: `flock_registry`, `SafeZoneAllocator`'s `SpinMutex`. On Windows
-every address/TID-based wait (`WaitOnAddress`, keyed events) is process-local; only a shared kernel object
-crosses.
+Cloud sessions are Linux: `webtop:debian-xfce` (`--initial-files rootfs.tar --rewrite-syscalls --uid 0 --gid 0 --pid1 --tun-device-name tun0 ... /bin/sh /init`) boots s6, Xvfb, XFCE, nginx, pulseaudio, dbus, Selkies; host browser at `http://10.0.0.2:3000` (TUN, host 10.0.0.1) drives it. Harness `tools/webtop/`. Native fork (`has_native_fork()==true`): child COW-copies every private kernel structure, so shared state must live in arena; thread-based fork corrupts guest memory on Linux. Per-process `/proc/self`, real pty line discipline, panic = `_exit(134)`, plateau ~9GB; dead-holder recovery `tkill(tid,0)` after 2s. Debug: `gdb -p <root> -batch -ex "thread apply all bt"`; shim tests `RUST_MIN_STACK=64M --skip tun`. Bare `cargo check -p litebox_shim_linux` fails 21x E0433 -- pre-existing; add `--features litebox_util_log/backend_tracing`; `cargo test -p litebox_shim_linux` fails 162/193 on `shared_kernel_arena_alloc_bytes` -- also pre-existing.
 
-## Cross-process file visibility, identity, apt (2026-09-30)
+## Cross-process shared memory and locks
 
-- A file written by one host process is invisible to siblings until it exits (per-process writable layer).
-  `syscalls/file_spill.rs` write-through-spills `SPILLED_PREFIXES` to
-  `%TEMP%\litebox-spill-<rootpid>\<slot>.bin` (1024 slots); open/stat/access/getdents/unlink/rename refresh
-  the local copy. Prefixes today (`file_spill.rs:10-18`): `/var/lib/apt/`, `/var/cache/apt/`,
-  `/tmp/.config/chromium`, `/tmp/.cache/chromium`, `/root/.config/chromium`, `/root/.cache/chromium`,
-  `/tmp/org.chromium.`. Fixes `apt-get update`. Extend the prefix list, not the mechanism;
-  `%TEMP%\litebox-spill-*` is never cleaned up.
-- Direction matters: a cross-process fork child receives the parent's exported writable layer AT SPAWN,
-  while a child's own writes reach the parent only when it exits and `wait4` imports them
-  (`litebox-forkwrite-*.tar`). So a fork carry of a fresh `/tmp` fd works and the same fd handed back over
-  SCM_RIGHTS does not; `only_in_own_writable_layer` is how the carry path tells those apart.
-- The fs layers check permissions against the calling task's fsuid/fsgid
-  (`litebox::fs::set_effective_identity`); root bypasses rwx bits. `chown` is real, export/import carry owner
-  and full mode. Anything walking the fs outside a syscall (export/import) must run inside
-  `litebox::fs::with_root_identity`.
-- The external fault watchdog only counts stalls after the VEH sets `litebox-fault-armed-<pid>`; before, it
-  killed any idle method process (apt's sqv, exit 1 = "signal 9").
-- `NETLINK_AUDIT` acks every `NLM_F_ACK` message; `getpriority`/`setpriority` exist (pam_limits aborts on
-  ENOSYS); AF_INET6 answers `getsockname` etc. as v4-mapped `sockaddr_in6`.
-- Fork children inherit cwd and full credentials (`task-state:` shim spec, fd `i32::MAX`); a child's
-  deletions reach the parent as `.wh.` tar entries; only the newest Source pipe bridge of a read end drains
-  (older siblings deadlocked dpkg-deb). `apt-get install -y file` completes.
+`RawMutex` = 32-slot pointer-free wait queue + cross-process `Event`s with `holder_pid` dead-holder recovery (`bff1d0b`); waits chunk to `LIVENESS_CHECK_INTERVAL` (2s) so recovery can run. 128MiB `shared_kernel_arena_alloc` backs `SharedArc<T>` (`GlobalState`, `Network`, pty/unix tables); `SLAB_ALLOC` stays per-process, and `SharedArc::new` shares only `T`'s inline bytes, so shared registries fixed-slot atomic tables -- why `SharedUnixConnTable`'s slots moved to `&'static mut` arena slice (`pty.rs:429`). Per-process still: `flock_registry`, `SafeZoneAllocator`. On Windows every address/TID-based wait process-local; only shared kernel object crosses. `litebox::sync::RwLock` writer-preferring (`rwlock.rs:74-82`) -- QUEUED writer blocks readers.
+
+## Cross-process file visibility, identity, apt
+
+- File written by one host process invisible to siblings until it exits (per-process writable layer). `syscalls/file_spill.rs` write-through-spills `SPILLED_PREFIXES` (`file_spill.rs:10-18`) to `%TEMP%\litebox-spill-<rootpid>\<slot>.bin` (1024 slots); open/stat/access/getdents/unlink/rename refresh local copy. Prefixes: apt's two dirs + five chromium paths. Extend prefix list, not mechanism -- do NOT "fix" missing-file class by adding `/tmp/`; `%TEMP%\litebox-spill-*` never cleaned up.
+- Direction matters: cross-process fork child receives parent's exported writable layer AT SPAWN, while its own writes reach parent only when it exits and `wait4` imports them (`litebox-forkwrite-*.tar`). So fork carry of fresh `/tmp` fd works and same fd handed back over SCM_RIGHTS does not; `only_in_own_writable_layer` (`9412184`): how carry path tells those apart (content snapshot `T|`).
+- fs layers check permissions against calling task's fsuid/fsgid (`litebox::fs::set_effective_identity`); root bypasses rwx bits. `chown` real, export/import carry owner and full mode. Anything walking fs outside syscall (export/import) must run inside `litebox::fs::with_root_identity` (`d428acd`: also per-thread root guard).
+- Fork children inherit cwd and full credentials (`task-state:` shim spec, fd `i32::MAX`); child's deletions reach parent as `.wh.` tar entries; only newest Source pipe bridge of read end drains. `getpriority`/`setpriority` exist (pam_limits aborts on ENOSYS); AF_INET6 answers `getsockname` as v4-mapped `sockaddr_in6`.
 
 ## Containers and OCI
 
-`litebox_packager --oci-image <ref> --output <tar>` pulls, merges, rewrites every ELF; the runner does the
-same in memory (`.litebox-cache/`, keyed by `REWRITER_CACHE_VERSION`; `LITEBOX_OCI_USE_LAST_RESOLVED=1`
-pins). Verified: `linuxserver/webtop:debian-xfce`/`ubuntu-xfce` ship XFCE, `alpine-mate` ships MATE,
-`alpine-xfce` does not exist. For `--gui` DRM use `Xorg` with `modesetting`; for browser/selkies `Xvfb`.
+`litebox_packager --oci-image <ref> --output <tar>` pulls, merges, rewrites every ELF; runner does same in memory (`.litebox-cache/`, keyed by `REWRITER_CACHE_VERSION`). `linuxserver/webtop:debian-xfce` and `ubuntu-xfce` ship XFCE, `alpine-mate` ships MATE, `alpine-xfce` doesn't exist; for `--gui` DRM use `Xorg` with `modesetting`, for browser/selkies use `Xvfb`; never trust tag name for its contents.
 
 ## Closed -- do not re-attempt without a genuinely new approach
 
-VEH_FRAME_STRIDE canary; `dev_bench`/`litebox_runner_snp` build failures; CoW-mmap performance; input
-latency (pre-118th); presenter-split duplicate `SYN_REPORT`; GUI-protocol decision; `spawn_suspended`
-stdio-handle bug; presenter-process split; ACK-stall-kill and port-8081 watchdog (2026-09-16);
-"session-client death cascade" and `xfdesktop`-first client deaths (both were the driver cap).
+net_lock freeze (`16f3e76`); "spawning `xset` wedges the loop" / "cumulative unreaped child" framing of event-loop freeze (`463dc29`: libuv's signal-lock pipe was being drained). Older closed items, per-commit mechanism writes live in archive.
 
 ## Docs and tooling map
 
-- Archives, newest first, under `docs/`: `AGENTS_ARCHIVE_2026-09-29.md` (118th), `_2026-09-28.md`
-  (4th-116th), `_2026-09-23.md`, `_2026-09-22.md`, `_2026-09-18.md`, `_2026-09-17.md`, `_2026-09-16.md`,
-  `_2026-09-15.md`, `_2026-09-10.md`, `_2026-09-03/05.md`.
-- Fork: `docs/track-b-fork-fix-progress.md`, `advisor/ADVISORY-002-d-zero-fork.md`,
-  `advisor/ADVISORY-001-fundamentals.md`; VEH: `docs/veh-exception-handler-design.md`; also
-  `diag-timeline-field-semantics.md`, `premade-library-research.md`, `drm-dumb-buffer-ioctl-reference.md`,
-  `macos.md`; `advisor/probes/` (decode_frame.py, symbolize_litebox_crash.py, MEASUREMENT-PITFALLS.md,
-  DISK-HYGIENE.md); `.gm/memories/` (superseded).
-- Helpers in `.wfgy/`: `logscan.py` (ANSI-stripping term scan -- gm codesearch skips these logs as binary),
-  `lockstall.py` (aggregates `[diag-lockstall]`), `scan_waiters.py` (arena `dd` -> `WaiterQueue` slots),
-  `symstk.py`/`symstk2.py` (llvm-symbolizer, 7/30 frames), `cdbsweep.ps1`, `cpuprof.ps1`.
+Archives, newest first, under `docs/`: `AGENTS_ARCHIVE_2026-10-03b.md`, `_2026-10-03.md`, `_2026-09-29.md`, `_2026-09-28.md`, `_2026-09-2{3,2}.md`, `_2026-09-1{8,7,6,5}.md`, `_2026-09-10.md`, `_2026-09-0{3,5}.md`, `track-b-fork-fix-progress.md`, `advisor/ADVISORY-00{1,2}*`, `veh-exception-handler-design.md`. Helpers in `.wfgy/`: `logscan.py`, `lockstall.py`, `scan_waiters.py`, `symstk.py`/`symstk2.py`, `cdbsweep.ps1`, `cpuprof.ps1`, `guest2.ps1`, `chrdesk_lock.ps1`, `chrdesk4.sh`, `sub{1..18}.sh`.
+- gm `codesearch` (INVARIANT 4: never grep/find): use `mode: "dual"`, read `phrase_hits` before concluding literal is absent; diagnose slow dispatch with `stage_ms`. `chrD*.err.log` BINARY to it -- use `.wfgy/logscan.py <file> <term>`.
 
-## Chromium (2026-10-03) -- renders a page with its OWN sandbox active
+## Chromium -- renders a page with its OWN sandbox active
 
-**MILESTONE (chr21/chr22)**: `.wfgy/guest2.ps1 -Script .wfgy/chr15.sh -Run chr21 -Secs 240` (webtop,
-`LITEBOX_PROCESS_FORK=1`, NO `--no-sandbox`) prints
-`<html><head></head><body><h1>hello from litebox</h1><p>sandboxed chromium rendered this</p></body></html>`
-plus `CHROME_PIPELINE_DONE rc=0`; 6x `Activated seccomp-bpf`, `Linux.SandboxStatus`=106
-(UserNS+NetNS+TSYNC+AMD64), ZERO `No usable sandbox!`, ZERO `Sanity checks are failing`. The old "zygote
-needs `Credentials::CanCreateProcessInNewUserNS()`" FATAL does NOT fire for a non-root uid; only the root
-path still dies (crbug 638180). Desktop (windowed): `.wfgy/chrdesk.ps1 -Run <n> -MaxSeconds N`.
-- **rc=133 (SIGTRAP) is a `HOME` problem, not a litebox one.** Chromium runs as uid 911 (`setpriv --reuid
-  911`) and derives its crashpad database from `HOME`; with `HOME=/config` (root-owned 0755)
-  `chrome_crashpad_handler` is exec'd with EIGHT arguments and no `--database`, answers `--database is
-  required`, the client's handshake read fails and the browser dies on a CHECK. With a writable
-  `HOME=/tmp/cuhome` the identical command line exits 0 and dumps the DOM (reproduced headlessly,
-  `.wfgy/cpad1.sh`). `--crash-dumps-dir` is NOT the lever: it does not exist in Debian's build.
-- **`--publish` works with an ordinary fork-child server**: a background `python3 -m http.server 8081`
-  answered the host 200/61 bytes seven times (pub2). So a published port that hangs is NOT automatically a
-  cross-process-fork/gateway bug -- ask the guest to curl its own `127.0.0.1:<port>` first. (pub2 phase B:
-  after an `exec` of the ROOT process the host listener stops accepting -- published ports are root-process
-  state, so `exec` in the root kills them.)
-- What unblocked it: `SHARED_UNIX_CONN_CAPACITY` 1024 -> **4096** (`7d2a6a7`); chr20's census read
-  `occupied=1024 held_live=1024`, 303 refusals ALL `reason=shared unix connection table full`. To fit one
-  power-of-two arena region the slot shrank ~14.8KB -> ~7KB (`SHARED_UNIX_CONN_BUF` 4096->2048,
-  `RING_FD_MAIL_ENTRIES` 4->2); the pty keeps 4096 via `PTY_RING_BYTES` + `PtyRing<Platform>`. Arena 64 ->
-  128MiB is free (`SEC_RESERVE`, committed on demand).
-- An SCM_RIGHTS carry the receiver never adopts leaks the sender's slot hold forever:
-  `UnixSocket::release_unadopted_carry` now runs on every discard path (`net.rs` EMFILE/rebuild
-  error/MSG_CTRUNC, `file.rs::rebuild_carried_unix`, `UnixSocket::recvfrom`).
-- `seccomp(2)`/`prctl(PR_SET_SECCOMP)` are real: a classic-BPF interpreter (`syscalls/seccomp.rs`) on the
-  raw syscall number at the top of `Task::do_syscall`; mode, `no_new_privs` and the filter stack live on
-  `Process` (TSYNC free, all three survive clone and execve). `SECCOMP_RET_TRAP` must RETURN THE SYSCALL
-  NUMBER (`ad2659f`): `syscall_rollback` leaves `rax = orig_ax` and Chromium's `Trap::SigSys` asserts
-  `si_syscall == SECCOMP_SYSCALL(ctx)`. Traps/kills log `seccomp: SECCOMP_RET_*`; errno verdicts are
-  deliberately not logged. ~19 SIGSYS on `sched_getaffinity` per run are Chromium's OWN trap handler.
-- Chromium must run NON-ROOT (`setpriv --reuid 911 --regid 911 --init-groups`) and `--user-data-dir` must be
-  `chmod 777` when a root shell created it (else `SingletonLock: Permission denied` = exit 21).
-- The carry path (SCM_RIGHTS and fork share ONE, `6beb669`): `scm_carry_spec` returns
-  `Result<Option<String>, &'static str>` and `net.rs` logs `reason=` with every refusal -- READ THAT FIELD.
-  A connected endpoint, an unbound socket and a listener cross; a bound-but-unconnected socket, a connect in
-  progress and a bound/connected DATAGRAM socket are refused EOPNOTSUPP on purpose. Only a `Presence` hold
-  is abandoned; a `Conn` hold ships with the spec. A file that exists only in the SENDER's writable layer
-  goes out as `T|` (content snapshot), everything else as `F|` (must stay the SAME inode on both sides). Do
-  NOT fix this class by adding `/tmp/` to `SPILLED_PREFIXES`. Repro `.wfgy/scmring.sh`;
-  `.wfgy/scmlisten.sh` (NOT yet run).
-- Fixed on the way: fork children keep committed `VM_OWN_FORK_PADDING` (`067367b` -- was the renderer AV
-  `error_code=0x4`); cross-process `/proc/<pid>` via `procfs::set_pid_known_fn`+`statm`; huge `PROT_NONE`
-  mmaps reserve address space only (`RESERVE_ONLY_THRESHOLD`); guest `int3` reaches the VEH;
-  `/dev/shm`+memfd travel by named section; tar mtimes preserved; `SO_PROTOCOL`/`SO_DOMAIN`.
-- Still open: (1) the launcher thread SERIALISES cross-process spawns, so children can hit the 15s "no
-  connection" self-termination -- native COW fork or a parallel launcher is the lever; (2)
-  `--single-process` dies on a Chromium CHECK in
-  `RenderProcessHostImpl::GetProcessHostForSiteInstance`; (3) ~1 per run `rebuilding a carried SCM_RIGHTS fd
-  failed errno=ENOENT spec=F|.../Local Storage/leveldb/LOG`; (4) `Vmem::duplicate` still skips
-  `VM_OWN_FORK_PADDING` (the SAME-process fork); (5) GWP-ASan `MapRegion` EEXIST occasionally.
-- **UNRESOLVED CONTRADICTION**: `9014df7` reported "chromium headless prints example.com" -- a page WAS
-  produced once, after unix `EPOLLOUT` stopped firing when the blocked message does not fit. Diff
-  `9014df7..HEAD` for unix/socket behaviour before assuming anything about the Mojo path.
+MILESTONE (chr21/chr22): `.wfgy/guest2.ps1 -Script .wfgy/chr15.sh -Run chr21 -Secs 240` (webtop, `LITEBOX_PROCESS_FORK=1`, NO `--no-sandbox`) prints `<h1>hello from litebox</h1><p>sandboxed chromium rendered this</p>` plus `CHROME_PIPELINE_DONE rc=0`; 6x `Activated seccomp-bpf`, `Linux.SandboxStatus`=106, ZERO `No usable sandbox!`. Zygote `Credentials::CanCreateProcessInNewUserNS()` FATAL doesn't fire for non-root uid (crbug 638180).
+- rc=133 (SIGTRAP) a `HOME` problem. Chromium runs as uid 911 and derives its crashpad database from `HOME`; with `HOME=/config` (root-owned 0755) `chrome_crashpad_handler` exec'd with no `--database`, handshake read fails and browser dies on CHECK. Writable `HOME=/tmp/cuhome` exits 0 (`.wfgy/cpad1.sh`).
+- Chromium must run NON-ROOT (`setpriv --reuid 911 --regid 911 --init-groups`) and `--user-data-dir` must be `chmod 777` when a root shell created it (else `SingletonLock: Permission denied` = exit 21).
+- `seccomp(2)`/`prctl(PR_SET_SECCOMP)` real: classic-BPF interpreter (`syscalls/seccomp.rs`) on raw syscall number at top of `Task::do_syscall`; mode, `no_new_privs` and filter stack live on `Process` (TSYNC free, all three survive clone and execve). `SECCOMP_RET_TRAP` must RETURN THE SYSCALL NUMBER (`ad2659f`) and its 16-bit payload goes into `si_errno` (`067367b`); ~19 SIGSYS on `sched_getaffinity` per run are Chromium's OWN trap handler -- expected.
+- What unblocked rendering: `SHARED_UNIX_CONN_CAPACITY` 1024->4096 (`7d2a6a7`, `unix.rs:3726`); chr20's census read `occupied=1024 held_live=1024`, 303 refusals ALL `reason=shared unix connection table full`.
+- Still open: (1) launcher thread SERIALISES cross-process spawns, so children can still hit 15s "no connection" self-termination; (2) `--single-process` dies on Chromium CHECK in `RenderProcessHostImpl::GetProcessHostForSiteInstance`; (3) `Vmem::duplicate` still skips `VM_OWN_FORK_PADDING` (SAME-process fork). Smaller open items in archive.
+- UNRESOLVED CONTRADICTION: `9014df7` reported "chromium headless prints example.com" -- page WAS produced once. Diff `9014df7..HEAD` for unix/socket behaviour before assuming anything about Mojo.
 
-## Selkies / host-browser visibility (2026-10-03)
+## Selkies / host-browser visibility -- WORKING (chrD8)
 
-The remaining gap to "visible from the browser" is selkies; several runs say where it is and where it is NOT:
-- The `--publish` path is HEALTHY, including large responses: the host fetched selkies' own `index.html`
-  (786B), `assets/index-*.js` (**650KB, 0.53s**), css, `manifest.json`, `icon.png`, `/api/status`, all 200.
-- The host BROWSER loads the app: CDP navigation to `http://localhost:8081/` succeeds (60s was too tight,
-  120s is not), 15/15 requests 200, zero console errors, and selkies logs `INFO:ws:Client ('10.0.0.1',
-  49162) connected`. It then sits on "Waiting for stream..." and the canvas stays black.
-- **SELKIES 2.0.0 BINDS 8080, NOT 8081 -- the old "selkies stalls at startup" symptom was a PORT MISMATCH**
-  (selk26): with everything else healthy it logged `INFO:server:Selkies server running on
-  http://0.0.0.0:8080`, while every probe, the `--publish 8081:8081` mapping and the host browser aimed at
-  8081 -- the chr6/selk6/selk8 refusals are explained by this alone. `CUSTOM_WS_PORT` is a 1.x name 2.0.0
-  ignores; **`--port=8081` is now passed explicitly**. Read the port out of selkies' OWN "running on
-  http://..." line before trusting any probe.
-- **SELKIES 2.0.0 ENABLES BASIC AUTH BY DEFAULT AND, WITH NO PASSWORD SET, STOPS ITS OWN SERVER** (selk12):
-  `ERROR:server:Basic authentication is enabled but no password was set`, then
-  `INFO:server:Stopping service: websockets` -- the port NEVER LISTENS. That is the entire selk6/selk8/
-  selk11/selk12 "wedges during its own startup" symptom: refusal-by-config, not a stall. Always pass
-  `--enable-basic-auth=false`, or set `PASSWORD`.
-- Two harness traps: selkies needs `DISPLAY` exported (it exits silently without one), and a log file it
-  writes under `/tmp/` is INVISIBLE to the shell that launched it -- `wc -l` over a running server's log
-  reads 0. Pipe the child's output: `( selkies --debug 2>&1 | sed 's/^/[selk] /' ) &`.
-- **MEASUREMENT ERROR, corrected (aio9)**: four server arms on one guest (uvloop+`asyncio.start_server
-  (sock=)`, uvloop+`start_server(host,port)`, uvloop+aiohttp `SockSite`, plain `SelectorEventLoop`), each
-  probed twice: **8/8 `code=200`**. So guest loopback TCP, uvloop's epoll, libuv's accept and aiohttp all
-  work. The runs that "proved" otherwise (aio5-aio7) passed an `(reader, writer)` callback to
-  `create_server`, which takes a no-arg PROTOCOL FACTORY -- every accept raised `TypeError`. **Set
-  `loop.set_exception_handler` in every guest probe script -- an exception there is invisible and reads as a
-  litebox hang.** Also: the litebox log clock starts at runner start and a guest script's `t0` is ~8s later,
-  so litebox t=28.9 IS guest t=21.
-- **selkies here is 2.0.0, a rewrite with DIFFERENT flags** (selk7 printed the real `--help`).
-  `--clipboard-enabled` does not exist; the real names are `--enable-clipboard`, `--printing-enabled`,
-  `--print-spool-path`, `--gamepad-enabled/--audio-enabled/--microphone-enabled/--webcam-enabled`, `--mode`,
-  `--enable-basic-auth`, `--unix-socket`, `--port`, `--addr`, `--web-root`. Read `selkies --help` first.
-- **PRINTING IS NOT THE CAUSE (selk8, both arms wedged identically)** -- `start_server()`'s printing block
-  is innocent. A/B on ONE port is useless (`kill -9` on a wedged cross-process child does not reap it ->
-  `Address already in use`). **selk9** cleared the two printing primitives (watchdog inotify Observer runs,
-  `asyncio.create_subprocess_exec` works) but the same spawn WITH `preexec_fn` fails
-  (`Exception occurred in preexec_fn` -- selkies' `_die_with_parent` `ctypes prctl(PR_SET_PDEATHSIG)`,
-  printing.py:239), so cupsd can never start under litebox today.
-- Guest-side `ps` is useless here (each cross-process child's `/proc` lists only itself); a host-side process
-  is identified by its THREAD NAMES: `litebox-guest-pid<N>`.
-- Guest app source is in the cached layer tars: selkies 2.0.0 is `sha256_669f2c..._v2.tar` under `lsiopy/`
-  (an older 1.x tree sits in `sha256_3e6fd1..._v1.tar` -- do not read that one by mistake).
-- Cheapest repro of the current wedge: `.wfgy/chrdesk_lock.ps1 -Run chrD5 -MaxSeconds 660 -Script
-  .wfgy/chrdesk3.sh` (adds `LITEBOX_DIAG_LOCKSTALL=1` + `LITEBOX_DIAG_WAIT_DUR=1`, see
-  "Frozen-in-`close(2)`"). `.wfgy/selk6.sh` is the no-DE selkies-only variant.
+- chrD8: THE DESKTOP STREAMS AND PAINTS IN A HOST BROWSER (with `463dc29` in) -- evidence at top of this file. Old wedge WAS subprocess spawning after all: sitecustomize hook logged `spawn ENTER ('xset','q')` / `('selkies-proot','check')` with neither ever logging EXIT.
+- CDP `take_screenshot` CANNOT SEE A `<video>` SURFACE: two shots two minutes apart at 40fps were BYTE-IDENTICAL, mean RGB (0,0,0). Capture frames with JS -- `drawImage(video)` into 2D canvas + `toDataURL('image/png')`, returned via `evaluate_script`'s `filePath`, decoded host-side (`.wfgy/chrD8_frame.png`). Black screenshot isn't evidence of broken stream.
+- xfce4-session takes ~120s to register WM here (`WM_POLL n=24`); until it does `xprop -root _NET_SUPPORTING_WM_CHECK` "not found", stream legitimately black root window -- never judge frame before WM check answers. Guest `ps -eo` lists only `ps` itself (useless for "is xfwm4 up?"): use `xprop -root _NET_CLIENT_LIST` + `xwininfo -root -tree`. Pass `--window-size=W,H --window-position=X,Y` (`.wfgy/chrdesk4.sh`); `xwininfo` then lists TWO windows (10x10 class-`chromium` stub + real one of Open #1).
+- SELKIES 2.0.0 BINDS 8080, NOT 8081 (selk26) -- old "selkies stalls at startup" symptom was PORT MISMATCH; `CUSTOM_WS_PORT` 1.x name 2.0.0 ignores, so `--port=8081` now explicit. ENABLES BASIC AUTH BY DEFAULT; WITH NO PASSWORD SET, STOPS ITS OWN SERVER (selk12) -- `ERROR:server:Basic authentication is enabled but no password was set` then `Stopping service: websockets`, so port NEVER LISTENS. Always pass `--enable-basic-auth=false`, or set `PASSWORD`. Rewrite with DIFFERENT flags (selk7 printed real `--help`; full list in archive) -- `--clipboard-enabled` doesn't exist. Printing NOT cause (selk8).
+- Harness traps: selkies needs `DISPLAY` exported (exits silently without one); log file it writes under `/tmp/` INVISIBLE to its launching shell -- pipe child's output instead: `( selkies --debug 2>&1 | sed 's/^/[selk] /' ) &`. A/B on ONE port useless (`kill -9` on wedged cross-process child doesn't reap it->`Address already in use`). Host-side process identified by its THREAD NAMES: `litebox-guest-pid<N>`. Set `loop.set_exception_handler` in every guest probe script -- exception there invisible, reads as litebox hang (aio9).
+- Selkies 2.0.0 source: `.litebox-cache/sha256_669f2c..._v2.tar` under `lsiopy/lib/python3.13/site-packages/selkies/` (1.x in `sha256_3e6fd1..._v1.tar`), extract with python `tarfile` (`.wfgy/selksrc/`). Cheapest full repro: `.wfgy/chrdesk_lock.ps1 -Run <name> -MaxSeconds 660 -Script .wfgy/chrdesk3.sh`.
