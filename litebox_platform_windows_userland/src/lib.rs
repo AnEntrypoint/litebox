@@ -7335,6 +7335,19 @@ impl RawMutex {
                             thread:? = std::thread::current().name();
                             "[diag-lockstall] raw mutex wait still blocked"
                         );
+                        if diag_lockstall_trace_enabled() && idle_chunks == 15 {
+                            litebox_util_log::warn!(
+                                lock:% = (self as *const Self as usize),
+                                tid:? = std::thread::current().id(),
+                                thread:? = std::thread::current().name(),
+                                guest_syscall:% = CURRENT_GUEST_SYSCALL.with(|s| {
+                                    let (nr, a0, a1, a2) = s.get();
+                                    std::format!("nr={nr} a0={a0:#x} a1={a1:#x} a2={a2:#x}")
+                                }),
+                                trace:% = std::format!("{}", std::backtrace::Backtrace::force_capture());
+                                "[diag-lockstall-trace] call chain of a wait that has now blocked 30s"
+                            );
+                        }
                     }
                 }
                 Win32_Foundation::WAIT_FAILED => {
@@ -7687,6 +7700,54 @@ fn diag_lockstall_enabled() -> bool {
         e.set(Some(v));
         v
     })
+}
+
+/// Whether `LITEBOX_DIAG_LOCKSTALL_TRACE=1` should attach a host call chain to the first
+/// `[diag-lockstall]` report of each long wait. Cached per thread, same pattern as
+/// [`diag_wait_dur_enabled`].
+///
+/// The lockstall line names the parked THREAD, not what it was doing: every unbounded park in the
+/// codebase funnels through this one wait loop (`WaitContext::commit_wait`'s no-deadline arm,
+/// `RawMutex::block`'s contended arm), so `val=1 holder_pid=0 chunk_ms=2000` identifies a lost
+/// wake but not the syscall that lost it. Capturing a backtrace at the first report (30s) of each
+/// wait turns that into a named call site; capturing it on every report would be a per-wait cost
+/// on a path that is already known to produce 300k lines in one desktop run.
+fn diag_lockstall_trace_enabled() -> bool {
+    thread_local! {
+        static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ENABLED.with(|e| {
+        if let Some(v) = e.get() {
+            return v;
+        }
+        let v = std::env::var_os("LITEBOX_DIAG_LOCKSTALL_TRACE").is_some();
+        e.set(Some(v));
+        v
+    })
+}
+
+/// The guest syscall this host thread is currently executing, as `(number, arg0, arg1, arg2)`.
+///
+/// A `[diag-lockstall-trace]` backtrace names the call site but not the operands, and the operand
+/// is the whole question once the call site is known to be `read(2)`: `arg0` is the fd, which is
+/// what distinguishes "blocked on the child's stdout" from "blocked on the fork/exec error pipe".
+/// Recorded on the guest thread in `syscall_handler` (the one place every guest syscall passes
+/// through) and read back by the lockstall report, which runs on that same thread further down
+/// its own stack. Host threads that never run guest code keep the initial `(0, 0, 0, 0)`.
+thread_local! {
+    static CURRENT_GUEST_SYSCALL: std::cell::Cell<(u64, u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+fn record_guest_syscall(thread_ctx: &ThreadContext<'_>) {
+    if !diag_lockstall_trace_enabled() {
+        return;
+    }
+    let c = &*thread_ctx.ctx;
+    // `rax` already holds whatever the previous syscall returned by the time the handler runs;
+    // the number being dispatched is in `orig_rax`, which is what `syscall_number()` reads.
+    let (nr, a0, a1, a2) = (c.syscall_number() as u64, c.rdi as u64, c.rsi as u64, c.rdx as u64);
+    CURRENT_GUEST_SYSCALL.with(|s| s.set((nr, a0, a1, a2)));
 }
 
 /// Whether `LITEBOX_DIAG_MM=1` memory-management diagnostics are enabled. Cached per thread,
@@ -13045,6 +13106,7 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) 
     // function calls into anything GS-dependent, rather than only reactively repairing after an
     // exception Windows may not have been able to deliver in the first place.
     WindowsUserland::restore_thread_gs_base_if_cleared();
+    record_guest_syscall(thread_ctx);
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
@@ -14365,6 +14427,14 @@ fn spawn_fork_child_pipe_pump(
             // distinguishes that from a real reader is whether the buffered bytes MOVE: a count
             // that sits unchanged for `UNDRAINED_GRACE` is data nobody is consuming, so forwarding
             // it to the child takes nothing from a reader that exists.
+            //
+            // That inference is only sound for the child's STDIN, though. Any other inherited read
+            // end the guest holds for its own reasons and reads when it pleases, and a byte it is
+            // about to read is not "data nobody is consuming" -- the read simply has not happened
+            // yet. Forwarding on stagnation there silently empties the guest's pipe: libuv's global
+            // signal lock, a pipe holding one byte that any locker blocks on, loses its byte to the
+            // first fork that carries it and the next lock hangs for ever. So the forwarding below
+            // is restricted to the end that is the child's stdin.
             litebox::platform::ForkPipeBridge::Source(mut end) => {
                 const POLL: core::time::Duration = core::time::Duration::from_millis(2);
                 // Comfortably longer than a guest reader scheduled late under host load needs to
@@ -14372,6 +14442,9 @@ fn spawn_fork_child_pipe_pump(
                 // running instead of idling to its timeout.
                 const UNDRAINED_GRACE: core::time::Duration =
                     core::time::Duration::from_millis(500);
+                // False for every carried read end but the child's stdin. See
+                // `ForkPipeBridge::buffered_belongs_to_child`.
+                let may_forward_buffered = end.buffered_belongs_to_child();
                 let mut last_pending = usize::MAX;
                 let mut undrained_since: Option<std::time::Instant> = None;
                 while end.owners() > 1 {
@@ -14379,7 +14452,12 @@ fn spawn_fork_child_pipe_pump(
                         break;
                     }
                     let pending = end.pending_bytes();
-                    if pending == 0 {
+                    if !may_forward_buffered {
+                        // Stagnant or not, these bytes are the guest's: it holds this end precisely
+                        // so that it can read them, and a pump that forwards them takes them away
+                        // from a reader that is still alive in this process.
+                        undrained_since = None;
+                    } else if pending == 0 {
                         // Nothing buffered: the guest may be waiting for a writer that has not
                         // produced yet, which is not stagnation. Start the clock afresh.
                         undrained_since = None;

@@ -3843,6 +3843,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     || false,
                                     || 0,
+                                    false,
                                 ),
                             )
                         }
@@ -3857,6 +3858,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     move || eof_probe.at_eof(),
                                     move || pending_probe.buffered_bytes(),
+                                    // Only the child's stdin has a buffer that is waiting for the
+                                    // child; every other inherited read end the parent may still
+                                    // read itself, and a pump that drains it silently takes the
+                                    // parent's bytes. See
+                                    // `ForkPipeBridge::buffered_belongs_to_child`.
+                                    fd == 0,
                                 ),
                             )
                         }

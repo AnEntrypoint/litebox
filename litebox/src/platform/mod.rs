@@ -1614,6 +1614,29 @@ impl ForkPipeBridge {
         }
     }
 
+    /// Whether bytes already buffered in a [`Self::Source`]'s pipe are destined for the child that
+    /// carries this end, so the platform's pump may drain them out of the parent.
+    ///
+    /// On a real `fork()` parent and child share ONE pipe, buffered bytes included: whichever of
+    /// them reads first gets them, and a parent that never reads loses nothing by the child taking
+    /// them. A bridge is not a shared pipe -- it is a pump that reads on the child's behalf and
+    /// pushes what it gets into the child's own OS pipe, so draining takes the bytes away from the
+    /// parent even while the parent still holds a descriptor on the same end and intends to read
+    /// them itself.
+    ///
+    /// That is only provably safe for the child's STDIN: bytes the parent buffered there are
+    /// waiting for the child by construction. Any other inherited read end the parent may be
+    /// reading itself -- libuv's global signal lock, a pipe holding exactly one byte whose
+    /// disappearance blocks its next locker for ever, is the case that cost a debugging session --
+    /// so there the pump leaves the buffer alone.
+    #[must_use]
+    pub fn buffered_belongs_to_child(&self) -> bool {
+        match self {
+            Self::Sink(_) => false,
+            Self::Source(e) => e.buffered_belongs_to_child,
+        }
+    }
+
     /// Record whether the guest fd this bridge carries is close-on-exec.
     pub fn set_cloexec(&mut self, cloexec: bool) {
         match self {
@@ -1648,24 +1671,29 @@ pub struct ForkPipeEnd<F> {
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
     pending: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+    buffered_belongs_to_child: bool,
     cloexec: bool,
 }
 
 impl<F> ForkPipeEnd<F> {
-    /// Wrap a transfer closure plus the two liveness probes: how many references to the underlying
-    /// pipe end are alive, and whether the pipe can only ever yield end-of-file.
+    /// Wrap a transfer closure plus the liveness probes: how many references to the underlying pipe
+    /// end are alive, whether the pipe can only ever yield end-of-file, how much it has buffered,
+    /// and whether that buffer is the child's to take (see
+    /// [`ForkPipeBridge::buffered_belongs_to_child`]).
     #[must_use]
     pub fn new(
         transfer: F,
         owners: impl Fn() -> usize + Send + 'static,
         at_eof: impl Fn() -> bool + Send + 'static,
         pending: impl Fn() -> usize + Send + 'static,
+        buffered_belongs_to_child: bool,
     ) -> Self {
         Self {
             transfer,
             owners: alloc::boxed::Box::new(owners),
             at_eof: alloc::boxed::Box::new(at_eof),
             pending: alloc::boxed::Box::new(pending),
+            buffered_belongs_to_child,
             cloexec: false,
         }
     }
@@ -1694,6 +1722,12 @@ impl<F> ForkPipeEnd<F> {
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
         (self.pending)()
+    }
+
+    /// See [`ForkPipeBridge::buffered_belongs_to_child`].
+    #[must_use]
+    pub fn buffered_belongs_to_child(&self) -> bool {
+        self.buffered_belongs_to_child
     }
 
     /// See [`ForkPipeBridge::owners`].
