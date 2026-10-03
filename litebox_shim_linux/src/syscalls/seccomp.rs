@@ -560,7 +560,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Applies a verdict the syscall must not survive: `Errno` skips the syscall and returns it,
-    /// every other non-allow verdict skips it and delivers `SIGSYS` instead.
+    /// every other non-allow verdict skips it and delivers `SIGSYS` instead. A `Trap` returns the
+    /// SYSCALL NUMBER, which is real Linux's `syscall_rollback` (`regs->ax = regs->orig_ax`), not a
+    /// success value -- see the `Trap` arm's comment.
     pub(crate) fn apply_seccomp_verdict(
         &self,
         verdict: Verdict,
@@ -598,7 +600,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // does. Without it a handler that emulates trapped syscalls cannot tell which one
                 // it was asked to emulate.
                 self.deliver_sigsys(false, nr, ip, data);
-                Err(Errno::ENOSYS)
+                // `syscall_rollback`: the SIGSYS handler's ucontext must show the syscall NUMBER in
+                // `rax` and the trapping `rip`, because that is the register pair the handler
+                // inspects and overwrites to emulate the syscall (`Syscall::PutValueInUcontext`).
+                // Chromium's `Trap::SigSys` asserts exactly this --
+                // `si_call_addr != SECCOMP_IP(ctx) || si_syscall != SECCOMP_SYSCALL(ctx) ||
+                // si_arch != SECCOMP_ARCH` -- and abandons the trap with "Sanity checks are
+                // failing after receiving SIGSYS." when it does not hold.
+                //
+                // The rollback has to be THIS function's return value rather than a write to
+                // `ctx.rax`: the signal is only queued here and delivered later by
+                // `process_signals`, which snapshots `ctx` into the frame, and by then
+                // `handle_syscall_request` has stored whatever this returned into `ctx.rax`.
+                // Returning `-ENOSYS` (as this used to) made RAX and `si_syscall` disagree on every
+                // trap. A handler that emulates nothing gets the syscall number back as the return
+                // value, which is also what real Linux leaves there.
+                Ok(usize::try_from(nr).unwrap_or(0))
             }
             Verdict::Trace | Verdict::KillThread | Verdict::KillProcess => {
                 self.deliver_sigsys(true, nr, ip, 0);

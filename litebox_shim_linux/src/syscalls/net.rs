@@ -628,6 +628,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
                 }
+                // `SO_DOMAIN`/`SO_PROTOCOL` are read-only on Linux (they report what `socket()`
+                // was called with); `setsockopt` on them falls through to `ENOPROTOOPT`.
+                SocketOption::DOMAIN | SocketOption::PROTOCOL => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -804,6 +807,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     }
                 }
                 SocketOption::TYPE => self.get_socket_type(fd)? as u32,
+                // `SO_DOMAIN`: the family `socket(2)` was called with. `is_v6` is recorded at
+                // creation and inherited by `accept`, and is already what `getsockname`/`accept`
+                // use to report a `sockaddr_in6`, so it is the one field that knows this.
+                SocketOption::DOMAIN => {
+                    if self.with_socket_options(fd, |opt| opt.is_v6) {
+                        AddressFamily::INET6 as u32
+                    } else {
+                        AddressFamily::INET as u32
+                    }
+                }
+                // `SO_PROTOCOL`: `sys_socket` only ever builds an inet socket of two kinds
+                // (SOCK_STREAM -> TCP, SOCK_DGRAM -> UDP, everything else refused), so the
+                // socket's own type determines the protocol; this is not a guess about what the
+                // peer or the connection does.
+                SocketOption::PROTOCOL => match self.get_socket_type(fd)? {
+                    SockType::Stream => IPProtocol::TCP as u32,
+                    SockType::Datagram => IPProtocol::UDP as u32,
+                    // `SOCK_RAW` is refused at creation (`EPERM`, see `sys_socket`) and this
+                    // stack has no other inet protocol, so there is no protocol number to
+                    // report; 0 (`IPPROTO_IP`) is Linux's own "unset" value.
+                    _ => 0,
+                },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => {
                     litebox::net::SOCKET_BUFFER_SIZE.trunc()
                 }

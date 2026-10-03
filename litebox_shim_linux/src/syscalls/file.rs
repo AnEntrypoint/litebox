@@ -8240,19 +8240,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.raw_fd_subsystem_name(raw_fd) == "unix-socket" {
             match self.raw_fd_unix_carry(raw_fd, 0, false) {
                 Ok((spec, hold)) => {
-                    // `child_pid == 0` means this is not a fork, and a non-fork carry hands back
-                    // no hold at all -- a listener's presence entry is registered by the RECEIVER,
-                    // the only process that knows its own pid. Should a hold ever appear here,
-                    // undoing it is the only safe answer: it would advertise the address under a
-                    // pid no process has, and `connect()` would find a listener nobody can accept.
-                    if let Some(hold) = hold {
-                        crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
-                            &self.global,
-                            hold,
-                        );
-                        unix_refusal = Some("unix-socket(listener; carried presence entry)");
-                    } else {
-                        return Ok(Some(alloc::format!("U|{spec}")));
+                    // A CONNECTED endpoint's carry counts an extra hold on the shared slot under
+                    // THIS host pid, and the receiver releases exactly that pid when it adopts the
+                    // fd (`from_fork_spec`'s `C` branch reads the spec's `me` field, which
+                    // `fork_carry` set to this pid because `for_spawn` is false here). Without it
+                    // the slot can be reclaimed between `sendmsg` and adoption, so a `Conn` hold is
+                    // the carry working -- abandoning it is what used to refuse every socketpair
+                    // end Chromium hands its children over Mojo. A `Presence` hold is the real
+                    // anomaly: it would advertise a listening address under a pid no process has
+                    // (`child_pid == 0`), and `connect()` would find a listener nobody can accept.
+                    match hold {
+                        Some(
+                            hold @ crate::syscalls::unix::UnixCarryHold::Presence { .. },
+                        ) => {
+                            crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
+                                &self.global,
+                                hold,
+                            );
+                            unix_refusal = Some("unix-socket(listener; carried presence entry)");
+                        }
+                        _ => return Ok(Some(alloc::format!("U|{spec}"))),
                     }
                 }
                 Err(reason) => unix_refusal = Some(reason),

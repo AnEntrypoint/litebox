@@ -27,8 +27,8 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
-    SocketOptionName, Ucred, errno::Errno,
+    AddressFamily, IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
+    SocketOption, SocketOptionName, Ucred, errno::Errno,
 };
 
 use crate::{
@@ -3169,6 +3169,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     Err(Errno::ENOPROTOOPT)
                 }
+                // `SO_DOMAIN`/`SO_PROTOCOL` report what the socket was created as; Linux has no
+                // setter for them (`sock_setsockopt` falls through to `ENOPROTOOPT`). Answering
+                // `Ok(())` here would let a caller believe it had re-classified the socket.
+                SocketOption::DOMAIN | SocketOption::PROTOCOL => Err(Errno::ENOPROTOOPT),
                 // SO_RCVBUF / SO_SNDBUF are advisory hints. Accept them and keep
                 // the fixed internal buffer size, instead of returning EOPNOTSUPP.
                 // Log at debug so the accepted-but-ignored option stays visible.
@@ -3232,6 +3236,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 }
                 // Unix sockets don't track async errors
                 SocketOption::ERROR => 0,
+                // `SO_DOMAIN` is the family `socket(2)` was called with, which is `AF_UNIX` for
+                // every socket here. `SO_PROTOCOL` is 0 because a unix socket has no protocol --
+                // that is Linux's own value (`sk->sk_protocol` stays `IPPROTO_IP`), not a
+                // placeholder. Found by a real failure: Python's `socket.socket(fileno=fd)` --
+                // the only way to adopt an fd received over SCM_RIGHTS -- probes both, and
+                // raising `OSError(92, 'Protocol not available')` made every carried unix
+                // socket unusable.
+                SocketOption::DOMAIN => AddressFamily::UNIX as u32,
+                SocketOption::PROTOCOL => 0,
                 SocketOption::TYPE => match &self.inner {
                     UnixSocketInner::Stream(stream) if stream.preserve_boundaries => {
                         SockType::SeqPacket as u32
@@ -4422,11 +4435,56 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         let mut held_live = 0usize;
         let mut orphaned = 0usize;
         let mut unheld = 0usize;
-        for slot in self.slots.iter() {
+        // `one_host` vs `multi_host` is the saturation-vs-leak discriminator the census was
+        // missing: a slot BOTH of whose sides are held by the SAME host process is a connection
+        // no second process ever took the other end of -- the signature of a carried endpoint
+        // whose receiver never adopted it (its placeholder hold stays counted under the sender's
+        // host pid forever). `multi_host` slots are what a real cross-process connection looks
+        // like. `chr18` (2026-10-03) hit `occupied=1024 held_live=1024 orphaned=0 unheld=0` and
+        // this split is what tells whether that is 1024 live channels (raise the capacity) or
+        // 1024 forgotten ones (fix the release path).
+        let mut one_host = 0usize;
+        let mut multi_host = 0usize;
+        let first_census = STRIDE.load(Ordering::Relaxed) == 1;
+        let mut samples = 0usize;
+        for (idx, slot) in self.slots.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) != CONN_SLOT_OCCUPIED {
                 continue;
             }
             occupied += 1;
+            let mut hosts = [0u32; 2 * CONN_HOLDER_HOSTS];
+            let mut hosts_n = 0usize;
+            for side in 0..2 {
+                for (h, c) in slot.holder_hosts[side].iter().zip(&slot.holder_counts[side]) {
+                    if c.load(Ordering::Acquire) == 0 {
+                        continue;
+                    }
+                    let host = h.load(Ordering::Acquire);
+                    if hosts[..hosts_n].contains(&host) {
+                        continue;
+                    }
+                    if let Some(dst) = hosts.get_mut(hosts_n) {
+                        *dst = host;
+                        hosts_n += 1;
+                    }
+                }
+            }
+            if hosts_n == 1 {
+                one_host += 1;
+            } else if hosts_n > 1 {
+                multi_host += 1;
+            }
+            if first_census && samples < 6 {
+                samples += 1;
+                litebox_util_log::warn!(
+                    slot:% = idx,
+                    client_pid:% = slot.client_pid.load(Ordering::Relaxed),
+                    server_pid:% = slot.server_pid.load(Ordering::Relaxed),
+                    hosts_n:% = hosts_n,
+                    holders = slot.holder_dump();
+                    "shared unix connection table full: occupied slot sample"
+                );
+            }
             if !slot.side_ever_held[0].load(Ordering::Acquire)
                 && !slot.side_ever_held[1].load(Ordering::Acquire)
             {
@@ -4443,6 +4501,8 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             arena_backed:% = self.arena_backed,
             occupied:% = occupied,
             held_live:% = held_live,
+            one_host:% = one_host,
+            multi_host:% = multi_host,
             orphaned:% = orphaned,
             unheld:% = unheld;
             "shared unix connection table full"
