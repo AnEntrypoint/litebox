@@ -3762,10 +3762,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // from a reader still live in this process. So the pump waits until this bridge is the
         // end's sole owner (see `ForkPipeBridge::owners`), which is precisely when the guest
         // parent has closed its own descriptor. A shell closes its copy immediately after forking,
-        // so a pipeline works; a parent that keeps reading its own copy never releases it, and the
-        // child's inherited fd simply never yields -- wrong only for a genuinely shared reader,
-        // which is unsupportable here in any case, and never wrong by delivering bytes to the
-        // wrong process.
+        // so a pipeline works. Holding a descriptor is not the same as reading it, though: a
+        // wrapper (`timeout`, `env`, `nohup`, `setpriv`) keeps its own stdin open purely to hand
+        // it to the child it is about to fork, so `owners()` never falls to 1 and the carried fd
+        // would never yield. `ForkPipeBridge::pending_bytes` is what lets the platform tell that
+        // case apart from a live reader and deliver the bytes anyway.
         let mut inherited_pipes: alloc::vec::Vec<(i32, litebox::platform::ForkPipeBridge)> =
             alloc::vec::Vec::new();
         let mut inherited_files: alloc::vec::Vec<litebox::platform::ForkInheritedFile> =
@@ -3829,6 +3830,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     };
                     let eof_probe = alloc::sync::Arc::clone(&end);
+                    let pending_probe = alloc::sync::Arc::clone(&end);
                     let mut bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
                             litebox::platform::ForkPipeBridge::Sink(
@@ -3840,6 +3842,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     }),
                                     owners,
                                     || false,
+                                    || 0,
                                 ),
                             )
                         }
@@ -3853,6 +3856,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     }),
                                     owners,
                                     move || eof_probe.at_eof(),
+                                    move || pending_probe.buffered_bytes(),
                                 ),
                             )
                         }

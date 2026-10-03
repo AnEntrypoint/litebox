@@ -1588,11 +1588,29 @@ impl ForkPipeBridge {
     /// actually deliver EOF. For a [`Self::Source`] it says something the platform must wait for:
     /// the guest parent has closed its own descriptor, so draining the pipe into the child no
     /// longer steals bytes from a reader still live in this process.
+    ///
+    /// It is not sufficient on its own: holding a reference and reading from it are two different
+    /// things, and a parent that keeps a descriptor open while it waits for a wrapper child of its
+    /// own (`timeout`, `env`, `nohup`, `setpriv`) never drops to `1` at all -- the pipe then has
+    /// nobody draining it and the child blocks for ever. See [`Self::pending_bytes`].
     #[must_use]
     pub fn owners(&self) -> usize {
         match self {
             Self::Sink(e) => e.owners(),
             Self::Source(e) => e.owners(),
+        }
+    }
+
+    /// Bytes waiting in a [`Self::Source`]'s pipe; `0` for a [`Self::Sink`].
+    ///
+    /// Sampled over time this separates "the guest parent is still reading this end" from "the
+    /// guest parent merely holds a reference to it": a non-zero count that does not change is
+    /// data nobody is consuming, so forwarding it to the child steals nothing from a real reader.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        match self {
+            Self::Sink(_) => 0,
+            Self::Source(e) => e.pending_bytes(),
         }
     }
 
@@ -1629,22 +1647,25 @@ pub struct ForkPipeEnd<F> {
     transfer: F,
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
+    pending: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     cloexec: bool,
 }
 
 impl<F> ForkPipeEnd<F> {
-    /// Wrap a transfer closure and a probe reporting how many references to the underlying pipe
-    /// end are alive.
+    /// Wrap a transfer closure plus the two liveness probes: how many references to the underlying
+    /// pipe end are alive, and whether the pipe can only ever yield end-of-file.
     #[must_use]
     pub fn new(
         transfer: F,
         owners: impl Fn() -> usize + Send + 'static,
         at_eof: impl Fn() -> bool + Send + 'static,
+        pending: impl Fn() -> usize + Send + 'static,
     ) -> Self {
         Self {
             transfer,
             owners: alloc::boxed::Box::new(owners),
             at_eof: alloc::boxed::Box::new(at_eof),
+            pending: alloc::boxed::Box::new(pending),
             cloexec: false,
         }
     }
@@ -1667,6 +1688,12 @@ impl<F> ForkPipeEnd<F> {
     #[must_use]
     pub fn at_eof(&self) -> bool {
         (self.at_eof)()
+    }
+
+    /// See [`ForkPipeBridge::pending_bytes`].
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        (self.pending)()
     }
 
     /// See [`ForkPipeBridge::owners`].

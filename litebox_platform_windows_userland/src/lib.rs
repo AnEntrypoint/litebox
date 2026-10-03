@@ -14248,14 +14248,44 @@ fn spawn_fork_child_pipe_pump(
             // parent has closed its own descriptor and there is no such reader left -- which is
             // exactly what a shell does immediately after forking a pipeline stage.
             //
-            // A parent that never closes its copy is the genuinely-shared case, which no bridge
-            // built out of a second OS pipe can reproduce; there the child's inherited fd simply
-            // never yields, and this thread ends when the child does rather than waiting for ever.
+            // A parent that never closes its copy is not necessarily a reader either: a wrapper
+            // (`timeout`, `env`, `nohup`, `setpriv`) holds its own stdin open for the whole life
+            // of the child it is about to fork, purely so it can hand that fd down, so `owners()`
+            // never falls to 1 and the wait below would never end -- the child blocks on a stdin
+            // that already holds its bytes and then dies on the wrapper's own timeout. What
+            // distinguishes that from a real reader is whether the buffered bytes MOVE: a count
+            // that sits unchanged for `UNDRAINED_GRACE` is data nobody is consuming, so forwarding
+            // it to the child takes nothing from a reader that exists.
             litebox::platform::ForkPipeBridge::Source(mut end) => {
                 const POLL: core::time::Duration = core::time::Duration::from_millis(2);
+                // Comfortably longer than a guest reader scheduled late under host load needs to
+                // get to bytes that are already there; short enough that a wrapper's child starts
+                // running instead of idling to its timeout.
+                const UNDRAINED_GRACE: core::time::Duration =
+                    core::time::Duration::from_millis(500);
+                let mut last_pending = usize::MAX;
+                let mut undrained_since: Option<std::time::Instant> = None;
                 while end.owners() > 1 {
                     if end.at_eof() {
                         break;
+                    }
+                    let pending = end.pending_bytes();
+                    if pending == 0 {
+                        // Nothing buffered: the guest may be waiting for a writer that has not
+                        // produced yet, which is not stagnation. Start the clock afresh.
+                        undrained_since = None;
+                    } else if pending != last_pending {
+                        last_pending = pending;
+                        undrained_since = None;
+                    } else {
+                        let since = *undrained_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= UNDRAINED_GRACE {
+                            litebox_util_log::debug!(
+                                handle:% = local, owners:% = end.owners(), pending:% = pending;
+                                "fork-child pipe pump (parent): the guest holds this pipe's read end without draining it, forwarding the buffered bytes to the child"
+                            );
+                            break;
+                        }
                     }
                     if process_fork::process_has_exited(child_process) {
                         litebox_util_log::debug!(

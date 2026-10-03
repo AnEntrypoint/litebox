@@ -96,6 +96,14 @@ Fixed (newest first; mechanism in the archive unless noted):
   process died some other way".
 - **Before blaming litebox for a death or stall, correlate it with the harness's own time caps, kill loops
   and the host's free RAM / pages-per-sec first.**
+- **The image's `Xvfb` is XLibre now and ABORTS when `/tmp/.X11-unix` already exists with the wrong
+  mode**: its `_XSERVTransmkdir` warning uses `%o` and `os/log.c`'s `vpnprintf` has no `o` directive
+  (`BUG: ../os/log.c:620 in vpnprintf()` + a backtrace). Every X client then fails with `unable to open
+  display :1`, and cross-process with `connect_cross_process: listener in another process never accepted
+  within SHARED_UNIX_CROSS_CONNECT_TIMEOUT`. So `mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix`
+  BEFORE starting Xvfb (now in `.wfgy/{xv1,chrdesk,pass118_full}.sh`); `webtop_stack.sh` never creates the
+  dir, which is why the s6-driven stack was never hit. A dead X server looks exactly like a litebox unix
+  socket bug -- check the server's own output first.
 - **Run dbus-daemon non-forking** (`dbus-launch` daemonizing breaks connects); for XFCE use
   `xfce4-session`. `.wfgy/webtop_stack.sh` is embedded in `.wfgy/webtop_seed.tar` (re-tar after edits).
   Readbacks inside a boot script use `$( )`/pipes, not `cmd > /tmp/f` + a sibling's read.

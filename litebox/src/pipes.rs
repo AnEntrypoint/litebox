@@ -298,6 +298,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platfor
         }
     }
 
+    /// How many bytes are waiting to be read from a receiver half (`FIONREAD`); `0` on a sender
+    /// half.
+    ///
+    /// Sampled twice, this is the only evidence available about whether the holder of a second
+    /// reference to this end is actually reading: a count that never moves means nobody is
+    /// draining it, whatever `strong_count` says about who still holds one.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.endpoint.rb.lock().occupied_len(),
+            PipeEnd::Sender(_) => 0,
+        }
+    }
+
     /// Whether this is the sender half or the receiver half.
     #[must_use]
     pub fn half_pipe_type(&self) -> HalfPipeType {
