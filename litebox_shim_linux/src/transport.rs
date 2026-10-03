@@ -75,9 +75,21 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
         let proxy = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
 
         // 3. Initiate the TCP connection.
+        //
+        // The `net_lock` guard is bound and dropped INSIDE the block: `match
+        // global.net_lock().connect(..)` keeps the temporary guard alive to the end
+        // of the whole `match`, so the `spin_loop()` in the `InProgress` arm would
+        // run with the cross-process `net_lock` HELD -- a connect that never
+        // completes would then spin forever while every other host process in the
+        // fork family queues behind that lock (the same whole-guest freeze shape as
+        // `16f3e76`, on the guest side instead of the worker's).
         let mut check_progress = false;
         loop {
-            match global.net_lock().connect(&sockfd, &addr, check_progress) {
+            let result = {
+                let mut net = global.net_lock();
+                net.connect(&sockfd, &addr, check_progress)
+            };
+            match result {
                 Ok(()) => break,
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     core::hint::spin_loop();
