@@ -733,7 +733,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
-                        process_table: syscalls::signal::xproc::SharedProcessTable::new(),
+                        process_table: syscalls::signal::xproc::SharedProcessTable::new(
+                            self.platform,
+                        ),
                         pid_namespaces: syscalls::pidns::PidNamespaceTable::new(),
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
@@ -756,6 +758,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // by `default_fs`, before `GlobalState` exists) can only reach through a hook like this.
         syscalls::signal::xproc::publish_process_table(&inner.process_table);
         litebox::fs::procfs::set_pid_known_fn(syscalls::signal::xproc::pid_is_known);
+        // Same hook, the other two questions `/proc` has no way to answer from inside `litebox`:
+        // WHICH pids exist across the fork family (`ls /proc`), and what a pid running in another
+        // host process is CALLED (`/proc/<pid>/{comm,cmdline,stat}`). Without the first, `ps` sees
+        // a one-process system; without the second, every foreign pid is nameless.
+        litebox::fs::procfs::set_pid_list_fn(syscalls::signal::xproc::live_pids);
+        litebox::fs::procfs::set_pid_identity_fn(syscalls::signal::xproc::pid_identity);
         LinuxShim(GlobalStateHandle {
             inner,
             litebox: my_litebox,

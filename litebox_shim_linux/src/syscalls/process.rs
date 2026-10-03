@@ -4867,6 +4867,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.attached_pty_id.set(None);
         self.global.platform.set_process_guest_pid(new_pid);
         self.install_proc_live_views();
+        // A forked child that never `execve`s keeps its parent's `comm`/`cmdline`, so the
+        // inherited row above is exactly what other host processes must see it as.
+        self.xproc_publish_identity(new_pid, old_pid);
     }
 
     /// Points this process's `/proc/self/{task,fd}` views at ITS OWN thread list and fd table.
@@ -6396,6 +6399,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .proc_self_info
                 .write()
                 .inherit(self.pid.get(), pid);
+            // Same as `install_task_state`/`load_program`: the child has no row in any OTHER host
+            // process, so its inherited identity goes into the shared registry.
+            self.xproc_publish_identity(pid, self.pid.get());
             // A child inherits its parent's seccomp filters and `no_new_privs`, as on real Linux.
             // `/proc/self/status`'s `Seccomp:`/`NoNewPrivs:` lines came along with `inherit`.
             thread.process.seccomp.inherit_from(&self.process().seccomp);
@@ -7530,6 +7536,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     environ,
                     pid: self.pid.get(),
                     comm,
+                    ppid: self.ppid.get(),
                     auxv: alloc::vec::Vec::new(),
                     maps: None,
                     tids: None,
@@ -7557,6 +7564,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         self.global.proc_self_info.write().set(self.pid.get(), info);
+        // This process runs in its OWN host process, so the only way any sibling host process can
+        // name it in `/proc` is through the shared registry -- publish what the row just restored.
+        self.xproc_publish_identity(self.pid.get(), self.ppid.get());
         Some(())
     }
 
@@ -8773,6 +8783,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tids: None,
                     fds: None,
                     statm: None,
+                    ppid: self.ppid.get(),
                     no_new_privs: false,
                     seccomp_mode: 0,
                 },
@@ -8827,6 +8838,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .proc_self_info
             .write()
             .with_mut(self.pid.get(), |info| info.auxv = load_info.auxv.clone());
+
+        // `comm`/`cmdline` are final now, so publish them for every OTHER host process: under
+        // `LITEBOX_PROCESS_FORK=1` this pid's `/proc` entry is read from processes that have no
+        // `ProcSelfTable` row for it at all.
+        self.xproc_publish_identity(self.pid.get(), self.ppid.get());
 
         self.set_task_comm(loader.comm());
 

@@ -20,8 +20,11 @@
 //! target then applies whatever it does for them in-process, and this module adds no
 //! job-control stop semantics of its own.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::signal::Signal;
@@ -31,6 +34,13 @@ use crate::{GlobalStateHandle, ShimFS, ShimPlatform, Task};
 
 pub(crate) const SHARED_PROCESS_CAPACITY: usize = 512;
 pub(crate) const NO_SLOT: u32 = u32::MAX;
+
+/// `/proc/[pid]/comm` is `TASK_COMM_LEN` (16) bytes on real Linux, NUL included.
+const COMM_MAX: usize = 16;
+/// `/proc/[pid]/cmdline` is unbounded on real Linux, but a slot in a fixed-size shared table
+/// cannot be: this budget is what one process's `argv` gets, and a longer one is truncated to it
+/// (what `ps` does to a terminal width anyway). 512 slots x this is the whole cost.
+const CMDLINE_MAX: usize = 512;
 
 const SLOT_FREE: i32 = 0;
 const SLOT_CLAIMING: i32 = -1;
@@ -55,6 +65,64 @@ impl ProcessSlot {
     }
 }
 
+/// The `/proc`-visible identity of one registered pid: the fields of
+/// `litebox::fs::procfs::ProcSelfInfo` that do NOT depend on which host process is asking.
+///
+/// Kept OUT of [`SharedProcessTable`]'s own inline bytes and allocated as its own arena slice, for
+/// the reason `SharedUnixConnTable` documents: `GlobalState` is built as a value in the creating
+/// process, and 512 slots of this would put ~280 KiB of it on that stack. Pointer-free and
+/// fixed-size, so it is safe to read from any host process of the fork family and holds nothing
+/// process-relative.
+///
+/// Byte-wise, not `Mutex`-guarded: this is read from an arbitrary host process, possibly while the
+/// owner is mid-`execve`, and a cross-process lock on a `/proc` read is exactly the "no path may
+/// block" rule this codebase already paid for. A reader can therefore see a torn
+/// `comm`/`cmdline` during a rewrite -- real `/proc` has the same race, and the answer here is
+/// informational. Lengths are always clamped to the array they name, so a torn length can never
+/// read out of bounds.
+struct ProcIdentitySlot {
+    pid: AtomicI32,
+    ppid: AtomicI32,
+    comm_len: AtomicUsize,
+    cmdline_len: AtomicUsize,
+    comm: [AtomicU8; COMM_MAX],
+    cmdline: [AtomicU8; CMDLINE_MAX],
+}
+
+impl ProcIdentitySlot {
+    const fn new() -> Self {
+        Self {
+            pid: AtomicI32::new(0),
+            ppid: AtomicI32::new(0),
+            comm_len: AtomicUsize::new(0),
+            cmdline_len: AtomicUsize::new(0),
+            comm: [const { AtomicU8::new(0) }; COMM_MAX],
+            cmdline: [const { AtomicU8::new(0) }; CMDLINE_MAX],
+        }
+    }
+
+    /// Copies up to `field.len()` bytes of `src` in, and records how many. Relaxed: the
+    /// publishing `Release` store of `pid` is what orders this for a reader.
+    fn store_bytes(field: &[AtomicU8], len: &AtomicUsize, src: &[u8]) {
+        let n = src.len().min(field.len());
+        for (i, b) in src[..n].iter().enumerate() {
+            field[i].store(*b, Ordering::Relaxed);
+        }
+        len.store(n, Ordering::Relaxed);
+    }
+
+    /// The bytes recorded in `field`. Clamped, so a concurrent rewrite can at worst shorten the
+    /// answer, never overrun the array.
+    fn load_bytes(field: &[AtomicU8], len: &AtomicUsize) -> alloc::vec::Vec<u8> {
+        let n = len.load(Ordering::Acquire).min(field.len());
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(field[i].load(Ordering::Relaxed));
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SlotView {
     pub(crate) index: u32,
@@ -66,13 +134,118 @@ pub(crate) struct SlotView {
 
 pub(crate) struct SharedProcessTable {
     slots: [ProcessSlot; SHARED_PROCESS_CAPACITY],
+    /// `/proc`-visible identity, one slot per element of `slots`, indexed by the SAME index.
+    /// Lives in the shared arena (see [`ProcIdentitySlot`]); `identity_shared` is `false` only
+    /// when that allocation failed, in which case this slice is empty and every identity
+    /// read/write is a no-op -- a pointer to a process-private fallback must never be stored in
+    /// `GlobalState`, because a sibling host process would dereference an address it never
+    /// mapped.
+    identity: &'static mut [ProcIdentitySlot],
+    identity_shared: bool,
 }
 
 impl SharedProcessTable {
-    pub(crate) fn new() -> Self {
+    /// `platform` is only used for the one shared-arena allocation below, so it is taken as an
+    /// `impl` argument rather than made a type parameter of this table: the table itself holds
+    /// nothing platform-shaped, and `GlobalState`'s field would then need a `PhantomData`.
+    pub(crate) fn new(platform: &impl litebox::platform::SharedKernelStateProvider) -> Self {
+        let layout = core::alloc::Layout::array::<ProcIdentitySlot>(SHARED_PROCESS_CAPACITY)
+            .expect("SHARED_PROCESS_CAPACITY identity-slot-array layout cannot overflow");
+        let (ptr, identity_shared) = match platform.shared_kernel_arena_alloc_bytes(layout) {
+            Some(p) => (p.cast::<ProcIdentitySlot>(), true),
+            None => {
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared process table: shared kernel arena exhausted; /proc/<pid> identity is \
+                     not visible across host processes"
+                );
+                (core::ptr::NonNull::<ProcIdentitySlot>::dangling(), false)
+            }
+        };
+        let count = if identity_shared {
+            SHARED_PROCESS_CAPACITY
+        } else {
+            0
+        };
+        for i in 0..count {
+            // SAFETY: `ptr` names `count` contiguous `ProcIdentitySlot`s per `layout`, so
+            // `add(i)` stays inside that region; writing a freshly built value into
+            // uninitialized memory (rather than dropping a prior one) is what `write` is for.
+            // One slot at a time, so the largest value ever built on the stack is ~550 bytes.
+            unsafe {
+                ptr.as_ptr().add(i).write(ProcIdentitySlot::new());
+            }
+        }
         Self {
             slots: [const { ProcessSlot::new() }; SHARED_PROCESS_CAPACITY],
+            // SAFETY: `ptr` is non-null and aligned per `layout`, and the loop above initialized
+            // `count` slots at it. `'static` is sound because the arena allocation is never
+            // reclaimed and nothing else holds a reference to it.
+            identity: unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), count) },
+            identity_shared,
         }
+    }
+
+    /// The identity slot paired with `index`, when it names `pid` -- `None` when identity is
+    /// unavailable (arena allocation failed) or that slot has not been published for `pid`.
+    fn identity_slot(&self, index: u32, pid: i32) -> Option<&ProcIdentitySlot> {
+        if !self.identity_shared || pid <= 0 {
+            return None;
+        }
+        let slot = self.identity.get(index as usize)?;
+        (slot.pid.load(Ordering::Acquire) == pid).then_some(slot)
+    }
+
+    /// Publishes what `/proc/<pid>/{comm,cmdline,stat}` render for a pid running in another host
+    /// process. No-op when `pid` is not registered or identity is unavailable: a name is nice to
+    /// have, never worth failing an `execve` over.
+    pub(crate) fn publish_identity(&self, pid: i32, parent: i32, comm: &str, cmdline: &[u8]) {
+        let Some(index) = self.find(pid) else {
+            return;
+        };
+        let Some(slot) = self.identity_slot(index, pid).or_else(|| {
+            // Never published before: claim it by stamping `pid` first, so a reader either sees
+            // an empty record or a complete one.
+            let slot = self.identity.get(index as usize)?;
+            slot.pid.store(pid, Ordering::Relaxed);
+            Some(slot)
+        }) else {
+            return;
+        };
+
+        // Blank the record before refilling it, so a reader never sees one pid's `comm` under
+        // another pid's slot (pids are recycled). The `Release` store of `pid` at the end is what
+        // publishes all of it.
+        slot.comm_len.store(0, Ordering::Relaxed);
+        slot.cmdline_len.store(0, Ordering::Relaxed);
+        slot.ppid.store(parent, Ordering::Relaxed);
+        ProcIdentitySlot::store_bytes(&slot.comm, &slot.comm_len, comm.as_bytes());
+        ProcIdentitySlot::store_bytes(&slot.cmdline, &slot.cmdline_len, cmdline);
+        slot.pid.store(pid, Ordering::Release);
+    }
+
+    /// `pid`'s published identity as `(ppid, comm, cmdline)`, when the registry has one.
+    pub(crate) fn identity_of(
+        &self,
+        pid: i32,
+    ) -> Option<(i32, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+        let index = self.find(pid)?;
+        let slot = self.identity_slot(index, pid)?;
+        let parent = slot.ppid.load(Ordering::Relaxed);
+        Some((
+            parent,
+            ProcIdentitySlot::load_bytes(&slot.comm, &slot.comm_len),
+            ProcIdentitySlot::load_bytes(&slot.cmdline, &slot.cmdline_len),
+        ))
+    }
+
+    fn clear_identity(&self, index: u32) {
+        let Some(slot) = self.identity.get(index as usize) else {
+            return;
+        };
+        slot.comm_len.store(0, Ordering::Relaxed);
+        slot.cmdline_len.store(0, Ordering::Relaxed);
+        slot.pid.store(0, Ordering::Release);
     }
 
     fn slot(&self, index: u32, pid: i32) -> Option<&ProcessSlot> {
@@ -143,6 +316,11 @@ impl SharedProcessTable {
                     )
                     .is_ok()
                 {
+                    // A recycled slot must not keep the previous occupant's `comm`/`cmdline`:
+                    // pids are reused, and a stale name is a wrong answer rather than an absent
+                    // one. Cleared before `pid` is published, so the slot is empty until whoever
+                    // owns the new pid publishes into it.
+                    self.clear_identity(i as u32);
                     slot.host_pid.store(host_pid, Ordering::Relaxed);
                     slot.pgid.store(pgid, Ordering::Relaxed);
                     slot.pending.store(0, Ordering::Relaxed);
@@ -159,12 +337,17 @@ impl SharedProcessTable {
     }
 
     fn reclaim_dead_hosts(&self, host_alive: &impl Fn(u32) -> bool) {
-        for slot in &self.slots {
+        for (i, slot) in self.slots.iter().enumerate() {
             let pid = slot.pid.load(Ordering::Acquire);
             if pid > 0 && !host_alive(slot.host_pid.load(Ordering::Acquire)) {
-                let _ =
+                let reclaimed =
                     slot.pid
                         .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire);
+                // Only on success: a failed CAS means someone else owns this slot now, and
+                // clearing it would drop a live process's identity.
+                if reclaimed.is_ok() {
+                    self.clear_identity(i as u32);
+                }
             }
         }
     }
@@ -191,6 +374,7 @@ impl SharedProcessTable {
         if let Some(index) = self.find(pid) {
             let slot = &self.slots[index as usize];
             slot.pending.store(0, Ordering::Relaxed);
+            self.clear_identity(index);
             let _ = slot
                 .pid
                 .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire);
@@ -247,6 +431,41 @@ pub(crate) fn pid_is_known(pid: i32) -> bool {
     // the same address in each host process, so the reference is valid in whichever one runs this.
     let table = unsafe { &*(raw as *const SharedProcessTable) };
     table.find(pid).is_some()
+}
+
+/// Every guest pid registered anywhere in the fork family, for `readdir("/proc")`.
+///
+/// This is what makes `ls /proc` list the whole session: [`pid_is_known`] answers one pid at a
+/// time and cannot produce a listing, and the caller's own `ProcSelfTable` only ever holds the
+/// pids of one host process -- which under `LITEBOX_PROCESS_FORK=1` is one process out of dozens.
+/// Takes NO lock (the registry is a fixed array of atomics) so a `/proc` read can never block on
+/// another host process's bookkeeping, and is bounded by [`SHARED_PROCESS_CAPACITY`].
+pub(crate) fn live_pids() -> alloc::vec::Vec<i32> {
+    let raw = PUBLISHED_PROCESS_TABLE.load(Ordering::Acquire);
+    if raw == 0 {
+        return alloc::vec::Vec::new();
+    }
+    // SAFETY: as in `pid_is_known`.
+    let table = unsafe { &*(raw as *const SharedProcessTable) };
+    table.members().map(|view| view.pid).collect()
+}
+
+/// `pid`'s published identity, for `/proc/<pid>/{comm,cmdline,stat}` when the process runs in
+/// another host process. `None` when it is not registered or has published nothing, which leaves
+/// those files empty rather than `ENOENT` -- see `litebox::fs::procfs::PidIdentity`.
+pub(crate) fn pid_identity(pid: i32) -> Option<litebox::fs::procfs::PidIdentity> {
+    let raw = PUBLISHED_PROCESS_TABLE.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: as in `pid_is_known`.
+    let table = unsafe { &*(raw as *const SharedProcessTable) };
+    let (ppid, comm, cmdline) = table.identity_of(pid)?;
+    Some(litebox::fs::procfs::PidIdentity {
+        ppid,
+        comm: String::from_utf8_lossy(&comm).into_owned(),
+        cmdline,
+    })
 }
 
 const GRACEFUL_SIGKILL_EXIT_LIMIT_MS: u32 = 1000;
@@ -373,6 +592,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .register(child_pid, host, pgid, false, |h| {
                 platform.is_process_alive(h)
             });
+    }
+
+    /// Publishes this process's `comm`/`cmdline`/`ppid` into the shared registry, so `/proc/<pid>`
+    /// can name it from ANOTHER host process. Called wherever the local `ProcSelfTable` gains or
+    /// replaces a row -- `execve`, `clone`, and a cross-process fork child restoring its carried
+    /// identity -- because that row is precisely the data no sibling process can reach.
+    ///
+    /// A no-op when this pid has no row yet or no registry slot: a name in `/proc` is worth
+    /// having, never worth failing an `execve` over.
+    pub(crate) fn xproc_publish_identity(&self, pid: i32, ppid: i32) {
+        let Some(info) = self.global.proc_self_info.read().portable_snapshot(pid) else {
+            return;
+        };
+        self.global
+            .process_table
+            .publish_identity(pid, ppid, info.comm.as_str(), &info.cmdline);
     }
 
     /// Points a pre-registered child's slot at the host process `spawn_cross_process_fork_child`

@@ -43,6 +43,11 @@ pub struct ProcSelfInfo {
     /// Command name (`argv[0]`'s basename, truncated to 15 bytes on real Linux), for `stat`'s
     /// `comm` field and `status`'s `Name:` field.
     pub comm: String,
+    /// Parent pid, for `stat`'s `ppid` field and `status`'s `PPid:` field. `0` means "unknown",
+    /// which [`format_stat`] renders the way it always did (everything is init's child); only a
+    /// row that really knows its parent -- an `execve`'d or `clone`d process, or one rebuilt from
+    /// the cross-process registry -- carries a value.
+    pub ppid: i32,
     /// The process's auxiliary vector in `/proc/[pid]/auxv` form: `(a_type, a_val)` `usize` pairs
     /// in native byte order, terminated by an `AT_NULL` pair. Supplied by the loader from the bytes
     /// it wrote to the initial stack, so the two cannot disagree; load-bearing for rustix -- see gm
@@ -74,10 +79,26 @@ pub struct ProcSelfInfo {
 /// plausible rather than zero.
 pub const FAKE_BOOT_UPTIME_SECS: u64 = 3600;
 
+/// The `ppid` `/proc/[pid]/stat` and `/proc/[pid]/status` report for `info`.
+///
+/// A row that predates `ppid` (or one built for a pid nobody can place -- the caller's own, when
+/// it has no row) says `0`, and those keep the value this file always rendered: everything except
+/// init is init's child. A row that knows better reports its real parent, which is what makes
+/// `ps -ef` and `htop`'s tree view draw a tree.
+fn stat_ppid(info: &ProcSelfInfo) -> i32 {
+    if info.pid == 1 {
+        0
+    } else if info.ppid > 0 {
+        info.ppid
+    } else {
+        1
+    }
+}
+
 /// Real `/proc/[pid]/stat`: 52 whitespace-separated fields, `comm` parenthesized so readers split
 /// on the LAST `)`. `libgtop` parses it positionally -- see gm mutable `mut-1789043806784`.
 fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
-    let ppid = if info.pid == 1 { 0 } else { 1 };
+    let ppid = stat_ppid(info);
     let start_ticks = FAKE_BOOT_UPTIME_SECS.saturating_sub(5) * 100;
     format!(
         "{pid} ({comm}) R {ppid} {pid} {pid} 0 -1 4194560 100 0 0 0 50 20 0 0 20 0 1 0 {start_ticks}          1073741824 20000 18446744073709551615 4194304 4194305 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0          4194304 4194305 4194305 0 0 0 0 0
@@ -92,10 +113,11 @@ fn format_stat(info: &ProcSelfInfo) -> Vec<u8> {
 /// keys are omitted rather than guessed -- see gm mutable `mut-1789043822948`.
 fn format_status(info: &ProcSelfInfo) -> Vec<u8> {
     format!(
-        "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nNoNewPrivs:\t{}\nSeccomp:\t{}\n",
+        "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nNoNewPrivs:\t{}\nSeccomp:\t{}\n",
         info.comm,
         info.pid,
         info.pid,
+        stat_ppid(info),
         u8::from(info.no_new_privs),
         info.seccomp_mode
     )
@@ -330,9 +352,10 @@ fn format_uptime(uptime_secs: u64) -> Vec<u8> {
 
 /// How to ask whether guest `pid` exists ANYWHERE in this fork family -- something
 /// [`ProcSelfTable`] cannot answer, because it only holds the pids of THIS host process. Under
-/// `LITEBOX_PROCESS_FORK=1` a pid running in a sibling Windows process is therefore invisible to
+/// `LITEBOX_PROCESS_FORK=1` a pid running in a sibling Windows process was therefore invisible to
 /// `/proc/<pid>`, which answered `ENOENT` for a process that was plainly alive (live Chromium
-/// run: `/proc/57/status`, `/proc/41/task`, `/proc/57/task` all `errno=2`).
+/// run: `/proc/57/status`, `/proc/41/task`, `/proc/57/task` all `errno=2`) -- which is what this
+/// hook exists to fix.
 ///
 /// A plain `fn` pointer rather than a closure, for the same reason `crate::fs::ident` registers
 /// its callbacks this way: this module is compiled into every host process of the fork family, so
@@ -359,15 +382,86 @@ fn pid_known(pid: i32) -> bool {
     f(pid)
 }
 
+/// Everyone [`pid_known`] can name, for `/proc`'s own directory listing.
+///
+/// [`pid_known`] alone cannot produce that listing: "does this one pid exist" is the wrong
+/// question when the answer has to be a set, and guessing pids one by one would be unbounded.
+/// The shim registers the one function that can enumerate the shared registry. Unset, `/proc`
+/// lists only this host process's own pids, which is exactly the one-process view this fixes.
+static PID_LIST_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The parts of a guest process's identity that live in the cross-process registry rather than in
+/// the host process running it: what `/proc/<pid>/{comm,cmdline,stat}` render for a pid this host
+/// process has no [`ProcSelfInfo`] row for.
+///
+/// Bounded on the registry's side (see the shim's `SharedProcessTable`): `comm` is truncated to
+/// real Linux's `TASK_COMM_LEN` and `cmdline` to a fixed byte budget, so a slot is a fixed-size,
+/// pointer-free record with no allocation of its own -- the `String`/`Vec` here are built in the
+/// READING process's own heap, never stored in shared memory.
+pub struct PidIdentity {
+    pub ppid: i32,
+    pub comm: String,
+    /// NUL-separated `argv`, real Linux `/proc/[pid]/cmdline` format.
+    pub cmdline: Vec<u8>,
+}
+
+/// How to ask the shared registry for [`PidIdentity`]. Unset (or `None` for a pid that registered
+/// without publishing one), `/proc/<pid>/{comm,cmdline}` answer empty rather than `ENOENT`: real
+/// Linux always answers those files for a pid that exists, and a `readdir` entry that `ENOENT`s on
+/// `open` breaks an enumerator mid-walk, which is strictly worse than an empty field.
+static PID_IDENTITY_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Registers how to enumerate every live guest pid in this fork family.
+pub fn set_pid_list_fn(f: fn() -> Vec<i32>) {
+    PID_LIST_FN.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Registers how to look up a pid's cross-process identity.
+pub fn set_pid_identity_fn(f: fn(i32) -> Option<PidIdentity>) {
+    PID_IDENTITY_FN.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every live guest pid across the fork family; empty when no shim registered a source.
+///
+/// Non-blocking by contract: the registry is a fixed array of atomics, so the shim's
+/// implementation takes no lock and cannot contend with anything. Being unbounded is the one way
+/// this could break that contract, so the hook's result is capped here rather than trusted.
+fn pid_list() -> Vec<i32> {
+    let raw = PID_LIST_FN.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return Vec::new();
+    }
+    // SAFETY: only `set_pid_list_fn` stores here, and it stores exactly this fn type.
+    let f: fn() -> Vec<i32> = unsafe { core::mem::transmute(raw) };
+    let mut pids = f();
+    pids.truncate(MAX_SHARED_PIDS);
+    pids
+}
+
+/// `pid`'s cross-process identity, when the registry has one.
+fn pid_identity(pid: i32) -> Option<PidIdentity> {
+    let raw = PID_IDENTITY_FN.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: only `set_pid_identity_fn` stores here, and it stores exactly this fn type.
+    let f: fn(i32) -> Option<PidIdentity> = unsafe { core::mem::transmute(raw) };
+    f(pid)
+}
+
+/// Ceiling on how many pids [`pid_list`] will ever hand to a directory listing. A registry that
+/// reports more is truncated rather than trusted: `readdir` of `/proc` is a guest-reachable loop
+/// over another process's bookkeeping, and its cost has to be bounded here, not there.
+const MAX_SHARED_PIDS: usize = 4096;
+
 /// A [`Backend`] serving the static/host-derived `/proc` flat files that need no per-process state
-/// -- the exact set is `ProcfsEntry::ALL`, PLUS one subdirectory per pid [`ProcSelfTable`] tracks
-/// (`stat`/`status`/`cmdline`/`comm`/`statm`, reusing the same renderers `/proc/self` uses -- see
-/// [`ProcfsDirHandle::Pid`]). Mounted at `/proc`; still not a GENERAL procfs -- real Linux's full
-/// `/proc/<pid>` file set is not reproduced (no `exe`/`fd`/`maps`/`environ`). A pid directory
-/// exists when this host process's [`ProcSelfTable`] has a row for it, when it is the caller's
-/// own pid, or when the shim's cross-process table says some host process in this fork family runs
-/// it (see [`set_pid_known_fn`]) -- the last of those is what makes `/proc/<pid>` answer at all
-/// under `LITEBOX_PROCESS_FORK=1`, where the pid's row lives in a different host process.
+/// -- the exact set is `ProcfsEntry::ALL`, PLUS one subdirectory per live guest pid. Still not a
+/// GENERAL procfs -- real Linux's full `/proc/<pid>` file set is not reproduced (no
+/// `exe`/`fd`/`maps`/`environ`). The pid directories are the union of this host process's
+/// [`ProcSelfTable`] rows and every pid the shim's cross-process registry reports, so under
+/// `LITEBOX_PROCESS_FORK=1` -- where a sibling host process runs most of the session -- `ls /proc`
+/// names the whole session instead of the one pid this host process owns. Per-pid CONTENT for a
+/// pid running elsewhere comes from that registry's [`PidIdentity`] (see [`set_pid_identity_fn`]).
 /// Real Linux's own `ps`/`procps` library needs at minimum its own
 /// `/proc/<self-pid>/stat` to open successfully -- see gm mutable `mut-1789043963534`.
 pub struct Procfs<Platform>
@@ -446,10 +540,23 @@ where
         if let Some(info) = self.proc_self_info.read().get(pid).cloned() {
             return Some(info);
         }
-        (self.caller_pid() == Some(pid) || pid_known(pid)).then(|| ProcSelfInfo {
+        if self.caller_pid() != Some(pid) && !pid_known(pid) {
+            return None;
+        }
+        // A pid running in another host process: no row here, so everything that comes from the
+        // owning process's own state (environ, auxv, exe, statm, maps) is genuinely unavailable.
+        // What the shared registry DOES carry -- comm, cmdline, ppid -- is filled in below, so
+        // `ps` renders a real row instead of a nameless pid.
+        let mut info = ProcSelfInfo {
             pid,
             ..ProcSelfInfo::default()
-        })
+        };
+        if let Some(identity) = pid_identity(pid) {
+            info.ppid = identity.ppid;
+            info.comm = identity.comm;
+            info.cmdline = identity.cmdline;
+        }
+        Some(info)
     }
 
     /// The thread ids `/proc/<pid>/task` lists. Falls back to `pid` itself when the process
@@ -802,6 +909,14 @@ where
         let handle = handle.into_typed::<Self>();
         match handle {
             ProcfsDirHandle::Root => {
+                // EVERY live guest pid, not just this host process's: under
+                // `LITEBOX_PROCESS_FORK=1` the session spans many host processes and a listing
+                // limited to this one is a one-process system to `ps`/`top`/`pgrep`. Read before
+                // taking the table lock, so the lock is held for as little as possible.
+                let mut pids = pid_list();
+                pids.extend(self.proc_self_info.read().pids());
+                pids.sort_unstable();
+                pids.dedup();
                 let mut entries: Vec<DirEntry> = ProcfsEntry::ALL
                     .iter()
                     .map(|(n, _)| DirEntry {
@@ -810,17 +925,11 @@ where
                         ino_info: None,
                     })
                     .collect();
-                entries.extend(
-                    self.proc_self_info
-                        .read()
-                        .pids()
-                        .into_iter()
-                        .map(|pid| DirEntry {
-                            name: format!("{pid}"),
-                            file_type: FileType::Directory,
-                            ino_info: None,
-                        }),
-                );
+                entries.extend(pids.into_iter().map(|pid| DirEntry {
+                    name: format!("{pid}"),
+                    file_type: FileType::Directory,
+                    ino_info: None,
+                }));
                 Ok(entries)
             }
             ProcfsDirHandle::Pid(_) => {
@@ -1058,13 +1167,15 @@ impl ProcSelfTable {
 
     /// Gives `child` its own copy of `parent`'s entry, on a process `clone()`.
     ///
-    /// A child not yet `execve`'d runs its parent's binary and argv, so only `pid` differs; `maps`
-    /// is NOT inherited, closing over the parent's page manager. gm mutable `mut-1789043924408`.
+    /// A child not yet `execve`'d runs its parent's binary and argv, so only `pid` differs (and
+    /// `ppid`, which becomes the parent's -- the copy still names the grandparent); `maps` is NOT
+    /// inherited, closing over the parent's page manager. gm mutable `mut-1789043924408`.
     pub fn inherit(&mut self, parent: i32, child: i32) {
         let Some(mut info) = self.by_pid.get(&parent).cloned() else {
             return;
         };
         info.pid = child;
+        info.ppid = parent;
         info.maps = None;
         info.tids = None;
         info.fds = None;
@@ -1125,7 +1236,8 @@ impl ProcSelfTable {
         Some(info)
     }
 
-    /// Every pid this table currently has an entry for, for `/proc`'s own directory listing.
+    /// Every pid this table currently has an entry for -- this host process's own contribution to
+    /// `/proc`'s directory listing; the rest comes from [`pid_list`].
     fn pids(&self) -> Vec<i32> {
         self.by_pid.keys().copied().collect()
     }
