@@ -1336,6 +1336,9 @@ where
         fd: &SocketFd<Platform>,
         behavior: CloseBehavior,
     ) -> Result<(), CloseError> {
+        // Taken before the descriptor table is borrowed: the closure below needs
+        // `&mut self.socket_set`, so it cannot also borrow all of `self` to ask for the time.
+        let now = self.now();
         let mut dt = self.litebox.descriptor_table_mut();
         // We close immediately if we can
         match dt
@@ -1369,7 +1372,25 @@ where
                     // FIN and ACK -- no payload at all. It reproduced as a RACE, working whenever
                     // logging slowed the run enough for the drain to happen first, which is what a
                     // discarded buffer looks like from the outside.
-                    CloseBehavior::Graceful | CloseBehavior::GracefulIfNoPendingData => {}
+                    CloseBehavior::Graceful | CloseBehavior::GracefulIfNoPendingData => {
+                        // Hand the guest's queued bytes to smoltcp BEFORE deciding whether this
+                        // socket has to stay open. The TX ring is a plain `HeapRb` in THIS
+                        // process's heap (`socket_channel.rs`) and the descriptor lives in this
+                        // process's table, so once this process is gone root's
+                        // `drain_all_socket_channel_buffers` -- which walks root's OWN descriptor
+                        // table -- can never reach those bytes. Measured: a guest that wrote a
+                        // 43-byte response, closed and exited at once delivered NOTHING at all,
+                        // while the same write with a 0.3s pause before exiting delivered it
+                        // (`sock9`/`sock10`). After this call smoltcp owns the bytes, and smoltcp
+                        // lives in the shared socket set, so root transmits them -- and the FIN
+                        // `close_handle` queues -- even if this process dies the instant
+                        // `close()` returns.
+                        Self::drain_socket_channel_buffers(
+                            &mut self.socket_set,
+                            &entry.entry,
+                            now,
+                        );
+                    }
                 }
                 // check if there is pending data to be sent
                 let socket_handle = &entry.entry;
@@ -1392,11 +1413,21 @@ where
                 if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
                     return true;
                 }
-                !socket_handle.with_socket(
+                let queued = socket_handle.with_socket(
                     &self.socket_set,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
                     |udp_socket| udp_socket.is_open() && udp_socket.send_queue() > 0,
-                )
+                );
+                if matches!(behavior, CloseBehavior::Graceful) {
+                    // `close(2)` with linger unset: Linux takes the queued bytes, sends FIN after
+                    // them, and returns immediately -- it does not wait. Deferring here instead
+                    // leaves the FIN to a `close_pending_sockets` tick in THIS process, which a
+                    // process that exits right after `close()` never gets, so the peer saw neither
+                    // the payload nor a FIN. `close_handle` below queues this socket's FIN on
+                    // descriptor-independent state, so root finishes the exchange either way.
+                    return true;
+                }
+                !queued
             })
             .ok_or(CloseError::InvalidFd)?
         {
