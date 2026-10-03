@@ -710,7 +710,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         net: litebox::sync::Mutex::new(net),
                         boot_time: self.platform.now(),
                         next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-                        live_cross_process_fork_children: core::sync::atomic::AtomicU32::new(0),
+                        cross_process_fork_slots: core::array::from_fn(|_| {
+                            core::sync::atomic::AtomicU32::new(CROSS_PROCESS_FORK_SLOT_FREE)
+                        }),
                         native_vfork_gates: litebox::sync::Mutex::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -1249,6 +1251,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         // This process is the whole of its own host process, so a remote `SIGKILL` may end it
         // by terminating the host process.
         entrypoints.task.xproc_register_self(true);
+        // The rootfs the admission bound protects is already rebuilt here, so the slot is given
+        // back now rather than at a `wait4()` a long-lived child may never reach. See
+        // `cross_process_fork_slots`.
+        self.0.release_cross_process_fork_slot_for_child(self.0.platform.current_host_pid());
         entrypoints
     }
 
@@ -3724,6 +3730,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             litebox: &self.litebox,
         }
     }
+
+    /// See `cross_process_fork_slots` for what a slot bounds and why it is keyed, not counted.
+    pub(crate) fn try_take_cross_process_fork_slot(&self) -> Option<usize> {
+        use core::sync::atomic::Ordering;
+        for (idx, slot) in self.cross_process_fork_slots.iter().enumerate() {
+            if slot
+                .compare_exchange(
+                    CROSS_PROCESS_FORK_SLOT_FREE,
+                    CROSS_PROCESS_FORK_SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// A no-op if the child already released the slot itself: it does that as soon as it has its
+    /// own `GlobalState`, which can beat this call.
+    pub(crate) fn bind_cross_process_fork_slot(&self, idx: usize, child_host_pid: u32) {
+        use core::sync::atomic::Ordering;
+        if child_host_pid == CROSS_PROCESS_FORK_SLOT_FREE
+            || child_host_pid == CROSS_PROCESS_FORK_SLOT_RESERVED
+        {
+            return;
+        }
+        if let Some(slot) = self.cross_process_fork_slots.get(idx) {
+            let _ = slot.compare_exchange(
+                CROSS_PROCESS_FORK_SLOT_RESERVED,
+                child_host_pid,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub(crate) fn release_unbound_cross_process_fork_slot(&self, idx: usize) {
+        if let Some(slot) = self.cross_process_fork_slots.get(idx) {
+            slot.store(
+                CROSS_PROCESS_FORK_SLOT_FREE,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    pub(crate) fn release_cross_process_fork_slot_for_child(&self, child_host_pid: u32) {
+        use core::sync::atomic::Ordering;
+        if child_host_pid == CROSS_PROCESS_FORK_SLOT_FREE
+            || child_host_pid == CROSS_PROCESS_FORK_SLOT_RESERVED
+        {
+            return;
+        }
+        for slot in &self.cross_process_fork_slots {
+            if slot
+                .compare_exchange(
+                    child_host_pid,
+                    CROSS_PROCESS_FORK_SLOT_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Only read by `reserve_cross_process_fork_slot`'s admission-timeout warning, at most once per
+    /// 8s per fork, so the linear scan is free.
+    pub(crate) fn cross_process_fork_slots_occupied(&self) -> usize {
+        self.cross_process_fork_slots
+            .iter()
+            .filter(|slot| {
+                slot.load(core::sync::atomic::Ordering::Acquire) != CROSS_PROCESS_FORK_SLOT_FREE
+            })
+            .count()
+    }
 }
 
 /// The shared `Pipes` bound to the calling process's `LiteBox`; forwards each operation with it.
@@ -3817,6 +3903,13 @@ impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
         self.pipes.with_iopollable(self.litebox, fd, f)
     }
 }
+/// Bounds how many cross-process-fork children may be starting at once; see
+/// `cross_process_fork_slots` for what "starting" costs and why it is bounded.
+pub(crate) const CROSS_PROCESS_FORK_SLOT_COUNT: usize = 6;
+const CROSS_PROCESS_FORK_SLOT_FREE: u32 = 0;
+/// Needed as a distinct state because the reservation is made before `CreateProcessW`, so there is
+/// no host pid to key the slot by until it returns.
+const CROSS_PROCESS_FORK_SLOT_RESERVED: u32 = u32::MAX;
 
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
@@ -3859,28 +3952,29 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
-    /// Count of cross-process-fork children (`LITEBOX_PROCESS_FORK=1`) that have been spawned
-    /// (`CreateProcessW` succeeded) but not yet reaped by their parent's `wait4()` -- a plain
-    /// `AtomicU32` field of this same struct, free-riding on `GlobalState`'s own cross-process
-    /// sharing exactly like `unix_addr_presence` below, so every process in the fork FAMILY
-    /// (not just direct parent/child pairs) observes the same live count.
+    /// Admission slots bounding how many cross-process-fork children (`LITEBOX_PROCESS_FORK=1`) may
+    /// be STARTING at once -- [`CROSS_PROCESS_FORK_SLOT_FREE`] once released,
+    /// [`CROSS_PROCESS_FORK_SLOT_RESERVED`] from the moment a parent reserves one until it learns
+    /// the spawned child's host pid, then that pid until the slot is released. A fixed-size array
+    /// of plain `AtomicU32`s inside this same struct, free-riding on `GlobalState`'s own cross-
+    /// process sharing exactly like `unix_addr_presence` below, so every process in the fork FAMILY
+    /// (not just direct parent/child pairs) observes the same slots.
     ///
-    /// Root-caused 76th pass: each cross-process-fork child independently rebuilds its entire
-    /// merged/rewritten OCI rootfs into its own private heap on startup (~350MB-1.1GB working
-    /// set observed live, `.wfgy/pass76_crater_procsnapshot.txt`), and nothing previously bounded
-    /// how many such children could be simultaneously alive -- a real boot's desktop-startup
-    /// scripts fork in a TREE (parent -> child -> grandchild -> great-grandchild via nested
-    /// command substitutions/subshells), not a flat sequence, so this cost multiplies by tree
-    /// depth x branching factor. A live capture at the crater moment found 33 simultaneous
-    /// `litebox_runner_linux_on_windows_userland.exe` processes, 4 generations deep, ~10.5GB
-    /// combined working set on a 15GB host (0.4GB free), one call stack after another rebuilding
-    /// the identical read-only rootfs. `try_reserve_fork_slot`/`release_fork_slot` (see
-    /// `syscalls::process`) gate `spawn_cross_process_fork_child` on this counter staying under
-    /// [`CROSS_PROCESS_FORK_CONCURRENCY_CAP`], bounding peak transient RAM without changing fork
-    /// correctness (still genuinely cross-process, just admission-controlled) -- a real, deeper
-    /// fix (share the parsed rootfs itself instead of re-deriving it per child) remains open, see
-    /// AGENTS.md.
-    live_cross_process_fork_children: core::sync::atomic::AtomicU32,
+    /// What the bound protects is each child's from-scratch rebuild of the merged/rewritten OCI
+    /// rootfs into its own private heap, which desktop-startup scripts multiply by forking a TREE
+    /// (nested command substitutions/subshells), not a flat sequence. `reserve_cross_process_fork_
+    /// slot` (see `syscalls::process`) gates `spawn_cross_process_fork_child` on one, bounding peak
+    /// transient RAM without changing fork correctness. Measured sizes, and the open deeper fix
+    /// (share the parsed rootfs instead of re-deriving it per child), live in AGENTS.md.
+    ///
+    /// Keyed by pid rather than counted, and held from spawn to STARTUP-COMPLETE rather than to
+    /// reap: the rebuild is over within about a second of a child's life, so a slot held until
+    /// `wait4()` would bill every long-lived child (Xvfb, dbus-daemon, selkies, xfce4-session, ...)
+    /// for its whole lifetime against a budget of six. `release_cross_process_fork_slot_for_child`
+    /// is therefore idempotent and runs from BOTH sides -- the child once it has its own
+    /// `GlobalState`, the parent's reap for a child that died before that -- and clearing by pid
+    /// makes the second call a no-op instead of an undercount that would quietly disable the bound.
+    cross_process_fork_slots: [core::sync::atomic::AtomicU32; CROSS_PROCESS_FORK_SLOT_COUNT],
     /// One gate per native-`fork()` child that was created by `vfork()`/`clone(CLONE_VFORK)`,
     /// keyed by the child's pid. The parent blocks on it (`vfork()` suspends the caller until the
     /// child execs or exits); the child opens it. Lives in the shared kernel heap so the two

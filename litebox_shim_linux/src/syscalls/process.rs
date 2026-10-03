@@ -3175,7 +3175,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.import_cross_process_writable_layer(handle);
             process.reap_cross_process_child(pid);
             self.xproc_unregister(pid);
-            self.release_cross_process_fork_slot();
+            // A no-op unless this child died before releasing its own slot.
+            if let Some(child_host) = self.global.platform.cross_process_child_host_pid(handle) {
+                self.global
+                    .release_cross_process_fork_slot_for_child(child_host);
+            }
             // Forget this child's per-namespace pids NOW that it has been reaped -- not before:
             // `reported_pid` above is the last thing that still needs them, and once the parent
             // has been told the pid it knew this child by, no namespace can name it again.
@@ -3334,7 +3338,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
                     self.xproc_unregister(cross_pid);
-                    self.release_cross_process_fork_slot();
+                    if let Some(child_host) = self.global.platform.cross_process_child_host_pid(handle)
+                    {
+                        self.global
+                            .release_cross_process_fork_slot_for_child(child_host);
+                    }
                     let reported = reported_pid(cross_pid);
                     self.global.pid_namespaces.release(cross_pid);
                     let encoded = decode_cross_process_wait_status(raw_exit);
@@ -3542,37 +3550,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         clippy::similar_names,
         reason = "pid/ppid is standard Unix terminology"
     )]
-    /// Try to satisfy this `fork()` with a child in a genuinely separate Windows process, which
-    /// therefore gets its own address space. Returns the child's handle on success, `None` to
-    /// fall through to the ordinary thread-based fork.
-    ///
-    /// Called BEFORE `pm.duplicate()`, and that ordering is the whole point. A cross-process
-    /// child runs at SOURCE coordinates in its own address space, so it has no use whatsoever for
-    /// an in-process duplicate -- and building one anyway was actively harmful. The duplicate was
-    /// created, moved into a child `ThreadState`, and then dropped when this path returned early;
-    /// that teardown corrupted the parent badly enough to produce 67 unrecoverable AVs and a
-    /// SIGSEGV on `sh -c 'echo A; (echo B); echo C'`, while simply leaking it instead took that to
-    /// zero. Deciding here removes the duplicate rather than trying to tear it down more
-    /// carefully, and saves a full eager address-space copy per fork on top.
-    ///
-    /// Admission control for `spawn_cross_process_fork_child` -- 76th-pass fix for the real-RAM-
-    /// crater root cause: each cross-process-fork child independently rebuilds its entire merged
-    /// OCI rootfs into its own private heap (~350MB-1.1GB working set measured live), and desktop
-    /// startup scripts fork in a TREE via nested command substitutions/subshells, not a flat
-    /// sequence, so nothing previously bounded how many such rootfs-rebuilding children could be
-    /// simultaneously alive at once -- a live capture at the crater moment
-    /// (`.wfgy/pass76_crater_procsnapshot.txt`) found 33 simultaneous host processes, 4
-    /// generations deep, ~10.5GB combined working set on a 15GB host (0.4GB free).
-    ///
-    /// Blocks (bounded, never forever) until `live_cross_process_fork_children` drops below
-    /// [`CROSS_PROCESS_FORK_CONCURRENCY_CAP`], then reserves a slot by incrementing it and
-    /// returns. Always returns eventually -- fails OPEN (proceeds without a reserved slot) once
-    /// [`ADMISSION_POLL_ITERATIONS`] real waits have elapsed, so a parent that never calls
-    /// `wait4()` on a cross-process child (or a child this table otherwise loses track of) can
-    /// never permanently wedge every future fork in the whole fork family -- correctness/liveness
-    /// always wins over the RAM bound. The counter itself is a plain field of the shared-kernel-
-    /// arena `GlobalState` (see that field's own doc comment), so this bound is enforced across
-    /// the WHOLE fork family, not just this one process's direct children.
+    /// Blocks (bounded, never forever) until one of the [`CROSS_PROCESS_FORK_SLOT_COUNT`]
+    /// `cross_process_fork_slots` is free, claims it, and returns its index; see that field's doc
+    /// comment for what a slot bounds. Always returns eventually -- fails OPEN (`None`, proceeding
+    /// without a reserved slot) once [`ADMISSION_POLL_ITERATIONS`] real waits have elapsed, so a
+    /// slot that is somehow never released can never permanently wedge every future fork in the
+    /// whole fork family -- correctness/liveness always wins over the RAM bound.
     ///
     /// Uses `wait_cx().with_timeout(..).sleep()` (the same real, non-busy blocking-wait primitive
     /// `sys_clock_nanosleep` itself is built on), not a `core::hint::spin_loop` busy-wait -- unlike
@@ -3580,49 +3563,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// this expects to wait for another OS process's rootfs rebuild-and-exit (hundreds of ms to
     /// low seconds), and a tight spin for that long would burn a full host CPU core on an already
     /// RAM/CPU-pressured boot -- making exactly the problem this fix targets worse.
-    fn reserve_cross_process_fork_slot(&self) {
-        // 80th pass (2026-09-23): TRIED tightening 6 -> 3, REVERTED after live measurement.
-        // Two fresh `de_only.sh` boots on this same cap=3 binary (both with 76th+77th's fixes
-        // already landed) converged on the SAME WM_POLL n=4 ceiling the cap=6 binary already
-        // reached (77th pass Finding 3) -- a lower-headroom start (5.78GB free) craterd at
-        // WM_POLL n=1/t=92s/18 procs/1.14GB free, a higher-headroom start (~6.8-7GB free)
-        // reached WM_POLL n=4/t=140s/25 procs/0.79GB free before the kill switch, matching
-        // cap=6's own n=4 ceiling exactly, just ~20s slower. Conclusion: the cap value controls
-        // peak INSTANTANEOUS concurrency (18-25 procs vs cap=6's 28-33) but not how far the boot
-        // ultimately gets -- the crater is driven by CUMULATIVE committed memory across the
-        // whole fork history of the boot (WM_POLL's own 12-iteration retry loop keeps forking
-        // `xprop` every 5s regardless of the cap), not by how many fork children are alive at
-        // once. Tightening the cap further only adds latency for no depth benefit, so left at
-        // the original 6 -- see `docs/AGENTS_ARCHIVE_2026-09-23.md`'s 80th-pass entry for the
-        // full trajectory data (`.wfgy/pass80_ram_trajectory{,2}.csv`). This REFUTES "peak
-        // concurrency" as an independent lever from Finding 4's eager-fork-copy theory: they are
-        // the same underlying cost, just observed from two angles.
-        const CROSS_PROCESS_FORK_CONCURRENCY_CAP: u32 = 6;
+    fn reserve_cross_process_fork_slot(&self) -> Option<usize> {
+        // The cap value is 6 because tightening it was tried and reverted; see AGENTS.md.
         const ADMISSION_POLL_ITERATIONS: u32 = 80; // 80 x 100ms = 8s bound
-        let counter = &self.global.live_cross_process_fork_children;
         for attempt in 0..=ADMISSION_POLL_ITERATIONS {
-            let current = counter.load(core::sync::atomic::Ordering::Acquire);
-            if current < CROSS_PROCESS_FORK_CONCURRENCY_CAP
-                && counter
-                    .compare_exchange(
-                        current,
-                        current + 1,
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                return;
+            if let Some(idx) = self.global.try_take_cross_process_fork_slot() {
+                return Some(idx);
             }
             if attempt == ADMISSION_POLL_ITERATIONS {
                 litebox_util_log::warn!(
-                    live:% = current;
+                    occupied:% = self.global.cross_process_fork_slots_occupied(),
+                    host_pid:% = self.global.platform.current_host_pid(),
+                    tid:% = self.tid.get();
                     "reserve_cross_process_fork_slot: admission timeout, proceeding unreserved (failing open) rather than blocking a fork forever"
                 );
-                return;
+                return None;
             }
             // `Interrupted` (a real signal delivered to this thread) and `TimedOut` are handled
-            // identically here: either way, loop back and re-check the counter -- this is an
+            // identically here: either way, loop back and re-check the slots -- this is an
             // internal admission wait, not a guest-visible syscall, so there is no `EINTR` to
             // propagate and no reason to give up early just because a signal arrived.
             let _ = self
@@ -3630,24 +3588,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .with_timeout(core::time::Duration::from_millis(100))
                 .sleep();
         }
-    }
-
-    /// Releases a slot reserved by `reserve_cross_process_fork_slot` -- called from `sys_wait4`
-    /// right alongside each of its own calls to `Process::reap_cross_process_child` (the parent-
-    /// side "this child is fully done" point; `Process` itself has no `GlobalState` access of its
-    /// own to release a slot directly, see that method's doc comment) and from the two
-    /// `spawn_cross_process_fork_child` call sites themselves when it returns `None` (reservation
-    /// was optimistic; no child was actually created, so undo it immediately). Saturating: never
-    /// go below zero even if called one extra time, since undercounting only costs a little
-    /// unnecessary admission blocking, while a stuck-negative counter (wrapping to a huge u32)
-    /// would wedge every future fork.
-    fn release_cross_process_fork_slot(&self) {
-        let counter = &self.global.live_cross_process_fork_children;
-        let _ = counter.fetch_update(
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-            |v| Some(v.saturating_sub(1)),
-        );
+        None
     }
 
     /// Everything this needs is available before duplication and none of it comes from one:
@@ -4491,7 +4432,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
-        self.reserve_cross_process_fork_slot();
+        let fork_slot = self.reserve_cross_process_fork_slot();
         let handle = self.global.platform.spawn_cross_process_fork_child(
             &relocations,
             full_gprs,
@@ -4507,7 +4448,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // No child was actually created -- undo the optimistic reservation immediately
             // rather than leaving it held until some future reap that will never come, and the
             // holders counted for the child on carried unix sockets.
-            self.release_cross_process_fork_slot();
+            if let Some(idx) = fork_slot {
+                self.global.release_unbound_cross_process_fork_slot(idx);
+            }
             for (_, hold) in unix_holds.drain(..) {
                 crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
                     &self.global,
@@ -4520,6 +4463,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // adopt the fd, and a parent that exits first would otherwise leave that side of the
         // connection with no live holder -- an EOF the peer must not see. See
         // `UnixSocket::fork_carry`'s comment.
+        if let Some(idx) = fork_slot {
+            match handle.and_then(|h| self.global.platform.cross_process_child_host_pid(h)) {
+                Some(child_host) => self.global.bind_cross_process_fork_slot(idx, child_host),
+                // No child (or no pid for it) means nothing can ever recognise this slot again, so
+                // drop the reservation rather than strand it occupied forever.
+                None => self.global.release_unbound_cross_process_fork_slot(idx),
+            }
+        }
         if let Some(child) = handle
             && let Some(child_host) = self.global.platform.cross_process_child_host_pid(child)
         {
@@ -6255,7 +6206,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // the real spawn attempt, not any earlier in the chain, so a fork that was never going
             // to attempt the cross-process path at all (vfork, fd complexity, no GPR snapshot)
             // never touches the shared counter.
-            let mut fork_slot_reserved = false;
+            let mut fork_slot: Option<usize> = None;
             if !vfork_child
                 && (fd_complexity.beyond_stdio == 0 || ignore_fds)
                 && let Some(mut full_gprs) = cross_process_gprs
@@ -6264,8 +6215,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     true
                 }
                 && {
-                    fork_slot_reserved = true;
-                    self.reserve_cross_process_fork_slot();
+                    fork_slot = self.reserve_cross_process_fork_slot();
                     true
                 }
                 && let Some(handle) = self.global.platform.spawn_cross_process_fork_child(
@@ -6306,19 +6256,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global
                     .platform
                     .with_fork_duplicate_claim_owner(child_tid, || drop(thread));
+                if let Some(idx) = fork_slot {
+                    match self.global.platform.cross_process_child_host_pid(handle) {
+                        Some(child_host) => {
+                            self.global.bind_cross_process_fork_slot(idx, child_host)
+                        }
+                        None => self.global.release_unbound_cross_process_fork_slot(idx),
+                    }
+                }
                 return Ok(
                     usize::try_from(self.guest_pid_of(child_tid).unwrap_or(child_tid)).unwrap_or(0),
                 );
             }
-            if fork_slot_reserved {
-                // The chain above reserved a slot but did not reach (or did not take) the
-                // early-return success path -- either `spawn_cross_process_fork_child` returned
-                // `None`, or it succeeded but the whole condition was `false` for a different
-                // reason evaluated after the reservation. Undo the reservation unconditionally
-                // rather than trying to distinguish those cases: `release_cross_process_fork_slot`
-                // is saturating, so releasing a slot that was never actually granted a live child
-                // just costs a slightly-early free, never a stuck-negative counter.
-                self.release_cross_process_fork_slot();
+            if let Some(idx) = fork_slot {
+                // No child was created, so nothing can ever release this slot: undo the claim.
+                self.global.release_unbound_cross_process_fork_slot(idx);
             }
 
             // Pass 141 diagnostic-only proof (`LITEBOX_DIAG_PROCESS_FORK_WAIT4=1`, off by
