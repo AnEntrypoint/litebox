@@ -2044,6 +2044,16 @@ fn diag_process_fork_task_resume_probe(
     //
     // Must happen HERE: before `run_thread_with_fork_verification` consumes `entrypoints`, and on
     // this thread, because `LinuxShimEntrypoints` is deliberately `!Send`.
+    // A carried pipe the guest WRITES is a local litebox pipe plus a pump thread forwarding it into
+    // the inherited Windows handle, so the guest's own `write(2)` returns as soon as the bytes are
+    // in that local buffer -- long before they reach the parent. A guest that produces a lot and
+    // exits at once (`dd`, `tar`, any bulk producer) is therefore gone while the pump still holds
+    // the tail of its own output, and this process's exit would throw those bytes away: `dd
+    // bs=1024 count=200 | wc -c` reported 204800 written by `dd` but delivered only ~151000. Each
+    // write-direction pump raises its flag when its stream is done, and the exit path below waits
+    // for them before leaving.
+    let mut child_write_pumps: std::vec::Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::vec::Vec::new();
     if let Some(spec) = take_fork_env(pf::FORK_CHILD_PIPE_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
@@ -2081,6 +2091,13 @@ fn diag_process_fork_task_resume_probe(
                 if dir.child_writes() { "writes" } else { "reads" }
             );
             let pump_shim = shim.clone();
+            let pump_done = if dir.child_writes() {
+                let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                child_write_pumps.push(std::sync::Arc::clone(&flag));
+                Some(flag)
+            } else {
+                None
+            };
             // Live-caught (2026-09-21): this pump thread's `detached_pipe_read`/`detached_pipe_write`
             // calls route through the SAME shim/`Task`-adjacent machinery ordinary guest execution
             // does (`WaitState`/blocking-wait plumbing), but -- unlike every OTHER guest-work-capable
@@ -2154,6 +2171,9 @@ fn diag_process_fork_task_resume_probe(
                 drop(host_end);
                 // Safety: this thread is the sole owner of `handle`, and closes it exactly once.
                 unsafe { pf::close_inherited_handle(handle) };
+                if let Some(done) = pump_done {
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             })
                 .expect("failed to spawn cross-process fork child's pipe pump thread");
         }
@@ -2410,6 +2430,26 @@ fn diag_process_fork_task_resume_probe(
                 "[process_fork_diag] task-resume-probe (child): failed to export writable layer to {}: {e}",
                 export_path.display()
             ),
+        }
+    }
+
+    // Give the carried write-direction pipe pumps the chance to forward the bytes still sitting in
+    // their local pipes before this process takes them down with it (see `child_write_pumps`'s own
+    // comment). The guest is already gone by now, so their writers are closed and each pump is
+    // draining a finished stream -- bounded anyway, because a peer that has stopped reading (or a
+    // grandchild still holding a write end) would otherwise turn a lost tail into a hung child.
+    if !child_write_pumps.is_empty() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (index, done) in child_write_pumps.iter().enumerate() {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "[process_fork_diag] task-resume-probe (child): write pump {index} still draining at exit, leaving without it"
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     }
 
