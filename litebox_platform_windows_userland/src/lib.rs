@@ -6660,9 +6660,28 @@ struct WaiterRecord {
 const WAITER_SLOT_EMPTY: u32 = 0;
 
 /// How many threads may block on one [`RawMutex`] at the same time. See [`WaiterQueue`]'s doc
-/// comment for why this is a fixed inline array rather than a `Vec`; 32 concurrent blocked waiters
-/// on a single specific mutex is already an extreme contention scenario for one guest.
-const MAX_INLINE_WAITERS: usize = 32;
+/// comment for why this is a fixed inline array rather than a `Vec`.
+///
+/// Sized against a measured contention event, not a guess: at 32 slots a full desktop boot
+/// (38 host processes) drove ONE global mutex past its capacity and kept it there -- every further
+/// waiter took the polling fallback, which logged on every single attempt and wrote 140MB of log
+/// in nine minutes (chrD14). 32 was "already an extreme contention scenario for one guest"; it is
+/// not extreme for one guest SESSION of three dozen processes, which is the shape every desktop
+/// run has here.
+const MAX_INLINE_WAITERS: usize = 128;
+
+/// How long a waiter that found the queue full sleeps before looking again. Rises to
+/// [`QUEUE_FULL_POLL_MAX_INTERVAL`]: a queue this busy does not free a slot on a microsecond
+/// timescale, and a fixed 200us cadence is 5000 wakeups per second per waiter.
+const QUEUE_FULL_POLL_MIN_INTERVAL: Duration = Duration::from_micros(200);
+
+/// Ceiling for [`QUEUE_FULL_POLL_MIN_INTERVAL`]'s backoff.
+const QUEUE_FULL_POLL_MAX_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Minimum gap between two "waiter queue full" warnings from one host process. The condition it
+/// reports is per-wait, not per-lock-state, so an occupied queue makes EVERY new waiter log it --
+/// unbounded, that is a log flood large enough to starve the run it is describing.
+const QUEUE_FULL_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long [`RawMutex::block_or_maybe_timeout`] lets a wait run with no wake before checking
 /// whether the recorded holder ([`RawMutex::holder_pid`]) is still alive. Deliberately generous --
@@ -7159,16 +7178,16 @@ impl RawMutex {
             Registration::AlreadyChanged => return Ok(UnblockedOrTimedOut::Unblocked),
             Registration::Registered => {}
             Registration::QueueFull => {
-                // Every one of `MAX_INLINE_WAITERS` slots on this specific `RawMutex` is occupied
-                // -- extremely rare in practice (see `WaiterQueue`'s doc comment). This thread was
-                // never registered, so it cannot rely on `wake_many` ever signaling its event;
-                // falling back to polling `inner` directly is the only option that neither panics
-                // (guest-reachable) nor risks a permanent lost wakeup.
-                litebox_util_log::warn!(
-                    max_waiters:% = MAX_INLINE_WAITERS;
-                    "RawMutex::block_or_maybe_timeout: waiter queue full, falling back to polling"
-                );
-                return Ok(self.poll_until_value_changes(val, timeout));
+                // Every one of `MAX_INLINE_WAITERS` slots on this specific `RawMutex` is occupied.
+                // This thread was never registered, so it cannot rely on `wake_many` ever signaling
+                // its event; falling back to polling `inner` is the only option that neither panics
+                // (guest-reachable) nor risks a permanent lost wakeup. `poll_until_value_changes`
+                // re-tries registration on every poll, so it returns `None` as soon as a slot frees
+                // and this wait rejoins the event path below instead of sleeping to its deadline.
+                warn_waiter_queue_full();
+                if let Some(outcome) = self.poll_until_value_changes(val, timeout) {
+                    return Ok(outcome);
+                }
             }
         }
 
@@ -7589,32 +7608,63 @@ impl RawMutex {
         self.poisoned.swap(false, Ordering::AcqRel)
     }
 
-    /// Fallback for the (extremely rare, see `WaiterQueue`'s doc comment) case where
-    /// `block_or_maybe_timeout` could not register in the waiter queue at all: polls `inner`
-    /// directly rather than relying on any wake delivery. Correct by construction (immune to any
-    /// bug in the wake path, at the cost of latency/CPU while polling), never loses a wakeup.
+    /// Fallback for the case where `block_or_maybe_timeout` could not register in the waiter queue
+    /// at all: polls `inner` directly rather than relying on any wake delivery. Correct by
+    /// construction (immune to any bug in the wake path, at the cost of latency/CPU while polling),
+    /// never loses a wakeup.
     ///
     /// Also runs [`Self::try_recover_from_dead_holder_unregistered`] every
     /// [`LIVENESS_CHECK_INTERVAL`] -- see that function's own doc comment for why this loop must
     /// not be a bare `inner`-changed check: without it, this path has no way to ever detect or
     /// recover an orphaned lock, unlike every registered waiter on the same `RawMutex`.
-    fn poll_until_value_changes(&self, val: u32, timeout: Option<Duration>) -> UnblockedOrTimedOut {
+    ///
+    /// Returns `None` once this waiter HAS been registered, meaning the caller owns the wait again
+    /// and should proceed to its ordinary event wait; `Some(_)` means the wait already resolved
+    /// (unblocked or timed out) and the caller must not wait at all.
+    fn poll_until_value_changes(
+        &self,
+        val: u32,
+        timeout: Option<Duration>,
+    ) -> Option<UnblockedOrTimedOut> {
+        // SAFETY: reading the calling thread's own process id; no preconditions.
+        let pid = unsafe { Win32_Threading::GetCurrentProcessId() };
+        let record = WaiterRecord {
+            pid,
+            event: thread_waiter_event() as isize,
+        };
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
         let mut last_liveness_check = std::time::Instant::now();
+        let mut backoff = QUEUE_FULL_POLL_MIN_INTERVAL;
         loop {
-            if self.inner.load(Ordering::SeqCst) != val {
-                return UnblockedOrTimedOut::Unblocked;
+            // Re-try registration under the SAME lock `wake_many` uses, every pass: a slot frees
+            // whenever any queued waiter is woken, and without this a thread that arrived during a
+            // contention spike polls to the end of its wait even once the queue has been empty for
+            // minutes -- which is itself what keeps CPU and log volume high enough to sustain the
+            // spike. Values match the caller's own `record`, so `wake_many` pops this one either way.
+            match self.waiters.with_lock(|queue| {
+                if self.inner.load(Ordering::SeqCst) != val {
+                    QueueFullPoll::Resolved(UnblockedOrTimedOut::Unblocked)
+                } else if queue.push_locked(record) {
+                    QueueFullPoll::Registered
+                } else {
+                    QueueFullPoll::StillFull
+                }
+            }) {
+                QueueFullPoll::Resolved(outcome) => return Some(outcome),
+                // Back on the event path: `block_or_maybe_timeout` waits on `event` from here.
+                QueueFullPoll::Registered => return None,
+                QueueFullPoll::StillFull => {}
             }
             if let Some(deadline) = deadline {
                 if std::time::Instant::now() >= deadline {
-                    return UnblockedOrTimedOut::TimedOut;
+                    return Some(UnblockedOrTimedOut::TimedOut);
                 }
             }
             let now = std::time::Instant::now();
             if now.duration_since(last_liveness_check) >= LIVENESS_CHECK_INTERVAL {
                 last_liveness_check = now;
                 if self.try_recover_from_dead_holder_unregistered(val) {
-                    return UnblockedOrTimedOut::Unblocked;
+                    return Some(UnblockedOrTimedOut::Unblocked);
                 }
             }
             // 94th pass: this whole function is the `MAX_INLINE_WAITERS`-exhaustion fallback for
@@ -7637,9 +7687,59 @@ impl RawMutex {
             // each) relative to the sleep itself.
             WindowsUserland::restore_thread_gs_base_if_cleared();
             WindowsUserland::restore_thread_fs_base();
-            std::thread::sleep(Duration::from_micros(200));
+            std::thread::sleep(backoff);
+            // Back off instead of hammering at 200us for the whole wait: with N unregistered waiters
+            // on one lock, a fixed 200us cadence is 5000 lock acquisitions and 5000 sleeps per second
+            // per waiter -- contention the waiters themselves add to the very lock they are queued
+            // behind. Measured (chrD14): 38 host processes kept one queue full continuously and this
+            // path, at the old fixed cadence, drove the run to 140MB of log in nine minutes and left
+            // ~1.1GB of host RAM.
+            backoff = (backoff * 2).min(QUEUE_FULL_POLL_MAX_INTERVAL);
         }
     }
+}
+
+/// One attempt, from [`RawMutex::poll_until_value_changes`], to take a slot in a full waiter queue.
+enum QueueFullPoll {
+    /// The observed value already changed (or the lock was recovered): the wait is over.
+    Resolved(UnblockedOrTimedOut),
+    /// A slot freed and this waiter is now queued, so the caller resumes its event wait.
+    Registered,
+    /// Still full; poll again.
+    StillFull,
+}
+
+/// Reports a [`RawMutex`] whose waiter queue was found full, at most once per
+/// [`QUEUE_FULL_WARN_INTERVAL`] per host process.
+///
+/// Rate-limited because the condition is a property of ONE wait attempt, not of a lock state
+/// transition: while a queue stays occupied, every new waiter logs it, so an unbounded warning is
+/// one line per wait -- per thread, per contention episode. That is not a diagnostic, it is a
+/// denial of service on the log and on the CPU formatting it, and it lands precisely when the
+/// system can least afford it (see `MAX_INLINE_WAITERS`'s doc comment for the measured case).
+fn warn_waiter_queue_full() {
+    use core::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let window = QUEUE_FULL_WARN_INTERVAL.as_millis() as u64;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < window {
+        return;
+    }
+    if LAST
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    litebox_util_log::warn!(
+        max_waiters:% = MAX_INLINE_WAITERS,
+        suppressed_for:? = QUEUE_FULL_WARN_INTERVAL;
+        "RawMutex::block_or_maybe_timeout: waiter queue full, falling back to polling (further reports suppressed for this interval)"
+    );
 }
 
 impl Drop for RawMutex {
