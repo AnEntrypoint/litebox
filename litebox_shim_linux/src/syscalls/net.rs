@@ -1171,7 +1171,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             },
             || match self.net_lock().close(&fd, behavior) {
                 Ok(()) => Ok(()),
-                Err(litebox::net::errors::CloseError::DataPending) => Err(TryOpError::TryAgain),
+                Err(litebox::net::errors::CloseError::DataPending) => {
+                    // Only reachable with `SO_LINGER` set to a non-zero timeout
+                    // (`GracefulIfNoPendingData`): `close(2)` with linger unset takes the queued
+                    // bytes and returns, so this is the one branch that can park the calling guest
+                    // thread waiting on `Events::HUP` -- for as long as `linger_timeout` says, and
+                    // that wait is what makes a guest-visible `close(2)` look like a hang (chrD3:
+                    // 38 threads frozen in `sys_close` across 17 host processes). Named so the
+                    // branch is visible instead of inferred.
+                    litebox_util_log::warn!(
+                        behavior:? = behavior,
+                        linger_ms:? = linger_timeout.map(|t| t.as_millis());
+                        "close_socket: deferring, send queue not drained yet"
+                    );
+                    Err(TryOpError::TryAgain)
+                }
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
                     Err(TryOpError::Other(Errno::EBADF))
                 }

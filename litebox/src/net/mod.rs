@@ -949,7 +949,12 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
-        let table = self.litebox.descriptor_table();
+        // Best-effort for the same reason `attempt_to_close_queued` is: this runs with the
+        // cross-process `net_lock` held, so parking on the descriptor table here would let one
+        // guest thread that holds the table and wants `net_lock` freeze every process.
+        let Some(table) = self.litebox.try_descriptor_table() else {
+            return;
+        };
         for (_, mut handle) in table.iter_mut_nowait::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.shutdown_wr_pending {
@@ -1026,7 +1031,10 @@ where
     /// Drain all socket channel buffers
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
-        let table = self.litebox.descriptor_table();
+        // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
+        let Some(table) = self.litebox.try_descriptor_table() else {
+            return;
+        };
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
         }
@@ -1484,8 +1492,18 @@ where
             // fast path
             return false;
         }
-        let mut dt = self.litebox.descriptor_table_mut();
-        let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
+        // Never park in here. This runs on the net worker with `net_lock` -- an arena-resident,
+        // cross-process mutex -- already held, and with the descriptor table's write lock taken
+        // below; a guest thread that holds one descriptor's entry lock and then asks for either of
+        // those is waiting for US, so waiting for that entry closes the cycle and parks every other
+        // process in the fork family behind `net_lock` (live: 16 host processes queued on one arena
+        // mutex with the holder alive, chrD5). Both acquisitions are therefore best-effort: an fd
+        // we cannot lock right now stays queued and is retried on the next pass, which is exactly
+        // the trade-off `Descriptors::iter_mut_nowait` already documents for this same worker.
+        let Some(mut dt) = self.litebox.try_descriptor_table_mut() else {
+            return false;
+        };
+        let entries = dt.drain_entries_full_covered_by_nowait(&mut self.queued_for_closure);
         drop(dt);
         if entries.is_empty() {
             return false;

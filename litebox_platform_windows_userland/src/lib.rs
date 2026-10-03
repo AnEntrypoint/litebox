@@ -6853,6 +6853,29 @@ impl WaiterQueue {
         }
         popped
     }
+
+    /// Reads, without changing anything, whether `record` is still registered plus how many slots
+    /// are occupied. Only used by the `LITEBOX_DIAG_LOCKSTALL` long-wait report, where the single
+    /// decisive question is "has a waker already popped this waiter (and therefore committed to
+    /// signaling its event) or has nobody woken it at all?" -- answered under the same spinlock
+    /// every mutating path takes, so the two reads cannot straddle a concurrent `wake_many`.
+    fn queue_state_locked(&self, record: WaiterRecord) -> (bool, u32) {
+        let mut still_queued = false;
+        let mut occupied = 0u32;
+        for slot in &self.slots {
+            let pid = slot.pid.load(core::sync::atomic::Ordering::Relaxed);
+            if pid == WAITER_SLOT_EMPTY {
+                continue;
+            }
+            occupied += 1;
+            if pid == record.pid
+                && slot.event.load(core::sync::atomic::Ordering::Relaxed) == record.event
+            {
+                still_queued = true;
+            }
+        }
+        (still_queued, occupied)
+    }
 }
 
 struct ThreadWaiterEvent(Win32_Foundation::HANDLE);
@@ -6937,6 +6960,14 @@ pub struct RawMutex {
     /// anywhere, so it has no waiter event to report, and none is needed -- a waiter that decides
     /// to recover only needs to know whether this pid is still alive, never to signal it directly.
     holder_pid: AtomicU32,
+    /// The Windows THREAD id of whichever thread most recently ran
+    /// [`litebox::platform::RawMutex::note_locked`], or `0` if unlocked/unknown. A pid alone cannot
+    /// say WHICH thread of a live holder process is sitting on the lock, and a cross-process
+    /// `RawMutex` (the shared arena's `net_lock`) can freeze every process in the fork family while
+    /// its holder is alive and merely stuck: chrD5 had 16 processes parked on one arena mutex whose
+    /// `holder_pid` process was alive, so naming the thread for a `cdb` attach is the only way to
+    /// see what it is doing. Recorded at the moment the lock is taken.
+    holder_tid: AtomicU32,
     /// Set by [`Self::try_recover_from_dead_holder_unregistered`] when it forces this lock back
     /// open because its recorded holder was confirmed dead. Forcing the `inner` word back to
     /// unlocked is necessary so no thread waits forever, but it does nothing to repair whatever
@@ -6969,6 +7000,7 @@ impl RawMutex {
             inner: AtomicU32::new(0),
             waiters: WaiterQueue::new(),
             holder_pid: AtomicU32::new(0),
+            holder_tid: AtomicU32::new(0),
             poisoned: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -7092,7 +7124,8 @@ impl RawMutex {
         // the timeout shows actual<requested. Gated and gap-filtered to avoid flooding on the
         // (extremely common) fast/normal wait case.
         let diag = diag_wait_dur_enabled();
-        let start = diag.then(std::time::Instant::now);
+        let diag_lockstall = diag_lockstall_enabled();
+        let start = (diag || diag_lockstall).then(std::time::Instant::now);
 
         let event = thread_waiter_event();
         // SAFETY: reading the calling thread's own process id; no preconditions.
@@ -7159,10 +7192,16 @@ impl RawMutex {
             }
             let chunk =
                 remaining.map_or(LIVENESS_CHECK_INTERVAL, |r| r.min(LIVENESS_CHECK_INTERVAL));
-            let chunk_ms = chunk
-                .as_millis()
-                .min(u128::from(Win32_Threading::INFINITE - 1))
-                .trunc();
+            // `.max(1)`: a sub-millisecond `chunk` truncates to 0, and `WaitForSingleObject(h, 0)`
+            // returns `WAIT_TIMEOUT` *without blocking* -- so the loop below becomes a busy spin
+            // that re-enters this whole body (two segment-base repairs included) thousands of
+            // times per second per waiter, per call. Live (chrD5/chrD6): 503k diagnostics from
+            // 187 distinct waits, all `chunk_ms=0 rc=258`, some reaching 960 iterations in under a
+            // millisecond of wall time. Waiting 1ms instead overshoots a real deadline by at most
+            // that much and turns the spin into a single kernel wait.
+            let chunk_ms = u32::try_from(chunk.as_millis().min(u128::from(u32::MAX)))
+                .unwrap_or(u32::MAX)
+                .max(1);
 
             // SAFETY: `event` is this thread's own valid, owned-for-its-lifetime event handle.
             let rc = unsafe { Win32_Threading::WaitForSingleObject(event, chunk_ms) };
@@ -7241,9 +7280,60 @@ impl RawMutex {
                     if (holder != 0 || val == 2) && idle_chunks % 15 == 0 {
                         litebox_util_log::warn!(
                             lock:% = (self as *const Self as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
+                            holder_tid:% = self.holder_tid.load(Ordering::Relaxed),
                             waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
                             my_pid:% = std::process::id();
                             "RawMutex held by a live process for a long time"
+                        );
+                    }
+                    // `LITEBOX_DIAG_LOCKSTALL=1`: the gate above is silent for exactly the waits
+                    // that cannot name a holder -- `val != 2` means a `Condvar`-style wait (a guest
+                    // thread parked in `WaitState::commit_wait`, e.g. `epoll_wait`/`read`/a
+                    // `close(2)` still waiting on HUP), and `holder_pid == 0` means no holder was
+                    // ever recorded. A guest-wide freeze whose only blocked threads sit in that
+                    // silent case is invisible today: 38 threads across 17 host processes were
+                    // found frozen in `sys_close` (chrD3) with ZERO occurrences of the warning
+                    // above in a 1500s log, so the lock they were parked on could not be
+                    // identified at all. Log the LOCK ADDRESS unconditionally once a wait has run
+                    // long: one shared address across processes is a cross-process lock (net_lock
+                    // and friends live in the fixed-base shared arena), a distinct address per
+                    // thread is a per-thread waker condvar and the freeze is a missed wakeup, not
+                    // a held lock.
+                    //
+                    // Reported at 30s and then only on doubling boundaries (30/60/120/240/480s):
+                    // a straight `% 15 == 0` cadence produced 300k lines (190MB of log) in one
+                    // 830s desktop run, which is its own disk-hygiene failure.
+                    //
+                    // `wall_ms` is a real `Instant` measurement, unlike `waited_s` above, which
+                    // only counts elapsed `LIVENESS_CHECK_INTERVAL` chunks -- if the two disagree
+                    // wildly, `WaitForSingleObject` is returning `WAIT_TIMEOUT` without ever
+                    // blocking and the loop is spinning rather than waiting. `queued` is the
+                    // decisive one: `false` means some waker already popped this record, i.e.
+                    // committed to signaling this thread's event, so the wait that never ends is
+                    // a LOST WAKEUP in the event hand-off; `true` means nobody ever woke us, so
+                    // the state this waiter is waiting for (`inner != val`) is genuinely not
+                    // changing -- a lock holder that never releases, or an orphaned lock.
+                    if diag_lockstall && idle_chunks % 15 == 0 && (idle_chunks / 15).is_power_of_two()
+                    {
+                        let (queued, occupied) =
+                            self.waiters.with_lock(|queue| queue.queue_state_locked(record));
+                        // SAFETY: `event` is this thread's own valid, owned event handle; a 0
+                        // timeout only polls its state. A `WAIT_OBJECT_0` here would mean a wake
+                        // is pending right now, which this loop's own wait somehow never observed.
+                        let pending_wake = unsafe {
+                            Win32_Threading::WaitForSingleObject(event, 0)
+                                == Win32_Foundation::WAIT_OBJECT_0
+                        };
+                        litebox_util_log::warn!(
+                            lock:% = (self as *const Self as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
+                            holder_tid:% = self.holder_tid.load(Ordering::Relaxed),
+                            waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
+                            wall_ms:? = start.map(|s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                            chunks:% = idle_chunks, queued:? = queued, occupied:% = occupied, pending_wake:? = pending_wake,
+                            chunk_ms:? = chunk_ms, rc:? = rc,
+                            my_pid:% = std::process::id(), tid:? = std::thread::current().id(),
+                            thread:? = std::thread::current().name();
+                            "[diag-lockstall] raw mutex wait still blocked"
                         );
                     }
                 }
@@ -7583,6 +7673,22 @@ fn diag_wait_dur_enabled() -> bool {
     })
 }
 
+/// Whether `LITEBOX_DIAG_LOCKSTALL=1` long-wait diagnostics are enabled. Cached per thread,
+/// same pattern as [`diag_wait_dur_enabled`].
+fn diag_lockstall_enabled() -> bool {
+    thread_local! {
+        static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ENABLED.with(|e| {
+        if let Some(v) = e.get() {
+            return v;
+        }
+        let v = std::env::var_os("LITEBOX_DIAG_LOCKSTALL").is_some();
+        e.set(Some(v));
+        v
+    })
+}
+
 /// Whether `LITEBOX_DIAG_MM=1` memory-management diagnostics are enabled. Cached per thread,
 /// same pattern as [`diag_wait_dur_enabled`].
 ///
@@ -7678,12 +7784,15 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn note_locked(&self) {
-        // SAFETY: reading the calling thread's own process id; no preconditions.
+        // SAFETY: reading the calling thread's own process and thread id; no preconditions.
         let pid = unsafe { Win32_Threading::GetCurrentProcessId() };
         self.holder_pid.store(pid, Ordering::Release);
+        let tid = unsafe { Win32_Threading::GetCurrentThreadId() };
+        self.holder_tid.store(tid, Ordering::Release);
     }
 
     fn note_unlocked(&self) {
+        self.holder_tid.store(0, Ordering::Release);
         self.holder_pid.store(0, Ordering::Release);
     }
 

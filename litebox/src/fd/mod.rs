@@ -276,6 +276,71 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         entries
     }
 
+    /// Like [`Self::drain_entries_full_covered_by`], but skips (leaves queued) any entry whose
+    /// per-entry lock cannot be taken without waiting, instead of blocking on it.
+    ///
+    /// For a caller that is already holding a lock other threads need -- a shared worker such as
+    /// [`crate::net::Network::attempt_to_close_queued`], which runs while the cross-process
+    /// `net_lock` is held. Blocking there closes a cycle: a guest thread holding one descriptor's
+    /// entry lock (see [`Self::iter_mut`]) and then asking for `net_lock` waits for the worker,
+    /// while the worker waits for that entry -- and because `net_lock` lives in the shared arena,
+    /// every process in the fork family queues behind it (live: 16 host processes parked on one
+    /// arena mutex, chrD5). The skipped entry is simply visited on the next pass, the same
+    /// accepted trade-off [`Self::iter_mut_nowait`] already documents.
+    pub(crate) fn drain_entries_full_covered_by_nowait<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fds: &mut [Option<TypedFd<Subsystem>>],
+    ) -> Vec<Subsystem::Entry> {
+        let removable_entries: Vec<*const RwLock<_, _>> = {
+            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            for fd in fds.iter().flatten() {
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
+                let Some(guard) = entry.try_read() else { continue };
+                if !guard.matches_subsystem::<Subsystem>() {
+                    continue;
+                }
+                strong_count_and_count
+                    .entry(Arc::as_ptr(&entry.x))
+                    .or_insert((Arc::strong_count(&entry.x), 0))
+                    .1 += 1;
+            }
+            strong_count_and_count
+                .into_iter()
+                .filter(|(_ptr, (sc, c))| sc == c)
+                .map(|(ptr, _)| ptr)
+                .collect()
+        };
+        let mut entries = vec![];
+        for slot in fds.iter_mut() {
+            let Some(fd) = slot else { continue };
+            let Some(idx) = fd.x.as_usize() else { continue };
+            let Some(Some(entry)) = self.entries.get(idx) else {
+                continue;
+            };
+            let Some(guard) = entry.try_read() else { continue };
+            if !guard.matches_subsystem::<Subsystem>() {
+                continue;
+            }
+            let entry_ptr = Arc::as_ptr(&entry.x);
+            // Released before `self.remove`: the guard borrows `self.entries` through `entry`, and
+            // `remove` needs `&mut self`. (The blocking variant never had to say this because its
+            // guard was a temporary, dropped at the end of its own `if` condition.)
+            drop(guard);
+            if !removable_entries.contains(&entry_ptr) {
+                continue;
+            }
+            let entry = self.remove(fd);
+            if let Some(entry) = entry {
+                entries.push(entry);
+            }
+            *slot = None;
+        }
+        entries
+    }
+
     /// An iterator of descriptors and entries for a subsystem
     ///
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order

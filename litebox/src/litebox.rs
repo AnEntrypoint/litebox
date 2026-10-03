@@ -139,6 +139,31 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    /// Like [`Self::descriptor_table`], but yields `None` instead of waiting when another thread
+    /// already holds the table for writing.
+    ///
+    /// Same reason as [`Self::try_descriptor_table_mut`]: a caller that is itself holding a lock
+    /// other threads need cannot park here without risking a cycle.
+    pub fn try_descriptor_table(
+        &self,
+    ) -> Option<impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform>> {
+        self.x.descriptors.try_read()
+    }
+
+    /// Like [`Self::descriptor_table_mut`], but yields `None` instead of waiting when another
+    /// thread already holds the table.
+    ///
+    /// For a caller that cannot afford to park because it is itself holding a lock other threads
+    /// need -- [`crate::net::Network::attempt_to_close_queued`] runs with the cross-process
+    /// `net_lock` held, so blocking here would freeze every process in the fork family behind a
+    /// guest thread that holds the table and then asks for `net_lock`. Skipping the pass and
+    /// retrying on the next tick is always safe: this is maintenance work, not a request.
+    pub fn try_descriptor_table_mut(
+        &self,
+    ) -> Option<impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform>> {
+        self.x.descriptors.try_write()
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
