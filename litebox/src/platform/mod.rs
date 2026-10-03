@@ -1539,6 +1539,23 @@ pub struct ForkInheritedEventfd {
     pub flags: u32,
 }
 
+/// What one read of a [`ForkPipeBridge::Source`]'s parent-side pipe produced.
+///
+/// A pump thread must be able to tell these three apart: forwarding [`Self::Empty`] as EOF closes
+/// the child's read end early, and treating EOF as [`Self::Empty`] leaves the thread parked in a
+/// read that can never complete -- one leaked thread and OS handle per child that exits first.
+/// `Option<usize>` collapses the two, which is why this exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkPipeRead {
+    /// `n` bytes were placed in the buffer; `n > 0`.
+    Bytes(usize),
+    /// Nothing is available yet, but a writer may still produce bytes. The pump retries -- and
+    /// re-checks whether the child is still alive first, which is what stops the leak.
+    Empty,
+    /// No writer is left and nothing is buffered, so no read can ever return anything again.
+    Eof,
+}
+
 /// A host-side handle on one end of a PARENT's in-memory pipe, handed across to
 /// [`ForkChildVerificationProvider::spawn_cross_process_fork_child`] so the platform can bridge a
 /// cross-process `fork()` child's pipe fd to it.
@@ -1565,7 +1582,7 @@ pub enum ForkPipeBridge {
     /// The child writes; bytes flow child -> parent. See the type's own doc comment.
     Sink(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>>),
     /// The child reads; bytes flow parent -> child. See the type's own doc comment.
-    Source(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>>),
+    Source(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>>),
 }
 
 impl ForkPipeBridge {
@@ -1745,10 +1762,11 @@ impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>> {
     }
 }
 
-impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> Option<usize> + Send>> {
-    /// Read from the parent-side pipe into `buf`, blocking until there is something to read.
-    /// `Some(0)` is EOF; `None` means the pipe is gone.
-    pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>> {
+    /// Read from the parent-side pipe into `buf`, giving up after a bounded wait so the pump can
+    /// come back and re-check whether the child it serves is still alive. See [`ForkPipeRead`];
+    /// in particular [`ForkPipeRead::Empty`] is NOT end-of-file.
+    pub fn read(&mut self, buf: &mut [u8]) -> ForkPipeRead {
         (self.transfer)(buf)
     }
 }

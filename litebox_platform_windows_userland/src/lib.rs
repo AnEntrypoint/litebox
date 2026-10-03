@@ -14488,18 +14488,31 @@ fn spawn_fork_child_pipe_pump(
                 let mut buf = [0u8; 4096];
                 loop {
                     match end.read(&mut buf) {
-                        Some(0) | None => {
+                        litebox::platform::ForkPipeRead::Bytes(n) => {
+                            if !process_fork::write_all_to_inherited_handle(local, &buf[..n]) {
+                                // The child is gone or has closed its end; nothing left to deliver.
+                                break;
+                            }
+                        }
+                        // Nothing to forward yet. The read is bounded, so this is the pump's only
+                        // chance to notice that the child it exists to feed is gone: without the
+                        // check a stdin pump whose child dies first stays parked in `read` for
+                        // ever, leaking a host thread and a handle each time.
+                        litebox::platform::ForkPipeRead::Empty => {
+                            if process_fork::process_has_exited(child_process) {
+                                litebox_util_log::debug!(
+                                    handle:% = local;
+                                    "fork-child pipe pump (parent): child exited before the guest pipe produced anything more, closing its inherited read end"
+                                );
+                                break;
+                            }
+                        }
+                        litebox::platform::ForkPipeRead::Eof => {
                             litebox_util_log::debug!(
                                 handle:% = local;
                                 "fork-child pipe pump (parent): guest pipe reached EOF, closing the child's inherited read end"
                             );
                             break;
-                        }
-                        Some(n) => {
-                            if !process_fork::write_all_to_inherited_handle(local, &buf[..n]) {
-                                // The child is gone or has closed its end; nothing left to deliver.
-                                break;
-                            }
                         }
                     }
                 }

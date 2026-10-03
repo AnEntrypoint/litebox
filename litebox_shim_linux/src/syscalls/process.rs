@@ -3848,12 +3848,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             )
                         }
                         litebox::pipes::HalfPipeType::ReceiverHalf => {
+                            // A pump thread reads this end on the child's behalf, and it must
+                            // never park in a read for ever: the child it serves can exit while
+                            // the pump waits, and a parked thread then leaks one host thread and
+                            // one OS handle per child. So the read is BOUNDED, and the deadline
+                            // outcome is reported as `Empty` rather than collapsed into EOF --
+                            // which is the whole reason `ForkPipeRead` has three variants.
+                            const SOURCE_READ_POLL: core::time::Duration =
+                                core::time::Duration::from_millis(500);
                             litebox::platform::ForkPipeBridge::Source(
                                 litebox::platform::ForkPipeEnd::new(
                                     alloc::boxed::Box::new(move |buf: &mut [u8]| {
                                         let wait_state =
                                             litebox::event::wait::WaitState::new(platform);
-                                        end.read(&wait_state.context(), buf).ok()
+                                        match end.read(
+                                            &wait_state.context().with_timeout(SOURCE_READ_POLL),
+                                            buf,
+                                        ) {
+                                            Ok(0) => litebox::platform::ForkPipeRead::Eof,
+                                            Ok(n) => litebox::platform::ForkPipeRead::Bytes(n),
+                                            // Deadline reached with nothing to read: the pipe is
+                                            // alive and may still yield bytes. Same for a
+                                            // non-blocking end, whose caller expects EAGAIN, not
+                                            // a closed fd.
+                                            Err(litebox::pipes::errors::ReadError::WouldBlock)
+                                            | Err(litebox::pipes::errors::ReadError::WaitError(
+                                                _,
+                                            )) => litebox::platform::ForkPipeRead::Empty,
+                                            Err(_) => litebox::platform::ForkPipeRead::Eof,
+                                        }
                                     }),
                                     owners,
                                     move || eof_probe.at_eof(),
