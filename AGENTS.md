@@ -16,6 +16,15 @@ xfce4-terminal (prompt, `tty`, job control, pipelines, `su`, DNS), Mousepad, Set
 injected overlays -- use `Alt+Tab`/keyboard.
 
 Fixed (newest first; mechanism in the archive unless noted):
+- `a1423ee` a carried "child writes" pipe is a local pipe + a pump, so the guest's `write(2)` returns
+  before the bytes reach the parent -- a bulk producer that exits at once lost its tail (`dd bs=1024
+  count=200 | wc -c` = 151552 of 204800; three stages 81920). The child's exit now waits for its write
+  pumps to drain (bounded 5s). All seven shapes exact after.
+- `30d8f43` a `Source` pipe bridge waited for `owners()==1` before forwarding a byte, but HOLDING a pipe
+  end is not READING it: a wrapper (`timeout`/`env`/`nohup`/`setpriv`) keeps its stdin open to hand to
+  the child it forks, so `owners()` never fell and `at_eof()` stayed false while the bytes sat buffered
+  -- deadlock (`printf x | timeout 12 sh -s` was rc=124 25/25). `ForkPipeBridge::pending_bytes` (FIONREAD)
+  now breaks the wait when a non-zero count has sat unchanged 500ms: data nobody is consuming.
 - `7d2a6a7` `SHARED_UNIX_CONN_CAPACITY` 1024 -> 4096, and every unadopted-carry discard path releases the
   sender's slot hold: **chromium renders a page with its OWN sandbox active** (Chromium section). `ad2659f`
   `SECCOMP_RET_TRAP` returns the syscall number, a connected endpoint's `Conn` hold ships with the carry
@@ -82,6 +91,10 @@ Fixed (newest first; mechanism in the archive unless noted):
 - Browser: `mcp__chrome-devtools__*` for real CDP input. `click` needs a uid, so inject a fixed
   `pointer-events:none`, opacity .01 `<button id=probe>` at the wanted x,y and click that (the real mouse
   event lands on the video). `Control+Alt+t` opens Terminal (allow 30s); gm `cdp` is JS-eval only.
+- **Guest scripts must be LF.** A CRLF `.wfgy/*.sh` turns every `\`-continued line into its own
+  command (`/bin/bash: line 55: +iglx: command not found`, boot exits 127 immediately) -- the failure
+  looks like a litebox startup bug and is not one. Git's `core.autocrlf` reintroduces it; check any
+  script that has not been run since.
 - Cheap guest repro with no file in the guest: `.wfgy/guest2.ps1 -Script <sh> -Run <name> -Secs <n>`
   (base64's the script onto the command line; sets LITEBOX_PROCESS_FORK=1, LITEBOX_LAZY_FILE_MAP=1,
   LITEBOX_OCI_USE_LAST_RESOLVED=1; `-ExtraEnv "K=V;K2=V2"` overrides). **It kills every `litebox_runner*`
