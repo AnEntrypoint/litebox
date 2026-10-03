@@ -2052,17 +2052,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // `VmArea::reserved_extra`'s doc comment for the live fault this caused.
         vma.reserved_extra = reserved_extra;
         let total_length = (length + reserved_extra).unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
+        let fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
+        // A section-backed (shared) mapping is the one path whose base the platform can only take
+        // at allocation-granularity alignment, so its hint is computed in granule units -- see
+        // `shared_view_base`. Every other path keeps the page-granular search.
+        let new_addr = if !fixed_addr && vma.shared_handle.is_some() {
+            self.shared_view_base(
                 suggested_address,
                 total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
             )
-            .ok_or(AllocationError::OutOfMemory)?;
+        } else {
+            self.get_unmmaped_area(
+                suggested_address,
+                total_length,
+                fixed_addr,
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+            )
+        }
+        .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        let behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+        let behavior = if fixed_addr {
             if flags.contains(CreatePagesFlags::NOREPLACE) {
                 FixedAddressBehavior::NoReplace
             } else {
@@ -2161,6 +2172,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // for that case is not implemented.
             if cur_vma.is_file_backed() && cur_vma.shared_handle.is_none() {
                 unimplemented!("private file-backed mapping expansion is not supported yet");
+            }
+            // A section-backed (shared) mapping must NOT be "expanded" by mapping an extra view:
+            // `insert_mapping` below maps a view of the SAME object at the object's offset 0 (the
+            // platform's `map_shared_memory` has no offset argument on this path), so the bytes
+            // the guest expects at `range.end..new_end` would alias the object's FIRST bytes
+            // instead of extending it -- silent data corruption, not growth. Its view length is
+            // also the DELTA (`new_end - range.end`), which for a grown mapping can exceed the
+            // object's own fixed size, and that is refused outright with `ERROR_ACCESS_DENIED`.
+            // Report `RangeOccupied` so `MemoryManager::remap_pages` routes the growth through
+            // `move_mappings`, which grows the object itself and re-maps the whole mapping at its
+            // new size -- real `mremap(MREMAP_MAYMOVE)` behaviour.
+            if cur_vma.shared_handle.is_some() {
+                return Err(VmemResizeError::RangeOccupied(range.end..new_end));
             }
             let range = PageRange::new(range.end, new_end).unwrap();
             // Try to extend the mapping. Although we checked that there are no
@@ -2280,7 +2304,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // below now inserts and removes placeholder entries while searching (see its own comment),
         // and a live immutable borrow of the map would forbid that. Both values are small and
         // `Copy`.
-        let vma = {
+        let mut vma = {
             let (cur_range, vma) = self
                 .vmas
                 .get_key_value(&old_range.start)
@@ -2320,7 +2344,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // SAME underlying shared object at the new address rather than allocating unrelated
         // private memory -- no byte-copy is needed since the content lives in the shared object,
         // not in either view.
-        if let Some(_shared_handle) = vma.shared_handle {
+        if let Some(shared_handle) = vma.shared_handle {
+            // A GROWN shared mapping needs a bigger object, not just a bigger view: the object
+            // was created at the OLD length (see `grow_shared_object`), and asking the platform
+            // for a longer view than the object holds is what produced the live
+            // `diag-shm: map_shared_memory FAILED ... win32_err=5` failures. Grow it first, and
+            // re-point this VMA at the new object; the old view is still mapped at `old_range`
+            // and is dropped by the `remove_mapping` at the end of this branch, once the new
+            // mapping is live.
+            if new_size.as_usize() > old_range.len() {
+                vma.shared_handle = Some(unsafe {
+                    self.grow_shared_object(shared_handle, old_range.into(), new_size.as_usize())?
+                });
+            }
             // `insert_mapping` rejects `start < Platform::TASK_ADDR_MIN` unconditionally, even
             // under `FixedAddressBehavior::Hint` -- unlike `allocate_pages`, it has no "0 means
             // let the platform pick freely" convention of its own, so a literal 0 hint here
@@ -2338,10 +2374,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let mut attempt = 0u32;
             let new_ptr = loop {
                 let new_addr = self
-                    .get_unmmaped_area(
+                    .shared_view_base(
                         next_hint,
                         new_size,
-                        false,
                         vma.flags.contains(VmFlags::VM_GROWSDOWN),
                     )
                     .ok_or(VmemMoveError::OutOfMemory)?;
@@ -2752,6 +2787,164 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     }
 
     /*================================Internal Functions================================ */
+
+    /// Get an unmapped area in the virtual address space, aligned so the platform can actually
+    /// honour it as a shared-memory view base.
+    ///
+    /// [`PageManagementProvider::map_shared_memory`] is `MapViewOfFile3` on Windows, which accepts
+    /// an explicitly requested base ONLY at the host's allocation-granularity alignment (64 KiB):
+    /// a merely page-aligned base is refused with `ERROR_MAPPED_ALIGNMENT` (1132). That is the
+    /// first half of every live `diag-shm: map_shared_memory FAILED ... win32_err=1132` pair (10
+    /// of them in one desktop run), and it existed because [`Self::get_unmmaped_area`] computes
+    /// its candidates in PAGE units -- its fast path is literally `TASK_ADDR_MAX - length`, whose
+    /// alignment is whatever the requested length leaves behind, i.e. page alignment at best.
+    ///
+    /// So ask for one extra granule of address space and round the answer UP to a granule
+    /// boundary: the round-up shifts the start by less than one granule and the extra granule
+    /// absorbs that shift, so `length` bytes still fit inside the window `get_unmmaped_area`
+    /// proved free. This is the fix at the source -- the hint itself is now always a base the
+    /// platform can honour -- rather than letting every shared placement depend on
+    /// `map_shared_memory`'s blind retry with a null base (which the `NoReplace` in-place expand
+    /// path in `resize_mapping` never had, making it fail 100% of the time).
+    ///
+    /// Only for a NON-fixed placement: a `MAP_FIXED` request must land on the exact address the
+    /// guest named, so those keep `get_unmmaped_area`'s unrounded answer.
+    fn shared_view_base(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        is_growsdown: bool,
+    ) -> Option<usize> {
+        const GRANULE: usize = WINDOWS_ALLOCATION_GRANULARITY;
+        debug_assert!(GRANULE.is_multiple_of(ALIGN));
+        // An extra granule of search window, so rounding the start UP cannot push `length` bytes
+        // past the end of what was proven free. Fall back to the exact length if that addition
+        // cannot be represented (or is not a page multiple), rather than failing a mapping that
+        // would otherwise have fit.
+        let search_len = length
+            .as_usize()
+            .checked_add(GRANULE)
+            .and_then(NonZeroPageSize::new)
+            .unwrap_or(length);
+        let addr = self.get_unmmaped_area(suggested_address, search_len, false, is_growsdown)?;
+        let aligned = addr.next_multiple_of(GRANULE);
+        // Ordinary capacity answers, never panics: an out-of-range base must not reach the
+        // platform, and a guest that has genuinely run out of address space gets its `ENOMEM`.
+        let end = aligned.checked_add(length.as_usize())?;
+        (aligned >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX).then_some(aligned)
+    }
+
+    /// Grow a shared-memory object so a mapping of `new_len` bytes can be mapped from it.
+    ///
+    /// A platform shared-memory object is created with a FIXED size (Windows:
+    /// `CreateFileMappingW`), and no platform here can resize one in place, so a shared mapping
+    /// that GREW (`mremap` on a `MAP_SHARED` pool, e.g. weston's pixman shadow framebuffer or a
+    /// `wl_shm` pool) cannot simply be re-mapped at its new length: `map_shared_memory` would ask
+    /// for a view larger than the object, which Windows refuses with `ERROR_ACCESS_DENIED` (5) --
+    /// the second half of every live `diag-shm: map_shared_memory FAILED ... win32_err=5`, and the
+    /// reason those pairs always came in twos (first the misaligned base, then the too-long view).
+    ///
+    /// So build a fresh object of `new_len` bytes and copy the old object's contents into it,
+    /// preserving the bytes the guest could already see. Known deviation, inherent to a
+    /// fixed-size-object platform: the result is a NEW object, so a holder of `handle` that is
+    /// NOT this mapping (another `shmat` of the same SysV segment, or a `fork()`ed sibling that
+    /// mapped the old handle) keeps seeing the old, smaller one. That is strictly better than the
+    /// alternative this replaces, which was failing the growth outright with `ENOMEM`; real
+    /// `mremap` on a SysV attachment is not a pattern any observed guest relies on.
+    ///
+    /// # Safety
+    ///
+    /// `current_range` must be a live, readable-in-principle mapping of `handle` (its contents
+    /// are read through a fresh temporary view of the same object, so the guest's own permissions
+    /// on `current_range` do not matter).
+    unsafe fn grow_shared_object(
+        &mut self,
+        handle: Platform::SharedMemoryHandle,
+        current_range: core::ops::Range<usize>,
+        new_len: usize,
+    ) -> Result<Platform::SharedMemoryHandle, VmemMoveError> {
+        let copy_len = current_range.len().min(new_len);
+        let temp_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let new_handle = self
+            .platform
+            .create_shared_memory(new_len)
+            .map_err(|_| VmemMoveError::OutOfMemory)?;
+        // Map both objects temporarily, outside `self.vmas` (these are not guest mappings, they
+        // are the copy's own source and destination), at whatever address the platform chooses.
+        let (old_view, new_view) = {
+            let old_view = self.platform.map_shared_memory(
+                handle,
+                0..copy_len,
+                temp_permissions,
+                FixedAddressBehavior::Hint,
+            );
+            let new_view = self.platform.map_shared_memory(
+                new_handle,
+                0..new_len,
+                temp_permissions,
+                FixedAddressBehavior::Hint,
+            );
+            match (old_view, new_view) {
+                (Ok(old_view), Ok(new_view)) => (old_view, new_view),
+                (old_view, new_view) => {
+                    // Release whichever of the two views did get created, at its OWN length (an
+                    // unmap length that overruns a view is rejected outright by the platform).
+                    if let Ok(view) = &old_view {
+                        let start = view.as_usize();
+                        let _ =
+                            unsafe { self.platform.unmap_shared_memory(start..start + copy_len) };
+                    }
+                    if let Ok(view) = &new_view {
+                        let start = view.as_usize();
+                        let _ =
+                            unsafe { self.platform.unmap_shared_memory(start..start + new_len) };
+                    }
+                    let _ = self.platform.close_shared_memory(new_handle);
+                    return Err(VmemMoveError::OutOfMemory);
+                }
+            }
+        };
+        let copy_result: Result<(), VmemMoveError> = (|| {
+            // Chunked so a large pool does not need one allocation the size of the whole region.
+            const CHUNK: usize = 1024 * 1024;
+            let mut offset = 0usize;
+            while offset < copy_len {
+                let chunk_len = (copy_len - offset).min(CHUNK);
+                let source =
+                    Platform::RawConstPointer::<u8>::from_usize(old_view.as_usize() + offset);
+                let bytes = source
+                    .to_owned_slice(chunk_len)
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                new_view
+                    .write_slice_at_offset(isize::try_from(offset).unwrap(), &bytes)
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                offset += chunk_len;
+            }
+            Ok(())
+        })();
+        let _ = unsafe {
+            self.platform
+                .unmap_shared_memory(new_view.as_usize()..new_view.as_usize() + new_len)
+        };
+        let _ = unsafe {
+            self.platform
+                .unmap_shared_memory(old_view.as_usize()..old_view.as_usize() + copy_len)
+        };
+        copy_result?;
+        // Release the old object only once this mapping was its last holder here: other tracked
+        // mappings (e.g. a second `shmat` of the same segment) may still be using this handle
+        // value, and closing it under them would leave them unable to re-map.
+        let sole_holder = self
+            .vmas
+            .iter()
+            .filter(|(_, vma)| vma.shared_handle == Some(handle))
+            .count()
+            <= 1;
+        if sole_holder {
+            let _ = self.platform.close_shared_memory(handle);
+        }
+        Ok(new_handle)
+    }
 
     /// Get an unmapped area in the virtual address space.
     /// `suggested_range` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,

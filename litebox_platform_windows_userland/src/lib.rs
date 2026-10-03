@@ -10160,11 +10160,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // `Hint` means the platform may pick a different address if the hint isn't available
         // (matching `allocate_pages`'s handling of the same case): retry with no address hint
         // rather than surfacing an address collision as an error.
-        if view.Value.is_null()
-            && !base_addr.is_null()
-            && fixed_address_behavior == FixedAddressBehavior::Hint
-        {
-            view = try_map(core::ptr::null(), true);
+        //
+        // ONLY an address-class failure is retried. In particular `ERROR_ACCESS_DENIED` (5) is
+        // NOT one: `MapViewOfFile3` answers that when the requested VIEW LENGTH EXCEEDS THE
+        // SECTION'S SIZE, and no choice of base address can change that -- retrying is a futile
+        // second syscall that also doubled every real occurrence of this in the log (live: the
+        // `win32_err=1132` / `win32_err=5` error pairs, both from this one attach attempt). A
+        // too-long view is the caller's bug (a mapping grown past the size its object was created
+        // with), and it is now surfaced once, as the real capacity failure it is.
+        const ERROR_INVALID_ADDRESS: u32 = 487;
+        let mut first_err = 0u32;
+        if view.Value.is_null() && !base_addr.is_null() {
+            first_err = unsafe { GetLastError() };
+            let address_failure = matches!(
+                first_err,
+                ERROR_INVALID_ADDRESS | Win32_Foundation::ERROR_MAPPED_ALIGNMENT
+            );
+            if fixed_address_behavior == FixedAddressBehavior::Hint && address_failure {
+                view = try_map(core::ptr::null(), true);
+            }
         }
         if view.Value.is_null() {
             let err = unsafe { GetLastError() };
@@ -10174,8 +10188,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 protection:% = map_protection, permissions:? = initial_permissions;
                 "map_shared_memory: DIAG MapViewOfFile3 failed"
             );
+            // `base_addr`/`len` are on the ERROR line too, not only on the debug line above: the
+            // two real failure modes of this call are distinguishable ONLY from them --
+            // `win32_err=1132` is a base that is not 64 KiB-granularity aligned, `win32_err=5` is
+            // a view length larger than the section this handle was created with -- and the
+            // default log level is `warn`, which drops the debug line entirely.
             litebox_util_log::error!(
-                handle:% = handle as usize, pid:% = std::process::id(), win32_err:% = err;
+                handle:% = handle as usize, pid:% = std::process::id(), win32_err:% = err,
+                base_addr:% = base_addr as usize, len:% = suggested_range.len(),
+                first_err:% = first_err;
                 "diag-shm: map_shared_memory FAILED"
             );
             if fixed_address_behavior == FixedAddressBehavior::NoReplace
