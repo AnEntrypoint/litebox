@@ -5689,22 +5689,46 @@ pub fn run_external_fault_watchdog_child() -> ! {
     let mut stalled_ticks: u32 = 0;
     let mut cpu_time_at_stall_start: Option<u64> = None;
     let diag_enabled = std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some();
-    // `SYNCHRONIZE` access. If the parent could not create the event, fall back to the old
-    // behaviour (always armed) rather than leaving the process unsupervised.
     let started_name = guest_started_event_name(target_pid);
     let started_event = unsafe {
         windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, started_name.as_ptr())
     };
+    // An idle guest process is ORDINARY: a server waiting for a client sits at ~0% CPU, which is
+    // exactly what the stall counter below measures. The arm is the ONLY thing separating that from
+    // "wedged after an unrecoverable fault", so when the arm cannot be observed this watchdog must
+    // not terminate anything. The in-process watchdog gates on its own internal flag rather than on
+    // this event, so a genuine fault is still collected there.
+    //
+    // `LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM=1` forces this path so the degradation is
+    // measured rather than assumed.
+    let unobservable_arm = std::env::var_os("LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM").is_some();
     let armed_name = fault_armed_event_name(target_pid);
-    let armed_event = unsafe {
-        windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, armed_name.as_ptr())
+    let armed_event = if unobservable_arm {
+        core::ptr::null_mut()
+    } else {
+        // `SYNCHRONIZE` access.
+        unsafe {
+            windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, armed_name.as_ptr())
+        }
     };
+    if armed_event.is_null() {
+        eprintln!(
+            "[diag-external-watchdog-disarmed] target_pid={target_pid} arm={} -- not supervising",
+            if unobservable_arm {
+                "unobservable(simulated)"
+            } else {
+                "unobservable(open_failed)"
+            }
+        );
+        unsafe { CloseHandle(handle) };
+        std::process::exit(0);
+    }
     loop {
         std::thread::sleep(POLL_INTERVAL);
-        if !armed_event.is_null()
-            && unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0) }
-                != 0
-        {
+        let arm_signalled = unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0)
+        } == 0;
+        if !arm_signalled {
             let mut code: u32 = STILL_ACTIVE;
             if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {
                 unsafe { CloseHandle(handle) };
