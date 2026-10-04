@@ -694,6 +694,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let my_xproc_local = Arc::new(litebox::sync::Mutex::new(
             alloc::collections::BTreeMap::new(),
         ));
+        let my_flock_registry = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
         let inner = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
@@ -726,9 +729,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         shared_file_spill: syscalls::file_spill::SharedFileSpill::new(),
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
-                        flock_registry: litebox::sync::Mutex::new(
-                            alloc::collections::BTreeMap::new(),
-                        ),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
                         record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
@@ -784,6 +784,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             xproc_local: my_xproc_local,
             record_locks_local: Arc::new(litebox::sync::Mutex::new(alloc::vec::Vec::new())),
             record_lock_pollee_local: Arc::new(litebox::event::polling::Pollee::new()),
+            flock_registry: my_flock_registry,
             bootstrap_process: Arc::new(once_cell::race::OnceBox::new()),
         })
     }
@@ -3589,6 +3590,16 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     record_locks_local:
         Arc<litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>>,
     record_lock_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
+    /// This process's own `flock(2)` registry (see `syscalls::file::FlockRegistry`), kept here
+    /// rather than on `GlobalState` because both halves of it -- the `BTreeMap`'s nodes and the
+    /// `Arc<FlockFile>`'s `Pollee` observers -- come from the ordinary private heap of whichever
+    /// process allocated them, so a byte-shared copy of the root pointer is garbage in every other
+    /// process of the fork family (twelfth instance of the defect class this struct's own doc
+    /// comment documents; see `GlobalState`'s matching removed-field note for the live panic).
+    /// Shadowing works by name, exactly like `pty_registry`/`fifo_registry`/`unix_addr_table`:
+    /// Rust resolves the field on this concrete type before auto-`Deref`ing to `GlobalState`, so
+    /// every existing `xxx.flock_registry` call site keeps compiling unchanged.
+    flock_registry: Arc<litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>>,
     bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
 
@@ -3614,6 +3625,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             xproc_local: self.xproc_local.clone(),
             record_locks_local: self.record_locks_local.clone(),
             record_lock_pollee_local: self.record_lock_pollee_local.clone(),
+            flock_registry: self.flock_registry.clone(),
             bootstrap_process: self.bootstrap_process.clone(),
         }
     }
@@ -4091,13 +4103,20 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     sysv_shm: litebox::sync::Mutex<Platform, syscalls::mm::SysvShmTable>,
     /// Next `shmid` to hand out.
     next_shmid: core::sync::atomic::AtomicI32,
-    /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`.
-    ///
-    /// This is deliberately shim-wide (not per-`FilesState`/per-process): real `flock()` locks
-    /// must contend across *any* two open file descriptions of the same underlying file, even ones
-    /// reached from independent `open()` calls in different (e.g. `fork()`-created) processes, not
-    /// just fds `dup()`-derived from a single `open()`. See [`syscalls::file::FlockFile`].
-    flock_registry: litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>,
+    // NOTE: this struct deliberately has NO `flock_registry` field -- TWELFTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, live-diagnosed 2026-10-04 (chr34, `RUST_BACKTRACE=full`): a cross-process-fork
+    // child's very first `flock()` panicked inside `BTreeMap<(usize, usize), Arc<FlockFile>>::
+    // entry(..).or_insert_with(..)` with `range end index 65529 out of range for slice of length
+    // 11` -- its copy of this map's root pointer is the first creator's, and the nodes behind it
+    // are private-heap addresses meaningless in the child's own address space. Same mechanism as
+    // `elf_patch_cache`/`record_locks`/etc, one field deeper: the map's nodes come from the
+    // allocating process's ordinary heap, and `Arc<FlockFile>`'s `Pollee` observer list does too.
+    // Every process therefore gets its own, always-freshly-constructed registry -- a fork-family
+    // member's `flock()` no longer contends with a DIFFERENT host process's, the same accepted
+    // gap `record_locks`/`pty_registry` carry for the same reason (see AGENTS.md). Restoring
+    // genuine cross-process contention needs a flat, pointer-free `SharedPtyTable`-style table
+    // with cross-process wakeup, which is separate follow-on work.
     /// Next id to hand out to a `flock()` holder, identifying an open file description to the
     /// `flock()` implementation (see `syscalls::file`). Shim-wide (rather than a function-local
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the

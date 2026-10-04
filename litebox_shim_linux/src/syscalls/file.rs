@@ -594,7 +594,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 }
 
 /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`. See
-/// `GlobalState::flock_registry`'s doc comment for why this is shim-wide rather than per-process.
+/// `GlobalStateHandle::flock_registry`'s doc comment for why it is per host process: it contends
+/// across every open file description THIS process holds, but not across the fork family.
 pub(crate) type FlockRegistry<Platform> =
     alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FlockFile<Platform>>>;
 
@@ -661,7 +662,7 @@ enum FlockLockState {
 /// Advisory-lock state for a single underlying file (identified by `(dev, ino)`), shared by every
 /// open file description of that file -- including ones from entirely independent `open()` calls,
 /// which is where real contention (as opposed to `dup()`-sharing, handled by [`FlockHolder`])
-/// happens. One instance lives in `GlobalState::flock_registry` per distinct locked file.
+/// happens. One instance lives in `GlobalStateHandle::flock_registry` per distinct locked file.
 pub(crate) struct FlockFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     state: litebox::sync::Mutex<Platform, FlockLockState>,
     /// Woken whenever the lock is released or downgraded, so blocked waiters can retry.
@@ -5417,7 +5418,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// This is implemented with two pieces of state:
     ///   - [`FlockFile`]: one per underlying file (keyed by `(dev, ino)` in
-    ///     `GlobalState::flock_registry`), tracking who currently holds the lock and any waiters.
+    ///     `GlobalStateHandle::flock_registry`, this host process's own), tracking who currently
+    ///     holds the lock and any waiters.
     ///     This is the actual contention/mutual-exclusion point, shared across every open file
     ///     description of that file, matching kernel semantics for independent `open()`s.
     ///   - A holder id stored in this open file description's `DescriptorEntry`-scoped metadata
