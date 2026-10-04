@@ -8928,6 +8928,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             } else {
                 let diag_requested_start = suggested_range.start;
                 let mut out_of_commit = false;
+                // Set when a `MEM_FREE` region of the requested range could not be reserved at all
+                // (see the `MEM_FREE` arm below), i.e. the request is not placeable where the
+                // caller asked for it.
+                let mut placement_blocked = false;
                 process_memory_range_by_regions(
                     suggested_range,
                     |r, state| -> Result<bool, std::convert::Infallible> {
@@ -9281,9 +9285,40 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
+                                if placement_blocked {
+                                    return Ok(true);
+                                }
                                 let ptr =
                                     reserve_and_commit(r.clone(), prot_flags(initial_permissions), 0);
-                                !ptr.is_null()
+                                if ptr.is_null() {
+                                    // `reserve_and_commit` rounds its `MEM_RESERVE` OUT to the 64 KiB
+                                    // allocation granularity, so a range that is only PAGE-aligned
+                                    // (or only page-sized) whose granule already holds a live
+                                    // neighbouring allocation is refused with ERROR_INVALID_ADDRESS,
+                                    // and its "already reserved" `MEM_COMMIT` fallback fails too because
+                                    // the target pages are genuinely free. Such a granule is created by
+                                    // any page-granular allocation -- a shared section view mapped to a
+                                    // VMA whose extent is not granularity-sized, or a restored view
+                                    // flank -- and it is unallocatable for the rest of this process's
+                                    // life. This used to fall through to `process_memory_range_by_
+                                    // regions`'s `assert!`, killing the whole host process (the fork
+                                    // child) over an ordinary guest `mmap`; report it to the caller
+                                    // instead so a `Hint` can be relocated and a fixed request can
+                                    // fail with an errno.
+                                    placement_blocked = true;
+                                    litebox_util_log::error!(
+                                        start:% = r.start,
+                                        end:% = r.end,
+                                        behavior:? = fixed_address_behavior;
+                                        "diag-place-blocked: requested range is free but its allocation granule is unavailable"
+                                    );
+                                    // Report the region as HANDLED: the walk asserts on a `false`
+                                    // return, so the failure has to travel out through
+                                    // `placement_blocked`, which the caller turns into either a
+                                    // relocation (`Hint`) or an errno (fixed-address requests).
+                                    return Ok(true);
+                                }
+                                true
                             }
                             _ => unimplemented!(
                                 "Unexpected memory state: {:?} when allocating pages",
@@ -9314,6 +9349,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     );
                     return Err(AllocationError::OutOfMemory);
                 }
+                if placement_blocked {
+                    match fixed_address_behavior {
+                        // A `Hint` asked for a neighbourhood, not an address: let the OS pick one,
+                        // exactly as the collision branch above does, keeping the placement floor so
+                        // the substitute lands near the discarded one instead of at the bottom of the
+                        // guest range.
+                        FixedAddressBehavior::Hint => {
+                            if std::env::var_os("LITEBOX_NO_PLACEMENT_FLOOR").is_none() {
+                                placement_floor = diag_requested_start;
+                            }
+                            base_addr = core::ptr::null_mut();
+                        }
+                        FixedAddressBehavior::NoReplace => {
+                            return Err(AllocationError::AddressInUse);
+                        }
+                        FixedAddressBehavior::Replace => {
+                            return Err(AllocationError::OutOfMemory);
+                        }
+                    }
+                }
                 // Claimed for EVERY behavior, not just `Replace`.
                 //
                 // `claim_range`'s own doc comment already states that `Hint`-mode allocations
@@ -9334,26 +9389,33 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 // allocation that did not happen to be relocated first.
                 //
                 // `NoReplace` is claimed for the same reason: it commits real host memory too.
-                claim_range(base_addr as usize..(base_addr as usize + size));
-                // DIAG (AGENTS.md pass 223): allocation-free raw print of the actual returned
-                // base_addr vs. the originally-requested suggested_range.start, specifically for
-                // Replace-mode fixed calls -- to finally observe directly whether this success
-                // path (reached whenever the collision/committed-page checks above do NOT
-                // trigger) ever returns a MISMATCHED address, which pass 213's own downstream
-                // check in litebox_common_linux::mm::do_mmap would then reject as EEXIST. Gated
-                // on a mismatch only, so it cannot spam the log on the overwhelming common case
-                // where this path already returns the correct address.
-                if fixed_address_behavior == FixedAddressBehavior::Replace
-                    && base_addr as usize != diag_requested_start
-                {
-                    diag_raw_print(
-                        b"[diag-replace-mismatch] requested=0x",
-                        diag_requested_start,
-                        b" actual=0x",
-                        base_addr as usize,
-                    );
+                //
+                // Skipped when `base_addr` is null, i.e. when `placement_blocked` relocated a
+                // `Hint` below: nothing was placed at the requested address, so there is no range
+                // to claim and no address to return -- execution falls through to the
+                // OS-picks-the-address path at the bottom of this function instead.
+                if !base_addr.is_null() {
+                    claim_range(base_addr as usize..(base_addr as usize + size));
+                    // DIAG (AGENTS.md pass 223): allocation-free raw print of the actual returned
+                    // base_addr vs. the originally-requested suggested_range.start, specifically for
+                    // Replace-mode fixed calls -- to finally observe directly whether this success
+                    // path (reached whenever the collision/committed-page checks above do NOT
+                    // trigger) ever returns a MISMATCHED address, which pass 213's own downstream
+                    // check in litebox_common_linux::mm::do_mmap would then reject as EEXIST. Gated
+                    // on a mismatch only, so it cannot spam the log on the overwhelming common case
+                    // where this path already returns the correct address.
+                    if fixed_address_behavior == FixedAddressBehavior::Replace
+                        && base_addr as usize != diag_requested_start
+                    {
+                        diag_raw_print(
+                            b"[diag-replace-mismatch] requested=0x",
+                            diag_requested_start,
+                            b" actual=0x",
+                            base_addr as usize,
+                        );
+                    }
+                    return Ok(UserMutPtr::from_ptr(base_addr.cast()));
                 }
-                return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }
         }
 
@@ -9616,13 +9678,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         process_memory_range_by_regions(
             range.clone(),
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_ne!(
-                    state,
-                    Win32_Memory::MEM_FREE,
-                    "Trying to deallocate a free region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
+                // A `MEM_FREE` region holds nothing to decommit, so there is nothing to do here --
+                // and `VirtualFree(MEM_DECOMMIT)` on it FAILS with ERROR_INVALID_ADDRESS (487),
+                // which used to return `false` and trip `process_memory_range_by_regions`'s own
+                // `assert!`, killing the whole host process (a fork child) over an ordinary guest
+                // `munmap()`. A free region inside a requested unmap range is normal: litebox
+                // unmaps a shared VMA with `UnmapViewOfFileEx`, which drops the WHOLE underlying
+                // view (possibly wider than the VMA) straight to free, and a section view cannot
+                // be decommitted in place the way private memory can. Replacing the old
+                // `debug_assert_ne!` (compiled out in release, so it never fired where it mattered)
+                // with this early return makes the release behaviour match its intent.
+                if state == Win32_Memory::MEM_FREE {
+                    if diag_mm_enabled() {
+                        litebox_util_log::debug!(
+                            start:% = r.start, end:% = r.end,
+                            pid:% = std::process::id(), tid:? = std::thread::current().id();
+                            "diag-decommit: already-free region, nothing to decommit"
+                        );
+                    }
+                    return Ok(true);
+                }
                 // `VirtualFree(MEM_DECOMMIT)` is only valid on privately-committed memory --
                 // calling it on a mapped SECTION VIEW (`MEM_MAPPED`) is invalid on Windows and,
                 // if litebox's own VMA bookkeeping ever fails to recognize a range as shared
@@ -9768,7 +9843,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             "diag-vprotect: update_permissions VirtualProtect"
                         );
                     }
-                    Ok(ok)
+                    if !ok {
+                        // `VirtualProtect` cannot succeed on a range Windows reports as `MEM_FREE`
+                        // (ERROR_INVALID_ADDRESS, 487) -- the same page-granular-hole situation
+                        // `allocate_pages`'s own `MEM_FREE` arm documents (a carried section view
+                        // dropped to free by an earlier `UnmapViewOfFileEx` leaves a hole no later
+                        // operation can fill). Returning `false` here trips `process_memory_range_by
+                        // _regions`'s `assert!` and kills the whole host process; the guest asked to
+                        // protect memory it does not have, which is exactly the ENOMEM this
+                        // propagates.
+                        denied = true;
+                    }
+                    Ok(true)
                 },
             )
             .expect("update_permissions failed");
