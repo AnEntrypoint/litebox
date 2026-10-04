@@ -23,7 +23,7 @@ use crate::{
     mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{MemoryRegionPermissions, RemapError, SharedRegionCarry},
+        page_mgmt::{MemoryRegionPermissions, RemapError},
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -1037,20 +1037,6 @@ where
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
-    }
-
-    /// Every `VM_SHARED` mapping this address space holds, described well enough for a fork child
-    /// on another host process to attach to the SAME object.
-    ///
-    /// This is the parent half of carrying a real shared mapping across a cross-process `fork()`.
-    /// Hand the result to `Platform::export_fork_shared_regions` immediately before the spawn;
-    /// the child's own `PageManager::new_adopting_existing_memory` picks it up from there. A
-    /// mapping whose object has no host-wide name is simply absent from the list: it cannot be
-    /// reconstructed elsewhere, and the child reports it as unrestorable rather than quietly
-    /// mapping a private copy of it.
-    #[must_use]
-    pub fn shared_region_carry(&self) -> Vec<SharedRegionCarry> {
-        self.vmem.read().shared_region_carry()
     }
 
     /// Map an already-existing shared-memory handle (from a prior real allocation this platform

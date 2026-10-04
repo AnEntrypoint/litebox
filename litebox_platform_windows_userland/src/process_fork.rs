@@ -51,27 +51,9 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_0,
-    MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, UnmapViewOfFile2, VirtualFreeEx,
+    MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MemExtendedParameterAddressRequirements,
+    PAGE_READWRITE, VirtualFreeEx,
 };
-// The placeholder family: reserve address space as a PLACEHOLDER, split it, then replace each
-// piece either with a real section view (`MEM_REPLACE_PLACEHOLDER`) or with ordinary committed
-// memory. This is the ONLY way a shared mapping can be given to another process at a fixed
-// address -- `MapViewOfFile3` cannot be made to overlay memory the child already holds, in any
-// state (`ERROR_INVALID_ADDRESS`, 487, measured for committed, decommitted and merely-reserved
-// alike), so the address must still be FREE-but-reserved at the moment the view is placed.
-// Spelled out here rather than imported so this file does not depend on the exact names
-// `windows-sys` exports for them.
-const PLACEHOLDER_RESERVE: u32 = 0x0004_0000; // MEM_RESERVE_PLACEHOLDER
-const PLACEHOLDER_REPLACE: u32 = 0x0000_4000; // MEM_REPLACE_PLACEHOLDER
-const PLACEHOLDER_PRESERVE: u32 = 0x0000_0002; // MEM_PRESERVE_PLACEHOLDER
-
-use crate::{
-    FORK_CHILD_SHARED_REGIONS_ENV_VAR, encode_fork_shared_regions, shm_section_handle,
-    take_fork_shared_regions,
-};
-use litebox::platform::page_mgmt::SharedRegionCarry;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{
@@ -1811,8 +1793,6 @@ pub fn diagnostic_spawn_and_copy(
             source_group,
             *dest_base,
             &mut read_source_bytes,
-            // Diagnostic-only spawn: nothing was exported for it, so nothing is carried.
-            &[],
         ));
     }
 
@@ -1994,32 +1974,12 @@ pub fn spawn_process_fork_child(
             "[lazy_fork_commit] 114th-pass DIAG: active_rsps at fork = {active_rsps:x?}"
         );
     }
-    // Taken HERE, not at the `child_env.push` below, because it also decides which groups may stay
-    // lazy -- see the `lazy_eligible` filter right after this call.
-    let carried_shared: Vec<SharedRegionCarry> = take_fork_shared_regions();
     let mut lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
         group_relocations,
         vma_layout,
         &active_rsps,
         sigreturn_trampoline,
     );
-    // A group that carries a shared region may NOT stay lazy. The child's lazy installer reserves
-    // the group's whole span and faults its pages in on first access, which for a shared range
-    // means faulting in a PRIVATE copy of the object's bytes -- and reserving over the view the
-    // parent mapped there would clobber it outright. Sharing wins over laziness: such a group is
-    // built eagerly (the placeholder route commits its non-shared part instead of deferring it).
-    for (i, eligible) in lazy_eligible.iter_mut().enumerate() {
-        if !*eligible {
-            continue;
-        }
-        let group = &group_relocations[i].0;
-        if carried_shared
-            .iter()
-            .any(|c| c.range.start < group.end && group.start < c.range.end)
-        {
-            *eligible = false;
-        }
-    }
     let mut lazy_group_ranges: Vec<Range<usize>> = group_relocations
         .iter()
         .zip(lazy_eligible.iter())
@@ -2124,21 +2084,6 @@ pub fn spawn_process_fork_child(
             .join(",");
         child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
     }
-    // Pushed UNCONDITIONALLY, empty when this process has no shared mapping to carry, for exactly
-    // the reason `FORK_CHILD_PARENT_LAYER_ENV_VAR` above is: an omitted entry is INHERITED, and a
-    // cross-process child is itself a fork parent, so omitting it would let a grandchild adopt its
-    // grandparent's shared regions -- addresses this child never mapped and objects it may not
-    // even hold.
-    //
-    // This is the whole point of the mechanism: `carried_shared` names the shared objects behind
-    // this process's `VM_SHARED` mappings, and the child re-opens them BY NAME to get its own
-    // handle to the very same bytes. Only the ranges the parent actually manages to map (below,
-    // while the child is suspended) turn into real sharing; the child verifies each one itself
-    // rather than taking the name on faith (see `Vmem::adopt_carried_shared`).
-    child_env.push((
-        FORK_CHILD_SHARED_REGIONS_ENV_VAR,
-        encode_fork_shared_regions(&carried_shared),
-    ));
     // Track B step 4 (ADVISORY-002 3.3): hand the child a real, live handle to the SAME shared
     // kernel heap section this process itself maps, instead of letting it reserve its own,
     // content-independent 8 GiB mapping (the deliberate, previously-incomplete step-3 shape --
@@ -2355,14 +2300,7 @@ pub fn spawn_process_fork_child(
             );
         }
         let group_t0 = std::time::Instant::now();
-        // A LAZY group holding a `VM_SHARED` region cannot take the lazy route: lazy reserves the
-        // group's span and lets the child fault its pages in, which for a shared region would
-        // fault in a PRIVATE copy of the object's bytes. Sharing wins over laziness here, so such a
-        // group goes through the placeholder route (which commits its non-shared part eagerly).
-        let has_shared = carried_shared
-            .iter()
-            .any(|c| c.range.start < source_group.end && source_group.start < c.range.end);
-        let result = if *lazy && !has_shared {
+        let result = if *lazy {
             if let Some(claim) = guard_cow_claim.as_mut() {
                 let group_slot_base = next_guard_slot;
                 next_guard_slot += source_group.len().div_ceil(4096);
@@ -2377,13 +2315,7 @@ pub fn spawn_process_fork_child(
                 crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
             }
         } else {
-            copy_one_group(
-                process,
-                source_group,
-                *dest_base,
-                &mut read_source_bytes,
-                &carried_shared,
-            )
+            copy_one_group(process, source_group, *dest_base, &mut read_source_bytes)
         };
         if diag_copy_timing {
             eprintln!(
@@ -4564,312 +4496,14 @@ fn spawn_suspended_impl(
     ))
 }
 
-/// Rebuilds `source_group` in the child with its `VM_SHARED` sub-ranges as REAL views of the real
-/// shared objects, and everything else as ordinary copied bytes.
-///
-/// # Why a placeholder, and why only the parent can do the mapping
-///
-/// `MapViewOfFile3` cannot be made to overlay address space the child already holds -- measured:
-/// committed, decommitted and merely-reserved targets all answer `ERROR_INVALID_ADDRESS` (487). A
-/// view can only *replace a placeholder*. So the group is reserved as ONE placeholder, split into
-/// per-segment placeholders with `VirtualFreeEx(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`, each
-/// shared segment replaced by `MapViewOfFile3(..., MEM_REPLACE_PLACEHOLDER, ...)`, and each
-/// remaining segment replaced by `MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER` plus the
-/// parent's bytes. The layout is unchanged -- the group still covers exactly `source_group`, at
-/// exactly that address -- only the shared sub-ranges are backed differently.
-///
-/// Only the parent can do it: by the time the child runs, its address space already exists, and a
-/// `SharedMemoryHandle` is a `HANDLE` value that means nothing in another process. The child's own
-/// route to the same bytes is the NAME, which it re-opens in `Vmem::adopt_carried_shared`.
-///
-/// Returns `Err(win32_err)` on failure. The caller must surface that as a failure, never as a
-/// silent byte-copy: a shared region the child does not genuinely share is the bug, not a
-/// degradation to absorb.
-fn copy_one_group_with_shared(
-    child: HANDLE,
-    source_group: &Range<usize>,
-    shared: &[SharedRegionCarry],
-    read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
-) -> Result<(), u32> {
-    const GRAN: usize = 64 * 1024;
-    // `ERROR_INVALID_HANDLE`: this process holds no live handle to the object it is trying to hand
-    // the child, so there is nothing to map.
-    const NO_SECTION_HANDLE: u32 = 6;
-    let len = source_group.len();
-    if source_group.start % GRAN != 0 || len % GRAN != 0 {
-        // A placeholder must be granularity-aligned and granularity-sized. Reservation groups are
-        // by construction (pass 110), so reaching this means the group bookkeeping changed, not
-        // that this region is uncarriable.
-        return Err(0);
-    }
-
-    // Step 1: the whole group as ONE placeholder -- reserved, nothing committed, so still
-    // replaceable.
-    let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
-        LowestStartingAddress: source_group.start as *mut c_void,
-        HighestEndingAddress: (source_group.end - 1) as *mut c_void,
-        Alignment: 0,
-    };
-    let mut ext_param = MEM_EXTENDED_PARAMETER {
-        Anonymous1: MEM_EXTENDED_PARAMETER_0 {
-            _bitfield: MemExtendedParameterAddressRequirements as u64,
-        },
-        Anonymous2: MEM_EXTENDED_PARAMETER_1 {
-            Pointer: (&raw mut addr_req).cast::<c_void>(),
-        },
-    };
-    let reserved = unsafe {
-        windows_sys::Win32::System::Memory::VirtualAlloc2(
-            child,
-            core::ptr::null_mut(),
-            len,
-            MEM_RESERVE | PLACEHOLDER_RESERVE,
-            PAGE_NOACCESS,
-            &raw mut ext_param,
-            1,
-        )
-    };
-    if reserved.is_null() {
-        return Err(unsafe { GetLastError() });
-    }
-    if reserved as usize != source_group.start {
-        unsafe {
-            VirtualFreeEx(child, reserved, 0, MEM_RELEASE);
-        }
-        return Err(0);
-    }
-
-    // Step 2: cut the group into segments along the shared ranges, then split the placeholder to
-    // match. One `VirtualFreeEx(..., MEM_PRESERVE_PLACEHOLDER)` per segment, in address order,
-    // carves each segment out of whatever placeholder currently covers it.
-    let mut segments: std::vec::Vec<(Range<usize>, Option<&SharedRegionCarry>)> =
-        std::vec::Vec::new();
-    let mut cursor = source_group.start;
-    for carry in shared {
-        let start = carry.range.start.max(source_group.start);
-        let end = carry.range.end.min(source_group.end);
-        if start >= end {
-            continue;
-        }
-        if start > cursor {
-            segments.push((cursor..start, None));
-        }
-        segments.push((start..end, Some(carry)));
-        cursor = end;
-    }
-    if cursor < source_group.end {
-        segments.push((cursor..source_group.end, None));
-    }
-    // Every boundary the group is cut at has to be granularity-aligned: a placeholder can only be
-    // split there. Carries live inside granularity-rounded reservation groups, so they are; if
-    // that bookkeeping ever changes the honest answer is "cannot carry this one", not a guess.
-    if segments.iter().any(|(segment, _)| segment.start % GRAN != 0) {
-        return Err(0);
-    }
-    // Best-effort undo, run before every failure return below that has already placed something.
-    // Freeing each segment's base with `MEM_RELEASE` (size 0) releases the whole allocation that
-    // contains it -- after a split every segment is its own allocation, and an unsplit remainder's
-    // allocation base is the first segment inside it, so covering every segment base covers the
-    // whole group. It has to be undone because the caller's byte-copy fallback re-reserves the
-    // group at this SAME address, and reserving over live memory answers 487 (measured,
-    // `.wfgy/xproc_placeholder2.py` case D/G).
-    let cleanup = || {
-        for (segment, _) in &segments {
-            unsafe {
-                // A section view answers `VirtualFreeEx(..., MEM_RELEASE)` with 87 and has to be
-                // unmapped with `UnmapViewOfFile2` instead; a placeholder or a committed private
-                // range ignores that and is released by the `VirtualFreeEx` after it. Both are
-                // best-effort, and together they cover every state a segment can be left in when
-                // a later step fails. Measured: `.wfgy/xproc_placeholder5.py`.
-                let _ = UnmapViewOfFile2(
-                    child,
-                    MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: segment.start as *mut c_void,
-                    },
-                    0,
-                );
-                let _ = VirtualFreeEx(child, segment.start as *mut c_void, 0, MEM_RELEASE);
-            }
-        }
-    };
-    let diag = std::env::var_os("LITEBOX_DIAG_FORK_SHARED").is_some();
-    // A split has to leave a remainder. `VirtualFreeEx(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`
-    // over a range that is ALREADY the whole placeholder covering it is rejected with
-    // `ERROR_INVALID_ADDRESS` (487) -- measured, `.wfgy/xproc_placeholder3.py` case J: splitting
-    // an entire 12-granule placeholder returns 487, splitting only its first granule returns 0.
-    // Once segment `i` has been split off, the leftover placeholder begins exactly at segment
-    // `i + 1` and ends at the group end, so the LAST segment is already exactly one placeholder
-    // and must not be split again. This was the whole 487 in run shmf2: group=12 granules with
-    // the shared range as its first granule, so the loop's second split covered the entire
-    // remaining 11-granule placeholder and failed.
-    for (index, (segment, _)) in segments.iter().enumerate() {
-        if index + 1 == segments.len() {
-            break;
-        }
-        let ok = unsafe {
-            VirtualFreeEx(
-                child,
-                segment.start as *mut c_void,
-                segment.len(),
-                MEM_RELEASE | PLACEHOLDER_PRESERVE,
-            )
-        };
-        if ok == 0 {
-            let err = unsafe { GetLastError() };
-            if diag {
-                eprintln!(
-                    "[diag-fork-shared] SPLIT FAILED group={:#x}..{:#x} segment={:#x}..{:#x} err={}",
-                    source_group.start, source_group.end, segment.start, segment.end, err
-                );
-            }
-            cleanup();
-            return Err(err);
-        }
-    }
-
-    // Step 3: replace each placeholder segment with what actually belongs there.
-    for (segment, carry) in &segments {
-        match carry {
-            Some(carry) => {
-                let Some(section) = shm_section_handle(carry.name.as_str()) else {
-                    cleanup();
-                    return Err(NO_SECTION_HANDLE);
-                };
-                // Widest first: a view can never exceed the section's protection ceiling, so the
-                // narrow retries are what a file-backed section whose ceiling fell back to
-                // `PAGE_READWRITE` needs. The child narrows to the mapping's real permissions
-                // itself, from the `VmFlags` the carry also brings across.
-                let mut view = 0usize;
-                for protection in [PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY] {
-                    let mapped = unsafe {
-                        MapViewOfFile3(
-                            section as *mut c_void,
-                            child,
-                            segment.start as *mut c_void,
-                            0,
-                            segment.len(),
-                            PLACEHOLDER_REPLACE,
-                            protection,
-                            core::ptr::null_mut(),
-                            0,
-                        )
-                    };
-                    if !mapped.Value.is_null() {
-                        view = mapped.Value as usize;
-                        break;
-                    }
-                }
-                if view == 0 {
-                    let err = unsafe { GetLastError() };
-                    if diag {
-                        eprintln!(
-                            "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
-                            source_group.start, source_group.end, segment.start, segment.end,
-                            carry.name.as_str(), err
-                        );
-                    }
-                    cleanup();
-                    return Err(err);
-                }
-                if view != segment.start {
-                    // Should be unreachable: `MEM_REPLACE_PLACEHOLDER` with an explicit base
-                    // either replaces exactly that placeholder or fails.
-                    cleanup();
-                    return Err(0);
-                }
-            }
-            None => {
-                let placed = unsafe {
-                    windows_sys::Win32::System::Memory::VirtualAlloc2(
-                        child,
-                        segment.start as *mut c_void,
-                        segment.len(),
-                        MEM_RESERVE | MEM_COMMIT | PLACEHOLDER_REPLACE,
-                        PAGE_READWRITE,
-                        core::ptr::null_mut(),
-                        0,
-                    )
-                };
-                if placed.is_null() {
-                    let err = unsafe { GetLastError() };
-                    cleanup();
-                    return Err(err);
-                }
-                // The parent's real bytes for the non-shared part of the group: the same
-                // page-by-page copy `copy_one_group` does, restricted to this segment so an
-                // unreadable padding page stays zero-filled instead of failing the whole group.
-                if let Some(err) = copy_pages_into(child, segment, read_source_bytes) {
-                    cleanup();
-                    return Err(err);
-                }
-            }
-        }
-    }
-    if std::env::var_os("LITEBOX_DIAG_FORK_SHARED").is_some() {
-        for (segment, carry) in &segments {
-            eprintln!(
-                "[diag-fork-shared] group={:#x}..{:#x} segment={:#x}..{:#x} {}",
-                source_group.start,
-                source_group.end,
-                segment.start,
-                segment.end,
-                match carry {
-                    Some(c) => alloc::format!("SHARED view of {}", c.name.as_str()),
-                    None => "private copy".to_string(),
-                }
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `WriteProcessMemory`s the parent's live bytes for every page of `range` into `child` at the same
-/// addresses. Unreadable pages (real guest padding inside a granularity-rounded group) are left
-/// zero-filled, and all-zero pages are skipped because `MEM_COMMIT` already zero-fills them.
-/// Returns `Some(win32_err)` on the first write failure.
-fn copy_pages_into(
-    child: HANDLE,
-    range: &Range<usize>,
-    read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
-) -> Option<u32> {
-    const PAGE_SIZE: usize = 4096;
-    let mut cursor = range.start;
-    while cursor < range.end {
-        let page_end = (cursor + PAGE_SIZE).min(range.end);
-        if let Some(bytes) = read_source_bytes(cursor..page_end) {
-            if !bytes.iter().all(|b| *b == 0) {
-                let mut written = 0usize;
-                let ok = unsafe {
-                    WriteProcessMemory(
-                        child,
-                        cursor as *mut c_void,
-                        bytes.as_ptr().cast::<c_void>(),
-                        bytes.len(),
-                        &raw mut written,
-                    )
-                };
-                if ok == 0 || written != bytes.len() {
-                    return Some(unsafe { GetLastError() });
-                }
-            }
-        }
-        cursor = page_end;
-    }
-    None
-}
-
 /// Attempts steps 1-2 of [`diagnostic_spawn_and_copy`]'s doc comment for a single reservation
 /// group. Never panics on failure -- a failed group is reported in the returned
 /// [`GroupCopyResult`], not propagated as an error, so the caller sees every group's outcome.
-///
-/// `carried_shared` are the parent's `VM_SHARED` mappings; any that fall inside this group are
-/// mapped as real views by [`copy_one_group_with_shared`] instead of being copied as bytes.
 fn copy_one_group(
     child: HANDLE,
     source_group: &Range<usize>,
     _dest_base: usize,
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
-    carried_shared: &[SharedRegionCarry],
 ) -> GroupCopyResult {
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
@@ -4884,46 +4518,6 @@ fn copy_one_group(
         succeeded: false,
         last_error: err,
     };
-
-    // A `VM_SHARED` mapping inside this group is NOT bytes to copy. Copying the parent's bytes
-    // gives the child its own private pages that merely start out equal, and then every write the
-    // child makes lands where the parent cannot see it -- which is the bug. The shared sub-ranges
-    // get a real view of the real object instead; everything else in the group is copied as bytes
-    // exactly as before.
-    let mut shared: std::vec::Vec<SharedRegionCarry> = carried_shared
-        .iter()
-        .filter(|c| c.range.start < source_group.end && source_group.start < c.range.end)
-        .cloned()
-        .collect();
-    shared.sort_by_key(|c| c.range.start);
-    if !shared.is_empty() {
-        match copy_one_group_with_shared(child, source_group, &shared, read_source_bytes) {
-            Ok(()) => {
-                return GroupCopyResult {
-                    source_group: source_group.clone(),
-                    succeeded: true,
-                    last_error: 0,
-                }
-            }
-            Err(err) => {
-                // NAMED, never silent: this is a region the child will NOT genuinely share, and
-                // the child says so too when it refuses to book it (`Vmem::adopt_carried_shared`).
-                litebox_util_log::error!(
-                    group:? = source_group, regions:? = shared.iter().map(|c| (c.range.start, c.range.end, c.name.as_str())).collect::<std::vec::Vec<_>>(), win32_err:% = err;
-                    "fork: a shared region could not be mapped into the child, so this fork loses \
-                     real sharing for it -- parent and child will NOT observe each other's writes"
-                );
-                // NOT fatal to the fork. Losing sharing for one region is the pre-existing bug
-                // this carry exists to fix; a fork that abandons the cross-process spawn is
-                // strictly worse -- it lands on the same-process thread-based fallback, where
-                // every child faults before its first instruction, which also makes the carry
-                // impossible to test. So: fall through and rebuild this group as copied bytes,
-                // exactly as it was before the carry existed. The child still refuses to book
-                // the range as shared (`memory_is_shared_view` sees PRIVATE pages), so the
-                // degradation is loud on both sides and never mistaken for real sharing.
-            }
-        }
-    }
 
     // Step 1: force-reserve+commit the group's exact span, at its exact SOURCE address, in the
     // child. `MEM_ADDRESS_REQUIREMENTS` makes this a hard requirement -- per pass 109, either it
