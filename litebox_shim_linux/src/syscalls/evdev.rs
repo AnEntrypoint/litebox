@@ -63,10 +63,14 @@ static INPUT_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// non-interactive program that merely opened the device) can't grow this queue unboundedly from
 /// host-side input the guest never asked to receive.
 ///
-/// Sized down from 256 to 128 for the shared-table rewrite: the ring now lives in the 128MiB
-/// shared kernel arena (see [`SharedEvdevTable`]) as a power-of-two allocation with an 8KiB floor,
-/// and 128 is still 2x the real kernel's own `EVDEV_BUFFER_SIZE`.
-const MAX_QUEUED_EVENTS: usize = 128;
+/// Kept at 256 for the shared-table rewrite: the ring now lives in the 128MiB shared kernel arena
+/// (see [`SharedEvdevTable`]), which hands out power-of-two blocks with an 8KiB floor, so
+/// `256 * INPUT_EVENT_BYTES` (6144B) plus the ~1568B guard is ~7.7KiB and takes the SAME single
+/// 8KiB block that 128 (~4.6KiB) would have taken -- restoring 256 costs zero extra arena bytes,
+/// which is the only budget that matters here because AGENTS.md Open 3 has that arena nearly full
+/// from ~6 concurrent `GlobalState`s. The runtime `debug!` in `SharedEvdevTable::new` prints the
+/// real `region_bytes` if this arithmetic ever needs re-checking.
+const MAX_QUEUED_EVENTS: usize = 256;
 /// Width of one entry of [`SharedEvdevRegion::events`]: the exact byte image of one `InputEvent`,
 /// so what the guest `read()`s is bit-identical to the `VecDeque<InputEvent>` this replaced.
 const INPUT_EVENT_BYTES: usize = size_of::<InputEvent>();
