@@ -35,8 +35,9 @@ use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     AllocationError, CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    SharedMemoryError,
+    SharedMemoryError, SharedMemoryName, SharedObjectKind, SharedRegionCarry,
 };
+use std::fmt::Write as _;
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
 
@@ -10008,30 +10009,105 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
-        let size_u64 = size as u64;
-        // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into
-        // high/low 32-bit halves, not a single 64-bit parameter.
-        #[expect(clippy::cast_possible_truncation)]
-        let handle = unsafe {
-            CreateFileMappingW(
-                Win32_Foundation::INVALID_HANDLE_VALUE,
-                core::ptr::null(),
-                Win32_Memory::PAGE_EXECUTE_READWRITE,
-                (size_u64 >> 32) as u32,
-                size_u64 as u32,
-                core::ptr::null(),
-            )
+        // NAMED, not anonymous. This used to be a plain unnamed `CreateFileMappingW`, and that
+        // one omission is why a fork child could not have this mapping: the only identity an
+        // unnamed section has is the `HANDLE` value, which is meaningless in another process, so
+        // there was nothing the child could ask its own OS for. A name is askable.
+        //
+        // Nothing else changes: the object is still pagefile-backed, still private to this
+        // process until someone opens the name, and the name is unguessable (`pid` + a monotonic
+        // counter), so no other process can stumble into it -- the fork child is told it
+        // explicitly, through `FORK_CHILD_SHARED_REGIONS_ENV_VAR`.
+        let n = ANON_SHM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("Local\\litebox_anon_shm_{}_{n:x}", std::process::id());
+        <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::create_named_shared_memory(
+            self, &name, size,
+        )
+    }
+
+    fn shared_memory_object_name(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Option<(SharedMemoryName, SharedObjectKind)> {
+        let names = SHM_OBJECT_NAMES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (name, kind) = names.get(&handle)?;
+        Some((SharedMemoryName::new(name)?, *kind))
+    }
+
+    fn export_fork_shared_regions(&self, regions: &[SharedRegionCarry]) {
+        // Replacing, not appending: a stale export from an earlier fork would otherwise describe
+        // regions this child does not have, and the child would attach to objects it never mapped.
+        let mut slot = FORK_SHARED_EXPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = regions.to_vec();
+    }
+
+    fn carried_fork_shared_regions(&self) -> alloc::vec::Vec<SharedRegionCarry> {
+        // Read once, then DROP the variable (`bb518ca`'s rule for per-child env vars): this
+        // process is itself a fork parent for its own children, and an inherited value would
+        // otherwise survive into them.
+        let Some(raw) = std::env::var_os(FORK_CHILD_SHARED_REGIONS_ENV_VAR) else {
+            return alloc::vec::Vec::new();
         };
-        if handle.is_null() {
-            return Err(SharedMemoryError::OutOfMemory);
+        unsafe {
+            std::env::remove_var(FORK_CHILD_SHARED_REGIONS_ENV_VAR);
         }
-        if diag_mm_enabled() {
-            litebox_util_log::debug!(
-                handle:% = handle as usize, size:% = size, pid:% = std::process::id();
-                "diag-shm: create_shared_memory"
-            );
+        let Some(raw) = raw.to_str() else {
+            return alloc::vec::Vec::new();
+        };
+        let mut out = alloc::vec::Vec::new();
+        for entry in raw.split(';') {
+            if entry.is_empty() {
+                continue;
+            }
+            let mut f = entry.split(':');
+            let (Some(start), Some(end), Some(size), Some(flags), Some(perms), Some(kind), Some(name_hex)) =
+                (f.next(), f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+            else {
+                continue;
+            };
+            if f.next().is_some() {
+                continue;
+            }
+            let (Ok(start), Ok(end), Ok(size), Ok(flags), Ok(perms)) = (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+                usize::from_str_radix(size, 16),
+                u32::from_str_radix(flags, 16),
+                u8::from_str_radix(perms, 16),
+            ) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            let kind = match kind {
+                "N" => SharedObjectKind::Named,
+                "F" => SharedObjectKind::FileBacked,
+                _ => continue,
+            };
+            let Some(bytes) = unhex(name_hex) else {
+                continue;
+            };
+            let Ok(name) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Some(name) = SharedMemoryName::new(name) else {
+                continue;
+            };
+            out.push(SharedRegionCarry {
+                range: start..end,
+                name,
+                kind,
+                size,
+                perms: MemoryRegionPermissions::from_bits_truncate(perms),
+                flags,
+            });
         }
-        Ok(handle as usize)
+        out
     }
 
     fn create_named_shared_memory(
@@ -10079,6 +10155,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 "diag-shm: create_named_shared_memory"
             );
         }
+        register_shm_name(handle as usize, name.to_string(), SharedObjectKind::Named);
         Ok(handle as usize)
     }
 
@@ -10214,6 +10291,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 "diag-shm: create_file_backed_named_shared_memory"
             );
         }
+        register_shm_name(handle as usize, name.to_string(), SharedObjectKind::FileBacked);
         Ok(handle as usize)
     }
 
@@ -10552,7 +10630,39 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
         }
         let _ = unsafe { Win32_Foundation::CloseHandle(handle as *mut c_void) };
+        // Drop the name alongside the handle. Win32 may reuse this value for the NEXT object this
+        // process opens, and a stale entry would then tell a fork child to re-open the wrong
+        // object by name -- a silent cross-sharing of two unrelated regions.
+        let mut names = SHM_OBJECT_NAMES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        names.remove(&handle);
         Ok(())
+    }
+
+    fn memory_is_shared_view(&self, range: core::ops::Range<usize>) -> bool {
+        // `Type == MEM_MAPPED` is the OS's own answer to "is this a section view": `VirtualAlloc`
+        // memory reports `MEM_PRIVATE` and a mapped view reports `MEM_MAPPED`, and no amount of
+        // byte-copying can turn one into the other. Used by a fork child to confirm the parent's
+        // `MapViewOfFile3` into it really landed before it books the region as shared -- see the
+        // trait method's doc comment.
+        let mut info: Win32_Memory::MEMORY_BASIC_INFORMATION =
+            unsafe { core::mem::zeroed() };
+        let queried = unsafe {
+            Win32_Memory::VirtualQuery(
+                range.start as *const c_void,
+                &raw mut info,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            return false;
+        }
+        let covers_whole_range = info.BaseAddress as usize <= range.start
+            && info.BaseAddress as usize + info.RegionSize >= range.end;
+        covers_whole_range
+            && info.State == Win32_Memory::MEM_COMMIT
+            && info.Type == Win32_Memory::MEM_MAPPED
     }
 }
 
@@ -11016,6 +11126,116 @@ pub(crate) static VIRTUAL_PROTECT_LOCK: Mutex<()> = Mutex::new(());
 /// be sampled at the SAME instant (see `diag-shm-crossview`). Diagnostic only.
 static ADV_SHM_VIEWS: Mutex<std::collections::BTreeMap<usize, Vec<(usize, usize)>>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+/// The host-wide name of every shared-memory object this process owns, keyed by its handle.
+///
+/// This is the ONLY thing that makes a `VM_SHARED` mapping carryable into a fork child. A
+/// `SharedMemoryHandle` is a raw `HANDLE` value -- an index into THIS process's handle table --
+/// so handing it to another process yields `ERROR_INVALID_HANDLE` (6), which is exactly why a
+/// child used to be left with no attachment at all. The name is what the child can re-open.
+static SHM_OBJECT_NAMES: Mutex<std::collections::BTreeMap<usize, (std::string::String, SharedObjectKind)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Distinguishes the anonymous objects [`WindowsUserland::create_shared_memory`] mints. Their
+/// names are unguessable by construction, so a collision would mean a counter wraparound, not a
+/// guest-visible clash.
+static ANON_SHM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The environment variable a fork child's own [`PageManagementProvider::carried_fork_shared_
+/// regions`] reads its [`SharedRegionCarry`] list back from.
+///
+/// Every field is hex-encoded and the separators are `:`, `;` and `,`, none of which can appear
+/// inside a hex digit -- so a guest-chosen object name (which may contain any of them) survives
+/// the round trip verbatim instead of splitting the record.
+pub const FORK_CHILD_SHARED_REGIONS_ENV_VAR: &str = "LITEBOX_FORK_SHARED_REGIONS";
+
+/// What [`WindowsUserland::export_fork_shared_regions`] most recently exported: the shared
+/// regions of the process that is about to spawn (or has just spawned) a fork child. Read back
+/// by `process_fork` while the child is still suspended.
+static FORK_SHARED_EXPORT: Mutex<alloc::vec::Vec<SharedRegionCarry>> =
+    Mutex::new(alloc::vec::Vec::new());
+
+/// Take the exported carry list, leaving the export slot empty.
+pub fn take_fork_shared_regions() -> alloc::vec::Vec<SharedRegionCarry> {
+    core::mem::take(
+        &mut *FORK_SHARED_EXPORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Remember what `handle` can be re-opened as, so a fork child can be told the name instead of
+/// being handed a `HANDLE` value that means nothing in its address space.
+///
+/// Keyed on the handle VALUE, which is unique among the handles this process currently holds
+/// (Win32 never issues the same value twice while an earlier one is open), so a closed-and-
+/// reopened handle cannot collide with a stale entry -- `close_shared_memory` removes it first.
+fn register_shm_name(
+    handle: usize,
+    name: std::string::String,
+    kind: SharedObjectKind,
+) {
+    let mut names = SHM_OBJECT_NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    names.insert(handle, (name, kind));
+}
+
+/// This process's own handle to the object called `name`, for a fork child's parent-side mapping.
+///
+/// Any handle registered under that name refers to the same object, so the first match is the
+/// right answer; `None` means this process holds no live handle to it, which is a real blocker
+/// (the child cannot be given a view of an object this process no longer has open).
+pub fn shm_section_handle(name: &str) -> Option<usize> {
+    let names = SHM_OBJECT_NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    names
+        .iter()
+        .find(|(_, (n, _))| n == name)
+        .map(|(handle, _)| *handle)
+}
+
+/// Serialize `regions` into the string [`FORK_CHILD_SHARED_REGIONS_ENV_VAR`] carries.
+pub(crate) fn encode_fork_shared_regions(regions: &[SharedRegionCarry]) -> std::string::String {
+    let mut out = std::string::String::new();
+    for (i, r) in regions.iter().enumerate() {
+        if i != 0 {
+            out.push(';');
+        }
+        let kind = match r.kind {
+            SharedObjectKind::Named => "N",
+            SharedObjectKind::FileBacked => "F",
+        };
+        out.push_str(&format!(
+            "{:x}:{:x}:{:x}:{:x}:{:x}:{}:{}",
+            r.range.start,
+            r.range.end,
+            r.size,
+            r.flags,
+            r.perms.bits(),
+            kind,
+            hex(r.name.as_str().as_bytes()),
+        ));
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> std::string::String {
+    let mut s = std::string::String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn unhex(s: &str) -> Option<alloc::vec::Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
 
 /// Serializes the ENTIRE `fork_verify` healing sequence (every AV-path healer plus
 /// `on_single_step`) across threads process-wide.

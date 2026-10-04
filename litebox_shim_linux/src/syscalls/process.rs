@@ -4540,6 +4540,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         let fork_slot = self.reserve_cross_process_fork_slot();
+        // UNCONDITIONAL, and BEFORE the spawn: the platform reads this export while the child is
+        // still suspended and maps each region into it. An empty list must be exported too --
+        // otherwise a child of a process with no shared mapping inherits its PARENT's carried
+        // list from the environment and tries to adopt regions it never had.
+        self.global
+            .platform
+            .export_fork_shared_regions(&self.process().pm().shared_region_carry());
         let handle = self.global.platform.spawn_cross_process_fork_child(
             &relocations,
             full_gprs,
@@ -6334,6 +6341,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 && {
                     fork_slot = self.reserve_cross_process_fork_slot();
+                    true
+                }
+                && {
+                    // UNCONDITIONAL, and BEFORE the spawn -- see the other
+                    // `export_fork_shared_regions` call site. This chain can short-circuit past
+                    // the spawn entirely; the other site always exports before its own spawn, so
+                    // nothing stale can survive into a later child.
+                    self.global
+                        .platform
+                        .export_fork_shared_regions(&self.process().pm().shared_region_carry());
                     true
                 }
                 && let Some(handle) = self.global.platform.spawn_cross_process_fork_child(
