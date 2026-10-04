@@ -280,6 +280,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     arg2:% = format_args!("{:#x}", entry.args[2]),
                     arg0_as_path:? = UserPtr::<core::ffi::c_char>::from_usize(entry.args[0] as usize)
                         .to_cstring::<Platform>()
+                        .map(|c| c.to_string_lossy().into_owned()),
+                    // 2026-10-04: arg1 is the path pointer for openat/newfstatat/stat/readlink,
+                    // and the only way to name the file a guest is opening when /proc is not
+                    // readable -- a library-loading crash is unidentifiable without it.
+                    arg1_as_path:? = UserPtr::<core::ffi::c_char>::from_usize(entry.args[1] as usize)
+                        .to_cstring::<Platform>()
                         .map(|c| c.to_string_lossy().into_owned());
                     "diag-guest-exception: syscall trail (oldest first)"
                 );
@@ -342,6 +348,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     flags:? = flags;
                     "diag-guest-exception: mapping containing rip"
                 );
+            }
+            // 2026-10-04 headless-chromium pass: a cross-process fork child faults with
+            // `rip=0x0 cr2=0x0 error_code=0x14` -- an instruction fetch from a NON-PRESENT page at
+            // address 0, i.e. a call or a ret through a NULL pointer. rip is 0, so "mapping
+            // containing rip" and "rip byte dump" above both print nothing for it: the only way to
+            // name the CALL SITE is the 8 bytes immediately below rsp, which hold the return
+            // address a `call` pushed (or the address a `ret` popped).
+            let stack_lo = (ctx.rsp as usize).saturating_sub(0x40);
+            let stack = UserPtr::<u8>::from_usize(stack_lo).to_owned_slice::<Platform>(0x48);
+            litebox_util_log::warn!(
+                reg:% = "rsp-0x40", addr:% = format_args!("{:#x}", stack_lo),
+                bytes:% = format_args!("{:02x?}", stack.as_deref());
+                "diag-guest-exception: memory at register"
+            );
+            // A `ret`-through-NULL leaves the popped address at [rsp-8]; a `call *reg` pushes the
+            // return address, so it sits at [rsp]. Report both: [rsp-8] holding a STACK address is
+            // how chrshot7 proved the faulting instruction was a call, not a ret.
+            for (slot, delta) in [("rsp-8", 8usize), ("rsp+0", 0usize)] {
+                let addr = stack.as_deref().and_then(|s| {
+                    let off = (ctx.rsp as usize).saturating_sub(delta) - stack_lo;
+                    let w: [u8; 8] = s.get(off..off + 8)?.try_into().ok()?;
+                    Some(u64::from_le_bytes(w))
+                });
+                let Some(ret) = addr else { continue };
+                litebox_util_log::warn!(
+                    slot:% = slot, rip:% = format_args!("{:#x}", ctx.rip),
+                    value:% = format_args!("{:#x}", ret);
+                    "diag-guest-exception: candidate call site (NULL indirect call)"
+                );
+                if let Some((r, flags)) = self
+                    .process()
+                    .0
+                    .pm()
+                    .mappings()
+                    .into_iter()
+                    .find(|(r, _)| r.contains(&(ret as usize)))
+                {
+                    litebox_util_log::warn!(
+                        slot:% = slot, value:% = format_args!("{:#x}", ret),
+                        range_start:% = format_args!("{:#x}", r.start),
+                        range_end:% = format_args!("{:#x}", r.end),
+                        offset_in_range:% = format_args!("{:#x}", (ret as usize) - r.start),
+                        flags:? = flags;
+                        "diag-guest-exception: mapping containing that call site"
+                    );
+                }
+                // The instruction that faulted is the one BEFORE the return address. Dumping it
+                // names the addressing mode: `ff d0` is `call *rax` (a pointer loaded earlier),
+                // `ff 15 xx` is `call *[rip+disp]` (a GOT slot) -- and the displacement then gives
+                // the exact GOT entry that read as zero, which is the whole question.
+                if delta == 0 {
+                    let prologue = UserPtr::<u8>::from_usize((ret as usize).saturating_sub(32))
+                        .to_owned_slice::<Platform>(32);
+                    litebox_util_log::warn!(
+                        call_site:% = format_args!("{:#x}", ret),
+                        bytes_before:% = format_args!("{:02x?}", prologue.as_deref());
+                        "diag-guest-exception: bytes immediately before the call site"
+                    );
+                }
             }
             if rip_range.is_some() {
                 let dump = unsafe { core::slice::from_raw_parts(ctx.rip as *const u8, 64) };
