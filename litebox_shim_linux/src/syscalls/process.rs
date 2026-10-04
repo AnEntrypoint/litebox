@@ -4005,6 +4005,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             }
                         }
                     }
+                    // An INET socket (AF_INET/AF_INET6 TCP or UDP) now CROSSES the process
+                    // boundary. It used to fall into the `None =>` arm below, making the whole
+                    // fork "not eligible" -- so ANY process holding a TCP connection that forked
+                    // got the thread-based relocating fallback, which faults the child before its
+                    // first instruction. That is the worst possible outcome for a guest, and it
+                    // was silent. The `Network` already lives in the shared arena, so the child
+                    // attaches to the parent's very socket (found by endpoint) instead of
+                    // reopening anything: a carried connection is marked borrowed, so the child
+                    // closing it does not tear down the parent's. A listener or an unbound UDP
+                    // socket is recreated in the child.
+                    //
+                    // ORDERING: this arm must sit ABOVE the `FD_CLOEXEC` one below -- a
+                    // close-on-exec INET socket still crosses. `FD_CLOEXEC` is a statement about
+                    // `execve()`, not about `fork()`: real Linux keeps the fd alive in the child
+                    // between the two, and a child that never execs at all uses it normally. The
+                    // carry does not fight that -- `install_inet_at_fd` re-applies `FD_CLOEXEC` in
+                    // the child, so the fd still vanishes at exec exactly as the guest asked.
+                    // Dropping it here instead (where the arm below used to catch it first) loses
+                    // the fd for the whole fork-to-exec window, and silently: Python marks EVERY
+                    // socket it creates `SOCK_CLOEXEC` (PEP 446), so before this reordering no
+                    // INET socket a Python process held ever reached a forked child -- it read
+                    // `EBADF` while the fork itself looked perfectly healthy.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "socket" => {
+                        match self.raw_fd_inet_carry(*raw_fd) {
+                            Some(spec) => inet_to_carry.push((*raw_fd, spec)),
+                            None => {
+                                dropped_inet += 1;
+                                litebox_util_log::debug!(
+                                    tid:% = self.tid.get(), fd:% = raw_fd;
+                                    "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
+                                );
+                            }
+                        }
+                    }
                     // A close-on-exec fd does not block the fork, and is not carried.
                     //
                     // This is the Win32 rendering of what the guest already declared, not a
@@ -4043,28 +4077,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
                             "clone: dropping a close-on-exec fd rather than refusing the fork; the child would lose it at exec anyway"
                         );
-                    }
-                    // An INET socket (AF_INET/AF_INET6 TCP or UDP) now CROSSES the process
-                    // boundary. It used to fall into the `None =>` arm below, making the whole
-                    // fork "not eligible" -- so ANY process holding a TCP connection that forked
-                    // got the thread-based relocating fallback, which faults the child before its
-                    // first instruction. That is the worst possible outcome for a guest, and it
-                    // was silent. The `Network` already lives in the shared arena, so the child
-                    // attaches to the parent's very socket (found by endpoint) instead of
-                    // reopening anything: a carried connection is marked borrowed, so the child
-                    // closing it does not tear down the parent's. A listener or an unbound UDP
-                    // socket is recreated in the child.
-                    None if self.raw_fd_subsystem_name(*raw_fd) == "socket" => {
-                        match self.raw_fd_inet_carry(*raw_fd) {
-                            Some(spec) => inet_to_carry.push((*raw_fd, spec)),
-                            None => {
-                                dropped_inet += 1;
-                                litebox_util_log::debug!(
-                                    tid:% = self.tid.get(), fd:% = raw_fd;
-                                    "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
-                                );
-                            }
-                        }
                     }
                     // A regular file with no reachable path -- a `memfd_create` fd before its
                     // first `ftruncate`, or anything else already unlinked while still open --

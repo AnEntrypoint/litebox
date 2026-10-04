@@ -206,9 +206,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// relocating fallback faults the child before it runs one instruction, while a missing fd is
     /// an `EBADF` the guest can see and recover from.
     ///
-    /// The spec is `<net spec>|<v6>|<nonblock>`: the two flags are shim-level descriptor metadata
+    /// The spec is `<v6>|<nonblock>|<net spec>`: the two flags are shim-level descriptor metadata
     /// (they decide what `getsockname` reports and whether `recv` returns `EAGAIN`), so they ride
-    /// along with the network-side description rather than living inside it.
+    /// along with the network-side description rather than living inside it. `Task::
+    /// raw_fd_inet_carry` prefixes `<cloexec>`, and `install_inet_at_fd` parses the result in
+    /// EXACTLY that order -- `<net spec>` is last because it is the only field whose width varies,
+    /// and a fixed-arity prefix read off the front is what the other carry specs do too.
     pub(crate) fn raw_fd_inet_carry(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
@@ -230,7 +233,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
                     .with_metadata(inet, |f: &SocketOFlags| f.0.contains(OFlags::NONBLOCK))
                     .unwrap_or(false);
                 Ok(Some(alloc::format!(
-                    "{net_spec}|{}|{}",
+                    "{}|{}|{net_spec}",
                     u8::from(v6),
                     u8::from(nonblock)
                 )))
