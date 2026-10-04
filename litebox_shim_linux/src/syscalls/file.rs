@@ -6671,7 +6671,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FlockOp::SH | FlockOp::EX => {
                 let exclusive = op == FlockOp::EX;
-                {
+                // Diagnostic A/B only: `LITEBOX_FLOCK_SHARED_OFF=1` skips the cross-process table,
+                // so one binary can be measured both with it and with the pre-`SharedFlockTable`
+                // per-process behaviour it replaced.
+                if !self.global.platform.env_flag("LITEBOX_FLOCK_SHARED_OFF") {
                     let table = &self.global.shared_flock;
                     if let Some(res) = table.lock(
                         self.global.platform,
