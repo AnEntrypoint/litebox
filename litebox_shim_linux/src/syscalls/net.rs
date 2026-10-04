@@ -220,6 +220,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// EXACTLY that order -- `<net spec>` is last because it is the only field whose width varies,
     /// and a fixed-arity prefix read off the front is what the other carry specs do too.
     pub(crate) fn raw_fd_inet_carry(
+    /// The spec is `<net spec>|<v6>|<nonblock>`: the two flags are shim-level descriptor metadata
+    /// along with the network-side description rather than living inside it.
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
+        let raw_fd = u32::try_from(raw_fd).ok()?;
+        self.with_socket_netlink(
+            global,
+            raw_fd,
+            |inet| {
+                let Some(net_spec) = global.net_lock().fork_carry_spec(inet) else {
+                    return Ok(None);
+                };
+                let dt = global.litebox.descriptor_table();
+                let v6 = dt
+                    .with_metadata(inet, |o: &SocketOptions| o.is_v6)
+                    .unwrap_or(false);
+                let nonblock = dt
+                    .with_metadata(inet, |f: &SocketOFlags| f.0.contains(OFlags::NONBLOCK))
+                    .unwrap_or(false);
+                Ok(Some(alloc::format!(
+                    "{net_spec}|{}|{}",
+                    u8::from(v6),
+                    u8::from(nonblock)
+                )))
+            },
+            |_unix| Err(Errno::ENOTSOCK),
+            |_netlink| Err(Errno::ENOTSOCK),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// `true` only for a Unix-domain socket fd that is BOTH unbound (never `bind()`ed to a real
+    /// filesystem/abstract address) AND unconnected-to-a-named-peer -- i.e. one half of a
+    /// `socketpair(2)` result, real Linux's own definition of "unnamed" for this address family
+    /// (`unix(7)`: "an unnamed socket has no [...] pathname"). `false` for every other socket
+    /// kind/state, including a normal `connect()`ed client socket (X11, D-Bus): those always carry
+    /// a real peer address even though `getsockname()` on the CLIENT side is also often
+    /// `Unnamed` -- so this checks the PEER address too, not just the local one, to actually
+    /// distinguish "no real address was ever involved" (`socketpair`) from "this end just never
+    /// called `bind()`" (an ordinary autobind-free client). See `try_cross_process_fork`'s use of
+    /// this (`litebox_shim_linux/src/syscalls/process.rs`): a `socketpair(2)` pair is real Linux's
+    /// own mechanism for pre-`exec()` parent<->child bookkeeping (`dbus-daemon`'s babysitter
+    /// protocol, confirmed live against upstream `dbus-spawn-unix.c`'s `_dbus_socketpair` call use
+    /// this exact shape), so unlike an ordinary named-address CLOEXEC socket, dropping this kind
+    /// silently produces WRONG guest-visible behavior rather than a merely-unavailable-post-exec
+    /// fd -- that call site carries it into the child instead.
+    pub(crate) fn raw_fd_is_addressless_unix_socket_pair(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         raw_fd: usize,

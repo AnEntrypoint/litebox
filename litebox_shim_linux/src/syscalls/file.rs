@@ -11277,6 +11277,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 return None;
             }
+        let spec = self.files.borrow().raw_fd_inet_carry(&self.global, raw_fd)?;
+    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried (see
+    /// `Task::raw_fd_inet_carry`). The child attaches to the SAME `Network` socket its parent
+    /// holds, located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
+    /// reference, so closing it here cannot tear down the parent's.
+    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let cloexec = parts.next()? == "1";
+        let v6 = parts.next()? == "1";
+        let nonblock = parts.next()? == "1";
+        let net_spec = parts.next()?;
+        let sock_type = match net_spec.as_bytes().first()? {
+            b'T' | b'L' => SockType::Stream,
+            _ => SockType::Datagram,
         };
         let mut flags = SockFlags::empty();
         flags.set(SockFlags::NONBLOCK, nonblock);
@@ -11320,6 +11333,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
+        let socket = self.global.net_lock().fork_adopt(net_spec)?;
+        self.global.initialize_socket(&socket, sock_type, flags);
         if v6 {
             let mut dt = self.global.litebox.descriptor_table_mut();
             let _ = dt.with_metadata_mut(&socket, |o: &mut super::net::SocketOptions| {
@@ -11470,6 +11485,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             epfd:% = epfd, restored:% = restored, lost:% = lost;
             "fork child: rebuilt a carried epoll set"
         );
+        let dup_flags = cloexec.then_some(OFlags::CLOEXEC);
+            let moved = self.sys_dup(raw, Some(target_fd), dup_flags).is_ok();
+        if dup_flags.is_some() {
+            let desc = usize::try_from(target_fd).ok()?;
+            set_file_descriptor_flags(
+                desc,
+                &self.global,
+                &files,
+                FileDescriptorFlags::FD_CLOEXEC,
+            )
         Some(())
     }
 

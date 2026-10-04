@@ -4022,6 +4022,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the fd instead hands it `EBADF` on its first `epoll_wait`.
         let mut epoll_to_carry: alloc::vec::Vec<(usize, alloc::string::String)> =
             alloc::vec::Vec::new();
+        let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
                 continue;
@@ -4372,6 +4373,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             subsystem:% = self.raw_fd_subsystem_name(*raw_fd);
                             "clone: dropping a close-on-exec fd rather than refusing the fork; the child would lose it at exec anyway"
                         );
+                    }
+                    // An INET socket (AF_INET/AF_INET6 TCP or UDP) now CROSSES the process
+                    // boundary. It used to fall into the `None =>` arm below, making the whole
+                    // fork "not eligible" -- so ANY process holding a TCP connection that forked
+                    // got the thread-based relocating fallback, which faults the child before its
+                    // first instruction. That is the worst possible outcome for a guest, and it
+                    // was silent. The `Network` already lives in the shared arena, so the child
+                    // attaches to the parent's very socket (found by endpoint) instead of
+                    // reopening anything: a carried connection is marked borrowed, so the child
+                    // closing it does not tear down the parent's. A listener or an unbound UDP
+                    // socket is recreated in the child.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "socket" => {
+                        match self.raw_fd_inet_carry(*raw_fd) {
+                            Some(spec) => inet_to_carry.push((*raw_fd, spec)),
+                            None => {
+                                dropped_inet += 1;
+                                litebox_util_log::debug!(
+                                    tid:% = self.tid.get(), fd:% = raw_fd;
+                                    "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
+                                );
+                            }
+                        }
                     }
                     // A regular file with no reachable path -- a `memfd_create` fd before its
                     // first `ftruncate`, or anything else already unlinked while still open --

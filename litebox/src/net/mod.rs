@@ -3226,6 +3226,7 @@ where
             socket_handle.handle,
             socket_handle.slot_gen,
         ) {
+        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
             return None;
         }
         match socket_handle.protocol() {
@@ -3249,6 +3250,7 @@ where
                     }),
                     "fork_carry_spec:tcp",
                 )?;
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
                 // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
                 // so there is nothing a child could match it on -- and nothing to share yet either.
                 let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
@@ -3271,6 +3273,7 @@ where
                     "fork_carry_spec:udp",
                 )?;
                 let endpoint = socket.endpoint();
+                let endpoint = self.socket_set.get::<udp::Socket>(socket_handle.handle).endpoint();
                 let remote = socket_handle.udp().remote_endpoint;
                 if endpoint.port == 0 && remote.is_none() {
                     // Never bound, never connected: the child can simply make its own.
@@ -3336,6 +3339,8 @@ where
                 // connection, whose bytes this child would then read and whose buffers it would
                 // release.
                 let slot_gen = self.mint_handle_generation(handle);
+                    (socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote))
+                        .then_some(handle)
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -3372,6 +3377,11 @@ where
             // description, so the child accepts from the queue the parent owns: no slots are
             // armed here, and `accept`/the readiness sweep look for queued connections on the
             // endpoint itself (`Network::unclaimed_connection_on`).
+            // TCP, listening: a listening socket's own state is entirely reconstructed here --
+            // a fresh main handle plus `refill_to_backlog`'s own freshly-listening backlog
+            // sockets on the carried endpoint. Nothing of the parent's is shared except the port
+            // number, which is why this needs no `borrowed` marking and why
+            // `close_handle` may tear it down wholesale.
             "L" => {
                 let (lip, lport, backlog) = (
                     hex(parts.next())?,
@@ -3416,6 +3426,12 @@ where
                 }
                 // Added above, so the slot's generation is this child's to stamp.
                 let slot_gen = self.mint_handle_generation(handle);
+                let mut server_socket = TcpServerSpecific {
+                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+                    backlog: Some(backlog.max(1)),
+                    socket_set_handles: Vec::new(),
+                };
+                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -3440,6 +3456,8 @@ where
                     borrowed: true,
                     // ...but the socket itself was added above, for this referent alone.
                     own_slot: true,
+                        server_socket: Some(server_socket),
+                    borrowed: false,
                 }))
             }
             // UDP, bound: found by its bound endpoint (unique per the local-port allocator).
@@ -3510,6 +3528,7 @@ where
         }
     }
 
+    /// Close the socket at `fd`
     pub fn close(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -3750,6 +3769,10 @@ where
         // backlog slots of its own -- the port's queue is ONE shared row (`Network::listen_queues`)
         // that any process maintains -- so all this referent's close owes the port is one fewer
         // `refs` on that row. Without this branch, an inherited TCP connection died the
+        // thing this process DID create for itself is a carried TCP listener's backlog sockets
+        // (`fork_adopt` refills those locally), so those are still removed; the listener's main
+        // handle is likewise locally created and is left alone, since it is not in `socket_set`'s
+        // closing path either way. Without this branch, an inherited TCP connection died the
         // moment the child that inherited it exited -- the parent's own fd survived but pointed
         // at an aborted socket.
         if borrowed {
@@ -3760,6 +3783,12 @@ where
                 // armed sockets once the last one goes -- never this process dropping an inherited
                 // copy (`Network::release_listen_queue`).
                 self.release_listen_queue(server_socket.ip_listen_endpoint.port);
+                for handle in server_socket.socket_set_handles {
+                    if Self::socket_set_contains(&self.socket_set, handle) {
+                        let _ =
+                            Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
+                    }
+                }
             }
             if let Some(proxy) = proxy {
                 proxy.set_state(socket_channel::SocketState::Closed);
