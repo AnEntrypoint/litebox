@@ -20,6 +20,8 @@ use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 use crate::platform::page_mgmt::RemapError;
 use crate::platform::page_mgmt::SharedMemoryError;
+use crate::platform::page_mgmt::SharedObjectKind;
+use crate::platform::page_mgmt::SharedRegionCarry;
 
 /// Page size in bytes.
 ///
@@ -1077,6 +1079,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
         let mut adopted = 0usize;
         let mut shared = 0usize;
+        // A child that INHERITED the parent's address space natively (`keep_all`, a real Linux
+        // `fork()`) already has every shared view mapped for real, so there is nothing to carry
+        // and nothing to re-open -- asking here would re-open the same object a second time for
+        // no reason. Only the adopt-from-scratch case (a Windows cross-process fork child, whose
+        // own address space starts empty) needs the carry.
+        let carried_shared: Vec<SharedRegionCarry> = if keep_all {
+            Vec::new()
+        } else {
+            platform.carried_fork_shared_regions()
+        };
         for (range, flag_bits, is_file_backed) in regions {
             if range.start >= range.end || range.start % ALIGN != 0 || range.end % ALIGN != 0 {
                 // Malformed/unaligned input (this data crossed a process boundary): skip rather
@@ -1094,18 +1106,44 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // child ended up with address space claimed but no host page behind it, so a read the
             // PARENT served from committed memory faulted as a genuine AV in the child.
             if !keep_all && !is_padding && (is_shared || is_inaccessible) {
+                if is_shared {
+                    // A `VM_SHARED` region can be adopted for real after all. The parent mapped
+                    // the SAME object into this process at this address before spawning it and
+                    // named it in the carry, so re-opening that name here yields a handle to the
+                    // same bytes; what was missing was the bookkeeping, and recording a real
+                    // `shared_handle` is what turns this address from "some private pages that
+                    // happen to hold a copy of the parent's data at fork time" into an attachment
+                    // to the one shared store. See [`Self::adopt_carried_shared`].
+                    match carried_shared.iter().find(|c| c.range == range) {
+                        Some(carry)
+                            if vmem.adopt_carried_shared(
+                                range.clone(),
+                                flags,
+                                is_file_backed,
+                                carry,
+                            ) =>
+                        {
+                            adopted += 1;
+                            continue;
+                        }
+                        _ => {
+                            shared += 1;
+                            continue;
+                        }
+                    }
+                }
                 // A `PROT_NONE` region CAN be given real backing in this process after all:
-                // reserving its address range without committing anything (`PageManagementProvider::
-                // reserve_pages_without_commit`) reproduces exactly the state it has on the source
-                // side -- address space owned, no memory behind it, any access still faulting --
-                // and leaves a later guest `mprotect` over it free to commit pages into it. That
-                // is not a workaround: without it, a `fork()` child of a process whose allocator
-                // reserved a big `PROT_NONE` range (Chromium's renderers, V8, PartitionAlloc) got
-                // `ENOMEM` from the very `mprotect` that makes the reservation usable, and died.
-                // Repro: `.wfgy/mres1.sh` (every size, parent succeeds / child fails ENOMEM).
+                // reserving its address range without committing anything
+                // (`PageManagementProvider::reserve_pages_without_commit`) reproduces exactly the
+                // state it has on the source side -- address space owned, no memory behind it, any
+                // access still faulting -- and leaves a later guest `mprotect` over it free to
+                // commit pages into it. That is not a workaround: without it, a `fork()` child of
+                // a process whose allocator reserved a big `PROT_NONE` range (Chromium's
+                // renderers, V8, PartitionAlloc) got `ENOMEM` from the very `mprotect` that makes
+                // the reservation usable, and died. Repro: `.wfgy/mres1.sh` (every size, parent
+                // succeeds / child fails ENOMEM).
                 //
-                // `VM_SHARED` still cannot: its bytes are another process's live mapping, and
-                // nothing here duplicates the backing handle.
+                // `VM_SHARED` no longer needs this escape hatch -- see the branch above.
                 let reserved_here = !is_shared
                     && is_inaccessible
                     && platform.reserve_pages_without_commit(range.clone());
@@ -1133,6 +1171,131 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             adopted += 1;
         }
         (vmem, adopted, shared)
+    }
+
+    /// Every `VM_SHARED` mapping this address space holds, described as a [`SharedRegionCarry`]
+    /// -- i.e. by the host-wide NAME of its backing object rather than by its
+    /// [`VmArea::shared_handle`], which is a per-process handle with no meaning anywhere else.
+    ///
+    /// This is the parent half of carrying a real shared mapping into a cross-process `fork()`
+    /// child. A mapping whose object has no name on this platform is simply absent here: it
+    /// cannot be reconstructed elsewhere, and the child reports it as unrestorable rather than
+    /// quietly substituting a private copy (see [`Self::adopt`]).
+    pub(super) fn shared_region_carry(&self) -> Vec<SharedRegionCarry> {
+        let mut out = Vec::new();
+        for (range, vma) in self.vmas.iter() {
+            let Some(handle) = vma.shared_handle else {
+                continue;
+            };
+            let Some((name, kind)) = self.platform.shared_memory_object_name(handle) else {
+                continue;
+            };
+            // The object's REAL size, not the VMA's possibly-shrunken tracked extent: a partial
+            // `munmap` narrows `range` while the underlying view (`view_len`) never changes, and
+            // a re-open asked for the shorter length would hand the child a different, smaller
+            // object on a platform that fixes size at creation.
+            let size = if vma.view_len != 0 {
+                vma.view_len
+            } else {
+                range.end - range.start
+            };
+            out.push(SharedRegionCarry {
+                range: range.clone(),
+                name,
+                kind,
+                size,
+                // Same bit positions by construction: `VmFlags::VM_READ/WRITE/EXEC` are `1<<0/1/2`
+                // and so are `MemoryRegionPermissions::READ/WRITE/EXEC` (see `impl From<
+                // MemoryRegionPermissions> for VmFlags`). Only the access bits are wanted here --
+                // `VM_MAY*` sits at `1<<4..` and would land on unrelated permission bits.
+                perms: MemoryRegionPermissions::from_bits_truncate(
+                    vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).bits() as u8,
+                ),
+                flags: vma.flags.bits(),
+            });
+        }
+        out
+    }
+
+    /// Re-open `carry`'s named object in THIS process and record it as the backing of `range`,
+    /// so a fork child's `VM_SHARED` region is THE SAME BYTES the parent sees, not a copy of
+    /// them.
+    ///
+    /// Returns `false` (having closed anything it opened) when the object cannot be re-opened by
+    /// name. Never falls back to a private/COW mapping: a silent copy is the bug this exists to
+    /// fix, so an unrestorable region stays unrestorable and is counted as such.
+    ///
+    /// It does NOT map anything. The parent already did, into this process, before this process
+    /// ran a single instruction -- a section view cannot be created over memory a process already
+    /// holds (`MapViewOfFile3` over committed, decommitted or merely reserved address space all
+    /// fail; `.wfgy/winshmprobe.py`), so the mapping has to be made by whoever holds the child's
+    /// process handle while it is still suspended. What is left to do here is the bookkeeping
+    /// that turns those pages into an attachment.
+    fn adopt_carried_shared(
+        &mut self,
+        range: Range<usize>,
+        flags: VmFlags,
+        is_file_backed: bool,
+        carry: &SharedRegionCarry,
+    ) -> bool {
+        let name = carry.name.as_str();
+        if name.is_empty() {
+            return false;
+        }
+        let opened = match carry.kind {
+            SharedObjectKind::FileBacked => self
+                .platform
+                .create_file_backed_named_shared_memory(name, carry.size),
+            SharedObjectKind::Named => self
+                .platform
+                .create_named_shared_memory(name, carry.size),
+        };
+        let Ok(handle) = opened else {
+            litebox_util_log::warn!(
+                target:? = range, name:% = name;
+                "fork child: the carried shared object could not be re-opened by name"
+            );
+            return false;
+        };
+        let Some(page_range) = PageRange::<ALIGN>::new(range.start, range.end) else {
+            let _ = self.platform.close_shared_memory(handle);
+            return false;
+        };
+        // Ask the OS, not the parent's word for it, whether this address is genuinely a view. The
+        // parent maps each carried region while this process is still suspended, and a parent-side
+        // failure there is not otherwise visible from here -- re-opening the name SUCCEEDS either
+        // way, because the object exists regardless of whether this process holds a view of it.
+        // Booking a `shared_handle` over pages that are actually a private copy is exactly the
+        // silent "looks shared, is not" failure, so refuse instead: the caller then treats this
+        // range as an ordinary inherited private mapping, which is honest.
+        if !self.platform.memory_is_shared_view(range.clone()) {
+            litebox_util_log::error!(
+                target:? = range, name:% = name;
+                "fork child: the parent could not map the carried shared object into this process, \
+                 so this region is NOT shared -- parent and child will NOT observe each other's writes"
+            );
+            let _ = self.platform.close_shared_memory(handle);
+            return false;
+        }
+        // The view is ALREADY here: the parent mapped this very object into this process at this
+        // very address before spawning it (see `PageManagementProvider::export_fork_shared_
+        // regions`, and `map_shared_memory`'s own placement rule -- a section view cannot be
+        // created over memory this process already has, so only the parent, holding the child's
+        // process handle while it was still suspended, could have put it there). Calling
+        // `insert_mapping` here would therefore fail, and would be the wrong call anyway.
+        //
+        // What is missing is the BOOKKEEPING: without a `VmArea` whose `shared_handle` is this
+        // process's own handle to the SAME object, this address is only whatever placeholder the
+        // group spans left behind -- a read of it does not reach the object and a write through it
+        // lands in memory nobody else can see, which is precisely the "the inherited mapping is a
+        // private copy" failure. Recording it is what makes reads and writes go to the one store.
+        let mut vma = VmArea::new_shared(flags, is_file_backed, handle);
+        // `insert_mapping` would fill these in from the platform's answer; there is no answer
+        // here, so state them: the view is exactly `range`, mapped by the parent.
+        vma.view_base = range.start;
+        vma.view_len = range.end - range.start;
+        self.register_existing_mapping_overwrite(page_range, vma);
+        true
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
