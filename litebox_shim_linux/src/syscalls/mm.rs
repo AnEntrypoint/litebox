@@ -1210,9 +1210,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if size == 0 {
                     break;
                 }
-                // ptr is a valid pointer returned by do_mmap.
-                ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
-                    .unwrap();
+                // `copy_from_slice` answers `None` when the destination pages cannot be written
+                // at all -- a `PROT_NONE` file mapping of >= 64 MiB is created reserved-but-
+                // never-committed (see `allocate_pages`'s `reserve_only`), and a concurrent
+                // `munmap` of this range mid-loop is the other case. Both used to `.unwrap()`
+                // here and panicked, which kills the whole guest session. Report it as an
+                // ordinary mapping failure instead: real Linux's `mmap(2)` returns ENOMEM for
+                // a mapping it cannot back.
+                if ptr
+                    .copy_from_slice::<Platform>(copied, &buffer[..size])
+                    .is_none()
+                {
+                    return Err(MappingError::OutOfMemory);
+                }
                 copied += size;
                 file_offset += size;
             }

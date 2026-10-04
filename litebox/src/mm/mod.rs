@@ -1193,9 +1193,10 @@ where
     /// [`create_readable_pages`](Self::create_readable_pages) and
     /// [`create_inaccessible_pages`](Self::create_inaccessible_pages) each hardcode.
     /// `PROT_READ|PROT_WRITE|PROT_EXEC` in particular is the combination every GTK program asks
-    /// for to hold its closure trampolines. Pages are created writable (unless the requested
-    /// permissions are empty, which keeps its own never-briefly-writable behavior) so `op` can
-    /// populate them, then protected down to whatever was actually asked for.
+    /// for to hold its closure trampolines. Pages are created writable so `op` can populate them,
+    /// then protected down to whatever was actually asked for. The one exception is an anonymous
+    /// mapping with no permissions at all, which is created inaccessible and never committed --
+    /// see the note on `before_perms` in the body.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
     /// Otherwise, let the kernel choose an available memory region.
@@ -1222,7 +1223,16 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let before_perms = if permissions.is_empty() {
+        // A file-backed mapping is populated by `op`, so its pages must be committed and writable
+        // while `op` runs even when the guest asked for NO access at all: `mmap(PROT_NONE)` on a
+        // large file is a reservation the guest `mprotect`s into use later (the dynamic loader's
+        // shape), and the file bytes have to be there by then. Without this, the request reaches
+        // the platform with empty permissions, which on the Windows backend reserves the range
+        // without committing it, so every write from `op` failed and `mmap()` panicked the whole
+        // guest session instead of returning an errno. Anonymous `PROT_NONE` keeps the
+        // never-committed path -- there is nothing to populate and a guard reservation must stay
+        // free.
+        let before_perms = if permissions.is_empty() && !flags.contains(CreatePagesFlags::MAP_FILE) {
             MemoryRegionPermissions::empty()
         } else {
             MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
