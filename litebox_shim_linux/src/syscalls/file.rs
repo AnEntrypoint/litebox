@@ -469,7 +469,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     /// the *other* (see `fork_duplicate`'s doc comment for the full failure mode this avoids --
     /// this was the actual root cause of `dup2()` returning `EBADF` for shell output-redirection
     /// fds surviving a `fork()`).
-    pub(crate) fn fork_duplicate(&self, litebox: &litebox::LiteBox<Platform>) -> Self {
+    /// `sysv_shm` is the byte-shared cross-process segment table this copy's attachments have to
+    /// be registered against -- see the `shm_attachments` handling inside for why a fork cannot
+    /// simply clone the map and stop there.
+    pub(crate) fn fork_duplicate(
+        &self,
+        litebox: &litebox::LiteBox<Platform>,
+        sysv_shm: &litebox::sync::Mutex<Platform, super::mm::SysvShmTable>,
+    ) -> Self {
         // `Descriptors::duplicate` (used per-subsystem below) is also `dup()`/`dup2()`'s own
         // primitive, and by design does *not* propagate `FD_CLOEXEC` -- POSIX requires a
         // duplicated fd to never inherit the original's close-on-exec flag. `fork()`, however, has
@@ -505,6 +512,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             Some(new_fd)
         }
 
+        // SysV shm: this copy is what makes the child hold the SAME attachments the parent does,
+        // and the child's own exit decrements each one once (`take_all_shm_attachments` ->
+        // `mm::Task::detach_sysv_shm_on_process_exit`). Real Linux is symmetric about that pair:
+        // `dup_mmap()` calls `shm_open()` for every VMA it copies, i.e. a fork INCREMENTS
+        // `shm_nattch` once per inherited attachment, and `exit_shm()`'s `shm_close()` is the
+        // thing that takes it away. Cloning the records without the matching increment let a
+        // child that merely INHERITED an attachment drive its segment's count down on exit: a
+        // parent that did shmget+shmat+shmctl(IPC_RMID) and then forked -- chromium's
+        // zygote/renderer, every XShm client -- saw `attaches` hit zero while IT still mapped
+        // the segment, so the slot was freed and the backing store unlinked underneath it.
+        //
+        // Done FIRST, and released before the fd duplication below, for two reasons: (1)
+        // `sysv_shm` is one of the shim-wide locks
+        // `GlobalStateHandle::with_shimwide_locks_held` acquires around the native `fork()` call
+        // itself, so it must never still be held when that runs -- and a native `fork()` child
+        // resumes on this very stack, where a held guard would be duplicated mid-hold; (2) it
+        // keeps this lock's critical section from overlapping the descriptor-table lock
+        // `dup_preserving_cloexec` takes below. Nothing under it does host file IO either, the
+        // same rule `sys_shmget`/`sys_shmdt` obey.
+        //
+        // One increment per RECORD, and the child's map is this same snapshot, so the child's
+        // later decrement lands on exactly the entries charged here.
+        let shm_attachments = self.shm_attachments.read().clone();
+        if !shm_attachments.is_empty() {
+            let mut table = sysv_shm.lock();
+            table.record_inherited_attachments(shm_attachments.values().copied());
+        }
+
         let raw_descriptor_store = self.raw_descriptor_store.read().fork_duplicate(
             |fd: &TypedFd<FS>| dup_preserving_cloexec(litebox, fd),
             |fd: &TypedFd<litebox::net::Network<Platform>>| dup_preserving_cloexec(litebox, fd),
@@ -525,7 +560,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(raw_descriptor_store),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
             fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
-            shm_attachments: litebox::sync::RwLock::new(self.shm_attachments.read().clone()),
+            shm_attachments: litebox::sync::RwLock::new(shm_attachments),
         }
     }
 }
@@ -1900,12 +1935,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         usize::try_from(raw).map_err(|_| Errno::EINVAL)
     }
 
+    /// Cap on a [`Self::snapshot_nameless_file_for_carry`] payload. Module-level so the fork-side
+    /// eligibility check and the snapshot itself can never drift apart on what size still travels.
+    const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Whether `raw_fd` is a regular file whose bytes could still travel as a
+    /// [`Self::snapshot_nameless_file_for_carry`] snapshot.
+    ///
+    /// This is the fork-side counterpart of `scm_carry_spec`'s `T|` fallback and exists for one
+    /// measured reason: a `memfd_create` fd is an unlinked regular file (see that syscall's own doc
+    /// comment), so `carriable_file_for_raw_fd` cannot name it and -- until something calls
+    /// `ftruncate`/`fallocate` -- `carriable_shm_for_raw_fd` has no named object to hand over
+    /// either. Such an fd therefore fell through to "uncarriable" in `clone`, which REFUSED the
+    /// cross-process fork and forced the thread-based relocating fallback; that fallback is what
+    /// actually faults the child (`shmvis3`: every child of a process holding a memfd died with
+    /// SIGSEGV, while `shmvis4`'s children -- whose parent had closed its memfd first -- all
+    /// reached status=0). Cheap preconditions only; the real snapshot is built after the fork is
+    /// known eligible, mirroring `raw_fd_unix_carry_check`/`raw_fd_unix_carry`.
+    pub(crate) fn snapshot_carriable_file_for_raw_fd(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    if status.file_type != litebox::fs::FileType::RegularFile
+                        || status.size > Self::SNAPSHOT_MAX_BYTES
+                    {
+                        return None;
+                    }
+                    Some(())
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Content of a regular file that has no name left (unlinked temporary files Chromium hands to
     /// its children), copied into a fresh named shared object so the receiving process can rebuild
     /// a private copy: `T|<flags>|<size>|<object name>`. A read-only handoff is exact; writes made
     /// afterwards by either side are not shared.
-    fn snapshot_nameless_file_for_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
-        const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+    pub(crate) fn snapshot_nameless_file_for_carry(
+        &self,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
         let (flags, bytes) = {
             let files = self.files.borrow();
             files
@@ -1914,7 +1997,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |fd| {
                         let status = files.fs.fd_file_status(fd).ok()?;
                         if status.file_type != litebox::fs::FileType::RegularFile
-                            || status.size > SNAPSHOT_MAX_BYTES
+                            || status.size > Self::SNAPSHOT_MAX_BYTES
                         {
                             return None;
                         }
@@ -2036,6 +2119,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let size: usize = parts.next()?.parse().ok()?;
         let name = parts.next()?;
         let raw = i32::try_from(self.install_shm_file(name, size, flags, cloexec).ok()?).ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
+    }
+
+    /// Fork-child form of [`Self::rebuild_snapshot_file`]: `spec` is
+    /// `<cloexec 0|1>|T|<flags>|<size>|<object name>`, installed at exactly `target_fd`.
+    ///
+    /// The rebuilt file is created and then unlinked under `/dev/shm`, so
+    /// `sys_unlinkat`'s `tag_unlinked_regular_file_as_shm_like` tags it `MemfdMarker` -- the child
+    /// gets a memfd-shaped fd (bytes and all) whose later `ftruncate`/`mmap(MAP_SHARED)` gets real
+    /// shared-memory backing, exactly like the parent's.
+    pub(crate) fn install_snapshot_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let mut parts = spec.splitn(5, '|');
+        let cloexec = parts.next()? == "1";
+        // The `T` marker comes from `snapshot_nameless_file_for_carry`'s own spec, kept verbatim
+        // rather than re-derived so the two ends cannot disagree on what was snapshotted.
+        if parts.next()? != "T" {
+            return None;
+        }
+        let flags: u32 = parts.next()?.parse().ok()?;
+        let size: usize = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        let raw = i32::try_from(self.rebuild_snapshot_file(flags, size, name, cloexec).ok()?).ok()?;
         if raw != target_fd {
             let moved = self
                 .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))

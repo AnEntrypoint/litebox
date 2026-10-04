@@ -3737,6 +3737,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut pty_masters_to_carry: alloc::vec::Vec<(usize, u32, bool)> = alloc::vec::Vec::new();
         let mut shm_to_carry: alloc::vec::Vec<(usize, alloc::string::String, usize, u32, bool)> =
             alloc::vec::Vec::new();
+        // Unlinked ("nameless") regular files to carry as byte snapshots -- a `memfd_create` fd
+        // that has never been `ftruncate`d, and any other file whose directory entry is already
+        // gone. Collected here, snapshotted only once the fork is known eligible, exactly like
+        // `unix_to_carry`: the snapshot mints a named host section, which must not be leaked by a
+        // fork that ends up refused.
+        let mut snap_to_carry: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
@@ -4027,6 +4033,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             "clone: dropping a close-on-exec fd rather than refusing the fork; the child would lose it at exec anyway"
                         );
                     }
+                    // A regular file with no reachable path -- a `memfd_create` fd before its
+                    // first `ftruncate`, or anything else already unlinked while still open --
+                    // cannot be reopened by name and has no shared object to hand over yet, but
+                    // its BYTES still travel as a snapshot. This is the fork-side twin of the
+                    // `T|` fallback `scm_carry_spec` already gives the same fd over SCM_RIGHTS;
+                    // without it, one such fd made every fork "not eligible" and pushed it onto
+                    // the thread-based relocating fallback, which is what actually faults the
+                    // child (see `Task::snapshot_carriable_file_for_raw_fd`).
+                    None if self.snapshot_carriable_file_for_raw_fd(*raw_fd) => {
+                        snap_to_carry.push(*raw_fd);
+                        litebox_util_log::debug!(
+                            tid:% = self.tid.get(), fd:% = raw_fd;
+                            "clone: carrying a nameless regular file into the cross-process child by byte snapshot"
+                        );
+                    }
                     None => {
                         uncarriable += 1;
                         let subsystem = self.raw_fd_subsystem_name(*raw_fd);
@@ -4064,7 +4085,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 carried_pipes:% = inherited_pipes.len(),
                 carried_files:% = inherited_files.len(),
                 carried_eventfds:% = inherited_eventfds.len(),
-                carried_unix:% = unix_to_carry.len();
+                carried_unix:% = unix_to_carry.len(),
+                carried_snapshots:% = snap_to_carry.len();
                 "clone: cross-process fork() not eligible -- these fd subsystems cannot cross the process boundary yet; each one taught is one more fork that gets a real address space instead of the thread-based relocating fallback"
             );
             return None;
@@ -4405,6 +4427,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 spec: alloc::format!("shm:{}|{flags}|{size}|{name}", u8::from(cloexec)),
             });
         }
+        for raw_fd in snap_to_carry {
+            match self.snapshot_nameless_file_for_carry(raw_fd) {
+                Some(spec) => {
+                    inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                        fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                        spec: alloc::format!(
+                            "snap:{}|{}",
+                            u8::from(self.raw_fd_is_cloexec(raw_fd)),
+                            spec
+                        ),
+                    });
+                }
+                None => {
+                    litebox_util_log::warn!(
+                        tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
+                        fd:% = raw_fd;
+                        "clone: cross-process fork() not eligible -- a nameless file could not be snapshotted"
+                    );
+                    return None;
+                }
+            }
+        }
         for raw_fd in unix_to_carry {
             match self.raw_fd_unix_carry(raw_fd, child_tid, true) {
                 Ok((spec, hold)) => {
@@ -4599,7 +4643,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let shared = self.global.platform.native_fork_shares_kernel_state();
         let child_state = shared.then(|| {
             (
-                Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox)),
+                Arc::new(
+                    self.files
+                        .borrow()
+                        .fork_duplicate(&self.global.litebox, &self.global.sysv_shm),
+                ),
                 Arc::new((**self.fs.borrow()).clone()),
             )
         });
@@ -5249,7 +5297,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if flags.contains(CloneFlags::FILES) {
                 self.files.borrow().clone()
             } else {
-                alloc::sync::Arc::new(self.files.borrow().fork_duplicate(&self.global.litebox))
+                alloc::sync::Arc::new(
+                    self.files
+                        .borrow()
+                        .fork_duplicate(&self.global.litebox, &self.global.sysv_shm),
+                )
             }
         };
 

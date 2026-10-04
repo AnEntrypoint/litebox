@@ -186,6 +186,28 @@ impl SysvShmTable {
         Some(&mut self.slots[i].as_mut().unwrap().segment)
     }
 
+    /// `fork()`'s half of the `exit_shm()` accounting [`Task::detach_sysv_shm_on_process_exit`]
+    /// performs, and the reason the two must be kept symmetric. Real Linux's `dup_mmap()` calls
+    /// `shm_open()` for every VMA it copies, i.e. a fork ADDS one `shm_nattch` per inherited
+    /// attachment; `exit_shm()`'s `shm_close()` is what takes it away again. A fork that copies
+    /// the attachment records without this increment lets a child's own exit drive a segment's
+    /// count down to zero while its PARENT still maps it -- the exact shape that frees the slot
+    /// and unlinks the backing store underneath a live attacher.
+    ///
+    /// Called once per inherited attachment RECORD, not once per distinct `shmid`: the same
+    /// segment attached at two addresses counts twice, matching Linux's
+    /// one-`shm_nattch`-per-VMA rule (and `take_all_shm_attachments`, which yields it twice).
+    ///
+    /// A `shmid` with no live slot is skipped rather than resurrected: nothing can be attached
+    /// to a segment that has already been destroyed.
+    pub(crate) fn record_inherited_attachments(&mut self, shmids: impl Iterator<Item = i32>) {
+        for shmid in shmids {
+            if let Some(seg) = self.get_mut(shmid) {
+                seg.attaches = seg.attaches.saturating_add(1);
+            }
+        }
+    }
+
     fn remove(&mut self, shmid: i32) {
         if let Some(i) = self.index_of_id(shmid) {
             self.slots[i] = None;
@@ -501,11 +523,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// its window maps and never paints.
     ///
     /// One decrement per recorded attachment, matching Linux's one-`shm_nattch`-per-VMA
-    /// accounting. `fork()` copies this process's attachment records without incrementing
-    /// (see `FilesState::fork_duplicate`), so a `shmat`-owning process that also forks a lot can
-    /// drive a segment's count to zero while its own mapping is still live; the consequence is
-    /// only that the slot is recycled (the host keeps a mapped section's bytes alive until its
-    /// last view goes away), which is strictly better than the table filling up permanently.
+    /// accounting -- and one INCREMENT per inherited record on the other side, which is what
+    /// `FilesState::fork_duplicate` now performs (Linux's `dup_mmap()` -> `shm_open()`). An
+    /// inherited attachment therefore nets to zero across the child's own lifetime instead of
+    /// being charged against the parent that still maps the segment. The only residual
+    /// imbalance is the safe direction: a `fork()` that duplicated the records but never
+    /// produced a child (a failed native `fork()`, a failed `spawn_thread`) leaves the count
+    /// one too high, which merely delays a slot's reclaim and never destroys a live one.
     pub(crate) fn detach_sysv_shm_on_process_exit(&self) {
         let attached = self.files.borrow().take_all_shm_attachments();
         if attached.is_empty() {
