@@ -733,6 +733,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
                         next_shmid: core::sync::atomic::AtomicI32::new(1),
                         next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+                        // See `syscalls::file::SharedFlockTable`'s own doc comment: the slot
+                        // array is itself in the shared arena, so this field is just its
+                        // (fixed-address, so cross-process-valid) region pointer plus one counter
+                        // -- same shape as `unix_shared_conn_table` above, and same reason it can
+                        // be a plain field here while `flock_registry` cannot.
+                        shared_flock: syscalls::file::SharedFlockTable::new(&platform),
                         record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
@@ -4115,16 +4121,23 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     // are private-heap addresses meaningless in the child's own address space. Same mechanism as
     // `elf_patch_cache`/`record_locks`/etc, one field deeper: the map's nodes come from the
     // allocating process's ordinary heap, and `Arc<FlockFile>`'s `Pollee` observer list does too.
-    // Every process therefore gets its own, always-freshly-constructed registry -- a fork-family
-    // member's `flock()` no longer contends with a DIFFERENT host process's, the same accepted
-    // gap `record_locks`/`pty_registry` carry for the same reason (see AGENTS.md). Restoring
-    // genuine cross-process contention needs a flat, pointer-free `SharedPtyTable`-style table
-    // with cross-process wakeup, which is separate follow-on work.
+    // Every process therefore gets its own, always-freshly-constructed registry (see
+    // `GlobalStateHandle::flock_registry`), which is what fixed the crash. The genuine cross-process
+    // contention that field can no longer provide is restored by `shared_flock` below -- do not
+    // re-add a field with this name here.
     /// Next id to hand out to a `flock()` holder, identifying an open file description to the
     /// `flock()` implementation (see `syscalls::file`). Shim-wide (rather than a function-local
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
+    /// Cross-process `flock(2)` exclusion: a fixed array of flat, pointer-free slots in the shared
+    /// kernel arena, one per locked file, with cross-process waiter wakeup -- see
+    /// [`syscalls::file::SharedFlockTable`]'s own doc comment for the whole design (why the
+    /// `BTreeMap` this replaces could not live here, how a waiter in another host process is woken,
+    /// and how a holder killed without running `Drop` is reclaimed). This is what makes a fork
+    /// child's `LOCK_EX|LOCK_NB` fail `EWOULDBLOCK` while its parent holds `LOCK_EX`, which
+    /// `flock_registry` alone had stopped doing (`.wfgy/flockx1.sh`).
+    shared_flock: syscalls::file::SharedFlockTable<Platform>,
     /// POSIX (`fcntl`) record locks held by any guest process, owned by pid.
     record_locks: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>,
     /// Woken whenever a record lock is released, so `F_SETLKW` waiters retry.

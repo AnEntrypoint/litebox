@@ -911,6 +911,149 @@ mod flock_tests {
     }
 }
 
+/// The cross-process rules a real `fork()` into another host process is otherwise the only way to
+/// observe, exercised directly against the shared table. It keys every holding by
+/// `(host pid, holder id)` and cannot tell how it was called, so distinct `host` arguments are as
+/// good as distinct host processes -- and these are exactly the assertions the per-process registry
+/// `f5d73ff` left behind could not make, because that registry never saw another process's lock.
+///
+/// These build a bare table rather than a whole `GlobalState`: every `GlobalState` a test process
+/// creates takes a ~15 MiB bite out of the one 128 MiB shared kernel arena it lives in and never
+/// gives it back, and these tests need the table, not the shim around it.
+mod shared_flock_tests {
+    extern crate std;
+
+    use litebox_common_linux::errno::Errno;
+
+    use super::{TestPlatform, test_platform};
+
+    type Table = crate::syscalls::file::SharedFlockTable<TestPlatform>;
+
+    /// One table for the whole module, deliberately OFF the shared arena: every `GlobalState` a test
+    /// process builds costs ~15 MiB of the one 128 MiB shared kernel arena and never gives it back,
+    /// so the six `flock_tests` in this file already sit at the edge of what one test process can
+    /// afford. The tests stay independent by each locking a different `(dev, ino)`.
+    fn table() -> &'static Table {
+        static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let table = Table::new_local();
+            assert!(
+                table.excludes(),
+                "test flock table could not exclude; this module would then prove nothing"
+            );
+            table
+        })
+    }
+
+    /// A distinct key per test, so the shared table above cannot make them interfere.
+    const fn key(n: usize) -> (usize, usize) {
+        (0x00f1_00d0 + n, 0x00f1_00d1 + n)
+    }
+
+    #[test]
+    fn another_host_process_cannot_take_a_held_exclusive_lock() {
+        let platform: &'static TestPlatform = test_platform(None);
+        let table = table();
+        let (dev, ino) = key(1);
+        let never = || false;
+
+        // "Process 1" holds `LOCK_EX`; "process 2" gets neither `LOCK_EX` nor `LOCK_SH`, and
+        // non-blocking `flock(2)` reports that as EWOULDBLOCK.
+        assert_eq!(
+            table.lock(platform, dev, ino, 1, 100, true, true, &never),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            table.lock(platform, dev, ino, 2, 200, true, true, &never),
+            Some(Err(Errno::EWOULDBLOCK))
+        );
+        assert_eq!(
+            table.lock(platform, dev, ino, 2, 200, false, true, &never),
+            Some(Err(Errno::EWOULDBLOCK))
+        );
+
+        // Re-locking through the SAME holder is still a no-op conversion, not self-contention.
+        assert_eq!(
+            table.lock(platform, dev, ino, 1, 100, false, true, &never),
+            Some(Ok(()))
+        );
+
+        assert!(table.unlock(dev, ino, 1, 100));
+        assert_eq!(
+            table.lock(platform, dev, ino, 2, 200, true, true, &never),
+            Some(Ok(()))
+        );
+    }
+
+    #[test]
+    fn shared_holders_from_several_host_processes_coexist_and_block_exclusive() {
+        let platform: &'static TestPlatform = test_platform(None);
+        let table = table();
+        let (dev, ino) = key(2);
+        let never = || false;
+
+        for (host, id) in [(1u32, 100u64), (2, 200), (3, 300)] {
+            assert_eq!(
+                table.lock(platform, dev, ino, host, id, false, true, &never),
+                Some(Ok(()))
+            );
+        }
+        // `LOCK_SH` is compatible with `LOCK_SH`, but any of them blocks a fourth process's
+        // `LOCK_EX`.
+        assert_eq!(
+            table.lock(platform, dev, ino, 4, 400, true, true, &never),
+            Some(Err(Errno::EWOULDBLOCK))
+        );
+
+        // Releasing only SOME of them is not enough.
+        assert!(table.unlock(dev, ino, 2, 200));
+        assert_eq!(
+            table.lock(platform, dev, ino, 4, 400, true, true, &never),
+            Some(Err(Errno::EWOULDBLOCK))
+        );
+
+        assert!(table.unlock(dev, ino, 1, 100));
+        assert!(table.unlock(dev, ino, 3, 300));
+        assert_eq!(
+            table.lock(platform, dev, ino, 4, 400, true, true, &never),
+            Some(Ok(()))
+        );
+    }
+
+    /// The other half of the bug: a waiter parked in ANOTHER host process has to be woken by the
+    /// holder's unlock. `Pollee`/`Waker` cannot do that (they are process-local), which is what the
+    /// table's futex word is for.
+    #[test]
+    fn a_blocking_waiter_in_another_host_process_wakes_on_release() {
+        let platform: &'static TestPlatform = test_platform(None);
+        let table = table();
+        let (dev, ino) = key(3);
+        let never = || false;
+
+        assert_eq!(
+            table.lock(platform, dev, ino, 1, 100, true, true, &never),
+            Some(Ok(()))
+        );
+
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let waiter =
+                scope.spawn(|| table.lock(platform, dev, ino, 2, 200, true, false, &|| false));
+
+            // Give the waiter time to actually park, so this measures a wakeup and not a race the
+            // waiter won by arriving after the unlock.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(table.unlock(dev, ino, 1, 100));
+
+            assert_eq!(waiter.join().expect("waiter thread panicked"), Some(Ok(())));
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waiter did not wake on release"
+        );
+    }
+}
+
 #[allow(
     clippy::similar_names,
     reason = "st_atime/st_atime_nsec/st_mtime/st_mtime_nsec mirror struct-stat field names"

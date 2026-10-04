@@ -9,12 +9,15 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{Events, wait::CheckForInterrupt, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
-    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, StdioStream, TimeProvider},
+    platform::{
+        Instant as _, RawConstPointer as _, RawMutPointer as _, RawMutex as _, StdioStream,
+        TimeProvider,
+    },
     sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
@@ -31,7 +34,7 @@ use crate::{
     GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
     syscalls::{file_spill::SpillEdit, signal},
 };
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -641,8 +644,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 }
 
 /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`. See
-/// `GlobalStateHandle::flock_registry`'s doc comment for why it is per host process: it contends
-/// across every open file description THIS process holds, but not across the fork family.
+/// `GlobalStateHandle::flock_registry`'s doc comment for why it lives per host process rather than
+/// on the byte-shared `GlobalState`: both halves of it -- the `BTreeMap`'s nodes and the
+/// `Arc<FlockFile>`'s `Pollee` observers -- come from the ordinary private heap of whichever process
+/// allocated them, so a byte-shared copy of the root pointer is garbage in every other process of
+/// the fork family (twelfth instance of that defect class; the live panic was
+/// `btree/node.rs` "range end index out of range for slice of length ...").
+///
+/// It is therefore only the FALLBACK: genuine cross-process contention is
+/// [`SharedFlockTable`]'s job, and this registry serves a file only when that table cannot
+/// represent it (see [`SharedFlockTable::lock`]'s `None` return) -- in which case `flock(2)`
+/// degrades to excluding within this host process, exactly as it did before `SharedFlockTable`
+/// existed, rather than failing the guest.
 pub(crate) type FlockRegistry<Platform> =
     alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FlockFile<Platform>>>;
 
@@ -678,22 +691,71 @@ bitflags::bitflags! {
 /// calls -- is actually dropped), matching the kernel's "closing any fd referring to the open file
 /// description drops its flock" behavior, without needing a separate explicit close-time hook into
 /// every filesystem backend's `close()` implementation.
+/// That release has to reach whichever table the lock was taken in: [`SharedFlockTable`] normally,
+/// this process's own [`FlockFile`] when that table could not serve this file. So the holder stores
+/// the shared region's ADDRESS instead of reaching it through `GlobalState` -- `Drop` runs without
+/// one, and `(dev, ino)` plus this process's host pid identify the holding inside that region.
 type FlockHolder<Platform> = alloc::sync::Arc<FlockHolderInner<Platform>>;
 
-struct FlockHolderInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+struct FlockHolderInner<Platform: ShimPlatform> {
     id: u64,
-    file: alloc::sync::Arc<FlockFile<Platform>>,
+    /// This process's host pid, pairing with `id` to identify this open file description in
+    /// [`SharedFlockTable`] (ids are handed out by a shim-wide counter shared by the whole fork
+    /// family, so two processes never collide even though each numbers its own holders from 1).
+    host: u32,
+    dev: usize,
+    ino: usize,
+    /// Address of the [`SharedFlockRegion`] this holder takes its cross-process lock in, recorded
+    /// at creation because `Drop` has neither a `&Platform` nor a `&GlobalState` to find it with.
+    /// Zero when the file was never locked through the shared table (`flock(2)` was never called,
+    /// or only `LOCK_UN` was), which `release` treats as "nothing to release there".
+    region: usize,
+    /// Non-`None` only on the fallback path, and holds the SAME `Arc<FlockFile>` this file's entry
+    /// in `GlobalStateHandle::flock_registry` holds -- kept here because `Drop` has no way to reach
+    /// that registry, exactly as it had no way to reach `GlobalState` before.
+    local: litebox::sync::Mutex<Platform, Option<alloc::sync::Arc<FlockFile<Platform>>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockHolderInner<Platform> {
-    fn new(id: u64, file: alloc::sync::Arc<FlockFile<Platform>>) -> FlockHolder<Platform> {
-        alloc::sync::Arc::new(Self { id, file })
+impl<Platform: ShimPlatform> FlockHolderInner<Platform> {
+    fn new(id: u64, host: u32, dev: usize, ino: usize, region: usize) -> FlockHolder<Platform> {
+        alloc::sync::Arc::new(Self {
+            id,
+            host,
+            dev,
+            ino,
+            region,
+            local: litebox::sync::Mutex::new(None),
+        })
+    }
+
+    /// The shared region this holder's cross-process lock lives in, if it has one.
+    ///
+    /// SAFETY-free alternative to a process-global "current table" static: the address was recorded
+    /// by the process that created this holder, and the shared kernel arena is mapped at the same
+    /// address in every process of a fork family, so it stays valid if a fork carries the holder
+    /// into a child.
+    fn shared_region(&self) -> Option<&'static SharedFlockRegion<Platform>> {
+        // SAFETY: `self.region` is either 0 (checked) or the address `SharedFlockTable::new` got
+        // from `shared_kernel_arena_alloc_bytes` (or, on the arena-exhausted path, a leaked
+        // `alloc_zeroed`). That region is never freed and is only ever mutated under `guard`, so
+        // re-forming a shared reference to it from its address is sound.
+        (self.region != 0).then(|| unsafe { &*(self.region as *const SharedFlockRegion<Platform>) })
+    }
+
+    /// Releases whatever lock this open file description holds, in whichever table it took it.
+    fn release(&self) {
+        if let Some(region) = self.shared_region() {
+            region.release(self.dev, self.ino, self.host, self.id);
+        }
+        if let Some(file) = self.local.lock().take() {
+            file.unlock(self.id);
+        }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for FlockHolderInner<Platform> {
+impl<Platform: ShimPlatform> Drop for FlockHolderInner<Platform> {
     fn drop(&mut self) {
-        self.file.unlock(self.id);
+        self.release();
     }
 }
 
@@ -816,6 +878,585 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockFile<Platform> {
         drop(state);
         if changed {
             self.pollee.notify_observers(Events::IN);
+        }
+    }
+}
+
+/// Cross-process `flock(2)` lock table: the genuinely shared half of `flock(2)`'s state.
+///
+/// `flock(2)` has to EXCLUDE across a fork family: a fork child runs in ITS OWN HOST PROCESS
+/// (`LITEBOX_PROCESS_FORK`), so a lock the parent took is only visible to the child through memory
+/// every process of the family maps at the same address -- the shared kernel arena. `GlobalState`'s
+/// bytes are shared, but anything holding a POINTER is not: the per-process `FlockRegistry`'s
+/// `BTreeMap` nodes and every `FlockFile`'s `Pollee` observers are heap addresses that mean nothing
+/// in a fork child. That is why `f5d73ff` moved the registry off `GlobalState` -- and why a child
+/// that nonetheless touched it panicked in `btree/node.rs` with a garbage slice length.
+///
+/// So this table is POINTER-FREE: fixed slots of plain atomics, the `SharedUnixConnTable` shape.
+/// Two consequences worth stating:
+///
+/// * The whole table is guarded by ONE cross-process mutex, and every slot lookup, claim and state
+///   transition happens inside that single critical section, so there is no window in which two
+///   processes can disagree about which slot owns which file. The sections are a handful of atomic
+///   stores, so the coarse lock costs microseconds and buys an argument that is easy to check.
+/// * A waiter cannot be woken through `Pollee`/`Waker` (those are process-local), so the table
+///   carries a `RawMutex` used purely as a FUTEX WORD: a release bumps the word and `wake_all`s; a
+///   waiter samples the word and then `block_or_timeout`s on the sample, which returns immediately
+///   for a bump that already happened and cannot miss one that happens afterwards. The 25ms chunk
+///   is the bound on how long a waiter can sit on a wakeup the platform lost, and it doubles as the
+///   interrupt poll.
+const SHARED_FLOCK_CAPACITY: usize = 128;
+/// Concurrent `LOCK_SH` holders one file can track. A guest SESSION -- the full XFCE stack runs
+/// ~38 processes -- shares far more often than it excludes, and 32 keeps a slot a fixed, arena-sized
+/// thing. A 33rd `LOCK_SH` holder degrades to the per-process `FlockFile`: still correct, because
+/// `LOCK_SH` is compatible with `LOCK_SH` anyway.
+const SHARED_FLOCK_SHARED_HOLDERS: usize = 32;
+/// The bound on a lost wakeup, and the granularity at which a blocked `flock(2)` notices a signal.
+const SHARED_FLOCK_WAIT_CHUNK: core::time::Duration = core::time::Duration::from_millis(25);
+/// A waiter reaps holdings of processes that died without unlocking every Nth chunk (~1s).
+const SHARED_FLOCK_RECLAIM_EVERY: u32 = 40;
+
+const FLOCK_SLOT_FREE: u32 = 0;
+const FLOCK_SLOT_RESERVED: u32 = 1;
+const FLOCK_SLOT_SHARED: u32 = 2;
+const FLOCK_SLOT_EXCLUSIVE: u32 = 3;
+
+/// One attempt to take a slot, in the only terms its caller can act on.
+enum SharedFlockOutcome {
+    /// The lock is ours.
+    Acquired,
+    /// Somebody else holds it incompatibly.
+    Conflict,
+    /// The table cannot represent this lock (it is full, or out of shared-holder rows): the caller
+    /// falls back to the per-process `FlockFile` rather than failing the guest.
+    Unavailable,
+}
+
+pub(crate) struct SharedFlockTable<Platform: ShimPlatform> {
+    region: &'static mut SharedFlockRegion<Platform>,
+    /// Count of locks this process has had to degrade to the per-process `FlockFile`. Logged
+    /// gap-filtered: a full table is a real (if soft) capacity signal, not a per-call event.
+    degraded: AtomicU32,
+}
+
+/// The arena-resident half: ONE critical section, ONE futex word, and the pointer-free slots.
+struct SharedFlockRegion<Platform: ShimPlatform> {
+    /// Whether this region's bytes are in memory EVERY process that could contend for these locks
+    /// can see -- the cross-process shared kernel arena in production. `false` means the arena was
+    /// exhausted at construction, so every lock degrades to the per-process `FlockFile`: granting an
+    /// "exclusive" lock out of process-private memory is a lie two processes could both act on. It
+    /// lives here rather than on the table because a `FlockHolder`'s `Drop` reaches only the region.
+    excludes: AtomicBool,
+    /// Serializes every slot lookup, claim and transition in the whole family. Held for a handful
+    /// of atomic stores; a holder killed mid-section is recovered by `RawMutex`'s `holder_pid`
+    /// dead-holder path (see that platform's own `RawMutex::block` doc comment).
+    guard: litebox::sync::Mutex<Platform, ()>,
+    /// Futex word, never actually locked: `underlying_atomic()` is bumped on every release and
+    /// `wake_all` unparks whoever is `block_or_timeout`ing on it.
+    wake: Platform::RawMutex,
+    slots: [SharedFlockSlot; SHARED_FLOCK_CAPACITY],
+}
+
+struct SharedFlockSlot {
+    dev: AtomicUsize,
+    ino: AtomicUsize,
+    kind: AtomicU32,
+    reserver_pid: AtomicU32,
+    exclusive_id: AtomicU64,
+    exclusive_pid: AtomicU32,
+    shared_ids: [AtomicU64; SHARED_FLOCK_SHARED_HOLDERS],
+    shared_pids: [AtomicU32; SHARED_FLOCK_SHARED_HOLDERS],
+}
+
+impl SharedFlockSlot {
+    fn new() -> Self {
+        Self {
+            // `ino` starts at a value no real file has, so a slot that has never been claimed
+            // cannot match by accident.
+            dev: AtomicUsize::new(0),
+            ino: AtomicUsize::new(usize::MAX),
+            kind: AtomicU32::new(FLOCK_SLOT_FREE),
+            reserver_pid: AtomicU32::new(0),
+            exclusive_id: AtomicU64::new(0),
+            exclusive_pid: AtomicU32::new(0),
+            shared_ids: core::array::from_fn(|_| AtomicU64::new(0)),
+            shared_pids: core::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    fn shared_holder_count(&self) -> usize {
+        self.shared_ids
+            .iter()
+            .filter(|id| id.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
+    fn holds_shared(&self, host: u32, id: u64) -> bool {
+        self.shared_pids
+            .iter()
+            .zip(self.shared_ids.iter())
+            .any(|(pid, sid)| {
+                pid.load(Ordering::Acquire) == host && sid.load(Ordering::Acquire) == id
+            })
+    }
+
+    fn first_free_shared(&self) -> Option<usize> {
+        self.shared_ids
+            .iter()
+            .position(|id| id.load(Ordering::Acquire) == 0)
+    }
+
+    /// Clears one shared-holder row. Returns whether it was ours.
+    fn clear_shared(&self, host: u32, id: u64) -> bool {
+        for (pid, sid) in self.shared_pids.iter().zip(self.shared_ids.iter()) {
+            if pid.load(Ordering::Acquire) == host && sid.load(Ordering::Acquire) == id {
+                sid.store(0, Ordering::Release);
+                pid.store(0, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<Platform: ShimPlatform> SharedFlockRegion<Platform> {
+    fn holds_key(&self, i: usize, dev: usize, ino: usize) -> bool {
+        self.slots[i].dev.load(Ordering::Acquire) == dev
+            && self.slots[i].ino.load(Ordering::Acquire) == ino
+    }
+
+    /// Bump the futex word and unpark every waiter. Callers hold `guard`.
+    fn bump(&self) {
+        self.wake
+            .underlying_atomic()
+            .fetch_add(1, Ordering::Release);
+        self.wake.wake_all();
+    }
+
+    /// Releases `host`/`id`'s hold on slot `i`. Returns whether it held anything.
+    /// Callers hold `guard`.
+    fn release_slot(&self, i: usize, host: u32, id: u64) -> bool {
+        let slot = &self.slots[i];
+        let released = match slot.kind.load(Ordering::Acquire) {
+            FLOCK_SLOT_RESERVED => {
+                if slot.reserver_pid.load(Ordering::Acquire) == host
+                    && slot.exclusive_id.load(Ordering::Acquire) == id
+                {
+                    slot.exclusive_id.store(0, Ordering::Release);
+                    slot.exclusive_pid.store(0, Ordering::Release);
+                    slot.reserver_pid.store(0, Ordering::Release);
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            }
+            FLOCK_SLOT_EXCLUSIVE => {
+                if slot.exclusive_pid.load(Ordering::Acquire) == host
+                    && slot.exclusive_id.load(Ordering::Acquire) == id
+                {
+                    slot.exclusive_id.store(0, Ordering::Release);
+                    slot.exclusive_pid.store(0, Ordering::Release);
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            }
+            FLOCK_SLOT_SHARED => {
+                let cleared = slot.clear_shared(host, id);
+                if cleared && slot.shared_holder_count() == 0 {
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                }
+                cleared
+            }
+            _ => false,
+        };
+        if released {
+            self.bump();
+        }
+        released
+    }
+
+    /// Releases `host`/`id`'s hold on `(dev, ino)`, if this region holds one.
+    fn release(&self, dev: usize, ino: usize, host: u32, id: u64) -> bool {
+        if !self.excludes.load(Ordering::Acquire) {
+            return false;
+        }
+        let _guard = self.guard.lock();
+        for i in 0..SHARED_FLOCK_CAPACITY {
+            if self.holds_key(i, dev, ino) && self.release_slot(i, host, id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Frees every holding whose host process is gone. Callers hold `guard`.
+    ///
+    /// A fork child that is killed never runs `Drop`, and a child's exit path does not reach back
+    /// into this table, so without this a dead process's lock would pin its file for the rest of
+    /// the session. `is_process_alive` is the same check the platform's own dead-`RawMutex`-holder
+    /// recovery makes. Pid 0 means "no holder recorded" and is skipped.
+    fn reclaim_dead(&self, platform: &Platform) -> bool {
+        let mut reclaimed = false;
+        for slot in self.slots.iter() {
+            match slot.kind.load(Ordering::Acquire) {
+                FLOCK_SLOT_RESERVED | FLOCK_SLOT_EXCLUSIVE => {
+                    let pid = slot.exclusive_pid.load(Ordering::Acquire);
+                    if pid != 0 && !platform.is_process_alive(pid) {
+                        slot.exclusive_id.store(0, Ordering::Release);
+                        slot.exclusive_pid.store(0, Ordering::Release);
+                        slot.reserver_pid.store(0, Ordering::Release);
+                        slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                        reclaimed = true;
+                    }
+                }
+                FLOCK_SLOT_SHARED => {
+                    let mut dropped = false;
+                    for (pid, sid) in slot.shared_pids.iter().zip(slot.shared_ids.iter()) {
+                        let p = pid.load(Ordering::Acquire);
+                        if p != 0 && !platform.is_process_alive(p) {
+                            sid.store(0, Ordering::Release);
+                            pid.store(0, Ordering::Release);
+                            dropped = true;
+                        }
+                    }
+                    if dropped {
+                        reclaimed = true;
+                        if slot.shared_holder_count() == 0 {
+                            slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if reclaimed {
+            self.bump();
+        }
+        reclaimed
+    }
+}
+
+impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
+    /// Allocates the region in the cross-process SHARED kernel arena and initializes it.
+    ///
+    /// Runs exactly once per fork family, from `LinuxShimBuilder::build`'s create branch: every
+    /// other process in the family attaches to the already-built `GlobalState` and never calls this
+    /// (the same create-vs-attach split `SharedUnixConnTable::new` relies on).
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let (ptr, excludes) = match arena {
+            Some(ptr) => (ptr.cast::<SharedFlockRegion<Platform>>(), true),
+            None => {
+                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+                // process IS the whole guest session). Leak a process-private allocation so every
+                // later access stays memory-safe, and let `excludes` disable the table.
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
+                     this host process only"
+                );
+                (
+                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                        .expect("shared flock table: fallback allocation failed")
+                        .cast::<SharedFlockRegion<Platform>>(),
+                    false,
+                )
+            }
+        };
+        Self::new_in(ptr, excludes)
+    }
+
+    /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
+    ///
+    /// `excludes` is the caller's answer to "can every process that could contend for these locks
+    /// see this memory?" -- see `SharedFlockRegion::excludes`. A unit test passes process-private
+    /// memory and `true`, which is the honest answer for it: every contender it can create lives in
+    /// its own process.
+    fn new_in(ptr: core::ptr::NonNull<SharedFlockRegion<Platform>>, excludes: bool) -> Self {
+        // SAFETY (all three writes): `ptr` names one contiguous, uninitialized `SharedFlockRegion`
+        // sized by [`Self::new`]'s `layout`, and writing a freshly built value into uninitialized
+        // memory is what `write` is for. Initializing through the pointer ONE FIELD AT A TIME is
+        // also the whole point: a `SharedFlockRegion` value is tens of KiB of stack at once, and
+        // `GlobalState` is built by value on a stack that is already near its documented limit.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).excludes).write(AtomicBool::new(excludes));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).guard).write(litebox::sync::Mutex::new(()));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).wake)
+                .write(<Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT);
+            for i in 0..SHARED_FLOCK_CAPACITY {
+                core::ptr::addr_of_mut!((*ptr.as_ptr()).slots[i]).write(SharedFlockSlot::new());
+            }
+        }
+        Self {
+            // SAFETY: `ptr` is non-null and suitably aligned, and the region at it was just
+            // initialized field-by-field above. `'static` is sound because this allocation is
+            // arena-backed (or a deliberately leaked one) and never reclaimed, and nothing else
+            // holds a reference to it.
+            region: unsafe { &mut *ptr.as_ptr() },
+            degraded: AtomicU32::new(0),
+        }
+    }
+
+    /// Test-only: the same table over the process heap instead of the shared arena.
+    ///
+    /// A unit test cannot produce a second host process, so process-private memory exercises exactly
+    /// the same exclusion and wakeup logic -- and it keeps the test from spending any of the one
+    /// 128 MiB arena a test process shares between every `GlobalState` it builds, which the six
+    /// `flock_tests` in this crate already use to the brim. What this cannot cover is the arena's
+    /// cross-process visibility itself: that is what `.wfgy/flockx1.sh` is for.
+    #[cfg(test)]
+    pub(crate) fn new_local() -> Self {
+        let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
+        let ptr = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+            .expect("shared flock table: test allocation failed")
+            .cast::<SharedFlockRegion<Platform>>();
+        Self::new_in(ptr, true)
+    }
+
+    /// The region's address, for a [`FlockHolder`] to record so that its `Drop` can release the
+    /// lock without a `&Platform` or a `&GlobalState`.
+    fn region_addr(&self) -> usize {
+        self.region as *const SharedFlockRegion<Platform> as usize
+    }
+
+    /// Lowest-index slot currently carrying `dev`/`ino` in a non-free state. Callers hold `guard`.
+    fn find_held(&self, dev: usize, ino: usize) -> Option<usize> {
+        (0..SHARED_FLOCK_CAPACITY).find(|i| {
+            self.region.holds_key(*i, dev, ino)
+                && self.region.slots[*i].kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE
+        })
+    }
+
+    /// Claims the lowest free slot for `dev`/`ino` and reserves it. Callers hold `guard`.
+    fn claim_free(&self, dev: usize, ino: usize, host: u32, id: u64) -> Option<usize> {
+        for i in 0..SHARED_FLOCK_CAPACITY {
+            let slot = &self.region.slots[i];
+            if slot.kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE {
+                continue;
+            }
+            slot.dev.store(dev, Ordering::Release);
+            slot.ino.store(ino, Ordering::Release);
+            slot.reserver_pid.store(host, Ordering::Release);
+            slot.exclusive_id.store(id, Ordering::Release);
+            slot.exclusive_pid.store(host, Ordering::Release);
+            slot.kind.store(FLOCK_SLOT_RESERVED, Ordering::Release);
+            return Some(i);
+        }
+        None
+    }
+
+    /// One critical section that finds the slot for `dev`/`ino` (claiming a free one if this file is
+    /// new here) AND applies the state transition. Doing both under one lock is what makes the
+    /// "which slot owns this file" question unarguable.
+    fn try_lock(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        ino: usize,
+        host: u32,
+        id: u64,
+        exclusive: bool,
+    ) -> SharedFlockOutcome {
+        let _guard = self.region.guard.lock();
+        let idx = match self.find_held(dev, ino) {
+            Some(i) => i,
+            None => match self.claim_free(dev, ino, host, id) {
+                Some(i) => i,
+                // Table full: try once to take back holdings of processes that died without
+                // unlocking, since those would otherwise pin their files for the whole session.
+                None if self.region.reclaim_dead(platform) => {
+                    match self.claim_free(dev, ino, host, id) {
+                        Some(i) => i,
+                        None => {
+                            self.log_degraded();
+                            return SharedFlockOutcome::Unavailable;
+                        }
+                    }
+                }
+                None => {
+                    self.log_degraded();
+                    return SharedFlockOutcome::Unavailable;
+                }
+            },
+        };
+        let slot = &self.region.slots[idx];
+        match slot.kind.load(Ordering::Acquire) {
+            FLOCK_SLOT_RESERVED => {
+                // The slot this call just reserved. (`flock(2)` never yields mid-syscall, so a
+                // reservation is only ever observed by the process that made it.)
+                if slot.reserver_pid.load(Ordering::Acquire) != host
+                    || slot.exclusive_id.load(Ordering::Acquire) != id
+                {
+                    return SharedFlockOutcome::Conflict;
+                }
+                slot.kind.store(
+                    if exclusive {
+                        FLOCK_SLOT_EXCLUSIVE
+                    } else {
+                        FLOCK_SLOT_SHARED
+                    },
+                    Ordering::Release,
+                );
+                if !exclusive {
+                    self.move_to_shared(slot, host, id);
+                }
+                self.region.bump();
+                SharedFlockOutcome::Acquired
+            }
+            FLOCK_SLOT_EXCLUSIVE => {
+                if slot.exclusive_pid.load(Ordering::Acquire) != host
+                    || slot.exclusive_id.load(Ordering::Acquire) != id
+                {
+                    return SharedFlockOutcome::Conflict;
+                }
+                // Re-locking our own exclusive hold: `LOCK_SH` downgrades it and `LOCK_EX` keeps
+                // it, exactly as Linux's own `flock(2)` conversion rules say.
+                if !exclusive {
+                    slot.kind.store(FLOCK_SLOT_SHARED, Ordering::Release);
+                    self.move_to_shared(slot, host, id);
+                }
+                self.region.bump();
+                SharedFlockOutcome::Acquired
+            }
+            FLOCK_SLOT_SHARED => {
+                if slot.holds_shared(host, id) {
+                    if exclusive {
+                        // Upgrade, legal only when we are the sole holder -- same as Linux.
+                        if slot.shared_holder_count() != 1 {
+                            return SharedFlockOutcome::Conflict;
+                        }
+                        slot.clear_shared(host, id);
+                        slot.exclusive_id.store(id, Ordering::Release);
+                        slot.exclusive_pid.store(host, Ordering::Release);
+                        slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
+                    }
+                    // Already ours: Linux's `flock(2)` on an fd that already holds it is a no-op,
+                    // not a second hold.
+                    self.region.bump();
+                    return SharedFlockOutcome::Acquired;
+                }
+                if exclusive {
+                    return SharedFlockOutcome::Conflict;
+                }
+                match slot.first_free_shared() {
+                    Some(j) => {
+                        slot.shared_ids[j].store(id, Ordering::Release);
+                        slot.shared_pids[j].store(host, Ordering::Release);
+                        self.region.bump();
+                        SharedFlockOutcome::Acquired
+                    }
+                    // Out of shared-holder rows. `LOCK_SH` is compatible with `LOCK_SH` anyway, so
+                    // the caller's per-process fallback cannot produce a wrong answer here.
+                    None => {
+                        self.log_degraded();
+                        SharedFlockOutcome::Unavailable
+                    }
+                }
+            }
+            _ => SharedFlockOutcome::Conflict,
+        }
+    }
+
+    /// Moves a slot's single exclusive holder into a shared-holder row. Callers hold `guard`.
+    ///
+    /// Leaves the hold EXCLUSIVE if there is no row to put it in: stronger than the `LOCK_SH` that
+    /// was asked for, but never a lost lock.
+    fn move_to_shared(&self, slot: &SharedFlockSlot, host: u32, id: u64) {
+        match slot.first_free_shared() {
+            Some(j) => {
+                slot.exclusive_id.store(0, Ordering::Release);
+                slot.exclusive_pid.store(0, Ordering::Release);
+                slot.shared_ids[j].store(id, Ordering::Release);
+                slot.shared_pids[j].store(host, Ordering::Release);
+            }
+            None => {
+                slot.exclusive_id.store(id, Ordering::Release);
+                slot.exclusive_pid.store(host, Ordering::Release);
+                slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
+                self.log_degraded();
+            }
+        }
+    }
+
+    /// Takes `flock(2)`'s cross-process lock on `(dev, ino)` for holder `host`/`id`.
+    ///
+    /// Returns `None` when the table cannot represent this lock, meaning the caller must fall back
+    /// to the per-process `FlockFile`; never a panic. `interrupted` is the task's own
+    /// `check_for_interrupt`, so a blocked `flock(2)` stays responsive to signals.
+    pub(crate) fn lock(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        ino: usize,
+        host: u32,
+        id: u64,
+        exclusive: bool,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Option<Result<(), Errno>> {
+        if !self.region.excludes.load(Ordering::Acquire) {
+            self.log_degraded();
+            return None;
+        }
+        let mut chunks = 0u32;
+        loop {
+            match self.try_lock(platform, dev, ino, host, id, exclusive) {
+                SharedFlockOutcome::Acquired => return Some(Ok(())),
+                SharedFlockOutcome::Unavailable => return None,
+                SharedFlockOutcome::Conflict => {
+                    if nonblock {
+                        return Some(Err(Errno::EWOULDBLOCK));
+                    }
+                    if interrupted() {
+                        return Some(Err(Errno::EINTR));
+                    }
+                    // Sample BEFORE blocking: a bump that already happened shows up as an immediate
+                    // return, and one that happens after the sample sets this waiter's event, so a
+                    // release cannot be missed in either order. The chunk bounds how long a waiter
+                    // can sit on a wakeup the platform lost, and is the poll for `interrupted`.
+                    let sampled = self.region.wake.underlying_atomic().load(Ordering::Acquire);
+                    let _ = self
+                        .region
+                        .wake
+                        .block_or_timeout(sampled, SHARED_FLOCK_WAIT_CHUNK);
+                    chunks = chunks.wrapping_add(1);
+                    if chunks % SHARED_FLOCK_RECLAIM_EVERY == 0 {
+                        let _guard = self.region.guard.lock();
+                        self.region.reclaim_dead(platform);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Releases `host`/`id`'s hold on `(dev, ino)`, if this table holds one.
+    ///
+    /// `FlockHolderInner::drop` reaches the same thing through the region address it recorded, so
+    /// this is the spelled-out form, for callers that already have the table.
+    pub(crate) fn unlock(&self, dev: usize, ino: usize, host: u32, id: u64) -> bool {
+        self.region.release(dev, ino, host, id)
+    }
+
+    /// Whether the table can exclude at all (i.e. whether its region is in memory every contending
+    /// process can see).
+    pub(crate) fn excludes(&self) -> bool {
+        self.region.excludes.load(Ordering::Acquire)
+    }
+
+    fn log_degraded(&self) {
+        let n = self.degraded.fetch_add(1, Ordering::Relaxed);
+        // Gap-filtered: a full table is a capacity signal worth seeing, not a per-call event.
+        if n & 0x3f == 0 {
+            litebox_util_log::warn!(
+                capacity:% = SHARED_FLOCK_CAPACITY,
+                degraded:% = n + 1;
+                "flock(2): shared lock table cannot hold this file; excluding within this host \
+                 process only"
+            );
         }
     }
 }
@@ -5764,11 +6405,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// every other open file description of the same underlying file).
     ///
     /// This is implemented with two pieces of state:
-    ///   - [`FlockFile`]: one per underlying file (keyed by `(dev, ino)` in
-    ///     `GlobalStateHandle::flock_registry`, this host process's own), tracking who currently
-    ///     holds the lock and any waiters.
-    ///     This is the actual contention/mutual-exclusion point, shared across every open file
-    ///     description of that file, matching kernel semantics for independent `open()`s.
+    ///   - [`SharedFlockTable`] (a `GlobalState` field, so genuinely shared by every host process
+    ///     of the fork family): one slot per underlying file, keyed by `(dev, ino)`, tracking who
+    ///     currently holds the lock.
+    ///     This is the actual contention/mutual-exclusion point across PROCESSES, matching kernel
+    ///     semantics for independent `open()`s in different processes -- including a cross-process
+    ///     `fork()` child, which is a different host process here.
+    ///     When that table cannot represent a lock (its fixed capacity is full), `flock()` degrades
+    ///     to [`FlockFile`] below, which excludes within this host process only -- never to a
+    ///     failure the guest could not have provoked on real Linux.
+    ///   - [`FlockFile`]: this host process's own per-file lock state, the pre-`SharedFlockTable`
+    ///     behavior, now only the fallback.
     ///   - A holder id stored in this open file description's `DescriptorEntry`-scoped metadata
     ///     (via `set_entry_metadata`/`with_metadata_mut`, which is exactly LiteBox's existing
     ///     "shared across `dup()`'d fds of the same open, independent across separate `open()`s"
@@ -5776,6 +6423,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///     offsets), identifying *which* open file description currently holds the lock so a
     ///     `LOCK_UN`/re-`LOCK_EX` from the same open file description is idempotent/self-consistent
     ///     rather than contending with itself.
+    ///
+    /// Known deviation from real `flock()`, unchanged by `SharedFlockTable`: a `fork()`ed child that
+    /// INHERITS an already-locked fd gets its own holder id rather than sharing the parent's open
+    /// file description's, so it contends with its parent where real Linux would see one holder.
+    /// Real `flock()` callers that mean to contend open the file themselves (what
+    /// `.wfgy/flockx1.sh`, chromium's profile lock and SQLite all do), which this gets right.
     pub(crate) fn sys_flock(&self, fd: i32, operation: i32) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -5817,15 +6470,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .fd_file_status(fd)
             .map_err(Errno::from)?
             .node_info;
-        let key = (node_info.dev, node_info.ino);
-
-        let flock_file = {
-            let mut registry = self.global.flock_registry.lock();
-            registry
-                .entry(key)
-                .or_insert_with(|| alloc::sync::Arc::new(FlockFile::new()))
-                .clone()
-        };
+        let dev = node_info.dev;
+        let ino = node_info.ino;
+        // Host pid + holder id identify this open file description in the shared table: ids come
+        // from `GlobalState::next_flock_holder_id`, which is itself in the shared arena, so two
+        // processes never hand out the same one.
+        let host = self.global.platform.current_host_pid();
 
         // The holder id identifies this open file description (not this fd number) to the
         // `FlockFile`. It is stored as entry-shared metadata so it is visible to (and shared by)
@@ -5842,7 +6492,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .next_flock_holder_id
                     .fetch_add(1, Ordering::Relaxed);
-                let h = FlockHolderInner::new(id, flock_file.clone());
+                let h = FlockHolderInner::new(
+                    id,
+                    host,
+                    dev,
+                    ino,
+                    self.global.shared_flock.region_addr(),
+                );
                 dt.set_entry_metadata(fd, h.clone());
                 h
             }
@@ -5850,11 +6506,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(dt);
 
         match op {
-            FlockOp::SH => flock_file.lock_shared(&self.wait_cx(), holder.id, nonblock),
-            FlockOp::EX => flock_file.lock_exclusive(&self.wait_cx(), holder.id, nonblock),
             FlockOp::UN => {
-                flock_file.unlock(holder.id);
+                holder.release();
                 Ok(0)
+            }
+            FlockOp::SH | FlockOp::EX => {
+                let exclusive = op == FlockOp::EX;
+                {
+                    let table = &self.global.shared_flock;
+                    if let Some(res) = table.lock(
+                        self.global.platform,
+                        dev,
+                        ino,
+                        host,
+                        holder.id,
+                        exclusive,
+                        nonblock,
+                        // Signals (and an exiting task) interrupt a blocked `flock(2)`, as on real
+                        // Linux: checked once per wait chunk, so delivery latency is bounded by
+                        // `SHARED_FLOCK_WAIT_CHUNK`, not by the unlock.
+                        &|| self.check_for_interrupt(),
+                    ) {
+                        return res.map(|()| 0);
+                    }
+                }
+                // Fallback: this host process's own registry (per-process exclusion only, the
+                // pre-`SharedFlockTable` behavior). The `Arc<FlockFile>` is also stashed on the
+                // holder so its `Drop` -- which cannot reach this registry -- can release it.
+                let file = {
+                    let mut registry = self.global.flock_registry.lock();
+                    registry
+                        .entry((dev, ino))
+                        .or_insert_with(|| alloc::sync::Arc::new(FlockFile::new()))
+                        .clone()
+                };
+                *holder.local.lock() = Some(file.clone());
+                if exclusive {
+                    file.lock_exclusive(&self.wait_cx(), holder.id, nonblock)
+                } else {
+                    file.lock_shared(&self.wait_cx(), holder.id, nonblock)
+                }
             }
             _ => Err(Errno::EINVAL),
         }
