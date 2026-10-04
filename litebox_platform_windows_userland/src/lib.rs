@@ -9770,8 +9770,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         &self,
         range: core::ops::Range<usize>,
         source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
     ) -> bool {
-        crate::lazy_file_map::enabled() && crate::lazy_file_map::register(range, source_data)
+        crate::lazy_file_map::enabled()
+            && crate::lazy_file_map::register(range, source_data, prot_flags(permissions))
     }
 
     unsafe fn update_permissions(

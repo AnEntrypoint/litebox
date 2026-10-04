@@ -1149,6 +1149,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        // The lazy range must hand a chunk back at exactly the protection this mapping was
+        // requested with, not at read-write: a `PROT_READ|PROT_EXEC` mapping that fills as
+        // `PAGE_READWRITE` is writable but not executable, so the guest's first call into it faults
+        // instead of running. Computed before `op` so the closure never borrows `prot` (which
+        // `do_mmap` below takes by value).
+        let mut lazy_permissions = MemoryRegionPermissions::empty();
+        lazy_permissions.set(
+            MemoryRegionPermissions::READ,
+            prot.contains(ProtFlags::PROT_READ),
+        );
+        lazy_permissions.set(
+            MemoryRegionPermissions::WRITE,
+            prot.contains(ProtFlags::PROT_WRITE),
+        );
+        lazy_permissions.set(
+            MemoryRegionPermissions::EXEC,
+            prot.contains(ProtFlags::PROT_EXEC),
+        );
         let lazy_source = self.static_backing_slice(fd, offset, len);
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
             if let Some(source) = lazy_source {
@@ -1158,6 +1176,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.global.platform,
                     start..start + mapped_len,
                     source,
+                    lazy_permissions,
                 ) {
                     return Ok(len);
                 }

@@ -265,13 +265,22 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 
-    /// Turns the freshly created read-write `range` into a demand-paged private mapping of
-    /// `source_data` (page `i` of the range is page `i` of the source, zero past its end): the
-    /// platform leaves it unfilled and copies each chunk in on first touch, so untouched parts of
-    /// a large file never become resident. Returns `false` when unsupported, leaving the range
-    /// untouched for the caller to fill eagerly.
+    /// Turns the freshly created `range` -- which the guest mapped with `permissions` -- into a
+    /// demand-paged private mapping of `source_data` (page `i` of the range is page `i` of the
+    /// source, zero past its end): the platform leaves it unfilled and copies each chunk in on
+    /// first touch, so untouched parts of a large file never become resident. Returns `false` when
+    /// unsupported, leaving the range untouched for the caller to fill eagerly.
+    ///
+    /// `permissions` is the protection the guest asked for, and the platform MUST restore exactly
+    /// that (its own translation of it) when it fills a chunk: an executable mapping that comes
+    /// back merely writable is a guest-visible SIGSEGV the first time the guest calls into it.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn try_lazy_file_pages(&self, range: Range<usize>, source_data: &'static [u8]) -> bool {
+    fn try_lazy_file_pages(
+        &self,
+        range: Range<usize>,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+    ) -> bool {
         false
     }
 

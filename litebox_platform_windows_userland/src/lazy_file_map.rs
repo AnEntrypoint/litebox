@@ -505,9 +505,20 @@ unsafe extern "system" fn lazy_file_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Turns the freshly created, committed, read-write `range` into an unfilled lazy mapping of
-/// `source`. Returns `false` (leaving the range untouched) when it cannot be armed.
-pub(crate) fn register(range: Range<usize>, source: &'static [u8]) -> bool {
+/// Turns the freshly created, committed `range` into an unfilled lazy mapping of `source`.
+/// Returns `false` (leaving the range untouched) when it cannot be armed.
+///
+/// `protection` is the host protection the mapping was created with, and it is what a chunk gets
+/// back when it is filled. It MUST be the guest's own mapping protection: a text segment mapped
+/// `PROT_READ|PROT_EXEC` that is filled with `PAGE_READWRITE` is writable but NOT executable, and
+/// the guest's first call into it faults as an instruction fetch from a present page (Windows
+/// `Exception(14) error_code=0x15`) -- which is how an executable mapping's execute bit was lost
+/// here before.
+pub(crate) fn register(
+    range: Range<usize>,
+    source: &'static [u8],
+    protection: PAGE_PROTECTION_FLAGS,
+) -> bool {
     if range.len() < MIN_LAZY_LEN || !range.start.is_multiple_of(4096) {
         return false;
     }
@@ -548,7 +559,7 @@ pub(crate) fn register(range: Range<usize>, source: &'static [u8]) -> bool {
             end: range.end,
             source: source.as_ptr() as usize,
             source_len: source.len(),
-            protection: PAGE_READWRITE,
+            protection,
             first_chunk,
             filled: vec![false; last_chunk - first_chunk + 1],
             dirty: vec![false; last_chunk - first_chunk + 1],
