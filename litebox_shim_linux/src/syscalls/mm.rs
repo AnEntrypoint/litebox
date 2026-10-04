@@ -656,18 +656,21 @@ pub(crate) struct MemfdEntry<Platform: PageManagementProvider<{ litebox::mm::lin
     /// resolves against `size.next_multiple_of(PAGE_SIZE)`, matching `create_shared_memory`'s own
     /// page-rounding).
     pub(crate) size: usize,
-    /// Whether `handle` has already been `mmap`'d by anyone since it was (re)created. The
-    /// backing in-mem file's `Vec<u8>` is only ever written by `write()`/`pwrite()`, never by a
-    /// peer's `mmap`'d writes -- so once a SECOND process (or the same process a second time,
-    /// e.g. the compositor mapping a `wl_shm` pool the client already drew into through its own
-    /// mapping) maps this handle, the `Vec<u8>` is stale and must NOT be re-copied over the
-    /// shared object, or every write anyone has made through their own mapping is silently
-    /// wiped back to whatever the guest last `write()`'d (usually zeros, since real Wayland/X11
-    /// shm clients draw exclusively through their mapping and never call `write()` at all).
-    /// Confirmed live: this is why every dumped frame ever captured under `--gui` showed only
-    /// weston-desktop-shell's own repainted-every-second clock widget and nothing else -- every
-    /// surface that painted once and then waited for damage got mmap-wiped back to black the
-    /// moment the compositor mapped the client's pool.
+    /// Whether `handle` has ever been `mmap`'d since it was (re)created.
+    ///
+    /// Once a SECOND party maps this handle -- a peer process (a fork child, an `SCM_RIGHTS`
+    /// receiver), or simply this process a second time, e.g. the compositor mapping a `wl_shm`
+    /// pool the client already drew into through its own mapping -- the in-mem file cannot be
+    /// assumed to reflect the object's contents any more, because writes through a mapping never
+    /// reach the file. Historically that is also what gated a first-`mmap` file -> object sync
+    /// here; that sync is gone (see `try_memfd_mmap`), because the object is now the ONE store
+    /// and is kept current by `Task::memfd_write_through` instead, so this flag is bookkeeping
+    /// only. It is still carried across a resize by `resize_memfd_shared_backing`.
+    ///
+    /// Confirmed live (the hazard this flag was introduced for): this is why every dumped frame
+    /// ever captured under `--gui` showed only weston-desktop-shell's own repainted-every-second
+    /// clock widget and nothing else -- every surface that painted once and then waited for
+    /// damage got mmap-wiped back to black the moment the compositor mapped the client's pool.
     pub(crate) mapped: bool,
     /// The host-wide name of `handle` when it was created by `create_named_shared_memory`, so a
     /// descriptor for this memfd can be passed to another host process (fork, `SCM_RIGHTS`) which
@@ -1253,74 +1256,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Err(MappingError::UnAligned));
         }
         let handle = entry.handle;
-        // See `MemfdEntry::mapped`'s own doc comment: only the FIRST `mmap` of a given handle
-        // may sync the in-mem `Vec<u8>` into the shared object -- every mmap after that must
-        // leave the shared object's own live contents alone, or a second mapper (typically the
-        // compositor, mapping a `wl_shm` pool the client already drew into through its own
-        // mapping) wipes everything the first mapper wrote.
-        let already_mapped = entry.mapped;
+        // The shared object -- NOT the in-mem file -- is a sized memfd's ONE store, so there is
+        // deliberately NO "seed the object from the file's bytes" step here any more. The object
+        // is already current: `resize_memfd_shared_backing` seeds it from the file at
+        // `ftruncate`/`fallocate` time and carries the old object's bytes across a resize, and
+        // every `write(2)`/`pwrite(2)` afterwards is mirrored into it by
+        // `Task::memfd_write_through` (which is also what `read(2)`/`pread(2)` answer from, via
+        // `Task::memfd_read_through`). Copying the file over the object here would therefore only
+        // ever DESTROY live content: the file is a zero-filled mirror of page-rounded length, so
+        // the first `mmap` after a fork child (or an `SCM_RIGHTS` receiver) drew into the object
+        // wiped everything that process had written -- measured in `shmvis12`, where a parent that
+        // had never mapped its own memfd saw all-zero bytes where the child had just written.
         entry.mapped = true;
         drop(memfds);
-        // The bytes are only needed for the first mapping's one-time sync (below).
-        let current_bytes: alloc::vec::Vec<u8> = if already_mapped {
-            alloc::vec::Vec::new()
-        } else {
-            files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |typed_fd| {
-                        let size = files.fs.fd_file_status(typed_fd).map_or(0, |s| s.size);
-                        let mut buf = alloc::vec![0u8; size];
-                        let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
-                        buf.truncate(n);
-                        buf
-                    },
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                    |_| alloc::vec::Vec::new(),
-                )
-                .unwrap_or_default()
-        };
         drop(files);
-        // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
-        // before ever mmapping (the real Wayland `wl_shm` pattern this bridges: `ftruncate` then
-        // `write()` the pixel data, THEN the peer -- typically a different process/thread, e.g.
-        // the compositor -- `mmap()`s the same fd to read it, see this function's own doc comment
-        // for why an ordinary in-mem file can't support `MAP_SHARED|PROT_WRITE` directly). A
-        // transient, private, exclusively-owned mapping the caller never observes -- copies bytes
-        // in and unmaps immediately, before returning the REAL mapping requested below. Skipped
-        // entirely once `already_mapped`, since the shared object is now the sole source of
-        // truth and re-syncing from the (now-stale) `Vec<u8>` would destroy live content.
-        if !already_mapped
-            && let Some(sync_len) = litebox::mm::linux::NonZeroPageSize::new(aligned_len)
-        {
-            // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
-            // observed this address, so writing into it and unmapping it immediately after is
-            // sound; `handle` itself outlives this transient mapping (owned by `memfds`).
-            if let Ok(ptr) = unsafe {
-                self.process().pm().map_existing_shared_pages(
-                    None,
-                    sync_len,
-                    litebox::mm::linux::CreatePagesFlags::empty(),
-                    handle,
-                )
-            } {
-                let copy_len = current_bytes.len().min(aligned_len);
-                let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
-                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-                let _ = litebox_common_linux::mm::sys_munmap(
-                    &self.process().pm(),
-                    user_ptr,
-                    aligned_len,
-                );
-            }
-        }
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         let create_flags = {
             let mut f = litebox::mm::linux::CreatePagesFlags::empty();

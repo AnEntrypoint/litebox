@@ -1692,13 +1692,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `memfd_create` fd. Registered/updated in `GlobalState::memfds`, keyed by the file's own
     /// `(dev, ino)` (stable across `dup()`/`fork()`, unlike the raw fd number).
     ///
-    /// This handle starts independent of the in-mem file's own `Vec<u8>` bytes that ordinary
-    /// `write()`/`read()` on this same fd still go through (an ordinary regular file has no such
-    /// real shared-memory backing at all -- see `syscalls::mm::try_memfd_mmap`'s own doc comment
-    /// for why memfd needs one in the first place); `try_memfd_mmap` itself is what closes this
-    /// gap, by syncing the file's CURRENT bytes into the real handle at `mmap()` time, so a guest
-    /// that writes pixel bytes via plain `write()` and only later has a peer `mmap()` the same fd
-    /// (the real `wl_shm` pattern this exists to support) observes them correctly.
+    /// This handle is a sized memfd's ONE store, and the in-mem file is only its mirror: the
+    /// object is seeded from the file here (so a `write(2)` made before this `ftruncate` survives)
+    /// and carried across a resize, and from then on `Task::memfd_write_through` /
+    /// `Task::memfd_read_through` keep `write(2)`/`read(2)` on the object rather than on the file.
+    /// The file keeps doing what it always did for `fstat`'s size and the fd's read/write
+    /// position; it is never again copied over the object, since it cannot reflect anyone's
+    /// `mmap`'d writes (see `syscalls::mm::try_memfd_mmap`).
     fn resize_memfd_shared_backing(&self, fd: &TypedFd<FS>, length: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
         let status = files.fs.fd_file_status(fd).map_err(Errno::from)?;
@@ -1751,6 +1751,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     user_ptr,
                     old_len.as_usize(),
                 );
+            }
+        } else if old_entry.is_none() {
+            // No object existed yet, so every byte the guest has written so far lives ONLY in the
+            // in-mem file -- the store `write(2)`/`read(2)` use until one appears. Seed the new
+            // object from those bytes, because from here on the OBJECT is the one store all three
+            // of `read(2)`, `write(2)` and `mmap` share (see `memfd_read_through`): starting from a
+            // fresh zeroed object here would silently discard a `write(2)` that happened before
+            // this `ftruncate`, which is `shmvis9`'s write-then-grow case.
+            let files = self.files.borrow();
+            let size = files.fs.fd_file_status(fd).map_or(0, |s| s.size);
+            if size > 0 {
+                let mut buf = alloc::vec![0u8; size];
+                let n = files.fs.read(fd, &mut buf, Some(0)).unwrap_or(0);
+                buf.truncate(n);
+                carry_bytes = buf;
             }
         }
 
@@ -1820,6 +1835,178 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
         );
         Ok(())
+    }
+
+    /// `(dev, ino)` identity of the file behind `raw_fd`, the key every shared-memory registry in
+    /// this shim is keyed by. `None` for any fd that is not a live `FS`-subsystem fd.
+    fn memfd_key_for_raw_fd(&self, raw_fd: usize) -> Option<(usize, usize)> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    Some((status.node_info.dev, status.node_info.ino))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Whether any fd in this process has a memfd backing object registered, so the `write(2)`
+    /// path can skip the lookup entirely in the overwhelmingly common case -- the same gate
+    /// [`Self::has_shared_file_mappings`] already is for the `shared_files` registry.
+    pub(crate) fn has_memfd_backings(&self) -> bool {
+        !self.global.memfds.lock().is_empty()
+    }
+
+    /// Mirror `bytes` into the shared-memory object backing the memfd at `raw_fd`, at `start`.
+    ///
+    /// The OBJECT -- not the in-mem file -- is a sized memfd's ONE store: `mmap(MAP_SHARED)`
+    /// reads and writes it directly (`syscalls::mm::try_memfd_mmap`), and it is the only thing a
+    /// `fork` child or an `SCM_RIGHTS` receiver ever sees, since both rebuild the fd from the
+    /// object's NAME (`install_shm_file`), never from this process's private writable layer. A
+    /// `write(2)` that stayed in that layer would therefore be invisible to every other view and
+    /// to every other process, with no errno -- measured in `shmvis10`: an `mmap` write followed
+    /// by `read(2)` returned zeros, and a fork child read a zeroed buffer while the parent still
+    /// read its own bytes back. Writing through here on every successful file write keeps the
+    /// object (and so every other view and process) current; the in-mem file stays a mirror whose
+    /// only remaining jobs are `fstat`'s size and the fd's position.
+    pub(crate) fn memfd_write_through(&self, raw_fd: usize, start: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(key) = self.memfd_key_for_raw_fd(raw_fd) else {
+            return;
+        };
+        let (handle, end) = {
+            let mut memfds = self.global.memfds.lock();
+            match memfds.get_mut(&key) {
+                Some(entry) => {
+                    // The object's size is fixed at creation (see `create_shared_memory`'s own doc
+                    // comment), so a write can reach at most its capacity. Within that, writing
+                    // past the last `ftruncate`d length extends the memfd exactly as on real Linux
+                    // -- a memfd is a file and `write(2)` past EOF grows it -- which is what
+                    // `entry.size` records for later `read(2)`s. Growing past the capacity needs a
+                    // new object and stays `ftruncate`/`fallocate`'s job, as it always has.
+                    let capacity = entry.size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+                    let end = start.saturating_add(bytes.len()).min(capacity);
+                    if start >= end {
+                        return;
+                    }
+                    entry.size = entry.size.max(end);
+                    (entry.handle, end)
+                }
+                None => return,
+            }
+        };
+        let Some(length) =
+            litebox::mm::linux::NonZeroPageSize::new(end.next_multiple_of(PAGE_SIZE))
+        else {
+            return;
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, written and unmapped here; no
+        // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
+        // this transient mapping.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let _ = ptr.write_slice_at_offset(start as isize, &bytes[..end - start]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(
+                &self.process().pm(),
+                user_ptr,
+                end.next_multiple_of(PAGE_SIZE),
+            );
+        }
+    }
+
+    /// Read a memfd's bytes from its shared-memory object -- the ONE store -- rather than from the
+    /// per-process in-mem file. Returns `None` when `raw_fd` has no registered backing object (an
+    /// unsized memfd, or an ordinary file), so the caller falls through to the ordinary file read.
+    ///
+    /// The read half of [`Self::memfd_write_through`], needed for the same reason: a `write(2)`
+    /// and an `mmap` write must be the same bytes to `read(2)` as to each other, and a `fork`
+    /// child / `SCM_RIGHTS` receiver -- whose fd is rebuilt from the object, never from this
+    /// process's file -- must see them too. Answering from the in-mem file would read a store the
+    /// mmapper's writes never reach, which is `shmvis10`'s `mmap`-write-then-`read(2)` zeros and
+    /// its zeroed child buffer.
+    fn memfd_read_through(
+        &self,
+        key: (usize, usize),
+        raw_fd: usize,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Option<Result<usize, Errno>> {
+        let (handle, size) = {
+            let memfds = self.global.memfds.lock();
+            match memfds.get(&key) {
+                Some(entry) => (entry.handle, entry.size),
+                None => return None,
+            }
+        };
+        // `read(2)` with no explicit offset reads at the fd's own current position; the shared
+        // object carries no position of its own, so ask the file for it. A pure query -- it moves
+        // nothing, and the caller advances the position by what was actually read.
+        let start = match offset {
+            Some(explicit) => explicit,
+            None => i32::try_from(raw_fd)
+                .ok()
+                .and_then(|raw| self.sys_lseek(raw, 0, SeekWhence::RelativeToCurrentOffset).ok())
+                .unwrap_or(0),
+        };
+        // Past the memfd's length is EOF, exactly as for a read of a real file.
+        let n = buf.len().min(size.saturating_sub(start));
+        if n == 0 {
+            return Some(Ok(0));
+        }
+        let mapped_len = (start + n).next_multiple_of(PAGE_SIZE);
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(mapped_len) else {
+            return None;
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, read and unmapped here; no
+        // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
+        // this transient mapping.
+        let ptr = match unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            Ok(ptr) => ptr,
+            // Fall through to the ordinary file read rather than failing a read the fd can still
+            // serve from its own bytes.
+            Err(_) => return None,
+        };
+        let mut read = 0usize;
+        for (i, slot) in buf[..n].iter_mut().enumerate() {
+            match ptr.read_at_offset(isize::try_from(start + i).unwrap_or(isize::MAX)) {
+                Some(v) => {
+                    *slot = v;
+                    read += 1;
+                }
+                None => break,
+            }
+        }
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, mapped_len);
+        Some(Ok(read))
     }
 
     /// `(host-wide object name, size, open flags)` of a `memfd_create`/`/dev/shm` fd whose shared
@@ -2487,6 +2674,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+        // Resolve the raw fd number once: `run_on_raw_fd`'s closures take a `TypedFd` named `fd`
+        // too, and the memfd read hook below needs the NUMBER, not the typed handle.
+        let raw_fd_num = fd as usize;
         let n = files
             .run_on_raw_fd(
                 fd as usize,
@@ -2572,6 +2762,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let n = event_bytes.len().min(out.len());
                         out[..n].copy_from_slice(&event_bytes[..n]);
                         return Ok(n);
+                    }
+                    // A memfd whose backing object exists reads from THAT, not from the in-mem
+                    // file -- the object is the one store `read(2)`, `write(2)` and `mmap` share,
+                    // and the only one a fork child / SCM_RIGHTS receiver ever sees (see
+                    // `memfd_read_through`). `None` means "not a backed memfd": fall through to
+                    // the ordinary file read below.
+                    let key = files
+                        .fs
+                        .fd_file_status(fd)
+                        .ok()
+                        .map(|s| (s.node_info.dev, s.node_info.ino));
+                    if let Some(key) = key
+                        && let Some(result) =
+                            self.memfd_read_through(key, raw_fd_num, &mut buf.borrow_mut(), offset)
+                    {
+                        // `read(2)` (no explicit offset) advances the fd's position by what it
+                        // got; `pread(2)` deliberately does not.
+                        if offset.is_none()
+                            && let Ok(n) = result
+                            && n > 0
+                            && let Ok(raw) = i32::try_from(raw_fd_num)
+                        {
+                            let _ = self.sys_lseek(
+                                raw,
+                                isize::try_from(n).unwrap_or(0),
+                                SeekWhence::RelativeToCurrentOffset,
+                            );
+                        }
+                        return result;
                     }
                     files
                         .fs
@@ -2934,7 +3153,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if let Ok(n) = res
             && n > 0
-            && self.has_shared_file_mappings()
+            && (self.has_shared_file_mappings() || self.has_memfd_backings())
         {
             let start = match offset {
                 Some(explicit) => Some(explicit),
@@ -2945,6 +3164,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             if let Some(start) = start {
                 self.shared_file_write_through(raw_fd, start, &buf[..n]);
+                // A sized memfd's object is its ONE store, so this write has to reach it too --
+                // otherwise `mmap`, and every other host process holding this memfd, never see it
+                // (see `memfd_write_through`).
+                self.memfd_write_through(raw_fd, start, &buf[..n]);
             }
         }
         if let Ok(n) = res
