@@ -2554,6 +2554,8 @@ pub fn spawn_process_fork_child(
     // investigation; for a lazy-fork-commit bug specifically, prefer unperturbed logging over this
     // diagnostic where possible, since even a correctly-passed-through exception still costs real
     // wall-clock time this mechanism's own timing-sensitive bugs may be exposed by.
+    static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
     let external_debugger_skip: u32 =
         std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
             .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
@@ -4626,6 +4628,7 @@ fn copy_one_group_with_shared(
     // boundary and both non-granularity-sized views succeed. Requiring 64KB alignment there is
     // what made every real group holding an odd-sized shared region uncarriable, which is the
     // whole regression -- a shared range is always page-aligned because it is an mmap.
+    const PAGE_SIZE: usize = 4096;
     if segments
         .iter()
         .any(|(segment, _)| segment.start % PAGE_SIZE != 0)
@@ -4766,6 +4769,56 @@ fn copy_one_group_with_shared(
                 let mapped = unsafe {
                     MapViewOfFile3(
                         section as *mut c_void,
+                // Widest first: a view can never exceed the section's protection ceiling, so the
+                // narrow retries are what a file-backed section whose ceiling fell back to
+                // `PAGE_READWRITE` needs. The child narrows to the mapping's real permissions
+                // itself, from the `VmFlags` the carry also brings across.
+                let mut view = 0usize;
+                for protection in [PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY] {
+                    let mapped = unsafe {
+                        MapViewOfFile3(
+                            section as *mut c_void,
+                            child,
+                            segment.start as *mut c_void,
+                            0,
+                            segment.len(),
+                            PLACEHOLDER_REPLACE,
+                            protection,
+                            core::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                    if !mapped.Value.is_null() {
+                        view = mapped.Value as usize;
+                        break;
+                    }
+                }
+                if view == 0 {
+                    let err = unsafe { GetLastError() };
+                    if diag {
+                        eprintln!(
+                            "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
+                            source_group.start,
+                            source_group.end,
+                            segment.start,
+                            segment.end,
+                            carry.name.as_str(),
+                            err
+                        );
+                    }
+                    cleanup();
+                    return Err(err);
+                }
+                if view != segment.start {
+                    // Should be unreachable: `MEM_REPLACE_PLACEHOLDER` with an explicit base
+                    // either replaces exactly that placeholder or fails.
+                    cleanup();
+                    return Err(0);
+                }
+            }
+            None => {
+                let placed = unsafe {
+                    windows_sys::Win32::System::Memory::VirtualAlloc2(
                         child,
                         segment.start as *mut c_void,
                         0,
