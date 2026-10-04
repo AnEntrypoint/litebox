@@ -131,6 +131,16 @@ impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, P
         }
     }
 
+    /// Whether anything is registered for this subject's events right now.
+    ///
+    /// Deliberately the loose answer: `nums` still counts observers whose owner is gone but has
+    /// not been pruned yet, so this can over-report. Every caller uses it only to decide whether
+    /// delivering something to this subject is worth it, and over-reporting leaves the behaviour
+    /// that predates the check in place.
+    pub fn has_observers(&self) -> bool {
+        self.nums.load(Ordering::Relaxed) != 0
+    }
+
     /// Notify all observers of the given events.
     pub fn notify_observers(&self, events: E) {
         if self.nums.load(Ordering::Relaxed) == 0 {

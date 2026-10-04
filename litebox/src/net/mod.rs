@@ -160,6 +160,16 @@ where
     /// `LocalPortAllocator::refcount` doc comment covers the identical bug class, found and fixed
     /// the same pass; `queued_for_closure` above got the same fix, twenty-eighth pass).
     closing_in_background: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    /// Smoltcp sockets that have a referent in ANOTHER process of the cross-process-fork family
+    /// (recorded by [`Self::fork_adopt`]'s borrowed arms, which hand out exactly such second
+    /// referents). Fixed, pointer-free and `MAX_SOCKETS`-sized for the same reason as
+    /// `closing_in_background` just above.
+    ///
+    /// Set once per socket and never cleared: a mark means "some process other than the one that
+    /// created this socket may be the one reading it", which stays true for as long as the socket
+    /// is reachable, and a stale mark (a slot reused after a close) only costs an extra pull,
+    /// never a lost byte -- see [`Self::drain_socket_channel_buffers`].
+    shared_across_fork: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -226,6 +236,7 @@ where
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: core::array::from_fn(|_| None),
             closing_in_background: [None; MAX_SOCKETS],
+            shared_across_fork: [None; MAX_SOCKETS],
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -1035,6 +1046,24 @@ where
         }
     }
 
+    /// Record that `handle` is reachable from another process of the fork family as well (a
+    /// `fork_adopt` borrowed arm just handed out such a second referent).
+    fn mark_shared_across_fork(&mut self, handle: smoltcp::iface::SocketHandle) {
+        if self.is_shared_across_fork(handle) {
+            return;
+        }
+        if let Some(slot) = self.shared_across_fork.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(handle);
+        }
+    }
+
+    /// Whether `handle` is reachable from another process of the fork family as well.
+    fn is_shared_across_fork(&self, handle: smoltcp::iface::SocketHandle) -> bool {
+        self.shared_across_fork
+            .iter()
+            .any(|marked| *marked == Some(handle))
+    }
+
     /// Drain all socket channel buffers
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
@@ -1043,7 +1072,13 @@ where
             return;
         };
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
-            Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
+            let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
+            Self::drain_socket_channel_buffers(
+                &mut self.socket_set,
+                &entry.entry,
+                now,
+                shared_across_fork,
+            );
         }
     }
 
@@ -1057,11 +1092,21 @@ where
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
         now: smoltcp::time::Instant,
+        shared_across_fork: bool,
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
             None => return,
         };
+        // A socket another process of the fork family also reads: let this process's proxy know,
+        // so a read here pulls RX for itself instead of waiting for this tick to deliver it.
+        if shared_across_fork {
+            match proxy {
+                NetworkProxy::Stream(channel) => channel.mark_shared_across_fork(),
+                NetworkProxy::Datagram(channel) => channel.mark_shared_across_fork(),
+                NetworkProxy::Raw => {}
+            }
+        }
         // See `Network::socket_set_contains`'s doc comment: a stale handle (this descriptor's
         // own socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
         // elsewhere) has nothing left to drain -- `socket_set.get_mut` would otherwise panic.
@@ -1088,12 +1133,22 @@ where
                     tcp_socket.close();
                 }
 
-                // Drain RX buffer: from smoltcp directly to ring buffer
-                while tcp_socket.can_recv() {
-                    let received = proxy
-                        .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
-                    if received == 0 {
-                        break;
+                // Drain RX buffer: from smoltcp directly to ring buffer.
+                //
+                // NOT done when this socket has a referent in another process of the fork family
+                // and nothing here is waiting on it: a proxy is a PER-PROCESS object, so bytes
+                // this tick hands to a proxy nobody reads are unreachable from the process that
+                // IS reading -- its reader waits forever while the bytes sit in a buffer no poll
+                // ever looks at (measured, `.wfgy/cb11.out`: `it1 PARENT_LEFTOVER b'P1-1'`,
+                // `it4 PARENT_LEFTOVER b'P1-4'`). Such a reader pulls instead
+                // ([`Network::drain_rx_into_proxy`]).
+                if !(shared_across_fork && !proxy.has_observers()) {
+                    while tcp_socket.can_recv() {
+                        let received = proxy
+                            .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
+                        if received == 0 {
+                            break;
+                        }
                     }
                 }
 
@@ -1193,19 +1248,22 @@ where
                     }
                 }
 
-                // Drain RX: receive from smoltcp, push to channel
-                while udp_socket.can_recv() {
-                    let received = udp_proxy.try_recv_datagram_with(|| {
-                        let (data, meta) = udp_socket.recv().ok()?;
-                        let source_addr = match meta.endpoint.addr {
-                            smoltcp::wire::IpAddress::Ipv4(ipv4) => SocketAddr::V4(
-                                core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
-                            ),
-                        };
-                        Some((data.into(), source_addr))
-                    });
-                    if received.is_none() {
-                        break;
+                // Drain RX: receive from smoltcp, push to channel. Same "only for a process that
+                // is actually waiting" rule as the TCP arm above, same reason.
+                if !(shared_across_fork && !udp_proxy.has_observers()) {
+                    while udp_socket.can_recv() {
+                        let received = udp_proxy.try_recv_datagram_with(|| {
+                            let (data, meta) = udp_socket.recv().ok()?;
+                            let source_addr = match meta.endpoint.addr {
+                                smoltcp::wire::IpAddress::Ipv4(ipv4) => SocketAddr::V4(
+                                    core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
+                                ),
+                            };
+                            Some((data.into(), source_addr))
+                        });
+                        if received.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -1214,6 +1272,28 @@ where
             }
             _ => panic!("Mismatched protocol and proxy type"),
         }
+    }
+
+    /// Move `fd`'s socket's RX into this process's proxy right now, whatever the per-tick drain
+    /// would have decided.
+    ///
+    /// The tick hands a fork-family-shared socket's RX only to a proxy somebody is waiting on (see
+    /// [`Self::drain_socket_channel_buffers`]), so a read that is NOT such a wait -- a non-blocking
+    /// read, or one that lost the race against another process's tick -- has to fetch for itself
+    /// rather than report "no data".
+    ///
+    /// Returns `false` when `fd` is not a socket this process has a descriptor for.
+    pub fn drain_rx_into_proxy(&mut self, fd: &SocketFd<Platform>) -> bool {
+        let now = self.now();
+        // Best-effort, same reason as `drain_all_socket_channel_buffers`: `net_lock` is held.
+        let Some(table) = self.litebox.try_descriptor_table() else {
+            return false;
+        };
+        let Some(entry) = table.get_entry(fd) else {
+            return false;
+        };
+        Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now, false);
+        true
     }
 }
 
@@ -1341,6 +1421,21 @@ where
         let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
             return false;
         };
+        // The proxy this process reads from has to know when the socket is shared with another
+        // process of the fork family, because the tick that moves RX out of smoltcp refuses to
+        // deliver to a proxy nobody is waiting on -- a reader then pulls for itself.
+        let shared_across_fork = {
+            let borrowed = table_entry.entry.borrowed;
+            let handle = table_entry.entry.handle;
+            borrowed || self.shared_across_fork.iter().any(|marked| *marked == Some(handle))
+        };
+        if shared_across_fork {
+            match proxy.as_ref() {
+                NetworkProxy::Stream(channel) => channel.mark_shared_across_fork(),
+                NetworkProxy::Datagram(channel) => channel.mark_shared_across_fork(),
+                NetworkProxy::Raw => {}
+            }
+        }
         let socket_handle = &mut table_entry.entry;
         socket_handle.proxy = Some(proxy);
         true
@@ -1451,6 +1546,9 @@ where
                     (socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote))
                         .then_some(handle)
                 })?;
+                // From here on this socket has TWO referents, in two processes, and only the one
+                // that reads it may take its RX (see `drain_socket_channel_buffers`).
+                self.mark_shared_across_fork(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -1524,6 +1622,8 @@ where
                     let endpoint = socket.endpoint();
                     (endpoint.port == lport && v4_to_u32(endpoint.addr) == lip).then_some(handle)
                 })?;
+                // Two referents in two processes from here on: see the TCP arm above.
+                self.mark_shared_across_fork(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -1616,10 +1716,16 @@ where
                         // lives in the shared socket set, so root transmits them -- and the FIN
                         // `close_handle` queues -- even if this process dies the instant
                         // `close()` returns.
+                        let handle = entry.entry.handle;
+                        let shared_across_fork = self
+                            .shared_across_fork
+                            .iter()
+                            .any(|marked| *marked == Some(handle));
                         Self::drain_socket_channel_buffers(
                             &mut self.socket_set,
                             &entry.entry,
                             now,
+                            shared_across_fork,
                         );
                     }
                 }
@@ -2246,7 +2352,13 @@ where
                     {
                         channel.shutdown_write();
                         let now = self.now();
-                        Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
+                        let shared_across_fork = self.is_shared_across_fork(socket_handle.handle);
+                        Self::drain_socket_channel_buffers(
+                            &mut self.socket_set,
+                            socket_handle,
+                            now,
+                            shared_across_fork,
+                        );
                     } else {
                         let pending_in_channel = socket_handle
                             .proxy

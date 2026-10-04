@@ -353,6 +353,11 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
+    /// Set once this socket's smoltcp socket gained a second referent in ANOTHER process of the
+    /// fork family. RX is then only drained into this proxy on demand (see
+    /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
+    shared_across_fork: AtomicBool,
+
     /// Socket error.
     socket_error: SocketAsyncErrorState,
 
@@ -381,6 +386,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             peer_closed: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
+
+            shared_across_fork: AtomicBool::new(false),
 
             socket_error: SocketAsyncErrorState::new(),
 
@@ -525,6 +532,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Check if the socket is writable (has buffer space).
     pub fn is_writable(&self) -> bool {
         self.inner.tx_available.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether this socket's smoltcp socket is also referenced by another process of the fork
+    /// family, in which case a reader has to pull its RX for itself.
+    pub fn is_shared_across_fork(&self) -> bool {
+        self.inner.shared_across_fork.load(Ordering::Acquire)
+    }
+
+    /// Record that this socket's smoltcp socket is also referenced by another process of the fork
+    /// family.
+    pub fn mark_shared_across_fork(&self) {
+        self.inner.shared_across_fork.store(true, Ordering::Release);
+    }
+
+    /// Whether anyone is registered for this socket's events (a blocked read, an `epoll`
+    /// registration).
+    pub fn has_observers(&self) -> bool {
+        self.inner.pollee.has_observers()
     }
 
     /// Shutdown the read side of the socket.
@@ -795,6 +820,11 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// Space available in TX
     tx_space: AtomicUsize,
 
+    /// Set once this socket's smoltcp socket gained a second referent in ANOTHER process of the
+    /// fork family. RX is then only drained into this proxy on demand (see
+    /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
+    shared_across_fork: AtomicBool,
+
     /// Local port the socket is bound to (0 if unbound).
     /// This is set atomically when auto-binding during sendto.
     local_port: AtomicU16,
@@ -830,6 +860,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
 
             rx_count: AtomicUsize::new(0),
             tx_space: AtomicUsize::new(queue_size),
+
+            shared_across_fork: AtomicBool::new(false),
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
@@ -955,6 +987,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Returns 0 if the socket is not yet bound.
     pub fn local_port(&self) -> u16 {
         self.inner.local_port.load(Ordering::Acquire)
+    }
+
+    /// Whether this socket's smoltcp socket is also referenced by another process of the fork
+    /// family, in which case a reader has to pull its RX for itself.
+    pub fn is_shared_across_fork(&self) -> bool {
+        self.inner.shared_across_fork.load(Ordering::Acquire)
+    }
+
+    /// Record that this socket's smoltcp socket is also referenced by another process of the fork
+    /// family.
+    pub fn mark_shared_across_fork(&self) {
+        self.inner.shared_across_fork.store(true, Ordering::Release);
+    }
+
+    /// Whether anyone is registered for this socket's events (a blocked read, an `epoll`
+    /// registration).
+    pub fn has_observers(&self) -> bool {
+        self.inner.pollee.has_observers()
     }
 
     /// Set the local port the socket is bound to.

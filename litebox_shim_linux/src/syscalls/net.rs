@@ -1143,6 +1143,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         }
 
         let proxy = self.get_proxy(fd)?;
+        // A socket another process of the fork family also refers to only gets its RX delivered to
+        // a process that is actually waiting on it (see `Network::drain_socket_channel_buffers`),
+        // so a read here has to fetch for itself instead of trusting the last tick.
+        let pulls_own_rx = match proxy.as_ref() {
+            NetworkProxy::Stream(channel) => channel.is_shared_across_fork(),
+            NetworkProxy::Datagram(channel) => channel.is_shared_across_fork(),
+            NetworkProxy::Raw => false,
+        };
         super::unix::wait_on_events_polling(
                 &cx.with_timeout(timeout),
                 is_nonblock,
@@ -1151,15 +1159,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
-                    Err(ChannelReadError::ReadShutdown) => Ok(0),
-                    Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
-                        Some(err) => Err(TryOpError::Other(err.into())),
-                        None => Ok(0),
-                    },
-                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                || {
+                    if pulls_own_rx {
+                        self.net_lock().drain_rx_into_proxy(fd);
+                    }
+                    match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
+                        Ok(0) => Err(TryOpError::TryAgain),
+                        Ok(n) => Ok(n),
+                        Err(ChannelReadError::ReadShutdown) => Ok(0),
+                        Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
+                            Some(err) => Err(TryOpError::Other(err.into())),
+                            None => Ok(0),
+                        },
+                        Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                    }
                 },
             )
             .map_err(Errno::from)
