@@ -17,7 +17,7 @@ mod net;
 pub mod presentation;
 mod spill;
 pub use spill::prepare_spill_directory;
-use spill::{open_spill_file, spill_directory, write_all_at};
+use spill::{open_spill_file, spill_directory, sysvshm_file_path, write_all_at};
 pub mod process_fork;
 pub mod xproc_sync;
 
@@ -10080,6 +10080,162 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
         }
         Ok(handle as usize)
+    }
+
+    fn create_file_backed_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // A file-backed section is what makes a SysV segment outlive its attachers: the object
+        // `create_named_shared_memory` returns is pagefile-backed, so it (and every byte written
+        // through it) disappears as soon as the last process holding a HANDLE on it exits, while
+        // real Linux keeps a segment until `shmctl(IPC_RMID)`. Two `CreateFileMappingW` calls on
+        // the SAME file, in two unrelated processes, are views of the same bytes, and the bytes
+        // themselves live on disk regardless of who currently has a handle.
+        let Some(path) = sysvshm_file_path(name) else {
+            return Err(SharedMemoryError::UnsupportedByPlatform);
+        };
+        let Some(directory) = path.parent() else {
+            return Err(SharedMemoryError::UnsupportedByPlatform);
+        };
+        if std::fs::create_dir_all(directory).is_err() {
+            litebox_util_log::error!(
+                name:% = name;
+                "diag-shm: sysvshm backing directory could not be created"
+            );
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem as Win32_Storage;
+        // `access_mode` (not `.read()`/`.write()`) because the section's protection CEILING is
+        // decided by the rights this handle carries: `map_shared_memory` maps every shared view
+        // with the widest permissions it could ever need (READ|WRITE|EXEC, so the guest can
+        // `mprotect` a shared mapping executable later), and `MapViewOfFile3` can never grant a
+        // view more than the section was created with. A file opened without `FILE_GENERIC_EXECUTE`
+        // therefore makes `CreateFileMappingW(PAGE_EXECUTE_READWRITE)` fail, and a section created
+        // with only `PAGE_READWRITE` as a fallback answers every such `MapViewOfFile3` with
+        // `ERROR_ACCESS_DENIED` -- which is how this read, as an `shmat` that returns `MAP_FAILED`.
+        // `.read(true)/.write(true)` stay set because `std` validates `.create(true)` against
+        // them before it ever looks at `access_mode`; the explicit `access_mode` below is still
+        // what the kernel actually grants, and it is the one that carries `FILE_GENERIC_EXECUTE`.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .access_mode(
+                Win32_Storage::FILE_GENERIC_READ
+                    | Win32_Storage::FILE_GENERIC_WRITE
+                    | Win32_Storage::FILE_GENERIC_EXECUTE,
+            )
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                litebox_util_log::error!(
+                    name:% = name, size:% = size, err:? = err;
+                    "diag-shm: sysvshm backing file could not be opened"
+                );
+                return Err(SharedMemoryError::OutOfMemory);
+            }
+        };
+        // Size the file to the segment. Idempotent by construction: `size` is the `shmget` size
+        // and never changes for a given `shmid`, so a second process opening an existing file
+        // takes the `current >= size` branch and never disturbs the bytes already in it. Growing
+        // it here is also exactly right for a brand-new segment -- a fresh SysV segment reads as
+        // zeroes, and extending a file zero-fills the new tail.
+        let current = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if current < size as u64 && file.set_len(size as u64).is_err() {
+            litebox_util_log::error!(
+                name:% = name, size:% = size;
+                "diag-shm: sysvshm backing file could not be sized"
+            );
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        // Same session-scoped name as `create_named_shared_memory` builds, so a process that
+        // already holds the object open and one that comes along later agree on it.
+        let section_name = alloc::format!("Local\\{name}");
+        let wide: std::vec::Vec<u16> = section_name
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .collect();
+        let size_u64 = size as u64;
+        // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into
+        // high/low 32-bit halves, not a single 64-bit parameter.
+        #[expect(clippy::cast_possible_truncation)]
+        let (size_high, size_low) = ((size_u64 >> 32) as u32, size_u64 as u32);
+        let mut handle = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                core::ptr::null(),
+                Win32_Memory::PAGE_EXECUTE_READWRITE,
+                size_high,
+                size_low,
+                wide.as_ptr(),
+            )
+        };
+        // Last resort only: the handle above now requests `FILE_GENERIC_EXECUTE` precisely so
+        // this does not happen. Narrowing the ceiling is what makes a later
+        // `MapViewOfFile3(PAGE_EXECUTE_READWRITE)` -- what `map_shared_memory` always asks for --
+        // fail with `ERROR_ACCESS_DENIED`, so it is logged rather than silently degrading into an
+        // `shmat` that returns `MAP_FAILED`.
+        if handle.is_null() {
+            litebox_util_log::error!(
+                name:% = name, size:% = size, win32_err:% = unsafe { GetLastError() };
+                "diag-shm: sysvshm section fell back to a non-executable ceiling"
+            );
+            handle = unsafe {
+                CreateFileMappingW(
+                    file.as_raw_handle(),
+                    core::ptr::null(),
+                    Win32_Memory::PAGE_READWRITE,
+                    size_high,
+                    size_low,
+                    wide.as_ptr(),
+                )
+            };
+        }
+        let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        // The section holds its own reference to the file, so the handle is not needed past this
+        // point (same as `try_allocate_cow_pages`, which closes its file handle immediately after
+        // creating the mapping).
+        drop(file);
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            litebox_util_log::error!(
+                name:% = name, size:% = size, win32_err:% = err;
+                "diag-shm: create_file_backed_named_shared_memory FAILED"
+            );
+            return Err(SharedMemoryError::OutOfMemory);
+        }
+        if diag_mm_enabled() {
+            litebox_util_log::debug!(
+                handle:% = handle as usize, name:% = name, size:% = size, pid:% = std::process::id();
+                "diag-shm: create_file_backed_named_shared_memory"
+            );
+        }
+        Ok(handle as usize)
+    }
+
+    fn delete_file_backed_named_shared_memory(&self, name: &str) -> bool {
+        let Some(path) = sysvshm_file_path(name) else {
+            return false;
+        };
+        // An unlink, not a truncate: Windows keeps the file alive until its last reference goes,
+        // so every mapping already established in any process keeps working and keeps seeing the
+        // same bytes -- exactly `shmctl(IPC_RMID)`'s contract. A failure here (the usual one is
+        // `ERROR_USER_MAPPED_FILE`, an attacher that has not detached yet) is normal and
+        // retryable, not a fault worth surfacing to the guest.
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(_) => {
+                litebox_util_log::debug!(
+                    name:% = name;
+                    "diag-shm: sysvshm backing file still referenced, unlink deferred"
+                );
+                false
+            }
+        }
     }
 
     fn map_shared_memory(

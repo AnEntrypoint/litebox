@@ -354,6 +354,50 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(SharedMemoryError::UnsupportedByPlatform)
     }
 
+    /// Creates, or opens if it already exists, a NAMED shared-memory object of `size` bytes whose
+    /// bytes live in a real host-side FILE rather than in the platform's page file.
+    ///
+    /// [`Self::create_named_shared_memory`]'s object is pagefile-backed on Windows, so its
+    /// lifetime is the lifetime of the HANDLEs anyone holds on it: once the last process holding
+    /// one exits, the object and every byte written through it are gone. Linux SysV semantics are
+    /// the opposite -- a `shmget` segment keeps its contents, its size and its permissions until
+    /// `shmctl(IPC_RMID)`, whether or not anyone currently has it attached -- and real guest
+    /// programs depend on exactly that producer-then-later-consumer shape (X11 MIT-SHM: a client
+    /// creates a segment and hands its id to the X server, a process that was started earlier and
+    /// is not fork-related to the client at all). A file gives that: `CreateFileMappingW` over the
+    /// same host file in two unrelated processes yields views of the same bytes, and the bytes
+    /// outlive every handle.
+    ///
+    /// Every caller passing the same `name` MUST pass the same `size`, exactly as for
+    /// [`Self::create_named_shared_memory`].
+    ///
+    /// Returns [`SharedMemoryError::UnsupportedByPlatform`] where there is no session-scoped
+    /// scratch directory to put the file in; a caller that can tolerate the weaker (handle-
+    /// lifetime) semantics should fall back to [`Self::create_named_shared_memory`] on that error
+    /// rather than failing.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_file_backed_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Deletes the host-side file backing a [`Self::create_file_backed_named_shared_memory`]
+    /// object, so a later create with the same `name` starts from zero bytes again.
+    ///
+    /// This is an unlink, not a truncate: mappings of the object already established in any
+    /// process keep working and keep seeing the same bytes (the host file lives until its last
+    /// reference goes), which is exactly what `shmctl(IPC_RMID)` promises -- it drops the NAME
+    /// while leave existing attachers alone. Returns whether the file is gone. `false` only ever
+    /// means it could not be unlinked right now (a mapping still references it); it is never a
+    /// failure the caller must surface, and the caller retries when the last attacher detaches.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn delete_file_backed_named_shared_memory(&self, name: &str) -> bool {
+        false
+    }
+
     /// Maps `handle` (from [`Self::create_shared_memory`]) into the address space at
     /// `suggested_range`, with the given semantics -- the same request shape as
     /// [`Self::allocate_pages`], since from the caller's perspective this is just another way to
@@ -406,6 +450,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 }
 
 /// Possible errors for [`PageManagementProvider::create_shared_memory`],
+/// [`PageManagementProvider::create_named_shared_memory`],
+/// [`PageManagementProvider::create_file_backed_named_shared_memory`],
 /// [`PageManagementProvider::map_shared_memory`],
 /// [`PageManagementProvider::unmap_shared_memory`], and
 /// [`PageManagementProvider::close_shared_memory`].

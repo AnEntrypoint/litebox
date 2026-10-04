@@ -26,6 +26,24 @@ pub fn open_spill_file(slot: u32) -> Option<File> {
         .ok()
 }
 
+/// Path of the on-disk backing file of the persistent named shared-memory object called `name`
+/// (SysV shm -- see `PageManagementProvider::create_file_backed_named_shared_memory`).
+///
+/// Nested inside the spill directory on purpose, so it inherits that directory's one-per-session
+/// scoping instead of inventing a second one: the runner sets `SPILL_DIRECTORY_ENV_VAR` once at
+/// startup and every cross-process-fork child inherits it, so two guest processes that are NOT
+/// fork-related still resolve the same `name` to the SAME file -- the whole point, since the
+/// alternative (a directory derived from `std::process::id()` in each process) would silently
+/// give each process its own private copy of the segment. `None` when the spill directory is not
+/// configured, which the caller reports as `UnsupportedByPlatform`.
+///
+/// These files are never cleaned up at session teardown, matching the spill directory's own
+/// convention; they are unlinked by `shmctl(IPC_RMID)` (see
+/// `PageManagementProvider::delete_file_backed_named_shared_memory`).
+pub fn sysvshm_file_path(name: &str) -> Option<PathBuf> {
+    spill_directory().map(|directory| directory.join("sysvshm").join(format!("{name}.bin")))
+}
+
 pub fn write_all_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Option<()> {
     while !bytes.is_empty() {
         let written = file.seek_write(bytes, offset).ok()?;

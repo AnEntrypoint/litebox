@@ -9,7 +9,7 @@ use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer, RawMutPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError},
     },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
@@ -166,10 +166,15 @@ impl SysvShmTable {
             .position(|slot| matches!(slot, Some(s) if s.shmid == shmid))
     }
 
+    /// A `shmctl(IPC_RMID)`'d segment no longer answers its key, exactly as on Linux: RMID frees
+    /// the key for a fresh `shmget` immediately, while the segment itself (and its bytes) lives
+    /// on until its last detach. Without this, `shmget(same key)` after an RMID hands back the
+    /// dying segment -- the observed `fresh_after_rmid shmid=1 same=True` -- and a client that
+    /// recreated its buffer after tearing the old one down keeps reading the OLD contents.
     fn index_of_key(&self, key: i32) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|slot| matches!(slot, Some(s) if s.segment.key == key))
+        self.slots.iter().position(|slot| {
+            matches!(slot, Some(s) if s.segment.key == key && !s.segment.removed)
+        })
     }
 
     fn get_mut(&mut self, shmid: i32) -> Option<&mut SysvShmSegment> {
@@ -194,7 +199,65 @@ impl SysvShmTable {
     }
 }
 
+/// Host name of the shared-memory object backing SysV segment `shmid`.
+///
+/// The `shmid` alone is the whole identity, on purpose: `GlobalState::next_shmid` is a
+/// cross-process atomic inside the shared kernel arena (every guest process, fork-related or
+/// not, gets the SAME `GlobalState` -- see its construction inside `create_shared_kernel_state`),
+/// so two processes that never met agree on which object a given `shmid` names. No pid, no
+/// per-process component: adding one would give each process its own private segment, which is
+/// the exact bug this design replaced.
+fn sysv_shm_object_name(shmid: i32) -> alloc::string::String {
+    alloc::format!("litebox_sysvshm_{shmid}")
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Create-or-open the host-side backing store of segment `shmid`, sized to `size`.
+    ///
+    /// This is what makes a real Linux `shmget` segment: the backing store must exist -- and must
+    /// keep every byte written to it -- from `shmget` until `shmctl(IPC_RMID)`, independently of
+    /// whether any process currently has it attached. A pagefile-backed named section cannot do
+    /// that (its lifetime is its HANDLEs': the last process out takes the bytes with it), so this
+    /// asks the platform for a FILE-backed one and treats "no file backing here" as "fall back to
+    /// the old handle-lifetime behaviour" rather than as a failure. Idempotent, so both
+    /// `sys_shmget` and `sys_shmat` call it.
+    fn ensure_sysv_shm_backing(&self, shmid: i32, size: usize) -> Result<(), Errno> {
+        let name = sysv_shm_object_name(shmid);
+        match self
+            .global
+            .platform
+            .create_file_backed_named_shared_memory(&name, size)
+        {
+            Ok(handle) => {
+                // Only the file has to outlive this call, not a HANDLE on it: `shmat` opens the
+                // object again (by name, from the file) in whichever process attaches. Releasing
+                // the handle here keeps `shmget` from leaking one kernel object per segment.
+                let _ = self.global.platform.close_shared_memory(handle);
+                Ok(())
+            }
+            Err(SharedMemoryError::UnsupportedByPlatform) => Ok(()),
+            Err(_) => {
+                litebox_util_log::error!(
+                    shmid:% = shmid, size:% = size;
+                    "sysv shm: backing store could not be created"
+                );
+                Err(Errno::ENOMEM)
+            }
+        }
+    }
+
+    /// Unlink segment `shmid`'s backing store. Best effort, never reported to the guest -- see
+    /// `PageManagementProvider::delete_file_backed_named_shared_memory`: a host that still has
+    /// the file referenced (an attacher that has not detached yet) simply defers the unlink, and
+    /// the last detach retries it.
+    fn release_sysv_shm_backing(&self, shmid: i32) {
+        let name = sysv_shm_object_name(shmid);
+        let _ = self
+            .global
+            .platform
+            .delete_file_backed_named_shared_memory(&name);
+    }
+
     /// `shmget(key, size, shmflg)`.
     ///
     /// System V shared memory was entirely unimplemented, which is what stopped the webtop's
@@ -236,10 +299,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let page = litebox::mm::linux::PAGE_SIZE;
         let rounded = size.checked_next_multiple_of(page).ok_or(Errno::EINVAL)?;
 
-        // No memory is actually created here -- matching real Linux, where `shmget` only
-        // reserves an id/size and the first REAL mapping happens at `shmat` time, in whichever
-        // process calls it (see `SysvShmSegment`'s own doc comment for why this changed: the
-        // previous single-canonical-address design was wrong under cross-process fork).
+        // No ADDRESS is created here -- matching real Linux, where `shmget` only reserves an
+        // id/size and the first REAL mapping happens at `shmat` time, in whichever process calls
+        // it (see `SysvShmSegment`'s own doc comment for why this changed: the previous
+        // single-canonical-address design was wrong under cross-process fork). The segment's
+        // BACKING STORE is created here though: real Linux keeps a segment -- its bytes, its size,
+        // its permissions -- from `shmget` until `shmctl(IPC_RMID)` whether or not anyone ever
+        // attaches, and a producer that `shmget`s, writes and exits must leave those bytes behind
+        // for a consumer that only execs much later.
         let shmid = self
             .global
             .next_shmid
@@ -258,6 +325,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
             )
             .map_err(|_| Errno::ENOMEM)?;
+        // The backing store is created OUTSIDE the table lock: `table` is a cross-process arena
+        // lock and this is host file IO, so it must not be held while this process blocks on the
+        // host (the same rule `perform_network_interaction` was fixed to obey for `net_lock`).
+        drop(table);
+        if let Err(err) = self.ensure_sysv_shm_backing(shmid, rounded) {
+            self.global.sysv_shm.lock().remove(shmid);
+            return Err(err);
+        }
         litebox_util_log::debug!(
             key:% = key, shmid:% = shmid, size:% = rounded;
             "sysv shm: created segment"
@@ -291,6 +366,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(seg) = table.get_mut(shmid) else {
                 return Err(Errno::EINVAL);
             };
+            // Linux refuses new attachments to a segment already marked for destruction, and so
+            // must this: the segment is only still addressable because an EARLIER attacher has
+            // not detached yet, and a fresh attach would keep it alive past its RMID forever.
+            if seg.removed {
+                return Err(Errno::EINVAL);
+            }
             seg.attaches += 1;
             seg.size
         };
@@ -304,10 +385,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the FIRST attacher (almost always the creator's own first `shmat`, since `shmget`
         // itself no longer maps anything -- see `SysvShmSegment`'s doc comment) creates the real
         // object; every later attacher, in any process, opens the SAME one by shmid.
-        let name = alloc::format!("Local\\litebox_sysvshm_{shmid}");
-        let handle = match self.global.platform.create_named_shared_memory(&name, size) {
-            Ok(h) => h,
+        //
+        // FILE-backed where the platform can do it, because the segment has to survive every
+        // process that ever held a handle on it (see `ensure_sysv_shm_backing`); the
+        // pagefile-backed named object is only the fallback for a platform with no scratch
+        // directory, i.e. exactly today's behaviour, never a hard failure.
+        let name = sysv_shm_object_name(shmid);
+        let handle = match self
+            .global
+            .platform
+            .create_file_backed_named_shared_memory(&name, size)
+        {
+            Ok(handle) => handle,
+            Err(SharedMemoryError::UnsupportedByPlatform) => {
+                let section = alloc::format!("Local\\{name}");
+                match self.global.platform.create_named_shared_memory(&section, size) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        rollback_attach();
+                        return Err(Errno::ENOMEM);
+                    }
+                }
+            }
             Err(_) => {
+                litebox_util_log::error!(
+                    shmid:% = shmid, size:% = size;
+                    "sysv shm: backing store could not be opened"
+                );
                 rollback_attach();
                 return Err(Errno::ENOMEM);
             }
@@ -316,9 +420,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             rollback_attach();
             return Err(Errno::EINVAL);
         };
-        // SAFETY: `handle` is a real shared-memory object sized to match `len`; mapping it at a
-        // platform-chosen (non-fixed) address is sound -- no guest code has observed this address
-        // range before this call returns it.
+        // SAFETY: `handle` is a real shared-memory object sized to match `len` -- never shorter,
+        // since both creation paths above are handed the full segment `size`, which is what keeps
+        // the view length within its section (`MapViewOfFile3` answers a too-long view with
+        // win32_err 5, and a requested base that is not 64 KiB-aligned with 1132; `Vmem`'s
+        // `shared_view_base` handles the second). Mapping it at a platform-chosen (non-fixed)
+        // address is sound -- no guest code has observed this address range before this call
+        // returns it.
         let ptr = match unsafe {
             self.process().pm().map_existing_shared_pages(
                 None,
@@ -366,6 +474,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if drop_now {
             table.remove(shmid);
         }
+        // Drop the cross-process arena lock before the host file IO below.
+        drop(table);
+        // Last detach of a removed segment: nothing references the backing store any more, so
+        // this is the point where it can actually be unlinked.
+        if drop_now {
+            self.release_sysv_shm_backing(shmid);
+        }
         Ok(0)
     }
 
@@ -394,12 +509,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if drop_now {
                     table.remove(shmid);
                 }
+                // Drop the cross-process arena lock before the host file IO below.
+                drop(table);
+                // Real Linux drops the segment here but keeps the memory alive until the last
+                // detach, and so does the backing store: the unlink only removes the NAME, so an
+                // attacher's mapping still works. When nobody is attached there is nothing left to
+                // keep it for; when someone is, the last `shmdt` unlinks it instead -- deliberately
+                // NOT unlinked while `attaches > 0`, because a later attacher would then re-create
+                // the file empty and silently get zeros, which is the very bug this fixes.
+                if drop_now {
+                    self.release_sysv_shm_backing(shmid);
+                }
                 Ok(0)
             }
             IPC_STAT => {
                 // `struct shmid_ds` on x86-64: a 48-byte `ipc_perm` followed by `shm_segsz`.
-                // Only the size is meaningfully knowable here; the rest is zeroed rather than
-                // fabricated.
+                // Only the size and the attach count are meaningfully knowable here; the
+                // timestamps and pids are zeroed rather than fabricated.
                 let Some(buf) = buf else {
                     return Err(Errno::EFAULT);
                 };
@@ -422,6 +548,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 for (i, b) in size.to_le_bytes().iter().enumerate() {
                     let off = 48isize + isize::try_from(i).unwrap();
+                    let _ = buf.write_at_offset::<Platform>(off, *b);
+                }
+                // `shm_nattch` (`unsigned long`, offset 88): past `shm_segsz` (48) and the three
+                // `shm_{a,d,c}time` timestamps (56/64/72) and the two pids (80/84). Cheap and
+                // real -- `attaches` is the live cross-process attach count -- so report it rather
+                // than leaving a field every MIT-SHM caller can see as zero.
+                let nattch = u64::try_from(seg.attaches).unwrap_or(u64::MAX);
+                for (i, b) in nattch.to_le_bytes().iter().enumerate() {
+                    let off = 88isize + isize::try_from(i).unwrap();
                     let _ = buf.write_at_offset::<Platform>(off, *b);
                 }
                 Ok(0)
