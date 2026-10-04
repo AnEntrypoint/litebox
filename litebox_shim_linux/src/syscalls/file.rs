@@ -1881,38 +1881,109 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// read its own bytes back. Writing through here on every successful file write keeps the
     /// object (and so every other view and process) current; the in-mem file stays a mirror whose
     /// only remaining jobs are `fstat`'s size and the fd's position.
-    pub(crate) fn memfd_write_through(&self, raw_fd: usize, start: usize, bytes: &[u8]) {
+    ///
+    /// `Ok(())` when the bytes reached the object (or the fd has no backing object at all, so the
+    /// in-mem file is legitimately the only store); `Err` when they could not be, which the caller
+    /// must surface rather than swallow -- a `write(2)` that reports success while its bytes exist
+    /// only in this process's private file is the silent divergence this whole path exists to
+    /// prevent.
+    ///
+    /// A `write(2)` past EOF GROWS a memfd on real Linux (a memfd is a shmem-backed FILE, not a
+    /// fixed-size buffer), and this object is its ONE store, so a write that would run past the
+    /// object's page-rounded capacity grows the store here instead of being clipped to it. A
+    /// Windows file mapping's size is fixed at creation (see `create_shared_memory`'s own doc
+    /// comment), so growing means a NEW object seeded from the old one -- exactly the
+    /// `resize_memfd_shared_backing` path `ftruncate`/`fallocate` growth already uses. Leaving the
+    /// tail clipped (the previous behaviour) put those bytes in the in-mem file alone, where
+    /// `mmap(MAP_SHARED)`, a fork child and an `SCM_RIGHTS` receiver never see them: `write` 1MB
+    /// into a memfd last `ftruncate`d to 0 reported 1MB and grew `fstat`'s size, while `read(2)`
+    /// -- which answers from the object -- returned one page.
+    ///
+    /// KNOWN LIMITATION, not papered over: the grown store is a NEW object, so a `MAP_SHARED`
+    /// mapping established BEFORE the growth still points at the old one and silently diverges
+    /// from `read(2)`/`write(2)` afterwards. That is pre-existing and not specific to this path --
+    /// `ftruncate`-growth has always replaced the object the same way -- and closing it needs the
+    /// mmapper to re-map, which nothing here can force.
+    pub(crate) fn memfd_write_through(
+        &self,
+        raw_fd: usize,
+        start: usize,
+        bytes: &[u8],
+    ) -> Result<(), Errno> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(key) = self.memfd_key_for_raw_fd(raw_fd) else {
-            return;
+            return Ok(());
         };
+        // Real Linux: `size = max(old size, start + n)`. `start` is where this write actually
+        // landed (the caller derived it from the post-write position), so this is exact for
+        // `write(2)`, `pwrite(2)` and an `O_APPEND` fd alike -- unlike any start guessed before
+        // the write, which would have to second-guess append mode.
+        let needed_end = start.checked_add(bytes.len()).ok_or(Errno::EFBIG)?;
+        let grow_to = {
+            let memfds = self.global.memfds.lock();
+            match memfds.get(&key) {
+                // No backing object at all (an unsized memfd): the in-mem file IS this fd's only
+                // store and `shared_files` covers any later `mmap`, so there is nothing to grow.
+                None => return Ok(()),
+                Some(entry) => {
+                    // The object was created at `size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE)`
+                    // and `entry.size` only ever grows up to that, so this is its real capacity.
+                    let capacity = entry.size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+                    (needed_end > capacity).then_some(needed_end)
+                }
+            }
+        };
+        if let Some(new_len) = grow_to {
+            // `usize::next_multiple_of` panics on overflow and `resize_memfd_shared_backing`
+            // rounds with it, so refuse the absurd size here -- guest-reachable code returns an
+            // errno, never a panic, and the host process is the whole guest session.
+            if new_len > usize::MAX - PAGE_SIZE {
+                return Err(Errno::EFBIG);
+            }
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| self.resize_memfd_shared_backing(fd, new_len),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                )
+                .flatten()?;
+        }
         let (handle, end) = {
             let mut memfds = self.global.memfds.lock();
             match memfds.get_mut(&key) {
                 Some(entry) => {
                     // The object's size is fixed at creation (see `create_shared_memory`'s own doc
-                    // comment), so a write can reach at most its capacity. Within that, writing
-                    // past the last `ftruncate`d length extends the memfd exactly as on real Linux
-                    // -- a memfd is a file and `write(2)` past EOF grows it -- which is what
-                    // `entry.size` records for later `read(2)`s. Growing past the capacity needs a
-                    // new object and stays `ftruncate`/`fallocate`'s job, as it always has.
+                    // comment), so a write can reach at most its capacity -- which the growth
+                    // above just made at least `needed_end`. Within that, writing past the last
+                    // `ftruncate`d length extends the memfd exactly as on real Linux -- a memfd is
+                    // a file and `write(2)` past EOF grows it -- which is what `entry.size`
+                    // records for later `read(2)`s.
                     let capacity = entry.size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
                     let end = start.saturating_add(bytes.len()).min(capacity);
                     if start >= end {
-                        return;
+                        return Ok(());
                     }
                     entry.size = entry.size.max(end);
                     (entry.handle, end)
                 }
-                None => return,
+                None => return Ok(()),
             }
         };
         let Some(length) =
             litebox::mm::linux::NonZeroPageSize::new(end.next_multiple_of(PAGE_SIZE))
         else {
-            return;
+            return Ok(());
         };
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, written and unmapped here; no
         // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
@@ -1933,6 +2004,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 end.next_multiple_of(PAGE_SIZE),
             );
         }
+        Ok(())
     }
 
     /// Read a memfd's bytes from its shared-memory object -- the ONE store -- rather than from the
@@ -3166,8 +3238,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.shared_file_write_through(raw_fd, start, &buf[..n]);
                 // A sized memfd's object is its ONE store, so this write has to reach it too --
                 // otherwise `mmap`, and every other host process holding this memfd, never see it
-                // (see `memfd_write_through`).
-                self.memfd_write_through(raw_fd, start, &buf[..n]);
+                // (see `memfd_write_through`). Its `Err` is propagated rather than ignored: the
+                // bytes are already in this process's in-mem file, but that file is the store
+                // `mmap`/a fork child/an `SCM_RIGHTS` receiver never read, so reporting success
+                // here is precisely the silent two-store divergence this path exists to prevent.
+                // It only fails when the backing object could not be grown (ENOMEM), i.e. a host
+                // condition, not a guest-reachable panic.
+                self.memfd_write_through(raw_fd, start, &buf[..n])?;
             }
         }
         if let Ok(n) = res
