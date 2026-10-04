@@ -1713,9 +1713,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         const MIN_SHARED_LEN: usize = 256 * 1024;
+        // `PROT_NONE` is a RESERVATION the guest `mprotect`s into use later -- that is the
+        // dynamic loader's own shape -- so it must not be pinned to this function's
+        // permanently-read-only shared view. That view carries no `VM_MAYWRITE`, so the later
+        // `mprotect(PROT_READ|PROT_WRITE)` is refused with EACCES where Linux always lets a
+        // private file mapping become writable, and it also hands the guest read access it
+        // never asked for. Measured (`.wfgy/cb45.sh`): `mmap(PROT_NONE)` on an 8 MiB regular
+        // file followed by `mprotect(PROT_READ|PROT_WRITE)` returns EACCES in the parent and in
+        // a cross-process fork child alike (arm F2, `vma_flags_bits=89` = `VM_READ|VM_SHARED|
+        // VM_MAYREAD|VM_MAYEXEC`), while arm F1 -- the same file mapped RW and round-tripped
+        // through `PROT_NONE` and back -- succeeds.
         if flags.contains(MapFlags::MAP_ANONYMOUS)
             || flags.contains(MapFlags::MAP_SHARED)
             || prot.intersects(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC)
+            || prot.is_empty()
             || offset != 0
             || align_up(len, PAGE_SIZE) < MIN_SHARED_LEN
         {
