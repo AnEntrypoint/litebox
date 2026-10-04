@@ -20,7 +20,7 @@
 //! sequence issues against it, and none of the accepted calls (`VT_SETMODE`, `KDSKBMODE`,
 //! `KDSETMODE`) have any real switching/keyboard-mode/graphics-mode effect to perform -- they
 //! succeed because the state they would otherwise change does not exist for this device to get
-//! wrong, mirroring how `DriDevices`/`DrmSubsystem` (`drm.rs`) emulate a DRM device with no real
+//! wrong, mirroring how `DriDevices`/`SharedDrmTable` (`drm.rs`) emulate a DRM device with no real
 //! GPU behind it. `VT_ACTIVATE`/`VT_WAITACTIVE` and the rest of the real kernel's `VT_*` surface
 //! are deliberately NOT implemented: they are not on `seatd`'s single-seat call path (confirmed
 //! by reading `seatd`'s real source directly, not guessed).

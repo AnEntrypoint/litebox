@@ -209,7 +209,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             EpollDescriptor::File(file) => {
                 // An evdev fd (tagged at `open()` time, see `syscalls::file::EvdevFd`'s doc
                 // comment for why this metadata check exists) reports `Events::IN` exactly when
-                // `EvdevSubsystem` actually has a queued event -- checked BEFORE the `StdioStream`
+                // `SharedEvdevTable` actually has a queued event -- checked BEFORE the `StdioStream`
                 // match below (an evdev fd carries no `StdioStream` tag, so it would otherwise
                 // fall into that match's `Err(_)` arm and be reported permanently unreadable,
                 // exactly as confirmed live: a guest's `select()`/`poll()` loop waiting on
@@ -221,7 +221,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     .is_ok()
                 {
                     if let Some(observer) = observer {
-                        global.evdev.register_observer(observer);
+                        global
+                            .evdev_pollee_local
+                            .register_observer(observer, Events::IN);
                     }
                     let events = if global.evdev.has_pending() {
                         Events::IN
@@ -231,8 +233,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     return Some(events & mask);
                 }
                 // See `DriFd`'s own doc comment for why this check exists -- identical structural
-                // shape to the `EvdevFd` check just above, for `DrmSubsystem::pending_flip_events`
-                // instead of `EvdevSubsystem`'s own queue.
+                // shape to the `EvdevFd` check just above, for the shared flip-event ring
+                // (`SharedDrmTable::has_pending_flip_events`) instead of `SharedEvdevTable`'s own
+                // queue.
                 if global
                     .litebox
                     .descriptor_table()
@@ -240,7 +243,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     .is_ok()
                 {
                     if let Some(observer) = observer {
-                        global.drm.register_flip_observer(observer);
+                        global.drm_flip_local.register_flip_observer(observer);
                     }
                     let events = if global.drm.has_pending_flip_events() {
                         Events::IN
@@ -1146,7 +1149,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         // message for the repro).
         //
         // An evdev fd (`/dev/input/event0`) has the exact same shape as stdin here: its `poll()`
-        // arm above answers from `EvdevSubsystem::has_pending()` but never registers a real
+        // arm above answers from `SharedEvdevTable::has_pending()` but never registers a real
         // `Observer` (there is no OS-level async notification for "host pushed an input event" this
         // codebase's `Waker` machinery can hook into, same as stdin's console-input case) -- so
         // without joining this same bounded-repoll path, a `select()`/`poll()` waiting solely on
@@ -1192,7 +1195,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
             // notification this codebase's `Waker`/`Observer` machinery can hook into for "new
             // console input arrived" or "host pushed an input event". Bound this iteration's sleep
             // to a short repoll interval so the loop comes back around and re-checks
-            // `stdin_ready()`/`EvdevSubsystem::has_pending()` on a short cadence instead of
+            // `stdin_ready()`/`SharedEvdevTable::has_pending()` on a short cadence instead of
             // sleeping on a condvar that would otherwise never be signaled. `with_timeout` composes
             // with (takes the min of) any caller-supplied deadline, so the caller's real timeout
             // still fires on schedule instead of being silently overridden.
