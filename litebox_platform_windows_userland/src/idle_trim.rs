@@ -23,11 +23,23 @@ const FILETIME_UNITS_PER_SECOND: u64 = 10_000_000;
 static START: Once = Once::new();
 
 fn cpu_units() -> u64 {
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: querying the calling process's own times.
-    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
-    let join = |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    let join =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
     join(kernel) + join(user)
 }
 
@@ -53,7 +65,8 @@ pub(crate) fn start() {
                     let now = cpu_units();
                     let used = now.saturating_sub(last);
                     last = now;
-                    let budget = CHECK_INTERVAL.as_secs() * FILETIME_UNITS_PER_SECOND
+                    let budget = CHECK_INTERVAL.as_secs()
+                        * FILETIME_UNITS_PER_SECOND
                         * IDLE_CPU_PERCENT_TENTHS
                         / 1000;
                     if std::env::var_os("LITEBOX_DIAG_IDLE_TRIM").is_some() {

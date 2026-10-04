@@ -8,11 +8,13 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod ctxwatch;
-mod idle_trim;
 mod fork_verify;
+mod idle_trim;
 mod lazy_file_map;
 pub mod lazy_fork_commit;
-pub use lazy_file_map::{adopt_from_file as adopt_inherited_lazy_file_maps, register_source as register_lazy_file_source};
+pub use lazy_file_map::{
+    adopt_from_file as adopt_inherited_lazy_file_maps, register_source as register_lazy_file_source,
+};
 mod net;
 pub mod presentation;
 mod spill;
@@ -37,9 +39,9 @@ use litebox::platform::page_mgmt::{
     AllocationError, CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
     SharedMemoryError, SharedMemoryName, SharedObjectKind, SharedRegionCarry,
 };
-use std::fmt::Write as _;
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
+use std::fmt::Write as _;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -1078,9 +1080,15 @@ unsafe extern "system" fn vectored_exception_handler(
         // gate below so it can independently confirm whether that gate itself is the reason the
         // main diagnostic below stays silent for this exception class.
         if raw_exception_code == Win32_Foundation::EXCEPTION_BREAKPOINT {
-            diag_raw_print(b"[diag-bp-entry] rip=0x", rip as usize, b" rsp=0x", rsp as usize);
+            diag_raw_print(
+                b"[diag-bp-entry] rip=0x",
+                rip as usize,
+                b" rsp=0x",
+                rsp as usize,
+            );
             for slot in 0..192usize {
-                let value = unsafe { core::ptr::read_unaligned((rsp as usize + slot * 8) as *const usize) };
+                let value =
+                    unsafe { core::ptr::read_unaligned((rsp as usize + slot * 8) as *const usize) };
                 if (0x1_0000_0000..0x1_4000_0000).contains(&value) {
                     diag_raw_print(b"[diag-bp-stack] slot=0x", slot, b" value=0x", value);
                 }
@@ -1088,9 +1096,19 @@ unsafe extern "system" fn vectored_exception_handler(
         }
         if is_ud_fault {
             let tid0 = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-            diag_raw_print(b"[diag-ud-entry] tid=0x", tid0 as usize, b" rip=0x", rip as usize);
+            diag_raw_print(
+                b"[diag-ud-entry] tid=0x",
+                tid0 as usize,
+                b" rip=0x",
+                rip as usize,
+            );
             let insn_bytes = unsafe { core::ptr::read_unaligned(rip as *const u64) };
-            diag_raw_print(b"[diag-ud-entry]   insn_bytes=0x", insn_bytes as usize, b" rip=0x", rip as usize);
+            diag_raw_print(
+                b"[diag-ud-entry]   insn_bytes=0x",
+                insn_bytes as usize,
+                b" rip=0x",
+                rip as usize,
+            );
             // Encode the tri-state as 0/1/2 (not `this_is_in_guest as usize`'s collapsed 0/1):
             // 2 means "no TLS slot -- could not determine", never conflated with a confirmed 0.
             diag_raw_print(
@@ -2318,12 +2336,12 @@ unsafe extern "system" fn vectored_exception_handler(
                         // unconditional-terminate path below.
                         FAULT_TERMINATE_ARMED_TICK.fetch_add(1, Ordering::SeqCst);
                         process_fork::mark_fault_terminate_armed();
-            // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
-            // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
-            // block, so if it never returns the watchdog still terminates -- the dump attempt
-            // cannot turn a crash into a hang. See `write_crash_minidump` for why this uses the
-            // native API rather than a crate, and what it deliberately does not capture.
-            write_crash_minidump(exception_info);
+                        // Capture a real minidump now that the watchdog is standing by. Deliberately AFTER the
+                        // arm, never before: `MiniDumpWriteDump` walks every thread in the process and can
+                        // block, so if it never returns the watchdog still terminates -- the dump attempt
+                        // cannot turn a crash into a hang. See `write_crash_minidump` for why this uses the
+                        // native API rather than a crate, and what it deliberately does not capture.
+                        write_crash_minidump(exception_info);
                         unsafe {
                             windows_sys::Win32::System::Threading::TerminateProcess(
                                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -2892,8 +2910,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 Some((prev_rip, count)) if prev_rip == rip => count + 1,
                 _ => 1,
             };
-            tls.fork_verify_av_data_repeat
-                .set(Some((rip, occurrences)));
+            tls.fork_verify_av_data_repeat.set(Some((rip, occurrences)));
             if occurrences <= 2 || occurrences % AV_HEAL_LOG_SAMPLE_STRIDE as u64 == 0 {
                 litebox_util_log::warn!(
                     host_pid:? = std::process::id(),
@@ -3706,9 +3723,15 @@ fn run_thread_inner(
     // thread, every `clone()`-spawned one, every cross-process fork child) -- one shared
     // registration point rather than needing a separate hook per thread-creation path.
     #[cfg(target_arch = "x86_64")]
-    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.rsp);
+    ALL_THREAD_STACK_RSPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ctx.rsp);
     #[cfg(target_arch = "aarch64")]
-    ALL_THREAD_STACK_RSPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ctx.sp);
+    ALL_THREAD_STACK_RSPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ctx.sp);
 
     // Diagnostic only (LITEBOX_DIAG_TLS_ADDR): print this thread's own TlsState address to check
     // for cross-thread TlsState address collisions -- see AGENTS.md's "DEFINITIVE (4th pass)"
@@ -4824,7 +4847,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
-
         // Guest code (both a brand-new thread's entry point and a `fork()` child resuming via
         // `ThreadInitState::ForkedChild`) runs directly on this real Windows thread's own stack --
         // there is no separate emulated guest-stack region (see `switch_to_guest`'s doc comment).
@@ -6480,7 +6502,9 @@ impl ThreadHandle {
             // Case 1: jump to interrupt callback without saving the guest
             // context, since it's already saved.
             true
-        } else if is_in_ntdll_or_this(context.Rip.trunc()) || !rip_in_guest_range(context.Rip.trunc()) {
+        } else if is_in_ntdll_or_this(context.Rip.trunc())
+            || !rip_in_guest_range(context.Rip.trunc())
+        {
             // Case 2/3: we can't distinguish between them. For case 2 we don't
             // need to do anything, but for case 3 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
@@ -7333,10 +7357,13 @@ impl RawMutex {
                     // a LOST WAKEUP in the event hand-off; `true` means nobody ever woke us, so
                     // the state this waiter is waiting for (`inner != val`) is genuinely not
                     // changing -- a lock holder that never releases, or an orphaned lock.
-                    if diag_lockstall && idle_chunks % 15 == 0 && (idle_chunks / 15).is_power_of_two()
+                    if diag_lockstall
+                        && idle_chunks % 15 == 0
+                        && (idle_chunks / 15).is_power_of_two()
                     {
-                        let (queued, occupied) =
-                            self.waiters.with_lock(|queue| queue.queue_state_locked(record));
+                        let (queued, occupied) = self
+                            .waiters
+                            .with_lock(|queue| queue.queue_state_locked(record));
                         // SAFETY: `event` is this thread's own valid, owned event handle; a 0
                         // timeout only polls its state. A `WAIT_OBJECT_0` here would mean a wake
                         // is pending right now, which this loop's own wait somehow never observed.
@@ -7577,12 +7604,9 @@ impl RawMutex {
         // really released -- never clobber a DIFFERENT holder that may have legitimately acquired
         // the lock in the interim, and never forget an owner whose lock is still stuck.
         if released {
-            let _ = self.holder_pid.compare_exchange(
-                holder,
-                0,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            let _ =
+                self.holder_pid
+                    .compare_exchange(holder, 0, Ordering::AcqRel, Ordering::Relaxed);
         }
         // Unconditional `store`, not a CAS: unlike `inner`/`holder_pid` above (which must not
         // clobber a legitimate new holder/value), poisoning is monotonic within one recovery
@@ -7847,7 +7871,12 @@ fn record_guest_syscall(thread_ctx: &ThreadContext<'_>) {
     let c = &*thread_ctx.ctx;
     // `rax` already holds whatever the previous syscall returned by the time the handler runs;
     // the number being dispatched is in `orig_rax`, which is what `syscall_number()` reads.
-    let (nr, a0, a1, a2) = (c.syscall_number() as u64, c.rdi as u64, c.rsi as u64, c.rdx as u64);
+    let (nr, a0, a1, a2) = (
+        c.syscall_number() as u64,
+        c.rdi as u64,
+        c.rsi as u64,
+        c.rdx as u64,
+    );
     CURRENT_GUEST_SYSCALL.with(|s| s.set((nr, a0, a1, a2)));
 }
 
@@ -8489,7 +8518,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
-        if suggested_range.start != 0 && matches!(fixed_address_behavior, FixedAddressBehavior::Replace) {
+        if suggested_range.start != 0
+            && matches!(fixed_address_behavior, FixedAddressBehavior::Replace)
+        {
             crate::lazy_file_map::forget(suggested_range.clone());
         }
 
@@ -8542,8 +8573,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // be relocated to the very bottom of the guest range -- see the `hint_foreign_claim`
         // fallback below for the packing that causes. Passing the discarded hint as `floor`
         // keeps the retry in the same neighbourhood instead.
-        let reserve_only = initial_permissions.is_empty()
-            && suggested_range.len() >= RESERVE_ONLY_THRESHOLD;
+        let reserve_only =
+            initial_permissions.is_empty() && suggested_range.len() >= RESERVE_ONLY_THRESHOLD;
         let reserve_and_commit = |r: core::ops::Range<usize>,
                                   flags: Win32_Memory::PAGE_PROTECTION_FLAGS,
                                   floor: usize|
@@ -8633,7 +8664,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             if ptr.is_null() && !maybe_already_reserved {
                 core::ptr::null_mut()
             } else {
-                let commit_addr = if r.start == 0 { ptr } else { r.start as *mut c_void };
+                let commit_addr = if r.start == 0 {
+                    ptr
+                } else {
+                    r.start as *mut c_void
+                };
                 if reserve_only {
                     let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
                     let queried = unsafe {
@@ -9656,7 +9691,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
-    fn try_lazy_file_pages(&self, range: core::ops::Range<usize>, source_data: &'static [u8]) -> bool {
+    fn try_lazy_file_pages(
+        &self,
+        range: core::ops::Range<usize>,
+        source_data: &'static [u8],
+    ) -> bool {
         crate::lazy_file_map::enabled() && crate::lazy_file_map::register(range, source_data)
     }
 
@@ -10064,8 +10103,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 continue;
             }
             let mut f = entry.split(':');
-            let (Some(start), Some(end), Some(size), Some(flags), Some(perms), Some(kind), Some(name_hex)) =
-                (f.next(), f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+            let (
+                Some(start),
+                Some(end),
+                Some(size),
+                Some(flags),
+                Some(perms),
+                Some(kind),
+                Some(name_hex),
+            ) = (
+                f.next(),
+                f.next(),
+                f.next(),
+                f.next(),
+                f.next(),
+                f.next(),
+                f.next(),
+            )
             else {
                 continue;
             };
@@ -10291,7 +10345,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 "diag-shm: create_file_backed_named_shared_memory"
             );
         }
-        register_shm_name(handle as usize, name.to_string(), SharedObjectKind::FileBacked);
+        register_shm_name(
+            handle as usize,
+            name.to_string(),
+            SharedObjectKind::FileBacked,
+        );
         Ok(handle as usize)
     }
 
@@ -10452,7 +10510,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if map_protection != requested_protection {
             let mut previous: u32 = 0;
             let protected = unsafe {
-                VirtualProtect(view.Value, suggested_range.len(), requested_protection, &raw mut previous)
+                VirtualProtect(
+                    view.Value,
+                    suggested_range.len(),
+                    requested_protection,
+                    &raw mut previous,
+                )
             } != 0;
             if !protected {
                 unsafe { UnmapViewOfFileEx(view, 0) };
@@ -10646,8 +10709,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // byte-copying can turn one into the other. Used by a fork child to confirm the parent's
         // `MapViewOfFile3` into it really landed before it books the region as shared -- see the
         // trait method's doc comment.
-        let mut info: Win32_Memory::MEMORY_BASIC_INFORMATION =
-            unsafe { core::mem::zeroed() };
+        let mut info: Win32_Memory::MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
         let queried = unsafe {
             Win32_Memory::VirtualQuery(
                 range.start as *const c_void,
@@ -11133,8 +11195,9 @@ static ADV_SHM_VIEWS: Mutex<std::collections::BTreeMap<usize, Vec<(usize, usize)
 /// `SharedMemoryHandle` is a raw `HANDLE` value -- an index into THIS process's handle table --
 /// so handing it to another process yields `ERROR_INVALID_HANDLE` (6), which is exactly why a
 /// child used to be left with no attachment at all. The name is what the child can re-open.
-static SHM_OBJECT_NAMES: Mutex<std::collections::BTreeMap<usize, (std::string::String, SharedObjectKind)>> =
-    Mutex::new(std::collections::BTreeMap::new());
+static SHM_OBJECT_NAMES: Mutex<
+    std::collections::BTreeMap<usize, (std::string::String, SharedObjectKind)>,
+> = Mutex::new(std::collections::BTreeMap::new());
 
 /// Distinguishes the anonymous objects [`WindowsUserland::create_shared_memory`] mints. Their
 /// names are unguessable by construction, so a collision would mean a counter wraparound, not a
@@ -11158,7 +11221,9 @@ static FORK_SHARED_EXPORT: Mutex<alloc::vec::Vec<SharedRegionCarry>> =
 /// Take the exported carry list, leaving the export slot empty.
 pub fn take_fork_shared_regions() -> alloc::vec::Vec<SharedRegionCarry> {
     core::mem::take(
-        &mut *FORK_SHARED_EXPORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        &mut *FORK_SHARED_EXPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     )
 }
 
@@ -11168,11 +11233,7 @@ pub fn take_fork_shared_regions() -> alloc::vec::Vec<SharedRegionCarry> {
 /// Keyed on the handle VALUE, which is unique among the handles this process currently holds
 /// (Win32 never issues the same value twice while an earlier one is open), so a closed-and-
 /// reopened handle cannot collide with a stale entry -- `close_shared_memory` removes it first.
-fn register_shm_name(
-    handle: usize,
-    name: std::string::String,
-    kind: SharedObjectKind,
-) {
+fn register_shm_name(handle: usize, name: std::string::String, kind: SharedObjectKind) {
     let mut names = SHM_OBJECT_NAMES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12722,7 +12783,10 @@ fn diag_resident_bytes(base: usize, size: usize) -> u64 {
     while page < end {
         batch.clear();
         while page < end && batch.len() < BATCH {
-            batch.push(WorkingSetEx { virtual_address: page, attributes: 0 });
+            batch.push(WorkingSetEx {
+                virtual_address: page,
+                attributes: 0,
+            });
             page += 4096;
         }
         // SAFETY: `batch` is a valid array of the documented `PSAPI_WORKING_SET_EX_INFORMATION` layout.
@@ -12736,7 +12800,11 @@ fn diag_resident_bytes(base: usize, size: usize) -> u64 {
         if ok == 0 {
             return 0;
         }
-        resident += batch.iter().filter(|entry| entry.attributes & 1 != 0).count() as u64 * 4096;
+        resident += batch
+            .iter()
+            .filter(|entry| entry.attributes & 1 != 0)
+            .count() as u64
+            * 4096;
     }
     resident
 }
@@ -14298,8 +14366,10 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         let vma_layout = relocations.vma_layout();
         if std::env::var_os("LITEBOX_DIAG_MEM_BREAKDOWN").is_some() {
             diag_private_memory_breakdown("fork-parent at spawn");
-            let mut spans: std::vec::Vec<(usize, usize)> =
-                vma_layout.iter().map(|(r, _, _)| (r.start, r.end - r.start)).collect();
+            let mut spans: std::vec::Vec<(usize, usize)> = vma_layout
+                .iter()
+                .map(|(r, _, _)| (r.start, r.end - r.start))
+                .collect();
             spans.sort_by_key(|s| core::cmp::Reverse(s.1));
             let total: usize = spans.iter().map(|s| s.1).sum();
             eprintln!(
@@ -14308,7 +14378,10 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 total >> 20
             );
             for (start, len) in spans.iter().take(8) {
-                eprintln!("[mem_breakdown]   vma start={start:#x} size={}MB", len >> 20);
+                eprintln!(
+                    "[mem_breakdown]   vma start={start:#x} size={}MB",
+                    len >> 20
+                );
             }
         }
         // Read PAGE AT A TIME and refuse to touch a page that is not committed.
@@ -14344,7 +14417,10 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 let addr = range.start.wrapping_add(off);
                 let chunk = (PAGE - (addr % PAGE)).min(len - off);
                 let index = pristine_spans.partition_point(|span| span.end <= addr);
-                if pristine_spans.get(index).is_some_and(|span| span.start <= addr) {
+                if pristine_spans
+                    .get(index)
+                    .is_some_and(|span| span.start <= addr)
+                {
                     off += chunk;
                     continue;
                 }
@@ -15098,7 +15174,9 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     }
 
     fn spill_set_len(&self, slot: u32, length: u64) -> bool {
-        open_spill_file(slot).and_then(|file| file.set_len(length).ok()).is_some()
+        open_spill_file(slot)
+            .and_then(|file| file.set_len(length).ok())
+            .is_some()
     }
 
     fn spill_read_at(&self, slot: u32, offset: u64, buf: &mut [u8]) -> usize {

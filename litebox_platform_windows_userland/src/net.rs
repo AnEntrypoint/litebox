@@ -480,18 +480,18 @@ impl GatewayState {
         let spawn_result = std::thread::Builder::new()
             .name("litebox-tcp-flow-connect".to_owned())
             .spawn(move || {
-            let result = (|| -> std::io::Result<std::net::TcpStream> {
-                let socket = socket2::Socket::new(
-                    socket2::Domain::IPV4,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )?;
-                socket.connect_timeout(&dest_addr.into(), Duration::from_secs(10))?;
-                socket.set_nonblocking(true)?;
-                Ok(socket.into())
-            })();
-            let _ = tx.send(result);
-        });
+                let result = (|| -> std::io::Result<std::net::TcpStream> {
+                    let socket = socket2::Socket::new(
+                        socket2::Domain::IPV4,
+                        socket2::Type::STREAM,
+                        Some(socket2::Protocol::TCP),
+                    )?;
+                    socket.connect_timeout(&dest_addr.into(), Duration::from_secs(10))?;
+                    socket.set_nonblocking(true)?;
+                    Ok(socket.into())
+                })();
+                let _ = tx.send(result);
+            });
         if let Err(e) = spawn_result {
             eprintln!("[net] failed to spawn tcp-flow-connect thread: {e}");
             return;
@@ -1016,9 +1016,7 @@ pub(crate) fn init_published_ports(slot: &OnceLock<NatGateway>) {
 /// [`litebox::platform::IPInterfaceProvider::owns_ip_interface`]).
 pub(crate) fn owns_ip_interface() -> bool {
     static OWNS: OnceLock<bool> = OnceLock::new();
-    *OWNS.get_or_init(|| {
-        std::env::var_os(crate::process_fork::FORK_CHILD_GPRS_ENV_VAR).is_none()
-    })
+    *OWNS.get_or_init(|| std::env::var_os(crate::process_fork::FORK_CHILD_GPRS_ENV_VAR).is_none())
 }
 
 /// Send a raw IP packet from the guest into the NAT gateway.

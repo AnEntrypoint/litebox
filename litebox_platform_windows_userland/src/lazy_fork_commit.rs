@@ -1565,7 +1565,13 @@ fn ensure_guard_cow_veh_installed() {
 /// A page whose `VirtualProtect` call itself fails is simply left unguarded (not fatal to the
 /// group) -- narrows Bug 4's original TOCTOU risk to just that one page, never a NEW hazard beyond
 /// what already existed before this mechanism did.
-fn guard_one_page(claim: &mut GuardCowClaim, child_pid: u32, page: usize, slot_index: usize, diag: bool) {
+fn guard_one_page(
+    claim: &mut GuardCowClaim,
+    child_pid: u32,
+    page: usize,
+    slot_index: usize,
+    diag: bool,
+) {
     // 114th-pass confirmation diagnostic ONLY -- artificially widens the real
     // "page not yet guard-protected while another parent thread can still write to it with no
     // fault at all" window this module's own doc comment (see AGENTS.md's 114th-pass entry)

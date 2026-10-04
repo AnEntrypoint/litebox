@@ -1990,9 +1990,7 @@ pub fn spawn_process_fork_child(
         v
     };
     if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
-        eprintln!(
-            "[lazy_fork_commit] 114th-pass DIAG: active_rsps at fork = {active_rsps:x?}"
-        );
+        eprintln!("[lazy_fork_commit] 114th-pass DIAG: active_rsps at fork = {active_rsps:x?}");
     }
     // Taken HERE, not at the `child_env.push` below, because it also decides which groups may stay
     // lazy -- see the `lazy_eligible` filter right after this call.
@@ -2576,14 +2574,15 @@ pub fn spawn_process_fork_child(
     // wall-clock time this mechanism's own timing-sensitive bugs may be exposed by.
     static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
         std::sync::atomic::AtomicU32::new(0);
-    let external_debugger_skip: u32 = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
-        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
-        .unwrap_or(0);
+    let external_debugger_skip: u32 =
+        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
     let external_debugger_fork_index =
         EXTERNAL_DEBUGGER_FORK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let external_debugger_requested = std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER")
-        .is_some()
-        && external_debugger_fork_index >= external_debugger_skip;
+    let external_debugger_requested =
+        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER").is_some()
+            && external_debugger_fork_index >= external_debugger_skip;
     if external_debugger_requested {
         eprintln!(
             "[process_fork_diag] real-resume: external debugger attaching for fork_index={external_debugger_fork_index} (skip={external_debugger_skip})"
@@ -4582,9 +4581,16 @@ fn spawn_suspended_impl(
 /// `SharedMemoryHandle` is a `HANDLE` value that means nothing in another process. The child's own
 /// route to the same bytes is the NAME, which it re-opens in `Vmem::adopt_carried_shared`.
 ///
-/// Returns `Err(win32_err)` on failure. The caller must surface that as a failure, never as a
-/// silent byte-copy: a shared region the child does not genuinely share is the bug, not a
-/// degradation to absorb.
+/// Returns `Err(win32_err)` when this group cannot be carried. The caller then rebuilds the group
+/// as copied bytes -- loudly, never silently: the parent logs the region it failed to share, and
+/// the child refuses to book it as shared (`memory_is_shared_view` sees PRIVATE pages), so a
+/// degraded group is never mistaken for real sharing.
+///
+/// A refusal must leave the child's address space exactly as the caller's byte-copy fallback
+/// expects it -- FREE at this span. Every check that can refuse runs before the placeholder is
+/// reserved, and every failure after it runs `cleanup`; a hole left here is what broke chrD62,
+/// where the fallback's re-reserve hit `ERROR_INVALID_ADDRESS` (487) and the whole cross-process
+/// spawn was abandoned.
 fn copy_one_group_with_shared(
     child: HANDLE,
     source_group: &Range<usize>,
@@ -4603,7 +4609,47 @@ fn copy_one_group_with_shared(
         return Err(0);
     }
 
-    // Step 1: the whole group as ONE placeholder -- reserved, nothing committed, so still
+    // Step 1: cut the group into segments along the shared ranges. Pure bookkeeping, done BEFORE
+    // anything exists in the child, so every refusal up to here leaves the child's address space
+    // byte-for-byte untouched and the caller's byte-copy fallback re-reserves a FREE span.
+    // That ordering is what chrD62 broke: the check used to run AFTER the reserve, so a refused
+    // group left a live placeholder over the very span the fallback then re-reserved --
+    // `ERROR_INVALID_ADDRESS` (487), `spawn/resume failed`, and every child pushed onto the
+    // same-process thread-based fork where it faults before its first instruction.
+    let mut segments: std::vec::Vec<(Range<usize>, Option<&SharedRegionCarry>)> =
+        std::vec::Vec::new();
+    let mut cursor = source_group.start;
+    for carry in shared {
+        let start = carry.range.start.max(source_group.start);
+        let end = carry.range.end.min(source_group.end);
+        if start >= end {
+            continue;
+        }
+        if start > cursor {
+            segments.push((cursor..start, None));
+        }
+        segments.push((start..end, Some(carry)));
+        cursor = end;
+    }
+    if cursor < source_group.end {
+        segments.push((cursor..source_group.end, None));
+    }
+    // Only PAGE alignment is required: a placeholder splits at any page boundary and a view starts
+    // at any page boundary. Allocation-granularity alignment is NOT -- measured,
+    // `.wfgy/xproc_sparse.py`, which reproduces chrD62's sparse group exactly (28672 shared at
+    // +0x0, a 36864 private gap, 4096 shared at +0x10000): the split at the UNALIGNED +0x7000
+    // boundary and both non-granularity-sized views succeed. Requiring 64KB alignment there is
+    // what made every real group holding an odd-sized shared region uncarriable, which is the
+    // whole regression -- a shared range is always page-aligned because it is an mmap.
+    const PAGE_SIZE: usize = 4096;
+    if segments
+        .iter()
+        .any(|(segment, _)| segment.start % PAGE_SIZE != 0)
+    {
+        return Err(0);
+    }
+
+    // Step 2: the whole group as ONE placeholder -- reserved, nothing committed, so still
     // replaceable.
     let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: source_group.start as *mut c_void,
@@ -4639,33 +4685,9 @@ fn copy_one_group_with_shared(
         return Err(0);
     }
 
-    // Step 2: cut the group into segments along the shared ranges, then split the placeholder to
-    // match. One `VirtualFreeEx(..., MEM_PRESERVE_PLACEHOLDER)` per segment, in address order,
-    // carves each segment out of whatever placeholder currently covers it.
-    let mut segments: std::vec::Vec<(Range<usize>, Option<&SharedRegionCarry>)> =
-        std::vec::Vec::new();
-    let mut cursor = source_group.start;
-    for carry in shared {
-        let start = carry.range.start.max(source_group.start);
-        let end = carry.range.end.min(source_group.end);
-        if start >= end {
-            continue;
-        }
-        if start > cursor {
-            segments.push((cursor..start, None));
-        }
-        segments.push((start..end, Some(carry)));
-        cursor = end;
-    }
-    if cursor < source_group.end {
-        segments.push((cursor..source_group.end, None));
-    }
-    // Every boundary the group is cut at has to be granularity-aligned: a placeholder can only be
-    // split there. Carries live inside granularity-rounded reservation groups, so they are; if
-    // that bookkeeping ever changes the honest answer is "cannot carry this one", not a guess.
-    if segments.iter().any(|(segment, _)| segment.start % GRAN != 0) {
-        return Err(0);
-    }
+    // Step 3: split the placeholder to match the segments. One `VirtualFreeEx(...,
+    // MEM_PRESERVE_PLACEHOLDER)` per segment, in address order, carves each segment out of whatever
+    // placeholder currently covers it.
     // Best-effort undo, run before every failure return below that has already placed something.
     // Freeing each segment's base with `MEM_RELEASE` (size 0) releases the whole allocation that
     // contains it -- after a split every segment is its own allocation, and an unsplit remainder's
@@ -4764,8 +4786,12 @@ fn copy_one_group_with_shared(
                     if diag {
                         eprintln!(
                             "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
-                            source_group.start, source_group.end, segment.start, segment.end,
-                            carry.name.as_str(), err
+                            source_group.start,
+                            source_group.end,
+                            segment.start,
+                            segment.end,
+                            carry.name.as_str(),
+                            err
                         );
                     }
                     cleanup();
@@ -4804,6 +4830,15 @@ fn copy_one_group_with_shared(
                 }
             }
         }
+    }
+    // Measurement only: `LITEBOX_DIAG_FORK_SHARED_FORCE_FAIL=1` fails every carry AFTER the group
+    // is fully placed in the child, so the degradation can be proven to rebuild the child exactly
+    // as the byte-copy path does -- a forced failure must reproduce the no-carry baseline result
+    // for every probe. Without it the degradation is exercised only by whichever real group happens to
+    // fail, which is how chrD62 shipped a hole in the child's address space untested.
+    if std::env::var_os("LITEBOX_DIAG_FORK_SHARED_FORCE_FAIL").is_some() {
+        cleanup();
+        return Err(0);
     }
     if std::env::var_os("LITEBOX_DIAG_FORK_SHARED").is_some() {
         for (segment, carry) in &segments {
@@ -4903,7 +4938,7 @@ fn copy_one_group(
                     source_group: source_group.clone(),
                     succeeded: true,
                     last_error: 0,
-                }
+                };
             }
             Err(err) => {
                 // NAMED, never silent: this is a region the child will NOT genuinely share, and
@@ -5434,10 +5469,13 @@ pub fn is_fault_watchdog_child() -> bool {
 
 /// Raw handle of this process's own "guest has started running" event (0 = none), created by
 /// [`spawn_external_fault_watchdog`] and signalled by [`mark_guest_started`].
-static GUEST_STARTED_EVENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+static GUEST_STARTED_EVENT: core::sync::atomic::AtomicIsize =
+    core::sync::atomic::AtomicIsize::new(0);
 
 fn guest_started_event_name(target_pid: u32) -> Vec<u16> {
-    let mut name: Vec<u16> = format!(r"Local\litebox-guest-started-{target_pid}").encode_utf16().collect();
+    let mut name: Vec<u16> = format!(r"Local\litebox-guest-started-{target_pid}")
+        .encode_utf16()
+        .collect();
     name.push(0);
     name
 }
@@ -5445,7 +5483,9 @@ fn guest_started_event_name(target_pid: u32) -> Vec<u16> {
 static FAULT_ARMED_EVENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
 
 fn fault_armed_event_name(target_pid: u32) -> Vec<u16> {
-    let mut name: Vec<u16> = format!(r"Local\litebox-fault-armed-{target_pid}").encode_utf16().collect();
+    let mut name: Vec<u16> = format!(r"Local\litebox-fault-armed-{target_pid}")
+        .encode_utf16()
+        .collect();
     name.push(0);
     name
 }
@@ -5506,7 +5546,10 @@ pub fn spawn_external_fault_watchdog() {
         )
     };
     if !started_event.is_null() {
-        GUEST_STARTED_EVENT.store(started_event as isize, core::sync::atomic::Ordering::Release);
+        GUEST_STARTED_EVENT.store(
+            started_event as isize,
+            core::sync::atomic::Ordering::Release,
+        );
     }
     let armed_name = fault_armed_event_name(parent_pid);
     let armed_event = unsafe {
@@ -5672,8 +5715,9 @@ pub fn run_external_fault_watchdog_child() -> ! {
             continue;
         }
         if !started_event.is_null()
-            && unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(started_event, 0) }
-                != 0
+            && unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(started_event, 0)
+            } != 0
         {
             // Guest has not started: the parent is still preparing its rootfs. Only bail out if
             // the parent itself is gone.

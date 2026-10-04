@@ -10,26 +10,26 @@
 //! Commit charge is unchanged (the range is still committed); only resident memory shrinks.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64};
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::cell::UnsafeCell;
 use std::sync::{Mutex, MutexGuard, Once, OnceLock};
-use core::sync::atomic::{AtomicU32, AtomicU64};
 
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS,
-};
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, GetCurrentThreadId, GetThreadTimes, OpenThread, WaitForSingleObject,
-    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery, VirtualUnlock,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, GetCurrentThreadId, GetThreadTimes, OpenThread,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SYNCHRONIZE, WaitForSingleObject,
 };
 
 const CHUNK_SHIFT: usize = 16;
@@ -86,9 +86,7 @@ fn is_writable_protection(protection: PAGE_PROTECTION_FLAGS) -> bool {
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("LITEBOX_LAZY_FILE_MAP").is_some_and(|v| v != "0")
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("LITEBOX_LAZY_FILE_MAP").is_some_and(|v| v != "0"))
 }
 
 fn diagnostics_enabled() -> bool {
@@ -208,13 +206,20 @@ fn current_thread_start() -> u64 {
 fn thread_alive(tid: u32, expected_start: u64) -> bool {
     // SAFETY: the handle is closed before returning; a thread that cannot be opened is gone.
     unsafe {
-        let handle = OpenThread(THREAD_SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+        let handle = OpenThread(
+            THREAD_SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION,
+            0,
+            tid,
+        );
         if handle.is_null() {
             return false;
         }
         let mut alive = WaitForSingleObject(handle, 0) != 0;
         if alive && expected_start != 0 {
-            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
             let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
             if GetThreadTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
                 alive = filetime_to_u64(created) == expected_start;
@@ -371,7 +376,9 @@ fn split_at(map: &mut BTreeMap<usize, LazyRange>, addr: usize) {
             .to_vec(),
         dirty: range.dirty[upper_first - range.first_chunk..=last_chunk - range.first_chunk]
             .to_vec(),
-        origin: range.origin.map(|(index, offset)| (index, offset + consumed)),
+        origin: range
+            .origin
+            .map(|(index, offset)| (index, offset + consumed)),
     };
     range.end = addr;
     range
@@ -391,7 +398,9 @@ fn split_at(map: &mut BTreeMap<usize, LazyRange>, addr: usize) {
 fn fill_partial_overlaps(map: &mut BTreeMap<usize, LazyRange>, range: &Range<usize>) {
     let cut: Vec<usize> = map
         .range(..range.end)
-        .filter(|entry| entry.1.end > range.start && (*entry.0 < range.start || entry.1.end > range.end))
+        .filter(|entry| {
+            entry.1.end > range.start && (*entry.0 < range.start || entry.1.end > range.end)
+        })
         .map(|(&start, _)| start)
         .collect();
     for start in cut {
@@ -608,7 +617,9 @@ pub(crate) fn forget(range: Range<usize>) {
 }
 
 fn sources() -> MutexGuard<'static, Vec<(usize, usize)>> {
-    SOURCES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Declares that `data` is source number `index`. The numbering must be the same in every process
@@ -623,10 +634,13 @@ pub fn register_source(index: usize, data: &'static [u8]) {
 
 fn locate_source(slice: &[u8]) -> Option<(usize, usize)> {
     let start = slice.as_ptr() as usize;
-    sources().iter().enumerate().find_map(|(index, &(base, len))| {
-        (len != 0 && start >= base && start + slice.len() <= base + len)
-            .then_some((index, start - base))
-    })
+    sources()
+        .iter()
+        .enumerate()
+        .find_map(|(index, &(base, len))| {
+            (len != 0 && start >= base && start + slice.len() <= base + len)
+                .then_some((index, start - base))
+        })
 }
 
 /// Prepares this process's lazy ranges for a cross-process fork and returns the path of a
@@ -659,7 +673,13 @@ pub(crate) fn export_for_fork() -> (Option<String>, Vec<Range<usize>>) {
         }
         let bits: String = lazy
             .chunk_indices()
-            .map(|chunk| if lazy.is_filled(chunk) && !lazy.is_pristine(chunk) { '1' } else { '0' })
+            .map(|chunk| {
+                if lazy.is_filled(chunk) && !lazy.is_pristine(chunk) {
+                    '1'
+                } else {
+                    '0'
+                }
+            })
             .collect();
         if !bits.contains('0') {
             continue;
@@ -712,7 +732,10 @@ pub fn adopt_from_file(path: &str) {
             .copied()
             .filter(|&(_, total)| total != 0)
             .unwrap_or_else(|| panic!("lazy file map source {index} not registered in fork child"));
-        assert!(offset + hex(source_len) <= total, "lazy file map source {index} shorter in child");
+        assert!(
+            offset + hex(source_len) <= total,
+            "lazy file map source {index} shorter in child"
+        );
         let mut lazy = LazyRange {
             end,
             source: base + offset,
@@ -729,7 +752,12 @@ pub fn adopt_from_file(path: &str) {
                 let mut previous = 0;
                 // SAFETY: the parent's group copy committed this whole range in this process.
                 unsafe {
-                    VirtualProtect(span.start as *const _, span.len(), PAGE_NOACCESS, &mut previous);
+                    VirtualProtect(
+                        span.start as *const _,
+                        span.len(),
+                        PAGE_NOACCESS,
+                        &mut previous,
+                    );
                 }
             }
         }
