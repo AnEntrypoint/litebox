@@ -1637,6 +1637,7 @@ mod test {
                 .descriptor_table()
                 .with_entry(&receiver_typed, |entry| {
                     entry.recvfrom(
+                        &task.global,
                         &task.wait_cx(),
                         &mut buf,
                         litebox_common_linux::ReceiveFlags::empty(),
@@ -1812,6 +1813,7 @@ mod test {
                             &receiver_typed,
                             |entry| {
                                 entry.recvfrom(
+                                    &global,
                                     &WaitState::new(platform())
                                         .context()
                                         .with_timeout(core::time::Duration::from_millis(0)),
