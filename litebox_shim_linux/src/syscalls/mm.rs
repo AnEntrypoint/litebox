@@ -392,10 +392,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(seg) = table.get_mut(shmid) else {
                 return Err(Errno::EINVAL);
             };
-            // Linux refuses new attachments to a segment already marked for destruction, and so
-            // must this: the segment is only still addressable because an EARLIER attacher has
-            // not detached yet, and a fresh attach would keep it alive past its RMID forever.
-            if seg.removed {
+            // An `IPC_RMID`'d segment is STILL attachable while somebody holds it. Linux's
+            // `do_shmat` carries no `SHM_DEST` check at all: `IPC_RMID` only sets that flag and
+            // frees the KEY, and the segment dies later, when the last detach drops `shm_nattch`
+            // to 0 with the flag still set (`shm_may_destroy`). Refusing here is therefore not
+            // hardening, it is a deviation -- and MIT-SHM makes it fatal. `XShmAttach` writes its
+            // request and does NOT wait for a reply, and every real MIT-SHM client `shmctl`s
+            // `IPC_RMID` on the very next line so its buffer cannot outlive it, so the server's
+            // own `shmat` normally lands AFTER the RMID; `ProcShmAttach` turns any failure there
+            // into `BadAccess`, and the client dies before it maps a window. That is the whole of
+            // chrD50's dead desktop: xfwm4, xfce4-panel and xfdesktop each took this error, and
+            // appm1's xfce4-terminal/thunar/mousepad the same.
+            // A removed segment with NO attacher left is already destroyed, so its id is dead --
+            // that, and only that, is the case where EINVAL is the right answer.
+            if seg.removed && seg.attaches == 0 {
                 return Err(Errno::EINVAL);
             }
             seg.attaches += 1;
@@ -478,30 +488,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// `shmdt(shmaddr)`.
     ///
-    /// Matches the pre-51st-pass implementation's own scope: releases this process's
-    /// bookkeeping (the shared attach count, and now the per-process reverse-lookup entry --
-    /// see `FilesState::shm_attachments`'s doc comment) but does not actually `munmap` the local
-    /// mapping. That was already true before this pass (the previous implementation never called
-    /// `sys_munmap` either) and remains a real, pre-existing, documented gap -- not one this
-    /// pass's fix introduces or widens -- because MIT-SHM/`-shmem` clients in practice keep a
-    /// segment attached for the whole connection lifetime, never calling `shmdt` at all, so it is
-    /// not on any path this investigation's own boot needs.
+    /// Releases this process's bookkeeping (the shared attach count and the per-process
+    /// reverse-lookup entry -- see `FilesState::shm_attachments`'s doc comment) AND unmaps the
+    /// local mapping, which is what real Linux's `shmdt` does. It used to do only the first half,
+    /// which was survivable while `shmat` refused every RMID'd segment: MIT-SHM never got far
+    /// enough to detach anything. Now that it does, the X server detaches one segment per client
+    /// surface for the whole session, so a `shmdt` that leaves its mapping behind leaks one guest
+    /// address region each time -- and the leak is in the one process that cannot afford it.
     pub(crate) fn sys_shmdt(&self, shmaddr: usize) -> Result<usize, Errno> {
         let Some(shmid) = self.files.borrow().take_shm_attachment(shmaddr) else {
             return Err(Errno::EINVAL);
         };
         let mut table = self.global.sysv_shm.lock();
-        let drop_now = if let Some(seg) = table.get_mut(shmid) {
+        let (size, drop_now) = if let Some(seg) = table.get_mut(shmid) {
             seg.attaches = seg.attaches.saturating_sub(1);
-            seg.removed && seg.attaches == 0
+            (Some(seg.size), seg.removed && seg.attaches == 0)
         } else {
-            false
+            (None, false)
         };
         if drop_now {
             table.remove(shmid);
         }
         // Drop the cross-process arena lock before the host file IO below.
         drop(table);
+        if let Some(size) = size {
+            // Best effort and never reported to the guest: a real `shmdt` of a live attachment
+            // cannot fail, so a failure here means this mapping is already gone (an `munmap` the
+            // guest issued itself over the same range), and the attachment record is what matters.
+            let _ = self.sys_munmap(UserPtrMut::<u8>::from_usize(shmaddr), size);
+        }
         // Last detach of a removed segment: nothing references the backing store any more, so
         // this is the point where it can actually be unlinked.
         if drop_now {
