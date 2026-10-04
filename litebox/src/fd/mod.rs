@@ -404,8 +404,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !e.read().matches_subsystem::<Subsystem>() {
                     return None;
                 }
-                let entry = e.write();
-                assert!(entry.matches_subsystem::<Subsystem>());
+                let mut entry = e.write();
+                if !entry.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
                 Some((
                     InternalFd {
                         raw: i.try_into().unwrap(),
@@ -435,8 +437,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !e.try_read()?.matches_subsystem::<Subsystem>() {
                     return None;
                 }
-                let entry = e.try_write()?;
-                assert!(entry.matches_subsystem::<Subsystem>());
+                let mut entry = e.try_write()?;
+                if !entry.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
                 Some((
                     InternalFd {
                         raw: i.try_into().unwrap(),
@@ -465,12 +469,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// `CreateProcessW`, `litebox/src/fd/mod.rs:422` (`docs/AGENTS_ARCHIVE_2026-09-22.md`, 54th
     /// pass) -- a foreign index a `None`-tolerant `.get()` now simply treats as "not open here"
     /// instead of taking down the entire guest process it happened to land in.
+    ///
+    /// The `matches_subsystem` gate below is that same defect class one step further in: an index
+    /// that DOES resolve, but to an entry of a different subsystem, used to `unwrap()` a failed
+    /// downcast and panic the entire guest process -- selkies died exactly this way
+    /// (`litebox/src/fd/mod.rs:1095`, exit 101) the moment a browser client made it spawn
+    /// `xfconf-query`. A mistyped fd is EBADF, never a panic.
     pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
     {
         let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.read();
+        if !entry.matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(f(entry.as_subsystem::<Subsystem>()))
     }
 
@@ -485,6 +498,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
         let mut entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.write();
+        if !entry.matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
@@ -498,6 +514,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
     ) -> Option<EntryHandle<Platform, Subsystem>> {
         let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
@@ -540,6 +559,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
         let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(crate::sync::RwLockReadGuard::map(entry.read(), |e| {
             e.as_subsystem::<Subsystem>()
         }))
@@ -557,6 +579,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
         let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(crate::sync::RwLockWriteGuard::map(entry.write(), |e| {
             e.as_subsystem_mut::<Subsystem>()
         }))

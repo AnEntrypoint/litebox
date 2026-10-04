@@ -1191,7 +1191,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             .descriptor_table()
             .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
             .map_err(|e| match e {
-                litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
+                // A socket-subsystem fd with NO `SocketProxy` means the index does not name a
+                // live socket in THIS descriptor table -- most often a `TypedFd` whose slot was
+                // recycled for another subsystem. `unreachable!()` here panicked the whole guest
+                // process (chrD89: selkies' `xfconf-query` fork child died this way, which is what
+                // killed the stream). A mistyped fd is an errno, never a panic.
+                litebox::fd::MetadataError::NoSuchMetadata => {
+                    litebox_util_log::warn!("a socket fd has no SocketProxy metadata in this descriptor table (stale or recycled TypedFd); EBADF, not a panic");
+                    Errno::EBADF
+                }
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })
     }
