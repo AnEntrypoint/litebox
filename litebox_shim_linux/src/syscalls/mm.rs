@@ -114,11 +114,15 @@ pub(crate) struct SysvShmSegment {
     mode: u32,
 }
 
-/// Realistic upper bound on simultaneously live SysV shm segments in one guest session (X11's
-/// MIT-SHM extension allocates one per client-side pixmap/framebuffer pool, plus Xvfb's own
-/// `-shmem` framebuffer) -- sized generously, never grown, same discipline as
-/// `syscalls::unix::UNIX_ADDR_PRESENCE_CAPACITY`.
-pub(crate) const MAX_SYSV_SHM_SEGMENTS: usize = 128;
+/// Upper bound on simultaneously live SysV shm segments in one guest session (X11's MIT-SHM
+/// extension allocates one per client-side pixmap/framebuffer pool, plus Xvfb's own `-shmem`
+/// framebuffer). Matches real Linux's own default `shmmni` (4096) rather than a hand-picked
+/// smaller number: an XFCE session is not one client -- every GTK app, chromium's software
+/// compositor and selkies' capture each hold several at once, and a full that reports `ENOSPC`
+/// from `shmget` reads to a client as "cannot allocate a frame buffer", i.e. a window that maps
+/// and never paints. A fixed-size, pointer-free slot array -- deliberately NOT a `BTreeMap`,
+/// see [`SysvShmTable`].
+pub(crate) const MAX_SYSV_SHM_SEGMENTS: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct ShmSlot {
@@ -482,6 +486,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.release_sysv_shm_backing(shmid);
         }
         Ok(0)
+    }
+
+    /// Real Linux's `exit_shm()`: every attachment a process still holds dies with its last
+    /// thread. Called from `Task::prepare_for_exit`'s process-exit branch.
+    ///
+    /// Without this, a segment whose owner `shmget`s, `shmat`s, `shmctl(IPC_RMID)`s and then
+    /// exits -- the universal MIT-SHM idiom, since RMID is how a client guarantees its buffer
+    /// cannot outlive it -- keeps its [`SysvShmTable`] slot for the rest of the session:
+    /// `removed` is set but `attaches` never reaches zero, because `sys_shmdt` was the only
+    /// thing that ever decremented it and these clients never call it. Each XFCE startup
+    /// therefore burns slots permanently, and once the table is full `shmget` answers `ENOMEM`
+    /// to everyone -- including a client whose whole presentation path is an `XShmPutImage`, so
+    /// its window maps and never paints.
+    ///
+    /// One decrement per recorded attachment, matching Linux's one-`shm_nattch`-per-VMA
+    /// accounting. `fork()` copies this process's attachment records without incrementing
+    /// (see `FilesState::fork_duplicate`), so a `shmat`-owning process that also forks a lot can
+    /// drive a segment's count to zero while its own mapping is still live; the consequence is
+    /// only that the slot is recycled (the host keeps a mapped section's bytes alive until its
+    /// last view goes away), which is strictly better than the table filling up permanently.
+    pub(crate) fn detach_sysv_shm_on_process_exit(&self) {
+        let attached = self.files.borrow().take_all_shm_attachments();
+        if attached.is_empty() {
+            return;
+        }
+        let mut destroyed: BTreeSet<i32> = BTreeSet::new();
+        {
+            let mut table = self.global.sysv_shm.lock();
+            for shmid in &attached {
+                let Some(seg) = table.get_mut(*shmid) else {
+                    continue;
+                };
+                seg.attaches = seg.attaches.saturating_sub(1);
+                if seg.removed && seg.attaches == 0 {
+                    destroyed.insert(*shmid);
+                }
+            }
+            for shmid in &destroyed {
+                table.remove(*shmid);
+            }
+        }
+        // Backing-store unlink is host file IO, so it runs after the cross-process arena lock is
+        // dropped -- the same rule `sys_shmget`'s own `ensure_sysv_shm_backing` call obeys.
+        for shmid in &destroyed {
+            self.release_sysv_shm_backing(*shmid);
+        }
+        litebox_util_log::debug!(
+            n_attached:% = attached.len(), n_destroyed:% = destroyed.len();
+            "sysv shm: process exit detached attachments"
+        );
     }
 
     /// `shmctl(shmid, cmd, buf)`.

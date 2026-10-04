@@ -2514,6 +2514,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // happen before `notify_detached` below -- see this function's comment above.
             self.close_all_fds_on_process_exit();
             litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: close_all_fds done");
+            // Real Linux's `do_exit()` -> `exit_mm()` -> `exit_shm()`: the address space is going
+            // away, so every SysV shm attachment this process still holds goes with it. Same
+            // reason it belongs next to the fd cleanup -- both are "the last thread is gone, drop
+            // what only this process could reference", and both must precede `notify_detached`.
+            self.detach_sysv_shm_on_process_exit();
             // Drop this process's `/proc/self` snapshot along with its fds. Not optional
             // housekeeping: the entry holds the whole `cmdline`, `environ` and `auxv`, plus an
             // `Arc` closure that keeps this process's page-manager mapping table alive for as long

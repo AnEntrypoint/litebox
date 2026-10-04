@@ -574,6 +574,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.shm_attachments.write().remove(&addr)
     }
 
+    /// Process-exit teardown: consumes EVERY `shmid` this process still had attached, one entry
+    /// per live attachment record (a process that `shmat`'d the same segment twice yields it
+    /// twice, matching real Linux's one-`shm_nattch`-per-VMA accounting). Real Linux does the
+    /// same in `exit_shm()` when a process's last thread drops its address space; see
+    /// `mm::Task::detach_sysv_shm_on_process_exit` for what leaving this out costs.
+    pub(crate) fn take_all_shm_attachments(&self) -> alloc::vec::Vec<i32> {
+        let mut attachments = self.shm_attachments.write();
+        let shmids: alloc::vec::Vec<i32> = attachments.values().copied().collect();
+        attachments.clear();
+        shmids
+    }
+
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
     // Err(typed_fd)
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
