@@ -199,6 +199,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         .map_err(|_| "not a unix socket")?
     }
 
+    /// Describes the INET socket at `raw_fd` for a cross-process fork child (see
+    /// `Network::fork_carry_spec`). `None` when `raw_fd` is not an INET socket at all, or is one
+    /// whose state cannot be named across a process boundary -- in which case the caller DROPS the
+    /// fd in the child rather than refusing the fork, because a fork pushed onto the thread-based
+    /// relocating fallback faults the child before it runs one instruction, while a missing fd is
+    /// an `EBADF` the guest can see and recover from.
+    ///
+    /// The spec is `<net spec>|<v6>|<nonblock>`: the two flags are shim-level descriptor metadata
+    /// (they decide what `getsockname` reports and whether `recv` returns `EAGAIN`), so they ride
+    /// along with the network-side description rather than living inside it.
+    pub(crate) fn raw_fd_inet_carry(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
+        let raw_fd = u32::try_from(raw_fd).ok()?;
+        self.with_socket_netlink(
+            global,
+            raw_fd,
+            |inet| {
+                let Some(net_spec) = global.net_lock().fork_carry_spec(inet) else {
+                    return Ok(None);
+                };
+                let dt = global.litebox.descriptor_table();
+                let v6 = dt
+                    .with_metadata(inet, |o: &SocketOptions| o.is_v6)
+                    .unwrap_or(false);
+                let nonblock = dt
+                    .with_metadata(inet, |f: &SocketOFlags| f.0.contains(OFlags::NONBLOCK))
+                    .unwrap_or(false);
+                Ok(Some(alloc::format!(
+                    "{net_spec}|{}|{}",
+                    u8::from(v6),
+                    u8::from(nonblock)
+                )))
+            },
+            |_unix| Err(Errno::ENOTSOCK),
+            |_netlink| Err(Errno::ENOTSOCK),
+        )
+        .ok()
+        .flatten()
+    }
+
     /// `true` only for a Unix-domain socket fd that is BOTH unbound (never `bind()`ed to a real
     /// filesystem/abstract address) AND unconnected-to-a-named-peer -- i.e. one half of a
     /// `socketpair(2)` result, real Linux's own definition of "unnamed" for this address family

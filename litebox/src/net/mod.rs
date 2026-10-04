@@ -298,6 +298,13 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     /// The proxy associated with this socket to enable lock-free data transfer
     /// and event notification
     proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
+    /// Whether this descriptor is a BORROWED second reference to a socket another process in the
+    /// cross-process-fork family owns (`Network::fork_adopt`). Such a reference's `close()`
+    /// releases only the reference: it must NOT close/abort the shared smoltcp socket or
+    /// deallocate the shared local port, or the process that actually owns the socket loses a
+    /// connection it still holds -- the Linux `fork()` semantics this exists to reproduce
+    /// (`close()` in the child cannot tear down the parent's end).
+    borrowed: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
@@ -1306,6 +1313,7 @@ where
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             proxy: None,
+            borrowed: false,
         }))
     }
 
@@ -1336,6 +1344,221 @@ where
         let socket_handle = &mut table_entry.entry;
         socket_handle.proxy = Some(proxy);
         true
+    }
+
+    /// Describes the socket at `fd` for a cross-process `fork()` child: the minimum a child that
+    /// is a DIFFERENT host process needs to attach a second reference to this very socket, as an
+    /// ASCII spec. `None` when this socket's state cannot be named that way, in which case the
+    /// caller drops the fd in the child rather than refusing the fork (see
+    /// `litebox_shim_linux::syscalls::process::try_cross_process_fork`).
+    ///
+    /// Nothing here carries a pointer or a private-heap allocation, because the spec crosses a
+    /// `CreateProcessW` boundary in the child's environment. It names the socket by its ENDPOINTS
+    /// rather than by its `smoltcp` slot index: `SocketHandle`'s index is private to smoltcp and
+    /// the slot ordering it would encode is not stable across the ~1s the child takes to boot
+    /// (a sibling socket created or closed in between shifts every later ordinal).
+    ///
+    /// What actually makes the carry work is that `socket_set`'s storage, every socket's rx/tx
+    /// buffers and the local-port refcount table are all shared-kernel-arena-native: the child
+    /// attaches to the SAME `Network`, so a socket it finds there is the parent's socket.
+    ///
+    /// Shapes: `T,<lip>,<lport>,<rip>,<rport>` (TCP, connected), `L,<lip>,<lport>,<backlog>`
+    /// (TCP, listening), `U,<lip>,<lport>,<rip>,<rport>` (UDP, bound), `u` (UDP, never bound).
+    /// All numbers hex. `<rip>/<rport>` are `0` when there is no connected peer.
+    pub fn fork_carry_spec(&self, fd: &SocketFd<Platform>) -> Option<alloc::string::String> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let table_entry = descriptor_table.get_entry_mut(fd)?;
+        let socket_handle = &table_entry.entry;
+        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+            return None;
+        }
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                if let Some(server) = socket_handle.tcp().server_socket.as_ref() {
+                    let endpoint = server.ip_listen_endpoint;
+                    let backlog = server.backlog?;
+                    return Some(alloc::format!(
+                        "L,{:x},{:x},{:x}",
+                        v4_to_u32(endpoint.addr),
+                        endpoint.port,
+                        backlog
+                    ));
+                }
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
+                // so there is nothing a child could match it on -- and nothing to share yet either.
+                let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
+                Some(alloc::format!(
+                    "T,{:x},{:x},{:x},{:x}",
+                    v4_to_u32(Some(local.addr)),
+                    local.port,
+                    v4_to_u32(Some(remote.addr)),
+                    remote.port
+                ))
+            }
+            Protocol::Udp => {
+                let endpoint = self.socket_set.get::<udp::Socket>(socket_handle.handle).endpoint();
+                let remote = socket_handle.udp().remote_endpoint;
+                if endpoint.port == 0 && remote.is_none() {
+                    // Never bound, never connected: the child can simply make its own.
+                    return Some(alloc::string::String::from("u"));
+                }
+                Some(alloc::format!(
+                    "U,{:x},{:x},{:x},{:x}",
+                    v4_to_u32(endpoint.addr),
+                    endpoint.port,
+                    v4_to_u32(remote.map(|ep| ep.addr)),
+                    remote.map_or(0, |ep| ep.port)
+                ))
+            }
+            Protocol::Icmp | Protocol::Raw { .. } => None,
+        }
+    }
+
+    /// Rebuilds, in a cross-process `fork()` child, the socket [`Self::fork_carry_spec`]
+    /// described: a second reference in THIS process's descriptor table to the same socket.
+    ///
+    /// Returns `None` (never panics) when the socket cannot be found or recreated -- most often
+    /// because the parent closed it, or the socket table/buffer pool is exhausted -- and the
+    /// caller then leaves the guest fd missing, which the guest sees as `EBADF`.
+    pub fn fork_adopt(&mut self, spec: &str) -> Option<SocketFd<Platform>> {
+        let mut parts = spec.split(',');
+        let kind = parts.next()?;
+        let hex = |p: Option<&str>| -> Option<u32> { u32::from_str_radix(p?, 16).ok() };
+        match kind {
+            // TCP, connected: find the one socket whose local AND remote endpoints match. Both
+            // are needed: a client's local port alone is not unique across two connections to
+            // different peers, and the pair is.
+            "T" => {
+                let (lip, lport, rip, rport) = (
+                    hex(parts.next())?,
+                    hex(parts.next())? as u16,
+                    hex(parts.next())?,
+                    hex(parts.next())? as u16,
+                );
+                let local = smoltcp::wire::IpEndpoint {
+                    addr: smoltcp::wire::IpAddress::Ipv4(u32_to_v4(lip)),
+                    port: lport,
+                };
+                let remote = smoltcp::wire::IpEndpoint {
+                    addr: smoltcp::wire::IpAddress::Ipv4(u32_to_v4(rip)),
+                    port: rport,
+                };
+                let handle = self.socket_set.iter().find_map(|(handle, socket)| {
+                    let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                        return None;
+                    };
+                    (socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote))
+                        .then_some(handle)
+                })?;
+                Some(self.new_socket_fd_for(SocketHandle {
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
+                    shutdown_wr_pending: false,
+                    handle,
+                    specific: ProtocolSpecific::Tcp(TcpSpecific {
+                        // Deliberately `None`: the parent owns the port's refcount, and a token
+                        // here would make this child's `close()` free a port the parent still
+                        // binds. `getsockname` does not need it -- a connected socket's address
+                        // comes from smoltcp's own `local_endpoint()`.
+                        local_port: None,
+                        server_socket: None,
+                        immediate_close: AtomicBool::new(false),
+                        connect_initiated_at_us: None,
+                    }),
+                    proxy: None,
+                    borrowed: true,
+                }))
+            }
+            // TCP, listening: a listening socket's own state is entirely reconstructed here --
+            // a fresh main handle plus `refill_to_backlog`'s own freshly-listening backlog
+            // sockets on the carried endpoint. Nothing of the parent's is shared except the port
+            // number, which is why this needs no `borrowed` marking and why
+            // `close_handle` may tear it down wholesale.
+            "L" => {
+                let (lip, lport, backlog) = (
+                    hex(parts.next())?,
+                    hex(parts.next())? as u16,
+                    hex(parts.next())? as u16,
+                );
+                if self.socket_set.iter().count() >= MAX_SOCKETS {
+                    return None;
+                }
+                let (rx, tx, claim) = self.buffers.tcp()?;
+                let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
+                self.buffers.adopt(handle, claim);
+                let mut server_socket = TcpServerSpecific {
+                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+                        addr: Some(smoltcp::wire::IpAddress::Ipv4(u32_to_v4(lip))),
+                        port: lport,
+                    },
+                    backlog: Some(backlog.max(1)),
+                    socket_set_handles: Vec::new(),
+                };
+                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
+                Some(self.new_socket_fd_for(SocketHandle {
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
+                    shutdown_wr_pending: false,
+                    handle,
+                    specific: ProtocolSpecific::Tcp(TcpSpecific {
+                        local_port: None,
+                        server_socket: Some(server_socket),
+                        immediate_close: AtomicBool::new(false),
+                        connect_initiated_at_us: None,
+                    }),
+                    proxy: None,
+                    borrowed: false,
+                }))
+            }
+            // UDP, bound: found by its bound endpoint (unique per the local-port allocator).
+            "U" => {
+                let (lip, lport, rip, rport) = (
+                    hex(parts.next())?,
+                    hex(parts.next())? as u16,
+                    hex(parts.next())?,
+                    hex(parts.next())? as u16,
+                );
+                let handle = self.socket_set.iter().find_map(|(handle, socket)| {
+                    let smoltcp::socket::Socket::Udp(socket) = socket else {
+                        return None;
+                    };
+                    let endpoint = socket.endpoint();
+                    (endpoint.port == lport && v4_to_u32(endpoint.addr) == lip).then_some(handle)
+                })?;
+                Some(self.new_socket_fd_for(SocketHandle {
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
+                    shutdown_wr_pending: false,
+                    handle,
+                    specific: ProtocolSpecific::Udp(UdpSpecific {
+                        remote_endpoint: (rport != 0).then(|| smoltcp::wire::IpEndpoint {
+                            addr: smoltcp::wire::IpAddress::Ipv4(u32_to_v4(rip)),
+                            port: rport,
+                        }),
+                    }),
+                    proxy: None,
+                    borrowed: true,
+                }))
+            }
+            // UDP, never bound: nothing to share, so the child gets its own fresh socket.
+            "u" => {
+                if self.socket_set.iter().count() >= MAX_SOCKETS {
+                    return None;
+                }
+                let (rx, tx, claim) = self.buffers.udp()?;
+                let handle = self.socket_set.add(udp::Socket::new(rx, tx));
+                self.buffers.adopt(handle, claim);
+                Some(self.new_socket_fd_for(SocketHandle {
+                    consider_closed: core::sync::atomic::AtomicBool::new(false),
+                    shutdown_wr_pending: false,
+                    handle,
+                    specific: ProtocolSpecific::Udp(UdpSpecific {
+                        remote_endpoint: None,
+                    }),
+                    proxy: None,
+                    borrowed: false,
+                }))
+            }
+            _ => None,
+        }
     }
 
     /// Close the socket at `fd`
@@ -1522,7 +1745,36 @@ where
             handle,
             mut specific,
             proxy,
+            borrowed,
         } = socket_handle;
+        // A BORROWED reference (a cross-process `fork()` carry, see `Network::fork_adopt`) is only
+        // this process's own handle on a socket some other process in the fork family owns, so
+        // releasing it must release exactly that and nothing else: no smoltcp `close()`/`abort()`
+        // on the shared socket, no `LocalPort` deallocation, no `closing_in_background` entry --
+        // any of those would tear down a connection the owning process is still using, which is
+        // precisely what real Linux's per-`fork()` file-descriptor refcount prevents. The one
+        // thing this process DID create for itself is a carried TCP listener's backlog sockets
+        // (`fork_adopt` refills those locally), so those are still removed; the listener's main
+        // handle is likewise locally created and is left alone, since it is not in `socket_set`'s
+        // closing path either way. Without this branch, an inherited TCP connection died the
+        // moment the child that inherited it exited -- the parent's own fd survived but pointed
+        // at an aborted socket.
+        if borrowed {
+            if let ProtocolSpecific::Tcp(tcp_specific) = &mut specific
+                && let Some(server_socket) = tcp_specific.server_socket.take()
+            {
+                for handle in server_socket.socket_set_handles {
+                    if Self::socket_set_contains(&self.socket_set, handle) {
+                        let _ =
+                            Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
+                    }
+                }
+            }
+            if let Some(proxy) = proxy {
+                proxy.set_state(socket_channel::SocketState::Closed);
+            }
+            return;
+        }
         // Stale-handle guard at each `socket_set` touch point below (see `socket_set_contains`'s
         // own doc comment): a dead-holder `reset_after_poisoning()` elsewhere may already have
         // wiped `handle` (and/or a TCP listening socket's own backlog handles) out of
@@ -2210,6 +2462,7 @@ where
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
+                    borrowed: false,
                 };
                 if let Some(peer) = peer {
                     let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
@@ -2592,6 +2845,20 @@ pub enum CloseBehavior {
     /// Close the socket in background only if there is not unsent data remaining,
     /// else return an error.
     GracefulIfNoPendingData,
+}
+
+/// Encodes an IPv4 address for [`Network::fork_carry_spec`]'s spec; `0` for "unspecified"/absent,
+/// which is this stack's only address family (see `Network::new`'s interface addresses).
+fn v4_to_u32(addr: impl Into<Option<smoltcp::wire::IpAddress>>) -> u32 {
+    match Into::<Option<smoltcp::wire::IpAddress>>::into(addr) {
+        Some(smoltcp::wire::IpAddress::Ipv4(v4)) => u32::from_be_bytes(v4.octets()),
+        _ => 0,
+    }
+}
+
+/// The inverse of [`v4_to_u32`], for [`Network::fork_adopt`].
+fn u32_to_v4(addr: u32) -> smoltcp::wire::Ipv4Address {
+    smoltcp::wire::Ipv4Address::from_octets(u32::to_be_bytes(addr))
 }
 
 crate::fd::enable_fds_for_subsystem! {

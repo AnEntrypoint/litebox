@@ -454,6 +454,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         if let Some(snap) = spec.strip_prefix("snap:") {
             return self.task.install_snapshot_at_fd(target_fd, snap);
         }
+        if let Some(inet) = spec.strip_prefix("inet:") {
+            return self.task.install_inet_at_fd(target_fd, inet);
+        }
         self.task.install_unix_at_fd(target_fd, spec)
     }
 

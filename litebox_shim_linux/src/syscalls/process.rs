@@ -3743,6 +3743,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `unix_to_carry`: the snapshot mints a named host section, which must not be leaked by a
         // fork that ends up refused.
         let mut snap_to_carry: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        // INET sockets to carry across the process boundary: the `Network` (its socket table,
+        // buffers and port refcounts) already lives in the shared arena, so a child can attach to
+        // the parent's socket by the endpoints that name it. Collected here like `unix_to_carry`.
+        let mut inet_to_carry: alloc::vec::Vec<(usize, alloc::string::String)> =
+            alloc::vec::Vec::new();
+        // An INET socket whose state cannot be named across a process boundary (Icmp/Raw, a bound
+        // but unconnected TCP socket, ...). Dropped in the child (EBADF) rather than poisoning the
+        // fork: a lost fd is an error the guest can see and survive, a fork pushed onto the
+        // thread-based relocating fallback is not -- that path faults the child before one
+        // instruction (`575f0e2`).
+        let mut dropped_inet = 0usize;
         let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
@@ -4033,6 +4044,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             "clone: dropping a close-on-exec fd rather than refusing the fork; the child would lose it at exec anyway"
                         );
                     }
+                    // An INET socket (AF_INET/AF_INET6 TCP or UDP) now CROSSES the process
+                    // boundary. It used to fall into the `None =>` arm below, making the whole
+                    // fork "not eligible" -- so ANY process holding a TCP connection that forked
+                    // got the thread-based relocating fallback, which faults the child before its
+                    // first instruction. That is the worst possible outcome for a guest, and it
+                    // was silent. The `Network` already lives in the shared arena, so the child
+                    // attaches to the parent's very socket (found by endpoint) instead of
+                    // reopening anything: a carried connection is marked borrowed, so the child
+                    // closing it does not tear down the parent's. A listener or an unbound UDP
+                    // socket is recreated in the child.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "socket" => {
+                        match self.raw_fd_inet_carry(*raw_fd) {
+                            Some(spec) => inet_to_carry.push((*raw_fd, spec)),
+                            None => {
+                                dropped_inet += 1;
+                                litebox_util_log::debug!(
+                                    tid:% = self.tid.get(), fd:% = raw_fd;
+                                    "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
+                                );
+                            }
+                        }
+                    }
                     // A regular file with no reachable path -- a `memfd_create` fd before its
                     // first `ftruncate`, or anything else already unlinked while still open --
                     // cannot be reopened by name and has no shared object to hand over yet, but
@@ -4086,7 +4119,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 carried_files:% = inherited_files.len(),
                 carried_eventfds:% = inherited_eventfds.len(),
                 carried_unix:% = unix_to_carry.len(),
-                carried_snapshots:% = snap_to_carry.len();
+                carried_snapshots:% = snap_to_carry.len(),
+                carried_inet:% = inet_to_carry.len();
                 "clone: cross-process fork() not eligible -- these fd subsystems cannot cross the process boundary yet; each one taught is one more fork that gets a real address space instead of the thread-based relocating fallback"
             );
             return None;
@@ -4103,9 +4137,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             tid:% = self.tid.get(),
             dropped_cloexec:% = dropped_cloexec,
             dropped_pty:% = dropped_pty,
+            dropped_inet:% = dropped_inet,
             carried_pipes:% = inherited_pipes.len(),
             carried_files:% = inherited_files.len(),
-            carried_eventfds:% = inherited_eventfds.len();
+            carried_eventfds:% = inherited_eventfds.len(),
+            carried_inet:% = inet_to_carry.len();
             "clone: cross-process fork() is eligible -- the child gets a real address space"
         );
         let Ok(parent_fs_base) = self
@@ -4448,6 +4484,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return None;
                 }
             }
+        }
+        for (raw_fd, spec) in inet_to_carry {
+            litebox_util_log::debug!(
+                tid:% = self.tid.get(), fd:% = raw_fd, spec:% = spec;
+                "clone: carrying an inet socket into the cross-process child"
+            );
+            inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                spec: alloc::format!("inet:{spec}"),
+            });
         }
         for raw_fd in unix_to_carry {
             match self.raw_fd_unix_carry(raw_fd, child_tid, true) {
