@@ -1909,6 +1909,10 @@ pub fn spawn_process_fork_child(
     // environment. See `build_child_environment_block` for why that distinction is load-bearing.
     let mut child_env: Vec<(&str, String)> = vec![
         (REEXEC_CHILD_ENV_VAR, "1".to_string()),
+        (
+            FORK_CHILD_PARENT_HOST_PID_ENV_VAR,
+            std::process::id().to_string(),
+        ),
         ("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1".to_string()),
         ("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1".to_string()),
         ("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1".to_string()),
@@ -5540,6 +5544,79 @@ pub fn mark_guest_started() {
         // SAFETY: `handle` is the event this process created in `spawn_external_fault_watchdog`
         // and never closes.
         unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as HANDLE) };
+    }
+}
+
+/// Env var carrying the SPAWNING parent's own Windows pid into a cross-process-fork child's
+/// environment block -- set unconditionally by [`spawn_process_fork_child`], read by
+/// [`arm_parent_death_watch`].
+///
+/// Deliberately NOT `lazy_fork_commit::FORK_CHILD_PARENT_PID_ENV_VAR`: that one is pushed only
+/// when `lazy_group_ranges` is non-empty (`spawn_process_fork_child`), so a child that took the
+/// fully-eager path (or a grandchild that inherited it) never sees it -- and it is read only for
+/// `OpenProcess(PROCESS_VM_READ, ..)`, never for liveness. This one exists solely so a child can
+/// notice its parent's DEATH, which every child needs regardless of how its memory arrived.
+pub const FORK_CHILD_PARENT_HOST_PID_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_HOST_PID";
+
+/// Child-side: exits this process when the host process that forked it is gone.
+///
+/// A cross-process-fork child is a real `CreateProcessW` sibling, not a thread of its parent, so
+/// killing the parent does NOT kill it -- and the child's waits are cross-process primitives
+/// living in the shared kernel arena (see `RawMutex`/`WaiterQueue`'s doc comments in this crate's
+/// `lib.rs`), whose state only the parent's threads were going to publish. A parent terminated
+/// mid-run therefore leaves the child spinning in user mode forever, at a full core, with no
+/// liveness check of its own to notice. This turns that into a real kernel wait:
+/// `WaitForSingleObject` on the parent's process handle is woken by the kernel the instant the
+/// parent is signalled (clean exit or `TerminateProcess` alike) and costs nothing while it waits.
+/// Called from the runner's `main()` before any guest work, so it covers the whole child lifetime.
+/// Best-effort and never fatal to a correctly-parented child: if the pid is missing or
+/// `OpenProcess` fails, no watch is armed and behavior is exactly today's.
+pub fn arm_parent_death_watch() {
+    let Some(raw) = std::env::var(FORK_CHILD_PARENT_HOST_PID_ENV_VAR).ok() else {
+        return;
+    };
+    let Ok(parent_pid) = raw.parse::<u32>() else {
+        return;
+    };
+    if parent_pid == 0 || parent_pid == std::process::id() {
+        return;
+    }
+    // `SYNCHRONIZE` is the only access a pure death-wait needs -- deliberately not
+    // `PROCESS_TERMINATE`/`PROCESS_VM_READ`, so this can never itself kill or read the parent.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    // SAFETY: `parent_pid` is this process's own spawning parent, as recorded by
+    // `spawn_process_fork_child`; a stale/pid-reused value can only ever make this wait on an
+    // unrelated live process (harmless: the watch then never fires) or fail outright (handled).
+    let handle =
+        unsafe { windows_sys::Win32::System::Threading::OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+    if handle.is_null() {
+        // Cannot watch the parent: either it is already gone, or this process is not allowed to
+        // open it (a lower-integrity/protected target). Returning un-watched is strictly today's
+        // behavior, and is the safe direction -- exiting here on an `OpenProcess` failure that is
+        // merely a permissions artifact would kill a healthy, correctly-parented child.
+        return;
+    }
+    // A raw `HANDLE` is a `*mut c_void` and therefore not `Send`, so carry it across the
+    // thread boundary as a plain integer and re-cast inside -- the handle value itself is what
+    // Windows keys the object on, in this process, and nothing else touches it.
+    let handle_value = handle as usize;
+    let spawned = std::thread::Builder::new()
+        .name("parent-death-watch".into())
+        .spawn(move || {
+            let handle = handle_value as HANDLE;
+            // SAFETY: `handle` is an owned `SYNCHRONIZE` handle opened just above, closed only
+            // after this wait returns. `INFINITE` is correct: this thread exists for nothing but
+            // this one wait, so there is no bounded timeout to report and no work to do early.
+            unsafe { WaitForSingleObject(handle, INFINITE) };
+            unsafe { CloseHandle(handle) };
+            // `ExitProcess`, not a panic: a guest may be mid-syscall on every other thread and
+            // none of them has a correct exit path once the process that owned their shared state
+            // is gone.
+            std::process::exit(0);
+        });
+    if spawned.is_err() {
+        // SAFETY: owned handle, no watcher thread exists to use it.
+        unsafe { CloseHandle(handle) };
     }
 }
 
