@@ -9862,7 +9862,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// different object here than the parent's, so the parent's `Arc`s cannot simply be copied.
     /// An interest whose target did not survive the fork is dropped and counted, not fatal: the
     /// alternative is the whole fd being absent, which is what a daemon's `epoll_wait` reads as
-    /// `EBADF` (`dbus-daemon --fork`, `xproc10`/`xproc11`).
+    /// `EBADF`.
     pub(crate) fn install_epoll_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
         let (cloexec, interests) = spec.split_once('|')?;
         let cloexec = cloexec == "1";

@@ -3758,11 +3758,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Epoll sets to carry: an epoll instance is process-local state (its interests hold `Arc`s
         // into this process's descriptor table), so what crosses is the INTEREST LIST, which the
         // child re-registers against its own rebuilt descriptors -- see
-        // `EpollFile::fork_carry_spec`. A daemon that builds its loop and then forks
-        // (`dbus-daemon --fork`: bind, `epoll_create1`, register, fork, parent exits) has no other
-        // way to get a working loop in the child: Linux shares the instance itself across `fork()`,
-        // and dropping the fd gave that child `EBADF` on its first `epoll_wait` and killed it
-        // ~50 ms in (`xproc10`/`xproc11`).
+        // `EpollFile::fork_carry_spec`. Linux shares the instance itself across `fork()`, so a
+        // daemon that builds its loop and then forks must get a working loop in the child; dropping
+        // the fd instead hands it `EBADF` on its first `epoll_wait`.
         let mut epoll_to_carry: alloc::vec::Vec<(usize, alloc::string::String)> =
             alloc::vec::Vec::new();
         for raw_fd in &beyond_stdio_fds {
