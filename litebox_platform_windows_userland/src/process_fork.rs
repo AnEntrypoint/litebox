@@ -276,9 +276,7 @@ pub const RESUME_CHILD_READY_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_READY";
 pub const RESUME_CHILD_FD_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_FD_OK";
 
 /// Whether the CURRENT process is a `CreateProcess`-spawned diagnostic resume child (pass 114),
-/// checked by the runner's `main()` before clap-parsing argv. `std::env::var` (not `var_os`) is
-/// deliberate: the marker's value is meaningless, only presence matters, and this mirrors
-/// [`diag_process_fork_spawn_enabled`]'s own presence-check style.
+/// checked by the runner's `main()` before clap-parsing argv.
 #[must_use]
 pub fn is_diagnostic_resume_child() -> bool {
     std::env::var_os(REEXEC_CHILD_ENV_VAR).is_some()
@@ -1332,9 +1330,6 @@ pub(crate) fn export_parent_writable_layer_for_child() -> Option<std::path::Path
         );
     }
     match export_result {
-        // Publish this export as the boot tree's new canonical "latest" snapshot -- see
-        // `CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment -- and hand the child THAT path, not
-        // the now-possibly-renamed-away unique one.
         Ok(()) => {
             let publish_t0 = std::time::Instant::now();
             let published = publish_as_container_fs_snapshot(path);
@@ -1432,19 +1427,16 @@ impl ChildPipeEnd {
         }
     }
 
-    /// Whether the child writes into the OS pipe (the parent-side bridge is a `Sink`).
     #[must_use]
     pub fn child_writes(self) -> bool {
         matches!(self, Self::ChildWrites | Self::ChildWritesCloexec)
     }
 
-    /// Whether the guest fd this pipe rebuilds is close-on-exec.
     #[must_use]
     pub fn cloexec(self) -> bool {
         matches!(self, Self::ChildWritesCloexec | Self::ChildReadsCloexec)
     }
 
-    /// This direction, marked close-on-exec when `cloexec`.
     #[must_use]
     pub fn with_cloexec(self, cloexec: bool) -> Self {
         match (self.child_writes(), cloexec) {
@@ -1455,7 +1447,6 @@ impl ChildPipeEnd {
         }
     }
 
-    /// Parse [`Self::tag`].
     #[must_use]
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag {
@@ -1812,7 +1803,6 @@ pub fn diagnostic_spawn_and_copy(
             source_group,
             *dest_base,
             &mut read_source_bytes,
-            // Diagnostic-only spawn: nothing was exported for it, so nothing is carried.
             &[],
         ));
     }
@@ -1861,8 +1851,6 @@ pub fn diagnostic_spawn_and_copy(
         }
     }
 
-    // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
-    // ever resumed -- see the guard's own doc comment.
     Ok(results)
 }
 
@@ -2067,8 +2055,6 @@ pub fn spawn_process_fork_child(
     // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets
     // around to reading it.
     let parent_layer = export_parent_writable_layer_for_child();
-    // Pushed UNCONDITIONALLY, empty when there is nothing to hand over.
-    //
     // `build_child_environment_block` copies this process's own environment and skips whatever is
     // being overridden -- so an entry that is merely omitted here is inherited instead. A
     // cross-process child is itself a fork parent for its own children, and it already carries
@@ -2123,11 +2109,9 @@ pub fn spawn_process_fork_child(
             .join(",");
         child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
     }
-    // Pushed UNCONDITIONALLY, empty when this process has no shared mapping to carry, for exactly
-    // the reason `FORK_CHILD_PARENT_LAYER_ENV_VAR` above is: an omitted entry is INHERITED, and a
-    // cross-process child is itself a fork parent, so omitting it would let a grandchild adopt its
-    // grandparent's shared regions -- addresses this child never mapped and objects it may not
-    // even hold.
+    // An omitted entry is INHERITED, and a cross-process child is itself a fork parent, so
+    // omitting it would let a grandchild adopt its grandparent's shared regions -- addresses this
+    // child never mapped and objects it may not even hold.
     //
     // This is the whole point of the mechanism: `carried_shared` names the shared objects behind
     // this process's `VM_SHARED` mappings, and the child re-opens them BY NAME to get its own
@@ -2354,10 +2338,6 @@ pub fn spawn_process_fork_child(
             );
         }
         let group_t0 = std::time::Instant::now();
-        // A LAZY group holding a `VM_SHARED` region cannot take the lazy route: lazy reserves the
-        // group's span and lets the child fault its pages in, which for a shared region would
-        // fault in a PRIVATE copy of the object's bytes. Sharing wins over laziness here, so such a
-        // group goes through the placeholder route (which commits its non-shared part eagerly).
         let has_shared = carried_shared
             .iter()
             .any(|c| c.range.start < source_group.end && source_group.start < c.range.end);
@@ -3419,7 +3399,7 @@ fn observe_real_resume_fault(child_pid: u32) {
             }
             // Keep watching: a VEH-handled exception may be followed by a SECOND, unhandled one
             // (e.g. the guest instruction retried and faulted again, or a different guest
-            // instruction faults next) -- bounded by the same 3s deadline as the outer loop.
+            // instruction faults next).
             continue;
         }
         unsafe {
@@ -5397,7 +5377,6 @@ pub const WAIT4_PROBE_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_WAIT4_PROBE_CHILD"
 /// [`WAIT4_PROBE_CHILD_ENV_VAR`] child should exit with.
 pub const WAIT4_PROBE_EXIT_CODE_ENV_VAR: &str = "LITEBOX_INTERNAL_WAIT4_PROBE_EXIT_CODE";
 
-/// Whether the CURRENT process is a [`WAIT4_PROBE_CHILD_ENV_VAR`]-marked child.
 #[must_use]
 pub fn is_wait4_probe_child() -> bool {
     std::env::var_os(WAIT4_PROBE_CHILD_ENV_VAR).is_some()
@@ -5648,7 +5627,6 @@ pub fn spawn_external_fault_watchdog() {
         std::env::remove_var(WATCHDOG_TARGET_PID_ENV_VAR);
     }
     if ok == 0 {
-        // Best-effort, see doc comment above -- not fatal.
         return;
     }
     // Neither handle is needed past spawn: this watchdog child is deliberately unsupervised

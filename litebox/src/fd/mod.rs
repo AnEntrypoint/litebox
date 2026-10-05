@@ -28,15 +28,10 @@ pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
-    /// Explicitly crate-internal: Create a new empty descriptor table.
-    ///
-    /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
-    /// be invoked anywhere else in the codebase.
     pub(crate) fn new_from_litebox_creation() -> Self {
         Self { entries: vec![] }
     }
 
-    /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     #[expect(
         clippy::missing_panics_doc,
         reason = "panics impossible due to type invariants"
@@ -160,7 +155,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             return None;
         };
         if Arc::strong_count(&old.x) == 1 {
-            // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
@@ -169,14 +163,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     .unwrap();
                 Some(CloseResult::Closed(entry))
             } else {
-                // Put it back
                 let old = self.entries[idx].replace(old);
                 assert!(old.is_none());
                 Some(CloseResult::Deferred)
             }
         } else {
             fd.x.mark_as_closed();
-            // Shared, so we need to duplicate it.
             let old = self.entries[idx].replace(old);
             assert!(old.is_none());
             Some(CloseResult::Duplicated(TypedFd {
@@ -237,16 +229,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fds: &mut [Option<TypedFd<Subsystem>>],
     ) -> Vec<Subsystem::Entry> {
-        // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
-        // we have the same number of FDs as matching to the strong-count of a descriptor entry,
-        // then it must be the case that we have everything needed to close the entries out.
+        // A queued count equal to the entry's strong count means every reference to it is in
+        // `fds`, so nothing outside `fds` can still reach it.
         let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            let mut strong_and_queued_counts = HashMap::<*const _, (usize, usize)>::new();
             for fd in fds.iter().flatten() {
-                // `None` here means either a real closed-fd (the ordinary, previously-anticipated
-                // case -- see the historical comment this replaced) or a foreign-process index
-                // this table cannot resolve (see this function's own doc comment) -- both skip
-                // identically; there is no way, or need, to tell them apart from here.
                 let Some(idx) = fd.x.as_usize() else { continue };
                 let Some(Some(entry)) = self.entries.get(idx) else {
                     continue;
@@ -254,18 +241,17 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !entry.read().matches_subsystem::<Subsystem>() {
                     continue;
                 }
-                strong_count_and_count
+                strong_and_queued_counts
                     .entry(Arc::as_ptr(&entry.x))
                     .or_insert((Arc::strong_count(&entry.x), 0))
                     .1 += 1;
             }
-            strong_count_and_count
+            strong_and_queued_counts
                 .into_iter()
-                .filter(|(_ptr, (sc, c))| sc == c)
+                .filter(|(_ptr, (strong_count, queued_count))| strong_count == queued_count)
                 .map(|(ptr, _)| ptr)
                 .collect()
         };
-        // Now we can actually go and remove every single such FD.
         let entries: Vec<Subsystem::Entry> = {
             let mut entries = vec![];
             for slot in fds.iter_mut() {
@@ -281,10 +267,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !removable_entries.contains(&entry_ptr) {
                     continue;
                 }
-                // This FD is removable
                 let entry = self.remove(fd);
                 if let Some(entry) = entry {
-                    // This is the last of the individual entries that were holding a ref to this.
                     entries.push(entry);
                 }
                 *slot = None;
@@ -311,7 +295,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fds: &mut [Option<TypedFd<Subsystem>>],
     ) -> Vec<Subsystem::Entry> {
         let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            let mut strong_and_queued_counts = HashMap::<*const _, (usize, usize)>::new();
             for fd in fds.iter().flatten() {
                 let Some(idx) = fd.x.as_usize() else { continue };
                 let Some(Some(entry)) = self.entries.get(idx) else {
@@ -321,14 +305,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !guard.matches_subsystem::<Subsystem>() {
                     continue;
                 }
-                strong_count_and_count
+                strong_and_queued_counts
                     .entry(Arc::as_ptr(&entry.x))
                     .or_insert((Arc::strong_count(&entry.x), 0))
                     .1 += 1;
             }
-            strong_count_and_count
+            strong_and_queued_counts
                 .into_iter()
-                .filter(|(_ptr, (sc, c))| sc == c)
+                .filter(|(_ptr, (strong_count, queued_count))| strong_count == queued_count)
                 .map(|(ptr, _)| ptr)
                 .collect()
         };
@@ -423,7 +407,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !e.read().matches_subsystem::<Subsystem>() {
                     return None;
                 }
-                let mut entry = e.write();
+                let entry = e.write();
                 if !entry.matches_subsystem::<Subsystem>() {
                     return None;
                 }
@@ -456,7 +440,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 if !e.try_read()?.matches_subsystem::<Subsystem>() {
                     return None;
                 }
-                let mut entry = e.try_write()?;
+                let entry = e.try_write()?;
                 if !entry.matches_subsystem::<Subsystem>() {
                     return None;
                 }
@@ -638,7 +622,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         }
     }
 
-    /// Similar to [`Self::with_metadata`] but mutable.
     pub fn with_metadata_mut<Subsystem, T, R>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -773,7 +756,6 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 /// naive derived `Clone` (which would `Arc::clone` every stored ownership token) is unsound for
 /// `fork()`'s per-process fd-table duplication.
 pub struct RawDescriptorStorage {
-    /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<StoredFd>>,
 }
 
@@ -796,7 +778,6 @@ impl StoredFd {
 
 impl RawDescriptorStorage {
     #[expect(clippy::new_without_default)]
-    /// Create a new raw descriptor store.
     pub fn new() -> Self {
         Self { stored_fds: vec![] }
     }
@@ -926,7 +907,6 @@ impl RawDescriptorStorage {
         // the requested slot is bounded by that limit rather than by an arbitrary constant that
         // turned a legal request into a panic.
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
-            // There's already something at this slot.
             return false;
         }
         if raw_fd >= self.stored_fds.len() {
@@ -974,7 +954,6 @@ impl RawDescriptorStorage {
         self.stored_fds.get(fd).is_some_and(Option::is_some)
     }
 
-    /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
     pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
         self.stored_fds
             .iter()
@@ -988,7 +967,6 @@ macro_rules! multi_subsystem_generic {
         /// Invoke the corresponding function that matches the subsystem.
         ///
         /// Equivalent versions of this function exist at differing number of subsystems.
-        // One callback per subsystem, generated per arity by this macro.
         #[allow(clippy::too_many_arguments)]
         fn $ident_f<R, $($subsystem),+>(
             &self,
@@ -1104,14 +1082,12 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
     }
 }
 
-/// A crate-internal entry for a descriptor.
 pub(crate) struct DescriptorEntry {
     entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
     metadata: AnyMap,
 }
 
 impl DescriptorEntry {
-    /// Check if this entry matches the specified subsystem
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
         core::any::TypeId::of::<Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
@@ -1160,7 +1136,6 @@ pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
 }
 
 impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
-    /// Get the "internal FD"
     pub(crate) fn as_internal_fd(&self) -> InternalFd {
         assert!(!self.x.is_closed());
         InternalFd { raw: self.x.raw }
@@ -1195,12 +1170,10 @@ impl OwnedFd {
         }
     }
 
-    /// Check if it is closed
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(core::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Mark it as closed
     pub(crate) fn mark_as_closed(&self) {
         let was_closed = self
             .closed

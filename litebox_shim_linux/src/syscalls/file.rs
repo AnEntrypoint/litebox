@@ -591,7 +591,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.fd_paths.write().insert(raw_fd, path);
     }
 
-    /// Look up the absolute path a raw file fd was opened with, if any.
     pub(crate) fn lookup_fd_path(&self, raw_fd: usize) -> Option<CString> {
         self.fd_paths.read().get(&raw_fd).cloned()
     }
@@ -624,8 +623,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         shmids
     }
 
-    // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
-    // Err(typed_fd)
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
         &self,
         typed_fd: TypedFd<Subsystem>,
@@ -1540,16 +1537,13 @@ impl RecordLock {
     }
 }
 
-/// Path in the file system
 #[derive(Debug)]
 enum FsPath {
-    /// Absolute path
     Absolute { path: CString },
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
     FdRelative { fd: u32, path: CString },
-    /// Fd
     Fd(u32),
 }
 
@@ -1886,7 +1880,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
-    /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
         let old_mask = self
@@ -1897,7 +1890,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Mode::from_bits_retain(old_mask)
     }
 
-    /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         litebox_util_log::debug!(
@@ -1912,7 +1904,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `openat`
     pub fn sys_openat(
         &self,
         dirfd: i32,
@@ -2273,7 +2264,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
-    /// Handle syscall `ftruncate`
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
         litebox_util_log::debug!(
             tid:% = self.tid.get(), fd:% = fd, length:% = length;
@@ -3167,7 +3157,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,
         dirfd: i32,
@@ -3304,7 +3293,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `renameat`/`renameat2`
     pub(crate) fn sys_renameat(
         &self,
         olddirfd: i32,
@@ -3359,7 +3347,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `linkat`
     pub(crate) fn sys_linkat(
         &self,
         olddirfd: i32,
@@ -3392,7 +3379,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `symlinkat`
     pub(crate) fn sys_symlinkat(
         &self,
         target: impl path::Arg,
@@ -3972,13 +3958,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         res
     }
 
-    /// Handle syscall `pread64`
     pub fn sys_pread64(&self, fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_read(fd, buf, Some(pos))
     }
 
-    /// Handle syscall `pwrite64`
     pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
@@ -4014,7 +3998,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
-    /// Handle syscall `sendfile`
     pub(crate) fn sys_sendfile(
         &self,
         out_fd: i32,
@@ -4403,7 +4386,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `mkdirat`
     pub(crate) fn sys_mkdirat(
         &self,
         dirfd: i32,
@@ -4488,7 +4470,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
-    /// Handle syscall `chown`/`lchown`/`fchownat`.
     pub(crate) fn sys_fchownat(
         &self,
         dirfd: i32,
@@ -4779,7 +4760,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `close`
     /// Handle syscall `close_range`
     ///
     /// Closes every open descriptor in `first..=last`, or -- with `CLOSE_RANGE_CLOEXEC` -- marks
@@ -4932,7 +4912,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.check_raw_fd_exists(fd)
     }
 
-    /// Handle syscall `preadv`
     pub(crate) fn sys_preadv(
         &self,
         fd: i32,
@@ -4953,7 +4932,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `pwritev`
     pub(crate) fn sys_pwritev(
         &self,
         fd: i32,
@@ -4974,7 +4952,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `readv`
     pub(crate) fn sys_readv(
         &self,
         fd: i32,
@@ -5052,7 +5029,6 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
     Ok(())
 }
 
-/// Drain reads into a sequence of user iovecs.
 fn read_from_iovec<F, Platform: ShimPlatform>(
     iovs: &[IoReadVec],
     kernel_buffer: &mut [u8],
@@ -5150,7 +5126,6 @@ where
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `writev`
     pub(crate) fn sys_writev(
         &self,
         fd: i32,
@@ -5259,7 +5234,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
 
-    /// Handle syscall `faccessat`
     pub(crate) fn sys_faccessat(
         &self,
         dirfd: i32,
@@ -5337,12 +5311,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(Errno::from)
     }
 
-    /// Handle syscall `readlink`
     pub fn sys_readlink(&self, pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
         self.sys_readlinkat(litebox_common_linux::AT_FDCWD, pathname, buf)
     }
 
-    /// Handle syscall `readlinkat`
     pub fn sys_readlinkat(
         &self,
         dirfd: i32,
@@ -5781,7 +5753,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `stat`
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
         litebox_util_log::debug!(tid:% = self.tid.get(), path:? = pathname; "sys_stat: entry");
@@ -5808,7 +5779,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_stat(pathname, false)
     }
 
-    /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
         litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = fd; "sys_fstat: entry");
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -5856,7 +5826,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `newfstatat`
     pub(crate) fn sys_newfstatat(
         &self,
         dirfd: i32,
@@ -5887,7 +5856,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `statx`
     pub(crate) fn sys_statx(
         &self,
         dirfd: i32,
@@ -6746,14 +6714,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::path::Arg as _;
 
-        // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
         let resolved = self.resolve_path(pathname)?;
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
         // `chdir` follows a symlink in the final component (`chdir link-to-dir` is how
         // `s6-supervise` enters each `/run/service/<name> -> servicedir`); `file_status` does not.
         let abs_path = self.resolve_final_symlinks(abs_path)?;
 
-        // Verify the path exists and is a directory.
         match self.files.borrow().fs.file_status(abs_path.as_str()) {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
@@ -6888,7 +6854,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let pipe = self.global.create_linux_pipe(flags)?;
 
@@ -7067,7 +7032,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    /// Handle syscall `timerfd_settime`.
     pub fn sys_timerfd_settime(
         &self,
         fd: i32,
@@ -7169,7 +7133,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `timerfd_gettime`.
     pub fn sys_timerfd_gettime(
         &self,
         fd: i32,
@@ -7599,7 +7562,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -8517,7 +8479,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(0)
     }
 
-    /// Handle syscall `epoll_create` and `epoll_create1`
     pub fn sys_epoll_create(&self, flags: EpollCreateFlags) -> Result<u32, Errno> {
         litebox_util_log::debug!(flags:? = flags; "sys_epoll_create: entry");
         if flags.intersects(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
@@ -8547,7 +8508,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    /// Handle syscall `epoll_ctl`
     pub(crate) fn sys_epoll_ctl(
         &self,
         epfd: i32,
@@ -8604,7 +8564,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `epoll_pwait`
     pub fn sys_epoll_pwait(
         &self,
         epfd: i32,
@@ -8700,7 +8659,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `ppoll`.
     pub fn sys_ppoll(
         &self,
         fds: UserPtrMut<litebox_common_linux::Pollfd>,
@@ -8772,7 +8730,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Write just the revents back.
         let fds_base_addr = fds.as_usize();
         let mut ready_count = 0;
         for (i, revents) in set.revents().enumerate() {
@@ -8882,7 +8839,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(ready_count)
     }
 
-    /// Handle syscall `pselect`.
     pub(crate) fn sys_pselect(
         &self,
         nfds: u32,
@@ -10016,7 +9972,6 @@ const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,
         fd: i32,
@@ -10056,7 +10011,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
-                        // not enough space
                         if nbytes == 0 {
                             // not enough space for even a single entry
                             return Err(Errno::EINVAL);
