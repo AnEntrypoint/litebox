@@ -499,8 +499,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                             | Some(EpollDescriptor::Pty(_))
                     )
             })
-            .map(|(key, entry)| (key.0, entry.clone()))
+            .map(|(key, entry)| (key.0, key.1, entry.clone()))
             .collect();
+        // An interest whose target this process can no longer poll at all -- its fd was closed, or
+        // the number now names something else -- is dropped here rather than re-polled forever:
+        // `close(2)` takes an fd out of every epoll set that holds it, so a `None` from
+        // `EpollEntry::poll` (as opposed to `Some((None, _))`, "open but not ready") is terminal.
+        // Left in place, such an entry is re-polled on every 15ms repoll tick for the rest of the
+        // session and each poll re-reports the failure: 12,696 `epoll poll with socket fd: EBADF`
+        // warnings in one 900s chromium run (chrF4), 38% of that run's whole log.
+        let mut unpolllable: alloc::vec::Vec<EpollEntryKey> = alloc::vec::Vec::new();
         litebox_util_log::trace!(
             tid:% = diag_tid,
             epfd:% = diag_epfd,
@@ -518,9 +526,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         static REPOLL_UNIX_DIAG_COUNTER: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
         let call_idx = REPOLL_UNIX_DIAG_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        for (fd, entry) in entries {
+        for (fd, entry_ptr, entry) in entries {
             let is_unix = matches!(entry.desc.upgrade(), Some(EpollDescriptor::Unix(_)));
             let result = entry.poll(global);
+            if result.is_none() {
+                unpolllable.push(EpollEntryKey(fd, entry_ptr));
+                continue;
+            }
             // ROOT CAUSE (2026-09-20, live-confirmed via cursor/mask tracing): `EpollEntry::poll`
             // returns `(event: Option<EpollEvent>, is_still_ready: bool)`. `is_still_ready` means
             // "keep auto-requeuing this entry for CONTINUOUS reporting" and is unconditionally
@@ -551,6 +563,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             if has_event {
                 self.ready.push(&entry);
             }
+        }
+        if !unpolllable.is_empty() {
+            let mut interests = self.interests.lock();
+            for key in unpolllable.iter() {
+                interests.remove(key);
+            }
+            litebox_util_log::debug!(
+                tid:% = diag_tid,
+                epfd:% = diag_epfd,
+                dropped:% = unpolllable.len();
+                "DIAG repoll: dropped epoll interest(s) whose fd can no longer be polled"
+            );
         }
     }
 

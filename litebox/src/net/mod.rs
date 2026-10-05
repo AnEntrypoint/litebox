@@ -178,6 +178,17 @@ where
     /// is reachable, and a stale mark (a slot reused after a close) only costs an extra pull,
     /// never a lost byte -- see [`Self::drain_socket_channel_buffers`].
     shared_across_fork: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    /// Backlog slots already handed out by [`Self::accept`], so that no second process of the fork
+    /// family hands the same connection out again. Fixed, pointer-free and `MAX_SOCKETS`-sized for
+    /// the same reason as `closing_in_background` above.
+    ///
+    /// `fork()` shares a listening socket's open file description, so parent and child accept from
+    /// ONE queue, and a connection in that queue belongs to whichever of them takes it first. The
+    /// queue itself is the set of smoltcp slots armed on the listen endpoint -- shared already --
+    /// but each process's `TcpServerSpecific::socket_set_handles` list is its own, so a slot is
+    /// claimed here at `accept` time and skipped by every later scan. Cleared when a slot is armed
+    /// back into LISTEN (a reused slot must be claimable again).
+    accepted_slots: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -245,6 +256,7 @@ where
             queued_for_closure: core::array::from_fn(|_| None),
             closing_in_background: [None; MAX_SOCKETS],
             shared_across_fork: [None; MAX_SOCKETS],
+            accepted_slots: [None; MAX_SOCKETS],
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -1160,8 +1172,109 @@ where
             .any(|marked| *marked == Some(handle))
     }
 
+    /// Records that `handle` -- a backlog slot of some listening port -- has been handed out by
+    /// `accept`, so no other process of the fork family hands the same connection out again.
+    /// These four take the array itself rather than `&self` because the one caller that matters,
+    /// [`Self::accept`], holds a borrow of `self.litebox` (the descriptor table) across them; the
+    /// array and `socket_set` are disjoint fields, so naming them keeps that borrow legal.
+    fn mark_accepted_in(
+        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        handle: smoltcp::iface::SocketHandle,
+    ) {
+        if Self::is_accepted_in(accepted_slots, handle) {
+            return;
+        }
+        if let Some(slot) = accepted_slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(handle);
+        }
+    }
+
+    fn is_accepted_in(
+        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        handle: smoltcp::iface::SocketHandle,
+    ) -> bool {
+        accepted_slots
+            .iter()
+            .any(|marked| *marked == Some(handle))
+    }
+
+    /// Forgets the claim on `handle`, for a slot armed back into LISTEN: the same smoltcp slot
+    /// index gets reused for the port's next connection, which must be claimable again.
+    fn clear_accepted_in(
+        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        handle: smoltcp::iface::SocketHandle,
+    ) {
+        for slot in accepted_slots.iter_mut() {
+            if *slot == Some(handle) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// A connection queued for `port` that no process has accepted yet: an established slot whose
+    /// local endpoint is the listen port (a slot still in LISTEN has no remote endpoint at all,
+    /// and one already accepted is marked in [`Self::accepted_slots`]).
+    ///
+    /// This is what makes a listening socket shared across `fork()`: the queue is the shared set
+    /// of smoltcp slots armed on the endpoint, not any one process's
+    /// `TcpServerSpecific::socket_set_handles`, so a fork child -- whose own list is empty, because
+    /// it must not arm a SECOND listener competing for the same SYNs -- accepts from the queue its
+    /// parent owns, exactly as Linux hands one connection to whichever of them calls `accept`
+    /// first.
+    fn unclaimed_connection_on(
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        port: u16,
+    ) -> Option<smoltcp::iface::SocketHandle> {
+        socket_set.iter().find_map(|(handle, socket)| {
+            let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                return None;
+            };
+            let established = matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            );
+            let on_port = socket
+                .local_endpoint()
+                .is_some_and(|local| local.port == port);
+            let claimed = accepted_slots.iter().any(|marked| *marked == Some(handle));
+            (established && on_port && socket.remote_endpoint().is_some() && !claimed)
+                .then_some(handle)
+        })
+    }
+
+    /// Forgets every claim whose slot is no longer an unaccepted connection -- a slot is handed
+    /// out once and then either dies with its connection or is armed back into LISTEN for the
+    /// port's next one, and smoltcp reuses a freed slot index, so the mark cannot simply stay.
+    fn reap_stale_claims_in(
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    ) {
+        let stale: alloc::vec::Vec<smoltcp::iface::SocketHandle> = accepted_slots
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|handle| {
+                !socket_set.iter().any(|(live, socket)| {
+                    live == *handle
+                        && matches!(socket, smoltcp::socket::Socket::Tcp(socket) if matches!(
+                            socket.state(),
+                            tcp::State::Established | tcp::State::CloseWait
+                        ))
+                })
+            })
+            .collect();
+        for handle in stale {
+            Self::clear_accepted_in(accepted_slots, handle);
+        }
+    }
+
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
+        // Stale accept claims would suppress BOTH the readiness sweep below and `accept` itself
+        // (see `Network::reap_stale_claims`), and this is the one place that runs for every
+        // process on every tick whether or not anything is accepted.
+        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
         // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
         let Some(table) = self.litebox.try_descriptor_table() else {
             return;
@@ -1174,6 +1287,7 @@ where
                 now,
                 shared_across_fork,
                 false,
+                &self.accepted_slots,
             );
         }
         // Separate pass: the repair needs to mutate each entry, and the drain above deliberately
@@ -1336,6 +1450,7 @@ where
         now: smoltcp::time::Instant,
         shared_across_fork: bool,
         pull_rx: bool,
+        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
@@ -1448,7 +1563,7 @@ where
                 if let Some(server_socket) = tcp_specific.server_socket.as_ref()
                     && !proxy.is_readable()
                 {
-                    server_socket
+                    let pending = server_socket
                         .socket_set_handles
                         .iter()
                         .any(|&h| {
@@ -1467,11 +1582,24 @@ where
                                     tcp::State::Established | tcp::State::CloseWait
                                 )
                             }
+                            // A slot another process of the fork family already accepted is not
+                            // pending for this one (see `Network::accepted_slots`).
+                            && !accepted_slots.iter().any(|marked| *marked == Some(h))
                         })
-                        .then(|| {
-                            proxy.set_readable(true);
-                            proxy.notify_io_event(Events::IN);
-                        });
+                        // A fork child's own list is empty by design -- it shares its parent's
+                        // queue instead of arming a second listener on the same port -- so queued
+                        // connections are looked for on the endpoint itself, or the child would
+                        // never be reported readable and never accept a thing.
+                        || Self::unclaimed_connection_on(
+                            socket_set,
+                            accepted_slots,
+                            server_socket.ip_listen_endpoint.port,
+                        )
+                        .is_some();
+                    if pending {
+                        proxy.set_readable(true);
+                        proxy.notify_io_event(Events::IN);
+                    }
                 }
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
@@ -1556,6 +1684,7 @@ where
             now,
             shared_across_fork,
             true,
+            &self.accepted_slots,
         );
         true
     }
@@ -1828,11 +1957,20 @@ where
                     borrowed: true,
                 }))
             }
-            // TCP, listening: a listening socket's own state is entirely reconstructed here --
-            // a fresh main handle plus `refill_to_backlog`'s own freshly-listening backlog
-            // sockets on the carried endpoint. Nothing of the parent's is shared except the port
-            // number, which is why this needs no `borrowed` marking and why
-            // `close_handle` may tear it down wholesale.
+            // TCP, listening: the child gets a SECOND REFERENT of the listening socket, not a
+            // second listener. Arming its own backlog slots here used to give the port two
+            // independent accept queues -- the parent's and the child's -- both `listen()`ing on
+            // the same endpoint in the shared smoltcp set, so an incoming SYN went to whichever
+            // smoltcp matched first and the other queue sat empty: a child that inherits a
+            // listening socket and is the one that runs the accept loop (exactly what a server
+            // that forks per client does) accepted nothing, while connections already queued on
+            // the parent went unserved until the parent got round to them. Measured as selkies'
+            // published 8081 answering one request and then refusing every connect in 20ms for
+            // the rest of a 900s run (chrF4), against the same recipe holding code=200 throughout
+            // before CLOEXEC sockets crossed a fork (chrF3). Linux shares the open file
+            // description, so the child accepts from the queue the parent owns: no slots are
+            // armed here, and `accept`/the readiness sweep look for queued connections on the
+            // endpoint itself (`Network::unclaimed_connection_on`).
             "L" => {
                 let (lip, lport, backlog) = (
                     hex(parts.next())?,
@@ -1845,28 +1983,28 @@ where
                 let (rx, tx, claim) = self.buffers.tcp()?;
                 let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
-                let mut server_socket = TcpServerSpecific {
-                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(u32_to_v4(lip))),
-                        port: lport,
-                    },
-                    backlog: Some(backlog.max(1)),
-                    socket_set_handles: Vec::new(),
-                    no_slot_listening_reported: false,
-                };
-                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port: None,
-                        server_socket: Some(server_socket),
+                        server_socket: Some(TcpServerSpecific {
+                            ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+                                addr: Some(smoltcp::wire::IpAddress::Ipv4(u32_to_v4(lip))),
+                                port: lport,
+                            },
+                            backlog: Some(backlog.max(1)),
+                            socket_set_handles: Vec::new(),
+                            no_slot_listening_reported: false,
+                        }),
                         immediate_close: AtomicBool::new(false),
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
-                    borrowed: false,
+                    // The port's listening slots belong to the parent: this process's own close
+                    // must not tear the queue down, same as every other borrowed arm.
+                    borrowed: true,
                 }))
             }
             // UDP, bound: found by its bound endpoint (unique per the local-port allocator).
@@ -1987,6 +2125,7 @@ where
                             now,
                             shared_across_fork,
                             false,
+                            &self.accepted_slots,
                         );
                     }
                 }
@@ -2631,6 +2770,7 @@ where
                             now,
                             shared_across_fork,
                             false,
+                            &self.accepted_slots,
                         );
                     } else {
                         let pending_in_channel = socket_handle
@@ -2824,7 +2964,13 @@ where
                     );
                     server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 }
-                let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
+                let own_ready = {
+                    // A claim outlives the connection it marked only until the slot is armed back
+                    // into LISTEN, and smoltcp reuses a freed slot index, so claims are reaped
+                    // before any scan -- otherwise one stale mark strands the next connection
+                    // that lands on that slot (neither scan would offer it to anybody).
+                    Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
+                    server_socket.socket_set_handles.iter().position(|&h| {
                     Self::socket_set_contains(&self.socket_set, h) && {
                         let socket: &tcp::Socket = self.socket_set.get(h);
                         // Linux hands a connection out of the accept queue even once its peer's FIN
@@ -2840,18 +2986,43 @@ where
                             tcp::State::Established | tcp::State::CloseWait
                         )
                     }
-                }) else {
-                    if let Some(proxy) = &socket_handle.proxy {
-                        proxy.set_readable(false);
+                    // A slot another process of this fork family already took is not pending here
+                    // (see `Network::accepted_slots`): parent and child accept from ONE queue.
+                    && !Self::is_accepted_in(&self.accepted_slots, h)
+                })
+                };
+                let ready_handle = match own_ready {
+                    Some(position) => {
+                        let ready_handle = server_socket.socket_set_handles.swap_remove(position);
+                        Self::mark_accepted_in(&mut self.accepted_slots, ready_handle);
+                        server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
+                        ready_handle
                     }
-                    return Err(AcceptError::NoConnectionsReady);
+                    // Nothing in this process's own backlog: a connection can still be queued on
+                    // the endpoint itself, armed there by whichever process owns this port's
+                    // listening slots -- which is the only state a fork child sharing its parent's
+                    // listener ever sees, since it arms none of its own. The borrower never
+                    // refills: adding slots here would be arming a SECOND listener on the port.
+                    None => {
+                        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
+                        let Some(ready_handle) = Self::unclaimed_connection_on(
+                            &self.socket_set,
+                            &self.accepted_slots,
+                            server_socket.ip_listen_endpoint.port,
+                        ) else {
+                            if let Some(proxy) = &socket_handle.proxy {
+                                proxy.set_readable(false);
+                            }
+                            return Err(AcceptError::NoConnectionsReady);
+                        };
+                        Self::mark_accepted_in(&mut self.accepted_slots, ready_handle);
+                        ready_handle
+                    }
                 };
                 if let Some(proxy) = &socket_handle.proxy {
                     // reset the readable flag so that we send one [`Events::In`] event per accepted connection
                     proxy.set_readable(false);
                 }
-                let ready_handle = server_socket.socket_set_handles.swap_remove(position);
-                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 let local_port = handle
                     .local_port
                     .as_ref()
