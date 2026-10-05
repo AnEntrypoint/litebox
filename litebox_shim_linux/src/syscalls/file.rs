@@ -9650,16 +9650,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .unwrap_or(false)
     }
 
-    /// Task-level wrapper around `FilesState::raw_fd_is_addressless_unix_socket_pair` (`net.rs`)
-    /// -- see that method's own doc comment for the full rationale. Used by
-    /// `try_cross_process_fork` to carry (not silently drop) a `socketpair(2)`-originated CLOEXEC
-    /// fd.
-    pub(crate) fn raw_fd_is_addressless_unix_socket_pair(&self, raw_fd: usize) -> bool {
-        self.files
-            .borrow()
-            .raw_fd_is_addressless_unix_socket_pair(&self.global, raw_fd)
-    }
-
     /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
     pub(crate) fn raw_fd_unix_carry_check(&self, raw_fd: usize) -> Option<Result<(), &'static str>> {
         self.files

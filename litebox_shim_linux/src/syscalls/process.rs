@@ -3971,19 +3971,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         );
                     }
                     // A unix socket is carried: a connection is promoted onto a shared slot both
-                    // processes use, a listener is rebuilt in the child, an unbound fresh socket
-                    // is recreated (`UnixSocket::fork_carry`). Close-on-exec ones are carried
-                    // only when they are an addressless `socketpair(2)` end: that is the fd a
-                    // child really uses before exec (54th pass: `dbus-daemon`'s activation
-                    // babysitter reports its pid over one, so dropping it made every D-Bus
-                    // activation "exit, reason unknown"). Any other close-on-exec unix socket --
-                    // the X11 and D-Bus client connections every desktop process holds -- is
-                    // dropped by the rule below, which avoids moving every such connection onto a
-                    // slow, capacity-bounded shared slot on each fork.
-                    None if self.raw_fd_subsystem_name(*raw_fd) == "unix-socket"
-                        && (!self.raw_fd_is_cloexec(*raw_fd)
-                            || self.raw_fd_is_addressless_unix_socket_pair(*raw_fd)) =>
-                    {
+                    // processes use (once per connection, never once per fork -- `promote_for_fork`
+                    // reuses the slot it already allocated), a listener is rebuilt in the child, an
+                    // unbound fresh socket is recreated (`UnixSocket::fork_carry`).
+                    //
+                    // `FD_CLOEXEC` does not excuse dropping one. It is a statement about `execve()`,
+                    // not about `fork()`: real Linux keeps the fd alive in the child between the
+                    // two, and a child that never execs at all uses it normally. The carry re-applies
+                    // `FD_CLOEXEC` in the child (`install_unix_at_fd`), so the fd still vanishes at
+                    // exec exactly as the guest asked. Dropping it here instead loses it for the
+                    // whole fork-to-exec window, and silently: Python marks EVERY socket it creates
+                    // `SOCK_CLOEXEC` (PEP 446), so before this no unix socket a Python process held
+                    // ever reached a forked child -- `xproc6`'s child read
+                    // `OSError: [Errno 9] Bad file descriptor` from `getsockname()` on the listener
+                    // its parent had just bound and handed it, while the fork itself looked healthy.
+                    // The same drop is why `dbus-daemon --fork` never answered on an address
+                    // `--nofork` served from the same process (`xproc4`/`xproc5`): `--fork` is
+                    // exactly bind-then-fork, so the daemon's listener never reached the daemon.
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "unix-socket" => {
                         match self.raw_fd_unix_carry_check(*raw_fd) {
                             Some(Ok(())) => unix_to_carry.push(*raw_fd),
                             refusal => {
