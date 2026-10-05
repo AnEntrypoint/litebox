@@ -942,10 +942,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                     slot:% = self.slot, n_fds:% = msg.fds.len();
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
                      files, pty slaves, eventfds, shm/memfd snapshots and unix sockets that \
-                     `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound \
-                     socket, or a listener); a bound-but-unconnected socket, a connect in \
-                     progress and a bound or connected DATAGRAM socket are refused -- refusing \
-                     the send with EOPNOTSUPP rather than dropping the fds"
+                     `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound or \
+                     bound-but-unconnected socket, or a listener); a connect in progress and a \
+                     bound or connected DATAGRAM socket are refused -- refusing the send with \
+                     EOPNOTSUPP rather than dropping the fds"
                 );
                 return Err((msg, Errno::EOPNOTSUPP));
             };
@@ -5011,8 +5011,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     pub(super) fn fork_carry_check(&self) -> Result<(), &'static str> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
-                UnixStreamState::Init(init) if init.addr.is_none() => Ok(()),
-                UnixStreamState::Init(_) => Err("unix-socket(bound,unconnected)"),
+                // A bound-but-unconnected socket carries as `B`: the address is all the state it
+                // has beyond the two shutdown bits, and both survive the encode (Linux would hand
+                // over a dup sharing the same bound socket; litebox rebuilds one bound to the same
+                // name, which is the same approximation a carried listener `L` already makes).
+                UnixStreamState::Init(_) => Ok(()),
                 UnixStreamState::Listen(_) | UnixStreamState::Connected(_) => Ok(()),
                 UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
             }),
@@ -5061,7 +5064,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             UnixSocketInner::Stream(stream) => {
                 let seq = u8::from(stream.preserve_boundaries);
                 stream.with_state_ref(|state| match state {
-                    UnixStreamState::Init(_) => Ok((alloc::format!("I,{seq}"), None)),
+                    UnixStreamState::Init(init) => {
+                        let Some(addr) = init.addr.as_ref() else {
+                            return Ok((alloc::format!("I,{seq}"), None));
+                        };
+                        Ok((
+                            alloc::format!(
+                                "B,{seq},{},{},{}",
+                                encode_unix_addr(&UnixSocketAddr::from(addr)),
+                                u8::from(init.read_shutdown.load(Ordering::Acquire)),
+                                u8::from(init.write_shutdown.load(Ordering::Acquire))
+                            ),
+                            None,
+                        ))
+                    }
                     UnixStreamState::Listen(listen) => {
                         let backlog = &listen.backlog;
                         let cred = backlog.listener_cred;
@@ -5269,6 +5285,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             let seq = fields.next()? == "1";
             let state = match kind {
                 "I" => UnixStreamState::Init(UnixInitStream::new()),
+                "B" => {
+                    let addr = decode_unix_addr(fields.next()?)?;
+                    let read_shutdown = fields.next() == Some("1");
+                    let write_shutdown = fields.next() == Some("1");
+                    // Opened, not created: the carrier already bound it, so the socket file (if
+                    // any) exists and this process only re-opens the same name -- exactly what a
+                    // carried listener `L` does. A name that cannot be re-opened degrades to
+                    // `UnopenedPath`, so `getsockname` still reports the address.
+                    let addr = match (addr.clone().bind(task, false), addr) {
+                        (Ok(bound), _) => bound,
+                        (Err(err), UnixSocketAddr::Path(path)) => {
+                            litebox_util_log::debug!(
+                                path:% = path, err:? = err;
+                                "carried bound unix socket: could not open its socket file; keeping \
+                                 the name only"
+                            );
+                            UnixBoundSocketAddr::UnopenedPath(path)
+                        }
+                        (Err(_), _) => return None,
+                    };
+                    UnixStreamState::Init(UnixInitStream {
+                        addr: Some(addr),
+                        pollee: Pollee::new(),
+                        read_shutdown: AtomicBool::new(read_shutdown),
+                        write_shutdown: AtomicBool::new(write_shutdown),
+                    })
+                }
                 "L" => {
                     let limit = fields.next()?.parse().ok()?;
                     let cred = Ucred {
