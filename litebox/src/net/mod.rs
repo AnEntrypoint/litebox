@@ -115,18 +115,13 @@ where
         + platform::SharedKernelStateProvider,
 {
     litebox: LiteBox<Platform>,
-    /// The set of sockets
     socket_set: smoltcp::iface::SocketSet<'static>,
-    /// The actual "physical" device, that connects to the platform
     device: phy::Device<Platform>,
-    /// The smoltcp network interface
     interface: smoltcp::iface::Interface,
     /// Initial instant of creation, used as an arbitrary stop point from when time begins
     zero_time: Platform::Instant,
-    /// An allocator for local ports
     // TODO: Maybe we should have separate allocators for TCP, UDP, ...?
     local_port_allocator: LocalPortAllocator,
-    /// Whether outside interaction is automatic or manual
     platform_interaction: PlatformInteraction,
     /// FDs that are queued for eventual closure. A fixed, pointer-free, `MAX_SOCKETS`-capacity
     /// array of slots (`None` == empty), NOT a `Vec` (as this used to be) -- same fix, same
@@ -304,7 +299,6 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     shutdown_wr_pending: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
-    // Protocol-specific data
     specific: ProtocolSpecific,
     /// The proxy associated with this socket to enable lock-free data transfer
     /// and event notification
@@ -345,7 +339,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
         }
     }
 
-    // Convenience function to perform a mutable operation depending on the socket type
     fn with_socket_mut<TCP, UDP, R>(
         &mut self,
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
@@ -388,7 +381,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::DerefMut
     }
 }
 
-/// The [`ProtocolSpecific`] stores socket-type-specific data
 #[expect(
     dead_code,
     reason = "these might eventually get used, they exist for completeness sake"
@@ -400,25 +392,18 @@ pub(crate) enum ProtocolSpecific {
     Raw(RawSpecific),
 }
 
-/// Socket-specific data for TCP sockets
 pub(crate) struct TcpSpecific {
-    /// A local port associated with this socket, if any
     local_port: Option<LocalPort>,
-    /// Server socket specific data
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
-    /// Timestamp when `connect` was initiated
     connect_initiated_at_us: Option<smoltcp::time::Instant>,
 }
 
-/// Socket-specific data for TCP server sockets
 struct TcpServerSpecific {
-    /// IP listening endpoint, if used as a server socket
     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint,
     /// Specified backlog via `listen`, no packets can be `accept`ed unless this is `Some`
     backlog: Option<u16>,
-    /// Handles into the top-level `socket_set` for when things are `accept`ed.
     socket_set_handles: Vec<smoltcp::iface::SocketHandle>,
 }
 
@@ -469,7 +454,6 @@ impl TcpServerSpecific {
     }
 }
 
-/// Socket-specific data for UDP sockets
 pub(crate) struct UdpSpecific {
     /// Remote endpoint
     ///
@@ -477,10 +461,8 @@ pub(crate) struct UdpSpecific {
     remote_endpoint: Option<smoltcp::wire::IpEndpoint>,
 }
 
-/// Socket-specific data for ICMP sockets
 pub(crate) struct IcmpSpecific {}
 
-/// Socket-specific data for RAW sockets
 pub(crate) struct RawSpecific {
     protocol: u8,
 }
@@ -490,7 +472,6 @@ pub(crate) struct RawSpecific {
     reason = "the dead ones exist for completeness sake, might eventually get used"
 )]
 impl ProtocolSpecific {
-    /// Get the [`Protocol`] for this socket
     fn protocol(&self) -> Protocol {
         match self {
             ProtocolSpecific::Tcp(_) => Protocol::Tcp,
@@ -575,14 +556,10 @@ pub enum PlatformInteraction {
     Manual,
 }
 
-/// Direction of polling for platform interaction
 #[derive(Clone, Copy)]
 enum PollDirection {
-    /// Ingress (receiving) direction
     Ingress,
-    /// Egress (sending) direction
     Egress,
-    /// Both directions
     Both,
 }
 
@@ -605,7 +582,6 @@ pub enum PlatformInteractionReinvocationAdvice {
     },
 }
 impl PlatformInteractionReinvocationAdvice {
-    /// Convenience function to match against [`Self::CallAgainImmediately`]
     #[must_use]
     pub fn call_again_immediately(self) -> bool {
         matches!(self, Self::CallAgainImmediately)
@@ -1013,7 +989,6 @@ where
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                // check if there is pending data to be sent
                 if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
                 {
@@ -1057,14 +1032,12 @@ where
         }
     }
 
-    /// Whether `handle` is reachable from another process of the fork family as well.
     fn is_shared_across_fork(&self, handle: smoltcp::iface::SocketHandle) -> bool {
         self.shared_across_fork
             .iter()
             .any(|marked| *marked == Some(handle))
     }
 
-    /// Drain all socket channel buffers
     fn drain_all_socket_channel_buffers(&mut self) {
         let now = self.now();
         // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
@@ -1080,6 +1053,78 @@ where
                 shared_across_fork,
             );
         }
+        // Separate pass: the repair needs to mutate each entry, and the drain above deliberately
+        // takes a shared guard so a guest thread blocked in `read()` on a socket cannot starve
+        // its own bytes. A contended entry is skipped here and caught by the next tick.
+        for (_, mut entry) in table.iter_mut_nowait::<Network<Platform>>() {
+            Self::repair_listening_backlog(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut entry.entry,
+            );
+        }
+    }
+
+    /// Keep a listening port's backlog armed, whatever took a slot away.
+    ///
+    /// `accept` re-arms on the slots it sees, but it is only called when the port already looks
+    /// readable -- so a port whose every slot went stale (a dead-holder `reset_after_poisoning()`
+    /// elsewhere wiped them out of the shared socket set, see `socket_set_contains`'s doc comment)
+    /// gets NO `accept` call at all, and nothing else in the stack ever re-arms it: every later
+    /// SYN is refused for the rest of the session while the connections it already accepted keep
+    /// working. Same for a `refill_to_backlog` that found the socket table full: the slot it could
+    /// not create is never retried once the table drains. Both were live-measured as one symptom
+    /// (chrD92: an in-guest `curl 127.0.0.1:8081` was refused from t=120s to the end of the run
+    /// while selkies' accepted websocket went on streaming).
+    ///
+    /// Only stale slots (no longer in the socket set) are dropped here -- a slot that is still in
+    /// the set is never removed from it by this sweep, because the sweep runs from EVERY process's
+    /// tick over a socket set shared across the fork family, and dropping a socket another process
+    /// allocated runs its ring buffers through the wrong heap (see `remove_dead_sockets`).
+    fn repair_listening_backlog(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        buffers: &mut SocketBuffers,
+        socket_handle: &mut SocketHandle<Platform>,
+    ) {
+        if socket_handle
+            .consider_closed
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
+            return;
+        };
+        let Some(server_socket) = tcp_specific.server_socket.as_mut() else {
+            return;
+        };
+        let Some(backlog) = server_socket.backlog else {
+            return;
+        };
+        let handles_before = server_socket.socket_set_handles.len();
+        server_socket
+            .socket_set_handles
+            .retain(|&handle| Self::socket_set_contains(socket_set, handle));
+        let went_fully_dead =
+            server_socket.socket_set_handles.is_empty() && handles_before > 0;
+        // Nothing to do when the port is armed to its backlog: `accept` handles the slots it
+        // reaches, including any that are still in the socket set but no longer open.
+        if server_socket.socket_set_handles.len() == handles_before
+            && handles_before >= backlog.into()
+        {
+            return;
+        }
+        if went_fully_dead {
+            litebox_util_log::warn!(
+                port = server_socket.ip_listen_endpoint.port;
+                "diag-listener: every backlog slot of this listening port went stale, re-arming it"
+            );
+        }
+        // Nothing to re-arm with; the next sweep retries once a slot frees up.
+        if socket_set.iter().count() >= MAX_SOCKETS {
+            return;
+        }
+        server_socket.refill_to_backlog(socket_set, buffers);
     }
 
     /// Drain data between socket channels and smoltcp sockets.
@@ -1117,7 +1162,6 @@ where
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
 
-                // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
                     let sent = proxy
                         .pop_tx_data_with(|data| tcp_socket.send_slice(data).unwrap_or_default());
@@ -1133,8 +1177,6 @@ where
                     tcp_socket.close();
                 }
 
-                // Drain RX buffer: from smoltcp directly to ring buffer.
-                //
                 // NOT done when this socket has a referent in another process of the fork family
                 // and nothing here is waiting on it: a proxy is a PER-PROCESS object, so bytes
                 // this tick hands to a proxy nobody reads are unreachable from the process that
@@ -1174,10 +1216,8 @@ where
                 {
                     proxy.mark_peer_closed();
                 }
-                // Update socket state in the channel
                 // server socket that is listening also has closed state
                 if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
-                    // Determine error based on previous socket state
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
                             // Socket closed while connecting. Distinguish RST from timeout.
@@ -1191,7 +1231,6 @@ where
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
-                            // Connection was reset by peer
                             proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
@@ -1225,7 +1264,6 @@ where
                 let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
                 let remote_endpoint = socket_handle.udp().remote_endpoint;
 
-                // Drain TX queue: try to send datagrams, consume only on success
                 while udp_socket.can_send() {
                     // Try to send - consumes datagram only if closure returns true
                     let result = udp_proxy.try_send_datagram_with(|data, addr| {
@@ -1243,7 +1281,6 @@ where
                         }
                     });
                     if result != Some(true) {
-                        // Either queue empty or send failed
                         break;
                     }
                 }
@@ -1304,8 +1341,6 @@ where
         + sync::RawSyncPrimitivesProvider
         + platform::SharedKernelStateProvider,
 {
-    /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
-    /// initialized arbitrary 0-point in time.
     fn now(&self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_micros(
             // This conversion from u128 to i64 should practically never fail, since 2^63
@@ -1397,7 +1432,6 @@ where
         }))
     }
 
-    /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
     }
@@ -1661,7 +1695,6 @@ where
         }
     }
 
-    /// Close the socket at `fd`
     pub fn close(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1671,7 +1704,6 @@ where
         // `&mut self.socket_set`, so it cannot also borrow all of `self` to ask for the time.
         let now = self.now();
         let mut dt = self.litebox.descriptor_table_mut();
-        // We close immediately if we can
         match dt
             .close_and_duplicate_if_shared(fd, |entry| {
                 match behavior {
@@ -1769,14 +1801,10 @@ where
             .ok_or(CloseError::InvalidFd)?
         {
             super::fd::CloseResult::Closed(socket_handle) => {
-                // Can immediately close it out.
                 drop(dt);
                 self.close_handle(socket_handle.entry);
             }
             super::fd::CloseResult::Duplicated(dup_fd) => {
-                // It seems like there might be other duplicates around (e.g., due to `dup`), so we
-                // can't immediately close it out.
-                // We attempt to queue it for future closure and then just return.
                 if let Some(slot) = self.queued_for_closure.iter_mut().find(|s| s.is_none()) {
                     *slot = Some(dup_fd);
                 }
@@ -1825,7 +1853,6 @@ where
     /// were closed.
     fn attempt_to_close_queued(&mut self) -> bool {
         if self.queued_for_closure.iter().all(Option::is_none) {
-            // fast path
             return false;
         }
         // Never park in here. This runs on the net worker with `net_lock` -- an arena-resident,
@@ -1850,7 +1877,6 @@ where
         true
     }
 
-    /// Close the `socket_handle`
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
             consider_closed: _,
@@ -1922,7 +1948,6 @@ where
             Protocol::Tcp => {
                 let tcp_specific = specific.tcp_mut();
                 if let Some(server_socket) = tcp_specific.server_socket.take() {
-                    // remove all listening sockets in the backlog
                     for handle in server_socket.socket_set_handles {
                         if Self::socket_set_contains(&self.socket_set, handle) {
                             let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
@@ -1983,7 +2008,6 @@ where
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                     match state {
                         tcp::State::Established => {
-                            // already connected
                             Ok(())
                         }
                         tcp::State::Closed | tcp::State::TimeWait => {
@@ -2082,7 +2106,6 @@ where
         result
     }
 
-    /// Get the local address and port a socket is bound to.
     pub fn get_local_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, LocalAddrError> {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
@@ -2171,7 +2194,6 @@ where
         }
     }
 
-    /// Get the remote address and port a socket is connected to, if any.
     pub fn get_remote_addr(&self, fd: &SocketFd<Platform>) -> Result<SocketAddr, RemoteAddrError> {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
@@ -2181,7 +2203,6 @@ where
         self.get_remote_addr_for_handle(socket_handle)
     }
 
-    /// Get the remote address and port a `SocketHandle` is connected to, if any.
     fn get_remote_addr_for_handle(
         &self,
         socket_handle: &SocketHandle<Platform>,
@@ -2533,14 +2554,30 @@ where
                 // (twenty-eighth pass) as a real `"handle does not refer to a valid socket"` panic
                 // that killed a whole cross-process-fork child's guest-execution thread outright
                 // (this was selkies' own `accept()` call).
+                let handles_before_retain = server_socket.socket_set_handles.len();
                 server_socket.socket_set_handles.retain(|&h| {
                     Self::socket_set_contains(&self.socket_set, h) && {
                         let socket: &tcp::Socket = self.socket_set.get(h);
                         socket.is_open()
                     }
                 });
-                // Find a socket that has progressed further in its TCP state machine, by finding a
-                // socket in an established state
+                // A backlog slot dropped here is a socket nobody is listening on any more, so the
+                // port must be re-armed to its backlog in BOTH arms: with every handle gone the
+                // port has NO socket left listening, every later SYN is refused, no handle can
+                // ever become `Established` again, and so `drain_socket_channel_buffers`'s
+                // readable re-arm never fires either -- the port stays dead for the rest of the
+                // session while the connections it already accepted keep working (chrD92: an
+                // in-guest `curl 127.0.0.1:8081` was refused from t=120s to the end of the run
+                // while selkies' accepted websocket went on streaming).  The success arm refills
+                // after its own `swap_remove` below; this is the other one.
+                let stale_dropped = handles_before_retain - server_socket.socket_set_handles.len();
+                if stale_dropped > 0 {
+                    litebox_util_log::warn!(
+                        dropped = stale_dropped;
+                        "diag-accept: listening backlog slot(s) went stale, re-arming the listener"
+                    );
+                    server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
+                }
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
                     Self::socket_set_contains(&self.socket_set, h) && {
                         let socket: &tcp::Socket = self.socket_set.get(h);
@@ -2548,7 +2585,6 @@ where
                     }
                 }) else {
                     if let Some(proxy) = &socket_handle.proxy {
-                        // No connections are ready; make sure the readable flag is cleared
                         proxy.set_readable(false);
                     }
                     return Err(AcceptError::NoConnectionsReady);
@@ -2557,19 +2593,14 @@ where
                     // reset the readable flag so that we send one [`Events::In`] event per accepted connection
                     proxy.set_readable(false);
                 }
-                // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
-                // Refill to the backlog, so that we can have more listening sockets again if needed
                 server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
-                // Grab the local port again, so we can put it into the new `TcpSpecific`
                 let local_port = handle
                     .local_port
                     .as_ref()
                     .map(|lp| self.local_port_allocator.allocate_same_local_port(lp));
-                // Release the locks, needed to be able to use `self` below
                 drop(table_entry);
                 drop(descriptor_table);
-                // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -2620,7 +2651,6 @@ where
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 if destination.is_some() {
-                    // TCP is connection-oriented, so no destination address should be provided
                     return Err(SendError::UnnecessaryDestinationAddress);
                 }
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
@@ -2712,7 +2742,6 @@ where
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 if let Some(source_addr) = source_addr {
-                    // TCP is connection-oriented, so no need to provide a source address
                     *source_addr = None;
                 }
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
@@ -2790,7 +2819,6 @@ where
         ret
     }
 
-    /// Set TCP options
     pub fn set_tcp_option(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -2831,7 +2859,6 @@ where
             }
         }
     }
-    /// Get TCP options
     pub fn get_tcp_option(
         &self,
         fd: &SocketFd<Platform>,
