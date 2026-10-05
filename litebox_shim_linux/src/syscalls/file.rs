@@ -9832,6 +9832,117 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(())
     }
 
+    /// See `EpollFile::fork_carry_spec` (`epoll.rs`). `None` when `raw_fd` is not an epoll fd.
+    ///
+    /// Unlike every other carry this one ships no shared object and no reopenable name: it ships
+    /// the interest list, which the child re-registers against its own rebuilt descriptors.
+    pub(crate) fn raw_fd_epoll_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
+        let files = self.files.borrow();
+        let epoll_fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(raw_fd)
+            .ok()?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)?;
+        let spec = handle.with_entry(|entry| entry.fork_carry_spec());
+        drop(files);
+        Some(alloc::format!("{}|{spec}", u8::from(self.raw_fd_is_cloexec(raw_fd))))
+    }
+
+    /// Rebuilds, at exactly `target_fd`, an epoll set a cross-process fork parent carried (see
+    /// `Task::raw_fd_epoll_carry`). `spec` is `<cloexec 0|1>|<interest>[,<interest>...]`, an
+    /// interest being `<target fd>:<events>:<data>`.
+    ///
+    /// The child gets a fresh `EpollFile` and re-registers each interest against its OWN
+    /// descriptor for the same fd number -- its carried listening socket, eventfd or pipe is a
+    /// different object here than the parent's, so the parent's `Arc`s cannot simply be copied.
+    /// An interest whose target did not survive the fork is dropped and counted, not fatal: the
+    /// alternative is the whole fd being absent, which is what a daemon's `epoll_wait` reads as
+    /// `EBADF` (`dbus-daemon --fork`, `xproc10`/`xproc11`).
+    pub(crate) fn install_epoll_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, interests) = spec.split_once('|')?;
+        let cloexec = cloexec == "1";
+        let flags = if cloexec {
+            litebox_common_linux::EpollCreateFlags::EPOLL_CLOEXEC
+        } else {
+            litebox_common_linux::EpollCreateFlags::empty()
+        };
+        let raw = i32::try_from(self.sys_epoll_create(flags).ok()?).ok()?;
+        let epfd = if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            if !moved {
+                return None;
+            }
+            target_fd
+        } else {
+            raw
+        };
+        let epfd_u32 = u32::try_from(epfd).ok()?;
+        let files = self.files.borrow();
+        let epoll_fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd as usize)
+            .ok()?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)?;
+        let mut restored = 0usize;
+        let mut lost = 0usize;
+        for item in interests.split(',').filter(|s| !s.is_empty()) {
+            let mut parts = item.split(':');
+            let parsed = parts
+                .next()
+                .and_then(|f| f.parse::<u32>().ok())
+                .zip(parts.next().and_then(|e| e.parse::<u32>().ok()))
+                .zip(parts.next().and_then(|d| d.parse::<u64>().ok()));
+            let Some(((fd, events), data)) = parsed else {
+                lost += 1;
+                continue;
+            };
+            // `epoll_ctl` refuses an epoll set registering itself; Linux answers EINVAL.
+            if fd == epfd_u32 {
+                lost += 1;
+                continue;
+            }
+            let Ok(target) = super::epoll::EpollDescriptor::try_from(&files, fd as usize) else {
+                lost += 1;
+                litebox_util_log::debug!(
+                    epfd:% = epfd, target_fd:% = fd;
+                    "fork child: a carried epoll interest names an fd that did not survive the fork; it is left unregistered"
+                );
+                continue;
+            };
+            let event = litebox_common_linux::EpollEvent { events, data };
+            match handle.with_entry(|entry| {
+                entry.add_interest(&self.global, fd, &target, event, self.pid.get())
+            }) {
+                Ok(()) => restored += 1,
+                Err(errno) => {
+                    lost += 1;
+                    litebox_util_log::debug!(
+                        epfd:% = epfd, target_fd:% = fd, errno:? = errno;
+                        "fork child: a carried epoll interest could not be re-registered here"
+                    );
+                }
+            }
+        }
+        litebox_util_log::debug!(
+            epfd:% = epfd, restored:% = restored, lost:% = lost;
+            "fork child: rebuilt a carried epoll set"
+        );
+        Some(())
+    }
+
     pub(crate) fn raw_fd_subsystem_name(&self, raw_fd: usize) -> &'static str {
         let files = self.files.borrow();
         files

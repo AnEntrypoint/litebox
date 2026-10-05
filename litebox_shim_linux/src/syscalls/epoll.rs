@@ -628,7 +628,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
     }
 
-    fn add_interest(
+    /// Parent side of carrying this epoll set into a cross-process `fork()` child: the interest
+    /// list, as `<target fd>:<events>:<data>` triples joined by `,`.
+    ///
+    /// An epoll instance is process-local state -- every interest holds an `Arc` into THIS
+    /// process's descriptor table -- so unlike a pipe or a unix socket it has no shared object to
+    /// hand over. It is also not something a forking child may lose. Linux `fork()` shares the
+    /// epoll instance itself: each interest stays registered and keeps naming the same open file
+    /// descriptions, so a daemon that builds its event loop and THEN forks keeps a working loop in
+    /// the child. Dropping the fd instead gave that child `EBADF` on its own loop's `epoll_wait`
+    /// about 50 ms into its life: `dbus-daemon --fork` -- bind, `epoll_create1`, register, fork,
+    /// parent exits -- died `exit(1)` there, and the bus address it had already printed answered
+    /// `ECONNREFUSED`, while `--nofork` (which never forks) served the very same bus
+    /// (`xproc10`/`xproc11`; a python child measured `errno=9` on its inherited epoll fd while its
+    /// carried listening socket still accepted).
+    ///
+    /// The child recreates the instance and re-registers each interest against its own rebuilt
+    /// descriptor for the same fd number (`Task::install_epoll_at_fd`) -- what `rebind_inherited`
+    /// above already does for the in-process case. An interest whose target fd did not itself
+    /// survive the fork cannot be restored, the same degradation any uncarriable fd already has.
+    pub(crate) fn fork_carry_spec(&self) -> alloc::string::String {
+        let interests = self.interests.lock();
+        let mut spec = alloc::string::String::new();
+        for (key, entry) in interests.iter() {
+            // A stale entry (its descriptor is gone) would only be refused by the child's
+            // re-registration; naming it here would count it as a lost interest.
+            if entry.desc.upgrade().is_none() {
+                continue;
+            }
+            let (events, data) = {
+                let inner = entry.inner.lock();
+                (inner.mask.bits() | inner.flags.bits(), inner.data)
+            };
+            if !spec.is_empty() {
+                spec.push(',');
+            }
+            spec.push_str(alloc::format!("{}:{}:{}", key.0, events, data).as_str());
+        }
+        spec
+    }
+
+    pub(crate) fn add_interest(
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         fd: u32,

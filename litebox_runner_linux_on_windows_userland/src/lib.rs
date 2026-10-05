@@ -1980,6 +1980,12 @@ fn diag_process_fork_task_resume_probe(
     }
 
     // Rebuild the unix sockets the parent carried (`litebox::platform::ForkInheritedShimFd`).
+    //
+    // An `epoll:` entry is deferred, not installed here: an epoll interest names a TARGET fd and
+    // is re-registered against the descriptor this child rebuilt at that number, so every other
+    // carried fd -- eventfds above, these sockets, the regular files and the pipes below -- has to
+    // be in place first. They are installed just before guest execution starts.
+    let mut deferred_epolls: std::vec::Vec<(i32, String)> = std::vec::Vec::new();
     if let Some(spec) = take_fork_env(pf::FORK_CHILD_SHIM_FDS_ENV_VAR)
         && let Some(spec) = spec.to_str()
     {
@@ -1995,6 +2001,10 @@ fn diag_process_fork_task_resume_probe(
                 );
                 continue;
             };
+            if spec.starts_with("epoll:") {
+                deferred_epolls.push((fd, spec));
+                continue;
+            }
             if entrypoints.install_shim_fd_at_fd(fd, &spec).is_none() {
                 eprintln!(
                     "[process_fork_diag] task-resume-probe (child): could not rebuild carried unix socket at guest fd {fd} (spec {spec:?}), it will be missing"
@@ -2308,6 +2318,17 @@ fn diag_process_fork_task_resume_probe(
         }
     })
         .expect("failed to spawn cross-process fork child's net_worker thread");
+
+    for (fd, spec) in deferred_epolls {
+        match entrypoints.install_shim_fd_at_fd(fd, &spec) {
+            Some(()) => eprintln!(
+                "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt as a carried epoll set"
+            ),
+            None => eprintln!(
+                "[process_fork_diag] task-resume-probe (child): could not rebuild a carried epoll set at guest fd {fd}, it will be missing"
+            ),
+        }
+    }
 
     eprintln!(
         "[process_fork_diag] task-resume-probe (child, winpid={} guest_pid={pid}): built Task, set fs_base={:#x}, calling \

@@ -522,6 +522,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         if let Some(inet) = spec.strip_prefix("inet:") {
             return self.task.install_inet_at_fd(target_fd, inet);
         }
+        if let Some(epoll) = spec.strip_prefix("epoll:") {
+            return self.task.install_epoll_at_fd(target_fd, epoll);
+        }
         self.task.install_unix_at_fd(target_fd, spec)
     }
 

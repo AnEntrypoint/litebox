@@ -3755,6 +3755,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // instruction (`575f0e2`).
         let mut dropped_inet = 0usize;
         let mut dropped_process_local = 0usize;
+        // Epoll sets to carry: an epoll instance is process-local state (its interests hold `Arc`s
+        // into this process's descriptor table), so what crosses is the INTEREST LIST, which the
+        // child re-registers against its own rebuilt descriptors -- see
+        // `EpollFile::fork_carry_spec`. A daemon that builds its loop and then forks
+        // (`dbus-daemon --fork`: bind, `epoll_create1`, register, fork, parent exits) has no other
+        // way to get a working loop in the child: Linux shares the instance itself across `fork()`,
+        // and dropping the fd gave that child `EBADF` on its first `epoll_wait` and killed it
+        // ~50 ms in (`xproc10`/`xproc11`).
+        let mut epoll_to_carry: alloc::vec::Vec<(usize, alloc::string::String)> =
+            alloc::vec::Vec::new();
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
                 dropped_process_local += 1;
@@ -4065,7 +4075,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `dup2` of stdio and the exec itself -- and a child that does not exec at all
                     // is already outside what the cross-process path can serve, since it is a
                     // different Windows process with none of the parent's live shim state.
-                    None if matches!(self.raw_fd_subsystem_name(*raw_fd), "epoll" | "netlink") => {
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "epoll" => {
+                        match self.raw_fd_epoll_carry(*raw_fd) {
+                            Some(spec) => epoll_to_carry.push((*raw_fd, spec)),
+                            None => {
+                                dropped_process_local += 1;
+                                litebox_util_log::debug!(
+                                    tid:% = self.tid.get(), fd:% = raw_fd;
+                                    "clone: dropping an epoll fd this process cannot describe rather than refusing the fork; the child sees EBADF on it"
+                                );
+                            }
+                        }
+                    }
+                    None if self.raw_fd_subsystem_name(*raw_fd) == "netlink" => {
                         dropped_process_local += 1;
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(),
@@ -4543,6 +4565,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return None;
                 }
             }
+        }
+        // LAST, after every other carried fd: an epoll interest names a target fd, and the child
+        // re-registers it against the descriptor it rebuilt for that number -- so the target has
+        // to be in place first. (The runner installs these after the regular-file pass too, for
+        // the same reason -- see `litebox_runner_linux_on_windows_userland`'s install loop.)
+        for (raw_fd, spec) in epoll_to_carry {
+            litebox_util_log::debug!(
+                tid:% = self.tid.get(), fd:% = raw_fd, spec:% = spec;
+                "clone: carrying an epoll set into the cross-process child"
+            );
+            inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                spec: alloc::format!("epoll:{spec}"),
+            });
         }
         let fork_slot = self.reserve_cross_process_fork_slot();
         // UNCONDITIONAL, and BEFORE the spawn: the platform reads this export while the child is
