@@ -114,7 +114,13 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
-            unreachable!();
+            // Same shape as `close_and_duplicate_if_shared`: the number outlived its entry, so
+            // there is no entry to hand back. `close(2)`-reachable, so EBADF, never a panic.
+            litebox_util_log::warn!(
+                fd:% = fd.x.as_usize().unwrap_or(usize::MAX);
+                "diag-fd-remove: descriptor slot is already empty, nothing to remove"
+            );
+            return None;
         };
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
@@ -136,9 +142,22 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
-        let idx = fd.x.as_usize()?;
+        let idx = match fd.x.as_usize() {
+            Some(idx) => idx,
+            None => return None,
+        };
         let Some(old) = self.entries[idx].take() else {
-            unreachable!();
+            // Guest-reachable, and a real run reached it (chrD91: `unreachable` at this line
+            // killed a cross-process fork child's guest-execution thread). An owned, unclosed
+            // `TypedFd` whose slot is empty means the number outlived its entry -- a second
+            // close racing the first, or an fd rebuilt in a fork child without its entry. Linux
+            // answers EBADF for a close of a number nothing owns, so report it and let the caller
+            // turn that into EBADF; taking the entry out twice must never kill the session.
+            litebox_util_log::warn!(
+                fd:% = idx;
+                "diag-fd-close: descriptor slot is already empty, close() answers EBADF"
+            );
+            return None;
         };
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.

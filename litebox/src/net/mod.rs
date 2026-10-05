@@ -1794,7 +1794,14 @@ where
                         .consider_closed
                         .store(true, core::sync::atomic::Ordering::Relaxed);
                 }) else {
-                    unreachable!()
+                    // The entry vanished between the defer decision and this store -- a concurrent
+                    // close of the same number won the race. There is nothing left to defer and
+                    // nothing left to flush, so `close(2)` has succeeded as far as the guest can
+                    // tell; killing the whole session here is the one answer Linux never gives.
+                    litebox_util_log::warn!(
+                        "diag-sock-close: deferred close found no descriptor entry to mark, treating as closed"
+                    );
+                    return Ok(());
                 };
                 // `close_pending_sockets` now owns this socket: it closes once the TX ring and
                 // smoltcp's send queue have both drained.

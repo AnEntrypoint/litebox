@@ -4677,7 +4677,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     ConsumedFd::Netlink(fd)
                 } else {
-                    unreachable!("all subsystems covered")
+                    // The raw number is in this process's descriptor store but no subsystem
+                    // enumerated here claims it, so there is nothing to close and the slot stays
+                    // occupied. This is `close(2)`-reachable, so answer EBADF -- what Linux
+                    // answers for a number nothing owns -- and leave the slot alone rather than
+                    // taking the whole session down over a subsystem this path does not know.
+                    return Err(Errno::EBADF);
                 }
             }
         };
