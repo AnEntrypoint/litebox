@@ -458,25 +458,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         proxy
     }
 
+    /// A socket's stored options, or EBADF when this descriptor table holds no entry at that
+    /// number.
+    ///
+    /// A cross-process fork child is handed every fd NUMBER its parent held and only some of them
+    /// are carried -- a dropped one is documented to read EBADF there -- so an empty slot is an
+    /// ordinary thing for a guest to hold and touch. `.unwrap()` here panicked the child's host
+    /// process on its first socket call: `.wfgy/pubx2a.err` has 13 fork children, every one dead
+    /// on `called Result::unwrap() on an Err value: ClosedFd`, which then killed the run. An fd
+    /// that is not there is an errno, never a panic.
     fn with_socket_options<R>(
         &self,
         fd: &SocketFd<Platform>,
         f: impl FnOnce(&SocketOptions) -> R,
-    ) -> R {
+    ) -> Result<R, Errno> {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |opt| f(opt))
-            .unwrap()
+            .map_err(|e| match e {
+                litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })
     }
     fn with_socket_options_mut<R>(
         &self,
         fd: &SocketFd<Platform>,
         f: impl FnOnce(&mut SocketOptions) -> R,
-    ) -> R {
+    ) -> Result<R, Errno> {
         self.litebox
             .descriptor_table_mut()
             .with_metadata_mut(fd, |opt| f(opt))
-            .unwrap()
+            .map_err(|e| match e {
+                litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })
     }
 
     /// Common implementation for setsockopt for options that are stored in [`SocketOptions`]:
@@ -589,7 +604,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     }
                     _ => unreachable!(),
                 }
-                Ok::<(), Errno>(())
             })?;
             // Apply deferred TCP option after releasing the descriptor table write lock.
             if let Some(tcp_data) = deferred_tcp_option
@@ -640,7 +654,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             SocketOptionName::IPV6(v6opt) => match v6opt {
                 litebox_common_linux::Ipv6Option::V6ONLY => {
                     let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
-                    self.with_socket_options_mut(fd, |opt| opt.v6_only = val != 0);
+                    self.with_socket_options_mut(fd, |opt| opt.v6_only = val != 0)?;
                     return Ok(());
                 }
                 litebox_common_linux::Ipv6Option::UNICAST_HOPS
@@ -803,16 +817,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
-        match self.getsockopt_common(optname, optval, len, |sopt| {
-            self.with_socket_options(fd, |options| match sopt {
-                SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
-                SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
-                SocketOption::LINGER => SocketOptionValue::Timeout(options.linger_timeout),
-                SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
-                SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
-                SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
-                _ => unreachable!(),
-            })
+        // Read the options once: this fd may not be one this descriptor table holds at all (a fork
+        // child's dropped fd), and that is EBADF for the whole call rather than a panic.
+        let options = self.with_socket_options(fd, |o| o.clone())?;
+        match self.getsockopt_common(optname, optval, len, |sopt| match sopt {
+            SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
+            SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
+            SocketOption::LINGER => SocketOptionValue::Timeout(options.linger_timeout),
+            SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
+            SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
+            SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
+            _ => unreachable!(),
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
             other => return other,
@@ -825,9 +840,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 _ => return Err(Errno::ENOPROTOOPT),
             },
             SocketOptionName::IPV6(v6opt) => match v6opt {
-                litebox_common_linux::Ipv6Option::V6ONLY => {
-                    u32::from(self.with_socket_options(fd, |opt| opt.v6_only))
-                }
+                litebox_common_linux::Ipv6Option::V6ONLY => u32::from(options.v6_only),
                 litebox_common_linux::Ipv6Option::RECVERR => 0,
                 _ => return Err(Errno::ENOPROTOOPT),
             },
@@ -857,7 +870,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 // creation and inherited by `accept`, and is already what `getsockname`/`accept`
                 // use to report a `sockaddr_in6`, so it is the one field that knows this.
                 SocketOption::DOMAIN => {
-                    if self.with_socket_options(fd, |opt| opt.is_v6) {
+                    if options.is_v6 {
                         AddressFamily::INET6 as u32
                     } else {
                         AddressFamily::INET as u32
@@ -958,7 +971,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         // this process waits on is otherwise lost.
         super::unix::wait_on_events_polling(
             cx,
-            self.get_status(fd).contains(OFlags::NONBLOCK),
+            self.get_status(fd)?.contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
                 let proxy = self.get_proxy(fd)?;
@@ -986,7 +999,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         let mut check_progress = false;
         super::unix::wait_on_events_polling::<_, _, Errno>(
             cx,
-            self.get_status(fd).contains(OFlags::NONBLOCK),
+            self.get_status(fd)?.contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
                 let proxy = self.get_proxy(fd)?;
@@ -1078,9 +1091,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             OOB,
         );
 
-        let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
+        let timeout = self.with_socket_options(fd, |opt| opt.send_timeout)?;
         let is_nonblock =
-            self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
+            self.get_status(fd)?.contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
         let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
         super::unix::wait_on_events_polling(
@@ -1115,8 +1128,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
-        let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
+        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout)?;
+        let is_nonblock = self.get_status(fd)?.contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
 
         let mut new_flags = convert_flags!(
@@ -1188,12 +1201,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             })
     }
 
-    fn get_status(&self, fd: &SocketFd<Platform>) -> litebox::fs::OFlags {
-        self.litebox
+    fn get_status(&self, fd: &SocketFd<Platform>) -> Result<litebox::fs::OFlags, Errno> {
+        Ok(self
+            .litebox
             .descriptor_table()
             .with_metadata(fd, |SocketOFlags(flags)| *flags)
-            .unwrap()
-            & litebox::fs::OFlags::STATUS_FLAGS_MASK
+            .map_err(|e| match e {
+                litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })?
+            & litebox::fs::OFlags::STATUS_FLAGS_MASK)
     }
 
     pub(crate) fn get_proxy(
@@ -1222,7 +1239,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd<Platform>>,
     ) -> Result<(), Errno> {
-        let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
+        let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout)?;
         let behavior = match linger_timeout {
             Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
@@ -1230,7 +1247,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         };
         let proxy = self.get_proxy(&fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
-            self.get_status(&fd).contains(OFlags::NONBLOCK),
+            self.get_status(&fd)?.contains(OFlags::NONBLOCK),
             Events::HUP,
             |observer, filter| {
                 proxy.register_observer(observer, filter);
@@ -1366,7 +1383,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let _ = self.global.initialize_socket(&socket, ty, flags);
                 if matches!(domain, AddressFamily::INET6) {
                     self.global
-                        .with_socket_options_mut(&socket, |options| options.is_v6 = true);
+                        .with_socket_options_mut(&socket, |options| options.is_v6 = true)?;
                 }
                 files.insert_raw_fd(socket).map_err(|socket| {
                     // Mirrors the `AddressFamily::UNIX` arm below: `insert_raw_fd` failing
@@ -1784,7 +1801,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .with_socket(
                 &self.global,
                 sockfd,
-                |fd| Ok(self.global.with_socket_options(fd, |options| options.is_v6)),
+                |fd| Ok(self.global.with_socket_options(fd, |options| options.is_v6)?),
                 |_| Ok(false),
             )
             .unwrap_or(false)
@@ -1840,9 +1857,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let proxy = self
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
-                if self.global.with_socket_options(fd, |options| options.is_v6) {
+                if self.global.with_socket_options(fd, |options| options.is_v6)? {
                     self.global
-                        .with_socket_options_mut(&accepted_file, |options| options.is_v6 = true);
+                        .with_socket_options_mut(&accepted_file, |options| options.is_v6 = true)?;
                 }
                 proxy.set_state(SocketState::Connected);
                 let raw_fd = files
