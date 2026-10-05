@@ -768,11 +768,23 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let my_flock_registry = Arc::new(litebox::sync::Mutex::new(
             alloc::collections::BTreeMap::new(),
         ));
-        let inner = platform
+        // Which branch this process takes is the one number that decides whether the 128 MiB
+        // shared kernel arena can run out: a `create` costs ~48.5 MiB of it (a 29 MiB
+        // `SharedUnixConnTable` plus a 16 MiB socket data pool), so two fills it and a third
+        // cannot be placed at all, while an `attach` costs nothing. Nothing logged it, so "how
+        // many creates did this run make" was unmeasurable -- say it once per process, before
+        // either branch runs.
+        let attached = platform
             .is_shared_kernel_state_attach_child(slot)
             .then(|| platform.attach_shared_kernel_state(slot))
-            .flatten()
-            .unwrap_or_else(|| {
+            .flatten();
+        litebox_util_log::warn!(
+            branch:% = if attached.is_some() { "attach" } else { "create" },
+            host_pid:% = platform.current_host_pid(),
+            slot:? = slot;
+            "shared kernel state: branch taken"
+        );
+        let inner = attached.unwrap_or_else(|| {
                 let mut net = Network::new(&self.litebox);
                 net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
                 platform.create_shared_kernel_state(
