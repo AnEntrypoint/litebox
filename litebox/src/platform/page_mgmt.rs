@@ -21,6 +21,23 @@ bitflags::bitflags! {
         const EXEC = 1 << 2;
         /// Sharable between processes
         const SHARED = 1 << 3;
+        /// Writes through this region must be private to the writing process, never observed by
+        /// another mapper of the same object -- i.e. `MAP_PRIVATE` semantics over a real
+        /// shared-memory object.
+        ///
+        /// This is not a third access kind next to [`Self::READ`]/[`Self::WRITE`]/[`Self::EXEC`]:
+        /// it qualifies [`Self::WRITE`], and only [`Self::WRITE`]. A region carrying it with
+        /// `WRITE` reads and writes exactly like a writable region, except that a write is
+        /// guaranteed not to reach anyone else. A region carrying it WITHOUT `WRITE` is simply
+        /// read-only, and every platform maps it read-only.
+        ///
+        /// It exists because one platform object can back a mapping the guest believes is
+        /// `MAP_PRIVATE`: `Vmem::map_existing_shared_pages_file_private_cow` serves a large
+        /// private file mapping from a single section so every process shares the physical pages,
+        /// and Windows can only keep that sharing honest through a copy-on-write view
+        /// (`PAGE_WRITECOPY`) -- a `PAGE_READWRITE` view of that section would let one process's
+        /// writes be read by every other mapper of the file.
+        const COPY_ON_WRITE = 1 << 4;
     }
 }
 

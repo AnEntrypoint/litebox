@@ -1697,13 +1697,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Copying such a file into every mapper's private memory multiplies it by the process count:
     /// every glibc program maps the multi-hundred-megabyte locale archive, so a desktop of sixty
-    /// processes spent gigabytes on sixty identical copies. A read-only private mapping can never
-    /// observe a difference from a shared one -- the mapping is created without the right to ever
-    /// become writable, so `mprotect(PROT_WRITE)` on it is refused, and the pages are never
-    /// patched (executable mappings and ELF files are excluded and keep their private copies).
+    /// processes spent gigabytes on sixty identical copies. The object is shared but the VIEW of it
+    /// is copy-on-write (see [`Vmem::map_existing_shared_pages_file_private_cow`]), so sharing it is
+    /// indistinguishable from a private copy for the guest -- including after an
+    /// `mprotect(PROT_READ|PROT_WRITE)`, which Linux always lets succeed on a `MAP_PRIVATE` file
+    /// mapping and which now yields this process's own pages -- while a process that never writes
+    /// still shares the physical pages with every other mapper. Executable mappings and ELF files
+    /// are excluded and keep their private, patchable copies.
     ///
     /// Returns `None` whenever the mapping does not qualify, leaving the ordinary path untouched.
-    fn try_shared_readonly_file_mmap(
+    fn try_shared_private_file_mmap(
         &self,
         addr: usize,
         len: usize,
@@ -1879,7 +1882,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         Some(
             unsafe {
-                self.process().pm().map_existing_shared_pages_file_readonly(
+                self.process().pm().map_existing_shared_pages_file_private_cow(
                     suggested_addr,
                     length,
                     create_flags,
@@ -2179,7 +2182,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         if let Some(result) =
-            self.try_shared_readonly_file_mmap(addr, aligned_len, &prot, &flags, fd, offset)
+            self.try_shared_private_file_mmap(addr, aligned_len, &prot, &flags, fd, offset)
         {
             return result.map_err(Errno::from);
         }

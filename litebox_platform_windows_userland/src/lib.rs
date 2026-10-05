@@ -8330,27 +8330,40 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
     reason = "Iterate over all cases for prot_flags."
 )]
 fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
+    // `COPY_ON_WRITE` qualifies WRITE, never replaces it: the guest's access is exactly what the
+    // three access bits say, and the only difference is that a write must land in a page private
+    // to this process. Windows has exactly one way to say that -- a `PAGE_*WRITECOPY` view -- so
+    // the write-copy variants below are picked whenever WRITE and COPY_ON_WRITE are both set, and
+    // the ordinary variants are picked otherwise (a copy-on-write view without WRITE is just a
+    // read-only view; asking Windows for one would GRANT write access the guest never asked for).
+    let cow = flags.contains(MemoryRegionPermissions::COPY_ON_WRITE)
+        && flags.contains(MemoryRegionPermissions::WRITE);
     match (
         flags.contains(MemoryRegionPermissions::READ),
         flags.contains(MemoryRegionPermissions::WRITE),
         flags.contains(MemoryRegionPermissions::EXEC),
+        cow,
     ) {
         // no permissions
-        (false, false, false) => Win32_Memory::PAGE_NOACCESS,
+        (false, false, false, _) => Win32_Memory::PAGE_NOACCESS,
         // read-only
-        (true, false, false) => Win32_Memory::PAGE_READONLY,
+        (true, false, false, _) => Win32_Memory::PAGE_READONLY,
         // write-only (Windows doesn't have write-only, so we use r+w)
-        (false, true, false) => Win32_Memory::PAGE_READWRITE,
+        (false, true, false, false) => Win32_Memory::PAGE_READWRITE,
+        (false, true, false, true) => Win32_Memory::PAGE_WRITECOPY,
         // read-write
-        (true, true, false) => Win32_Memory::PAGE_READWRITE,
+        (true, true, false, false) => Win32_Memory::PAGE_READWRITE,
+        (true, true, false, true) => Win32_Memory::PAGE_WRITECOPY,
         // exeute-only (Windows doesn't have execute-only, so we use r+x)
-        (false, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        (false, false, true, _) => Win32_Memory::PAGE_EXECUTE_READ,
         // read-execute
-        (true, false, true) => Win32_Memory::PAGE_EXECUTE_READ,
+        (true, false, true, _) => Win32_Memory::PAGE_EXECUTE_READ,
         // write-execute (Windows doesn't have write-execute, so we use rwx)
-        (false, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        (false, true, true, false) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        (false, true, true, true) => Win32_Memory::PAGE_EXECUTE_WRITECOPY,
         // read-write-execute
-        (true, true, true) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        (true, true, true, false) => Win32_Memory::PAGE_EXECUTE_READWRITE,
+        (true, true, true, true) => Win32_Memory::PAGE_EXECUTE_WRITECOPY,
     }
 }
 
@@ -10414,7 +10427,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 )
             };
         }
-        let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         // The section holds its own reference to the file, so the handle is not needed past this
         // point (same as `try_allocate_cow_pages`, which closes its file handle immediately after
         // creating the mapping).

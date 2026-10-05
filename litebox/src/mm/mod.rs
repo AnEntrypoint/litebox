@@ -1082,14 +1082,15 @@ where
         }
     }
 
-    /// Map a shared-memory object read-only, never able to become writable (see
-    /// [`Self::map_existing_shared_pages`] for the writable counterpart). Used to let every
-    /// process that maps the same large read-only file share one copy of its pages.
+    /// Map a shared-memory object read-only as a guest `MAP_PRIVATE` file mapping: one object
+    /// serves every process that maps the same large file, and the view is copy-on-write, so this
+    /// process can later `mprotect` it writable and write privately (see
+    /// [`Self::map_existing_shared_pages`] for the genuinely shared, writable counterpart).
     ///
     /// # Safety
     ///
     /// Same contract as [`Self::map_existing_shared_pages`].
-    pub unsafe fn map_existing_shared_pages_file_readonly(
+    pub unsafe fn map_existing_shared_pages_file_private_cow(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1098,7 +1099,7 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let mut vmem = self.vmem.write();
         unsafe {
-            vmem.map_existing_shared_pages_file_readonly(
+            vmem.map_existing_shared_pages_file_private_cow(
                 suggested_address,
                 length,
                 flags,

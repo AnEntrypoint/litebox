@@ -52,8 +52,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_0,
     MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, UnmapViewOfFile2, VirtualFreeEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, UnmapViewOfFile2, VirtualFreeEx,
 };
 // The placeholder family: reserve address space as a PLACEHOLDER, split it, then replace each
 // piece either with a real section view (`MEM_REPLACE_PLACEHOLDER`) or with ordinary committed
@@ -71,7 +71,7 @@ use crate::{
     FORK_CHILD_SHARED_REGIONS_ENV_VAR, encode_fork_shared_regions, shm_section_handle,
     take_fork_shared_regions,
 };
-use litebox::platform::page_mgmt::SharedRegionCarry;
+use litebox::platform::page_mgmt::{MemoryRegionPermissions, SharedRegionCarry};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{
@@ -4761,8 +4761,20 @@ fn copy_one_group_with_shared(
                 // narrow retries are what a file-backed section whose ceiling fell back to
                 // `PAGE_READWRITE` needs. The child narrows to the mapping's real permissions
                 // itself, from the `VmFlags` the carry also brings across.
+                //
+                // A `COPY_ON_WRITE` carry -- a guest `MAP_PRIVATE` file mapping, which one section
+                // serves for every process that maps that file -- must be mapped COPY-ON-WRITE, or
+                // the child's writes land in the shared object and every other mapper (including
+                // the parent) sees them: a "private" mapping that is not private. The child's own
+                // `mprotect(PROT_WRITE)` succeeds either way, so nothing but the bytes tells the
+                // two apart -- hence `cb70.sh`.
+                let protections: &[u32] = if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
+                    &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
+                } else {
+                    &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
+                };
                 let mut view = 0usize;
-                for protection in [PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY] {
+                for protection in protections {
                     let mapped = unsafe {
                         MapViewOfFile3(
                             section as *mut c_void,
@@ -4771,7 +4783,7 @@ fn copy_one_group_with_shared(
                             0,
                             segment.len(),
                             PLACEHOLDER_REPLACE,
-                            protection,
+                            *protection,
                             core::ptr::null_mut(),
                             0,
                         )

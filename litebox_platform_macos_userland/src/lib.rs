@@ -520,7 +520,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             };
         }
 
-        let mut flags = libc::MAP_SHARED;
+        let mut flags = if initial_permissions.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
+            // `MAP_PRIVATE` is the whole point of that qualifier: the caller wants the object's
+            // pages, but its own writes. `MAP_SHARED` here would let one mapper's writes be read
+            // by every other mapper of the same file.
+            libc::MAP_PRIVATE
+        } else {
+            libc::MAP_SHARED
+        };
         if fixed_address_behavior != FixedAddressBehavior::Hint {
             flags |= libc::MAP_FIXED;
         }

@@ -136,6 +136,28 @@ bitflags::bitflags! {
         /// different, merely-blocked process is going to resume using.
         const VM_FOREIGN_LIVE_NEVER_REPLACE = 1 << 10;
 
+        /// Marks a `shared_handle` VMA that stands in for a guest `MAP_PRIVATE` file mapping --
+        /// the only kind [`Vmem::map_existing_shared_pages_file_private_cow`] creates. The view
+        /// of the object is COPY-ON-WRITE, so the guest gets real `MAP_PRIVATE` semantics over
+        /// an object every mapper of that file shares: pages are shared until written, and a
+        /// write is this process's own.
+        ///
+        /// Why a dedicated bit rather than reading `is_file_backed && shared_handle.is_some()`:
+        /// a genuine `MAP_SHARED` attachment -- a SysV `shmat`, whose object is
+        /// [`SharedObjectKind::FileBacked`] and therefore also `is_file_backed` with a live
+        /// `shared_handle` -- must KEEP shared-write semantics, and `mprotect` on it must never
+        /// silently hand the guest a private view. The two are indistinguishable by every other
+        /// field (both carry `VM_SHARED` and both are file-backed), so the distinction has to be
+        /// stated explicitly.
+        ///
+        /// It lives in this flag word, not in a separate `VmArea` field, precisely because the
+        /// word is what crosses a `fork()`: it is copied verbatim by [`Vmem::duplicate`] and
+        /// transmitted as [`DuplicatedRangeInfo`]'s raw `flag_bits` into
+        /// [`Vmem::new_adopting_existing_memory`], so a child's inherited mapping is mapped
+        /// copy-on-write too -- the child shares the parent's pages until it writes, exactly as
+        /// Linux's `fork()` + `MAP_PRIVATE` file mapping does.
+        const VM_PRIVATE_FILE_COW = 1 << 11;
+
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
             | Self::VM_EXEC.bits();
@@ -163,6 +185,24 @@ impl VmFlags {
             Self::empty()
         };
         may | shared_flag
+    }
+
+    /// The [`MemoryRegionPermissions`] qualifier every platform call that touches this VMA's
+    /// memory must carry alongside the access bits.
+    ///
+    /// Non-empty only for [`Self::VM_PRIVATE_FILE_COW`]: the platform has to be told the view is
+    /// copy-on-write on BOTH the call that creates it and every later
+    /// [`PageManagementProvider::update_permissions`], because on Windows the difference is the
+    /// view's page protection itself (`PAGE_WRITECOPY` instead of `PAGE_READWRITE`), not
+    /// something the platform can infer from an address range -- and a call that forgets it
+    /// either fails (`ERROR_INVALID_PARAMETER` on a copy-on-write view) or, worse, succeeds by
+    /// handing the guest a writable view of the shared object.
+    pub(super) fn write_qualifier(self) -> MemoryRegionPermissions {
+        if self.contains(VmFlags::VM_PRIVATE_FILE_COW) {
+            MemoryRegionPermissions::COPY_ON_WRITE
+        } else {
+            MemoryRegionPermissions::empty()
+        }
     }
 }
 
@@ -1208,9 +1248,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // and so are `MemoryRegionPermissions::READ/WRITE/EXEC` (see `impl From<
                 // MemoryRegionPermissions> for VmFlags`). Only the access bits are wanted here --
                 // `VM_MAY*` sits at `1<<4..` and would land on unrelated permission bits.
+                //
+                // PLUS the copy-on-write qualifier, which is the whole ballgame for a
+                // `VM_PRIVATE_FILE_COW` region: the child's view of this one section is created by
+                // the PARENT (`process_fork`'s `MapViewOfFile3` into the suspended child), and if
+                // it is created as an ordinary writable view the child's writes land in the object
+                // every other mapper of that file sees -- a `MAP_PRIVATE` mapping that is not
+                // private. Measured: `.wfgy/cb70.sh` `P_SEES_FILE_NOT_CHILD_WRITE=False`.
                 perms: MemoryRegionPermissions::from_bits_truncate(
                     vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).bits() as u8,
-                ),
+                ) | vma.flags.write_qualifier(),
                 flags: vma.flags.bits(),
             });
         }
@@ -1466,9 +1513,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
     ///
-    /// # Panics
-    ///
-    /// File-backed mapping is not supported yet.
+    /// A file-backed region is left untouched: `MADV_DONTNEED` leaves the range's contents
+    /// unspecified rather than requiring them to change, and there is no way to drop a
+    /// file-backed (or copy-on-write shared-handle) region's pages without losing a mapping
+    /// this process may share with its fork children.
     ///
     /// # Safety
     ///
@@ -1492,7 +1540,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
                 }
-                unimplemented!("resetting file-backed mappings is not supported yet");
+                // `madvise(MADV_DONTNEED)` on a file-backed mapping is legal on Linux and can be
+                // asked for by any guest (a `MADV_FREE` caller hits the arm above instead, which
+                // is the one Linux restricts to anonymous memory). Discarding the pages is not
+                // implemented, and a `panic` here is not an option: guest-reachable code answers
+                // with an errno or with success, never by killing the host process -- which is
+                // the whole session. Preserving the bytes is a legal outcome of `MADV_DONTNEED`
+                // (the range's contents are unspecified afterwards, not required to change), so
+                // leave the mapping exactly as it is.
+                litebox_util_log::debug!(
+                    start:% = r.start, end:% = r.end, shared:% = vma.shared_handle.is_some();
+                    "diag-reset-pages: MADV_DONTNEED on a file-backed mapping is a no-op, contents preserved"
+                );
+                continue;
             }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
@@ -1721,7 +1781,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // adds `PROT_EXEC` to for a JIT).
             let widest_permissions = MemoryRegionPermissions::READ
                 | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC;
+                | MemoryRegionPermissions::EXEC
+                | vma.flags.write_qualifier();
             let dest_ptr = self
                 .platform
                 .map_shared_memory(
@@ -1740,7 +1801,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         AllocationError::OutOfMemory
                     }
                 })?;
-            let actual_permissions = MemoryRegionPermissions::from_bits(permissions).unwrap();
+            let actual_permissions =
+                MemoryRegionPermissions::from_bits(permissions).unwrap() | vma.flags.write_qualifier();
             if actual_permissions != widest_permissions {
                 let mapped_range =
                     dest_ptr.as_usize()..(dest_ptr.as_usize() + suggested_range.len());
@@ -2735,7 +2797,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             // flags >> 4 shift VM_MAY% in place of VM_%
             // turning on VM_% requires VM_MAY%
-            if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
+            let missing_may =
+                (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits();
+            if missing_may != 0 {
                 // Warn, not debug: this is a real `mprotect()` refusal (EACCES to the guest) and
                 // it is per-call, not per-VMA-per-call the way the "found overlapping tracked
                 // vma" line above is. The raw `VmFlags` bits are printed because the whole
@@ -2770,7 +2834,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // `intersection` is page aligned.
             unsafe {
                 self.platform
-                    .update_permissions(intersection.clone(), permissions)
+                    .update_permissions(intersection.clone(), permissions | vma.flags.write_qualifier())
             }
             .map_err(|e| {
                 // restore the original mapping
@@ -2819,14 +2883,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         Ok(())
     }
 
-    /// Create a mapping with the given flags.
-    ///
-    /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
-    /// Otherwise, let the kernel choose an available memory region.
-    ///
-    /// `length` is the size of the pages to be created.
-    ///
-    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    /// Create a mapping of `length` pages, either anonymous or file-backed, shared or private.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -2909,10 +2966,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map_err(MappingError::MapError)
     }
 
-    /// Maps `shared_handle` READ-ONLY as if it were a private, read-only view of a file: the
-    /// mapping can never gain write permission (`VM_MAYWRITE` is clear, like any shared
-    /// file-backed mapping), so every process mapping the same object sees identical pages.
-    pub(super) unsafe fn map_existing_shared_pages_file_readonly(
+    /// Map `shared_handle` as a guest `MAP_PRIVATE` file mapping: one object serves every process
+    /// that maps the same file, and the view of it is COPY-ON-WRITE, so a write is this process's
+    /// own -- the pages are still shared until something writes, which is exactly what Linux's
+    /// `MAP_PRIVATE` file mapping does.
+    ///
+    /// The VMA carries [`VmFlags::VM_PRIVATE_FILE_COW`], which is what makes the view
+    /// copy-on-write on every platform call (see [`VmFlags::write_qualifier`]) and what survives a
+    /// `fork()` so a child inherits the same arrangement. It starts read-only, and it is created
+    /// WITH `VM_MAYWRITE`, because real Linux lets `mprotect(PROT_READ|PROT_WRITE)` succeed on a
+    /// `MAP_PRIVATE` file mapping -- the copy-on-write view is what makes that grant honest.
+    ///
+    /// [`VmFlags::VM_SHARED`] stays set even though the guest asked for `MAP_PRIVATE`: it is what
+    /// makes `fork()` carry the region as a shared object instead of eagerly copying every byte of
+    /// it into the child ([`Vmem::duplicate`], [`Self::new_adopting_existing_memory`]). That is
+    /// the whole point of the optimization -- a 324 MB binary mapped in ten processes stays one
+    /// copy -- and it costs nothing in correctness now that writes are copy-on-write.
+    pub(super) unsafe fn map_existing_shared_pages_file_private_cow(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -2920,7 +2990,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         shared_handle: Platform::SharedMemoryHandle,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let vm_flags = VmFlags::from(MemoryRegionPermissions::READ)
-            | VmFlags::may_flags_for_mapping(true, true);
+            | VmFlags::may_flags_for_mapping(false, true)
+            | VmFlags::VM_SHARED
+            | VmFlags::VM_PRIVATE_FILE_COW;
         let vma = VmArea::new_shared(vm_flags, true, shared_handle);
         unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
             .map_err(MappingError::MapError)
