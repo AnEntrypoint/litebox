@@ -863,7 +863,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             "DIAG unix shared conn: hold"
         );
         self.slot_ref()
-            .hold(self.is_client, self.platform().current_host_pid());
+            .hold(self.is_client, self.platform().current_host_pid(), self.platform());
     }
 
     /// Wakes every host process holding the peer side so a thread blocked in a read/poll there
@@ -1333,12 +1333,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             let slot_ref = table.get(slot);
             slot_ref.framed.store(framed, Ordering::Release);
             let me = global.platform.current_host_pid();
-            slot_ref.hold(is_client, me);
+            slot_ref.hold(is_client, me, global.platform);
             if recv_channel.is_peer_shutdown() {
                 // The other end already closed: its side counts as gone from the start.
                 slot_ref.mark_side_gone(!is_client);
             } else {
-                slot_ref.hold(!is_client, me);
+                slot_ref.hold(!is_client, me, global.platform);
             }
             let _ = link.global.set(alloc::boxed::Box::new(global.clone()));
             link.slot.store(slot, Ordering::Release);
@@ -4120,15 +4120,28 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     last_writer_s2c: [AtomicU32; 3],
 }
 
-/// Distinct host processes that can hold one side of a shared connection at once.
-const CONN_HOLDER_HOSTS: usize = 8;
+/// Distinct host processes that can hold one side of a shared connection at once. A cross-process
+/// fork gives the SAME side to the parent and to every child that inherits the endpoint, and a
+/// process that dies without releasing keeps its slot until something reads this connection, so
+/// this is sized for a real session's fork fan-out rather than for the two ends of a socketpair.
+const CONN_HOLDER_HOSTS: usize = 32;
 
 fn conn_side(is_client: bool) -> usize {
     if is_client { 0 } else { 1 }
 }
 
 impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
-    fn hold(&self, is_client: bool, host: u32) {
+    /// Counts `host` as holding `is_client`'s side of this connection.
+    ///
+    /// `h` is claimed BEFORE `c` is raised, never after. The other order leaves a window in which
+    /// the slot shows a live count against the PREVIOUS host's pid, and `side_gone` -- a lazy,
+    /// read-time liveness check any host thread can run at any moment -- then compares that stale
+    /// pid against reality, finds it dead, and zeroes the count. That drops a holder which is in
+    /// fact alive, the worst outcome this bookkeeping can produce: the side is later declared gone
+    /// while a live process still holds it, and the peer gets an EOF Linux would never give it.
+    /// Live-caught in `chrF2.err` (18 `this holder is not counted` warnings, `comm=chromium`
+    /// taking crashpad's `IMMEDIATE_CRASH()` int3 when its `sendmsg` to the handler's end fails).
+    fn hold(&self, is_client: bool, host: u32, platform: &Platform) {
         let side = conn_side(is_client);
         self.side_ever_held[side].store(true, Ordering::Release);
         let hosts = &self.holder_hosts[side];
@@ -4140,13 +4153,33 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             }
         }
         for (h, c) in hosts.iter().zip(counts) {
-            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                h.store(host, Ordering::Release);
+            if c.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            let prev = h.load(Ordering::Acquire);
+            if h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                c.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
+        }
+        // Every slot is taken by a host that is still counted. A host process that died without
+        // releasing keeps its slot until somebody happens to read this connection and `side_gone`
+        // notices, so those are reclaimable right here: evict one rather than drop the live holder
+        // that would otherwise turn into a spurious EOF for the peer.
+        for (h, c) in hosts.iter().zip(counts) {
+            let prev = h.load(Ordering::Acquire);
+            if c.load(Ordering::Acquire) == 0 || prev == host {
+                continue;
+            }
+            if !platform.is_process_alive(prev)
+                && h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
+                c.store(1, Ordering::Release);
                 return;
             }
         }
         litebox_util_log::warn!(
-            host:% = host;
+            host:% = host, is_client:% = is_client;
             "shared unix connection: more host processes hold one side than tracked; this \
              holder is not counted"
         );
@@ -5091,7 +5124,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         global
                             .unix_shared_conn_table
                             .get(slot)
-                            .hold(is_client, me);
+                            .hold(is_client, me, global.platform);
                         let peer = conn.peer_cred;
                         Ok((
                             alloc::format!(
@@ -5137,7 +5170,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             return;
         }
         let slot_ref = global.unix_shared_conn_table.get(*slot);
-        slot_ref.hold(*is_client, child_host);
+        slot_ref.hold(*is_client, child_host, global.platform);
         slot_ref.release(*is_client, *host);
         litebox_util_log::__private::tracing::event!(
             target: "litebox_diag::unix_conn_teardown",
