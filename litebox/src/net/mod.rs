@@ -43,6 +43,19 @@ pub const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// arena (see `socket_buffers`), so this is a pool slot size, not a per-socket allocation.
 pub const SOCKET_BUFFER_SIZE: usize = 65536;
 
+/// Size of one smoltcp socket's rx (or tx) ring, i.e. one pool slot.
+///
+/// A TCP socket costs two slots, so `MAX_DATA_SLOTS / 2` is how many sockets the pool can hold and
+/// `MAX_DATA_SLOTS * SOCKET_RING_SIZE` is the whole pool. Both numbers are set together against
+/// the shared arena's budget -- the arena also carries every `GlobalState` of the session, and
+/// [`socket_buffers::Pool::new`] silently halves a request it cannot grant, so a too-large pool
+/// silently becomes a too-small one. 32 KiB rings buy twice the sockets for the same 16 MiB, and
+/// a desktop session runs out of SOCKETS long before it runs out of per-socket window: chrD97
+/// measured 128 sockets all in use, 104 of them merely armed backlog slots of 13 listening ports,
+/// after which every listening port whose next refill failed went deaf for the rest of the run
+/// while the connections it had already accepted kept streaming.
+pub const SOCKET_RING_SIZE: usize = 32768;
+
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
 
@@ -1160,6 +1173,7 @@ where
                 &entry.entry,
                 now,
                 shared_across_fork,
+                false,
             );
         }
         // Separate pass: the repair needs to mutate each entry, and the drain above deliberately
@@ -1314,11 +1328,14 @@ where
     /// and from the smoltcp socket to the RX ring buffer (user reads).
     ///
     /// Should be called periodically by the network worker to keep data flowing.
+    /// `pull_rx`: this call IS a reader fetching its own bytes, so RX moves into the proxy now
+    /// whatever the per-tick rule below would leave in smoltcp.
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
         now: smoltcp::time::Instant,
         shared_across_fork: bool,
+        pull_rx: bool,
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
@@ -1358,14 +1375,18 @@ where
                     tcp_socket.close();
                 }
 
-                // NOT done when this socket has a referent in another process of the fork family
-                // and nothing here is waiting on it: a proxy is a PER-PROCESS object, so bytes
-                // this tick hands to a proxy nobody reads are unreachable from the process that
-                // IS reading -- its reader waits forever while the bytes sit in a buffer no poll
-                // ever looks at (measured, `.wfgy/cb11.out`: `it1 PARENT_LEFTOVER b'P1-1'`,
-                // `it4 PARENT_LEFTOVER b'P1-4'`). Such a reader pulls instead
-                // ([`Network::drain_rx_into_proxy`]).
-                if !(shared_across_fork && !proxy.has_observers()) {
+                // NOT done for a socket another process of the fork family also refers to: a proxy
+                // is a PER-PROCESS object, so bytes this tick hands to THIS process's proxy are
+                // unreachable from the process that IS reading -- its reader waits forever while
+                // the bytes sit in a buffer no poll ever looks at. Nor can "is anybody waiting
+                // here?" be asked instead: an observer is never unregistered, so a process that
+                // has ever blocked on a carried socket keeps counting as "waiting" long after it
+                // stopped and goes on eating its child's bytes (measured, `.wfgy/ifrx1a.out`:
+                // child `NO TimeoutError('timed out')`, parent `leftover srv=b'PONG'`). Such a
+                // socket therefore keeps its RX in smoltcp and the reader fetches it itself
+                // ([`Network::drain_rx_into_proxy`]), told it is there by
+                // [`StreamSocketChannel::set_smoltcp_rx_pending`].
+                if !shared_across_fork || pull_rx {
                     while tcp_socket.can_recv() {
                         let received = proxy
                             .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
@@ -1373,6 +1394,9 @@ where
                             break;
                         }
                     }
+                }
+                if shared_across_fork {
+                    proxy.set_smoltcp_rx_pending(tcp_socket.can_recv());
                 }
 
                 if let tcp::State::Established = tcp_socket.state() {
@@ -1475,9 +1499,9 @@ where
                     }
                 }
 
-                // Drain RX: receive from smoltcp, push to channel. Same "only for a process that
-                // is actually waiting" rule as the TCP arm above, same reason.
-                if !(shared_across_fork && !udp_proxy.has_observers()) {
+                // Drain RX: receive from smoltcp, push to channel. Same rule as the TCP arm above,
+                // same reason.
+                if !shared_across_fork || pull_rx {
                     while udp_socket.can_recv() {
                         let received = udp_proxy.try_recv_datagram_with(|| {
                             let (data, meta) = udp_socket.recv().ok()?;
@@ -1493,6 +1517,9 @@ where
                         }
                     }
                 }
+                if shared_across_fork {
+                    udp_proxy.set_smoltcp_rx_pending(udp_socket.can_recv());
+                }
             }
             (Protocol::Icmp | Protocol::Raw { .. }, _) => {
                 unimplemented!()
@@ -1504,10 +1531,10 @@ where
     /// Move `fd`'s socket's RX into this process's proxy right now, whatever the per-tick drain
     /// would have decided.
     ///
-    /// The tick hands a fork-family-shared socket's RX only to a proxy somebody is waiting on (see
-    /// [`Self::drain_socket_channel_buffers`]), so a read that is NOT such a wait -- a non-blocking
-    /// read, or one that lost the race against another process's tick -- has to fetch for itself
-    /// rather than report "no data".
+    /// The tick leaves a fork-family-shared socket's RX in smoltcp (see
+    /// [`Self::drain_socket_channel_buffers`]), so a read -- blocking, non-blocking, or one that
+    /// lost the race against another process's tick -- has to fetch for itself rather than report
+    /// "no data".
     ///
     /// Returns `false` when `fd` is not a socket this process has a descriptor for.
     pub fn drain_rx_into_proxy(&mut self, fd: &SocketFd<Platform>) -> bool {
@@ -1519,7 +1546,17 @@ where
         let Some(entry) = table.get_entry(fd) else {
             return false;
         };
-        Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now, false);
+        // The socket's own shared marking still has to travel with the call: it is what tells the
+        // drain to clear this proxy's "smoltcp still holds bytes" flag once it has taken them, or
+        // the socket would keep reporting readable with nothing left to read.
+        let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
+        Self::drain_socket_channel_buffers(
+            &mut self.socket_set,
+            &entry.entry,
+            now,
+            shared_across_fork,
+            true,
+        );
         true
     }
 }
@@ -1646,8 +1683,8 @@ where
             return false;
         };
         // The proxy this process reads from has to know when the socket is shared with another
-        // process of the fork family, because the tick that moves RX out of smoltcp refuses to
-        // deliver to a proxy nobody is waiting on -- a reader then pulls for itself.
+        // process of the fork family, because the tick leaves such a socket's RX in smoltcp and a
+        // reader has to pull it for itself.
         let shared_across_fork = {
             let borrowed = table_entry.entry.borrowed;
             let handle = table_entry.entry.handle;
@@ -1949,6 +1986,7 @@ where
                             &entry.entry,
                             now,
                             shared_across_fork,
+                            false,
                         );
                     }
                 }
@@ -2201,11 +2239,25 @@ where
                         tcp::State::Established => {
                             Ok(())
                         }
+                        // The handshake completed and the peer is already shutting the connection
+                        // down (or this side is): `connect(2)` has succeeded and the application
+                        // learns the rest from `read`/`write`, so this is not a refusal.
+                        tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck => Ok(()),
                         tcp::State::Closed | tcp::State::TimeWait => {
                             Err(ConnectError::InvalidState)
                         }
                         tcp::State::SynSent => Err(ConnectError::InProgress),
-                        s => unimplemented!("state: {:?}", s),
+                        // Neither is reachable for a socket this process just `connect`ed, and
+                        // none of them means "connected" -- a guest-reachable path must return an
+                        // errno rather than panic here, so report the refusal the peer's RST (or
+                        // the connect timeout) would have produced anyway.
+                        tcp::State::Listen | tcp::State::SynReceived => {
+                            Err(ConnectError::InvalidState)
+                        }
                     }
                 };
 
@@ -2578,6 +2630,7 @@ where
                             socket_handle,
                             now,
                             shared_across_fork,
+                            false,
                         );
                     } else {
                         let pending_in_channel = socket_handle

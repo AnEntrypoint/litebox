@@ -357,6 +357,11 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// fork family. RX is then only drained into this proxy on demand (see
     /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
     shared_across_fork: AtomicBool,
+    /// Whether the smoltcp socket still holds bytes this process has not pulled into its own RX
+    /// buffer. Only ever set for a socket shared across the fork family, whose RX the tick leaves
+    /// in smoltcp so the process that reads it is the one that fetches it; this is how a
+    /// `poll`/`epoll`/`select` waiter learns the bytes are there without consuming them.
+    smoltcp_rx_pending: AtomicBool,
 
     /// Socket error.
     socket_error: SocketAsyncErrorState,
@@ -388,6 +393,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             tx_available: AtomicUsize::new(tx_capacity),
 
             shared_across_fork: AtomicBool::new(false),
+            smoltcp_rx_pending: AtomicBool::new(false),
 
             socket_error: SocketAsyncErrorState::new(),
 
@@ -546,12 +552,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.shared_across_fork.store(true, Ordering::Release);
     }
 
-    /// Whether anyone is registered for this socket's events (a blocked read, an `epoll`
-    /// registration).
-    pub fn has_observers(&self) -> bool {
-        self.inner.pollee.has_observers()
-    }
-
     /// Shutdown the read side of the socket.
     pub fn shutdown_read(&self) {
         self.inner.read_shutdown.store(true, Ordering::Release);
@@ -697,9 +697,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     }
 
     /// Check if the socket has data available for reading (or an end-of-file to report).
+    ///
+    /// A socket shared across the fork family also reports readable while its bytes still sit in
+    /// smoltcp waiting for this process to pull them ([`Self::set_smoltcp_rx_pending`]), or a
+    /// `poll`/`epoll` waiter on it would never be told to run the read that fetches them.
     pub(super) fn is_readable(&self) -> bool {
         self.inner.rx_available.load(Ordering::Acquire) > 0
             || self.inner.peer_closed.load(Ordering::Acquire)
+            || self.inner.smoltcp_rx_pending.load(Ordering::Acquire)
+    }
+
+    /// Record whether the smoltcp socket still holds bytes this process has not pulled, waking
+    /// any waiter when bytes appeared.
+    pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
+        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+            self.inner.pollee.notify_observers(Events::IN);
+        }
     }
 
     /// Record that the peer closed its side of the connection (its FIN arrived and all data it
@@ -821,9 +834,14 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     tx_space: AtomicUsize,
 
     /// Set once this socket's smoltcp socket gained a second referent in ANOTHER process of the
-    /// fork family. RX is then only drained into this proxy on demand (see
+    /// fork family. RX is then drained into this proxy only by this process's own read (see
     /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
     shared_across_fork: AtomicBool,
+    /// Whether the smoltcp socket still holds datagrams this process has not pulled into its own
+    /// RX queue. Only ever set for a socket shared across the fork family, whose RX the tick
+    /// leaves in smoltcp so the process that reads it is the one that fetches it; this is how a
+    /// `poll`/`epoll`/`select` waiter learns the datagrams are there without consuming them.
+    smoltcp_rx_pending: AtomicBool,
 
     /// Local port the socket is bound to (0 if unbound).
     /// This is set atomically when auto-binding during sendto.
@@ -862,6 +880,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
             tx_space: AtomicUsize::new(queue_size),
 
             shared_across_fork: AtomicBool::new(false),
+            smoltcp_rx_pending: AtomicBool::new(false),
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
@@ -973,8 +992,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     }
 
     /// Check if the socket is readable.
+    ///
+    /// A socket shared across the fork family also reports readable while its datagrams still sit
+    /// in smoltcp waiting for this process to pull them ([`Self::set_smoltcp_rx_pending`]), or a
+    /// `poll`/`epoll` waiter on it would never be told to run the read that fetches them.
     pub fn is_readable(&self) -> bool {
         self.inner.rx_count.load(Ordering::Acquire) > 0
+            || self.inner.smoltcp_rx_pending.load(Ordering::Acquire)
+    }
+
+    /// Record whether the smoltcp socket still holds datagrams this process has not pulled,
+    /// waking any waiter when one appeared.
+    pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
+        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+            self.inner.pollee.notify_observers(Events::IN);
+        }
     }
 
     /// Check if the socket is writable.
@@ -999,12 +1031,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// family.
     pub fn mark_shared_across_fork(&self) {
         self.inner.shared_across_fork.store(true, Ordering::Release);
-    }
-
-    /// Whether anyone is registered for this socket's events (a blocked read, an `epoll`
-    /// registration).
-    pub fn has_observers(&self) -> bool {
-        self.inner.pollee.has_observers()
     }
 
     /// Set the local port the socket is bound to.
@@ -1037,7 +1063,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
 
-        if self.inner.rx_count.load(Ordering::Acquire) > 0 {
+        if self.is_readable() {
             events |= Events::IN;
         }
 

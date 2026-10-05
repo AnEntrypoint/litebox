@@ -447,7 +447,12 @@ impl From<litebox::net::errors::SocketError> for Errno {
     fn from(value: litebox::net::errors::SocketError) -> Self {
         match value {
             litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
-            _ => unimplemented!(),
+            // `socket(2)` reports a socket table with no room left as "out of file descriptors",
+            // never as a crash: the caller is the one that has to cope, and a panic here takes
+            // down every process of the session at once (three guest processes died here in
+            // chrD97, each taking its listening ports with it).
+            litebox::net::errors::SocketError::TooManySockets => Errno::EMFILE,
+            _ => Errno::EMFILE,
         }
     }
 }

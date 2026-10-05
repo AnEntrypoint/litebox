@@ -20,10 +20,13 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::udp;
 use smoltcp::storage::{PacketBuffer, PacketMetadata, RingBuffer};
 
-use super::{MAX_PACKET_COUNT, MAX_SOCKETS, SOCKET_BUFFER_SIZE};
+use super::{MAX_PACKET_COUNT, MAX_SOCKETS, SOCKET_RING_SIZE};
 use crate::platform::SharedKernelStateProvider;
 
-const MAX_DATA_SLOTS: usize = 256;
+// Two data slots per TCP socket (rx + tx), so `MAX_DATA_SLOTS / 2` TCP sockets fit: sized to
+// `MAX_SOCKETS` so the pool stops being the binding limit, at the same 16 MiB the old 256x64KiB
+// pool cost -- see `SOCKET_RING_SIZE`'s own doc comment for the measurement behind it.
+const MAX_DATA_SLOTS: usize = 2 * MAX_SOCKETS;
 const MAX_META_SLOTS: usize = 64;
 const META_SLOT_SIZE: usize = 4096;
 const SLOT_ALIGN: usize = 4096;
@@ -123,7 +126,7 @@ pub(crate) struct SocketBuffers {
 impl SocketBuffers {
     pub(crate) fn new<P: SharedKernelStateProvider>(platform: &P) -> Self {
         Self {
-            data: Pool::new(platform, SOCKET_BUFFER_SIZE),
+            data: Pool::new(platform, SOCKET_RING_SIZE),
             meta: Pool::new(platform, META_SLOT_SIZE),
             owners: core::array::from_fn(|_| None),
         }
