@@ -54,6 +54,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
     PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, UnmapViewOfFile2, VirtualFreeEx,
+    VirtualProtectEx,
 };
 // The placeholder family: reserve address space as a PLACEHOLDER, split it, then replace each
 // piece either with a real section view (`MEM_REPLACE_PLACEHOLDER`) or with ordinary committed
@@ -4759,8 +4760,11 @@ fn copy_one_group_with_shared(
                 };
                 // Widest first: a view can never exceed the section's protection ceiling, so the
                 // narrow retries are what a file-backed section whose ceiling fell back to
-                // `PAGE_READWRITE` needs. The child narrows to the mapping's real permissions
-                // itself, from the `VmFlags` the carry also brings across.
+                // `PAGE_READWRITE` needs. The widest protection is NOT what the guest asked for,
+                // so the view is narrowed back to `carry.perms` right after it is placed --
+                // `adopt_carried_shared` on the child side only does bookkeeping, and the child
+                // runs no instruction of its own before it is resumed, so this is the only place
+                // the child's initial protection can be made to equal the parent's.
                 //
                 // A `COPY_ON_WRITE` carry -- a guest `MAP_PRIVATE` file mapping, which one section
                 // serves for every process that maps that file -- must be mapped COPY-ON-WRITE, or
@@ -4774,6 +4778,7 @@ fn copy_one_group_with_shared(
                     &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
                 };
                 let mut view = 0usize;
+                let mut granted = 0u32;
                 for protection in protections {
                     let mapped = unsafe {
                         MapViewOfFile3(
@@ -4790,6 +4795,7 @@ fn copy_one_group_with_shared(
                     };
                     if !mapped.Value.is_null() {
                         view = mapped.Value as usize;
+                        granted = *protection;
                         break;
                     }
                 }
@@ -4814,6 +4820,40 @@ fn copy_one_group_with_shared(
                     // either replaces exactly that placeholder or fails.
                     cleanup();
                     return Err(0);
+                }
+                // Handing the child a wider view than its own mapping is not harmless: a guest
+                // `PROT_READ` `MAP_SHARED` region mapped `PAGE_EXECUTE_READWRITE` lets the child
+                // write into the object every other mapper -- including the parent -- sees, and
+                // leaves a guest write there unfaulted. `PROT_READ|PROT_EXEC` likewise must not
+                // arrive writable. Narrowing can legitimately fail (the same section ceiling that
+                // forced the wide map), and a too-wide view stays correct in the direction that
+                // matters -- nothing is taken away that the mapping needs -- so the failure is
+                // reported, not fatal.
+                let narrowed = crate::prot_flags(carry.perms);
+                if narrowed != granted {
+                    let mut previous = 0u32;
+                    let ok = unsafe {
+                        VirtualProtectEx(
+                            child,
+                            view as *mut c_void,
+                            segment.len(),
+                            narrowed,
+                            &mut previous,
+                        )
+                    };
+                    if ok == 0 && diag {
+                        eprintln!(
+                            "[diag-fork-shared] NARROW FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} granted={:#x} wanted={:#x} err={}",
+                            source_group.start,
+                            source_group.end,
+                            segment.start,
+                            segment.end,
+                            carry.name.as_str(),
+                            granted,
+                            narrowed,
+                            unsafe { GetLastError() }
+                        );
+                    }
                 }
             }
             None => {
