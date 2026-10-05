@@ -6771,7 +6771,16 @@ impl WaiterSlot {
 /// slot reads/writes, never across a syscall or a wait, so unbounded spinning is safe and bounded in
 /// practice.
 struct WaiterQueue {
-    lock: core::sync::atomic::AtomicBool,
+    /// `0` when free, otherwise the host pid of the process whose thread holds it. Recording the
+    /// holder's PROCESS (not thread) is what lets [`Self::with_lock`] recover this lock when its
+    /// holder died while holding it: a cross-process-fork child's fast exit path skips ordinary
+    /// `Drop`-based unlocking, so a child killed inside a `with_lock` critical section used to
+    /// leave this word permanently taken and every later caller spinning on it forever with no
+    /// liveness check anywhere -- the orphaned-fork-child CPU burn that `b7caa8d` worked around by
+    /// killing any child whose parent had died. Stealing from a CONFIRMED-DEAD holder fixes the
+    /// cause, so that workaround (which also killed legitimate children Linux re-parents to init)
+    /// is gone.
+    lock: core::sync::atomic::AtomicU32,
     slots: [WaiterSlot; MAX_INLINE_WAITERS],
 }
 
@@ -6779,9 +6788,37 @@ impl WaiterQueue {
     const fn new() -> Self {
         const EMPTY: WaiterSlot = WaiterSlot::empty();
         Self {
-            lock: core::sync::atomic::AtomicBool::new(false),
+            lock: core::sync::atomic::AtomicU32::new(0),
             slots: [EMPTY; MAX_INLINE_WAITERS],
         }
+    }
+
+    /// Is the host process `holder` confirmably gone? Conservative in the same direction as
+    /// `RawMutex::try_recover_from_dead_holder_unregistered`: only a positively confirmed exit is
+    /// reported dead, so a live, legitimately slow holder never has this lock stolen from under it.
+    fn holder_process_dead(holder: u32) -> bool {
+        if holder == 0 {
+            return false;
+        }
+        // SAFETY: liveness probe only, minimum access requested.
+        let handle = unsafe {
+            Win32_Threading::OpenProcess(
+                Win32_Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                holder,
+            )
+        };
+        if handle.is_null() {
+            return true;
+        }
+        let mut exit_code: u32 = 0;
+        // SAFETY: `handle` was just successfully opened above.
+        let ok = unsafe { Win32_Threading::GetExitCodeProcess(handle, &raw mut exit_code) };
+        // SAFETY: `handle` is a valid, owned handle not used again after this point.
+        unsafe {
+            Win32_Foundation::CloseHandle(handle);
+        }
+        ok != 0 && exit_code != STILL_ACTIVE
     }
 
     /// Runs `f` with this queue's spinlock held. The whole point of this type: callers use this to
@@ -6822,21 +6859,45 @@ impl WaiterQueue {
     /// path out of this function, panic included, exactly like a real lock guard's `Drop` always
     /// has for every OTHER lock in this codebase.
     fn with_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
-        while self
-            .lock
-            .compare_exchange_weak(
-                false,
-                true,
+        let me = std::process::id();
+        let mut spins: u32 = 0;
+        loop {
+            match self.lock.compare_exchange_weak(
+                0,
+                me,
                 core::sync::atomic::Ordering::Acquire,
                 core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            core::hint::spin_loop();
+            ) {
+                Ok(_) => break,
+                Err(holder) => {
+                    // A holder in THIS process is a live thread of ours -- never steal, just wait.
+                    // Only a holder whose whole host process is confirmed gone can be taken over,
+                    // and only after a long spin, so ordinary contention never pays for a probe.
+                    if holder != me && spins & 0xFFF == 0x800 && Self::holder_process_dead(holder) {
+                        if self
+                            .lock
+                            .compare_exchange(
+                                holder,
+                                me,
+                                core::sync::atomic::Ordering::Acquire,
+                                core::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            litebox_util_log::warn!(
+                                holder_pid:% = holder, me:% = me;
+                                "WaiterQueue::with_lock: holder process is dead, recovering the orphaned queue lock"
+                            );
+                            break;
+                        }
+                    }
+                    spins = spins.wrapping_add(1);
+                    core::hint::spin_loop();
+                }
+            }
         }
         let _release_guard = litebox::utils::defer(|| {
-            self.lock
-                .store(false, core::sync::atomic::Ordering::Release);
+            self.lock.store(0, core::sync::atomic::Ordering::Release);
         });
         f(self)
     }

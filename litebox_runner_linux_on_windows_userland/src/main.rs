@@ -20,12 +20,6 @@ fn main() -> anyhow::Result<()> {
         litebox_platform_windows_userland::process_fork::run_external_fault_watchdog_child();
     }
 
-    // A cross-process-fork child outlives its parent by construction (it is a real `CreateProcessW`
-    // sibling, not a thread), so arm the kernel wait that notices the parent's death and exits this
-    // process -- BEFORE `spawn_external_fault_watchdog()`, so an already-orphaned child does not go
-    // on to spawn a watchdog process of its own. No-op for any process that is not a fork child.
-    litebox_platform_windows_userland::process_fork::arm_parent_death_watch();
-
     // Spawn this run's own external fault-terminate watchdog (a hidden, detached child of THIS
     // process, re-executing this same binary) before any other initialization -- as early as
     // possible, so the supervision window covers as much of this process's lifetime as it
