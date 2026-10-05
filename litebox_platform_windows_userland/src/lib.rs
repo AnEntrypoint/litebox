@@ -9746,9 +9746,39 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         "diag-decommit: VirtualFree(MEM_DECOMMIT)"
                     );
                 }
-                Ok(unsafe {
+                let freed = unsafe {
                     VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
-                } != 0)
+                } != 0;
+                if !freed {
+                    // Windows refuses a `VirtualFree(MEM_DECOMMIT)` for reasons litebox's own VMA
+                    // bookkeeping cannot see (a `VirtualQuery` region that merges two distinct
+                    // allocations, a placeholder reservation, ...). Returning `false` here tripped
+                    // `process_memory_range_by_regions`'s `assert!`, panicking the whole host
+                    // process -- measured live killing a chromium fork child 0.119s into its guest
+                    // run (2 panics in `.wfgy/newimg4.err`, and 0 in the working `chrE1`/`chrE2`
+                    // runs), so one refused decommit took out a guest process. The guest asked for
+                    // this range to go away and its VMA is already gone: leaving a few pages
+                    // committed leaks address space this process is about to release anyway, while
+                    // `allocate_pages` already knows how to re-take a still-committed range.
+                    // Throttled: a whole address space being torn down can refuse repeatedly, and
+                    // an unthrottled per-region log floods the monitor, not just the log.
+                    static REFUSED: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let refused = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if refused % 64 == 0 {
+                        litebox_util_log::error!(
+                            start:% = r.start, end:% = r.end, len:% = r.len(),
+                            mbi_state:% = mbi.State, mbi_type:% = mbi.Type,
+                            mbi_protect:% = mbi.Protect,
+                            mbi_alloc_base:% = mbi.AllocationBase as usize,
+                            mbi_region_size:% = mbi.RegionSize,
+                            refused_total:% = refused,
+                            last_error:% = std::io::Error::last_os_error();
+                            "diag-decommit-refused: VirtualFree(MEM_DECOMMIT) failed; leaving the pages committed rather than panicking the host process"
+                        );
+                    }
+                }
+                Ok(true)
             },
         )
         .expect("deallocate_pages failed");
