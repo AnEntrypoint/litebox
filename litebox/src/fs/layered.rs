@@ -564,8 +564,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
         let mut node_info_lookup = self.node_info_lookup.write();
         let rdev = node_info.rdev;
-        // ino starts at 1 (zero represents deleted file)
-        let new_id = node_info_lookup.len() + 1;
+        let new_id = layered_ino(node_info.dev, node_info.ino, node_info.rdev);
         let ino = *node_info_lookup.entry(node_info).or_insert(new_id);
         NodeInfo {
             dev: DEVICE_ID,
@@ -573,6 +572,39 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             rdev,
         }
     }
+}
+
+/// The inode number a layered file reports: a pure function of the layer node it came from, so one
+/// file carries one number in every process that mounts these layers, however many paths that
+/// process has stat'ed.
+///
+/// It used to be `node_info_lookup.len() + 1`, a count of first sightings, which renumbered every
+/// file in every fork child: a child rebuilt its file system from the parent's writable layer with an
+/// empty lookup table, so it handed out 1, 2, 3, ... in the order it happened to touch paths. ld.so
+/// decides "already loaded" by comparing the `st_dev`/`st_ino` of the file it just opened against the
+/// `l_dev`/`l_ino` of every loaded object, and those were the PARENT's small numbers -- 6 for libm, 8
+/// for libz, 9 for libexpat, 10 for libc. So `dlopen("/usr/lib/x86_64-linux-gnu/libEGL.so.1")` in a
+/// fork child whose seventh stat was that path returned the already-loaded libm, and every `dlsym` on
+/// the handle came back NULL (cb64: child inode 6 -> libm, 8 -> libz; a copy of the same file that
+/// drew inode 7 loaded correctly). That is what killed chromium's GPU process: it dlopens its GL
+/// stack inside a zygote fork child, stored NULL for every GL entry point, and died on a call through
+/// a NULL pointer -- `Exception(14) rip=0x0 cr2=0x0 error_code=0x14`.
+fn layered_ino(dev: usize, ino: usize, rdev: Option<core::num::NonZeroUsize>) -> usize {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for word in [
+        dev as u64,
+        ino as u64,
+        rdev.map_or(0, core::num::NonZeroUsize::get) as u64,
+    ] {
+        for byte in word.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    // zero means "deleted file" to the rest of the file system, so never hand one out
+    (hash | 1) as usize
 }
 
 /// Why [`FileSystem::migrate_entry_up_for_metadata`] could not make a path exist in the upper

@@ -149,3 +149,48 @@ Fork-placement mechanics, for when it matters: `Vmem::duplicate` (`mm/linux.rs:1
 ## 9. Open item 1: the exclusion list, verbatim (moved out of `AGENTS.md`)
 
 **EXCLUDED BY MEASUREMENT (do not re-test): bytes** -- `pread == mmap`, 5 libs incl. the 324MB binary, parent + 2 fork children (cb14/cb15), and an inherited 324MB `PROT_READ|PROT_EXEC` mapping read at 32 offsets with 0/20/40/60 preceding anon mappings is `bad=0/32` in parent AND child (cb37/cb38/cb39); **symbols** -- `LD_BIND_NOW=1 chromium --version` rc=0, `ldd -r` clean, `dlopen`+`dlsym("vkGetInstanceProcAddr")` NON-NULL at gen 0/1/2 (cb30/cb31/cb33); **wrong-file delivery** -- 98 opens x 2 rounds x 2 gens `bad=0` incl. `libnssutil3.so` and `libvulkan.so.1` (cb32); **zeroed anon/malloc/heap** -- 64MiB + 32MiB + 200k objects `bad=0` (cb32); **stale absolute pointers** -- a chromium-shaped child keeps every address and dereferences a heap-stored pointer across the fork (cb36/cb37); **the sandbox** -- cb21 L1, that pid loads ZERO libraries.
+
+## 10. `AGENTS.md` "Other subsystems" section, verbatim
+
+- **Linux runner:** cloud sessions boot `webtop:debian-xfce` (`--initial-files rootfs.tar --rewrite-syscalls --uid 0 --gid 0 --pid1 --tun-device-name tun0`) into s6/Xvfb/XFCE/nginx/pulseaudio/dbus/Selkies; host browser `http://10.0.0.2:3000`. **OCI:** `litebox_packager --oci-image <ref> --output <tar>`.
+- **Shared memory and locks:** `RawMutex` = pointer-free wait queue + cross-process `Event`s, `holder_pid` dead-holder recovery (`bff1d0b`), waits chunked to `LIVENESS_CHECK_INTERVAL` (2s). The 128MiB `shared_kernel_arena_alloc` backs `SharedArc<T>` (inline bytes only) -- shared registries must be fixed-slot atomic tables.
+- **File visibility:** a file one host process wrote is invisible to siblings until it exits. `file_spill.rs` write-through-spills `SPILLED_PREFIXES` (`file_spill.rs:10-18`); extend the prefix LIST -- **do NOT add `/tmp/`.** A fork child gets the parent's writable layer AT SPAWN; its writes reach the parent only on exit via `wait4` (`9412184`). Perms follow fsuid/fsgid; root bypasses rwx; fs walks outside a syscall need `with_root_identity` (`d428acd`).
+
+
+## 11. cb46/cb46b: the zygote fork is the discriminator (the GPU-process bug, localised)
+
+Same headless screenshot as cb42/cb46 (`--virtual-time-budget=8000`, `--window-size=800,600`,
+uid 911 via `setpriv`, `HOME=/tmp/cushot`), 30-45 x 2 s poll per arm:
+
+| run | arm | flags | PNG |
+|-----|-----|-------|-----|
+| cb46 | C | `--in-process-gpu` | **PNG_APPEARED i=8**, 3771 bytes |
+| cb46 | A | (default: zygote ON, sandbox ON) | **NO_PNG** |
+| cb46 | B | `--no-zygote` | INVALID -- chromium refuses: `Zygote cannot be disabled if sandbox is enabled. Use --no-zygote together with --no-sandbox` |
+| cb46 | E | `--no-sandbox` (zygote ON, sandbox OFF) | **NO_PNG** |
+| cb46b | C | `--in-process-gpu` | **PNG i=8**, 3808 bytes |
+| cb46b | F | `--no-zygote --no-sandbox` | **PNG i=24**, 3808 bytes |
+| cb46b | G | `--no-sandbox --no-zygote --disable-features=Vulkan` | **PNG i=9** |
+
+Two conclusions, both new:
+
+1. **The sandbox is NOT the discriminator.** zygote ON + sandbox OFF (cb46 E) is NO_PNG, so
+   `--no-sandbox` does not rescue it -- which also means the `CanCreateProcessInNewUserNS()` /
+   "No usable sandbox!" failure class is not what is happening here.
+2. **The zygote fork IS the discriminator.** zygote OFF + sandbox OFF (cb46b F) paints, and the
+   ONLY thing `--no-zygote` changes is that chromium spawns its children with execve instead of
+   forking from the zygote. So a GPU process created by CROSS-PROCESS FORK dies; one created by
+   execve paints.
+
+Combined with cb40 -- `LD_BIND_NOW=1` dies at the IDENTICAL snapshot
+(`rip=0x0 cr2=0x0 error_code=0x14 rax=0x0 rdx=0x1 rcx=0x14000 rdi=0x0`, only `rsi` differs) -- the
+NULL is a function pointer in WRITABLE data, not an unresolved PLT slot. So the forked child is
+being REFUSED something the exec'd child gets, chromium stores a null, and the first call through it
+faults. The renderer process is ALSO a zygote fork child and it works (arm C's PNG cannot appear
+without it), so this is not "any fork child dies": it is specific to what the GPU process does, and
+the GPU process is the one that dlopens its GL stack (`libEGL` / `libGLESv2` /
+`libvk_swiftshader`) -- which is what cb4b's `libvk_swiftshader.so: undefined symbol:
+wl_display_dispatch (fatal)` and cb42's nssutil-scope `vkGetInstanceProcAddr` lookup are.
+`.wfgy/cb49.sh` tests `dlopen` in a fork child directly; `.wfgy/cb52.sh` reads the dying process's
+own `--enable-logging=stderr --v=1` output A/B'd against the working exec'd arm; `.wfgy/cb50.sh`
+measures SCM_RIGHTS across the fork.
