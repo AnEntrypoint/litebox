@@ -227,4 +227,20 @@ impl SocketBuffers {
         self.meta.reset();
         self.owners = core::array::from_fn(|_| None);
     }
+
+    /// `(data_granted, data_used, meta_granted, meta_used, owners)`.
+    ///
+    /// `data_granted`/`meta_granted` are what the arena actually gave this pool, which
+    /// [`Pool::new`] halves until the allocation fits and which can therefore be far below
+    /// `MAX_DATA_SLOTS`/`MAX_META_SLOTS` under arena pressure -- a refill that fails "because the
+    /// pool is exhausted" can mean the pool was never bigger than a handful of slots.
+    pub(crate) fn occupancy(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.data.slots,
+            self.data.used[..self.data.slots].iter().filter(|u| **u).count(),
+            self.meta.slots,
+            self.meta.used[..self.meta.slots].iter().filter(|u| **u).count(),
+            self.owners.iter().filter(|o| o.is_some()).count(),
+        )
+    }
 }

@@ -405,6 +405,10 @@ struct TcpServerSpecific {
     /// Specified backlog via `listen`, no packets can be `accept`ed unless this is `Some`
     backlog: Option<u16>,
     socket_set_handles: Vec<smoltcp::iface::SocketHandle>,
+    /// Set while every slot of this port is spent (none left in LISTEN), so that state is reported
+    /// once per episode instead of once per tick -- the sweep runs every tick, in every process
+    /// of the fork family, so an unthrottled warning here would bury the log.
+    no_slot_listening_reported: bool,
 }
 
 impl TcpServerSpecific {
@@ -428,10 +432,7 @@ impl TcpServerSpecific {
                 break;
             }
             let Some((rx, tx, claim)) = buffers.tcp() else {
-                litebox_util_log::warn!(
-                    port = self.ip_listen_endpoint.port;
-                    "listen backlog cannot be refilled: the socket buffer pool is exhausted"
-                );
+                report_exhausted_buffer_pool(socket_set, buffers, self.ip_listen_endpoint.port);
                 break;
             };
             let mut listening_socket = tcp::Socket::new(rx, tx);
@@ -454,13 +455,74 @@ impl TcpServerSpecific {
     }
 }
 
+/// Says which sockets hold the buffer pool, when a backlog refill found none left.
+///
+/// `Network` is one object shared by every process of a cross-process-fork family, so the pool is
+/// shared too: a listening port that cannot refill its backlog is deaf from then on no matter
+/// which process polls it, and the sockets holding the slots may belong to any of them. Throttled
+/// rather than per-tick -- the refill sweep runs every tick in every process, so an unthrottled
+/// report here buries the log (measured: 144k lines in one run).
+fn report_exhausted_buffer_pool(
+    socket_set: &mut smoltcp::iface::SocketSet<'_>,
+    buffers: &SocketBuffers,
+    port: u16,
+) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+        return;
+    }
+    let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
+    let mut census = alloc::string::String::new();
+    let mut total = 0usize;
+    for (_handle, socket) in socket_set.iter() {
+        total += 1;
+        match socket {
+            smoltcp::socket::Socket::Tcp(t) => {
+                let state = match t.state() {
+                    tcp::State::Listen => "L",
+                    tcp::State::SynReceived => "SR",
+                    tcp::State::SynSent => "SS",
+                    tcp::State::Established => "E",
+                    tcp::State::FinWait1 => "FW1",
+                    tcp::State::FinWait2 => "FW2",
+                    tcp::State::CloseWait => "CW",
+                    tcp::State::Closing => "CG",
+                    tcp::State::LastAck => "LA",
+                    tcp::State::TimeWait => "TW",
+                    tcp::State::Closed => "C",
+                };
+                let local = t.local_endpoint().map_or(0, |e| e.port);
+                let remote = t.remote_endpoint().map_or(0, |e| e.port);
+                let _ = core::fmt::Write::write_fmt(&mut census, format_args!(" {local}:{state}:{remote}"));
+            }
+            smoltcp::socket::Socket::Udp(u) => {
+                let local = u.endpoint().port;
+                let _ = core::fmt::Write::write_fmt(&mut census, format_args!(" udp{local}"));
+            }
+            _ => {
+                let _ = core::fmt::Write::write_fmt(&mut census, format_args!(" other"));
+            }
+        }
+    }
+    litebox_util_log::warn!(
+        port = port,
+        data_granted = data_granted,
+        data_used = data_used,
+        meta_granted = meta_granted,
+        meta_used = meta_used,
+        owners = owners,
+        sockets = total,
+        census:% = census;
+        "diag-pool: a listening port cannot refill its backlog because the shared socket buffer pool has no slot left"
+    );
+}
+
 pub(crate) struct UdpSpecific {
     /// Remote endpoint
     ///
     /// If `connect`-ed, this is the remote endpoint to which packets are sent by default.
     remote_endpoint: Option<smoltcp::wire::IpEndpoint>,
 }
-
 pub(crate) struct IcmpSpecific {}
 
 pub(crate) struct RawSpecific {
@@ -925,6 +987,53 @@ where
         socket
     }
 
+    /// Drops every backlog slot of one listening port that reached a terminal TCP state, returning
+    /// how many went.
+    ///
+    /// A backlog slot has no application fd pointing at it -- it becomes one only once `accept`
+    /// hands it out -- so a slot sitting in a state `accept` never hands out is unreachable: no
+    /// application call can ever move it on, and the only thing it still does is occupy one of the
+    /// port's `backlog` slots, which smoltcp needs a slot in `Listen` to answer a SYN with. Left
+    /// alone, `backlog` such connections make the port refuse every later SYN for the rest of the
+    /// session. The socket's own buffers go back to the shared pools here, which is what lets the
+    /// caller's `refill_to_backlog` re-arm the slot as a fresh listener.
+    fn reclaim_finished_backlog_slots(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        buffers: &mut SocketBuffers,
+        handles: &mut Vec<smoltcp::iface::SocketHandle>,
+    ) -> usize {
+        let mut reclaimed = 0usize;
+        handles.retain(|&handle| {
+            if !Self::socket_set_contains(socket_set, handle) {
+                return false;
+            }
+            let socket: &tcp::Socket = socket_set.get(handle);
+            let terminal = matches!(
+                socket.state(),
+                tcp::State::Closed
+                    | tcp::State::TimeWait
+                    | tcp::State::Closing
+                    | tcp::State::LastAck
+                    | tcp::State::FinWait1
+                    | tcp::State::FinWait2
+            );
+            // A `Closed` slot that still names a remote endpoint owes that peer an RST; let it send
+            // it first, exactly as `remove_dead_sockets` does.
+            if !terminal
+                || (socket.state() == tcp::State::Closed && socket.remote_endpoint().is_some())
+            {
+                return true;
+            }
+            // `remove_socket` hands the socket back by value; it is dropped nowhere here, matching
+            // `remove_dead_sockets` -- see that call's own comment on running a socket's destructor
+            // from a process that did not create it.
+            core::mem::forget(Self::remove_socket(socket_set, buffers, handle));
+            reclaimed += 1;
+            false
+        });
+        reclaimed
+    }
+
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
             let Some(handle) = *slot else { continue };
@@ -1107,6 +1216,78 @@ where
             .retain(|&handle| Self::socket_set_contains(socket_set, handle));
         let went_fully_dead =
             server_socket.socket_set_handles.is_empty() && handles_before > 0;
+        // A port can hold its full backlog and still be unable to accept a thing: smoltcp
+        // dispatches a SYN only to a slot in `Listen`, so a port whose every slot already took a
+        // connection the application has not `accept`ed answers every later SYN with an RST --
+        // instantly, which is exactly how a "dead port" looks from outside while the connections
+        // it already accepted keep working. No slot is stale in that state, so nothing else in the
+        // stack ever mentions it; report it once per episode (this sweep runs every tick, from
+        // every process of the fork family).
+        // A backlog slot no application fd points at can still end up in a state `accept` will
+        // never hand out: the peer's FIN lands before the application gets round to `accept`
+        // (`CloseWait`, which `accept` does hand out now), or the connection is torn down outright
+        // (`Closed`, `TimeWait`, the `FinWait*`/`Closing`/`LastAck` a reset leaves behind). Linux
+        // keeps the port listening by reclaiming those slots; so must we, because a slot left in
+        // place costs the port one connection of capacity forever and after `backlog` of them the
+        // port refuses every SYN for the rest of the session while the connections it already
+        // accepted go on streaming (fl6: an in-guest connect answered through fork 7 and was
+        // refused from fork 8 on, `backlog` 8, while a control port beside it answered all 40).
+        let reclaimed = Self::reclaim_finished_backlog_slots(
+            socket_set,
+            buffers,
+            &mut server_socket.socket_set_handles,
+        );
+        if reclaimed > 0 {
+            static RECLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if RECLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+                litebox_util_log::warn!(
+                    port = server_socket.ip_listen_endpoint.port,
+                    reclaimed = reclaimed;
+                    "diag-listener: reclaimed finished backlog slot(s) so this listening port can re-arm them"
+                );
+            }
+        }
+        let mut listening = 0usize;
+        let mut pending = 0usize;
+        let mut other = 0usize;
+        for &handle in &server_socket.socket_set_handles {
+            match socket_set.get::<tcp::Socket>(handle).state() {
+                tcp::State::Listen => listening += 1,
+                // `CloseWait` is a connection whose peer already hung up: `accept` hands it out, so
+                // it is pending work for the application, not a slot stuck in limbo.
+                tcp::State::Established
+                | tcp::State::CloseWait
+                | tcp::State::SynReceived
+                | tcp::State::SynSent => pending += 1,
+                _ => other += 1,
+            }
+        }
+        // An emptied `socket_set_handles` counts as "no slot in LISTEN" too: that is what a port
+        // looks like once a refill failed (the slots went to accepted connections and the pool had
+        // nothing left to replace them), and it is the deadest a listening port can be.
+        if listening == 0 {
+            if !server_socket.no_slot_listening_reported {
+                server_socket.no_slot_listening_reported = true;
+                let readable = socket_handle.proxy.as_ref().is_some_and(|proxy| {
+                    matches!(proxy.as_ref(), NetworkProxy::Stream(ch) if ch.is_readable())
+                });
+                litebox_util_log::warn!(
+                    port = server_socket.ip_listen_endpoint.port,
+                    slots = server_socket.socket_set_handles.len(),
+                    pending = pending,
+                    other = other,
+                    readable = readable;
+                    "diag-listener: no backlog slot of this listening port is in LISTEN state; every later SYN is refused until the application accepts"
+                );
+            }
+        } else if server_socket.no_slot_listening_reported {
+            server_socket.no_slot_listening_reported = false;
+            litebox_util_log::warn!(
+                port = server_socket.ip_listen_endpoint.port,
+                listening = listening;
+                "diag-listener: this listening port has a LISTEN slot again"
+            );
+        }
         // Nothing to do when the port is armed to its backlog: `accept` handles the slots it
         // reaches, including any that are still in the socket set but no longer open.
         if server_socket.socket_set_handles.len() == handles_before
@@ -1251,7 +1432,16 @@ where
                             // accepted-connection handles can independently go stale.
                             socket_set.iter().any(|(live, _)| live == h) && {
                                 let socket: &tcp::Socket = socket_set.get(h);
-                                socket.state() == tcp::State::Established
+                                // Whatever `accept` hands out must wake the reader, or an
+                                // epoll-driven server never learns the connection is there: a peer
+                                // that hangs up straight after connecting leaves the slot in
+                                // `CloseWait`, which an `Established`-only test misses -- so the
+                                // listener is never reported readable, the application never calls
+                                // `accept`, and the slot is stranded for the rest of the session.
+                                matches!(
+                                    socket.state(),
+                                    tcp::State::Established | tcp::State::CloseWait
+                                )
                             }
                         })
                         .then(|| {
@@ -1625,6 +1815,7 @@ where
                     },
                     backlog: Some(backlog.max(1)),
                     socket_set_handles: Vec::new(),
+                    no_slot_listening_reported: false,
                 };
                 server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 Some(self.new_socket_fd_for(SocketHandle {
@@ -2282,6 +2473,7 @@ where
                     },
                     backlog: None,
                     socket_set_handles: vec![],
+                    no_slot_listening_reported: false,
                 });
             }
             Protocol::Udp => {
@@ -2469,6 +2661,7 @@ where
                         },
                         backlog: None,
                         socket_set_handles: vec![],
+                        no_slot_listening_reported: false,
                     });
                 }
                 let Some(server_socket) = &mut handle.server_socket else {
@@ -2581,7 +2774,18 @@ where
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
                     Self::socket_set_contains(&self.socket_set, h) && {
                         let socket: &tcp::Socket = self.socket_set.get(h);
-                        socket.state() == tcp::State::Established
+                        // Linux hands a connection out of the accept queue even once its peer's FIN
+                        // has landed (`CloseWait`): the application gets the fd and learns the peer
+                        // is gone by reading EOF. Requiring `Established` here stranded such a slot
+                        // -- `is_open()` keeps it, so the retain above never drops it, no later
+                        // `accept` matches it, and the refill below only runs when a slot actually
+                        // leaves, so one peer-closed connection cost the port a backlog slot
+                        // forever and after `backlog` of them the port refused every SYN for the
+                        // rest of the session (fl6: `LAST_FORK_WHERE_8095_ANSWERED=7`, backlog 8).
+                        matches!(
+                            socket.state(),
+                            tcp::State::Established | tcp::State::CloseWait
+                        )
                     }
                 }) else {
                     if let Some(proxy) = &socket_handle.proxy {
