@@ -120,6 +120,27 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 ///
 /// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
 /// to set up a proxy for each socket created, so that events can be notified properly.
+/// A tag that is stable within one host process and differs between them, for diagnostics that run
+/// from every process of the cross-process-fork family. The log carries no pid, so without a tag
+/// "this process stopped ticking" and "this process keeps ticking but never reaches its own
+/// listening entry" read identically in the file -- exactly the ambiguity chrF10 left behind
+/// (selkies' 8081 heartbeat stopped at uptime 79.5s while other ports' ran to ~300s).
+///
+/// The address of a static is fixed for the life of a process and every host process is its own
+/// image, so two processes report two addresses. The value is only ever printed.
+fn host_process_tag() -> u64 {
+    static TAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static MARKER: u8 = 0;
+    match TAG.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let v = &MARKER as *const u8 as usize as u64;
+            TAG.store(v, core::sync::atomic::Ordering::Relaxed);
+            v
+        }
+        t => t,
+    }
+}
+
 pub struct Network<Platform>
 where
     Platform: platform::IPInterfaceProvider
@@ -480,23 +501,12 @@ impl TcpServerSpecific {
     }
 }
 
-/// Says which sockets hold the buffer pool, when a backlog refill found none left.
+/// `(how many sockets the table holds`, `one `local:state:remote` token per socket in it)`.
 ///
-/// `Network` is one object shared by every process of a cross-process-fork family, so the pool is
-/// shared too: a listening port that cannot refill its backlog is deaf from then on no matter
-/// which process polls it, and the sockets holding the slots may belong to any of them. Throttled
-/// rather than per-tick -- the refill sweep runs every tick in every process, so an unthrottled
-/// report here buries the log (measured: 144k lines in one run).
-fn report_exhausted_buffer_pool(
-    socket_set: &mut smoltcp::iface::SocketSet<'_>,
-    buffers: &SocketBuffers,
-    port: u16,
-) {
-    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
-        return;
-    }
-    let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
+/// `Network` is one object shared by every process of a cross-process-fork family, so the sockets
+/// holding the table may belong to any of them, and a count alone cannot tell a leaked socket from
+/// a busy one: only listing them answers "who is using all the slots".
+fn socket_census(socket_set: &smoltcp::iface::SocketSet<'_>) -> (usize, alloc::string::String) {
     let mut census = alloc::string::String::new();
     let mut total = 0usize;
     for (_handle, socket) in socket_set.iter() {
@@ -529,6 +539,40 @@ fn report_exhausted_buffer_pool(
             }
         }
     }
+    (total, census)
+}
+
+/// A `connect(2)` that did not complete -- refused, reset, timed out or unaddressable. The
+/// application gets an errno and, before this line, the log said nothing at all, so a port that
+/// had gone deaf was indistinguishable from one whose SYN never arrived (chrF8/chrF9: selkies'
+/// 8081 streamed to the client it had already accepted while every new connect failed silently).
+/// Throttled: browsers fail connects routinely, so an unthrottled line here buries the log.
+fn report_connect_failure(what: &'static str, port: u16) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 != 0 {
+        return;
+    }
+    litebox_util_log::warn!(what:% = what, port = port; "diag-connect: connect(2) did not complete");
+}
+
+/// Says which sockets hold the buffer pool, when a backlog refill found none left.
+///
+/// `Network` is one object shared by every process of a cross-process-fork family, so the pool is
+/// shared too: a listening port that cannot refill its backlog is deaf from then on no matter
+/// which process polls it, and the sockets holding the slots may belong to any of them. Throttled
+/// rather than per-tick -- the refill sweep runs every tick in every process, so an unthrottled
+/// report here buries the log (measured: 144k lines in one run).
+fn report_exhausted_buffer_pool(
+    socket_set: &mut smoltcp::iface::SocketSet<'_>,
+    buffers: &SocketBuffers,
+    port: u16,
+) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+        return;
+    }
+    let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
+    let (total, census) = socket_census(socket_set);
     litebox_util_log::warn!(
         port = port,
         data_granted = data_granted,
@@ -1279,7 +1323,9 @@ where
         let Some(table) = self.litebox.try_descriptor_table() else {
             return;
         };
+        let mut drain_seen = 0usize;
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
+            drain_seen += 1;
             let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
             Self::drain_socket_channel_buffers(
                 &mut self.socket_set,
@@ -1293,12 +1339,49 @@ where
         // Separate pass: the repair needs to mutate each entry, and the drain above deliberately
         // takes a shared guard so a guest thread blocked in `read()` on a socket cannot starve
         // its own bytes. A contended entry is skipped here and caught by the next tick.
+        let mut reached_ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+        let mut repair_seen = 0usize;
         for (_, mut entry) in table.iter_mut_nowait::<Network<Platform>>() {
+            repair_seen += 1;
+            if let ProtocolSpecific::Tcp(tcp_specific) = &entry.entry.specific {
+                if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
+                    reached_ports.push(server_socket.ip_listen_endpoint.port);
+                }
+            }
             Self::repair_listening_backlog(
                 &mut self.socket_set,
                 &mut self.buffers,
                 &mut entry.entry,
             );
+        }
+        // WHICH ports this tick reached, not just what it found: `iter_mut_nowait` skips any entry
+        // a guest thread is holding, and a listening entry skipped on EVERY tick is never re-armed
+        // -- a port that then goes deaf stays deaf while the connections it already accepted go on
+        // streaming. chrF10 measured exactly that shape: in-guest connects to selkies' 8081 were
+        // refused from t=30s to the end of the run while an idle guest port (8082) beside it kept
+        // answering 200 at the same instants, selkies kept encoding at 14 FPS to the end (so its
+        // process was alive), and 8081's OWN repair heartbeat stopped at uptime 79.5s while 8082's
+        // and 9222's ran to ~300s. A missing port in this list says "never repaired again"; a port
+        // present in it with `slots=8 listening=8` says "repaired, healthy, and still refusing" --
+        // which would put the fault in packet delivery instead, and those need different fixes.
+        // `drain_seen` vs `repair_seen` says how many descriptors the two passes reached: the drain
+        // takes a shared guard and the repair an exclusive one, so `repair_seen < drain_seen`
+        // tick after tick is a descriptor a guest thread is holding across the repair, i.e. a
+        // listening port this process can never re-arm.
+        {
+            static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if tick % 512 == 0 {
+                let reached = alloc::format!("{:?}", reached_ports);
+                litebox_util_log::warn!(
+                    tick = tick,
+                    tag = host_process_tag(),
+                    drain_seen = drain_seen,
+                    repair_seen = repair_seen,
+                    reached:% = reached;
+                    "diag-tick: listening ports this tick's backlog repair actually reached"
+                );
+            }
         }
     }
 
@@ -1388,6 +1471,36 @@ where
                 | tcp::State::SynReceived
                 | tcp::State::SynSent => pending += 1,
                 _ => other += 1,
+            }
+        }
+        // `diag-listener` below speaks only when a port goes DEAF, so a port that looks healthy at
+        // the exact moment a connect fails leaves no trace at all -- which is why chrF8/chrF9 went
+        // unexplained: 8081 streamed to the one client it had accepted while every new connect
+        // failed. Say what the port and the shared table look like periodically instead, so the
+        // state at any failure can be read straight off the log. Throttled: this sweep runs every
+        // tick, from every process of the fork family.
+        {
+            static HEARTBEATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if HEARTBEATS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 == 0 {
+                let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
+                let (total, census) = socket_census(socket_set);
+                litebox_util_log::warn!(
+                    tag = host_process_tag(),
+                    port = server_socket.ip_listen_endpoint.port,
+                    slots = server_socket.socket_set_handles.len(),
+                    listening = listening,
+                    pending = pending,
+                    other = other,
+                    sockets = total,
+                    max = MAX_SOCKETS,
+                    data_granted = data_granted,
+                    data_used = data_used,
+                    meta_granted = meta_granted,
+                    meta_used = meta_used,
+                    owners = owners,
+                    census:% = census;
+                    "diag-port: listening port state and shared socket table occupancy"
+                );
             }
         }
         // An emptied `socket_set_handles` counts as "no slot in LISTEN" too: that is what a port
@@ -1713,6 +1826,35 @@ where
         )
     }
 
+    /// A `socket(2)` the guest asked for and could not have: the socket table is full, or one of
+    /// the shared buffer pools has no slot left. This is `EMFILE` to the guest, and before this
+    /// line it was INVISIBLE at every log level -- which is why chrF8/chrF9 looked like a dead
+    /// port: selkies' 8081 went on streaming to the client it had already accepted while every new
+    /// connection failed right here. `diag-listener` stayed quiet through it because the port still
+    /// had its LISTEN slots, and `diag-pool` because no port was refilling a backlog. Throttled:
+    /// this is a guest-reachable failure path, so it can fire very often under load.
+    fn warn_socket_refused(&self, protocol: &'static str, reason: &'static str) {
+        static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 != 0 {
+            return;
+        }
+        let (data_granted, data_used, meta_granted, meta_used, owners) = self.buffers.occupancy();
+        let (total, census) = socket_census(&self.socket_set);
+        litebox_util_log::warn!(
+            protocol:% = protocol,
+            reason:% = reason,
+            sockets = total,
+            max = MAX_SOCKETS,
+            data_granted = data_granted,
+            data_used = data_used,
+            meta_granted = meta_granted,
+            meta_used = meta_used,
+            owners = owners,
+            census:% = census;
+            "diag-socket: socket(2) refused, the socket table or a shared buffer pool has no slot left"
+        );
+    }
+
     /// Creates a socket.
     ///
     /// By default, the created socket has no associated proxy; to set a proxy, use
@@ -1723,17 +1865,24 @@ where
         // fixed-capacity table rather than growing, unlike the old `Vec`-backed one, so check
         // capacity ourselves first and return an ordinary error instead.
         if self.socket_set.iter().count() >= MAX_SOCKETS {
+            self.warn_socket_refused("any", "socket table full");
             return Err(SocketError::TooManySockets);
         }
         let handle = match protocol {
             Protocol::Tcp => {
-                let (rx, tx, claim) = self.buffers.tcp().ok_or(SocketError::TooManySockets)?;
+                let Some((rx, tx, claim)) = self.buffers.tcp() else {
+                    self.warn_socket_refused("tcp", "no buffer slot left");
+                    return Err(SocketError::TooManySockets);
+                };
                 let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
                 handle
             }
             Protocol::Udp => {
-                let (rx, tx, claim) = self.buffers.udp().ok_or(SocketError::TooManySockets)?;
+                let Some((rx, tx, claim)) = self.buffers.udp() else {
+                    self.warn_socket_refused("udp", "no buffer slot left");
+                    return Err(SocketError::TooManySockets);
+                };
                 let handle = self.socket_set.add(udp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
                 handle
@@ -2459,6 +2608,16 @@ where
         };
 
         let mut result = ret;
+        if let Err(ref err) = ret {
+            let what = match err {
+                ConnectError::TimedOut => "timeout",
+                ConnectError::Unaddressable => "unaddressable",
+                ConnectError::InvalidState => "refused",
+                ConnectError::InProgress => "in-progress",
+                _ => "other",
+            };
+            report_connect_failure(what, addr.port());
+        }
         if let Some(proxy) = &socket_handle.proxy {
             match ret {
                 Ok(()) => proxy.set_state(socket_channel::SocketState::Connected),
