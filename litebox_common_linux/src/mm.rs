@@ -314,11 +314,16 @@ pub fn sys_madvise<
 
     let addr = addr.to_platform_ptr::<Platform>();
     match advice {
-        crate::MadviseBehavior::Normal
-        | crate::MadviseBehavior::DontFork
-        | crate::MadviseBehavior::DoFork => {
-            // No-op for now, as we don't support fork yet.
-            Ok(())
+        crate::MadviseBehavior::Normal => Ok(()),
+        crate::MadviseBehavior::DontFork => {
+            // SAFETY: the advice concerns only whether a later `fork()` copies this range into
+            // its child, and the range is guest memory the caller owns (it was validated as
+            // mapped-and-owned by the caller of `madvise(2)` itself).
+            unsafe { pm.set_range_dont_fork(addr, aligned_len, true) }.map_err(Errno::from)
+        }
+        crate::MadviseBehavior::DoFork => {
+            // SAFETY: same as `DontFork` above; this only withdraws that advice.
+            unsafe { pm.set_range_dont_fork(addr, aligned_len, false) }.map_err(Errno::from)
         }
         crate::MadviseBehavior::DontNeed => {
             // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
