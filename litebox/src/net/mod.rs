@@ -580,10 +580,14 @@ fn socket_census(socket_set: &smoltcp::iface::SocketSet<'_>) -> (usize, alloc::s
 /// application gets an errno and, before this line, the log said nothing at all, so a port that
 /// had gone deaf was indistinguishable from one whose SYN never arrived (chrF8/chrF9: selkies'
 /// 8081 streamed to the client it had already accepted while every new connect failed silently).
-/// Throttled: browsers fail connects routinely, so an unthrottled line here buries the log.
+/// Throttled: browsers fail connects routinely, so an unthrottled line here buries the log. The
+/// FIRST FOUR failures of a process are always reported - a probe that fails three connects on a
+/// port it cares about would otherwise be invisible behind the 1/64 throttle (chrF15's three
+/// HOLD-tick curls to 8081 left no line at all, while 19 sampled lines hid ~1216 real ones).
 fn report_connect_failure(what: &'static str, port: u16) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 != 0 {
+    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n >= 4 && n % 64 != 0 {
         return;
     }
     litebox_util_log::warn!(what:% = what, port = port; "diag-connect: connect(2) did not complete");
