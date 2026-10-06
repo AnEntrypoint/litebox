@@ -617,6 +617,9 @@ fn report_connect_outcome(
     local: u16,
     elapsed_us: u64,
     timeout_us: u64,
+    slots: &str,
+    state: &'static str,
+    closed_here: bool,
 ) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -627,6 +630,9 @@ fn report_connect_outcome(
         local = local,
         elapsed_us = elapsed_us,
         timeout_us = timeout_us,
+        slots:% = slots,
+        state:% = state,
+        closed_here = closed_here,
         n = n;
         "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
     );
@@ -638,9 +644,50 @@ fn report_connect_outcome(
         port = port,
         local = local,
         elapsed_us = elapsed_us,
-        timeout_us = timeout_us;
+        timeout_us = timeout_us,
+        slots:% = slots,
+        state:% = state,
+        closed_here = closed_here;
         "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
     );
+}
+
+/// The states of every smoltcp socket bound to `port`, at the instant a connect to it was refused.
+///
+/// `diag-port` speaks only on every 512th sweep, so a refusal has never carried its own cause:
+/// chrF19/20/21 read `slots=8 listening=8 pending=0` at some heartbeat while 8081 was refusing at
+/// every tick, and a heartbeat and a refusal are whole sweeps and seconds apart -- a port that is
+/// deaf most of the time still looks armed at the sample, so the two could not be reconciled. smoltcp
+/// dispatches a SYN only to a socket in `Listen`, so that count IS the answer, and reading it here
+/// ties it to the failure instead of to whatever the port looked like some sweeps later.
+fn port_slots_at(socket_set: &smoltcp::iface::SocketSet<'_>, port: u16) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for (_handle, socket) in socket_set.iter() {
+        let smoltcp::socket::Socket::Tcp(t) = socket else {
+            continue;
+        };
+        if t.local_endpoint().map_or(0, |e| e.port) != port {
+            continue;
+        }
+        let state = match t.state() {
+            tcp::State::Listen => "L",
+            tcp::State::SynReceived => "SR",
+            tcp::State::SynSent => "SS",
+            tcp::State::Established => "E",
+            tcp::State::FinWait1 => "FW1",
+            tcp::State::FinWait2 => "FW2",
+            tcp::State::CloseWait => "CW",
+            tcp::State::Closing => "CG",
+            tcp::State::LastAck => "LA",
+            tcp::State::TimeWait => "TW",
+            tcp::State::Closed => "C",
+        };
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{state} "));
+    }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
 }
 
 /// Says which sockets hold the buffer pool, when a backlog refill found none left.
@@ -1935,6 +1982,22 @@ where
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
                             // Socket closed while connecting. Distinguish RST from timeout.
+                            let peer_port = tcp_specific.connect_peer_port.unwrap_or(0);
+                            // The socket's own endpoints are already gone (that is the whole reason
+                            // the peer port is carried on `TcpSpecific`), so take the local port
+                            // here too -- and with it the last use of `tcp_socket`, which frees the
+                            // socket set to be read again for the slot census below.
+                            let local_port = tcp_socket.local_endpoint().map_or(0, |e| e.port);
+                            // Taken while `tcp_socket` is still borrowed, because the socket set has
+                            // to be readable again for the census below. Two different things end a
+                            // connect and only one of them is a refusal: the peer's RST, and this
+                            // side closing the socket (a process that exited, `close_handle`, an
+                            // abort). Calling both "refused" is what let chrF21 read 68 refusals
+                            // without proving a single RST was ever received, so say which one.
+                            let state = tcp_socket.state();
+                            let closed_here = socket_handle
+                                .consider_closed
+                                .load(core::sync::atomic::Ordering::Relaxed);
                             let (error, elapsed) = match tcp_specific.connect_initiated_at_us {
                                 Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
                                     (errors::SocketAsyncError::TimedOut, now - initiated_at)
@@ -1953,10 +2016,25 @@ where
                                     errors::SocketAsyncError::ConnectionRefused => "refused",
                                     _ => "other",
                                 },
-                                tcp_specific.connect_peer_port.unwrap_or(0),
-                                tcp_socket.local_endpoint().map_or(0, |e| e.port),
+                                peer_port,
+                                local_port,
                                 elapsed.total_micros(),
                                 TCP_CONNECT_TIMEOUT.total_micros(),
+                                &port_slots_at(socket_set, peer_port),
+                                match state {
+                                    tcp::State::Listen => "L",
+                                    tcp::State::SynReceived => "SR",
+                                    tcp::State::SynSent => "SS",
+                                    tcp::State::Established => "E",
+                                    tcp::State::FinWait1 => "FW1",
+                                    tcp::State::FinWait2 => "FW2",
+                                    tcp::State::CloseWait => "CW",
+                                    tcp::State::Closing => "CG",
+                                    tcp::State::LastAck => "LA",
+                                    tcp::State::TimeWait => "TW",
+                                    tcp::State::Closed => "C",
+                                },
+                                closed_here,
                             );
                             proxy.set_async_error(error);
                             proxy.set_state(socket_channel::SocketState::Error);
