@@ -105,6 +105,13 @@ const MAX_PACKET_COUNT: usize = 32;
 /// (`SharedUnixAddrPresenceTable`'s 256, `RawMutex::WaiterQueue`'s 32).
 pub(crate) const MAX_SOCKETS: usize = 256;
 
+/// How many listening ports can have a recorded queue owner at once ([`Network::listen_owner`]).
+/// A desktop run arms ~13 listening ports (measured), so 64 leaves room; the table is a hint used
+/// only to adopt an ORPHANED queue, so overflow degrades to today's behavior (no adoption) rather
+/// than to anything worse -- no slot means "owner unknown", and an unknown owner is never assumed
+/// dead, exactly like the pre-existing borrowed-listener path.
+const LISTEN_OWNER_SLOTS: usize = 64;
+
 mod socket_buffers;
 use socket_buffers::SocketBuffers;
 
@@ -210,6 +217,18 @@ where
     /// claimed here at `accept` time and skipped by every later scan. Cleared when a slot is armed
     /// back into LISTEN (a reused slot must be claimable again).
     accepted_slots: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    /// Which process is responsible for arming each listening port's accept queue, as
+    /// `(port << 32) | host_pid` in one atomic word (`0` == slot free).
+    ///
+    /// A listening port's backlog slots live in the SHARED socket set, so they outlive the process
+    /// that armed them -- and their only maintainer is that process's own tick, which
+    /// `repair_listening_backlog` deliberately denies to a BORROWED referent (a borrower re-arming
+    /// the port is chrF4's competing-queues bug). So when the owning process dies, the port keeps
+    /// answering nothing forever: no process refills its backlog or reclaims its finished slots,
+    /// and every fork child that inherited it sits on a deaf port. This is what lets a borrower
+    /// tell "the owner is gone" (a pid that no longer exists) from "the owner is merely quiet",
+    /// and take the queue over -- the one distinction a tag, an address or a counter cannot make.
+    listen_owner: [core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -220,7 +239,8 @@ where
     Platform: platform::IPInterfaceProvider
         + platform::TimeProvider
         + sync::RawSyncPrimitivesProvider
-        + platform::SharedKernelStateProvider,
+        + platform::SharedKernelStateProvider
+        + platform::SystemInfoProvider,
 {
     /// Construct a new `Network` instance
     ///
@@ -278,6 +298,7 @@ where
             closing_in_background: [None; MAX_SOCKETS],
             shared_across_fork: [None; MAX_SOCKETS],
             accepted_slots: [None; MAX_SOCKETS],
+            listen_owner: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -737,7 +758,8 @@ where
     Platform: platform::IPInterfaceProvider
         + platform::TimeProvider
         + sync::RawSyncPrimitivesProvider
-        + platform::SharedKernelStateProvider,
+        + platform::SharedKernelStateProvider
+        + platform::SystemInfoProvider,
 {
     /// Rebind every field of this `Network` that holds a raw, process-relative pointer captured at
     /// construction time to the CALLING process's own, always-correct equivalent.
@@ -1116,6 +1138,133 @@ where
         reclaimed
     }
 
+    /// The recorded owner of `port`'s accept queue, if this port has one.
+    fn listen_owner_of(
+        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+        port: u16,
+    ) -> Option<u32> {
+        listen_owner.iter().find_map(|slot| {
+            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
+            (packed >> 32 == u64::from(port) && packed != 0).then_some(packed as u32)
+        })
+    }
+
+    /// Records `pid` as the process responsible for arming `port`'s accept queue.
+    fn record_listen_owner(
+        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+        port: u16,
+        pid: u32,
+    ) {
+        if pid == 0 {
+            return;
+        }
+        let want = (u64::from(port) << 32) | u64::from(pid);
+        for slot in listen_owner {
+            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
+            if packed == 0 {
+                if slot
+                    .compare_exchange(
+                        0,
+                        want,
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            } else if packed >> 32 == u64::from(port) {
+                // A re-bind, possibly by another process: the armer is whoever listened last. A
+                // pid left stale here would have every borrower conclude the live owner is dead.
+                slot.store(want, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// Installs `me` as `port`'s queue owner, but only while `dead` is still the recorded one --
+    /// the one word that stops two borrowers from both adopting the queue and arming two
+    /// competing backlogs on a single endpoint (chrF4's measured symptom).
+    fn claim_listen_owner(
+        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+        port: u16,
+        dead: u32,
+        me: u32,
+    ) -> bool {
+        if me == 0 || dead == 0 || me == dead {
+            return false;
+        }
+        let want = (u64::from(port) << 32) | u64::from(me);
+        listen_owner.iter().any(|slot| {
+            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
+            packed >> 32 == u64::from(port)
+                && packed as u32 == dead
+                && slot
+                    .compare_exchange(
+                        packed,
+                        want,
+                        core::sync::atomic::Ordering::Acquire,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+        })
+    }
+
+    /// Whether a BORROWED referent of listening port `port` may take that port's accept queue
+    /// over: only when the recorded owner is a pid that no longer exists. A live owner, an unknown
+    /// owner, a port with a socket already in LISTEN, or a lost race with another borrower all
+    /// leave this referent a borrower.
+    fn promote_borrowed_listener(
+        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        handles: &mut alloc::vec::Vec<smoltcp::iface::SocketHandle>,
+        port: u16,
+        platform: &Platform,
+    ) -> bool {
+        let me = platform.current_pid();
+        let Some(owner) = Self::listen_owner_of(listen_owner, port) else {
+            return false;
+        };
+        if owner == me {
+            return true;
+        }
+        // Confirmed dead, never "quiet": a borrower that adopts a queue its owner is still
+        // ticking for arms a second backlog beside the live one.
+        if platform.is_process_alive(owner) {
+            return false;
+        }
+        if !Self::claim_listen_owner(listen_owner, port, owner, me) {
+            return false;
+        }
+        // Adopt every socket already armed on this endpoint before the caller refills: refill only
+        // tops the list up to `backlog`, so leaving the dead owner's slots unlisted would add a
+        // second queue of `backlog` sockets beside them -- the competing-queues shape this
+        // promotion exists to prevent, reached from the other side.
+        for (handle, socket) in socket_set.iter() {
+            let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                continue;
+            };
+            if socket
+                .local_endpoint()
+                .is_some_and(|local| local.port == port)
+                && !handles.contains(&handle)
+            {
+                handles.push(handle);
+            }
+        }
+        static PROMOTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if PROMOTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+            litebox_util_log::warn!(
+                port = port,
+                dead_owner = owner,
+                new_owner = me,
+                adopted = handles.len();
+                "diag-listener: adopted an orphaned listening port's queue (its owner is gone)"
+            );
+        }
+        true
+    }
+
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
             let Some(handle) = *slot else { continue };
@@ -1385,9 +1534,11 @@ where
                 }
             }
             Self::repair_listening_backlog(
+                &self.listen_owner,
                 &mut self.socket_set,
                 &mut self.buffers,
                 &mut entry.entry,
+                self.litebox.platform(),
             );
         }
         // WHICH ports this tick reached, not just what it found: `iter_mut_nowait` skips any entry
@@ -1441,9 +1592,11 @@ where
     /// tick over a socket set shared across the fork family, and dropping a socket another process
     /// allocated runs its ring buffers through the wrong heap (see `remove_dead_sockets`).
     fn repair_listening_backlog(
+        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
         socket_handle: &mut SocketHandle<Platform>,
+        platform: &Platform,
     ) {
         if socket_handle
             .consider_closed
@@ -1463,9 +1616,28 @@ where
         // selkies' published 8081 answering one request and then refusing every connect for the
         // rest of the run; `fork_adopt` stopped arming them at adoption time but this sweep
         // re-armed them on the child's very next tick. Its slot list therefore stays EMPTY, and
-        // its `server_socket` here exists only to name the endpoint and the backlog to accept from.
+        // its `server_socket` here exists only to name the endpoint and the backlog to accept
+        // from -- until the process that owns the queue is GONE, at which point nobody maintains
+        // it and the port is deaf for good unless this referent takes it over.
         if socket_handle.borrowed {
-            return;
+            let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
+                return;
+            };
+            let Some(server_socket) = tcp_specific.server_socket.as_mut() else {
+                return;
+            };
+            if !Self::promote_borrowed_listener(
+                listen_owner,
+                socket_set,
+                &mut server_socket.socket_set_handles,
+                server_socket.ip_listen_endpoint.port,
+                platform,
+            ) {
+                return;
+            }
+            // Promoted: from here on this referent maintains the queue itself, so refill, reclaim
+            // and close all apply to it exactly as they do for the process that created the port.
+            socket_handle.borrowed = false;
         }
         let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
             return;
@@ -1863,7 +2035,8 @@ where
     Platform: platform::IPInterfaceProvider
         + platform::TimeProvider
         + sync::RawSyncPrimitivesProvider
-        + platform::SharedKernelStateProvider,
+        + platform::SharedKernelStateProvider
+        + platform::SystemInfoProvider,
 {
     fn now(&self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_micros(
@@ -3173,6 +3346,15 @@ where
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
                 }
                 server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
+                // Whoever arms a port's accept queue is the process that has to keep arming it:
+                // recorded so a fork child that inherits the port can tell an owner that is GONE
+                // from one that is merely quiet, and adopt the queue instead of sitting on a port
+                // that answers nothing for the rest of the session.
+                Self::record_listen_owner(
+                    &self.listen_owner,
+                    server_socket.ip_listen_endpoint.port,
+                    self.litebox.platform().current_pid(),
+                );
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),

@@ -15299,6 +15299,10 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         None
     }
 
+    fn current_pid(&self) -> u32 {
+        unsafe { Win32_Threading::GetCurrentProcessId() }
+    }
+
     fn env_flag(&self, name: &str) -> bool {
         // Cached per thread, because callers reasonably treat a trait method named `env_flag` as
         // a predicate cheap enough to consult from a hot path -- the shim's syscall dispatch did
