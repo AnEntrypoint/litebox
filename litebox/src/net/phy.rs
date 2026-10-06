@@ -143,16 +143,21 @@ fn diag_loop(dir: &'static str, packet: &[u8], depth: usize) {
     }
     let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
     let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    // Bound as locals and handed over as `&str`: the log macro takes a `str` value, and an owned
+    // `String` written straight into the field list does not satisfy it.
+    let src = alloc::format!(
+        "{}.{}.{}.{}:{}",
+        packet[12], packet[13], packet[14], packet[15],
+        u16::from_be_bytes([tcp[0], tcp[1]])
+    );
+    let dst = alloc::format!(
+        "{}.{}.{}.{}:{}",
+        packet[16], packet[17], packet[18], packet[19],
+        u16::from_be_bytes([tcp[2], tcp[3]])
+    );
     litebox_util_log::debug!(
         tag = super::host_process_tag(), dir:% = dir, depth = depth,
-        src = alloc::format!(
-            "{}.{}.{}.{}:{}", packet[12], packet[13], packet[14], packet[15],
-            u16::from_be_bytes([tcp[0], tcp[1]])
-        ),
-        dst = alloc::format!(
-            "{}.{}.{}.{}:{}", packet[16], packet[17], packet[18], packet[19],
-            u16::from_be_bytes([tcp[2], tcp[3]])
-        ),
+        src = src.as_str(), dst = dst.as_str(),
         flags = flags, seq = seq, ack = ack;
         "diag-loop: a guest-to-guest TCP packet crossed the loopback queue"
     );
