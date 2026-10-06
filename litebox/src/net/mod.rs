@@ -584,9 +584,15 @@ fn socket_census(socket_set: &smoltcp::iface::SocketSet<'_>) -> (usize, alloc::s
 /// FIRST FOUR failures of a process are always reported - a probe that fails three connects on a
 /// port it cares about would otherwise be invisible behind the 1/64 throttle (chrF15's three
 /// HOLD-tick curls to 8081 left no line at all, while 19 sampled lines hid ~1216 real ones).
+/// `SEEN` is shared by EVERY process in the family, so those first four are spent by whatever
+/// fails earliest in the run; every failure is repeated UNTHROTTLED at `debug` with its `n`, which
+/// is what a probe turns on to see its own (chrF19: the three refused curls to 8081 at t=90/120/150
+/// left ZERO lines, because 12 earlier failures had already spent the budget - the absence of a
+/// `diag-connect` line proves nothing).
 fn report_connect_failure(what: &'static str, port: u16) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    litebox_util_log::debug!(what:% = what, port = port, n = n; "diag-connect: connect(2) did not complete");
     if n >= 4 && n % 64 != 0 {
         return;
     }
