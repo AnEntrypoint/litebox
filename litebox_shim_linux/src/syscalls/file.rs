@@ -9379,8 +9379,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// receiver would silently have to drop.
     ///
     /// `Ok(None)` is the ordinary "this kind has no cross-process rebuild" case (pipes, epoll,
-    /// inet sockets, pty masters ...); `Err(reason)` is a unix socket we COULD have carried had it
+    /// pty masters ...); `Err(reason)` is a unix socket we COULD have carried had it
     /// been in a reachable state, which is the one worth reading in a log.
+    ///
+    /// An EPOLL fd is deliberately left unnameable: a set's interest list is rebuilt by FD NUMBER
+    /// (`Task::install_epoll_at_fd`), which is right for a fork child whose numbers the fork
+    /// reproduced, but a donation lands in a process whose fd numbers name unrelated objects - so
+    /// rebuilding it here would silently register the RECEIVER's fd 5 against the sender's events.
+    /// Refusing is `EOPNOTSUPP` on `sendmsg`, which the guest can see; a wrong interest cannot be.
     ///
     /// A regular file whose bytes live only in THIS process's writable layer is carried as `T|`,
     /// not `F|` -- see [`Self::carriable_file_spec_for_raw_fd`].
@@ -9429,6 +9435,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(reason) => unix_refusal = Some(reason),
             }
         }
+        if let Some(spec) = self.raw_fd_inet_carry(raw_fd) {
+            return Ok(Some(alloc::format!("N|{spec}")));
+        }
         let spec = if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
             let (path, flags) = match raw_fd {
                 0 => ("/dev/stdin", OFlags::RDONLY),
@@ -9451,6 +9460,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         const AT_FDCWD: i32 = -100;
         if let Some(carried) = spec.strip_prefix("U|") {
             return self.rebuild_carried_unix(carried, cloexec);
+        }
+        if let Some(carried) = spec.strip_prefix("N|") {
+            // `EBADF` is this codebase's vocabulary for "the carried fd is gone" (the fork path
+            // logs exactly that when a spec cannot be re-adopted), and it is what the receiver
+            // gets to see: the byte payload beside it was still genuinely delivered.
+            return self
+                .install_inet_carried(carried, cloexec)
+                .map(|raw| raw as usize)
+                .ok_or(Errno::EBADF);
         }
         let mut parts = spec.splitn(4, '|');
         let kind = parts.next().ok_or(Errno::EINVAL)?;
@@ -9722,11 +9740,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(alloc::format!("{}|{spec}", u8::from(cloexec)))
     }
 
-    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried (see
-    /// `Task::raw_fd_inet_carry`). The child attaches to the SAME `Network` socket its parent
-    /// holds, located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
-    /// reference, so closing it here cannot tear down the parent's.
-    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+    /// Rebuilds the INET socket a carry spec names (see `Task::raw_fd_inet_carry`) and returns its
+    /// NEW raw fd number. This process attaches to the SAME `Network` socket the sender holds,
+    /// located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
+    /// reference, so closing it here cannot tear down the sender's.
+    ///
+    /// `cloexec` is the RECEIVER's own close-on-exec disposition, not the bit the spec carries: an
+    /// SCM_RIGHTS donation is a new descriptor here, and Linux lets the receiver choose it
+    /// (`MSG_CMSG_CLOEXEC`) - the sender's bit describes the sender's fd, which this process does
+    /// not have. The fork path passes the spec's own bit, where the child's fd is meant to be the
+    /// same fd.
+    pub(crate) fn install_inet_carried(&self, spec: &str, cloexec: bool) -> Option<i32> {
         use litebox_common_linux::{SockFlags, SockType};
         let mut parts = spec.split('|');
         // Parsed in the order `FilesState::raw_fd_inet_carry` writes it (`<cloexec>|<v6>|<nonblock>|
@@ -9738,8 +9762,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 (Some(a), Some(b), Some(c), Some(d)) => (a == "1", b == "1", c == "1", d),
                 _ => {
                     litebox_util_log::warn!(
-                        fd:% = target_fd, spec:% = spec;
-                        "fork child: malformed inet carry spec; this fd is left missing (EBADF)"
+                        spec:% = spec;
+                        "carry: malformed inet carry spec; this fd is left missing (EBADF)"
                     );
                     return None;
                 }
@@ -9749,8 +9773,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some(b'U') | Some(b'u') => SockType::Datagram,
             _ => {
                 litebox_util_log::warn!(
-                    fd:% = target_fd, spec:% = spec;
-                    "fork child: inet carry spec names no known socket; this fd is left missing (EBADF)"
+                    spec:% = spec;
+                    "carry: inet carry spec names no known socket; this fd is left missing (EBADF)"
                 );
                 return None;
             }
@@ -9761,8 +9785,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let Some(socket) = self.global.net_lock().fork_adopt(net_spec) else {
             litebox_util_log::warn!(
-                fd:% = target_fd, spec:% = net_spec;
-                "fork child: a carried inet socket could not be re-adopted here; this fd is left missing (EBADF)"
+                spec:% = net_spec;
+                "carry: a carried inet socket could not be re-adopted here; this fd is left missing (EBADF)"
             );
             return None;
         };
@@ -9812,15 +9836,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok()?;
         drop(files);
         let raw = i32::try_from(raw).ok()?;
-        let dup_flags = cloexec.then_some(OFlags::CLOEXEC);
-        if raw != target_fd {
-            let moved = self.sys_dup(raw, Some(target_fd), dup_flags).is_ok();
-            let _ = self.sys_close(raw);
-            return moved.then_some(());
-        }
-        if dup_flags.is_some() {
+        if cloexec {
             let files = self.files.borrow();
-            let desc = usize::try_from(target_fd).ok()?;
+            let desc = usize::try_from(raw).ok()?;
             set_file_descriptor_flags(
                 desc,
                 &self.global,
@@ -9828,6 +9846,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 FileDescriptorFlags::FD_CLOEXEC,
             )
             .ok()?;
+        }
+        Some(raw)
+    }
+
+    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried.
+    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let cloexec = spec.split_once('|').is_some_and(|(c, _)| c == "1");
+        let raw = self.install_inet_carried(spec, cloexec)?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
         }
         Some(())
     }
