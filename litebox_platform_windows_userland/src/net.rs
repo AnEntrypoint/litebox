@@ -900,10 +900,60 @@ pub(crate) fn owns_ip_interface() -> bool {
     clippy::unnecessary_wraps,
     reason = "return type is fixed by the IPInterfaceProvider trait"
 )]
+/// One line per N packets on the guest<->gateway wire.
+///
+/// chrF11 measured selkies' 8081 refusing every in-guest connect from t=30s while an idle 8082
+/// beside it answered 200 at the same instant: same queue, same poller, same netstack, same
+/// process issuing both connects -- only the port differs. Every per-port state the socket layer
+/// can print looked healthy for 8081 (`slots=8 listening=8 pending=0`, and `diag-tick` reached it
+/// at uptime 226s), so the one question left is whether 8081's SYN reaches the stack at all --
+/// which only the wire itself can answer. `rx` without a matching `tx` is a stack that dropped or
+/// refused it; `tx` with no `rx` is a queue nobody drained.
+fn diag_pkt(dir: &'static str, packet: &[u8]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) % 512 != 0 {
+        return;
+    }
+    let Ok(ip) = Ipv4Packet::new_checked(packet) else {
+        return;
+    };
+    let src = ip.src_addr();
+    let dst = ip.dst_addr();
+    let tuple = match ip.next_header() {
+        IpProtocol::Tcp => match TcpPacket::new_checked(ip.payload()) {
+            Ok(t) => format!(
+                "tcp {}:{} -> {}:{} {}{}{}{}",
+                src,
+                t.src_port(),
+                dst,
+                t.dst_port(),
+                if t.syn() { "S" } else { "" },
+                if t.ack() { "A" } else { "" },
+                if t.rst() { "R" } else { "" },
+                if t.fin() { "F" } else { "" },
+            ),
+            Err(_) => format!("tcp {src} -> {dst} unparsed"),
+        },
+        IpProtocol::Udp => match UdpPacket::new_checked(ip.payload()) {
+            Ok(u) => format!("udp {}:{} -> {}:{}", src, u.src_port(), dst, u.dst_port()),
+            Err(_) => format!("udp {src} -> {dst} unparsed"),
+        },
+        _ => format!("other {src} -> {dst}"),
+    };
+    litebox_util_log::warn!(
+        dir:% = dir,
+        pid = std::process::id(),
+        tuple:% = tuple;
+        "diag-pkt: packet on the guest<->gateway wire"
+    );
+}
+
 pub(crate) fn send_ip_packet(
     slot: &OnceLock<NatGateway>,
     packet: &[u8],
 ) -> Result<(), litebox::platform::SendError> {
+    diag_pkt("tx", packet);
     let gw = gateway(slot);
     let targets_guest_loopback = packet_targets_guest_loopback(packet);
     let mut queue = gw.queue.lock().unwrap();
@@ -939,6 +989,7 @@ pub(crate) fn receive_ip_packet(
     };
     let n = data.len().min(packet.len());
     packet[..n].copy_from_slice(&data[..n]);
+    diag_pkt("rx", &packet[..n]);
     Ok(n)
 }
 

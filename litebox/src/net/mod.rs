@@ -1320,12 +1320,35 @@ where
         // process on every tick whether or not anything is accepted.
         Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
         // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
+        // A table that stays unreadable tick after tick makes this whole sweep a no-op in one
+        // process while every other process keeps going, which is indistinguishable in the log
+        // from "this process stopped ticking" unless it is said out loud -- the ambiguity that
+        // left chrF10/chrF11 unexplained (8081's heartbeat stopped at uptime 53.8s while 8082's
+        // and 9222's ran to ~600s).
         let Some(table) = self.litebox.try_descriptor_table() else {
+            static LOCKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if LOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 == 0 {
+                litebox_util_log::warn!(
+                    tag = host_process_tag();
+                    "diag-tick: this process's descriptor table was locked, no socket was swept"
+                );
+            }
             return;
         };
+        // This process's own descriptor table, whose address is per-process (every process has its
+        // own, even though the socket set it names is shared). `host_process_tag()` -- the address
+        // of a static -- came out IDENTICAL for every host process, because they are all the same
+        // image mapped at the same base, so it cannot tell one process's tick from another's.
+        let dtag = &*table as *const _ as usize as u64;
         let mut drain_seen = 0usize;
+        let mut drain_ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             drain_seen += 1;
+            if let ProtocolSpecific::Tcp(tcp_specific) = &entry.entry.specific {
+                if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
+                    drain_ports.push(server_socket.ip_listen_endpoint.port);
+                }
+            }
             let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
             Self::drain_socket_channel_buffers(
                 &mut self.socket_set,
@@ -1372,12 +1395,15 @@ where
             static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if tick % 512 == 0 {
+                let drained = alloc::format!("{:?}", drain_ports);
                 let reached = alloc::format!("{:?}", reached_ports);
                 litebox_util_log::warn!(
                     tick = tick,
                     tag = host_process_tag(),
+                    dtag = dtag,
                     drain_seen = drain_seen,
                     repair_seen = repair_seen,
+                    drained:% = drained,
                     reached:% = reached;
                     "diag-tick: listening ports this tick's backlog repair actually reached"
                 );
@@ -1410,6 +1436,22 @@ where
             .consider_closed
             .load(core::sync::atomic::Ordering::Relaxed)
         {
+            return;
+        }
+        // A BORROWED referent of a listening socket (`fork_adopt`'s `"L"` arm) owns no accept queue
+        // of its own: it accepts from the queue the OWNING process armed on the endpoint
+        // (`Network::unclaimed_connection_on`), which is what makes one listening port shared
+        // across `fork()` behave like Linux's shared open file description. Refilling here would
+        // undo exactly that -- this sweep runs from every process's tick, so every fork child
+        // inheriting the port would arm `backlog` more LISTEN sockets on the same endpoint in the
+        // shared socket set, and an incoming SYN would go to whichever queue smoltcp matched
+        // first, leaving the owning process's own queue empty while another process's fills with
+        // connections nobody accept()s. That is chrF4's competing-queues symptom, measured as
+        // selkies' published 8081 answering one request and then refusing every connect for the
+        // rest of the run; `fork_adopt` stopped arming them at adoption time but this sweep
+        // re-armed them on the child's very next tick. Its slot list therefore stays EMPTY, and
+        // its `server_socket` here exists only to name the endpoint and the backlog to accept from.
+        if socket_handle.borrowed {
             return;
         }
         let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
@@ -2132,6 +2174,21 @@ where
                 let (rx, tx, claim) = self.buffers.tcp()?;
                 let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
+                // How often a fork child inherits a listening port, and what the shared socket set
+                // looks like when it does: each adoption costs one socket slot for the life of the
+                // child, and 8081's refusal in chrF10/chrF11 wanted to know whether these pile up.
+                {
+                    static ADOPTS: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    if ADOPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+                        litebox_util_log::warn!(
+                            port = lport,
+                            sockets = self.socket_set.iter().count(),
+                            max = MAX_SOCKETS;
+                            "diag-adopt: a fork child inherited a listening port (borrowed, no slots of its own)"
+                        );
+                    }
+                }
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -2409,10 +2466,12 @@ where
         // on the shared socket, no `LocalPort` deallocation, no `closing_in_background` entry --
         // any of those would tear down a connection the owning process is still using, which is
         // precisely what real Linux's per-`fork()` file-descriptor refcount prevents. The one
-        // thing this process DID create for itself is a carried TCP listener's backlog sockets
-        // (`fork_adopt` refills those locally), so those are still removed; the listener's main
-        // handle is likewise locally created and is left alone, since it is not in `socket_set`'s
-        // closing path either way. Without this branch, an inherited TCP connection died the
+        // thing this process DID create for itself is a carried TCP listener's OWN handle
+        // (`fork_adopt`'s `"L"` arm adds one socket to name the endpoint), and that one is left
+        // alone: it is not in `socket_set`'s closing path either way. A borrowed listener arms no
+        // backlog slots of its own (`repair_listening_backlog` returns early for it), so the loop
+        // below finds an empty list and removes nothing -- kept because a handle in that list would
+        // have to be released here if one ever existed. Without this branch, an inherited TCP connection died the
         // moment the child that inherited it exited -- the parent's own fd survived but pointed
         // at an aborted socket.
         if borrowed {
