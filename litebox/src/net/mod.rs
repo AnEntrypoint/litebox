@@ -478,6 +478,10 @@ pub(crate) struct TcpSpecific {
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
     connect_initiated_at_us: Option<smoltcp::time::Instant>,
+    /// The port this socket dialled, kept because smoltcp clears the socket's own endpoints once it
+    /// closes: the sweep that later decides the connect's errno (see [`report_connect_outcome`])
+    /// runs after that and would otherwise name every failure `port=0`.
+    connect_peer_port: Option<u16>,
 }
 
 struct TcpServerSpecific {
@@ -597,6 +601,46 @@ fn report_connect_failure(what: &'static str, port: u16) {
         return;
     }
     litebox_util_log::warn!(what:% = what, port = port; "diag-connect: connect(2) did not complete");
+}
+
+/// The same failure as [`report_connect_failure`], decided by the tick instead of by a second
+/// `connect(2)`. A non-blocking connect parks its socket in `Connecting` and returns; it is this
+/// sweep that later notices the socket died without ever completing, and it is the ONLY place that
+/// decides such a connect's errno -- so while it logged nothing, a probe's refusal had no `what=`
+/// anywhere in the log and no way to tell a peer's RST from a SYN that went unanswered. (chrF20:
+/// 8081 refused at t=90/120/150/180 s while `diag-connect` held 101 lines and not one of them was
+/// a failure -- every one was the `in-progress` of the first call.) `elapsed_us` against
+/// `timeout_us` is that distinction: a refusal lands early, a timeout at or past the deadline.
+fn report_connect_outcome(
+    what: &'static str,
+    port: u16,
+    local: u16,
+    elapsed_us: u64,
+    timeout_us: u64,
+) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    litebox_util_log::debug!(
+        tag = host_process_tag(),
+        what:% = what,
+        port = port,
+        local = local,
+        elapsed_us = elapsed_us,
+        timeout_us = timeout_us,
+        n = n;
+        "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
+    );
+    if n >= 4 && n % 64 != 0 {
+        return;
+    }
+    litebox_util_log::warn!(
+        what:% = what,
+        port = port,
+        local = local,
+        elapsed_us = elapsed_us,
+        timeout_us = timeout_us;
+        "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
+    );
 }
 
 /// Says which sockets hold the buffer pool, when a backlog refill found none left.
@@ -1891,12 +1935,29 @@ where
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
                             // Socket closed while connecting. Distinguish RST from timeout.
-                            let error = match tcp_specific.connect_initiated_at_us {
+                            let (error, elapsed) = match tcp_specific.connect_initiated_at_us {
                                 Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
-                                    errors::SocketAsyncError::TimedOut
+                                    (errors::SocketAsyncError::TimedOut, now - initiated_at)
                                 }
-                                _ => errors::SocketAsyncError::ConnectionRefused,
+                                Some(initiated_at) => {
+                                    (errors::SocketAsyncError::ConnectionRefused, now - initiated_at)
+                                }
+                                None => (
+                                    errors::SocketAsyncError::ConnectionRefused,
+                                    smoltcp::time::Duration::ZERO,
+                                ),
                             };
+                            report_connect_outcome(
+                                match error {
+                                    errors::SocketAsyncError::TimedOut => "timeout",
+                                    errors::SocketAsyncError::ConnectionRefused => "refused",
+                                    _ => "other",
+                                },
+                                tcp_specific.connect_peer_port.unwrap_or(0),
+                                tcp_socket.local_endpoint().map_or(0, |e| e.port),
+                                elapsed.total_micros(),
+                                TCP_CONNECT_TIMEOUT.total_micros(),
+                            );
                             proxy.set_async_error(error);
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
@@ -2163,6 +2224,7 @@ where
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
                     connect_initiated_at_us: None,
+                    connect_peer_port: None,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
@@ -2340,6 +2402,7 @@ where
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
                         connect_initiated_at_us: None,
+                        connect_peer_port: None,
                     }),
                     proxy: None,
                     // Adopted: `handle` is the parent's socket, still in use by the parent.
@@ -2405,6 +2468,7 @@ where
                         }),
                         immediate_close: AtomicBool::new(false),
                         connect_initiated_at_us: None,
+                        connect_peer_port: None,
                     }),
                     proxy: None,
                     // The port's listening slots belong to the parent: this process's own close
@@ -2875,6 +2939,7 @@ where
                             socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
                             let tcp_specific = socket_handle.tcp_mut();
                             tcp_specific.connect_initiated_at_us = Some(now);
+                            tcp_specific.connect_peer_port = Some(addr.port);
                             let old_port = tcp_specific.local_port.replace(local_port);
                             if old_port.is_some() {
                                 // Need to think about how to handle this situation
@@ -3513,6 +3578,7 @@ where
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
                         connect_initiated_at_us: None,
+                        connect_peer_port: None,
                     }),
                     proxy: None,
                     // `closing_in_background` retires an accepted connection's own socket once its

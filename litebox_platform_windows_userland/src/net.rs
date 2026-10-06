@@ -961,6 +961,7 @@ pub(crate) fn send_ip_packet(
         // Nothing is listening on a real Windows `127.0.0.1` socket on the guest's behalf -- the
         // guest's own listener lives in this process's smoltcp stack -- so loop the packet
         // straight back, exactly as a real kernel's loopback device would.
+        diag_loop("sent", packet);
         queue.to_guest.push_back(packet.to_vec());
         drop(queue);
         gw.notify.notify_all();
@@ -968,6 +969,42 @@ pub(crate) fn send_ip_packet(
         queue.to_gateway.push_back(packet.to_vec());
     }
     Ok(())
+}
+
+/// Every looped-back TCP handshake packet, unthrottled at `debug`.
+///
+/// `diag_pkt` samples 1/512 of the wire, far too coarse to answer "did this SYN reach the stack at
+/// all" -- and a guest's packet to `127.0.0.1` or to `GUEST_IP_ADDR` never reaches the wire anyway,
+/// because `send_ip_packet` loops it straight back into `to_guest`. So the SYN a guest probe sent
+/// and whatever the stack answered are both invisible there, which is how a port that per-port
+/// state calls healthy (`slots=8 listening=8 pending=0`) can still refuse every connect: either the
+/// SYN never got delivered, or it was answered with an RST. Handshake packets are rare enough to
+/// log every one, and `sent` with no answering `SA` -- or with an `R` -- names that at the wire
+/// (chrF20: 8081 refused four HOLD ticks in a row with no line anywhere).
+fn diag_loop(dir: &'static str, packet: &[u8]) {
+    let Ok(ip) = Ipv4Packet::new_checked(packet) else {
+        return;
+    };
+    let Ok(t) = TcpPacket::new_checked(ip.payload()) else {
+        return;
+    };
+    if !(t.syn() || t.rst() || t.fin()) {
+        return;
+    }
+    litebox_util_log::debug!(
+        dir:% = dir,
+        pid = std::process::id(),
+        src:% = format!("{}:{}", ip.src_addr(), t.src_port()),
+        dst:% = format!("{}:{}", ip.dst_addr(), t.dst_port()),
+        flags:% = format!(
+            "{}{}{}{}",
+            if t.syn() { "S" } else { "" },
+            if t.ack() { "A" } else { "" },
+            if t.rst() { "R" } else { "" },
+            if t.fin() { "F" } else { "" }
+        );
+        "diag-loop: TCP handshake packet on the loopback path"
+    );
 }
 
 /// Whether `packet` is addressed to `127.0.0.0/8` or back to the guest's own interface address.
@@ -990,6 +1027,7 @@ pub(crate) fn receive_ip_packet(
     let n = data.len().min(packet.len());
     packet[..n].copy_from_slice(&data[..n]);
     diag_pkt("rx", &packet[..n]);
+    diag_loop("delivered", &packet[..n]);
     Ok(n)
 }
 
