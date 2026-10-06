@@ -992,6 +992,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                 .map(|s| s.join("\u{1e}"))
                 .filter(|s| s.len() <= RING_FD_MAIL_SPEC_BYTES);
             let Some(joined) = joined else {
+                // A donation this data plane cannot carry whole travels as NOTHING -- not even
+                // the parts that had a spec -- so each of those specs' placeholder holds dies
+                // with this message unless it is released here (see
+                // `UnixSocket::release_unadopted_carries`).
+                UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
                 litebox_util_log::warn!(
                     slot:% = self.slot, n_fds:% = n_donated;
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
@@ -1009,10 +1014,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         let (_, write_ring) = self.rings();
         if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
         {
+            UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
             return Err((msg, Errno::EPIPE));
         }
         if self.slot_ref().framed.load(Ordering::Acquire) {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
+                UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
                 return Err((msg, Errno::EMSGSIZE));
             }
             return if write_ring.try_write_record_with_fds(&msg.data, fd_specs) {
@@ -1023,6 +1030,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             };
         }
         if msg.data.is_empty() {
+            // Linux drops ancillary data sent with no real data at all, so these fds go nowhere
+            // -- which is exactly a carry that has to be released here.
+            UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
             return Ok(0);
         }
         if msg.data.len() > SHARED_UNIX_CONN_BUF {
@@ -1459,7 +1469,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     /// for an over-sized single write (see [`SharedView::send`]).
     fn try_sendto(
         &self,
-        msg: Message<Platform, FS>,
+        mut msg: Message<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<usize, (Message<Platform, FS>, Errno)> {
         let (connected_send_channel, link) = match &self.transport {
             ConnTransport::Shared { .. } => {
@@ -1476,6 +1487,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             drop(_guard);
             return view.send(msg);
         }
+        // An in-process delivery hands the receiver a real duplicate of every donated fd, so no
+        // spec travels and the placeholder hold `Task::scm_carry_spec` counted on the donated
+        // endpoint's shared slot has nothing left to keep alive. Release it here, and take the
+        // specs out of the message so a retry of the SAME message cannot release that hold a
+        // second time: an extra release underflows the side's holder count and frees a slot
+        // another endpoint is still reading.
+        UnixSocket::<Platform, FS>::release_unadopted_carries(
+            global,
+            &core::mem::take(&mut msg.fd_specs),
+        );
         // TODO: write partial data?
         let len = msg.data.len();
         let sock_id = self as *const _ as usize;
@@ -2246,13 +2267,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         addr: Option<UnixSocketAddr>,
         fds: Vec<AnyDupFd<Platform, FS>>,
         fd_specs: Vec<Option<String>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message {
             data: buf.to_vec(),
             fds,
             fd_specs,
         });
-        wait_on_events_polling(
+        let res = wait_on_events_polling(
             &cx.with_timeout(timeout),
             is_nonblocking,
             Events::OUT,
@@ -2271,7 +2293,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     if addr.is_some() {
                         return Err(TryOpError::Other(Errno::EISCONN));
                     }
-                    match conn.try_sendto(msg.take().unwrap()) {
+                    match conn.try_sendto(msg.take().unwrap(), global) {
                         Ok(n) => Ok(n),
                         Err((m, Errno::EAGAIN)) => {
                             let _ = msg.replace(m);
@@ -2282,7 +2304,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 })
             },
         )
-        .map_err(Errno::from)
+        .map_err(Errno::from);
+        // A message the loop never posted -- `SO_SNDTIMEO` expired, or the connection was gone
+        // before the first try -- still carries every donated fd's placeholder hold. Those are
+        // released here and nowhere else: the retry path deliberately keeps them, because the
+        // same message is offered again and its specs are what travel on success.
+        if let Some(msg) = msg {
+            UnixSocket::<Platform, FS>::release_unadopted_carries(global, &msg.fd_specs);
+        }
+        res
     }
 
     fn recvfrom(
@@ -3007,6 +3037,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     addr,
                     fds,
                     fd_specs,
+                    &task.global,
                 )
             }
             UnixSocketInner::Datagram(datagram) => {
@@ -5324,6 +5355,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             is_client,
         }
         .release_holder_for(release_host);
+    }
+
+    /// [`Self::release_unadopted_carry`] for every spec a message still holds: the placeholder
+    /// holds are counted one per donated fd (`Task::scm_carry_spec`), so "release this message's
+    /// carries" means releasing each of its specs.
+    ///
+    /// Called on every exit that does not post the specs as fd mail -- an in-process delivery that
+    /// hands the receiver real duplicates instead, a donation the data plane refuses, a give-up
+    /// after a full ring. A `C` spec that DOES travel is released by whoever rebuilds it
+    /// (`Self::from_fork_spec`) or drops it (`Self::recvfrom`); any other exit leaks one holder
+    /// count per donated socket, and a leaked count keeps its slot both `OCCUPIED` and
+    /// `held_live` -- "gone" is host-process liveness, not fd state -- until this whole host
+    /// process exits. `chrF15` (2026-10-06) filled all 4096 slots that way inside a minute and
+    /// left every later carry refused with `shared unix connection table full`.
+    pub(super) fn release_unadopted_carries(
+        global: &GlobalStateHandle<Platform, FS>,
+        specs: &[Option<String>],
+    ) {
+        for spec in specs.iter().flatten() {
+            Self::release_unadopted_carry(global, spec);
+        }
     }
 
     /// Rebuilds, in a cross-process fork child, the socket a parent's [`Self::fork_carry`]
