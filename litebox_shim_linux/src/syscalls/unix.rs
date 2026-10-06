@@ -720,6 +720,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
         // sent alongside has already been legitimately delivered by this point).
         res.map_err(|()| Errno::EMFILE)
     }
+
+    /// Releases a duplicate [`crate::syscalls::net::Task::resolve_scm_rights_fds`] made for a
+    /// donation that is actually crossing a PROCESS boundary: that data plane carries a descriptor
+    /// as a text spec (`RingFdMail`, rebuilt by the receiver) and never hands the `TypedFd` to
+    /// anyone, so the duplicate would otherwise sit in the SENDER's descriptor table for the rest
+    /// of the session.
+    ///
+    /// That residue is not a harmless fd leak. The duplicate holds an `Arc` reference to the same
+    /// descriptor entry, so the sender's own later `close(2)` of the donated fd sees a shared entry
+    /// and gets `CloseResult::Duplicated` -- which never runs the subsystem close. Measured
+    /// (xproc29): a listening socket donated to a fork child and then closed by the parent, with
+    /// the child reaped, still answered its port (`CONNECTED`) where a listener closed without a
+    /// donation is `ECONNREFUSED`; the same residue is what makes the shared socket table grow
+    /// monotonically across a run that frees every socket it opens (xproc28: `sockets=24` ->
+    /// `sockets=46`).
+    ///
+    /// [`litebox::fd::Descriptors::remove`] drops exactly this process's reference and nothing
+    /// more: the sender's own fd keeps the object alive. It hands the entry back only when no other
+    /// reference is left (the sender closed its own fd concurrently), and that one is closed
+    /// properly instead of dropped.
+    pub(super) fn release_undelivered_duplicate(self, global: &GlobalStateHandle<Platform, FS>) {
+        fn go<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalStateHandle<Platform, FS>,
+            fd: litebox::fd::TypedFd<S>,
+        ) {
+            let _ = global.litebox.descriptor_table_mut().remove(&fd);
+        }
+        match self {
+            AnyDupFd::Fs(fd) => go(global, fd),
+            AnyDupFd::Pipes(fd) => go(global, fd),
+            AnyDupFd::Eventfd(fd) => go(global, fd),
+            AnyDupFd::Epoll(fd) => go(global, fd),
+            AnyDupFd::Unix(fd) => go(global, fd),
+            AnyDupFd::Pty(fd) => go(global, fd),
+            AnyDupFd::Signalfd(fd) => go(global, fd),
+            AnyDupFd::Timerfd(fd) => go(global, fd),
+            AnyDupFd::Netlink(fd) => go(global, fd),
+            AnyDupFd::Net(fd) => global.net_lock().release_duplicate_descriptor(&fd),
+            // A `Carried` spec is a plain string: nothing was duplicated for it.
+            AnyDupFd::Carried(_) => {}
+        }
+    }
 }
 
 /// A message sent over a Unix socket.
@@ -928,18 +970,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// Prefers an atomic all-or-nothing write (temporary backpressure resolves via the normal
     /// `EAGAIN`-then-retry path); a byte stream degrades to a genuine short write only for a
     /// single message bigger than the whole ring, a record-framed slot refuses one (`EMSGSIZE`).
-    fn send(&self, msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
-        let fd_specs = if msg.fds.is_empty() {
+    fn send(&self, mut msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
+        // This data plane carries a donated descriptor as its TEXT SPEC alone (`RingFdMail`,
+        // rebuilt on the receiving side), so the `TypedFd`s `resolve_scm_rights_fds` duplicated
+        // into this process's descriptor table have no receiver here. Release them now, before
+        // every path out of this function -- a `Message` handed back to the caller on error is
+        // dropped there, which would leave them behind just the same. See
+        // `AnyDupFd::release_undelivered_duplicate` for why leaving them behind keeps the donated
+        // object open forever.
+        let donated = core::mem::take(&mut msg.fds);
+        let n_donated = donated.len();
+        for fd in donated {
+            fd.release_undelivered_duplicate(self.global);
+        }
+        let fd_specs = if n_donated == 0 {
             None
         } else {
             let specs: Option<Vec<&str>> = msg.fd_specs.iter().map(|s| s.as_deref()).collect();
             let joined = specs
-                .filter(|s| s.len() == msg.fds.len())
+                .filter(|s| s.len() == n_donated)
                 .map(|s| s.join("\u{1e}"))
                 .filter(|s| s.len() <= RING_FD_MAIL_SPEC_BYTES);
             let Some(joined) = joined else {
                 litebox_util_log::warn!(
-                    slot:% = self.slot, n_fds:% = msg.fds.len();
+                    slot:% = self.slot, n_fds:% = n_donated;
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
                      files, pty slaves, eventfds, shm/memfd snapshots and unix sockets that \
                      `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound or \

@@ -356,6 +356,19 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     /// connection it still holds -- the Linux `fork()` semantics this exists to reproduce
     /// (`close()` in the child cannot tear down the parent's end).
     borrowed: bool,
+    /// Whether `handle` names a smoltcp socket THIS process added to the shared socket set purely
+    /// to name an endpoint it inherited, and that no other process has a referent to: `fork_adopt`'s
+    /// `"L"`/`"u"` arms, which hand a fork child a second reference to a listening endpoint by
+    /// creating a fresh socket for it (the port's backlog slots stay the parent's). Releasing that
+    /// reference has to REMOVE the socket from the set, because it is not the parent's socket and
+    /// nothing else can ever name it again -- left in place it costs one socket-table slot and two
+    /// shared buffer-pool claims for the rest of the session, per adoption (xproc28: `sockets=24`
+    /// -> `sockets=46` in a run whose arms each adopt one listener and free everything they open).
+    ///
+    /// False everywhere else: a socket the ordinary `closing_in_background` path retires
+    /// (`socket()`, `accept`) or one another process still uses (`fork_adopt`'s `"T"`/`"U"`), for
+    /// which removing it here would tear down a live connection.
+    own_slot: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
@@ -1976,6 +1989,7 @@ where
             },
             proxy: None,
             borrowed: false,
+            own_slot: false,
         }))
     }
 
@@ -2145,7 +2159,9 @@ where
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
+                    // Adopted: `handle` is the parent's socket, still in use by the parent.
                     borrowed: true,
+                    own_slot: false,
                 }))
             }
             // TCP, listening: the child gets a SECOND REFERENT of the listening socket, not a
@@ -2211,6 +2227,8 @@ where
                     // The port's listening slots belong to the parent: this process's own close
                     // must not tear the queue down, same as every other borrowed arm.
                     borrowed: true,
+                    // ...but the socket itself was added above, for this referent alone.
+                    own_slot: true,
                 }))
             }
             // UDP, bound: found by its bound endpoint (unique per the local-port allocator).
@@ -2241,7 +2259,9 @@ where
                         }),
                     }),
                     proxy: None,
+                    // Adopted: `handle` is the parent's UDP socket, still in use by the parent.
                     borrowed: true,
+                    own_slot: false,
                 }))
             }
             // UDP, never bound: nothing to share, so the child gets its own fresh socket.
@@ -2261,6 +2281,8 @@ where
                     }),
                     proxy: None,
                     borrowed: false,
+                    // A socket of its own, but one `closing_in_background` retires, not this arm.
+                    own_slot: false,
                 }))
             }
             _ => None,
@@ -2451,7 +2473,33 @@ where
         true
     }
 
-    fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
+    /// `pub` so the shim can retire a socket it holds outside the descriptor table (see
+    /// `AnyDupFd::release_undelivered_duplicate`): the entry is only handed back when nothing else
+    /// refers to it, and that object still has to be closed, never dropped.
+    /// `pub(crate)`: `SocketHandle` itself is crate-private, so this stays inside the crate and the
+    /// shim reaches it through [`Self::release_duplicate_descriptor`].
+    /// Releases a DUPLICATE descriptor (`Descriptors::duplicate`) that was made for a donation
+    /// which is in fact crossing a process boundary: the cross-process AF_UNIX data plane carries a
+    /// donated descriptor as a text spec, rebuilt on the receiving side, and never hands the
+    /// `TypedFd` to anybody -- so the duplicate has no receiver and would sit in the sender's
+    /// descriptor table for the rest of the session, holding an `Arc` reference to the very entry
+    /// the sender's own later `close(2)` has to close. With it there, that `close()` sees a shared
+    /// entry and reports `CloseResult::Duplicated`, which never runs the subsystem close: a
+    /// listening socket donated to a fork child and then closed by the parent, with the child
+    /// reaped, kept answering its port, where a listener closed without a donation is
+    /// `ECONNREFUSED` (xproc29).
+    ///
+    /// This drops exactly `fd`'s own reference: the object stays alive as long as any other
+    /// descriptor names it. Only when none does -- the sender's own fd was closed concurrently -- is
+    /// the socket closed properly here rather than dropped.
+    pub fn release_duplicate_descriptor(&mut self, fd: &SocketFd<Platform>) {
+        let last_reference = self.litebox.descriptor_table_mut().remove(fd);
+        if let Some(descriptor_entry) = last_reference {
+            self.close_handle(descriptor_entry.entry);
+        }
+    }
+
+    pub(crate) fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
             consider_closed: _,
             shutdown_wr_pending: _,
@@ -2459,6 +2507,7 @@ where
             mut specific,
             proxy,
             borrowed,
+            own_slot,
         } = socket_handle;
         // A BORROWED reference (a cross-process `fork()` carry, see `Network::fork_adopt`) is only
         // this process's own handle on a socket some other process in the fork family owns, so
@@ -2487,6 +2536,22 @@ where
             }
             if let Some(proxy) = proxy {
                 proxy.set_state(socket_channel::SocketState::Closed);
+            }
+            if !own_slot {
+                return;
+            }
+            // A socket this process added to the shared set just to name an endpoint it inherited
+            // (`own_slot`): no other process ever had a referent to it, so releasing this reference
+            // is what retires it. It is not the borrowed connection/listener it names -- that one
+            // belongs to another process and is deliberately left alone above. Without this, every
+            // adoption of a listening port cost a socket-table slot and two shared buffer claims
+            // for the rest of the session, which a long desktop session cannot afford
+            // (`MAX_SOCKETS` 256, `MAX_DATA_SLOTS` 512 -- see `report_exhausted_buffer_pool`).
+            if Self::socket_set_contains(&self.socket_set, handle) {
+                // Dropped, not `mem::forget` like `remove_dead_sockets`: that one may be retiring a
+                // socket ANOTHER process created (whose `PacketBuffer` vecs live on that process's
+                // private heap), while this one was added by this very process.
+                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
             }
             return;
         }
@@ -3258,7 +3323,10 @@ where
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
+                    // `closing_in_background` retires an accepted connection's own socket once its
+                    // FIN exchange finishes; removing it here would drop it mid-close.
                     borrowed: false,
+                    own_slot: false,
                 };
                 if let Some(peer) = peer {
                     let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
