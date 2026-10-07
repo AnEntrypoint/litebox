@@ -105,12 +105,18 @@ const MAX_PACKET_COUNT: usize = 32;
 /// (`SharedUnixAddrPresenceTable`'s 256, `RawMutex::WaiterQueue`'s 32).
 pub(crate) const MAX_SOCKETS: usize = 256;
 
-/// How many listening ports can have a recorded queue owner at once ([`Network::listen_owner`]).
-/// A desktop run arms ~13 listening ports (measured), so 64 leaves room; the table is a hint used
-/// only to adopt an ORPHANED queue, so overflow degrades to today's behavior (no adoption) rather
-/// than to anything worse -- no slot means "owner unknown", and an unknown owner is never assumed
-/// dead, exactly like the pre-existing borrowed-listener path.
-const LISTEN_OWNER_SLOTS: usize = 64;
+/// How many listening ports can own a shared accept queue at once ([`Network::listen_queues`]).
+/// A desktop run arms ~13 listening ports (measured), so 64 leaves room; a port that finds no free
+/// row still accepts through [`Network::unclaimed_connection_on`] (which reads the shared socket
+/// set, not this table) but no process can re-arm it, i.e. overflow degrades to the pre-fix
+/// behavior rather than to anything worse.
+const LISTEN_QUEUE_SLOTS: usize = 64;
+
+/// How many backlog slots one listening port's shared queue can hold; a `listen(2)` backlog larger
+/// than this is capped, the way Linux caps one at `somaxconn`. 13 listening ports measured 104
+/// armed slots between them on a desktop run -- 8 each against a 256-socket table -- so 16 each is
+/// headroom no measured port has asked for.
+const MAX_BACKLOG_SLOTS: usize = 16;
 
 mod socket_buffers;
 use socket_buffers::SocketBuffers;
@@ -213,22 +219,16 @@ where
     /// `fork()` shares a listening socket's open file description, so parent and child accept from
     /// ONE queue, and a connection in that queue belongs to whichever of them takes it first. The
     /// queue itself is the set of smoltcp slots armed on the listen endpoint -- shared already --
-    /// but each process's `TcpServerSpecific::socket_set_handles` list is its own, so a slot is
-    /// claimed here at `accept` time and skipped by every later scan. Cleared when a slot is armed
-    /// back into LISTEN (a reused slot must be claimable again).
+    /// but a slot is claimed here at `accept` time and skipped by every later scan. Cleared when a
+    /// slot is armed back into LISTEN (a reused slot must be claimable again).
     accepted_slots: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
-    /// Which process is responsible for arming each listening port's accept queue, as
-    /// `(port << 32) | host_pid` in one atomic word (`0` == slot free).
+    /// ONE accept queue per listening port, in shared memory, indexed by nothing: [`ListenQueue`]
+    /// is where the port's backlog slots live now, not any process's descriptor entry.
     ///
-    /// A listening port's backlog slots live in the SHARED socket set, so they outlive the process
-    /// that armed them -- and their only maintainer is that process's own tick, which
-    /// `repair_listening_backlog` deliberately denies to a BORROWED referent (a borrower re-arming
-    /// the port is chrF4's competing-queues bug). So when the owning process dies, the port keeps
-    /// answering nothing forever: no process refills its backlog or reclaims its finished slots,
-    /// and every fork child that inherited it sits on a deaf port. This is what lets a borrower
-    /// tell "the owner is gone" (a pid that no longer exists) from "the owner is merely quiet",
-    /// and take the queue over -- the one distinction a tag, an address or a counter cannot make.
-    listen_owner: [core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+    /// Sharing them is what lets the sweep that maintains them run from ANY process's tick over
+    /// shared state alone, with no descriptor table involved -- see [`ListenQueue`]'s own doc
+    /// comment for the failures this retires.
+    listen_queues: [ListenQueue; LISTEN_QUEUE_SLOTS],
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -298,7 +298,7 @@ where
             closing_in_background: [None; MAX_SOCKETS],
             shared_across_fork: [None; MAX_SOCKETS],
             accepted_slots: [None; MAX_SOCKETS],
-            listen_owner: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
+            listen_queues: core::array::from_fn(|_| ListenQueue::EMPTY),
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -484,25 +484,81 @@ pub(crate) struct TcpSpecific {
     connect_peer_port: Option<u16>,
 }
 
-struct TcpServerSpecific {
+/// One listening port's accept queue: the smoltcp sockets armed on that port -- ONE queue per
+/// port, shared by every process of the cross-process-fork family.
+///
+/// This used to be `TcpServerSpecific::socket_set_handles`, a `Vec` inside each process's own
+/// descriptor entry, which made a port's survival depend entirely on the ONE process that could
+/// walk its OWN descriptor table to that entry on a given tick. Any one of
+///   * a guest thread parked in a blocking `descriptor_table_mut()` -- which makes every
+///     `try_descriptor_table()` in that process fail FOREVER (see `litebox::sync::RwLock`),
+///   * `iter_mut_nowait` skipping an entry a guest thread happens to hold,
+///   * that process exiting, or dropping the descriptor with no other referent left,
+/// left the port's slots unrepaired: every slot it had was spent on a connection or wiped by a
+/// dead-holder reset, nothing ever re-armed it, and smoltcp answered every later SYN with an RST
+/// while the connections it had already accepted went on streaming. Measured over and over, and
+/// never explainable from the log: chrD92 (refused from t=120s to the end of the run while selkies'
+/// accepted websocket streamed), chrF10 (8081's repair heartbeat stopped at uptime 79.5s while
+/// 8082's and 9222's ran to ~300s), fl6 (refused from fork 8 on, backlog 8), chrF32 (8081's
+/// heartbeat stopped at uptime 518s with refusals still being logged 37k lines later, selkies
+/// encoding frames in a live process the whole time).
+///
+/// The queue is per PORT, not per descriptor, which is also what retires the old `borrowed` arm of
+/// the repair sweep: one row can only ever hold `backlog` sockets, so a fork child that inherited
+/// the port cannot arm a SECOND queue competing for the same SYNs (chrF4), and ANY process may
+/// maintain the row -- the port now outlives the process that created it.
+struct ListenQueue {
+    /// The endpoint this queue is armed on; `port == 0` marks the row free.
     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint,
-    /// Specified backlog via `listen`, no packets can be `accept`ed unless this is `Some`
-    backlog: Option<u16>,
-    socket_set_handles: Vec<smoltcp::iface::SocketHandle>,
+    /// How many descriptor referents name this port across the whole fork family: one for the
+    /// `listen()` that created it plus one per `fork_adopt` carry. Only the last one to close (or
+    /// the creator itself) retires the armed sockets.
+    refs: u16,
+    /// The `listen(2)` backlog, capped at [`MAX_BACKLOG_SLOTS`].
+    backlog: u16,
+    /// The pid that called `listen()`, kept so a surviving referent can tell whether the process
+    /// that created the port is still around before it retires the queue.
+    owner_pid: u32,
     /// Set while every slot of this port is spent (none left in LISTEN), so that state is reported
     /// once per episode instead of once per tick -- the sweep runs every tick, in every process
     /// of the fork family, so an unthrottled warning here would bury the log.
     no_slot_listening_reported: bool,
+    /// The smoltcp sockets armed on [`Self::ip_listen_endpoint`], one per backlog slot. A slot
+    /// that takes a connection stays listed until `accept` hands it out.
+    handles: [Option<smoltcp::iface::SocketHandle>; MAX_BACKLOG_SLOTS],
 }
 
-impl TcpServerSpecific {
-    fn refill_to_backlog(
+impl ListenQueue {
+    const EMPTY: Self = Self {
+        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+            addr: None,
+            port: 0,
+        },
+        refs: 0,
+        backlog: 0,
+        owner_pid: 0,
+        no_slot_listening_reported: false,
+        handles: [None; MAX_BACKLOG_SLOTS],
+    };
+
+    fn live_handles(&self) -> usize {
+        self.handles.iter().flatten().count()
+    }
+
+    /// Records a `listen(2)` backlog, capped to what one row can hold -- the way Linux caps a
+    /// backlog at `somaxconn` rather than arming the thousands of sockets a caller may ask for.
+    fn set_backlog(&mut self, backlog: u16) {
+        self.backlog = backlog.max(1).min(MAX_BACKLOG_SLOTS as u16);
+    }
+
+    /// Arms the queue up to `backlog` sockets in LISTEN on [`Self::ip_listen_endpoint`].
+    fn refill(
         &mut self,
         socket_set: &mut smoltcp::iface::SocketSet,
         buffers: &mut SocketBuffers,
     ) {
-        let backlog = self.backlog.unwrap();
-        for _ in self.socket_set_handles.len()..backlog.into() {
+        let backlog = usize::from(self.backlog);
+        for _ in self.live_handles()..backlog {
             // `socket_set` is fixed-capacity now (see `MAX_SOCKETS`'s own doc comment): stop
             // refilling the backlog early rather than let `SocketSet::add` panic when the whole
             // table happens to be full -- a smaller-than-requested accept backlog under real
@@ -534,9 +590,18 @@ impl TcpServerSpecific {
             }
             let handle = socket_set.add(listening_socket);
             buffers.adopt(handle, claim);
-            self.socket_set_handles.push(handle);
+            let Some(slot) = self.handles.iter_mut().find(|slot| slot.is_none()) else {
+                break;
+            };
+            *slot = Some(handle);
         }
     }
+}
+
+struct TcpServerSpecific {
+    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint,
+    /// Specified backlog via `listen`, no packets can be `accept`ed unless this is `Some`
+    backlog: Option<u16>,
 }
 
 /// `(how many sockets the table holds`, `one `local:state:remote` token per socket in it)`.
@@ -1056,6 +1121,15 @@ where
             core::mem::forget(Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle));
         }
         self.closing_in_background = [None; MAX_SOCKETS];
+        // Every listening port's armed backlog slot was in the set just wiped, so every row's
+        // handle list is now stale. Freeing the rows outright would orphan the ports (each
+        // process's own descriptor still names one), which is exactly the "port that answers
+        // nothing while its accepted connections keep streaming" shape; the rows are cleared to
+        // empty instead, and `maintain_listening_queues` re-arms them on the next tick from the
+        // backlog each row still records.
+        for queue in self.listen_queues.iter_mut() {
+            queue.handles = [None; MAX_BACKLOG_SLOTS];
+        }
         self.buffers.reset();
         // Plain reassignment (not `mem::forget`-guarded like `socket_set` above) is safe here:
         // `TypedFd`'s `OwnedFd` holds no heap allocation at all (a bare `u32` + `AtomicBool`), so
@@ -1134,6 +1208,10 @@ where
 
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
+        // Every listening port's backlog is re-armed AFTER the drain and BEFORE this process's
+        // early return below: `maintain_listening_queues` reads shared state only, so it runs in
+        // the one process that polls AND in every fork-family process that does not.
+        self.maintain_listening_queues();
         if !platform::IPInterfaceProvider::owns_ip_interface(self.device.platform) {
             // The owner process polls for everyone: this process's packet queue is not connected
             // to the gateway, so a poll here would lose the frames it transmits.
@@ -1208,16 +1286,20 @@ where
     /// port's `backlog` slots, which smoltcp needs a slot in `Listen` to answer a SYN with. Left
     /// alone, `backlog` such connections make the port refuse every later SYN for the rest of the
     /// session. The socket's own buffers go back to the shared pools here, which is what lets the
-    /// caller's `refill_to_backlog` re-arm the slot as a fresh listener.
+    /// caller's [`ListenQueue::refill`] re-arm the slot as a fresh listener.
     fn reclaim_finished_backlog_slots(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
-        handles: &mut Vec<smoltcp::iface::SocketHandle>,
+        handles: &mut [Option<smoltcp::iface::SocketHandle>; MAX_BACKLOG_SLOTS],
     ) -> usize {
         let mut reclaimed = 0usize;
-        handles.retain(|&handle| {
+        for slot in handles.iter_mut() {
+            let Some(handle) = *slot else {
+                continue;
+            };
             if !Self::socket_set_contains(socket_set, handle) {
-                return false;
+                *slot = None;
+                continue;
             }
             let socket: &tcp::Socket = socket_set.get(handle);
             let terminal = matches!(
@@ -1234,144 +1316,101 @@ where
             if !terminal
                 || (socket.state() == tcp::State::Closed && socket.remote_endpoint().is_some())
             {
-                return true;
+                continue;
             }
             // `remove_socket` hands the socket back by value; it is dropped nowhere here, matching
             // `remove_dead_sockets` -- see that call's own comment on running a socket's destructor
             // from a process that did not create it.
             core::mem::forget(Self::remove_socket(socket_set, buffers, handle));
+            *slot = None;
             reclaimed += 1;
-            false
-        });
+        }
         reclaimed
     }
 
-    /// The recorded owner of `port`'s accept queue, if this port has one.
-    fn listen_owner_of(
-        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
-        port: u16,
-    ) -> Option<u32> {
-        listen_owner.iter().find_map(|slot| {
-            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
-            (packed >> 32 == u64::from(port) && packed != 0).then_some(packed as u32)
-        })
+    /// The shared accept queue of listening port `port`, if this port has one.
+    fn listen_queue_index(&self, port: u16) -> Option<usize> {
+        self.listen_queues
+            .iter()
+            .position(|queue| queue.ip_listen_endpoint.port == port)
     }
 
-    /// Records `pid` as the process responsible for arming `port`'s accept queue.
-    fn record_listen_owner(
-        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
-        port: u16,
-        pid: u32,
-    ) {
-        if pid == 0 {
+    /// Registers the shared accept queue of `endpoint` and returns its row index.
+    ///
+    /// A second `listen()` on an already-listening port only re-sizes the backlog, which Linux
+    /// allows in both directions; `refs` counts descriptor referents (the `listen()` that created
+    /// the port, plus one per `fork_adopt` carry of it into another process) so the LAST close is
+    /// what retires the armed sockets, never a fork child dropping its inherited copy.
+    fn register_listen_queue(
+        &mut self,
+        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint,
+        backlog: u16,
+    ) -> Option<usize> {
+        let port = ip_listen_endpoint.port;
+        if let Some(index) = self.listen_queue_index(port) {
+            let queue = &mut self.listen_queues[index];
+            queue.set_backlog(backlog);
+            queue.refs = queue.refs.saturating_add(1);
+            return Some(index);
+        }
+        let index = self
+            .listen_queues
+            .iter()
+            .position(|queue| queue.ip_listen_endpoint.port == 0)?;
+        let queue = &mut self.listen_queues[index];
+        queue.ip_listen_endpoint = ip_listen_endpoint;
+        queue.refs = 1;
+        queue.set_backlog(backlog);
+        queue.no_slot_listening_reported = false;
+        queue.owner_pid = self.litebox.platform().current_pid();
+        Some(index)
+    }
+
+    /// Retires the shared queue of `port` once the last descriptor referent to name it closes.
+    ///
+    /// The creator closing it retires it outright, matching the pre-existing behavior: a fork child
+    /// that inherited the port has no slots of its own to release, so before this existed the
+    /// parent's close was the only thing that ever took a listening port's sockets down at all.
+    /// A borrower's close retires the queue only when the creator is GONE -- otherwise the creator
+    /// is still the one servicing the port and its queue must stay armed.
+    fn release_listen_queue(&mut self, port: u16) {
+        let Some(index) = self.listen_queue_index(port) else {
+            return;
+        };
+        let me = self.litebox.platform().current_pid();
+        let owner_is_gone = {
+            let owner = self.listen_queues[index].owner_pid;
+            owner != 0 && !self.litebox.platform().is_process_alive(owner)
+        };
+        let queue = &mut self.listen_queues[index];
+        let retire = queue.refs <= 1 || me == queue.owner_pid || owner_is_gone;
+        queue.refs = queue.refs.saturating_sub(1);
+        if !retire {
             return;
         }
-        let want = (u64::from(port) << 32) | u64::from(pid);
-        for slot in listen_owner {
-            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
-            if packed == 0 {
-                if slot
-                    .compare_exchange(
-                        0,
-                        want,
-                        core::sync::atomic::Ordering::Relaxed,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-            } else if packed >> 32 == u64::from(port) {
-                // A re-bind, possibly by another process: the armer is whoever listened last. A
-                // pid left stale here would have every borrower conclude the live owner is dead.
-                slot.store(want, core::sync::atomic::Ordering::Relaxed);
-                return;
+        let handles = core::mem::replace(&mut queue.handles, [None; MAX_BACKLOG_SLOTS]);
+        queue.ip_listen_endpoint.port = 0;
+        queue.backlog = 0;
+        queue.owner_pid = 0;
+        queue.refs = 0;
+        queue.no_slot_listening_reported = false;
+        for handle in handles.into_iter().flatten() {
+            // Stale-handle guard: a dead-holder `reset_after_poisoning()` elsewhere may have wiped
+            // this slot out of the shared set already, and `SocketSet::remove` panics on a handle
+            // it no longer holds.
+            if Self::socket_set_contains(&self.socket_set, handle) {
+                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
             }
         }
     }
 
-    /// Installs `me` as `port`'s queue owner, but only while `dead` is still the recorded one --
-    /// the one word that stops two borrowers from both adopting the queue and arming two
-    /// competing backlogs on a single endpoint (chrF4's measured symptom).
-    fn claim_listen_owner(
-        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
-        port: u16,
-        dead: u32,
-        me: u32,
-    ) -> bool {
-        if me == 0 || dead == 0 || me == dead {
-            return false;
-        }
-        let want = (u64::from(port) << 32) | u64::from(me);
-        listen_owner.iter().any(|slot| {
-            let packed = slot.load(core::sync::atomic::Ordering::Relaxed);
-            packed >> 32 == u64::from(port)
-                && packed as u32 == dead
-                && slot
-                    .compare_exchange(
-                        packed,
-                        want,
-                        core::sync::atomic::Ordering::Acquire,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-        })
-    }
-
-    /// Whether a BORROWED referent of listening port `port` may take that port's accept queue
-    /// over: only when the recorded owner is a pid that no longer exists. A live owner, an unknown
-    /// owner, a port with a socket already in LISTEN, or a lost race with another borrower all
-    /// leave this referent a borrower.
-    fn promote_borrowed_listener(
-        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
-        socket_set: &mut smoltcp::iface::SocketSet<'static>,
-        handles: &mut alloc::vec::Vec<smoltcp::iface::SocketHandle>,
-        port: u16,
-        platform: &Platform,
-    ) -> bool {
-        let me = platform.current_pid();
-        let Some(owner) = Self::listen_owner_of(listen_owner, port) else {
-            return false;
-        };
-        if owner == me {
-            return true;
-        }
-        // Confirmed dead, never "quiet": a borrower that adopts a queue its owner is still
-        // ticking for arms a second backlog beside the live one.
-        if platform.is_process_alive(owner) {
-            return false;
-        }
-        if !Self::claim_listen_owner(listen_owner, port, owner, me) {
-            return false;
-        }
-        // Adopt every socket already armed on this endpoint before the caller refills: refill only
-        // tops the list up to `backlog`, so leaving the dead owner's slots unlisted would add a
-        // second queue of `backlog` sockets beside them -- the competing-queues shape this
-        // promotion exists to prevent, reached from the other side.
-        for (handle, socket) in socket_set.iter() {
-            let smoltcp::socket::Socket::Tcp(socket) = socket else {
-                continue;
-            };
-            if socket
-                .local_endpoint()
-                .is_some_and(|local| local.port == port)
-                && !handles.contains(&handle)
-            {
-                handles.push(handle);
-            }
-        }
-        static PROMOTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if PROMOTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
-            litebox_util_log::warn!(
-                port = port,
-                dead_owner = owner,
-                new_owner = me,
-                adopted = handles.len();
-                "diag-listener: adopted an orphaned listening port's queue (its owner is gone)"
-            );
-        }
-        true
-    }
+    // There is deliberately no "a borrower adopts the port's queue" path any more. Adoption
+    // existed because the queue used to BE a list inside one process's descriptor entry: when that
+    // process died the list died with it, so a fork child holding a second referent had to copy the
+    // slots out of the shared socket set before it could maintain them at all (`eb16abf`), and had
+    // to prove the owner was dead first so it did not arm a second, competing queue (`04e9961`).
+    // The queue is one shared row per port now, so any process maintains it and nobody adopts
+    // anything -- the port simply keeps being armed for as long as a referent to it exists.
 
     fn remove_dead_sockets(&mut self) {
         for slot in &mut self.closing_in_background {
@@ -1529,12 +1568,11 @@ where
     /// local endpoint is the listen port (a slot still in LISTEN has no remote endpoint at all,
     /// and one already accepted is marked in [`Self::accepted_slots`]).
     ///
-    /// This is what makes a listening socket shared across `fork()`: the queue is the shared set
-    /// of smoltcp slots armed on the endpoint, not any one process's
-    /// `TcpServerSpecific::socket_set_handles`, so a fork child -- whose own list is empty, because
-    /// it must not arm a SECOND listener competing for the same SYNs -- accepts from the queue its
-    /// parent owns, exactly as Linux hands one connection to whichever of them calls `accept`
-    /// first.
+    /// This is what makes a listening socket shared across `fork()`: the queue is the shared set of
+    /// smoltcp slots armed on the endpoint, not any one process's descriptor entry, so a fork child
+    /// accepts from the queue its parent armed, exactly as Linux hands one connection to whichever
+    /// of them calls `accept` first. It is also the fallback for a port with no `ListenQueue` row
+    /// left at all (see `Network::accept`).
     fn unclaimed_connection_on(
         socket_set: &smoltcp::iface::SocketSet<'static>,
         accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
@@ -1555,6 +1593,57 @@ where
             (established && on_port && socket.remote_endpoint().is_some() && !claimed)
                 .then_some(handle)
         })
+    }
+
+    /// Takes out of `queue` the one backlog slot holding a connection ready to hand out, marks it
+    /// accepted and re-arms the port. `None` when no slot of that port holds one.
+    ///
+    /// Re-arming on the way out is load-bearing, not an optimization: with every slot gone the port
+    /// has NO socket left listening, every later SYN is refused, no slot can ever become
+    /// `Established` again, and so nothing else in the stack ever re-arms it -- the port stays dead
+    /// for the rest of the session while the connections it already accepted keep working (chrD92:
+    /// an in-guest `curl 127.0.0.1:8081` was refused from t=120s to the end of the run while
+    /// selkies' accepted websocket went on streaming).
+    fn take_ready_backlog_slot(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        buffers: &mut SocketBuffers,
+        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        queue: &mut ListenQueue,
+    ) -> Option<smoltcp::iface::SocketHandle> {
+        // A claim outlives the connection it marked only until the slot is armed back into LISTEN,
+        // and smoltcp reuses a freed slot index, so claims are reaped before any scan -- otherwise
+        // one stale mark strands the next connection that lands on that slot.
+        Self::reap_stale_claims_in(socket_set, accepted_slots);
+        let position = queue.handles.iter().position(|slot| {
+            let Some(handle) = *slot else {
+                return false;
+            };
+            // Same stale-handle guard as everywhere else: a dead-holder `reset_after_poisoning()`
+            // elsewhere may already have wiped this slot out of the shared socket set, and
+            // smoltcp's `get` panics on a handle it no longer has ("handle does not refer to a
+            // valid socket", live-caught killing a fork child's guest-execution thread outright --
+            // this was selkies' own `accept()` call).
+            Self::socket_set_contains(socket_set, handle) && {
+                let socket: &tcp::Socket = socket_set.get(handle);
+                // Linux hands a connection out of the accept queue even once its peer's FIN has
+                // landed (`CloseWait`): the application gets the fd and learns the peer is gone by
+                // reading EOF. Requiring `Established` here stranded such a slot -- no later
+                // `accept` matched it, so one peer-closed connection cost the port a backlog slot
+                // forever and after `backlog` of them the port refused every SYN for the rest of
+                // the session (fl6: `LAST_FORK_WHERE_8095_ANSWERED=7`, backlog 8).
+                matches!(
+                    socket.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                )
+            }
+            // A slot another process of this fork family already took is not pending here (see
+            // `Network::accepted_slots`): parent and child accept from ONE queue.
+            && !Self::is_accepted_in(accepted_slots, handle)
+        })?;
+        let ready_handle = queue.handles[position].take()?;
+        Self::mark_accepted_in(accepted_slots, ready_handle);
+        queue.refill(socket_set, buffers);
+        Some(ready_handle)
     }
 
     /// Forgets every claim whose slot is no longer an unaccepted connection -- a slot is handed
@@ -1611,14 +1700,8 @@ where
         // image mapped at the same base, so it cannot tell one process's tick from another's.
         let dtag = &*table as *const _ as usize as u64;
         let mut drain_seen = 0usize;
-        let mut drain_ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             drain_seen += 1;
-            if let ProtocolSpecific::Tcp(tcp_specific) = &entry.entry.specific {
-                if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
-                    drain_ports.push(server_socket.ip_listen_endpoint.port);
-                }
-            }
             let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
             Self::drain_socket_channel_buffers(
                 &mut self.socket_set,
@@ -1629,165 +1712,106 @@ where
                 &self.accepted_slots,
             );
         }
-        // Separate pass: the repair needs to mutate each entry, and the drain above deliberately
-        // takes a shared guard so a guest thread blocked in `read()` on a socket cannot starve
-        // its own bytes. A contended entry is skipped here and caught by the next tick.
-        let mut reached_ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
-        let mut repair_seen = 0usize;
-        for (_, mut entry) in table.iter_mut_nowait::<Network<Platform>>() {
-            repair_seen += 1;
-            if let ProtocolSpecific::Tcp(tcp_specific) = &entry.entry.specific {
-                if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
-                    reached_ports.push(server_socket.ip_listen_endpoint.port);
-                }
-            }
-            Self::repair_listening_backlog(
-                &self.listen_owner,
-                &mut self.socket_set,
-                &mut self.buffers,
-                &mut entry.entry,
-                self.litebox.platform(),
-            );
-        }
-        // WHICH ports this tick reached, not just what it found: `iter_mut_nowait` skips any entry
-        // a guest thread is holding, and a listening entry skipped on EVERY tick is never re-armed
-        // -- a port that then goes deaf stays deaf while the connections it already accepted go on
-        // streaming. chrF10 measured exactly that shape: in-guest connects to selkies' 8081 were
-        // refused from t=30s to the end of the run while an idle guest port (8082) beside it kept
-        // answering 200 at the same instants, selkies kept encoding at 14 FPS to the end (so its
-        // process was alive), and 8081's OWN repair heartbeat stopped at uptime 79.5s while 8082's
-        // and 9222's ran to ~300s. A missing port in this list says "never repaired again"; a port
-        // present in it with `slots=8 listening=8` says "repaired, healthy, and still refusing" --
-        // which would put the fault in packet delivery instead, and those need different fixes.
-        // `drain_seen` vs `repair_seen` says how many descriptors the two passes reached: the drain
-        // takes a shared guard and the repair an exclusive one, so `repair_seen < drain_seen`
-        // tick after tick is a descriptor a guest thread is holding across the repair, i.e. a
-        // listening port this process can never re-arm.
+        drop(table);
+        // A listening port's backlog is maintained from SHARED state (`Self::maintain_listening_
+        // queues`), never from this walk, so `drain_seen` is the only thing this pass still has to
+        // report: how many descriptors it reached at all. A process whose table is readable but
+        // reaches 0 of them is a process with no socket left, which is ordinary (most guest
+        // processes have none) and no longer has any bearing on whether a port stays armed.
         {
             static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if tick % 512 == 0 {
-                let drained = alloc::format!("{:?}", drain_ports);
-                let reached = alloc::format!("{:?}", reached_ports);
                 litebox_util_log::warn!(
                     tick = tick,
                     tag = host_process_tag(),
                     dtag = dtag,
-                    drain_seen = drain_seen,
-                    repair_seen = repair_seen,
-                    drained:% = drained,
-                    reached:% = reached;
-                    "diag-tick: listening ports this tick's backlog repair actually reached"
+                    drain_seen = drain_seen;
+                    "diag-tick: descriptors this drain pass reached"
                 );
             }
         }
     }
 
-    /// Keep a listening port's backlog armed, whatever took a slot away.
+    /// Keep EVERY listening port's backlog armed, whatever took a slot away -- over the shared
+    /// [`Network::listen_queues`] rows, with no descriptor table involved, so that no port's
+    /// survival depends on any one process reaching its own listening descriptor on a given tick.
     ///
     /// `accept` re-arms on the slots it sees, but it is only called when the port already looks
     /// readable -- so a port whose every slot went stale (a dead-holder `reset_after_poisoning()`
     /// elsewhere wiped them out of the shared socket set, see `socket_set_contains`'s doc comment)
     /// gets NO `accept` call at all, and nothing else in the stack ever re-arms it: every later
     /// SYN is refused for the rest of the session while the connections it already accepted keep
-    /// working. Same for a `refill_to_backlog` that found the socket table full: the slot it could
-    /// not create is never retried once the table drains. Both were live-measured as one symptom
-    /// (chrD92: an in-guest `curl 127.0.0.1:8081` was refused from t=120s to the end of the run
-    /// while selkies' accepted websocket went on streaming).
+    /// working. Same for a refill that found the socket table full: the slot it could not create
+    /// is never retried once the table drains.
     ///
     /// Only stale slots (no longer in the socket set) are dropped here -- a slot that is still in
     /// the set is never removed from it by this sweep, because the sweep runs from EVERY process's
     /// tick over a socket set shared across the fork family, and dropping a socket another process
     /// allocated runs its ring buffers through the wrong heap (see `remove_dead_sockets`).
-    fn repair_listening_backlog(
-        listen_owner: &[core::sync::atomic::AtomicU64; LISTEN_OWNER_SLOTS],
+    fn maintain_listening_queues(&mut self) {
+        for index in 0..LISTEN_QUEUE_SLOTS {
+            if self.listen_queues[index].ip_listen_endpoint.port == 0 {
+                continue;
+            }
+            let Self {
+                listen_queues,
+                socket_set,
+                buffers,
+                ..
+            } = self;
+            Self::maintain_one_listening_queue(socket_set, buffers, &mut listen_queues[index]);
+        }
+        // WHICH ports this tick maintained. This is the instrument chrF10/chrF32 were missing: it
+        // reads shared state, so it is the same in every process, and a port that drops out of it
+        // is a port whose queue row is gone -- said once, by whoever ticks, instead of being
+        // guessable only from "some process stopped reaching its own descriptor entry".
+        {
+            static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if tick % 512 == 0 {
+                let maintained = alloc::format!(
+                    "{:?}",
+                    self.listen_queues
+                        .iter()
+                        .filter(|queue| queue.ip_listen_endpoint.port != 0)
+                        .map(|queue| queue.ip_listen_endpoint.port)
+                        .collect::<alloc::vec::Vec<u16>>()
+                );
+                litebox_util_log::warn!(
+                    tick = tick,
+                    tag = host_process_tag(),
+                    maintained:% = maintained;
+                    "diag-tick: listening ports whose shared backlog this tick maintained"
+                );
+            }
+        }
+    }
+
+    fn maintain_one_listening_queue(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
-        socket_handle: &mut SocketHandle<Platform>,
-        platform: &Platform,
+        queue: &mut ListenQueue,
     ) {
-        if socket_handle
-            .consider_closed
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-        // A BORROWED referent of a listening socket (`fork_adopt`'s `"L"` arm) owns no accept queue
-        // of its own: it accepts from the queue the OWNING process armed on the endpoint
-        // (`Network::unclaimed_connection_on`), which is what makes one listening port shared
-        // across `fork()` behave like Linux's shared open file description. Refilling here would
-        // undo exactly that -- this sweep runs from every process's tick, so every fork child
-        // inheriting the port would arm `backlog` more LISTEN sockets on the same endpoint in the
-        // shared socket set, and an incoming SYN would go to whichever queue smoltcp matched
-        // first, leaving the owning process's own queue empty while another process's fills with
-        // connections nobody accept()s. That is chrF4's competing-queues symptom, measured as
-        // selkies' published 8081 answering one request and then refusing every connect for the
-        // rest of the run; `fork_adopt` stopped arming them at adoption time but this sweep
-        // re-armed them on the child's very next tick. Its slot list therefore stays EMPTY, and
-        // its `server_socket` here exists only to name the endpoint and the backlog to accept
-        // from -- until the process that owns the queue is GONE, at which point nobody maintains
-        // it and the port is deaf for good unless this referent takes it over.
-        if socket_handle.borrowed {
-            let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
-                return;
-            };
-            let Some(server_socket) = tcp_specific.server_socket.as_mut() else {
-                return;
-            };
-            if !Self::promote_borrowed_listener(
-                listen_owner,
-                socket_set,
-                &mut server_socket.socket_set_handles,
-                server_socket.ip_listen_endpoint.port,
-                platform,
-            ) {
-                return;
+        let port = queue.ip_listen_endpoint.port;
+        let backlog = usize::from(queue.backlog);
+        let handles_before = queue.live_handles();
+        // A slot wiped out of the shared set by a dead-holder `reset_after_poisoning()` elsewhere
+        // is gone: forget it here rather than panic in smoltcp's `get` (see `socket_set_contains`).
+        for slot in queue.handles.iter_mut() {
+            if let Some(handle) = *slot
+                && !Self::socket_set_contains(socket_set, handle)
+            {
+                *slot = None;
             }
-            // Promoted: from here on this referent maintains the queue itself, so refill, reclaim
-            // and close all apply to it exactly as they do for the process that created the port.
-            socket_handle.borrowed = false;
         }
-        let ProtocolSpecific::Tcp(tcp_specific) = &mut socket_handle.specific else {
-            return;
-        };
-        let Some(server_socket) = tcp_specific.server_socket.as_mut() else {
-            return;
-        };
-        let Some(backlog) = server_socket.backlog else {
-            return;
-        };
-        let handles_before = server_socket.socket_set_handles.len();
-        server_socket
-            .socket_set_handles
-            .retain(|&handle| Self::socket_set_contains(socket_set, handle));
-        let went_fully_dead =
-            server_socket.socket_set_handles.is_empty() && handles_before > 0;
-        // A port can hold its full backlog and still be unable to accept a thing: smoltcp
-        // dispatches a SYN only to a slot in `Listen`, so a port whose every slot already took a
-        // connection the application has not `accept`ed answers every later SYN with an RST --
-        // instantly, which is exactly how a "dead port" looks from outside while the connections
-        // it already accepted keep working. No slot is stale in that state, so nothing else in the
-        // stack ever mentions it; report it once per episode (this sweep runs every tick, from
-        // every process of the fork family).
-        // A backlog slot no application fd points at can still end up in a state `accept` will
-        // never hand out: the peer's FIN lands before the application gets round to `accept`
-        // (`CloseWait`, which `accept` does hand out now), or the connection is torn down outright
-        // (`Closed`, `TimeWait`, the `FinWait*`/`Closing`/`LastAck` a reset leaves behind). Linux
-        // keeps the port listening by reclaiming those slots; so must we, because a slot left in
-        // place costs the port one connection of capacity forever and after `backlog` of them the
-        // port refuses every SYN for the rest of the session while the connections it already
-        // accepted go on streaming (fl6: an in-guest connect answered through fork 7 and was
-        // refused from fork 8 on, `backlog` 8, while a control port beside it answered all 40).
-        let reclaimed = Self::reclaim_finished_backlog_slots(
-            socket_set,
-            buffers,
-            &mut server_socket.socket_set_handles,
-        );
+        let went_fully_dead = queue.live_handles() == 0 && handles_before > 0;
+        let reclaimed = Self::reclaim_finished_backlog_slots(socket_set, buffers, &mut queue.handles);
         if reclaimed > 0 {
             static RECLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             if RECLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
                 litebox_util_log::warn!(
-                    port = server_socket.ip_listen_endpoint.port,
+                    port = port,
                     reclaimed = reclaimed;
                     "diag-listener: reclaimed finished backlog slot(s) so this listening port can re-arm them"
                 );
@@ -1796,8 +1820,8 @@ where
         let mut listening = 0usize;
         let mut pending = 0usize;
         let mut other = 0usize;
-        for &handle in &server_socket.socket_set_handles {
-            match socket_set.get::<tcp::Socket>(handle).state() {
+        for handle in queue.handles.iter().flatten() {
+            match socket_set.get::<tcp::Socket>(*handle).state() {
                 tcp::State::Listen => listening += 1,
                 // `CloseWait` is a connection whose peer already hung up: `accept` hands it out, so
                 // it is pending work for the application, not a slot stuck in limbo.
@@ -1821,8 +1845,8 @@ where
                 let (total, census) = socket_census(socket_set);
                 litebox_util_log::warn!(
                     tag = host_process_tag(),
-                    port = server_socket.ip_listen_endpoint.port,
-                    slots = server_socket.socket_set_handles.len(),
+                    port = port,
+                    slots = queue.live_handles(),
                     listening = listening,
                     pending = pending,
                     other = other,
@@ -1838,42 +1862,36 @@ where
                 );
             }
         }
-        // An emptied `socket_set_handles` counts as "no slot in LISTEN" too: that is what a port
-        // looks like once a refill failed (the slots went to accepted connections and the pool had
-        // nothing left to replace them), and it is the deadest a listening port can be.
+        // An emptied handle list counts as "no slot in LISTEN" too: that is what a port looks like
+        // once a refill failed (the slots went to accepted connections and the pool had nothing
+        // left to replace them), and it is the deadest a listening port can be.
         if listening == 0 {
-            if !server_socket.no_slot_listening_reported {
-                server_socket.no_slot_listening_reported = true;
-                let readable = socket_handle.proxy.as_ref().is_some_and(|proxy| {
-                    matches!(proxy.as_ref(), NetworkProxy::Stream(ch) if ch.is_readable())
-                });
+            if !queue.no_slot_listening_reported {
+                queue.no_slot_listening_reported = true;
                 litebox_util_log::warn!(
-                    port = server_socket.ip_listen_endpoint.port,
-                    slots = server_socket.socket_set_handles.len(),
+                    port = port,
+                    slots = queue.live_handles(),
                     pending = pending,
-                    other = other,
-                    readable = readable;
+                    other = other;
                     "diag-listener: no backlog slot of this listening port is in LISTEN state; every later SYN is refused until the application accepts"
                 );
             }
-        } else if server_socket.no_slot_listening_reported {
-            server_socket.no_slot_listening_reported = false;
+        } else if queue.no_slot_listening_reported {
+            queue.no_slot_listening_reported = false;
             litebox_util_log::warn!(
-                port = server_socket.ip_listen_endpoint.port,
+                port = port,
                 listening = listening;
                 "diag-listener: this listening port has a LISTEN slot again"
             );
         }
         // Nothing to do when the port is armed to its backlog: `accept` handles the slots it
         // reaches, including any that are still in the socket set but no longer open.
-        if server_socket.socket_set_handles.len() == handles_before
-            && handles_before >= backlog.into()
-        {
+        if queue.live_handles() == handles_before && handles_before >= backlog {
             return;
         }
         if went_fully_dead {
             litebox_util_log::warn!(
-                port = server_socket.ip_listen_endpoint.port;
+                port = port;
                 "diag-listener: every backlog slot of this listening port went stale, re-arming it"
             );
         }
@@ -1881,7 +1899,7 @@ where
         if socket_set.iter().count() >= MAX_SOCKETS {
             return;
         }
-        server_socket.refill_to_backlog(socket_set, buffers);
+        queue.refill(socket_set, buffers);
     }
 
     /// Drain data between socket channels and smoltcp sockets.
@@ -2060,39 +2078,19 @@ where
                 if let Some(server_socket) = tcp_specific.server_socket.as_ref()
                     && !proxy.is_readable()
                 {
-                    let pending = server_socket
-                        .socket_set_handles
-                        .iter()
-                        .any(|&h| {
-                            // Same stale-handle guard as above: one of a listening socket's own
-                            // accepted-connection handles can independently go stale.
-                            socket_set.iter().any(|(live, _)| live == h) && {
-                                let socket: &tcp::Socket = socket_set.get(h);
-                                // Whatever `accept` hands out must wake the reader, or an
-                                // epoll-driven server never learns the connection is there: a peer
-                                // that hangs up straight after connecting leaves the slot in
-                                // `CloseWait`, which an `Established`-only test misses -- so the
-                                // listener is never reported readable, the application never calls
-                                // `accept`, and the slot is stranded for the rest of the session.
-                                matches!(
-                                    socket.state(),
-                                    tcp::State::Established | tcp::State::CloseWait
-                                )
-                            }
-                            // A slot another process of the fork family already accepted is not
-                            // pending for this one (see `Network::accepted_slots`).
-                            && !accepted_slots.iter().any(|marked| *marked == Some(h))
-                        })
-                        // A fork child's own list is empty by design -- it shares its parent's
-                        // queue instead of arming a second listener on the same port -- so queued
-                        // connections are looked for on the endpoint itself, or the child would
-                        // never be reported readable and never accept a thing.
-                        || Self::unclaimed_connection_on(
-                            socket_set,
-                            accepted_slots,
-                            server_socket.ip_listen_endpoint.port,
-                        )
-                        .is_some();
+                    // The port's queue is shared state now, so "is anything pending" is one
+                    // question with one answer for every process (see `Network::listen_queues`).
+                    // Whatever `accept` hands out must wake the reader, or an epoll-driven server
+                    // never learns the connection is there: a peer that hangs up straight after
+                    // connecting leaves the slot in `CloseWait`, which an `Established`-only test
+                    // misses -- so the listener is never reported readable, the application never
+                    // calls `accept`, and the slot is stranded for the rest of the session.
+                    let pending = Self::unclaimed_connection_on(
+                        socket_set,
+                        accepted_slots,
+                        server_socket.ip_listen_endpoint.port,
+                    )
+                    .is_some();
                     if pending {
                         proxy.set_readable(true);
                         proxy.notify_io_event(Events::IN);
@@ -2522,6 +2520,18 @@ where
                 let (rx, tx, claim) = self.buffers.tcp()?;
                 let handle = self.socket_set.add(tcp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
+                // The child is a SECOND REFERENT of the port's shared accept queue
+                // (`Network::listen_queues`): one more `refs`, so the row -- and with it the armed
+                // backlog slots -- outlives the parent's own close of the port. Nothing is armed
+                // here: the queue is one row per port, so a child arming its own would be arming a
+                // competing listener again.
+                self.register_listen_queue(
+                    smoltcp::wire::IpListenEndpoint {
+                        addr: Some(smoltcp::wire::IpAddress::Ipv4(u32_to_v4(lip))),
+                        port: lport,
+                    },
+                    backlog.max(1),
+                );
                 // How often a fork child inherits a listening port, and what the shared socket set
                 // looks like when it does: each adoption costs one socket slot for the life of the
                 // child, and 8081's refusal in chrF10/chrF11 wanted to know whether these pile up.
@@ -2549,8 +2559,6 @@ where
                                 port: lport,
                             },
                             backlog: Some(backlog.max(1)),
-                            socket_set_handles: Vec::new(),
-                            no_slot_listening_reported: false,
                         }),
                         immediate_close: AtomicBool::new(false),
                         connect_initiated_at_us: None,
@@ -2851,21 +2859,19 @@ where
         // thing this process DID create for itself is a carried TCP listener's OWN handle
         // (`fork_adopt`'s `"L"` arm adds one socket to name the endpoint), and that one is left
         // alone: it is not in `socket_set`'s closing path either way. A borrowed listener arms no
-        // backlog slots of its own (`repair_listening_backlog` returns early for it), so the loop
-        // below finds an empty list and removes nothing -- kept because a handle in that list would
-        // have to be released here if one ever existed. Without this branch, an inherited TCP connection died the
+        // backlog slots of its own -- the port's queue is ONE shared row (`Network::listen_queues`)
+        // that any process maintains -- so all this referent's close owes the port is one fewer
+        // `refs` on that row. Without this branch, an inherited TCP connection died the
         // moment the child that inherited it exited -- the parent's own fd survived but pointed
         // at an aborted socket.
         if borrowed {
             if let ProtocolSpecific::Tcp(tcp_specific) = &mut specific
                 && let Some(server_socket) = tcp_specific.server_socket.take()
             {
-                for handle in server_socket.socket_set_handles {
-                    if Self::socket_set_contains(&self.socket_set, handle) {
-                        let _ =
-                            Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
-                    }
-                }
+                // One LESS referent of the port's shared accept queue, which is what retires the
+                // armed sockets once the last one goes -- never this process dropping an inherited
+                // copy (`Network::release_listen_queue`).
+                self.release_listen_queue(server_socket.ip_listen_endpoint.port);
             }
             if let Some(proxy) = proxy {
                 proxy.set_state(socket_channel::SocketState::Closed);
@@ -2922,11 +2928,7 @@ where
             Protocol::Tcp => {
                 let tcp_specific = specific.tcp_mut();
                 if let Some(server_socket) = tcp_specific.server_socket.take() {
-                    for handle in server_socket.socket_set_handles {
-                        if Self::socket_set_contains(&self.socket_set, handle) {
-                            let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
-                        }
-                    }
+                    self.release_listen_queue(server_socket.ip_listen_endpoint.port);
                 }
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
@@ -3280,8 +3282,6 @@ where
                         port: new_port,
                     },
                     backlog: None,
-                    socket_set_handles: vec![],
-                    no_slot_listening_reported: false,
                 });
             }
             Protocol::Udp => {
@@ -3443,6 +3443,7 @@ where
         // value for now until we have a better solution.
         let backlog = backlog.min(8);
 
+        let mut armed_endpoint: Option<smoltcp::wire::IpListenEndpoint> = None;
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 if handle.server_socket.is_none() {
@@ -3470,8 +3471,6 @@ where
                             port,
                         },
                         backlog: None,
-                        socket_set_handles: vec![],
-                        no_slot_listening_reported: false,
                     });
                 }
                 let Some(server_socket) = &mut handle.server_socket else {
@@ -3480,42 +3479,14 @@ where
                 if server_socket.ip_listen_endpoint.port == 0 {
                     return Err(ListenError::InvalidAddress);
                 }
-                if server_socket.backlog.is_some() || !server_socket.socket_set_handles.is_empty() {
-                    // Real servers (nginx's master process included) legitimately call `listen()`
-                    // again on an already-listening socket -- most commonly to grow the backlog,
-                    // but Linux also permits shrinking it. Growing just needs more pending-accept
-                    // sockets queued (handled below by `refill_to_backlog`); shrinking drops the
-                    // excess still-unconnected listening sockets from the tail of the list, since
-                    // those are equivalent placeholders with no client-visible state yet.
-                    let new_backlog_usize: usize = backlog.into();
-                    if server_socket.socket_set_handles.len() > new_backlog_usize {
-                        for handle in server_socket
-                            .socket_set_handles
-                            .split_off(new_backlog_usize)
-                        {
-                            // Stale-handle guard (see `socket_set_contains`'s own doc comment) --
-                            // a handle already wiped by a dead-holder `reset_after_poisoning()`
-                            // elsewhere has nothing left to remove.
-                            if Self::socket_set_contains(&self.socket_set, handle) {
-                                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
-                            }
-                        }
-                    }
-                    server_socket.backlog = Some(backlog);
-                } else {
-                    server_socket.backlog = Some(backlog);
-                    server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
-                }
-                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
-                // Whoever arms a port's accept queue is the process that has to keep arming it:
-                // recorded so a fork child that inherits the port can tell an owner that is GONE
-                // from one that is merely quiet, and adopt the queue instead of sitting on a port
-                // that answers nothing for the rest of the session.
-                Self::record_listen_owner(
-                    &self.listen_owner,
-                    server_socket.ip_listen_endpoint.port,
-                    self.litebox.platform().current_pid(),
-                );
+                // Real servers (nginx's master process included) legitimately call `listen()` again
+                // on an already-listening socket -- most commonly to grow the backlog, but Linux
+                // also permits shrinking it. Both directions are a re-registration of the port's
+                // shared queue row, which is what carries the backlog: growing arms more slots on
+                // the next refill, shrinking just stops re-arming past the new backlog (an
+                // already-connected slot is never dropped out from under a client).
+                server_socket.backlog = Some(backlog);
+                armed_endpoint = Some(server_socket.ip_listen_endpoint.clone());
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
@@ -3528,6 +3499,22 @@ where
 
         drop(table_entry);
         drop(descriptor_table);
+
+        // The port's accept queue is shared state (`Network::listen_queues`), so arming it takes
+        // `&mut self` and has to wait until this process's descriptor-table guard is released.
+        // Arming it HERE as well as from the tick is what makes a `listen()` that returns
+        // immediately followed by a SYN work: the port is listening before the next tick.
+        if let Some(ip_listen_endpoint) = armed_endpoint {
+            if let Some(index) = self.register_listen_queue(ip_listen_endpoint, backlog) {
+                let Self {
+                    listen_queues,
+                    socket_set,
+                    buffers,
+                    ..
+                } = self;
+                listen_queues[index].refill(socket_set, buffers);
+            }
+        }
 
         self.automated_platform_interaction(PollDirection::Ingress);
         Ok(())
@@ -3558,92 +3545,43 @@ where
                 if server_socket.backlog.is_none() {
                     return Err(AcceptError::NotListening);
                 }
-                // (Purely an optimization) remove all handles that are closed, by only keeping ones
-                // that are not closed. A stale handle (see `socket_set_contains`'s own doc
-                // comment: a dead-holder `reset_after_poisoning()` elsewhere may have wiped it out
-                // of `socket_set` already) is treated the same as a closed one -- both get
-                // dropped here -- instead of panicking deep in smoltcp's own `get`, live-caught
-                // (twenty-eighth pass) as a real `"handle does not refer to a valid socket"` panic
-                // that killed a whole cross-process-fork child's guest-execution thread outright
-                // (this was selkies' own `accept()` call).
-                let handles_before_retain = server_socket.socket_set_handles.len();
-                server_socket.socket_set_handles.retain(|&h| {
-                    Self::socket_set_contains(&self.socket_set, h) && {
-                        let socket: &tcp::Socket = self.socket_set.get(h);
-                        socket.is_open()
-                    }
-                });
-                // A backlog slot dropped here is a socket nobody is listening on any more, so the
-                // port must be re-armed to its backlog in BOTH arms: with every handle gone the
-                // port has NO socket left listening, every later SYN is refused, no handle can
-                // ever become `Established` again, and so `drain_socket_channel_buffers`'s
-                // readable re-arm never fires either -- the port stays dead for the rest of the
-                // session while the connections it already accepted keep working (chrD92: an
-                // in-guest `curl 127.0.0.1:8081` was refused from t=120s to the end of the run
-                // while selkies' accepted websocket went on streaming).  The success arm refills
-                // after its own `swap_remove` below; this is the other one.
-                let stale_dropped = handles_before_retain - server_socket.socket_set_handles.len();
-                if stale_dropped > 0 {
-                    litebox_util_log::warn!(
-                        dropped = stale_dropped;
-                        "diag-accept: listening backlog slot(s) went stale, re-arming the listener"
-                    );
-                    server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
-                }
-                let own_ready = {
-                    // A claim outlives the connection it marked only until the slot is armed back
-                    // into LISTEN, and smoltcp reuses a freed slot index, so claims are reaped
-                    // before any scan -- otherwise one stale mark strands the next connection
-                    // that lands on that slot (neither scan would offer it to anybody).
-                    Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
-                    server_socket.socket_set_handles.iter().position(|&h| {
-                    Self::socket_set_contains(&self.socket_set, h) && {
-                        let socket: &tcp::Socket = self.socket_set.get(h);
-                        // Linux hands a connection out of the accept queue even once its peer's FIN
-                        // has landed (`CloseWait`): the application gets the fd and learns the peer
-                        // is gone by reading EOF. Requiring `Established` here stranded such a slot
-                        // -- `is_open()` keeps it, so the retain above never drops it, no later
-                        // `accept` matches it, and the refill below only runs when a slot actually
-                        // leaves, so one peer-closed connection cost the port a backlog slot
-                        // forever and after `backlog` of them the port refused every SYN for the
-                        // rest of the session (fl6: `LAST_FORK_WHERE_8095_ANSWERED=7`, backlog 8).
-                        matches!(
-                            socket.state(),
-                            tcp::State::Established | tcp::State::CloseWait
+                // The accept queue is SHARED state (`Network::listen_queues`): ONE row per port,
+                // maintained by any process's tick, so the process that called `listen()` and every
+                // fork child that inherited the port accept from the same row and there is no
+                // "own backlog" arm / "borrowed" arm any more. Taking a slot out of that row is
+                // what re-arms the port (see `take_ready_backlog_slot`).
+                let port = server_socket.ip_listen_endpoint.port;
+                let ready_handle = match self.listen_queue_index(port) {
+                    Some(index) => {
+                        let Self {
+                            listen_queues,
+                            socket_set,
+                            buffers,
+                            accepted_slots,
+                            ..
+                        } = self;
+                        Self::take_ready_backlog_slot(
+                            socket_set,
+                            buffers,
+                            accepted_slots,
+                            &mut listen_queues[index],
                         )
                     }
-                    // A slot another process of this fork family already took is not pending here
-                    // (see `Network::accepted_slots`): parent and child accept from ONE queue.
-                    && !Self::is_accepted_in(&self.accepted_slots, h)
-                })
+                    // No row for this port (every referent closed, or a `reset_after_poisoning`
+                    // cleared it): fall back to the connection parked on the endpoint itself, so an
+                    // already-established connection is still handed out rather than stranded.
+                    None => Self::unclaimed_connection_on(
+                        &self.socket_set,
+                        &self.accepted_slots,
+                        port,
+                    ),
                 };
-                let ready_handle = match own_ready {
-                    Some(position) => {
-                        let ready_handle = server_socket.socket_set_handles.swap_remove(position);
-                        Self::mark_accepted_in(&mut self.accepted_slots, ready_handle);
-                        server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
-                        ready_handle
+                let Some(ready_handle) = ready_handle else {
+                    if let Some(proxy) = &socket_handle.proxy {
+                        // reset the readable flag so that we send one [`Events::In`] event per accepted connection
+                        proxy.set_readable(false);
                     }
-                    // Nothing in this process's own backlog: a connection can still be queued on
-                    // the endpoint itself, armed there by whichever process owns this port's
-                    // listening slots -- which is the only state a fork child sharing its parent's
-                    // listener ever sees, since it arms none of its own. The borrower never
-                    // refills: adding slots here would be arming a SECOND listener on the port.
-                    None => {
-                        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
-                        let Some(ready_handle) = Self::unclaimed_connection_on(
-                            &self.socket_set,
-                            &self.accepted_slots,
-                            server_socket.ip_listen_endpoint.port,
-                        ) else {
-                            if let Some(proxy) = &socket_handle.proxy {
-                                proxy.set_readable(false);
-                            }
-                            return Err(AcceptError::NoConnectionsReady);
-                        };
-                        Self::mark_accepted_in(&mut self.accepted_slots, ready_handle);
-                        ready_handle
-                    }
+                    return Err(AcceptError::NoConnectionsReady);
                 };
                 if let Some(proxy) = &socket_handle.proxy {
                     // reset the readable flag so that we send one [`Events::In`] event per accepted connection
