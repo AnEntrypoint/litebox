@@ -2778,8 +2778,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     Ok(())
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2850,8 +2850,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     Ok(())
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -6740,7 +6740,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
-                    |_fd| todo!("epoll"),
+                    // Real Linux's generic `setfl` accepts `F_SETFL` on an epoll fd - epoll has no
+                    // `check_flags`, so the flags are stored and simply mean nothing.
+                    |_fd| Ok(()),
                     |fd| {
                         toggle_flags!(fd);
                         Ok(())
@@ -7922,7 +7924,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // this build's "accept every TCSETS*-family ioctl" stance rather than ENOTTY.
                 Ok(0)
             }
-            _ => todo!(),
+            _ => Err(Errno::ENOTTY),
         }
     }
 
