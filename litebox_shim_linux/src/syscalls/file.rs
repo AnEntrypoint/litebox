@@ -34,7 +34,9 @@ use crate::{
     GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
     syscalls::{file_spill::SpillEdit, signal},
 };
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -1516,6 +1518,465 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                 "flock(2): shared lock table cannot hold this file; excluding within this host \
                  process only"
             );
+        }
+    }
+}
+
+/// One `fcntl(2)` record lock claim every host process of the fork family can see.
+///
+/// Record locks exclude by BYTE RANGE rather than per file, so a row here is one claim -- one
+/// (process, `start..end`, read-or-write) triple -- where [`SharedFlockTable`]'s row is one locked
+/// file. The rest of the design is that table's, for the same reasons: pointer-free rows of plain
+/// atomics in the shared kernel arena, one critical section for the scan and the commit, one futex
+/// word for cross-process wakeup, dead-holder reclaim by host pid (`platform.is_process_alive`), and
+/// `(dev, path)` rather than `(dev, ino)` as the key because `ino` is renumbered by a cross-process
+/// `fork()` child's filesystem rebuild (see [`SharedFlockSlot`]).
+///
+/// A request that overlaps the caller's own claims splits them as Linux does, so the parts outside
+/// the requested range stay held with their original mode. When a split needs more rows than are free
+/// the call answers `ENOLCK` -- Linux's own errno for a full lock table -- instead of widening or
+/// dropping a range: a claim narrower than the caller was told it holds is how two writers corrupt
+/// one file, while a refusal is a failure the guest can see.
+const SHARED_RECORD_LOCK_ROWS: usize = 256;
+/// Longest path a claim can be keyed on. A longer path falls back to the per-process table rather
+/// than being truncated into a key that could collide with a different file's.
+const SHARED_RECORD_LOCK_PATH_MAX: usize = 128;
+/// The bound on a lost wakeup, and the granularity at which a blocked `F_SETLKW` notices a signal.
+const SHARED_RECORD_LOCK_WAIT_CHUNK: core::time::Duration = core::time::Duration::from_millis(25);
+/// A waiter reaps claims of processes that died without unlocking every Nth chunk (~1s).
+const SHARED_RECORD_LOCK_RECLAIM_EVERY: u32 = 40;
+
+/// One attempt to apply a claim, in the only terms its caller can act on.
+enum SharedRecordLockOutcome {
+    /// The claim set now reflects the request.
+    Applied,
+    /// A live process holds an incompatible claim over the range.
+    Conflict,
+    /// This table cannot key the request: the caller falls back to its per-process table.
+    Unavailable,
+    /// This table is the live one but has no room for the split: the guest gets `ENOLCK`.
+    Full,
+}
+
+/// What `F_GETLK` asks for: is there a conflicting claim, and whose.
+enum SharedRecordLockQuery {
+    NoConflict,
+    Conflict {
+        guest_pid: i32,
+        write: bool,
+        start: u64,
+        end: u64,
+    },
+    /// Same meaning as [`SharedRecordLockOutcome::Unavailable`]: ask the per-process table.
+    Unavailable,
+}
+
+/// One claim row: pointer-free, so the same bytes mean the same thing in every host process.
+struct SharedRecordLockRow {
+    dev: AtomicUsize,
+    path: [AtomicU8; SHARED_RECORD_LOCK_PATH_MAX],
+    /// `0` marks a free row, which no real path can be.
+    path_len: AtomicU32,
+    /// Host process owning the claim: the identity dead-holder reclaim tests for liveness.
+    host_pid: AtomicU32,
+    /// Guest pid of the owner, which is what `F_GETLK` reports.
+    guest_pid: AtomicI32,
+    write: AtomicBool,
+    start: AtomicU64,
+    /// Exclusive; `u64::MAX` means "to end of file".
+    end: AtomicU64,
+}
+
+impl SharedRecordLockRow {
+    fn new() -> Self {
+        Self {
+            dev: AtomicUsize::new(0),
+            path: core::array::from_fn(|_| AtomicU8::new(0)),
+            path_len: AtomicU32::new(0),
+            host_pid: AtomicU32::new(0),
+            guest_pid: AtomicI32::new(0),
+            write: AtomicBool::new(false),
+            start: AtomicU64::new(0),
+            end: AtomicU64::new(0),
+        }
+    }
+
+    fn is_free(&self) -> bool {
+        self.path_len.load(Ordering::Acquire) == 0
+    }
+
+    fn key_matches(&self, dev: usize, path: &[u8]) -> bool {
+        self.dev.load(Ordering::Acquire) == dev
+            && self.path_len.load(Ordering::Acquire) as usize == path.len()
+            && self
+                .path
+                .iter()
+                .zip(path.iter())
+                .all(|(stored, b)| stored.load(Ordering::Relaxed) == *b)
+    }
+
+    fn owned_by(&self, host: u32, guest: i32) -> bool {
+        self.host_pid.load(Ordering::Acquire) == host
+            && self.guest_pid.load(Ordering::Acquire) == guest
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start.load(Ordering::Acquire) < end && start < self.end.load(Ordering::Acquire)
+    }
+
+    fn claim(&self) -> (bool, u64, u64) {
+        (
+            self.write.load(Ordering::Acquire),
+            self.start.load(Ordering::Acquire),
+            self.end.load(Ordering::Acquire),
+        )
+    }
+
+    /// Callers hold `guard` and pass a path of at least one byte.
+    fn set(
+        &self,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        guest: i32,
+        write: bool,
+        start: u64,
+        end: u64,
+    ) {
+        self.dev.store(dev, Ordering::Release);
+        for (i, b) in path.iter().enumerate() {
+            self.path[i].store(*b, Ordering::Release);
+        }
+        self.path_len.store(path.len() as u32, Ordering::Release);
+        self.host_pid.store(host, Ordering::Release);
+        self.guest_pid.store(guest, Ordering::Release);
+        self.write.store(write, Ordering::Release);
+        self.start.store(start, Ordering::Release);
+        self.end.store(end, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.path_len.store(0, Ordering::Release);
+        self.host_pid.store(0, Ordering::Release);
+        self.guest_pid.store(0, Ordering::Release);
+    }
+}
+
+/// The arena-resident half: ONE critical section, ONE futex word, and the pointer-free rows.
+struct SharedRecordLockRegion<Platform: ShimPlatform> {
+    /// Whether these bytes sit in memory EVERY process that could contend for these locks can see --
+    /// `false` means the arena was exhausted at construction, so every claim degrades to the
+    /// per-process table: granting a lock out of process-private memory is a claim two processes
+    /// could both act on.
+    excludes: AtomicBool,
+    /// Serializes every scan, claim and transition in the whole family. Held for a handful of atomic
+    /// stores; a holder killed mid-section is recovered by `RawMutex`'s own dead-holder path.
+    guard: litebox::sync::Mutex<Platform, ()>,
+    /// Futex word, never actually locked: `underlying_atomic()` is bumped on every change and
+    /// `wake_all` unparks whoever is `block_or_timeout`ing on it.
+    wake: Platform::RawMutex,
+    rows: [SharedRecordLockRow; SHARED_RECORD_LOCK_ROWS],
+}
+
+impl<Platform: ShimPlatform> SharedRecordLockRegion<Platform> {
+    fn bump(&self) {
+        self.wake
+            .underlying_atomic()
+            .fetch_add(1, Ordering::Release);
+        self.wake.wake_all();
+    }
+
+    fn free_row_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.is_free()).count()
+    }
+
+    /// Frees every claim whose host process is gone. Callers hold `guard`.
+    ///
+    /// A fork child that is killed never runs its exit path, so without this a dead process's claim
+    /// would pin its byte range for the rest of the session. `is_process_alive` is the same check the
+    /// platform's own dead-`RawMutex`-holder recovery makes. Pid 0 means "no owner recorded" and is
+    /// skipped.
+    fn reclaim_dead(&self, platform: &Platform) -> bool {
+        let mut reclaimed = false;
+        for row in self.rows.iter() {
+            let host = row.host_pid.load(Ordering::Acquire);
+            if !row.is_free() && host != 0 && !platform.is_process_alive(host) {
+                row.clear();
+                reclaimed = true;
+            }
+        }
+        if reclaimed {
+            self.bump();
+        }
+        reclaimed
+    }
+}
+
+pub(crate) struct SharedRecordLockTable<Platform: ShimPlatform> {
+    region: &'static mut SharedRecordLockRegion<Platform>,
+    /// Count of claims this process has had to degrade to the per-process table.
+    degraded: AtomicU32,
+}
+
+impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
+    /// Allocates the region in the cross-process SHARED kernel arena and initializes it.
+    ///
+    /// Runs exactly once per fork family, from `LinuxShimBuilder::build`'s create branch: every other
+    /// process in the family attaches to the already-built `GlobalState` and never calls this.
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout = core::alloc::Layout::new::<SharedRecordLockRegion<Platform>>();
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let (ptr, excludes) = match arena {
+            Some(ptr) => (ptr.cast::<SharedRecordLockRegion<Platform>>(), true),
+            None => {
+                // Arena exhausted: still never a panic (the host process IS the whole guest session).
+                // Leak a process-private allocation so every later access stays memory-safe, and let
+                // `excludes` disable the table.
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared record lock table: shared kernel arena exhausted; fcntl(2) record locks \
+                     exclude within this host process only"
+                );
+                (
+                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                        .expect("shared record lock table: fallback allocation failed")
+                        .cast::<SharedRecordLockRegion<Platform>>(),
+                    false,
+                )
+            }
+        };
+        Self::new_in(ptr, excludes)
+    }
+
+    /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
+    fn new_in(
+        ptr: core::ptr::NonNull<SharedRecordLockRegion<Platform>>,
+        excludes: bool,
+    ) -> Self {
+        // SAFETY (all four writes): `ptr` names one contiguous, uninitialized
+        // `SharedRecordLockRegion` sized by [`Self::new`]'s `layout`, and writing a freshly built
+        // value into uninitialized memory is what `write` is for. Initializing through the pointer
+        // ONE FIELD AT A TIME is also the point: a `SharedRecordLockRegion` value is tens of KiB of
+        // stack at once, and `GlobalState` is built by value on a stack already near its documented
+        // limit.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).excludes).write(AtomicBool::new(excludes));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).guard).write(litebox::sync::Mutex::new(()));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).wake)
+                .write(<Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT);
+            for i in 0..SHARED_RECORD_LOCK_ROWS {
+                core::ptr::addr_of_mut!((*ptr.as_ptr()).rows[i]).write(SharedRecordLockRow::new());
+            }
+        }
+        Self {
+            // SAFETY: `ptr` is non-null and suitably aligned, and the region at it was just
+            // initialized field-by-field above. `'static` is sound because this allocation is
+            // arena-backed (or a deliberately leaked one) and never reclaimed.
+            region: unsafe { &mut *ptr.as_ptr() },
+            degraded: AtomicU32::new(0),
+        }
+    }
+
+    /// Whether this table's bytes are in memory every contending process can see.
+    fn excludes(&self) -> bool {
+        self.region.excludes.load(Ordering::Acquire)
+    }
+
+    fn log_degraded(&self) {
+        let n = self.degraded.fetch_add(1, Ordering::Relaxed);
+        // Gap-filtered: a table that cannot key a lock is a capacity/reachability signal worth
+        // seeing, not a per-call event.
+        if n & 0x3f == 0 {
+            litebox_util_log::warn!(
+                rows:% = SHARED_RECORD_LOCK_ROWS,
+                degraded:% = n + 1;
+                "fcntl(2): shared record lock table cannot hold this lock; excluding within this \
+                 host process only"
+            );
+        }
+    }
+
+    /// One critical section that scans for a conflicting claim AND commits the request, so two
+    /// processes can never disagree about who holds a range.
+    fn try_apply(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        guest: i32,
+        start: u64,
+        end: u64,
+        write: bool,
+        unlock: bool,
+    ) -> SharedRecordLockOutcome {
+        let _guard = self.region.guard.lock();
+        // Two passes at most: the second only happens after a pass that found a conflict ALSO freed
+        // a dead holder's claim, which is what makes a killed process stop pinning its range without
+        // waiting for some other process to block on it.
+        for _ in 0..2 {
+            let mut mine: alloc::vec::Vec<(usize, bool, u64, u64)> = alloc::vec::Vec::new();
+            let mut parts = 0usize;
+            let mut conflict = false;
+            for (i, row) in self.region.rows.iter().enumerate() {
+                if row.is_free() || !row.key_matches(dev, path) {
+                    continue;
+                }
+                if !row.owned_by(host, guest) {
+                    if !unlock && row.overlaps(start, end) && (write || row.claim().0) {
+                        conflict = true;
+                    }
+                    continue;
+                }
+                if row.overlaps(start, end) {
+                    let (w, rs, re) = row.claim();
+                    parts += usize::from(rs < start) + usize::from(re > end);
+                    mine.push((i, w, rs, re));
+                }
+            }
+            if conflict && self.region.reclaim_dead(platform) {
+                continue;
+            }
+            if conflict {
+                return SharedRecordLockOutcome::Conflict;
+            }
+            let needed = parts + usize::from(!unlock);
+            if needed > mine.len() + self.region.free_row_count() {
+                return SharedRecordLockOutcome::Full;
+            }
+            // Commit: every row of ours that the request touches goes back into the pool, so a split
+            // can reuse the row it came from instead of needing fresh ones.
+            let mut pool: alloc::vec::Vec<usize> = mine.iter().map(|m| m.0).collect();
+            for (i, row) in self.region.rows.iter().enumerate() {
+                if row.is_free() {
+                    pool.push(i);
+                }
+            }
+            for (i, _, _, _) in mine.iter() {
+                self.region.rows[*i].clear();
+            }
+            let mut at = 0usize;
+            for (_, w, rs, re) in mine.iter() {
+                if *rs < start {
+                    self.region.rows[pool[at]].set(dev, path, host, guest, *w, *rs, start);
+                    at += 1;
+                }
+                if *re > end {
+                    self.region.rows[pool[at]].set(dev, path, host, guest, *w, end, *re);
+                    at += 1;
+                }
+            }
+            if !unlock {
+                self.region.rows[pool[at]].set(dev, path, host, guest, write, start, end);
+            }
+            self.region.bump();
+            return SharedRecordLockOutcome::Applied;
+        }
+        SharedRecordLockOutcome::Conflict
+    }
+
+    /// Applies this process's claim over `start..end` of `(dev, path)`.
+    ///
+    /// Returns `None` when the table cannot key the lock, meaning the caller must fall back to its
+    /// per-process table; never a panic. `interrupted` is the task's own `check_for_interrupt`, so a
+    /// blocked `F_SETLKW` stays responsive to signals.
+    pub(crate) fn apply(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        guest: i32,
+        start: u64,
+        end: u64,
+        write: bool,
+        unlock: bool,
+        nonblocking: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Option<Result<(), Errno>> {
+        if path.is_empty() || path.len() > SHARED_RECORD_LOCK_PATH_MAX || !self.excludes() {
+            self.log_degraded();
+            return None;
+        }
+        let mut chunks = 0u32;
+        loop {
+            match self.try_apply(platform, dev, path, host, guest, start, end, write, unlock) {
+                SharedRecordLockOutcome::Applied => return Some(Ok(())),
+                SharedRecordLockOutcome::Unavailable => return None,
+                SharedRecordLockOutcome::Full => return Some(Err(Errno::ENOLCK)),
+                SharedRecordLockOutcome::Conflict => {
+                    if nonblocking {
+                        return Some(Err(Errno::EAGAIN));
+                    }
+                    if interrupted() {
+                        return Some(Err(Errno::EINTR));
+                    }
+                    // Sample BEFORE blocking: a bump that already happened shows up as an immediate
+                    // return, and one that happens after the sample sets this waiter's event, so a
+                    // release cannot be missed in either order. The chunk bounds how long a waiter
+                    // can sit on a wakeup the platform lost, and is the poll for `interrupted`.
+                    let sampled = self.region.wake.underlying_atomic().load(Ordering::Acquire);
+                    let _ = self
+                        .region
+                        .wake
+                        .block_or_timeout(sampled, SHARED_RECORD_LOCK_WAIT_CHUNK);
+                    chunks = chunks.wrapping_add(1);
+                    if chunks % SHARED_RECORD_LOCK_RECLAIM_EVERY == 0 {
+                        let _guard = self.region.guard.lock();
+                        self.region.reclaim_dead(platform);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first claim that would stop `(host, guest)` from taking `write` over `start..end`.
+    pub(crate) fn conflicting_claim(
+        &self,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        guest: i32,
+        start: u64,
+        end: u64,
+        want_write: bool,
+    ) -> SharedRecordLockQuery {
+        if path.is_empty() || path.len() > SHARED_RECORD_LOCK_PATH_MAX || !self.excludes() {
+            return SharedRecordLockQuery::Unavailable;
+        }
+        let _guard = self.region.guard.lock();
+        for row in self.region.rows.iter() {
+            if row.is_free() || !row.key_matches(dev, path) || row.owned_by(host, guest) {
+                continue;
+            }
+            let (write, rs, re) = row.claim();
+            if rs < end && start < re && (want_write || write) {
+                return SharedRecordLockQuery::Conflict {
+                    guest_pid: row.guest_pid.load(Ordering::Acquire),
+                    write,
+                    start: rs,
+                    end: re,
+                };
+            }
+        }
+        SharedRecordLockQuery::NoConflict
+    }
+
+    /// Drops every claim `host`/`guest` holds; called when that guest process exits.
+    pub(crate) fn release_process(&self, host: u32, guest: i32) {
+        if !self.excludes() {
+            return;
+        }
+        let _guard = self.region.guard.lock();
+        let mut released = false;
+        for row in self.region.rows.iter() {
+            if !row.is_free() && row.owned_by(host, guest) {
+                row.clear();
+                released = true;
+            }
+        }
+        if released {
+            self.region.bump();
         }
     }
 }
@@ -6261,6 +6722,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
+                let path = self.files.borrow().lookup_fd_path(desc);
                 self.files
                     .borrow()
                     .run_on_raw_fd(
@@ -6278,36 +6740,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             let me = self.pid.get();
                             let want_write =
                                 lock_type == litebox_common_linux::FlockType::WriteLock;
-                            let conflict = self
+                            let path: &[u8] = path.as_deref().map_or(&[], |p| {
+                                let with_nul = p.to_bytes_with_nul();
+                                &with_nul[..with_nul.len().saturating_sub(1)]
+                            });
+                            // A conflict another host process holds is only visible in the shared
+                            // table; the per-process one can no longer see is the fallback.
+                            let shared = if self
                                 .global
-                                .record_locks()
-                                .lock()
-                                .iter()
-                                .find(|l| {
-                                    l.key == key
-                                        && l.pid != me
-                                        && l.overlaps(start, end)
-                                        && (want_write || l.write)
-                                })
-                                .cloned();
-                            match conflict {
+                                .platform
+                                .env_flag("LITEBOX_RECORD_LOCK_SHARED_OFF")
+                            {
+                                SharedRecordLockQuery::Unavailable
+                            } else {
+                                self.global.shared_record_locks.conflicting_claim(
+                                    key.0,
+                                    path,
+                                    self.global.platform.current_host_pid(),
+                                    me,
+                                    start,
+                                    end,
+                                    want_write,
+                                )
+                            };
+                            let conflict: Option<Option<(i32, bool, u64, u64)>> = match shared {
+                                SharedRecordLockQuery::NoConflict => Some(None),
+                                SharedRecordLockQuery::Conflict {
+                                    guest_pid,
+                                    write,
+                                    start,
+                                    end,
+                                } => Some(Some((guest_pid, write, start, end))),
+                                SharedRecordLockQuery::Unavailable => Some(
+                                    self.global
+                                        .record_locks()
+                                        .lock()
+                                        .iter()
+                                        .find(|l| {
+                                            l.key == key
+                                                && l.pid != me
+                                                && l.overlaps(start, end)
+                                                && (want_write || l.write)
+                                        })
+                                        .map(|l| (l.pid, l.write, l.start, l.end)),
+                                ),
+                            };
+                            match conflict.flatten() {
                                 None => {
                                     flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
                                 }
-                                Some(l) => {
-                                    flock.type_ = if l.write {
+                                Some((pid, write, s, e)) => {
+                                    flock.type_ = if write {
                                         litebox_common_linux::FlockType::WriteLock
                                     } else {
                                         litebox_common_linux::FlockType::ReadLock
                                     } as i16;
                                     flock.whence = 0;
-                                    flock.start = l.start as usize;
-                                    flock.len = if l.end == u64::MAX {
-                                        0
-                                    } else {
-                                        (l.end - l.start) as isize
-                                    };
-                                    flock.pid = l.pid;
+                                    flock.start = s as usize;
+                                    flock.len = if e == u64::MAX { 0 } else { (e - s) as isize };
+                                    flock.pid = pid;
                                 }
                             }
                             lock.write_at_offset::<Platform>(0, flock)
@@ -6331,6 +6822,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
                 let blocking = matches!(arg, FcntlArg::SETLKW(_));
+                // The path this descriptor was opened with: the one file identity that survives a
+                // cross-process `fork()` (see `SharedRecordLockRow`'s own doc comment), and what the
+                // cross-process table keys on.
+                let path = self.files.borrow().lookup_fd_path(desc);
                 self.files
                     .borrow()
                     .run_on_raw_fd(
@@ -6341,7 +6836,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 .map_err(|_| Errno::EINVAL)?;
                             let key = self.record_lock_key(fd)?;
                             let (start, end) = Self::record_lock_range(&flock)?;
-                            self.do_record_lock(key, lock_type, start, end, blocking)?;
+                            let path: &[u8] = path.as_deref().map_or(&[], |p| {
+                                let with_nul = p.to_bytes_with_nul();
+                                &with_nul[..with_nul.len().saturating_sub(1)]
+                            });
+                            self.do_record_lock(key, path, lock_type, start, end, blocking)?;
                             Ok(0)
                         },
                         |_fd| Err(Errno::EINVAL),
@@ -6429,15 +6928,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Applies (or, for `Unlock`, removes) this process's record lock over `start..end`.
+    ///
+    /// `key` is `(dev, ino)`, which identifies the file within this host process; `path` is what the
+    /// cross-process table keys on, because `ino` is renumbered by a `fork()` child's filesystem
+    /// rebuild (see [`SharedRecordLockRow`]).
     fn do_record_lock(
         &self,
         key: (usize, usize),
+        path: &[u8],
         lock_type: litebox_common_linux::FlockType,
         start: u64,
         end: u64,
         blocking: bool,
     ) -> Result<(), Errno> {
         let me = self.pid.get();
+        let unlock = lock_type == litebox_common_linux::FlockType::Unlock;
+        let write = lock_type == litebox_common_linux::FlockType::WriteLock;
+        // Cross-process exclusion first: the per-process table below cannot see another host
+        // process's claim, so two guest processes would both be granted the same write lock.
+        // Diagnostic A/B only: `LITEBOX_RECORD_LOCK_SHARED_OFF=1` skips it, so one binary can be
+        // measured both with the shared table and with the per-process behaviour it replaced.
+        if !self
+            .global
+            .platform
+            .env_flag("LITEBOX_RECORD_LOCK_SHARED_OFF")
+        {
+            let table = &self.global.shared_record_locks;
+            if let Some(res) = table.apply(
+                self.global.platform,
+                key.0,
+                path,
+                self.global.platform.current_host_pid(),
+                me,
+                start,
+                end,
+                write,
+                unlock,
+                !blocking,
+                &|| self.check_for_interrupt(),
+            ) {
+                return res;
+            }
+        }
         let try_apply = || -> Result<(), litebox::event::polling::TryOpError<Errno>> {
             let mut locks = self.global.record_locks().lock();
             let write = lock_type == litebox_common_linux::FlockType::WriteLock;
@@ -6496,6 +7028,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Drops every record lock this process holds; called when it exits.
     pub(crate) fn release_record_locks(&self) {
         let me = self.pid.get();
+        self.global
+            .shared_record_locks
+            .release_process(self.global.platform.current_host_pid(), me);
         let mut locks = self.global.record_locks().lock();
         let before = locks.len();
         locks.retain(|l| l.pid != me);
