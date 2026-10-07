@@ -1746,6 +1746,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     *byte = b;
                 }
                 self.set_task_comm(&name_buf);
+                // A fork child that never `execve`s keeps its PARENT's `cmdline`, so every
+                // chromium zygote child reads `--type=zygote` in `/proc` and `ps` - the one place
+                // a child says what it became is `prctl(PR_SET_NAME)`, which is what separates a
+                // legitimate spawn from a crash loop among the ~1.6/s fork churn.
+                let end = name_buf.iter().position(|b| *b == 0).unwrap_or(name_buf.len());
+                if let Ok(set_name) = core::str::from_utf8(&name_buf[..end]) {
+                    litebox_util_log::warn!(
+                        pid:% = self.pid.get(), tid:% = self.tid.get(), name = set_name;
+                        "diag-prctl-name: a task renamed itself");
+                }
                 Ok(0)
             }
             PrctlArg::GetSecureBits => Ok(0),
