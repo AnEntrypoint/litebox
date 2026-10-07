@@ -241,15 +241,48 @@ fn is_spilled_path(path: &str) -> bool {
     SPILLED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
 }
 
+/// A path the host asked to share on top of [`SPILLED_PREFIXES`]:
+/// `LITEBOX_SHARED_WRITE_PREFIXES=/tmp/lk/;/tmp/co/`.
+///
+/// The built-in list is a fixed guess at which paths a guest writes heavily AND wants shared; a
+/// file two host processes both write is only known at run time, so the list is extensible from
+/// the host instead of by rebuilding the shim.
+fn is_shared_write_path<Platform: SystemInfoProvider>(platform: &Platform, path: &str) -> bool {
+    is_spilled_path(path)
+        || platform
+            .env_value("LITEBOX_SHARED_WRITE_PREFIXES")
+            .is_some_and(|prefixes| {
+                prefixes
+                    .split([';', ':'])
+                    .any(|prefix| !prefix.is_empty() && path.starts_with(prefix))
+            })
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn spill_enabled_for(&self, path: &str) -> bool {
-        is_spilled_path(path) && self.global.platform.spill_available()
+        is_shared_write_path(self.global.platform, path) && self.global.platform.spill_available()
     }
 
     pub(crate) fn spilled_path_of_fd(&self, raw_fd: usize) -> Option<String> {
         let path = self.files.borrow().lookup_fd_path(raw_fd)?;
         let path = path.to_str().ok()?;
         self.spill_enabled_for(path).then(|| String::from(path))
+    }
+
+    /// Pull the shared store's current bytes into this process's private copy before a read or a
+    /// write of `raw_fd`.
+    ///
+    /// A spilled file's authoritative bytes are the store's, and another host process can publish
+    /// into that store at any moment; the private copy is otherwise frozen at whatever this process
+    /// last opened or wrote. A long-lived reader (a sqlite connection held across many transactions)
+    /// then answers every later read from that snapshot and writes back pages computed from it,
+    /// which is how a whole worker's rows went missing in `lockapp1 contend` even though its writes
+    /// reached the store. `refresh_from_spill` is a no-op unless the store's generation moved on, so
+    /// a process only pays for installs caused by SOMEONE ELSE's writes, never its own.
+    pub(crate) fn sync_spilled_fd(&self, raw_fd: usize) {
+        if let Some(path) = self.spilled_path_of_fd(raw_fd) {
+            self.refresh_from_spill(path.as_str());
+        }
     }
 
     pub(crate) fn refresh_from_spill(&self, path: &str) {
@@ -289,28 +322,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn install_spilled_content(&self, path: &str, view: &SpillView) {
         self.create_missing_parents(path);
-        let files = self.files.borrow();
-        let Ok(file) = files.fs.open(
-            path,
-            OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
-            Mode::from_bits_truncate(0o644),
-        ) else {
-            return;
-        };
         let mut chunk = vec![0u8; TRANSFER_CHUNK];
         let mut offset = 0u64;
+        let mut opened: Option<_> = None;
+        let files = self.files.borrow();
         while offset < view.length {
             let wanted = chunk.len().min((view.length - offset) as usize);
             let read = self
                 .global
                 .platform
                 .spill_read_at(view.slot as u32, offset, &mut chunk[..wanted]);
-            if read == 0 || files.fs.write(&file, &chunk[..read], None).is_err() {
+            if read == 0 {
+                break;
+            }
+            // The store is asked for bytes BEFORE the local file is truncated, never after: an
+            // `O_TRUNC` open followed by a store read that yields nothing would leave the guest
+            // holding an empty file while the store still believes it has `view.length` bytes --
+            // unrecoverable loss, and `sync_spilled_fd` makes this run on every read, not just at
+            // open, so there is no longer a rare path for that to hide behind.
+            if opened.is_none() {
+                self.create_missing_parents(path);
+                let Ok(file) = files.fs.open(
+                    path,
+                    OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
+                    Mode::from_bits_truncate(0o644),
+                ) else {
+                    return;
+                };
+                opened = Some(file);
+            }
+            let Some(file) = opened.as_ref() else {
+                return;
+            };
+            if files.fs.write(file, &chunk[..read], None).is_err() {
                 break;
             }
             offset += read as u64;
         }
-        let _ = files.fs.close(&file);
+        if let Some(file) = opened.as_ref() {
+            let _ = files.fs.close(file);
+        }
     }
 
     fn create_missing_parents(&self, path: &str) {

@@ -3875,6 +3875,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(raw_fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        // `pread(2)` routes here with `Some(offset)` and `readv(2)` loops over `sys_read`, so this
+        // one call covers every read of a spilled file -- see `sync_spilled_fd`.
+        self.sync_spilled_fd(raw_fd as usize);
         let result = self.do_read(raw_fd, buf, offset);
         litebox_util_log::debug!(
             tid:% = self.tid.get(),
@@ -4194,6 +4197,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
     /// If `Some`, it will write to the specified offset without changing the current file position.
     pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+        // A write must land on the store's CURRENT bytes, not on a private copy another process has
+        // already moved past: appending at a stale end-of-file, or writing a page that was read
+        // before a sibling's write, silently drops the sibling's bytes. `pwrite(2)` and `writev(2)`
+        // both route here.
+        self.sync_spilled_fd(usize::try_from(fd).unwrap_or(usize::MAX));
         let result = self.do_write(fd, buf, offset);
         // A guest's own error text -- panics, assertion failures, library diagnostics -- reaches
         // us only through this write, and 64 bytes truncates essentially all of it. A real
