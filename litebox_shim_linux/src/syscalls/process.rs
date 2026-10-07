@@ -4256,12 +4256,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // range's own start: the child reserves at the parent's bases, so `translate()` is the
         // identity and `fork_verify` in the child sees no spurious "stale pre-fork pointer".
         let pm = self.process().pm();
-        let layout = pm.tracked_regions();
-        if layout.is_empty() {
-            return None;
-        }
-        // `.1` is the program break -- the same pair the child's own adoption compares against.
-        let heap_top = pm.tracked_region_summary().1;
         // `madvise(MADV_DONTFORK)`: a range carrying `VM_DONT_FORK` is withheld from the child, so
         // the child adopts NO VMA for it and has a genuine HOLE there -- a later `mmap` may claim
         // it, and touching it before that faults, exactly as on real Linux. `Vmem::duplicate`
@@ -4269,10 +4263,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // no-op on the production cross-process fork and the child simply got a full copy (madvx1,
         // 2026-10-07: `dontfork` read exactly like `baseline` -- `child_code=0` where `3` was
         // required, with the `invalid` guard correctly returning `rc=-1 errno=12`).
+        //
+        // The filter is applied to `layout` ITSELF and not to the vectors derived from it:
+        // `ranges`, the copy groups, `flags`, `executable` and `is_file_backed` have to stay
+        // index-aligned with one another (`vma_layout()` zips them positionally), so filtering one
+        // of them alone shifts every later region onto its neighbour's flags -- which is what an
+        // earlier version of this fix did, and it mislabels every region after a withheld one.
         let withheld_from_child = |flags: u32| {
             litebox::mm::linux::VmFlags::from_bits_truncate(flags)
                 .contains(litebox::mm::linux::VmFlags::VM_DONT_FORK)
         };
+        let tracked = pm.tracked_regions();
+        let withheld: alloc::vec::Vec<core::ops::Range<usize>> = tracked
+            .iter()
+            .filter(|(_, flags, _)| withheld_from_child(*flags))
+            .map(|(range, _, _)| range.clone())
+            .collect();
+        let layout: alloc::vec::Vec<_> = tracked
+            .into_iter()
+            .filter(|(_, flags, _)| !withheld_from_child(*flags))
+            .collect();
+        if layout.is_empty() {
+            return None;
+        }
+        // `.1` is the program break -- the same pair the child's own adoption compares against.
+        let heap_top = pm.tracked_region_summary().1;
         let ranges: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = layout
             .iter()
             .filter(|(_, flags, _)| !withheld_from_child(*flags))
@@ -4307,11 +4322,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut sorted: alloc::vec::Vec<_> = layout
             .iter()
             .filter(|(_, f, _)| {
-                // The bytes are withheld too, not just the VMA: copying them into a range the
-                // child can never map would be pure cost today and stale data tomorrow.
-                if withheld_from_child(*f) {
-                    return false;
-                }
                 let f = litebox::mm::linux::VmFlags::from_bits_truncate(*f);
                 // `VM_OWN_FORK_PADDING` qualifies even though it carries no access bit: such a
                 // range is this process's OWN, genuinely committed host memory (see that flag's
@@ -4345,6 +4355,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 _ => groups.push(start..end),
             }
+        }
+        // A withheld range seeds no group of its own (it is gone from `layout` above), but a
+        // NEIGHBOUR's span is widened out to its enclosing granule and two widened spans merge when
+        // they touch, so a withheld range can still land INSIDE a group -- `copy_one_group` would
+        // then commit the parent's bytes there and `Vmem::adopt` would cover them with a
+        // `VM_OWN_FORK_PADDING` VMA, so the child could `mprotect` it and the advice would still be
+        // a no-op. Carve the withheld span back out, shrunk INWARD to granule boundaries: a group's
+        // base has to stay granule-aligned (`VirtualAlloc2` + `MEM_ADDRESS_REQUIREMENTS` rejects
+        // anything else with `ERROR_INVALID_PARAMETER`), and the <=64 KiB sliver left at each end
+        // belongs to the neighbour's own widened span and cannot be reserved on its own.
+        if !withheld.is_empty() {
+            let mut carved: alloc::vec::Vec<core::ops::Range<usize>> =
+                alloc::vec::Vec::new();
+            for group in groups {
+                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> =
+                    alloc::vec::Vec::new();
+                pieces.push(group);
+                for w in &withheld {
+                    let cut_start = w.start.next_multiple_of(GRANULE);
+                    let cut_end = w.end & !(GRANULE - 1);
+                    if cut_start >= cut_end {
+                        continue;
+                    }
+                    let mut next: alloc::vec::Vec<core::ops::Range<usize>> =
+                        alloc::vec::Vec::new();
+                    for p in pieces {
+                        if cut_end <= p.start || cut_start >= p.end {
+                            next.push(p);
+                            continue;
+                        }
+                        if cut_start > p.start {
+                            next.push(p.start..cut_start);
+                        }
+                        if cut_end < p.end {
+                            next.push(cut_end..p.end);
+                        }
+                    }
+                    pieces = next;
+                }
+                carved.extend(pieces);
+            }
+            groups = carved;
         }
         let total_bytes: usize = groups.iter().map(core::ops::Range::len).sum();
         litebox_util_log::debug!(
