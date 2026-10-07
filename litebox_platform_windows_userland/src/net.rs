@@ -277,6 +277,17 @@ impl GatewayState {
             ) else {
                 // Port collision or socket-set exhaustion: drop this connection rather than
                 // stalling the gateway. The host peer sees a closed connection and can retry.
+                // Measured shape: the host peer's connect dies with no answer (`curl` code 000)
+                // while the guest's own loopback connect to the same port still answers 200 --
+                // chrF27, three HOLD ticks wide.
+                litebox_util_log::warn!(
+                    guest_port = conn.guest_port,
+                    local_port = local_port,
+                    flows = self.tcp_flows.len(),
+                    sockets = self.sockets.iter().count(),
+                    claimed_ports = self.ports_claimed_by_inbound_flows.len();
+                    "diag-inbound-drop: a host connection could not be bridged into the guest"
+                );
                 continue;
             };
             self.ports_claimed_by_inbound_flows.insert(local_port);
@@ -374,6 +385,30 @@ impl GatewayState {
         // A second poll to flush any smoltcp-side sends queued up by the pumps above.
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.diag_gateway_state();
+    }
+
+    /// The gateway's own table occupancy, every 256th `drive()`.
+    ///
+    /// A published port that stops serving while the guest's own loopback connect to it still
+    /// answers has to be gateway-side bookkeeping (a flow never reaped, a claim never released, a
+    /// socket never removed), which no guest-side per-port diagnostic can see. `claimed_ports`
+    /// climbing across ticks is the one that eventually fails every new host connection.
+    fn diag_gateway_state(&self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) % 256 != 0 {
+            return;
+        }
+        litebox_util_log::warn!(
+            flows = self.tcp_flows.len(),
+            sockets = self.sockets.iter().count(),
+            listeners = self.tcp_listeners.len(),
+            claimed_ports = self.ports_claimed_by_inbound_flows.len(),
+            inbound_ports = self.inbound_flow_ports.len(),
+            udp_flows = self.udp_flows.len();
+            "diag-gateway-state: gateway flow and socket occupancy"
+        );
     }
 
     /// Begin proxying a freshly-accepted TCP connection: the socket's local endpoint is the real
@@ -708,12 +743,42 @@ fn spawn_publish_listener(
                 if real.set_nonblocking(true).is_err() {
                     continue;
                 }
+                // Bound as a local: the log macro takes a `&str` field, not an owned `String`.
+                let peer = format_peer(&real);
+                litebox_util_log::debug!(
+                    host_port = host_port,
+                    guest_port = guest_port,
+                    peer:% = peer.as_str();
+                    "diag-inbound-accept: a host connection on a published port was accepted"
+                );
                 if tx.send(InboundConnection { real, guest_port }).is_err() {
+                    // The gateway thread owns the receiver, so if it is gone this port is over for
+                    // the run -- and a host peer then sees it refuse or hang with nothing in the
+                    // log to tell that apart from a guest that stopped answering.
+                    litebox_util_log::warn!(
+                        host_port = host_port,
+                        guest_port = guest_port;
+                        "diag-inbound-listener: the gateway is gone, this published port stops accepting"
+                    );
                     return;
                 }
             }
+            litebox_util_log::warn!(
+                host_port = host_port,
+                guest_port = guest_port;
+                "diag-inbound-listener: the accept loop ended, this published port stops accepting"
+            );
         })?;
     Ok(())
+}
+
+/// The peer address of an accepted host socket, or `-` when it cannot be read (a socket closed
+/// by its peer between accept and here). Diagnostic-only.
+fn format_peer(real: &std::net::TcpStream) -> String {
+    match real.peer_addr() {
+        Ok(a) => a.to_string(),
+        Err(_) => String::from("-"),
+    }
 }
 
 /// Create a `smoltcp` socket that *connects to* the guest (rather than listening for it), to
@@ -955,33 +1020,27 @@ pub(crate) fn send_ip_packet(
 ) -> Result<(), litebox::platform::SendError> {
     diag_pkt("tx", packet);
     let gw = gateway(slot);
-    let targets_guest_loopback = packet_targets_guest_loopback(packet);
+    // A guest packet to 127.0.0.0/8 or to GUEST_IP_ADDR never reaches this hook: `phy::TxToken::
+    // consume` diverts it into the guest's own in-process loopback queue (`is_local_ipv4`, the
+    // predicate `packet_targets_guest_loopback` recomputed here) and never calls the platform. So
+    // the arm that used to live here -- pushing into `to_guest`, the RECEIVE queue, from the SEND
+    // hook -- was dead, and its `diag_loop("sent", ..)` could never fire: chrF21 logged 68
+    // refusals on 8081 and not one line from it. Guest-to-guest traffic is instrumented in
+    // `litebox/src/net/phy.rs`, on the queue it actually crosses.
     let mut queue = gw.queue.lock().unwrap();
-    if targets_guest_loopback {
-        // Nothing is listening on a real Windows `127.0.0.1` socket on the guest's behalf -- the
-        // guest's own listener lives in this process's smoltcp stack -- so loop the packet
-        // straight back, exactly as a real kernel's loopback device would.
-        diag_loop("sent", packet);
-        queue.to_guest.push_back(packet.to_vec());
-        drop(queue);
-        gw.notify.notify_all();
-    } else {
-        queue.to_gateway.push_back(packet.to_vec());
-    }
+    queue.to_gateway.push_back(packet.to_vec());
     Ok(())
 }
 
-/// Every looped-back TCP handshake packet, unthrottled at `debug`.
+/// Every TCP handshake packet the GATEWAY hands the guest, unthrottled at `debug`.
 ///
-/// `diag_pkt` samples 1/512 of the wire, far too coarse to answer "did this SYN reach the stack at
-/// all" -- and a guest's packet to `127.0.0.1` or to `GUEST_IP_ADDR` never reaches the wire anyway,
-/// because `send_ip_packet` loops it straight back into `to_guest`. So the SYN a guest probe sent
-/// and whatever the stack answered are both invisible there, which is how a port that per-port
-/// state calls healthy (`slots=8 listening=8 pending=0`) can still refuse every connect: either the
-/// SYN never got delivered, or it was answered with an RST. Handshake packets are rare enough to
-/// log every one, and `sent` with no answering `SA` -- or with an `R` -- names that at the wire
-/// (chrF20: 8081 refused four HOLD ticks in a row with no line anywhere).
-fn diag_loop(dir: &'static str, packet: &[u8]) {
+/// `diag_pkt` samples 1/512 of the wire, too coarse for "did this SYN reach the stack at all".
+/// What this sees is everything arriving from OUTSIDE the guest: an inbound published-port flow's
+/// SYN, the RST or SA answering it, and replies to guest-initiated connections. A guest's OWN
+/// packet to 127.0.0.1 or GUEST_IP_ADDR never reaches this path: `phy::TxToken::consume` loops it
+/// in-process and logs it under `diag-loop` there. Renamed from `diag-loop`: sharing a name mixed a
+/// guest-to-guest queue with a gateway-to-guest one and no line said which path it came from.
+fn diag_loop_inbound(dir: &'static str, packet: &[u8]) {
     let Ok(ip) = Ipv4Packet::new_checked(packet) else {
         return;
     };
@@ -1003,14 +1062,8 @@ fn diag_loop(dir: &'static str, packet: &[u8]) {
             if t.rst() { "R" } else { "" },
             if t.fin() { "F" } else { "" }
         );
-        "diag-loop: TCP handshake packet on the loopback path"
+        "diag-loop-inbound: TCP handshake packet from the gateway to the guest"
     );
-}
-
-/// Whether `packet` is addressed to `127.0.0.0/8` or back to the guest's own interface address.
-fn packet_targets_guest_loopback(packet: &[u8]) -> bool {
-    Ipv4Packet::new_checked(packet)
-        .is_ok_and(|p| p.dst_addr().is_loopback() || p.dst_addr() == GUEST_IP_ADDR)
 }
 
 /// Attempt to receive a raw IP packet (originating from the NAT gateway, e.g. a proxied TCP/UDP
@@ -1027,7 +1080,7 @@ pub(crate) fn receive_ip_packet(
     let n = data.len().min(packet.len());
     packet[..n].copy_from_slice(&data[..n]);
     diag_pkt("rx", &packet[..n]);
-    diag_loop("delivered", &packet[..n]);
+    diag_loop_inbound("delivered", &packet[..n]);
     Ok(n)
 }
 
