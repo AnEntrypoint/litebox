@@ -112,6 +112,13 @@ pub(crate) const MAX_SOCKETS: usize = 256;
 /// behavior rather than to anything worse.
 const LISTEN_QUEUE_SLOTS: usize = 64;
 
+/// How many host pids one listening port's shared queue records as referents to it. One for the
+/// `listen()` that armed the port plus one per `fork_adopt` carry; the row is retired once NONE of
+/// them is a live process, which is what makes a close by one referent unable to take the port away
+/// from the others. Full is not fatal: an unrecorded referent only forfeits its own vote, and the
+/// row then behaves as `refs` alone decides (the last close retires it).
+const MAX_QUEUE_REF_OWNERS: usize = 8;
+
 /// How many backlog slots one listening port's shared queue can hold; a `listen(2)` backlog larger
 /// than this is capped, the way Linux caps one at `somaxconn`. 13 listening ports measured 104
 /// armed slots between them on a desktop run -- 8 each against a 256-socket table -- so 16 each is
@@ -514,6 +521,11 @@ struct ListenQueue {
     /// `listen()` that created it plus one per `fork_adopt` carry. Only the last one to close (or
     /// the creator itself) retires the armed sockets.
     refs: u16,
+    /// WHO those referents are. The retire decision reads this, not `refs`: a port stays armed
+    /// while any referent is a LIVE process, so the creator closing its own descriptor leaves the
+    /// port up for the fork child that inherited it (what Linux's per-fd refcount does), and a
+    /// child's close leaves it up for a creator that is still alive. `0` marks a slot free.
+    ref_pids: [u32; MAX_QUEUE_REF_OWNERS],
     /// The `listen(2)` backlog, capped at [`MAX_BACKLOG_SLOTS`].
     backlog: u16,
     /// The pid that called `listen()`, kept so a surviving referent can tell whether the process
@@ -535,6 +547,7 @@ impl ListenQueue {
             port: 0,
         },
         refs: 0,
+        ref_pids: [0; MAX_QUEUE_REF_OWNERS],
         backlog: 0,
         owner_pid: 0,
         no_slot_listening_reported: false,
@@ -543,6 +556,33 @@ impl ListenQueue {
 
     fn live_handles(&self) -> usize {
         self.handles.iter().flatten().count()
+    }
+
+    /// Names `pid` a referent of this port. A pid already named is not named twice -- the same
+    /// process can hold several descriptors to one listening socket (each `listen()` on it, each
+    /// carried copy), and the question the retire decision asks is only "does this port still have
+    /// a live referent", not "how many descriptors does that referent hold".
+    fn record_referent(&mut self, pid: u32) {
+        if pid == 0 || self.ref_pids.contains(&pid) {
+            return;
+        }
+        if let Some(slot) = self.ref_pids.iter_mut().find(|slot| **slot == 0) {
+            *slot = pid;
+        }
+    }
+
+    fn drop_referent(&mut self, pid: u32) {
+        for slot in self.ref_pids.iter_mut() {
+            if *slot == pid {
+                *slot = 0;
+            }
+        }
+    }
+
+    /// The referent pids this row still records, copied out so the caller can test each one's
+    /// liveness without holding a borrow of the row (liveness needs `&self`, the row is `&mut`).
+    fn referent_pids(&self) -> [u32; MAX_QUEUE_REF_OWNERS] {
+        self.ref_pids
     }
 
     /// Records a `listen(2)` backlog, capped to what one row can hold -- the way Linux caps a
@@ -1347,10 +1387,12 @@ where
         backlog: u16,
     ) -> Option<usize> {
         let port = ip_listen_endpoint.port;
+        let me = self.litebox.platform().current_pid();
         if let Some(index) = self.listen_queue_index(port) {
             let queue = &mut self.listen_queues[index];
             queue.set_backlog(backlog);
             queue.refs = queue.refs.saturating_add(1);
+            queue.record_referent(me);
             return Some(index);
         }
         let index = self
@@ -1362,37 +1404,100 @@ where
         queue.refs = 1;
         queue.set_backlog(backlog);
         queue.no_slot_listening_reported = false;
+        queue.ref_pids = [0; MAX_QUEUE_REF_OWNERS];
+        queue.record_referent(me);
         queue.owner_pid = self.litebox.platform().current_pid();
+        litebox_util_log::warn!(
+            port = port,
+            owner = queue.owner_pid,
+            backlog = backlog,
+            index = index;
+            "diag-listener: this process armed a listening port's shared accept queue"
+        );
         Some(index)
     }
 
-    /// Retires the shared queue of `port` once the last descriptor referent to name it closes.
+    /// Spends this process's referent of the shared queue of `port`, retiring the port once no
+    /// LIVE referent names it any more.
     ///
-    /// The creator closing it retires it outright, matching the pre-existing behavior: a fork child
-    /// that inherited the port has no slots of its own to release, so before this existed the
-    /// parent's close was the only thing that ever took a listening port's sockets down at all.
-    /// A borrower's close retires the queue only when the creator is GONE -- otherwise the creator
-    /// is still the one servicing the port and its queue must stay armed.
+    /// The retirement used to be "the last `refs`, or the creator itself, or the creator is gone".
+    /// Both of the last two are wrong, and each can take a port away from a process that is still
+    /// serving it: `me == owner_pid` retires the port when the CREATOR closes its own descriptor
+    /// even though a fork child inherited the very same listening socket and is the one running the
+    /// accept loop (Linux keeps the port up: the child's descriptor is its own referent), and
+    /// `owner_is_gone` retires it on a child's close merely because the creator died first, even
+    /// though that child is alive and is now the only thing servicing the port. A listening port
+    /// belongs to every live referent, so the only correct question is whether any referent is
+    /// still alive.
     fn release_listen_queue(&mut self, port: u16) {
         let Some(index) = self.listen_queue_index(port) else {
             return;
         };
         let me = self.litebox.platform().current_pid();
+        // `LITEBOX_LISTEN_QUEUE_LEGACY_RETIRE=1` restores the old three-ground rule, so one binary
+        // can be run both ways over the same probe.
+        let legacy = self
+            .litebox
+            .platform()
+            .env_flag("LITEBOX_LISTEN_QUEUE_LEGACY_RETIRE");
         let owner_is_gone = {
             let owner = self.listen_queues[index].owner_pid;
             owner != 0 && !self.litebox.platform().is_process_alive(owner)
         };
         let queue = &mut self.listen_queues[index];
-        let retire = queue.refs <= 1 || me == queue.owner_pid || owner_is_gone;
+        // WHY a port's shared queue was or was not retired on this close. `diag-port` can only say
+        // that a port was armed and then stopped being mentioned at all; the retirement itself was
+        // invisible, so a port that went deaf while its server stayed alive and healthy (chrF35:
+        // 8081 at `slots=8 listening=8` uptime 74 s, then gone from `diag-port` for good) left no
+        // record of WHO closed it or on what grounds. `legacy_retire` is what the old three-ground
+        // rule would have answered, so a log can show the two rules disagreeing.
+        let refs_before = queue.refs;
+        let slots_before = queue.live_handles();
         queue.refs = queue.refs.saturating_sub(1);
+        queue.drop_referent(me);
+        let owner = queue.owner_pid;
+        let remaining = queue.referent_pids();
+        let legacy_retire = refs_before <= 1 || me == owner || owner_is_gone;
+        let live = remaining
+            .iter()
+            .filter(|pid| **pid != 0 && (**pid == me || self.litebox.platform().is_process_alive(**pid)))
+            .count();
+        // Both signals must agree. `live == 0` alone would retire a port the closing process itself
+        // still holds another descriptor to (one pid, two referents -- a second `listen()` on the
+        // same socket, or an inherited copy carried back into the same process); `refs == 0` alone
+        // is the old rule, which cannot tell a live referent from a leaked one.
+        let retire = if legacy {
+            legacy_retire
+        } else {
+            live == 0 && queue.refs == 0
+        };
+        litebox_util_log::warn!(
+            port = port,
+            refs = refs_before,
+            me = me,
+            owner = owner,
+            owner_is_gone = owner_is_gone,
+            live = live,
+            retire = retire,
+            legacy_retire = legacy_retire,
+            slots = slots_before;
+            "diag-listener: close of a descriptor referent to this listening port's shared accept queue"
+        );
         if !retire {
             return;
         }
+        self.retire_listen_queue(index);
+    }
+
+    /// Tears down one listening port's armed backlog and frees its shared queue row.
+    fn retire_listen_queue(&mut self, index: usize) {
+        let queue = &mut self.listen_queues[index];
         let handles = core::mem::replace(&mut queue.handles, [None; MAX_BACKLOG_SLOTS]);
         queue.ip_listen_endpoint.port = 0;
         queue.backlog = 0;
         queue.owner_pid = 0;
         queue.refs = 0;
+        queue.ref_pids = [0; MAX_QUEUE_REF_OWNERS];
         queue.no_slot_listening_reported = false;
         for handle in handles.into_iter().flatten() {
             // Stale-handle guard: a dead-holder `reset_after_poisoning()` elsewhere may have wiped
@@ -1733,6 +1838,51 @@ where
         }
     }
 
+    /// Retires the rows no LIVE referent names any more.
+    ///
+    /// A referent that dies without closing (a killed process runs no `close`) never spends its
+    /// `refs`, so its row would stay armed forever -- and an armed row is up to `backlog` smoltcp
+    /// sockets held for a port nobody will ever accept on, out of `MAX_SOCKETS` 256 for the whole
+    /// session. Checking liveness per pid is a syscall, so this runs once every 512 ticks rather
+    /// than on every tick in every process.
+    fn reclaim_orphaned_listen_queues(&mut self) {
+        static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+            return;
+        }
+        let me = self.litebox.platform().current_pid();
+        if self
+            .litebox
+            .platform()
+            .env_flag("LITEBOX_LISTEN_QUEUE_LEGACY_RETIRE")
+        {
+            return;
+        }
+        for index in 0..LISTEN_QUEUE_SLOTS {
+            let port = self.listen_queues[index].ip_listen_endpoint.port;
+            if port == 0 {
+                continue;
+            }
+            let remaining = self.listen_queues[index].referent_pids();
+            let live = remaining
+                .iter()
+                .filter(|pid| {
+                    **pid != 0 && (**pid == me || self.litebox.platform().is_process_alive(**pid))
+                })
+                .count();
+            if live > 0 {
+                continue;
+            }
+            litebox_util_log::warn!(
+                port = port,
+                index = index,
+                owner = self.listen_queues[index].owner_pid;
+                "diag-listener: no live referent names this listening port any more; retiring its shared accept queue"
+            );
+            self.retire_listen_queue(index);
+        }
+    }
+
     /// Keep EVERY listening port's backlog armed, whatever took a slot away -- over the shared
     /// [`Network::listen_queues`] rows, with no descriptor table involved, so that no port's
     /// survival depends on any one process reaching its own listening descriptor on a given tick.
@@ -1750,6 +1900,7 @@ where
     /// tick over a socket set shared across the fork family, and dropping a socket another process
     /// allocated runs its ring buffers through the wrong heap (see `remove_dead_sockets`).
     fn maintain_listening_queues(&mut self) {
+        self.reclaim_orphaned_listen_queues();
         for index in 0..LISTEN_QUEUE_SLOTS {
             if self.listen_queues[index].ip_listen_endpoint.port == 0 {
                 continue;
