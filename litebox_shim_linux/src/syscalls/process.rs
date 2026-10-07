@@ -4262,8 +4262,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         // `.1` is the program break -- the same pair the child's own adoption compares against.
         let heap_top = pm.tracked_region_summary().1;
+        // `madvise(MADV_DONTFORK)`: a range carrying `VM_DONT_FORK` is withheld from the child, so
+        // the child adopts NO VMA for it and has a genuine HOLE there -- a later `mmap` may claim
+        // it, and touching it before that faults, exactly as on real Linux. `Vmem::duplicate`
+        // already does this for the in-process fork path; without it here the advice was a silent
+        // no-op on the production cross-process fork and the child simply got a full copy (madvx1,
+        // 2026-10-07: `dontfork` read exactly like `baseline` -- `child_code=0` where `3` was
+        // required, with the `invalid` guard correctly returning `rc=-1 errno=12`).
+        let withheld_from_child = |flags: u32| {
+            litebox::mm::linux::VmFlags::from_bits_truncate(flags)
+                .contains(litebox::mm::linux::VmFlags::VM_DONT_FORK)
+        };
         let ranges: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = layout
             .iter()
+            .filter(|(_, flags, _)| !withheld_from_child(*flags))
             .map(|(range, _, _)| (range.clone(), range.start))
             .collect();
 
@@ -4295,6 +4307,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut sorted: alloc::vec::Vec<_> = layout
             .iter()
             .filter(|(_, f, _)| {
+                // The bytes are withheld too, not just the VMA: copying them into a range the
+                // child can never map would be pure cost today and stale data tomorrow.
+                if withheld_from_child(*f) {
+                    return false;
+                }
                 let f = litebox::mm::linux::VmFlags::from_bits_truncate(*f);
                 // `VM_OWN_FORK_PADDING` qualifies even though it carries no access bit: such a
                 // range is this process's OWN, genuinely committed host memory (see that flag's
