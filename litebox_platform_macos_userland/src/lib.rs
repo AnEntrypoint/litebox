@@ -1312,7 +1312,6 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
         thread.interrupt();
     }
 
-    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         ThreadHandle::run_with_handle(f)
     }

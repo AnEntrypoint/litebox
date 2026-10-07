@@ -3250,7 +3250,7 @@ mod tests {
         UserPtr, UserPtrMut,
         syscalls::{
             net::{CSockInetAddr, CSockNetlinkAddr, read_sockaddr_from_user},
-            tests::init_platform,
+            tests::{init_platform, init_tun_platform},
         },
     };
 
@@ -3580,7 +3580,11 @@ mod tests {
     }
 
     fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         test_tcp_socket_as_server(
             &task,
             TUN_IP_ADDR,
@@ -3600,7 +3604,11 @@ mod tests {
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         test_tcp_socket_as_server(
             &task,
             TUN_IP_ADDR,
@@ -3646,7 +3654,11 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_connection_refused() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         let socket_fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -3675,7 +3687,11 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_socket_as_client() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
 
         let child_handle = std::thread::spawn(|| {
             std::process::Command::new("nc")
@@ -3885,21 +3901,33 @@ mod tests {
 
     #[test]
     fn test_tun_blocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
         blocking_udp_server_socket(&task, false, false, false, "recvmsg");
     }
 
     #[test]
     fn test_tun_nonblocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
         blocking_udp_server_socket(&task, false, false, true, "recvmsg");
     }
 
     #[test]
     fn test_tun_blocking_udp_server_socket_with_truncation() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
         blocking_udp_server_socket(&task, true, true, false, "recvmsg");
         blocking_udp_server_socket(&task, true, false, false, "recvmsg");
@@ -3909,7 +3937,11 @@ mod tests {
     fn test_tun_udp_client_socket_without_server() {
         // We do not support loopback yet, so this test only checks that
         // the client can send packets without a server.
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
 
         // Client socket and explicit bind
         let client_fd = task
@@ -3958,7 +3990,11 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_sockopt() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -4125,7 +4161,11 @@ mod tests {
     #[ignore = "timeout is 75s"]
     #[test]
     fn test_tun_tcp_so_error_network_unreachable() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        // A host without a usable TUN device is a missing capability, not a shim defect, so the
+        // TUN-backed tests report as skipped there instead of failing (see `init_tun_platform`).
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");

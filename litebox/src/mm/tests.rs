@@ -180,26 +180,31 @@ fn test_vmm_mapping() {
         }
         .is_ok()
     );
-    // Grown, and deliberately NOT merged:
-    // [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
+    // Grown, with the growth folded into the ALLOCATION's own entry:
+    // [(0x1_0000, 0x1_4000), (0x1_4000, 0x1_c000)]
     //
-    // This expected one coalesced entry, which is what `rangemap` does for touching ranges whose
-    // values compare equal. `VmArea`'s `PartialEq` deliberately makes two PRIVATE areas never
-    // equal, so they never coalesce -- see that impl's own comment for the live failure that
-    // forced it: a tracked VMA's extent was observed growing from 0.93 MB to 5.44 MB with no
-    // corresponding guest operation, and a later `mprotect`/`munmap` walk that should have touched
-    // one fragment applied across the whole merged span, reaching into memory the guest never
-    // asked about. A private `VmArea` carries no field identifying which real allocation it is, so
-    // keeping every one as its own entry is the only safe option.
+    // `resize_mapping` maps the delta and then re-inserts `tail_start..new_end` for the same
+    // `VmArea` (the `shared_handle.is_none() && !is_file_backed()` arm in `mm/linux.rs`), so the
+    // grown mapping is ONE entry again -- it is one allocation, and recording it as two touching
+    // fragments would only invite the split/merge bookkeeping to disagree later.
     //
-    // The expectation here simply outlived that fix -- and the test already contradicted itself:
-    // the assertion a few dozen lines below, after `protect_mapping`, expects exactly these three
-    // separate entries.
+    // It is still NOT merged with the mapping above it: that is the separate rule this test's old
+    // three-entry expectation was really about, and it still holds. `VmArea`'s `PartialEq`
+    // deliberately makes two PRIVATE areas never equal, so they never coalesce -- see that impl's
+    // own comment for the live failure that forced it: a tracked VMA's extent was observed growing
+    // from 0.93 MB to 5.44 MB with no corresponding guest operation, and a later
+    // `mprotect`/`munmap` walk that should have touched one fragment applied across the whole
+    // merged span, reaching into memory the guest never asked about. A private `VmArea` carries no
+    // field identifying which real allocation it is, so keeping every one as its own entry is the
+    // only safe option.
+    //
+    // The three-entry expectation below predates the growth-fold above; the assertion after
+    // `protect_mapping` (which splits this entry back at 0x1_2000) expects the same three ranges
+    // and passes either way, so it never contradicted this one -- this one is simply stale.
     assert_eq!(
         collect_mappings(&vmm),
         vec![
-            start_addr..start_addr + 2 * PAGE_SIZE,
-            start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
+            start_addr..start_addr + 4 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
         ]
     );
@@ -212,7 +217,7 @@ fn test_vmm_mapping() {
                 "test",
             )
         },
-        // Failed to protect, remain [(0x1_0000, 0x1_c000)]
+        // Failed to protect, remain [(0x1_0000, 0x1_4000), (0x1_4000, 0x1_c000)]
         Err(VmemProtectError::NoAccess { .. })
     ));
 

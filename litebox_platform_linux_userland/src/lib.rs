@@ -2059,7 +2059,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
-    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
@@ -2195,19 +2194,155 @@ impl litebox::platform::TimerHandle for TimerHandle {
     }
 }
 
+/// One [`litebox::platform::SharedKernelStateProvider::shared_kernel_arena_alloc_bytes`]
+/// allocation, remembered so it can be handed out again once the kernel state that owns it is
+/// gone.
+///
+/// The address is a plain `usize`, not a `NonNull`/raw pointer: the handle that carries these is
+/// shared between threads by design (`GlobalStateHandle` is cloned into every task and into pump
+/// threads), and a pointer field would make it `!Send + !Sync`.
+#[derive(Clone, Copy)]
+struct ArenaBlock {
+    addr: usize,
+    layout: core::alloc::Layout,
+}
+
+impl ArenaBlock {
+    fn matches(&self, layout: core::alloc::Layout) -> bool {
+        self.layout.size() == layout.size() && self.layout.align() == layout.align()
+    }
+}
+
+// Blocks allocated on this thread since the last `create_shared_kernel_state`, i.e. the blocks
+// belonging to the kernel state whose `GlobalState` literal is (or was just) evaluated.
+//
+// Every call site of `shared_kernel_arena_alloc_bytes` is a fixed-capacity table constructed
+// inside `LinuxShimBuilder::build`'s `GlobalState { .. }` literal, so by the time
+// `create_shared_kernel_state` is entered the whole set for that state is here.
+std::thread_local! {
+    static PENDING_ARENA_BLOCKS: std::cell::RefCell<alloc::vec::Vec<ArenaBlock>> =
+        const { std::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+// Blocks whose owning kernel state is gone, offered to the next one that needs this size.
+static ARENA_POOL: std::sync::Mutex<alloc::vec::Vec<ArenaBlock>> =
+    std::sync::Mutex::new(alloc::vec::Vec::new());
+
+fn take_pending_arena_blocks() -> alloc::vec::Vec<ArenaBlock> {
+    PENDING_ARENA_BLOCKS
+        .try_with(|cell| core::mem::take(&mut *cell.borrow_mut()))
+        .unwrap_or_default()
+}
+
+fn return_arena_blocks_to_pool(blocks: &mut alloc::vec::Vec<ArenaBlock>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Ok(mut pool) = ARENA_POOL.lock() {
+        pool.extend(blocks.drain(..));
+    }
+}
+
+fn take_recycled_arena_block(layout: core::alloc::Layout) -> Option<ArenaBlock> {
+    let mut pool = ARENA_POOL.lock().ok()?;
+    let idx = pool.iter().position(|b| b.matches(layout))?;
+    let block = pool.swap_remove(idx);
+    drop(pool);
+    // SAFETY: `block.addr` is a live `alloc_zeroed` allocation of exactly `block.layout` that was
+    // never deallocated, and it is back here only because the kernel state that owned it -- and
+    // so every `&'static` reference into it -- has already been dropped.
+    unsafe { core::ptr::write_bytes(block.addr as *mut u8, 0, layout.size()) };
+    Some(block)
+}
+
+/// [`SharedKernelStateProvider::Handle`](litebox::platform::SharedKernelStateProvider::Handle)
+/// for Linux: the state itself, plus the arena blocks that were allocated to build it.
+///
+/// Real Linux shares nothing cross-process (see `create_shared_kernel_state` below), so unlike a
+/// genuinely shared arena these blocks are ordinary heap memory -- and nothing ever returned
+/// them. One `build()` costs ~47.9 MiB of them (a 28.9 MiB `SharedUnixConnTable` plus the 16 MiB
+/// socket data pool), so anything that builds more than one kernel state per process grew without
+/// bound: the shim's own unit-test binary builds one per test and was using ~5.2 GiB against a
+/// ~5.5 GiB container, close enough to the OOM killer to be SIGKILLed partway through a run.
+pub struct ReclaimableHandle<T>(std::sync::Arc<HandleInner<T>>);
+
+struct HandleInner<T> {
+    /// `None` only for the instant inside `Drop::drop` between taking the value and returning the
+    /// blocks.
+    value: Option<T>,
+    arena: alloc::vec::Vec<ArenaBlock>,
+}
+
+impl<T> Drop for HandleInner<T> {
+    fn drop(&mut self) {
+        // Drop the state FIRST: its fields hold `&'static` references into `arena`, and handing a
+        // block to another kernel state is only sound once every one of those is gone.
+        drop(self.value.take());
+        return_arena_blocks_to_pool(&mut self.arena);
+    }
+}
+
+impl<T> Clone for ReclaimableHandle<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> core::ops::Deref for ReclaimableHandle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // Unreachable: `None` exists only inside `HandleInner::drop`, after which no handle is
+        // left to deref.
+        self.0
+            .value
+            .as_ref()
+            .expect("kernel state taken while a handle to it is still live")
+    }
+}
+
 /// Real Linux `fork()` already gives every guest process an automatic, correct, isolated COPY of
 /// the parent's whole address space (see [`litebox::platform::SharedKernelStateProvider`]'s own
 /// doc comment) -- so this is the trivial, always-correct "construct fresh" default: an ordinary
 /// `Arc::new`, identical to what every call site did before this trait existed.
+///
+/// The one Linux-specific addition is [`ReclaimableHandle`]: since nothing is really shared here,
+/// the arena blocks a state was built from can go back into [`ARENA_POOL`] when it dies.
 impl litebox::platform::SharedKernelStateProvider for LinuxUserland {
-    type Handle<T: Send + Sync + 'static> = std::sync::Arc<T>;
+    type Handle<T: Send + Sync + 'static> = ReclaimableHandle<T>;
 
     fn create_shared_kernel_state<T: Send + Sync + 'static>(
         &self,
         _slot: litebox::platform::SharedKernelStateSlot,
         value: T,
     ) -> Self::Handle<T> {
-        std::sync::Arc::new(value)
+        ReclaimableHandle(std::sync::Arc::new(HandleInner {
+            value: Some(value),
+            arena: take_pending_arena_blocks(),
+        }))
+    }
+
+    fn shared_kernel_arena_alloc_bytes(
+        &self,
+        layout: core::alloc::Layout,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        let addr = match take_recycled_arena_block(layout) {
+            Some(block) => block.addr,
+            None => {
+                // SAFETY: `layout` is non-zero-sized by this method's own contract, as in the
+                // default implementation. Zeroed, not merely allocated, so a recycled block and a
+                // fresh one are indistinguishable to a caller.
+                let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                if ptr.is_null() {
+                    return None;
+                }
+                ptr as usize
+            }
+        };
+        let _ = PENDING_ARENA_BLOCKS.try_with(|cell| {
+            cell.borrow_mut().push(ArenaBlock { addr, layout });
+        });
+        core::ptr::NonNull::new(addr as *mut u8)
     }
 }
 
@@ -4740,7 +4875,6 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
     use litebox::platform::RawMutex;
@@ -4752,9 +4886,11 @@ mod tests {
 
     #[test]
     fn test_raw_mutex() {
-        let mutex = std::sync::Arc::new(super::RawMutex {
-            inner: AtomicU32::new(0),
-        });
+        // `RawMutex::new()`, not a struct literal: the type gained an `owner` field (the holder's
+        // thread token, used to reopen a mutex whose holder died mid-critical-section) and a
+        // literal listing only `inner` no longer compiles -- `new` initializes every field, so a
+        // later field cannot break this test again.
+        let mutex = std::sync::Arc::new(super::RawMutex::new());
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {

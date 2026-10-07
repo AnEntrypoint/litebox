@@ -87,7 +87,10 @@ pub trait ThreadProvider: RawPointerProvider {
     ///
     /// The default implementation simply calls `f()` with no additional setup.
     /// Platforms that require explicit thread registration should override this.
-    #[cfg(debug_assertions)]
+    ///
+    /// Deliberately NOT gated on `debug_assertions`: it is what `cfg(test)` code in the shim
+    /// crates calls, and a test build is not necessarily a debug build -- gating it made
+    /// `cargo test --release` fail to compile at every call site.
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
     }

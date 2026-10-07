@@ -299,6 +299,23 @@ impl ArchSpecificProvider for MockPlatform {
     }
 }
 
+// `Network`'s methods are bounded on this, so the crate's own `net` tests cannot even name
+// `Network::new` without it. Only the two methods with no default are implemented: every other
+// one keeps its default, which is exactly what `LinuxUserland` does (it overrides only
+// `get_syscall_entry_point`/`memory_info_kb`/`env_flag`/`env_value`/`get_vdso_address`), so a
+// mock-platform test exercises the same code paths as the real Linux platform rather than a
+// mock-only variant. In particular `current_pid()` stays `0` ("unknown", callers decline to act)
+// and `is_process_alive()` stays `true`.
+impl SystemInfoProvider for MockPlatform {
+    fn get_syscall_entry_point(&self) -> usize {
+        0
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
+        None
+    }
+}
+
 impl RawPointerProvider for MockPlatform {
     type RawConstPointer<T: zerocopy::FromBytes> = super::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> =

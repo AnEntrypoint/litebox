@@ -2187,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn master_close_surfaces_epipe_on_slave_write() {
+    fn master_close_surfaces_eio_on_slave_write() {
         let task = crate::syscalls::tests::init_platform(None);
         let (master, slave) = open_unlocked_pty_pair(&task);
 
@@ -2196,9 +2196,15 @@ mod tests {
         // The slave fd itself is a genuinely separate fd-table entry and stays open, but with no
         // master left to ever read them, writes to it must fail immediately rather than block
         // forever waiting for buffer space a reader will never free up.
+        //
+        // The errno is `EIO`, not `EPIPE`: that is what real Linux returns here, verified against
+        // the host (`os.openpty()`, close the master, `os.write(slave, b"x")` -> EIO; the
+        // matching read is EOF, not an error). `try_write_side`'s `master_gone` arm is the code
+        // that produces it, and `EPIPE` stays reserved for a ring that was explicitly shut down
+        // (`SharedByteRing::is_shutdown`), which is a different event.
         assert_eq!(
             task.sys_write(slave, b"anyone listening?", None),
-            Err(Errno::EPIPE)
+            Err(Errno::EIO)
         );
     }
 }

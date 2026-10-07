@@ -154,7 +154,7 @@ mod tests {
     use litebox::fs::nine_p;
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
-    use crate::syscalls::tests::init_platform;
+    use crate::syscalls::tests::{host_program_available, init_tun_platform};
 
     use super::*;
 
@@ -296,7 +296,15 @@ mod tests {
 
     #[test]
     fn test_tun_nine_p_create_and_read_file() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
+        // These tests drive a REAL `diod` over the TUN link, so it is a host dependency, not
+        // something the shim can supply -- skip where it is not installed (`apt install diod`).
+        if !host_program_available("diod") {
+            std::eprintln!("SKIPPED: `diod` is not installed on this host");
+            return;
+        };
 
         let server = DiodServer::start();
         let fs = connect_9p(&task, &server);
@@ -330,7 +338,15 @@ mod tests {
 
     #[test]
     fn test_tun_nine_p_host_files_visible() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let Some(task) = init_tun_platform(TUN_DEVICE_NAME) else {
+            return;
+        };
+        // These tests drive a REAL `diod` over the TUN link, so it is a host dependency, not
+        // something the shim can supply -- skip where it is not installed (`apt install diod`).
+        if !host_program_available("diod") {
+            std::eprintln!("SKIPPED: `diod` is not installed on this host");
+            return;
+        };
 
         let server = DiodServer::start();
 

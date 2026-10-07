@@ -11028,7 +11028,9 @@ mod tests {
         task.sys_chdir("/test_chdir_dir").unwrap();
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/test_chdir_dir/");
+        // Real Linux has no trailing slash here -- verified against the host: `os.getcwd()` after
+        // `chdir("/tmp/x/y")` is "/tmp/x/y", and only the root directory itself reads as "/".
+        assert_eq!(cwd, "/test_chdir_dir");
 
         // chdir to nonexistent path → ENOENT.
         assert_eq!(
@@ -11076,13 +11078,15 @@ mod tests {
         let mut buf = [0u8; 256];
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/rel_parent/rel_child/");
+        // No trailing slash -- see `getcwd_and_chdir`'s own "Real Linux has no trailing slash"
+        // note, verified against the host the same way.
+        assert_eq!(cwd, "/rel_parent/rel_child");
 
-        // chdir("..") should normalize back to /rel_parent/.
+        // chdir("..") should normalize back to /rel_parent.
         task.sys_chdir("..").unwrap();
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/rel_parent/");
+        assert_eq!(cwd, "/rel_parent");
     }
 
     #[test]

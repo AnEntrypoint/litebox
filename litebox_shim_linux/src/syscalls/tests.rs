@@ -40,6 +40,81 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
     })
 }
 
+/// Stack size for the thread that runs [`crate::LinuxShimBuilder::build`].
+///
+/// `build` constructs `GlobalState` **by value on the stack** -- 796,024 bytes on x86-64, plus a
+/// temporary each for its largest fields (`shared_file_spill` 221 KiB, `sysv_shm` 196 KiB, `net`
+/// 178 KiB, `shared_pty` 89 KiB) in an unoptimized build, so a little over 1.5 MiB of live stack
+/// at its peak. libtest gives every test thread a 2 MiB stack by default, which is *below* that
+/// once the harness's own frames are counted: the first test to reach `build` aborted the whole
+/// process with `fatal runtime error: stack overflow`, discarding every other test's result and
+/// leaving nothing but a thread name as a diagnostic. A real runner's main thread gets 8 MiB, so
+/// run the construction there and let a genuine failure show up as a test failure.
+const BUILD_STACK_SIZE: usize = 8 << 20;
+
+/// Whether this host can actually back a TUN device.
+///
+/// `/dev/net/tun` simply does not exist in an ordinary unprivileged container, and
+/// `TestPlatform::new` panics outright (`failed to open tun device: ENOENT`) when it cannot open
+/// it. A missing host capability is not a shim defect, so tests that need one must skip rather
+/// than fail -- see [`init_tun_platform`]. This probes the device directly instead of asking
+/// `test_platform`, because that one is a process-wide `OnceLock` any earlier test may already
+/// have initialized *without* a TUN device.
+pub(crate) fn tun_device_available() -> bool {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .is_ok()
+    }
+    // Windows takes no device name at all (`TestPlatform::new()` ignores it), so there is nothing
+    // to probe and nothing to skip -- keep today's behaviour there.
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+}
+
+/// Whether `prog` is an executable file somewhere on this host's `PATH`.
+///
+/// Same reasoning as [`tun_device_available`]: a test that shells out to a host daemon (`diod`,
+/// for the 9P tests) is testing the shim, not the host's package selection, so a missing daemon
+/// is a skip rather than a failure.
+pub(crate) fn host_program_available(prog: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(prog);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&candidate).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            candidate.is_file()
+        }
+    })
+}
+
+/// [`init_platform`] for a test that needs a TUN device: `None` when this host has none, so the
+/// caller can `let Some(task) = ... else { return; }` and report as skipped.
+#[must_use]
+pub(crate) fn init_tun_platform(
+    tun_device_name: &str,
+) -> Option<crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>>> {
+    if !tun_device_available() {
+        std::eprintln!(
+            "SKIPPED: this host has no usable TUN device (`{tun_device_name}` needs /dev/net/tun)"
+        );
+        return None;
+    }
+    Some(init_platform(Some(tun_device_name)))
+}
+
 #[must_use]
 pub(crate) fn init_platform(
     tun_device_name: Option<&str>,
@@ -54,7 +129,16 @@ pub(crate) fn init_platform(
             .expect("Failed to set permissions on root");
     });
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
-    let task = shim_builder.build().0.new_test_task(fs);
+    // See `BUILD_STACK_SIZE`: `build` needs more stack than libtest's default 2 MiB gives it.
+    // Only `build` moves to the new thread -- `new_test_task` still runs here, on the thread that
+    // will use the task, so the task's `ThreadHandle` is this thread's.
+    let global = std::thread::Builder::new()
+        .stack_size(BUILD_STACK_SIZE)
+        .spawn(move || shim_builder.build().0)
+        .expect("failed to spawn the shim-build thread")
+        .join()
+        .expect("LinuxShimBuilder::build panicked");
+    let task = global.new_test_task(fs);
 
     if tun_device_name.is_some() {
         let global = task.global.clone();
