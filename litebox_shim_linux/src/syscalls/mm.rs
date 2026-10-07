@@ -64,7 +64,6 @@ pub fn set_cow_mmap_enabled(enabled: bool) {
     COW_MMAP_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the copy-on-write file-mapping fast path may be attempted.
 fn cow_mmap_enabled() -> bool {
     COW_MMAP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -622,18 +621,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Some(buf) = buf else {
                     return Err(Errno::EFAULT);
                 };
-                let size = seg.size;
+                let (key, uid, gid, mode, size, attaches) =
+                    (seg.key, seg.uid, seg.gid, seg.mode, seg.size, seg.attaches);
+                // Guest-memory writes can fault and `table` is a cross-process arena lock -- the
+                // same rule the RMID arm above and `sys_shmget`'s `ensure_sysv_shm_backing` obey:
+                // never hold it across anything that can block.
+                drop(table);
                 for i in 0..48isize {
                     let _ = buf.write_at_offset::<Platform>(i, 0u8);
                 }
                 // `struct ipc64_perm`: key, uid, gid, cuid, cgid (i32/u32 each), then mode.
                 for (off, v) in [
-                    (0isize, seg.key as u32),
-                    (4, seg.uid),
-                    (8, seg.gid),
-                    (12, seg.uid),
-                    (16, seg.gid),
-                    (20, seg.mode),
+                    (0isize, key as u32),
+                    (4, uid),
+                    (8, gid),
+                    (12, uid),
+                    (16, gid),
+                    (20, mode),
                 ] {
                     for (i, b) in v.to_le_bytes().iter().enumerate() {
                         let _ = buf.write_at_offset::<Platform>(off + i as isize, *b);
@@ -647,7 +651,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `shm_{a,d,c}time` timestamps (56/64/72) and the two pids (80/84). Cheap and
                 // real -- `attaches` is the live cross-process attach count -- so report it rather
                 // than leaving a field every MIT-SHM caller can see as zero.
-                let nattch = u64::try_from(seg.attaches).unwrap_or(u64::MAX);
+                let nattch = u64::try_from(attaches).unwrap_or(u64::MAX);
                 for (i, b) in nattch.to_le_bytes().iter().enumerate() {
                     let off = 88isize + isize::try_from(i).unwrap();
                     let _ = buf.write_at_offset::<Platform>(off, *b);
@@ -826,7 +830,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
-        // Perform the normal mmap first (CoW or memcpy fallback).
         let cow_attempt = cow_mmap_enabled()
             .then(|| self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset))
             .flatten();
@@ -954,7 +957,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let available_len = static_data.len().saturating_sub(offset);
         if available_len < len {
-            // Cannot fill full page
             return None;
         }
 
@@ -1402,7 +1404,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 None => return,
             }
         };
-        // Where the write landed: the explicit offset, else the position now that it advanced.
         let offset = match explicit_offset {
             Some(o) => o,
             None => match self.sys_lseek(
@@ -2057,7 +2058,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fd:% = fd, offset:% = offset;
             "DIAG sys_mmap: entry"
         );
-        // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -2259,7 +2259,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             pid:% = self.pid.get(), tid:% = self.tid.get(), addr:% = addr.as_usize(), len:% = len, prot:? = prot;
             "sys_mprotect: entry"
         );
-        // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0 {
@@ -2411,7 +2410,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 for &(seg_start, seg_len) in &state.file_mappings {
                     let seg_end = seg_start.saturating_add(seg_len);
-                    // Check overlap with the mprotect range.
                     if seg_start < mprotect_end && seg_end > mprotect_start {
                         result.push((fd, seg_start, seg_len));
                     }
@@ -2482,7 +2480,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     #[cfg(target_arch = "x86_64")]
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
-        // Quick check: skip if already initialized.
         if self
             .global
             .elf_patch_cache
@@ -2497,19 +2494,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // up, misses, and re-initializes patch state from scratch -- computing a fresh
         // `trampoline_addr` while the copied code still jumps to the parent's. Worth revisiting.
 
-        // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
         match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
-            _ => return, // Not readable or short read, skip
+            _ => return,
         }
 
-        // Parse as typed ELF64 header.
         let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf) else {
             return;
         };
 
-        // Verify ELF magic
         if &ehdr.e_ident.magic != b"\x7fELF" {
             return;
         }
@@ -2519,17 +2513,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
 
-        // Validate e_phentsize: must be at least sizeof(Elf64_Phdr).
         if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
             return;
         }
 
-        // Read program headers.
         let Some(phdrs_size) = e_phentsize.checked_mul(e_phnum) else {
             return;
         };
         if phdrs_size == 0 || phdrs_size > 0x10000 {
-            return; // Sanity check
+            return;
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
         match self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)) {
@@ -2571,7 +2563,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         if max_load_end == 0 {
-            return; // No PT_LOAD segments
+            return;
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
@@ -2760,7 +2752,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .expect("fatal: failed to mprotect code segment RW for trap fallback");
         }
 
-        // Read, patch using the rewriter (proper disassembly), write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
             panic!("fatal: failed to read code segment for trap fallback");
         };
@@ -2783,7 +2774,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "fatal: failed to write trap bytes back to code segment"
         );
 
-        // Restore RX.
         self.sys_mprotect_raw(
             mapped_addr,
             len,
@@ -2828,7 +2818,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // linker loads shared libraries sequentially.
         let mut cache = self.global.elf_patch_cache.lock();
         let Some(state) = cache.get_mut(&self.elf_patch_key(fd)) else {
-            return true; // No patch state — not an ELF we're tracking
+            return true;
         };
 
         if state.pre_patched {
@@ -2858,7 +2848,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return false;
                 }
 
-                // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
@@ -2870,12 +2859,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
 
-                // Write syscall entry point to the first 8 bytes.
                 if tramp_data.len() >= 8 {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
-                // Write to the mapped region.
                 if tramp_ptr
                     .copy_from_slice::<Platform>(0, &tramp_data)
                     .is_none()
@@ -2884,7 +2871,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return false;
                 }
 
-                // Protect as RX immediately.
                 if let Err(err) = self.sys_mprotect_raw(
                     tramp_ptr,
                     tramp_len,
@@ -2908,7 +2894,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
-        // Allocate the trampoline region if not yet done.
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
@@ -3027,7 +3012,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             state.trampoline_addr = actual_addr;
 
-            // Write the 8-byte syscall entry point at the start.
             let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
             if entry_ptr
                 .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
@@ -3099,7 +3083,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return true;
         }
 
-        // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
             litebox_util_log::warn!(
                 "failed to read code segment for patching, falling back to trap patching"
@@ -3281,7 +3264,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     panic!("fatal: failed to write trampoline stubs");
                 }
 
-                // Write patched code back to the mapped region.
                 if mapped_addr
                     .copy_from_slice::<Platform>(0, &code_buf)
                     .is_none()
@@ -3310,7 +3292,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
-                // Fall through to restore RX protections below.
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
@@ -3320,7 +3301,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Restore the code segment to RX.
         let _ = self.sys_mprotect_raw(
             mapped_addr,
             len,
