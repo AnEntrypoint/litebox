@@ -1847,7 +1847,12 @@ where
     /// than on every tick in every process.
     fn reclaim_orphaned_listen_queues(&mut self) {
         static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+        // `wrapping_rem(..) != 511`, not `% 512 != 0`: the counter starts at 0, so the latter is
+        // true on the FIRST tick of every process -- a freshly spawned process would audit every
+        // port's liveness before it has itself registered anything (chrF37: both 8081 and 8082 were
+        // retired 0.167 s into a process spawned at teardown). 511 means a process sweeps only
+        // after 512 ticks of its own.
+        if TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed).wrapping_rem(512) != 511 {
             return;
         }
         let me = self.litebox.platform().current_pid();

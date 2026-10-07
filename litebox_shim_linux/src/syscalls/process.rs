@@ -3497,7 +3497,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
     ) -> Result<usize, Errno> {
-        self.do_clone(ctx, args, false)
+        Self::report_fork_failure(args, self.do_clone(ctx, args, false), self)
     }
 
     pub(crate) fn sys_clone3(
@@ -3506,7 +3506,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         args: UserPtr<litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
         let args = args.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        self.do_clone(ctx, &args, true)
+        Self::report_fork_failure(&args, self.do_clone(ctx, &args, true), self)
+    }
+
+    /// WHY a `fork()` a guest asked for was refused, named once per refusal.
+    ///
+    /// Chromium's zygote reports `Zygote could not fork: ... child_pid -1` with no errno, and a
+    /// fork that is simply refused is invisible everywhere else: the guest sees -1, `do_clone`'s
+    /// dozens of `Err` returns each look locally obvious, and nothing ever says which one fired or
+    /// whether the reason was a cap, an argument, or an allocation. Only a FORK-shaped clone is
+    /// logged (`CLONE_VM` absent): a thread clone's refusals are the ordinary `pthread_create`
+    /// path, and chromium alone calls enough of those to bury this line.
+    fn report_fork_failure(
+        args: &litebox_common_linux::CloneArgs,
+        result: Result<usize, Errno>,
+        task: &Self,
+    ) -> Result<usize, Errno> {
+        let Err(errno) = result else {
+            return result;
+        };
+        if args.flags.contains(CloneFlags::VM) {
+            return result;
+        }
+        // Throttled: a fork storm must not turn into a log storm. The first refusals are the
+        // informative ones, then one in 500 so a long storm is still countable.
+        static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let seen = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if seen > 50 && seen % 500 != 0 {
+            return result;
+        }
+        let (rows, namespaces) = task.global.pid_namespaces.occupancy();
+        litebox_util_log::warn!(
+            errno = errno.as_str(),
+            flags:% = args.flags.bits(),
+            newpid = args.flags.contains(CloneFlags::NEWPID),
+            newuser = args.flags.contains(CloneFlags::NEWUSER),
+            pid_rows = rows,
+            namespaces = namespaces,
+            tid:% = task.tid.get(),
+            seen = seen;
+            "diag-clone-fail: a fork-shaped clone was refused");
+        result
     }
 
     /// Handle syscall `unshare`. `CLONE_NEWUSER` is the one flag with a real implementation: the

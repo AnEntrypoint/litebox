@@ -207,6 +207,26 @@ impl PidNamespaceTable {
         }
     }
 
+    /// How many rows and namespaces are taken, for `diag-clone-fail`.
+    ///
+    /// A fork-shaped clone that comes back `EAGAIN` from [`Self::allocate`] or [`Self::create`]
+    /// means one of these hit its cap, and the cap is the only reason a `fork()` a guest asked for
+    /// is refused rather than performed -- so the counts are the whole explanation and they are
+    /// logged with the failure, not reconstructed afterwards from a log that never mentioned them.
+    pub(crate) fn occupancy(&self) -> (usize, usize) {
+        let rows = self
+            .members
+            .iter()
+            .filter(|row| row.ns_pid.load(Ordering::Acquire) != FREE_PID)
+            .count();
+        let namespaces = self
+            .namespaces
+            .iter()
+            .filter(|slot| slot.in_use.load(Ordering::Acquire))
+            .count();
+        (rows, namespaces)
+    }
+
     /// How `internal_pid` is spelled in `ns`: its own pid for the initial namespace (the identity
     /// mapping), its registered pid for one it belongs to, and `None` for a namespace that cannot
     /// see it at all -- which is what makes an out-of-namespace `kill` fail with `ESRCH`.
