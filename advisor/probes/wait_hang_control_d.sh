@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Phase 1 (fork+execve churn) THEN phase 3 (backgrounded subshells + wait).
 # Phase 3 alone passes; if this hangs, the churn is what poisons it.
 echo D_START

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Cheap discriminator for the fork_verify-scales-with-process-count hypothesis
 # (Pass 347): no GUI, no weston/xwayland/dbus -- just N idle `sleep` background
 # processes in the same guest, then a 200-exec busybox timing loop, using the

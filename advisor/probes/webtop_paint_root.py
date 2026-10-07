@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Draw a real, moving scene on the X root window through libX11 via ctypes.
 
 This image ships no xsetroot/xclock/xeyes, and xterm exits silently under litebox, so this is the

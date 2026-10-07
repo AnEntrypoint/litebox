@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 import fcntl, socket, struct, time, os, sys
 name = sys.argv[1] if len(sys.argv) > 1 else "tun0"
 for _ in range(600):

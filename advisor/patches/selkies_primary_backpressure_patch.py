@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Guest-side patch: close the primary-display ping-starvation gap in selkies.py.
 
 WHY. selkies (selkies-project/selkies @ 348bc4f61da66198573e7e57db9a266aca1991d5,

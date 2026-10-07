@@ -107,6 +107,10 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
         "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
     ),
     (
+        "mjs",
+        "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
+    ),
+    (
         "py",
         "#!/usr/bin/env python3\n\n# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n",
     ),
@@ -121,24 +125,36 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
     ("2", ""),
     ("6", ""),
     ("elf", ""),
+    ("gz", ""),
     ("hooked", ""),
     ("json", ""),
     ("ld", ""),
     ("lock", ""),
     ("md", ""),
     ("png", ""),
+    ("plist", ""),
     ("snap", ""),
     ("so", ""),
     ("svg", ""),
     ("tar", ""),
     ("toml", ""),
     ("txt", ""),
+    ("xml", ""),
 ];
 
 // Skipped files have their own custom requirements on why they are not checked via the regular
 // tests. Please do NOT modify this unless you have a very compelling reason to.
 const SKIP_FILES: &[&str] = &[
     "LICENSE",
+    // A generated (vendored) front-end bundle: minified third-party output whose contents are not
+    // ours to re-license, and whose text already mentions licensing, so auto-inclusion refuses it.
+    "advisor/probes/dashboard/assets/index-BTp9L9Xk.js",
+    // Compiled probe binaries, kept beside their `.c` sources; like the existing `test-bins`
+    // entries they are build output, not source.
+    "advisor/probes/drm_flip_probe",
+    "advisor/probes/forklock_probe",
+    "advisor/probes/hello_probe",
+    "advisor/probes/pty_fork_probe",
     "dist_tools/base-image/Dockerfile",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
@@ -151,4 +167,9 @@ const SKIP_FILES: &[&str] = &[
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
     "litebox_syscall_rewriter/tests/hello-aarch64",
+    // s6 service definitions for the webtop image: s6 only scans extension-less names in
+    // `custom-services.d`, so the header cannot be paid for with an extension.
+    "tools/webtop/custom-services.d/zz-apps",
+    "tools/webtop/custom-services.d/zz-ps",
+    "tools/webtop/custom-services.d/zz-shot",
 ];

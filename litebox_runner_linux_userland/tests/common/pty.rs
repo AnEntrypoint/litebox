@@ -87,7 +87,13 @@ impl Pty {
     }
 
     pub fn wait_for_output(&mut self, output: &mut Vec<u8>, needle: &[u8]) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // 60 s, not 10: this waits on a guest python that has to be rewritten, loaded and started
+        // while libtest runs its other tests concurrently on a 4-core host -- live-caught as this
+        // test failing with ZERO bytes of output (not even a partial banner) whenever 3 other
+        // runners were resident, and passing in 4.7 s when run alone. A deadline too short for
+        // the host is not an assertion about the guest, so it must not be what decides this test.
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + DEADLINE;
         loop {
             self.read_available(output);
             if output.windows(needle.len()).any(|window| window == needle) {
@@ -108,7 +114,13 @@ impl Pty {
         child: &mut std::process::Child,
         output: &mut Vec<u8>,
     ) -> std::process::ExitStatus {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // 60 s, not 10: this waits on a guest python that has to be rewritten, loaded and started
+        // while libtest runs its other tests concurrently on a 4-core host -- live-caught as this
+        // test failing with ZERO bytes of output (not even a partial banner) whenever 3 other
+        // runners were resident, and passing in 4.7 s when run alone. A deadline too short for
+        // the host is not an assertion about the guest, so it must not be what decides this test.
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + DEADLINE;
         loop {
             self.read_available(output);
             if let Some(status) = child.try_wait().expect("failed to wait for child process") {

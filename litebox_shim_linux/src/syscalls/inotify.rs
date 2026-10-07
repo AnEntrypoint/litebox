@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! `inotify`: change notifications for files and directories.
 //!
 //! An instance is an ordinary pipe. The guest holds the read end and reads packed

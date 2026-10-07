@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Attribute on-screen content to a specific process by diffing two frames.
 
 Comparing visual verdicts ("both look like a thin strip") cannot tell whether a

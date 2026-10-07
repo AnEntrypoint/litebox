@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Runs the compositor (`main.rs`'s logic) on a background thread and the client (`client.rs`'s
 //! logic) on the main thread, both inside ONE process -- avoiding `fork()`+`execv()` entirely.
 //!

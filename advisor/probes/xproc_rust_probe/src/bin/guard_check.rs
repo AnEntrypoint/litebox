@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Verifies the two deliberate failure behaviours of the primitive actually fire,
 //! rather than being untested comments: (a) unlocking a free mutex panics, and
 //! (b) dropping a guard while a waiter is blocked panics rather than silently

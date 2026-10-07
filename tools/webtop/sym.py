@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 import re,subprocess,sys
 t=open(sys.argv[1],errors='replace').read()
 base=int(re.search(r'litebox-exe-base: ([0-9a-f]+)',t).group(1),16)

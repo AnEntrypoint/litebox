@@ -883,6 +883,84 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+/// The `struct termios2` ABI (`TCGETS2`/`TCSETS2`/`TCSETSW2`/`TCSETSF2`), 44 bytes.
+///
+/// glibc 2.42+ moved `tcgetattr`/`tcsetattr` -- and with them `isatty`, which is literally
+/// `tcgetattr(fd, &t) == 0` -- off `TCGETS` (`0x5401`) and onto `TCGETS2` (`0x802c_542a`); the
+/// disassembly of glibc 2.43's `tcgetattr` on this host issues `syscall` with
+/// `esi = 0x802c542a`. A shim that only answers `TCGETS` therefore makes every glibc-2.42+
+/// guest see `isatty() == false` on a genuine terminal: live-caught as a guest `python3` on a
+/// pty never entering interactive mode (`sys.stdin.isatty()` False, no `>>> ` prompt ever
+/// emitted, the process blocking forever on a stdin it believes is a pipe that has not
+/// reached EOF), while a raw `ioctl(fd, 0x5401, ...)` from the same guest returned 0.
+///
+/// Unlike [`Termios`] this carries explicit input/output baud rates. This shim keeps no line
+/// discipline and no independent speed state -- `c_cflag`'s `CBAUD`/`CBAUDEX` bits are all it
+/// has -- so [`Termios2::from`] re-derives both speeds from there, and the reverse conversion
+/// drops them (`c_cflag` already carries the same information).
+#[repr(C)]
+#[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
+pub struct Termios2 {
+    pub c_iflag: tcflag_t,
+    pub c_oflag: tcflag_t,
+    pub c_cflag: tcflag_t,
+    pub c_lflag: tcflag_t,
+    pub c_line: cc_t,
+    pub c_cc: [cc_t; 19usize],
+    pub c_ispeed: tcflag_t,
+    pub c_ospeed: tcflag_t,
+}
+
+/// The low 4 bits of `c_cflag`, holding an index into [`BAUD_TABLE`].
+pub const CBAUD: tcflag_t = 0o000017;
+/// Set when `c_cflag`'s baud index belongs to the extended range (`B57600` and up), in which
+/// case Linux adds 15 to the index before looking it up.
+pub const CBAUDEX: tcflag_t = 0o010000;
+
+/// `c_cflag`'s `CBAUD`/`CBAUDEX` index -> bits per second, in Linux's own order
+/// (`asm-generic/termbits.h`'s `baud_table`).
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
+    3000000, 3500000, 4000000,
+];
+
+/// The baud rate a `c_cflag` encodes, following Linux's `tty_termios_baud_rate`: take `CBAUD`,
+/// and add 15 to the index when `CBAUDEX` is set.
+pub fn baud_from_cflag(c_cflag: tcflag_t) -> u32 {
+    let index = (c_cflag & CBAUD) as usize + if c_cflag & CBAUDEX != 0 { 15 } else { 0 };
+    BAUD_TABLE.get(index).copied().unwrap_or(0)
+}
+
+impl From<Termios> for Termios2 {
+    fn from(t: Termios) -> Self {
+        let baud = baud_from_cflag(t.c_cflag);
+        Self {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+            c_ispeed: baud,
+            c_ospeed: baud,
+        }
+    }
+}
+
+impl From<Termios2> for Termios {
+    fn from(t: Termios2) -> Self {
+        Self {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+        }
+    }
+}
+
 bitflags::bitflags! {
     /// `c_oflag` bits this codebase actually interprets. `Termios.c_oflag` itself stays a plain
     /// `tcflag_t` (not this type) since the struct must stay `#[repr(C)]`/`FromBytes`/`IntoBytes`
@@ -1909,6 +1987,11 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
+/// `TCGETS2` -- what glibc 2.42+'s `tcgetattr`/`isatty` actually issues; see [`Termios2`].
+pub const TCGETS2: u32 = 0x802c_542a;
+pub const TCSETS2: u32 = 0x402c_542b;
+pub const TCSETSW2: u32 = 0x402c_542c;
+pub const TCSETSF2: u32 = 0x402c_542d;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
@@ -1939,6 +2022,12 @@ pub enum IoctlArg {
     /// This is the command libuv's `uv__tty_make_raw` (and therefore Node's
     /// `tty.ReadStream.setRawMode`) actually issues.
     TCSETSF(UserPtr<Termios>),
+    /// The `termios2` twins of the four `TC*S` commands above -- identical semantics, different
+    /// (44-byte) userspace struct. glibc 2.42+ issues only these; see [`Termios2`].
+    TCGETS2(UserPtrMut<Termios2>),
+    TCSETS2(UserPtr<Termios2>),
+    TCSETSW2(UserPtr<Termios2>),
+    TCSETSF2(UserPtr<Termios2>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Set window size (`ioctl(fd, TIOCSWINSZ, &ws)`), used e.g. by terminal multiplexers and
@@ -4615,6 +4704,10 @@ impl SyscallRequest {
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
                         TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TCGETS2 => IoctlArg::TCGETS2(ctx.sys_req_ptr(2)),
+                        TCSETS2 => IoctlArg::TCSETS2(ctx.sys_req_ptr(2)),
+                        TCSETSW2 => IoctlArg::TCSETSW2(ctx.sys_req_ptr(2)),
+                        TCSETSF2 => IoctlArg::TCSETSF2(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),

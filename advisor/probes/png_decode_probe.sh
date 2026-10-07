@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal, fast test: can gdk-pixbuf decode a real PNG now that libgdk_pixbuf has been
 # swapped for a version with classic in-process PNG support (no glycin/bwrap sandboxing
 # needed)? Uses gdk-pixbuf-pixdata (round-trips a PNG through gdk-pixbuf's own loader) or

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // usage: node act.mjs out.png "click:x,y" "wait:secs" "key:..." ...   (page must already be open via shot.mjs's chrome; reuses first page)
 import fs from 'node:fs';
 const [out, ...steps] = process.argv.slice(2);

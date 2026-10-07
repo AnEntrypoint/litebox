@@ -213,6 +213,9 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                     tar_path,
                     data: rewritten.clone(),
                     mode,
+                    // A regular file, not a symlink: `real_path` was just read with
+                    // `std::fs::read`, which follows links, so there is no link target to carry.
+                    symlink_target: None,
                 });
             }
             Ok(entries)
@@ -265,6 +268,9 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
             tar_path: inc.tar_path.clone(),
             data: rewritten,
             mode,
+            // Same as the walk above: `--include` names a host file that was just read, so this
+            // entry is the file's bytes, not a link to them.
+            symlink_target: None,
         });
     }
 

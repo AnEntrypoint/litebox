@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Stock gdk-pixbuf 2.44.7 is built with GDK_PIXBUF_USE_GIO_MIME: it detects format via GIO
 # MIME sniffing, NOT magic bytes. GIO needs /usr/share/mime/mime.cache, which the layer does
 # not ship -- update-mime-database IS present but was never run. Without the cache, EVERY

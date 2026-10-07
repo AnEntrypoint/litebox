@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Re-emit an existing litebox layer tar with CoW-friendly layout.
 
 Two transforms, both of which the packager now does natively for OCI images but

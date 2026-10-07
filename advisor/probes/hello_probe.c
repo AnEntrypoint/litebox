@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Minimal launch-reliability probe: the smallest possible litebox guest program.
 // Writes staged markers so a silent run can be classified rather than guessed at:
 //   S = first instruction of _start reached (before anything else at all)

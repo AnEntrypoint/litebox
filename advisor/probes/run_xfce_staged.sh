@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # XFCE on weston, written to AVOID the concurrent-fork_verify crash:
 # every service is started ALONE and given time to settle before the next,
 # so at most one fork_verify healing pass is live at a time (the condition

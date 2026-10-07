@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Minimal raw-X11 client: connect, create a window, map it, fill it, and report
 // every reply. No Xlib, no toolkit, no headers -- just the wire protocol over a
 // Unix socket, so it isolates "does X work" from "does GTK work".

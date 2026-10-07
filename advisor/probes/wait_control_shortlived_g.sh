@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Definitive control: bare `wait` with SHORT-lived background children only.
 # If POSIX `wait`-waits-for-everything explains the earlier "hang", this must
 # complete quickly, since there is nothing long-lived to wait for.

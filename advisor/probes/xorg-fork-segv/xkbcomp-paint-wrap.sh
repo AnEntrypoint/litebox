@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # real xkbcomp first, so Xorg's keyboard init still succeeds
 /usr/bin/xkbcomp.real "$@"
 RC=$?

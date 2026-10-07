@@ -277,12 +277,24 @@ fn test_vmm_page_fault() {
         }
         .is_ok()
     );
+    // The grown page is its OWN tracked entry, not an extension of the stack's: `handle_page_fault`
+    // grows a `VM_GROWSDOWN` area by `insert_mapping`-ing the new range, and a private `VmArea`
+    // deliberately NEVER compares equal to another one (see `VmArea: PartialEq` in
+    // `litebox/src/mm/linux.rs`), so `rangemap` cannot coalesce the two adjacent fragments -- two
+    // unrelated private mappings that happen to sit next to each other must stay distinguishable.
+    // What the growth guarantees is therefore COVERAGE, not a single entry: 0x0fff_f000..0x1000_0000
+    // is the new page and 0x1000_0000..0x1000_4000 the original stack, together spanning exactly
+    // what one merged entry would.
     assert_eq!(
         vmm.mappings()
             .iter()
             .map(|v| v.0.clone())
             .collect::<Vec<_>>(),
-        vec![0x1_0000..0x1_4000, 0x0fff_f000..0x1000_4000]
+        vec![
+            0x1_0000..0x1_4000,
+            0x0fff_f000..0x1000_0000,
+            0x1000_0000..0x1000_4000
+        ]
     );
     // Cannot grow stack too far
     assert!(matches!(

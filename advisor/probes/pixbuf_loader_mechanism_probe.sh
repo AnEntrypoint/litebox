@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # XPM fails too, though libpixbufloader-xpm.so IS in the loaders dir. So this is
 # not about PNG or glycin -- NO loader is being found. The most likely reason is
 # that gdk-pixbuf looks up loaders through loaders.cache, and there is no cache

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Does dlopen of a TLS-using library hang here? No display stack at all.
 #
 # The peer's trace shows xfwm4's last syscall is a futex ENTRY at t=28.3 with no

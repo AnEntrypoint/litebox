@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 /* Raw-ioctl DRM guest test -- no libdrm dependency, matches litebox's own
  * DrmMode* struct layouts (litebox_common_linux/src/lib.rs) and real kernel
  * drm.h/drm_mode.h struct layouts verbatim. Exercises the full dumb-buffer

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Demand-paged private file mappings.
 //!
 //! A private file mapping is committed up front (so guest memory stays ordinary `VirtualAlloc`

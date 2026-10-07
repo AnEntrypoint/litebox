@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Turn litebox's own host-crash diagnostics into symbol names.
 
 WHY THIS EXISTS

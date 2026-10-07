@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal repro for the "client startup is extremely slow" investigation
 # (AGENTS.md priority 2). Same launch sequence as run_xfce_xwm.sh (XWM fix +
 # no set -x) but instruments wall-clock time around each stage with `date`

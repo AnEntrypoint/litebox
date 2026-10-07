@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Real Wayland CLIENT counterpart to `desktop.rs`'s extended compositor -- proves the
 //! `xdg_shell`/`wl_seat`/`wl_output` protocol surface `desktop.rs` added actually works against a
 //! real client, not just that it type-checks. Builds on `client.rs`'s already-proven

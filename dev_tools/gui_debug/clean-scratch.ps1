@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Frees disk space in the Windows temp dir consumed by stale litebox debugging scratch state.
 # This project's own debugging workflow routinely writes multi-GB scratch tars (`combined.tar`,
 # `repro-rootfs.tar`, layer snapshots, etc.) into %TEMP% during live repros -- across many sessions

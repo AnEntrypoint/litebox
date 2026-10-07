@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Is the shell's `wait` correctly waiting for the LONG-LIVED children too?
 # `wait` with no args waits for ALL children -- including the sleep 300s. If so,
 # the "hang" is CORRECT POSIX behaviour and my repro is simply wrong, not litebox.

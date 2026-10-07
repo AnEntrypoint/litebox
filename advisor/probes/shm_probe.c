@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Probe for POSIX /dev/shm shared-memory support (glibc shm_open's real syscall recipe),
 // motivated by AGENTS.md's pass 319 finding: labwc (stock linuxserver/webtop:alpine-mate image,
 // PIXELFLUX_WAYLAND=true, real Wayland/DRM backend) crashes with a null-deref during shm-keymap

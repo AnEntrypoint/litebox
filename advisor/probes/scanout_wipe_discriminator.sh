@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Discriminator: does content ever return after the wipe, if a fresh X client
 # connects later? If yes, this is a legitimate weston repaint-clears-to-empty
 # situation (a compositing/scene-graph issue), not memory corruption. If it

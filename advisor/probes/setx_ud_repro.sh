@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # dbustest2 + the two things the full script has that it lacked: set -x tracing
 # and LD_LIBRARY_PATH. Isolates which one makes the dbus spawn take #UD.
 set -x

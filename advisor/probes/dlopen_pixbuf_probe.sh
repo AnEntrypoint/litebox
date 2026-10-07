@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Does gdk-pixbuf's loader module actually LOAD under litebox?
 #
 # The evidence trail (advisor/probes/headless-evidence/pixbuf-findings.txt) ends at a precise,

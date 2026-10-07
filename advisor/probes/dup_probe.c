@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Probe (advisory Appendix D, risk 1): can the runner hand a scanout section HANDLE to a
 // separately spawned presenter process via DuplicateHandle, with no admin rights, and have the
 // presenter map the very same pixels? Parent creates a section, spawns the child, duplicates the

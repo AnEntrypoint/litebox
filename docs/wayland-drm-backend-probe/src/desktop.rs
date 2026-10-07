@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Guest-side probe, phase 9: extends the proven minimal compositor (`main.rs`,
 //! `wl_compositor`+`wl_shm` only) with the real protocol surface any serious Wayland client --
 //! including a real desktop-shell component like XFCE's `xfwl4`/`xfdesktop`/`xfce4-panel` --

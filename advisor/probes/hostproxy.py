@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Host-side reverse proxy for the litebox webtop.
 
 Serves the selkies dashboard's static files and tunnels /websockets straight through to selkies

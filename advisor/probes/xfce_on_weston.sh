@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # XFCE under WESTON rather than labwc.
 #
 # Why: labwc's own source (src/server.c) unconditionally does

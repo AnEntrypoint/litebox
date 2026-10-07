@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Build a trimmed webtop rootfs tar for the Xvfb + selkies stack.
 
 The stock `linuxserver/webtop:alpine-mate` rootfs is ~2.4 GiB of payload, and on a memory-tight

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Cross-process synchronization primitives for Windows.
 //!
 //! # Why this exists

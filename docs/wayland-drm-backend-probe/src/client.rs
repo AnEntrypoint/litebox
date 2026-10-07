@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A real, minimal Wayland CLIENT counterpart to `main.rs`'s compositor -- closes the last
 //! verification gap for `gui-wayland-compositor-on-drm-future`: the compositor itself was already
 //! proven to run cleanly (nested-epoll fix, commit `620907c`), but nothing in this environment had

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # run_xfce_xwm.sh + THE GDK-PIXBUF CACHE FIX.
 #
 # Identical to run_xfce_xwm.sh except for the block marked PIXBUF FIX below. Kept as a separate

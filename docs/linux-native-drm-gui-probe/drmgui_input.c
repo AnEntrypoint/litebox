@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 /* Combined DRM + evdev guest test -- same DRM pipeline as drmgui.c (which
  * stays untouched, already proven and referenced elsewhere), but replaces the
  * blind sleep(8) with a real select()+read() loop on /dev/input/event0,

@@ -1,4 +1,8 @@
-#!/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Step-0 decisive experiment for ADVISORY-002 (Track B, D==0 fork).
 #
 # Minimal, beyond_stdio==0 (stdio-only fd table -- no extra open files, sockets, or pipes)

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Build tars that exercise litebox's symlink handling, and report what works.
 
 Windows cannot create native symlinks without elevation, so these tar entries

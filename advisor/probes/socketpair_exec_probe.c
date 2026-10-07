@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // socketpair -> fork -> child EXECVEs /bin/sh which writes to the inherited fd.
 // fork alone is proven fine (sp3); this isolates execve as the variable, using a
 // REAL dynamically-linked binary so the exec actually succeeds.

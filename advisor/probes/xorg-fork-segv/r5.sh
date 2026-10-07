@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 export HOME=/root DISPLAY=:0
 # Xorg via fork + IMMEDIATE exec (the pattern proven to survive for xsetroot/xkbcomp),
 # NOT via `&` and NOT as pid 1. If Xorg SIGSEGVs here too, the write-to-RO-exec

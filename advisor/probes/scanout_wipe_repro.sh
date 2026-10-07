@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal: weston alone, then ONE fork, then watch the scanout.
 # If the buffer wipes here, the culprit is any fork -- not Xwayland, not XFCE,
 # and the repro drops from ~500s to ~40s.

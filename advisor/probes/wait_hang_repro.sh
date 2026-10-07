@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # RETRACTED -- THIS IS NOT A BUG. Kept only as the control for the real answer.
 #
 # This script was reported as a "5-second, 3/3 deterministic hang in sh wait".

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # EXPERIMENTAL faster variant of run_xfce_xwm.sh -- same stage structure and
 # same sequential-one-service-at-a-time discipline (still avoiding the
 # documented concurrent-fork_verify race, see docs/AGENTS_ARCHIVE_2026-09-03.md

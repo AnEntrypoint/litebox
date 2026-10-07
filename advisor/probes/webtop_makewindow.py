@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Create and map one real X window, then hold it open.
 
 The window census kept reporting `total=0` with a window manager supposedly running, which is

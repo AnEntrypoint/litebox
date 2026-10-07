@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Fail-fast preflight for a guest layer. Run this BEFORE spending a 400-second
 # launch run, so a packaging problem is reported in seconds with an exact cause
 # instead of showing up as a silent hang, an empty log, or a black screen.

@@ -972,7 +972,12 @@ enum SharedFlockOutcome {
 }
 
 pub(crate) struct SharedFlockTable<Platform: ShimPlatform> {
-    region: &'static mut SharedFlockRegion<Platform>,
+    /// `None` when NO memory could hold the region: neither the shared arena (exhausted) nor the
+    /// process heap (allocation refused). That is a state the table must survive, not a reason to
+    /// end the session -- every operation below then takes the same "cannot key this lock" path it
+    /// already takes for `excludes == false`, i.e. the caller's per-process `FlockFile`. It is the
+    /// single-region form of what `SharedUnixConnTable` does with a zero-length slice.
+    region: Option<&'static SharedFlockRegion<Platform>>,
     /// Count of locks this process has had to degrade to the per-process `FlockFile`. Logged
     /// gap-filtered: a full table is a real (if soft) capacity signal, not a per-call event.
     degraded: AtomicU32,
@@ -1223,27 +1228,34 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// (the same create-vs-attach split `SharedUnixConnTable::new` relies on).
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
-        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let (ptr, excludes) = match arena {
-            Some(ptr) => (ptr.cast::<SharedFlockRegion<Platform>>(), true),
+        match platform.shared_kernel_arena_alloc_bytes(layout) {
+            Some(ptr) => Self::new_in(Some(ptr.cast::<SharedFlockRegion<Platform>>()), true),
             None => {
                 // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Leak a process-private allocation so every
-                // later access stays memory-safe, and let `excludes` disable the table.
+                // process IS the whole guest session). Fall back to a process-private allocation,
+                // leaked so every later access stays memory-safe, and let `excludes` disable the
+                // table so this process stops pretending it can exclude anyone else.
                 litebox_util_log::error!(
                     bytes:% = layout.size();
                     "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
                      this host process only"
                 );
-                (
+                let fallback =
                     core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .expect("shared flock table: fallback allocation failed")
-                        .cast::<SharedFlockRegion<Platform>>(),
-                    false,
-                )
+                        .map(|p| p.cast::<SharedFlockRegion<Platform>>());
+                if fallback.is_none() {
+                    // Neither memory holds it. `new_in(None, _)` yields a table with no region, and
+                    // every operation on it answers "cannot key this lock" -- the caller's
+                    // per-process `FlockFile`, which is where `excludes == false` already lands.
+                    litebox_util_log::error!(
+                        bytes:% = layout.size();
+                        "shared flock table: fallback allocation failed; flock(2) will not exclude \
+                         at all in this host process"
+                    );
+                }
+                Self::new_in(fallback, false)
             }
-        };
-        Self::new_in(ptr, excludes)
+        }
     }
 
     /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
@@ -1251,8 +1263,18 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// `excludes` is the caller's answer to "can every process that could contend for these locks
     /// see this memory?" -- see `SharedFlockRegion::excludes`. A unit test passes process-private
     /// memory and `true`, which is the honest answer for it: every contender it can create lives in
-    /// its own process.
-    fn new_in(ptr: core::ptr::NonNull<SharedFlockRegion<Platform>>, excludes: bool) -> Self {
+    /// its own process. `None` builds a table with no region at all, whose every operation
+    /// degrades rather than panicking.
+    fn new_in(
+        ptr: Option<core::ptr::NonNull<SharedFlockRegion<Platform>>>,
+        excludes: bool,
+    ) -> Self {
+        let Some(ptr) = ptr else {
+            return Self {
+                region: None,
+                degraded: AtomicU32::new(0),
+            };
+        };
         // SAFETY (all three writes): `ptr` names one contiguous, uninitialized `SharedFlockRegion`
         // sized by [`Self::new`]'s `layout`, and writing a freshly built value into uninitialized
         // memory is what `write` is for. Initializing through the pointer ONE FIELD AT A TIME is
@@ -1272,7 +1294,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
             // initialized field-by-field above. `'static` is sound because this allocation is
             // arena-backed (or a deliberately leaked one) and never reclaimed, and nothing else
             // holds a reference to it.
-            region: unsafe { &mut *ptr.as_ptr() },
+            region: Some(unsafe { &*ptr.as_ptr() }),
             degraded: AtomicU32::new(0),
         }
     }
@@ -1290,27 +1312,54 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
         let ptr = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
             .expect("shared flock table: test allocation failed")
             .cast::<SharedFlockRegion<Platform>>();
-        Self::new_in(ptr, true)
+        Self::new_in(Some(ptr), true)
+    }
+
+    /// A table with no region at all: every operation on it degrades, as `new` produces when
+    /// neither the shared arena nor the process heap can hold the region.
+    #[cfg(test)]
+    pub(crate) fn new_absent() -> Self {
+        Self::new_in(None, false)
+    }
+
+    /// The region, or `None` when no memory could hold one.
+    fn region(&self) -> Option<&SharedFlockRegion<Platform>> {
+        self.region
     }
 
     /// The region's address, for a [`FlockHolder`] to record so that its `Drop` can release the
-    /// lock without a `&Platform` or a `&GlobalState`.
+    /// lock without a `&Platform` or a `&GlobalState`. `0` when there is no region, which
+    /// `FlockHolderInner::shared_region` already reads as "nothing to release".
     fn region_addr(&self) -> usize {
-        self.region as *const SharedFlockRegion<Platform> as usize
+        self.region
+            .map(|r| r as *const SharedFlockRegion<Platform> as usize)
+            .unwrap_or(0)
     }
 
     /// Lowest-index slot currently carrying `dev`/`path` in a non-free state. Callers hold `guard`.
-    fn find_held(&self, dev: usize, path: &[u8]) -> Option<usize> {
+    fn find_held(
+        &self,
+        region: &SharedFlockRegion<Platform>,
+        dev: usize,
+        path: &[u8],
+    ) -> Option<usize> {
         (0..SHARED_FLOCK_CAPACITY).find(|i| {
-            self.region.holds_key(*i, dev, path)
-                && self.region.slots[*i].kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE
+            region.holds_key(*i, dev, path)
+                && region.slots[*i].kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE
         })
     }
 
     /// Claims the lowest free slot for `dev`/`path` and reserves it. Callers hold `guard`.
-    fn claim_free(&self, dev: usize, path: &[u8], host: u32, id: u64) -> Option<usize> {
+    fn claim_free(
+        &self,
+        region: &SharedFlockRegion<Platform>,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        id: u64,
+    ) -> Option<usize> {
         for i in 0..SHARED_FLOCK_CAPACITY {
-            let slot = &self.region.slots[i];
+            let slot = &region.slots[i];
             if slot.kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE {
                 continue;
             }
@@ -1329,6 +1378,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// "which slot owns this file" question unarguable.
     fn try_lock(
         &self,
+        region: &SharedFlockRegion<Platform>,
         platform: &Platform,
         dev: usize,
         path: &[u8],
@@ -1336,15 +1386,15 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
         id: u64,
         exclusive: bool,
     ) -> SharedFlockOutcome {
-        let _guard = self.region.guard.lock();
-        let idx = match self.find_held(dev, path) {
+        let _guard = region.guard.lock();
+        let idx = match self.find_held(region, dev, path) {
             Some(i) => i,
-            None => match self.claim_free(dev, path, host, id) {
+            None => match self.claim_free(region, dev, path, host, id) {
                 Some(i) => i,
                 // Table full: try once to take back holdings of processes that died without
                 // unlocking, since those would otherwise pin their files for the whole session.
-                None if self.region.reclaim_dead(platform) => {
-                    match self.claim_free(dev, path, host, id) {
+                None if region.reclaim_dead(platform) => {
+                    match self.claim_free(region, dev, path, host, id) {
                         Some(i) => i,
                         None => {
                             self.log_degraded();
@@ -1358,7 +1408,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                 }
             },
         };
-        let slot = &self.region.slots[idx];
+        let slot = &region.slots[idx];
         match slot.kind.load(Ordering::Acquire) {
             FLOCK_SLOT_RESERVED => {
                 // The slot this call just reserved. (`flock(2)` never yields mid-syscall, so a
@@ -1379,7 +1429,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                 if !exclusive {
                     self.move_to_shared(slot, host, id);
                 }
-                self.region.bump();
+                region.bump();
                 SharedFlockOutcome::Acquired
             }
             FLOCK_SLOT_EXCLUSIVE => {
@@ -1394,7 +1444,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                     slot.kind.store(FLOCK_SLOT_SHARED, Ordering::Release);
                     self.move_to_shared(slot, host, id);
                 }
-                self.region.bump();
+                region.bump();
                 SharedFlockOutcome::Acquired
             }
             FLOCK_SLOT_SHARED => {
@@ -1411,7 +1461,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                     }
                     // Already ours: Linux's `flock(2)` on an fd that already holds it is a no-op,
                     // not a second hold.
-                    self.region.bump();
+                    region.bump();
                     return SharedFlockOutcome::Acquired;
                 }
                 if exclusive {
@@ -1421,7 +1471,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                     Some(j) => {
                         slot.shared_ids[j].store(id, Ordering::Release);
                         slot.shared_pids[j].store(host, Ordering::Release);
-                        self.region.bump();
+                        region.bump();
                         SharedFlockOutcome::Acquired
                     }
                     // Out of shared-holder rows. `LOCK_SH` is compatible with `LOCK_SH` anyway, so
@@ -1480,13 +1530,19 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
             self.log_degraded();
             return None;
         }
-        if !self.region.excludes.load(Ordering::Acquire) {
+        // No region at all, or one no contending process can see: same answer either way --
+        // the caller's per-process `FlockFile`, never a panic.
+        let Some(region) = self.region() else {
+            self.log_degraded();
+            return None;
+        };
+        if !region.excludes.load(Ordering::Acquire) {
             self.log_degraded();
             return None;
         }
         let mut chunks = 0u32;
         loop {
-            match self.try_lock(platform, dev, path, host, id, exclusive) {
+            match self.try_lock(region, platform, dev, path, host, id, exclusive) {
                 SharedFlockOutcome::Acquired => return Some(Ok(())),
                 SharedFlockOutcome::Unavailable => return None,
                 SharedFlockOutcome::Conflict => {
@@ -1500,15 +1556,14 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                     // return, and one that happens after the sample sets this waiter's event, so a
                     // release cannot be missed in either order. The chunk bounds how long a waiter
                     // can sit on a wakeup the platform lost, and is the poll for `interrupted`.
-                    let sampled = self.region.wake.underlying_atomic().load(Ordering::Acquire);
-                    let _ = self
-                        .region
+                    let sampled = region.wake.underlying_atomic().load(Ordering::Acquire);
+                    let _ = region
                         .wake
                         .block_or_timeout(sampled, SHARED_FLOCK_WAIT_CHUNK);
                     chunks = chunks.wrapping_add(1);
                     if chunks % SHARED_FLOCK_RECLAIM_EVERY == 0 {
-                        let _guard = self.region.guard.lock();
-                        self.region.reclaim_dead(platform);
+                        let _guard = region.guard.lock();
+                        region.reclaim_dead(platform);
                     }
                 }
             }
@@ -1521,14 +1576,15 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// this is the spelled-out form, for the tests, which drive the table without a holder.
     #[cfg(test)]
     pub(crate) fn unlock(&self, dev: usize, path: &[u8], host: u32, id: u64) -> bool {
-        self.region.release(dev, path, host, id)
+        self.region().is_some_and(|r| r.release(dev, path, host, id))
     }
 
     /// Whether the table can exclude at all (i.e. whether its region is in memory every contending
     /// process can see).
     #[cfg(test)]
     pub(crate) fn excludes(&self) -> bool {
-        self.region.excludes.load(Ordering::Acquire)
+        self.region()
+            .is_some_and(|r| r.excludes.load(Ordering::Acquire))
     }
 
     fn log_degraded(&self) {
@@ -1582,7 +1638,9 @@ enum SharedRecordLockOutcome {
 }
 
 /// What `F_GETLK` asks for: is there a conflicting claim, and whose.
-enum SharedRecordLockQuery {
+// `pub(crate)` rather than private: `conflicting_claim` below is `pub(crate)`, and a private return
+// type on a `pub(crate)` method is a `private_interfaces` warning.
+pub(crate) enum SharedRecordLockQuery {
     NoConflict,
     Conflict {
         guest_pid: i32,
@@ -1736,7 +1794,10 @@ impl<Platform: ShimPlatform> SharedRecordLockRegion<Platform> {
 }
 
 pub(crate) struct SharedRecordLockTable<Platform: ShimPlatform> {
-    region: &'static mut SharedRecordLockRegion<Platform>,
+    /// `None` when NO memory could hold the region: neither the shared arena (exhausted) nor the
+    /// process heap (allocation refused). Every operation then degrades to the per-process table,
+    /// exactly as it already does for `excludes == false`.
+    region: Option<&'static SharedRecordLockRegion<Platform>>,
     /// Count of claims this process has had to degrade to the per-process table.
     degraded: AtomicU32,
 }
@@ -1748,34 +1809,47 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
     /// process in the family attaches to the already-built `GlobalState` and never calls this.
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedRecordLockRegion<Platform>>();
-        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let (ptr, excludes) = match arena {
-            Some(ptr) => (ptr.cast::<SharedRecordLockRegion<Platform>>(), true),
+        match platform.shared_kernel_arena_alloc_bytes(layout) {
+            Some(ptr) => Self::new_in(Some(ptr.cast::<SharedRecordLockRegion<Platform>>()), true),
             None => {
                 // Arena exhausted: still never a panic (the host process IS the whole guest session).
-                // Leak a process-private allocation so every later access stays memory-safe, and let
-                // `excludes` disable the table.
+                // Fall back to a process-private allocation, leaked so every later access stays
+                // memory-safe, and let `excludes` disable the table.
                 litebox_util_log::error!(
                     bytes:% = layout.size();
                     "shared record lock table: shared kernel arena exhausted; fcntl(2) record locks \
                      exclude within this host process only"
                 );
-                (
+                let fallback =
                     core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .expect("shared record lock table: fallback allocation failed")
-                        .cast::<SharedRecordLockRegion<Platform>>(),
-                    false,
-                )
+                        .map(|p| p.cast::<SharedRecordLockRegion<Platform>>());
+                if fallback.is_none() {
+                    // Neither memory holds it: `new_in(None, _)` yields a table with no region, whose
+                    // every operation degrades instead of aborting the process.
+                    litebox_util_log::error!(
+                        bytes:% = layout.size();
+                        "shared record lock table: fallback allocation failed; fcntl(2) record locks \
+                         will not exclude at all in this host process"
+                    );
+                }
+                Self::new_in(fallback, false)
             }
-        };
-        Self::new_in(ptr, excludes)
+        }
     }
 
     /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
+    /// `None` builds a table with no region at all, whose every operation degrades rather than
+    /// panicking.
     fn new_in(
-        ptr: core::ptr::NonNull<SharedRecordLockRegion<Platform>>,
+        ptr: Option<core::ptr::NonNull<SharedRecordLockRegion<Platform>>>,
         excludes: bool,
     ) -> Self {
+        let Some(ptr) = ptr else {
+            return Self {
+                region: None,
+                degraded: AtomicU32::new(0),
+            };
+        };
         // SAFETY (all four writes): `ptr` names one contiguous, uninitialized
         // `SharedRecordLockRegion` sized by [`Self::new`]'s `layout`, and writing a freshly built
         // value into uninitialized memory is what `write` is for. Initializing through the pointer
@@ -1795,14 +1869,39 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
             // SAFETY: `ptr` is non-null and suitably aligned, and the region at it was just
             // initialized field-by-field above. `'static` is sound because this allocation is
             // arena-backed (or a deliberately leaked one) and never reclaimed.
-            region: unsafe { &mut *ptr.as_ptr() },
+            region: Some(unsafe { &*ptr.as_ptr() }),
             degraded: AtomicU32::new(0),
         }
     }
 
+    /// Test-only: the same table over the process heap instead of the shared arena, with
+    /// `excludes == true` -- the honest answer for a test, whose every contender lives in its own
+    /// process. Keeps the test off the one shared arena, as `SharedFlockTable::new_local` does.
+    #[cfg(test)]
+    pub(crate) fn new_local() -> Self {
+        let layout = core::alloc::Layout::new::<SharedRecordLockRegion<Platform>>();
+        let ptr = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+            .expect("shared record lock table: test allocation failed")
+            .cast::<SharedRecordLockRegion<Platform>>();
+        Self::new_in(Some(ptr), true)
+    }
+
+    /// A table with no region at all, as `new` produces when neither the shared arena nor the
+    /// process heap can hold the region: every operation on it degrades.
+    #[cfg(test)]
+    pub(crate) fn new_absent() -> Self {
+        Self::new_in(None, false)
+    }
+
+    /// The region, or `None` when no memory could hold one.
+    fn region(&self) -> Option<&SharedRecordLockRegion<Platform>> {
+        self.region
+    }
+
     /// Whether this table's bytes are in memory every contending process can see.
     fn excludes(&self) -> bool {
-        self.region.excludes.load(Ordering::Acquire)
+        self.region()
+            .is_some_and(|r| r.excludes.load(Ordering::Acquire))
     }
 
     fn log_degraded(&self) {
@@ -1823,6 +1922,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
     /// processes can never disagree about who holds a range.
     fn try_apply(
         &self,
+        region: &SharedRecordLockRegion<Platform>,
         platform: &Platform,
         dev: usize,
         path: &[u8],
@@ -1833,7 +1933,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         write: bool,
         unlock: bool,
     ) -> SharedRecordLockOutcome {
-        let _guard = self.region.guard.lock();
+        let _guard = region.guard.lock();
         // Two passes at most: the second only happens after a pass that found a conflict ALSO freed
         // a dead holder's claim, which is what makes a killed process stop pinning its range without
         // waiting for some other process to block on it.
@@ -1841,7 +1941,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
             let mut mine: alloc::vec::Vec<(usize, bool, u64, u64)> = alloc::vec::Vec::new();
             let mut parts = 0usize;
             let mut conflict = false;
-            for (i, row) in self.region.rows.iter().enumerate() {
+            for (i, row) in region.rows.iter().enumerate() {
                 if row.is_free() || !row.key_matches(dev, path) {
                     continue;
                 }
@@ -1857,42 +1957,42 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
                     mine.push((i, w, rs, re));
                 }
             }
-            if conflict && self.region.reclaim_dead(platform) {
+            if conflict && region.reclaim_dead(platform) {
                 continue;
             }
             if conflict {
                 return SharedRecordLockOutcome::Conflict;
             }
             let needed = parts + usize::from(!unlock);
-            if needed > mine.len() + self.region.free_row_count() {
+            if needed > mine.len() + region.free_row_count() {
                 return SharedRecordLockOutcome::Full;
             }
             // Commit: every row of ours that the request touches goes back into the pool, so a split
             // can reuse the row it came from instead of needing fresh ones.
             let mut pool: alloc::vec::Vec<usize> = mine.iter().map(|m| m.0).collect();
-            for (i, row) in self.region.rows.iter().enumerate() {
+            for (i, row) in region.rows.iter().enumerate() {
                 if row.is_free() {
                     pool.push(i);
                 }
             }
             for (i, _, _, _) in mine.iter() {
-                self.region.rows[*i].clear();
+                region.rows[*i].clear();
             }
             let mut at = 0usize;
             for (_, w, rs, re) in mine.iter() {
                 if *rs < start {
-                    self.region.rows[pool[at]].set(dev, path, host, guest, *w, *rs, start);
+                    region.rows[pool[at]].set(dev, path, host, guest, *w, *rs, start);
                     at += 1;
                 }
                 if *re > end {
-                    self.region.rows[pool[at]].set(dev, path, host, guest, *w, end, *re);
+                    region.rows[pool[at]].set(dev, path, host, guest, *w, end, *re);
                     at += 1;
                 }
             }
             if !unlock {
-                self.region.rows[pool[at]].set(dev, path, host, guest, write, start, end);
+                region.rows[pool[at]].set(dev, path, host, guest, write, start, end);
             }
-            self.region.bump();
+            region.bump();
             return SharedRecordLockOutcome::Applied;
         }
         SharedRecordLockOutcome::Conflict
@@ -1917,13 +2017,20 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         nonblocking: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Option<Result<(), Errno>> {
+        // No region at all, or one no contending process can see: same answer either way -- the
+        // caller's per-process table, never a panic.
+        let Some(region) = self.region() else {
+            self.log_degraded();
+            return None;
+        };
         if path.is_empty() || path.len() > SHARED_RECORD_LOCK_PATH_MAX || !self.excludes() {
             self.log_degraded();
             return None;
         }
         let mut chunks = 0u32;
         loop {
-            match self.try_apply(platform, dev, path, host, guest, start, end, write, unlock) {
+            match self.try_apply(region, platform, dev, path, host, guest, start, end, write, unlock)
+            {
                 SharedRecordLockOutcome::Applied => return Some(Ok(())),
                 SharedRecordLockOutcome::Unavailable => return None,
                 SharedRecordLockOutcome::Full => return Some(Err(Errno::ENOLCK)),
@@ -1938,15 +2045,14 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
                     // return, and one that happens after the sample sets this waiter's event, so a
                     // release cannot be missed in either order. The chunk bounds how long a waiter
                     // can sit on a wakeup the platform lost, and is the poll for `interrupted`.
-                    let sampled = self.region.wake.underlying_atomic().load(Ordering::Acquire);
-                    let _ = self
-                        .region
+                    let sampled = region.wake.underlying_atomic().load(Ordering::Acquire);
+                    let _ = region
                         .wake
                         .block_or_timeout(sampled, SHARED_RECORD_LOCK_WAIT_CHUNK);
                     chunks = chunks.wrapping_add(1);
                     if chunks % SHARED_RECORD_LOCK_RECLAIM_EVERY == 0 {
-                        let _guard = self.region.guard.lock();
-                        self.region.reclaim_dead(platform);
+                        let _guard = region.guard.lock();
+                        region.reclaim_dead(platform);
                     }
                 }
             }
@@ -1967,8 +2073,11 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         if path.is_empty() || path.len() > SHARED_RECORD_LOCK_PATH_MAX || !self.excludes() {
             return SharedRecordLockQuery::Unavailable;
         }
-        let _guard = self.region.guard.lock();
-        for row in self.region.rows.iter() {
+        let Some(region) = self.region() else {
+            return SharedRecordLockQuery::Unavailable;
+        };
+        let _guard = region.guard.lock();
+        for row in region.rows.iter() {
             if row.is_free() || !row.key_matches(dev, path) || row.owned_by(host, guest) {
                 continue;
             }
@@ -1987,19 +2096,23 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
 
     /// Drops every claim `host`/`guest` holds; called when that guest process exits.
     pub(crate) fn release_process(&self, host: u32, guest: i32) {
+        // No region: nothing was ever recorded here (every `apply` degraded), so nothing to drop.
+        let Some(region) = self.region() else {
+            return;
+        };
         if !self.excludes() {
             return;
         }
-        let _guard = self.region.guard.lock();
+        let _guard = region.guard.lock();
         let mut released = false;
-        for row in self.region.rows.iter() {
+        for row in region.rows.iter() {
             if !row.is_free() && row.owned_by(host, guest) {
                 row.clear();
                 released = true;
             }
         }
         if released {
-            self.region.bump();
+            region.bump();
         }
     }
 }
@@ -7872,6 +7985,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 dt.set_entry_metadata(fd, TermiosState(termios));
                 Ok(0)
             }
+            // The `termios2` (glibc 2.42+) twins: same stored state, converted to/from the
+            // 44-byte `Termios2` ABI by `From`, which re-derives `c_ispeed`/`c_ospeed` from
+            // `c_cflag`'s `CBAUD`/`CBAUDEX` bits on the way out.
+            IoctlArg::TCGETS2(termios_ptr) => {
+                let dt = self.global.litebox.descriptor_table();
+                let termios = dt
+                    .with_metadata(fd, |t: &TermiosState| t.0.clone())
+                    .unwrap_or_else(|_| TermiosState::default().0);
+                termios_ptr
+                    .write_at_offset::<Platform>(0, litebox_common_linux::Termios2::from(termios))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS2(termios_ptr)
+            | IoctlArg::TCSETSW2(termios_ptr)
+            | IoctlArg::TCSETSF2(termios_ptr) => {
+                let termios: litebox_common_linux::Termios2 = termios_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.set_entry_metadata(fd, TermiosState(termios.into()));
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 // Query the real terminal size where the platform can provide it (e.g. via
                 // `GetConsoleScreenBufferInfo` on Windows); fall back to the traditional 80x24
@@ -7963,6 +8099,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .read_at_offset::<Platform>(0)
                     .ok_or(Errno::EFAULT)?;
                 pair.set_termios(termios);
+                Ok(0)
+            }
+            IoctlArg::TCGETS2(termios_ptr) => {
+                termios_ptr
+                    .write_at_offset::<Platform>(
+                        0,
+                        litebox_common_linux::Termios2::from(pair.get_termios()),
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS2(termios_ptr)
+            | IoctlArg::TCSETSW2(termios_ptr)
+            | IoctlArg::TCSETSF2(termios_ptr) => {
+                let termios: litebox_common_linux::Termios2 = termios_ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or(Errno::EFAULT)?;
+                pair.set_termios(termios.into());
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
@@ -8464,6 +8618,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
             | IoctlArg::TCSETSF(..)
+            | IoctlArg::TCGETS2(..)
+            | IoctlArg::TCSETS2(..)
+            | IoctlArg::TCSETSW2(..)
+            | IoctlArg::TCSETSF2(..)
             | IoctlArg::TIOCGWINSZ(..)
             | IoctlArg::TIOCSWINSZ(..)
             | IoctlArg::TIOCGPTN(..)
@@ -12202,5 +12360,112 @@ mod tests {
                 .unwrap_err(),
             Errno::ENOTTY
         );
+    }
+}
+
+/// What [`SharedFlockTable::new`] and [`SharedRecordLockTable::new`] produce when NEITHER the
+/// shared arena nor the process heap can hold the region, driven directly.
+///
+/// That state used to be an `.expect("fallback allocation failed")`, i.e. a panic inside the one
+/// host process that IS the whole guest session. What it has to be instead is the same answer
+/// `excludes == false` already gives: `None`, meaning "this table cannot key this lock", so the
+/// caller falls back to its per-process table and the guest sees a lock it can still hold or be
+/// refused -- never a dead session. These are the assertions that make that more than a comment,
+/// and they need no second host process to make: a table with no region has nothing to share.
+#[cfg(test)]
+mod degraded_lock_table_tests {
+    use super::{SharedFlockTable, SharedRecordLockQuery, SharedRecordLockTable};
+    use crate::syscalls::tests::{TestPlatform, test_platform};
+
+    /// A `(dev, path)` no other test in this file uses.
+    const DEV: usize = 0xde_ad_10_cc;
+
+    #[test]
+    fn a_flock_table_with_no_region_degrades_instead_of_panicking() {
+        let platform = test_platform(None);
+        let table = SharedFlockTable::<TestPlatform>::new_absent();
+        let path = b"/tmp/degraded-flock".to_vec();
+        let never = || false;
+
+        assert!(
+            !table.excludes(),
+            "a table with no region must not claim it excludes"
+        );
+        // `None` is "the caller's per-process `FlockFile` takes over", and it is the answer for a
+        // BLOCKING request too: a waiter must not park on a futex word that does not exist.
+        assert_eq!(
+            table.lock(platform, DEV, &path, 1, 100, true, true, &never),
+            None
+        );
+        assert_eq!(
+            table.lock(platform, DEV, &path, 1, 100, false, false, &never),
+            None
+        );
+        assert!(!table.unlock(DEV, &path, 1, 100));
+        // No region means no address for a `FlockHolder` to record, which `FlockHolderInner`
+        // already reads as "nothing to release" -- so a lock taken while degraded (i.e. in the
+        // per-process table) never reaches back into a region that is not there.
+        assert_eq!(table.region_addr(), 0);
+
+        // CONTROL: the same call against a table that DOES have a region must succeed, so the
+        // `None`s above are the absent region's answer and not a request this test mis-shaped.
+        let live = SharedFlockTable::<TestPlatform>::new_local();
+        assert_eq!(
+            live.lock(platform, DEV, &path, 1, 100, true, true, &never),
+            Some(Ok(()))
+        );
+    }
+
+    #[test]
+    fn a_record_lock_table_with_no_region_degrades_instead_of_panicking() {
+        let platform = test_platform(None);
+        let table = SharedRecordLockTable::<TestPlatform>::new_absent();
+        let path = b"/tmp/degraded-record".to_vec();
+        let never = || false;
+
+        assert!(
+            !table.excludes(),
+            "a table with no region must not claim it excludes"
+        );
+        // Both the blocking (`F_SETLKW`) and non-blocking (`F_SETLK`) forms, and the unlock.
+        assert_eq!(
+            table.apply(
+                platform, DEV, &path, 1, 100, 0, 64, true, false, false, &never
+            ),
+            None
+        );
+        assert_eq!(
+            table.apply(
+                platform, DEV, &path, 1, 100, 0, 64, false, true, false, &never
+            ),
+            None
+        );
+        assert_eq!(
+            table.apply(
+                platform, DEV, &path, 1, 100, 0, 64, false, false, true, &never
+            ),
+            None
+        );
+        // `F_GETLK` cannot answer from a table that holds nothing: the per-process table is asked.
+        assert!(matches!(
+            table.conflicting_claim(DEV, &path, 1, 100, 0, 64, true),
+            SharedRecordLockQuery::Unavailable
+        ));
+        // Process exit dropping every claim is a no-op here, not a walk over absent rows.
+        table.release_process(1, 100);
+
+        // CONTROL: the same claim against a table that DOES have a region is applied, and `F_GETLK`
+        // finds nothing to conflict with -- so the `None`s above are the absent region's answer.
+        let live = SharedRecordLockTable::<TestPlatform>::new_local();
+        assert_eq!(
+            live.apply(
+                platform, DEV, &path, 1, 100, 0, 64, true, false, true, &never
+            ),
+            Some(Ok(()))
+        );
+        assert!(matches!(
+            live.conflicting_claim(DEV, &path, 1, 100, 0, 64, true),
+            SharedRecordLockQuery::NoConflict
+        ));
     }
 }

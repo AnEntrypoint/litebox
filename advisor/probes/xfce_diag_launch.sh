@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # XFCE launch script with the diagnostics the advisor has been asking for, and without the
 # fixed-sleep races that invalidated earlier measurements.
 #

@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Grab the X root window and print it as coarse ASCII.
 
 Verifying that a desktop actually PAINTED normally means running the whole capture/encode/stream

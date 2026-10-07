@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Find what destroys a DRM scanout buffer's contents, from a LITEBOX_DRM_TRACE run.
 
 The blackout signature: a framebuffer that is created once, never destroyed, and

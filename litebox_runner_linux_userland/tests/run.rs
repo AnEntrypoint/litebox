@@ -297,18 +297,64 @@ fn test_host_program_with_rewrite_syscalls() {
     assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
 }
 
-/// Get the path of a program using `which`
+/// Get the path of a program using `which`, or `None` if it is not installed.
+///
+/// A test whose host program is missing must SKIP, not fail -- see [`skip`].
 #[cfg(target_arch = "x86_64")]
-fn run_which(prog: &str) -> std::path::PathBuf {
-    let prog_path_str = std::process::Command::new("which")
+fn find_program(prog: &str) -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("which")
         .arg(prog)
         .output()
         .expect("Failed to find program binary")
         .stdout;
-    let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
-    let prog_path = std::path::PathBuf::from(prog_path_str);
-    assert!(prog_path.exists(), "Program binary not found");
-    prog_path
+    let path = std::path::PathBuf::from(String::from_utf8(output).unwrap().trim());
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Get the path of a program using `which`
+#[cfg(target_arch = "x86_64")]
+fn run_which(prog: &str) -> std::path::PathBuf {
+    find_program(prog).unwrap_or_else(|| panic!("Program binary {prog} not found"))
+}
+
+/// End the calling test early, reporting `why` instead of failing it.
+///
+/// This suite runs against whatever Linux host invokes it, and several of its tests need host
+/// capabilities that are not universal: `/dev/net/tun` plus `CAP_NET_ADMIN` for the TUN tests, a
+/// `python3` whose stdlib can be staged into the guest rootfs for the python tests, `iperf3` or
+/// `curl` on `$PATH`. A missing capability is a gap in the HOST, not a litebox bug, so the test
+/// says so and returns -- otherwise `cargo test` is red on every unprivileged container for
+/// reasons that have nothing to do with the code under test
+/// (see `docs/LINUX-TEST-SUITE.md`).
+#[track_caller]
+fn skip(why: &str) {
+    println!("SKIPPED {}: {why}", std::panic::Location::caller());
+}
+
+/// Whether this host can actually create a TUN interface.
+///
+/// Both halves are required: the `/dev/net/tun` device node must exist, and the process must hold
+/// `CAP_NET_ADMIN` (bit 12 of `/proc/self/status`'s `CapEff`). Lacking either, the runner dies
+/// before the guest ever sees an interface, which used to be reported as a test failure on hosts
+/// that simply cannot do TUN at all.
+fn tun_available() -> bool {
+    if !Path::new("/dev/net/tun").exists() {
+        return false;
+    }
+    const CAP_NET_ADMIN: u64 = 1 << 12;
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        })
+        .is_some_and(|eff| eff & CAP_NET_ADMIN != 0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -347,8 +393,24 @@ fn test_runner_with_ls() {
     }
 
     // test `ls` subdir
+    //
+    // Where this host keeps its shared libraries is a HOST LAYOUT question, not a constant: on a
+    // usrmerged host `ldd` resolves `ls`'s dependencies to `/usr/lib/x86_64-linux-gnu`, and the
+    // guest rootfs only carries the paths `ldd` actually named -- so a hardcoded
+    // `/lib/x86_64-linux-gnu` (a host symlink to the same place, and an empty directory inside
+    // the guest) lists nothing. Ask `ldd`; that is the directory `Runner::new` staged.
+    let lib_dir = common::find_dependencies(ls_path.to_str().unwrap())
+        .into_iter()
+        .find(|dep| dep.ends_with("/libc.so.6"))
+        .map(PathBuf::from)
+        .as_deref()
+        .and_then(Path::parent)
+        .expect("ls links against libc.so.6")
+        .to_str()
+        .unwrap()
+        .to_string();
     let output = Runner::new(&ls_path, "ls_lib_rewriter")
-        .args(["-a", "/lib/x86_64-linux-gnu"])
+        .args(["-a", &lib_dir])
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
@@ -397,13 +459,29 @@ fn python_runner(unique_name: &str) -> Runner {
     println!("Detected PYTHONPATH: {python_sys_path}");
     let python_home = python_home.trim().to_string();
     let python_home_dir = PathBuf::from(&python_home);
+    // A venv keeps its stdlib in the BASE prefix, not in `sys.prefix`: on this host
+    // `which python3` resolves to /lsiopy/bin/python3 (`sys.prefix=/lsiopy`) while
+    // `sysconfig`'s stdlib -- the directory holding `encodings/`, `os.py`, ... -- is
+    // /usr/lib/python3.14. Staging only what sits under `sys.prefix` therefore ships a rootfs
+    // with no stdlib at all, and python's own bootstrap dies with
+    // "ModuleNotFoundError: No module named 'encodings'". Stage the stdlib too, wherever it is.
+    let python_stdlib = run_python(&[
+        "-c",
+        "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
+    ]);
+    println!("Detected stdlib: {python_stdlib}");
+    let python_stdlib_dir = PathBuf::from(python_stdlib.trim());
+    let mut stage_roots = vec![python_home_dir.clone()];
+    if python_stdlib_dir.is_absolute() {
+        stage_roots.push(python_stdlib_dir);
+    }
     let python_lib_paths = python_sys_path
         .split(':')
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .filter(|path| path.starts_with(&python_home_dir))
+        .filter(|path| stage_roots.iter().any(|root| path.starts_with(root)))
         .collect::<Vec<_>>();
 
     let python_lib_paths_str = python_lib_paths
@@ -572,6 +650,10 @@ fn test_runner_with_python_repl_pty() {
 
 #[test]
 fn test_tun_with_tcp_socket() {
+    if !tun_available() {
+        skip("no /dev/net/tun or no CAP_NET_ADMIN on this host");
+        return;
+    }
     let tcp_server_path = PathBuf::from("./tests/net/tcp_server.c");
     let tcp_client_path = PathBuf::from("./tests/net/tcp_client.c");
     let unique_name = "tcp_server_exec_rewriter";
@@ -609,8 +691,15 @@ fn test_tun_with_tcp_socket() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tun_and_runner_with_iperf3() {
+    if !tun_available() {
+        skip("no /dev/net/tun or no CAP_NET_ADMIN on this host");
+        return;
+    }
+    let Some(iperf3_path) = find_program("iperf3") else {
+        skip("iperf3 is not installed on this host");
+        return;
+    };
     const NUM_CLIENTS: usize = 1;
-    let iperf3_path = run_which("iperf3");
     let cloned_path = iperf3_path.clone();
     let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_started_clone = has_started.clone();
@@ -667,6 +756,15 @@ fn test_tun_with_curl() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    if !tun_available() {
+        skip("no /dev/net/tun or no CAP_NET_ADMIN on this host");
+        return;
+    }
+    let Some(curl_path) = find_program("curl") else {
+        skip("curl is not installed on this host");
+        return;
+    };
+
     const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
 
     // Bind to an OS-assigned port on all interfaces.
@@ -690,7 +788,6 @@ fn test_tun_with_curl() {
             .expect("Failed to send response");
     });
 
-    let curl_path = run_which("curl");
     let url = format!("http://10.0.0.1:{port}/something");
     let output = Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])

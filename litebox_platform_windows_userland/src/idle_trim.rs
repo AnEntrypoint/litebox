@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Hands an idle host process's physical pages back to Windows.
 //!
 //! A desktop session is dozens of host processes, most of them asleep (daemons, panels, idle

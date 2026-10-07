@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Create the missing SONAME links in an extracted guest layer.
 
 Cause: tar does not preserve the symlinks a normal distro install creates, so a

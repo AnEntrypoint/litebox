@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # All DT_NEEDED of the xpm loader resolve (ldd: zero "not found"), so a broken
 # dependency chain is ruled out. Remaining candidates for "cache is valid, .so
 # is loadable, yet no format registers":

@@ -1,4 +1,8 @@
-#!/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # usage: t.sh 'shell commands' [timeout]
 R=/home/user/litebox/target/release/litebox_runner_linux_userland
 cd /home/user/wt

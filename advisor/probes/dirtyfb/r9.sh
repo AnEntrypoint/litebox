@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # ENDPOINT-2 TEST with DIRTYFB implemented.
 # Xorg is a FORKED child (the case the placement_floor fix repaired).
 # Clients are plain fork+exec -- no wrapper, no retry loop, no second runner.

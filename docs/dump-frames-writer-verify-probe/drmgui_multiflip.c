@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 /* Repeated-PAGE_FLIP DRM guest probe -- verifies LITEBOX_DUMP_FRAMES' background-writer change
  * (bounded queue + dedicated writer thread, LITEBOX_DUMP_FRAMES_EVERY sampling, and
  * LITEBOX_DUMP_FRAMES_METADATA_ONLY) against a real, repeated flip workload instead of the single

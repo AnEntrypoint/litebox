@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Guest-side probe, phase 2: a genuinely minimal Wayland COMPOSITOR (not just the DRM backend
 //! layer phase 1 already proved) -- a real Unix-socket-listening `wl_display` that accepts a real
 //! Wayland client, advertises `wl_compositor`+`wl_shm`, and on the client's first `wl_surface`

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Lazy (reserve-then-commit-on-first-fault) memory population for cross-process
 //! `LITEBOX_PROCESS_FORK=1` fork children -- the mechanism 76th-82nd pass's own RAM-crater
 //! investigation converged on as the only remaining safe lever (see `AGENTS.md`'s "Where things

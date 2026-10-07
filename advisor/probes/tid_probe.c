@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Guest-side probe (Linux/musl): is the per-thread tid plumbing correct?
 // A musl pthread_mutex stores self->tid in the lock word's low 30 bits, so a thread whose
 // tid field is 0 produces a lock word of exactly 0x80000000 once another thread waits on it,

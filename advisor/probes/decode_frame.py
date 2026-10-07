@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Report what a captured frame actually CONTAINS, not just how many pixels are lit.
 
 Why this exists: `non_black_pixels` from LITEBOX_DUMP_FRAMES cannot distinguish

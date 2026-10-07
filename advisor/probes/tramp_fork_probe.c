@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Fast repro for the deterministic #UD-in-a-trampoline fault that kills the first backgrounded
 // service in every launch script (advisory 3F).
 //

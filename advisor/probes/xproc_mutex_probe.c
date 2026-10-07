@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // xproc_mutex_probe.c -- live verification of a cross-process mutex for litebox
 // (ADVISORY-002 Track B step 2).
 //

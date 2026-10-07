@@ -1,4 +1,8 @@
-#!/usr/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 export HOME=/root
 # swap in the wrapper (writable layer overlays the read-only image)
 cp /usr/bin/xkbcomp /usr/bin/xkbcomp.real 2>/dev/null

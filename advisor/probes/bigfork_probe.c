@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Minimal repro for the deterministic instruction-fetch fault seen in Xwayland's keymap helper.
 //
 // Observed shape (2026-09-03, two independent runs): a LARGE process (Xwayland: ~296 relocation

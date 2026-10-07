@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Automates the manual "cross-reference a crash rip/addr against fork_verify's own logged
 // relocation table" technique this project's own debugging history has repeatedly done BY HAND
 // (see AGENTS.md's "libcairo"/"libwayland-client" symbolization passes) -- every prior instance

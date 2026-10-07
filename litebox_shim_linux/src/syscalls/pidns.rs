@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! PID namespaces (`CLONE_NEWPID`).
 //!
 //! A task sees the pids allocated in the namespace it belongs to: the child of a

@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Build a trimmed `linuxserver/webtop:debian-xfce` rootfs for the Xvfb + selkies + XFCE stack.
 
 The stock image packs to a 9.0 GB tar of 119k entries, and loading it costs the runner ~7 GB of

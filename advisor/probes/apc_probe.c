@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Probe: can a parent interrupt a cloned child's thread with QueueUserAPC2 (special user APC)?
 #include <windows.h>
 #include <winternl.h>

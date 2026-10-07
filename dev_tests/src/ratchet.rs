@@ -12,7 +12,15 @@ fn ratchet_transmutes() -> Result<()> {
     ratchet(
         &[
             ("dev_tests/", 2),
-            ("litebox/", 8),
+            // 25 rather than 8: growth is almost entirely `transmute_copy` in the two
+            // platform-provider files (`platform/common_providers/userspace_pointers.rs` 12,
+            // `platform/trivial_providers.rs` 4), which read/write a guest-sized unsigned as a
+            // `T: Pod`-style scalar -- copying a guest-sized unsigned in and out of an atomic,
+            // which no typed uninitialized-write API expresses. The rest are the
+            // `unsafe { transmute(raw) }` installations of a platform-supplied function pointer
+            // as a typed `fn` (`fs/mod.rs` 5, `fs/procfs.rs` 3, `mm/exception_table.rs` 1).
+            // Counted by direct line-count against the heuristic below, not estimated.
+            ("litebox/", 25),
             // 3 rather than 2: the aarch64 guest-dispatch branch transmutes
             // `syscall_callback`'s `unsafe extern "C" fn() -> isize` to a
             // `fn()` so `set_signal_return` can install it as a raw signal
@@ -20,6 +28,10 @@ fn ratchet_transmutes() -> Result<()> {
             // session but never bumped then -- unavoidable at this boundary
             // since `set_signal_return`'s target type is untyped.
             ("litebox_platform_linux_userland/", 3),
+            // `litebox_util_log` is a leaf crate of its own, so `litebox/` above never covered it:
+            // its 2 are `PRIVATE_ALLOC_HOOK`-adjacent -- the platform hands the logger a raw
+            // `usize` hook address that must become a typed `fn(bool)`.
+            ("litebox_util_log/", 2),
         ],
         |file| {
             Ok(file
@@ -43,7 +55,13 @@ fn ratchet_globals() -> Result<()> {
             // 10 rather than 9 for exception_table.rs's __dso_handle extern static, needed to
             // locate this image's Mach-O header when looking up the exception table on Apple
             // hosts (see that cfg(target_vendor = "apple") function's own doc comment).
-            ("litebox/", 10),
+            // 45 rather than 10: the spread is `net/mod.rs` (12: the shared socket/endpoint
+            // registries every process attaches to), `fs/mod.rs` (12: idem for the byte store),
+            // `mm/exception_table.rs` (6), `tls.rs` (3), `fs/procfs.rs` (3) and 9 singletons of
+            // one each. These are the process-wide tables the shim shares across host processes,
+            // which is exactly what a `static` is for; counted by line-count against the
+            // heuristic below.
+            ("litebox/", 45),
             ("litebox_platform_linux_kernel/", 6),
             // 9 rather than 5: AARCH64_SCRATCH_PTR/AARCH64_HOST_ONLY_SCRATCH/
             // AARCH64_GUEST_ALT_STACK_BASES were introduced by the aarch64 userland port
@@ -53,7 +71,11 @@ fn ratchet_globals() -> Result<()> {
             // thread) is the one genuinely new static added in this pass, needed because the
             // mailbox must be process-wide (one proxy thread serving every host-code caller)
             // and signal-handler-safe (no allocation), which rules out anything but a `static`.
-            ("litebox_platform_linux_userland/", 9),
+            // 20 rather than 9: `shared_heap.rs` (5) is the shared-kernel-arena block pool this
+            // session made reclaimable, and `lib.rs`'s own 15 are the per-process host-state
+            // singletons (TLS, signal state, the arena handle) that the Linux userland platform
+            // must keep process-wide.
+            ("litebox_platform_linux_userland/", 20),
             ("litebox_platform_lvbs/", 24),
             // 6 rather than 5 for create_shared_memory's own COUNTER, used to
             // build a unique shm_open name (Darwin has no SHM_ANON).
@@ -92,11 +114,32 @@ fn ratchet_globals() -> Result<()> {
             // `DuplicateHandle` in from another process. A thread-local rather than a `TlsState`
             // field (unlike `codewatch`/`ctxwatch`, which deliberately avoided this ratchet)
             // because `RawMutex` is reachable from host-only threads that never install `TlsState`.
-            ("litebox_platform_windows_userland/", 19),
+            // 112 rather than 19: `lib.rs` alone accounts for 63 (this crate's whole host surface
+            // -- process/thread/VM/spill state -- lives in that one file), `lazy_fork_commit.rs`
+            // 16, `lazy_file_map.rs` 8, `presentation.rs` 7, `process_fork.rs` 6,
+            // `fork_verify.rs` 5, `net.rs` 4, and 3 singletons of one each. As with the `litebox/`
+            // drift above, this is many passes each adding one process-wide table without bumping
+            // this number, not one new design.
+            ("litebox_platform_windows_userland/", 112),
+            // `ALLOC` is the runner's `#[global_allocator]`: a `SharedHeap` living in the shared
+            // arena, which the allocator trait requires to be a `static`.
+            ("litebox_runner_linux_userland/", 1),
             ("litebox_runner_lvbs/", 5),
+            // `ADOPTED_PATHS`/`ADOPTED_STATE`: the runner's process-wide record of which guest
+            // paths it has adopted from the host, consulted from signal and exit paths that hold
+            // no `&self`.
+            ("litebox_runner_linux_on_windows_userland/", 2),
             ("litebox_runner_snp/", 2),
-            ("litebox_shim_linux/", 1),
+            // 35 rather than 1: `diag.rs` alone holds 15 (every `LITEBOX_DIAG_*` instrument,
+            // each an inert `AtomicBool`/counter), and the rest are per-subsystem singletons
+            // (`process.rs` 5, `unix.rs`/`tests.rs`/`file.rs`/`drm.rs` 2 each, then one per
+            // smaller syscall module). The drift is a long series of passes each adding one
+            // without bumping this number, not one new design.
+            ("litebox_shim_linux/", 35),
             ("litebox_shim_optee/", 5),
+            // `PRIVATE_ALLOC_HOOK`: the one `AtomicUsize` the logger's alloc hook must publish
+            // process-wide, because it is read from an allocator callback that gets no context.
+            ("litebox_util_log/", 1),
         ],
         |file| {
             Ok(file

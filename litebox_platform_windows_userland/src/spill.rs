@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::FileExt as _;
 use std::path::PathBuf;

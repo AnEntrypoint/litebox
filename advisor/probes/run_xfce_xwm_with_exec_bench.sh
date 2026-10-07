@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Combined verification: launch the canonical, already-proven-stable XFCE session
 # (identical recipe to run_xfce_xwm.sh -- see that script's own comments for why
 # every service is started ALONE with settle delays: at most one fork_verify

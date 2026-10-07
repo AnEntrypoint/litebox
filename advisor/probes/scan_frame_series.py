@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Scan a numbered series of litebox_frame_dump_N.bmp files and report
 non_black_pixels per frame, to locate a blanking/degradation transition.
 

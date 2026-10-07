@@ -1,4 +1,8 @@
-#!/usr/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 export HOME=/root
 # exec => this shell BECOMES Xorg, so Xorg is pid 1 and is never a forked child.
 # -listen tcp: X normally disables TCP; we need it so a client in a SECOND runner

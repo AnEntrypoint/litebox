@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 import re,subprocess,sys
 exe=r'C:\dev\litebox-main\target\release\litebox_runner_linux_on_windows_userland.exe'
 for f in sys.argv[1:]:

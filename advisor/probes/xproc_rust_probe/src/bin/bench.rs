@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Isolated cost of the cross-process mutex's acquire/release, and a head-to-head
 //! against the obvious alternative design (a named kernel `Mutex` object).
 //!

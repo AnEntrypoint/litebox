@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """litebox bring-up shim for the selkies webtop stack.
 
 Two jobs, both narrow:

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # WHICH libgdk_pixbuf does the guest actually get, and can it load?
 #
 # The layer contains TWO different builds of libgdk_pixbuf-2.0.so.0 at the SAME path (duplicate

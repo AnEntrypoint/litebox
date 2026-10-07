@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use alloc::{string::String, vec, vec::Vec};
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use litebox::{

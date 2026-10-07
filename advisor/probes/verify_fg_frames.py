@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Cross-verify the ENDPOINT-2 foreground-daemon XFCE frames against the
 `-retro` root-weave baseline.
 

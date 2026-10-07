@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 import struct,sys,zlib
 d=open(sys.argv[1],'rb').read()
 h=struct.unpack('>25I',d[:100])

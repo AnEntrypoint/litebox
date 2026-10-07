@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal, fast repro: does bwrap (bubblewrap) work at all under litebox, and
 # does glycin-image-rs succeed at decoding a PNG through it? Tests the leading
 # hypothesis for the xfce4-panel SIGABRT: Alpine's gdk-pixbuf is built with

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // xproc_mutex_clone_probe.c -- verify the cross-process mutex protocol under the
 // ACTUAL eventual use case: `RtlCloneUserProcess` (ADVISORY-002 Track B step 5),
 // rather than the ordinary `CreateProcessW` used by xproc_mutex_probe.c.

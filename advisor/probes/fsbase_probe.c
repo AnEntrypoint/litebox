@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Probe: when does Windows clear a user-written FS base? (wrfsbase needs CR4.FSGSBASE)
 #include <windows.h>
 #include <stdio.h>

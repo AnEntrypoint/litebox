@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 int main() {
     int r = write(STDOUT_FILENO, (const void *)0x10000, 1);

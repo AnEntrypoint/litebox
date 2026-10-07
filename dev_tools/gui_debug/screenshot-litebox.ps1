@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Screenshots the litebox `--gui` window reliably, working around a real, repeatedly-hit issue in
 # this dev environment: `SetForegroundWindow`/`AttachThreadInput` frequently fail to bring the
 # litebox window to front (Windows' own foreground-lock protection rejects the request when this

@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 import os,subprocess,re,struct,sys
 root=int(subprocess.check_output(['pgrep','-x','litebox_runner_']).split()[0])
 addr=None

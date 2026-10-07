@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Build a MINIMAL --initial-files tar for an X11 client, from the already-cached
 # OCI layers of linuxserver/webtop:debian-xfce.
 #

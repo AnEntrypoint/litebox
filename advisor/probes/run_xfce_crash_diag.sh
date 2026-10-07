@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Diagnostic variant of run_xfce_gschema.sh: extends the settle window well past
 # the observed Xwayland SIGABRT (t=115.7s) and hard-hang (t=56.2s) boundaries,
 # and dumps weston.out (which carries Xwayland's own stderr, since weston spawns

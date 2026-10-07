@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Does dlopen work under litebox, and specifically does gdk-pixbuf's loader module load?
 //
 // The pixbuf evidence trail (advisor/probes/headless-evidence/pixbuf-findings.txt) ends at a

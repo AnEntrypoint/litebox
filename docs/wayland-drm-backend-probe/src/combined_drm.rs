@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Full end-to-end probe: a real `wayland-client` connecting to a real, unmodified-shape Wayland
 //! compositor built on litebox's DRM emulation, with the commit handler pushing the client's
 //! committed `wl_shm` pixels all the way through `push_to_drm_dumb_buffer` (`main.rs`'s own real

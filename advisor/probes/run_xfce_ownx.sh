@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # run_xfce_xwm.sh + THREE FIXES: an OWN rootful Xwayland on :1 (so XFCE owns the WM role),
 # gsettings schema compile, and the gdk-pixbuf cache.
 #

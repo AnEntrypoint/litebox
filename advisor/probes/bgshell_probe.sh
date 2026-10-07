@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal repro for the guest-shell fragility that blocks every XFCE launch path.
 #
 # Observed (2026-09-03): launch scripts die partway through, with FOUR different fatal signals

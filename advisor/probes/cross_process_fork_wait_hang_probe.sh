@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Minimal repro for a parent hang after TWO back-to-back cross-process `fork()`s
 # (`LITEBOX_PROCESS_FORK=1`), discovered 2026-09-10 while chasing why the real
 # `webtop_stack.sh` boot (nginx's SSL cert supervisor loop) stalls forever after the

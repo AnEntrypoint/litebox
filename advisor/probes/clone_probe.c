@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Probe: is RtlCloneUserProcess a usable fork() primitive on this host?
 // Checks: CoW isolation of private memory, sharing of a pre-clone section view,
 // inherited pipe handle usable from the child, NtCreateThreadEx (and CreateThread) in the child,

@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Does the missing inotify actually DEGRADE dbus, or does dbus fall back cleanly?
 # "Cannot initialize inotify" is printed at startup regardless, so the message alone
 # proves nothing. The functional test is service ACTIVATION: dbus reads its service

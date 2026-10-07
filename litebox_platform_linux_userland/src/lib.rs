@@ -4448,7 +4448,23 @@ unsafe extern "C" fn exception_signal_handler(
         // at RIP-1..RIP. Recognize it and emulate the syscall via the same TLS
         // PtRegs that `copy_signal_context` just filled, instead of delivering
         // a fatal SIGSEGV/SIGTRAP.
+        //
+        // That probe reads `rip - 1`, so it is only safe when that byte sits on the SAME page
+        // as `rip` -- a page already known to be mapped, since fetching (or nearly fetching)
+        // from it is what trapped. A fault whose RIP sits at offset 0 of its page would read
+        // into whatever precedes that page, which is very often not mapped at all, so the
+        // probe itself takes a SECOND fault -- inside this handler, with SIGSEGV blocked, so
+        // the nested fault can neither be handled nor reported and the thread is simply lost.
+        // That is exactly where the synthesized sigreturn trampoline sits (offset 0 of its own
+        // fresh `mmap`), so EVERY delivery through it died this way: live-caught as the guest
+        // handler running and returning, then a hard hang with RSS climbing past 1.7 GB and no
+        // further fault, syscall or log line -- `sys_rt_sigreturn` was never reached, because
+        // the probe read `rip - 1` and nothing after it ever ran. `rip & 0xfff != 0` confines
+        // the probe to the one page already proven mapped; the only case it now declines is an
+        // `ICEBP;HLT` pair split across a page boundary (F1 last byte of one page, F4 first
+        // byte of the next), which the rewriter never emits -- it writes the pair whole.
         let is_syscall_trap = rip >= 1
+            && rip & 0xfff != 0
             && unsafe {
                 *(rip.wrapping_sub(1) as *const u8) == 0xF1 && *(rip as *const u8) == 0xF4
             };

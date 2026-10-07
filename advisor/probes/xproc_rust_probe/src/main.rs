@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Live verification of `litebox_platform_windows_userland::xproc_sync` across TWO
 //! REAL, SEPARATE Windows processes.
 //!

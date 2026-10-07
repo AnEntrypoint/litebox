@@ -1,4 +1,8 @@
-#!/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # usage: t2.sh 'guest shell commands' ; runs with tun0 configured on host (10.0.0.1), guest 10.0.0.2
 R=/home/user/litebox/target/release/litebox_runner_linux_userland
 cd /home/user/wt

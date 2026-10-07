@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Audit an extracted guest layer for unresolvable shared-library dependencies.
 
 Every "Error loading shared library X: No such file or directory" costs a full

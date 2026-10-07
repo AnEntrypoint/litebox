@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Minimal DRM page-flip probe: drives the virtual /dev/dri/card0 scanout path end-to-end
 // WITHOUT weston, Xwayland, or any part of XFCE, turning a multi-minute full-stack launch into
 // a ~1s test of the display pipeline itself.

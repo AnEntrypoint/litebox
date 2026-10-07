@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Isolates the exact glycin shape WITHOUT execve (which a freestanding binary
 // cannot survive being re-loaded into):
 //   socketpair -> fork -> PARENT closes its copy of the child's end -> child writes.

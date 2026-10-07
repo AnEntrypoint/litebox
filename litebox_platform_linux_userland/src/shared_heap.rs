@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A `#[global_allocator]` whose memory lives in one `MAP_SHARED` arena, so every process in a
 //! native-`fork()` family sees the same heap at the same addresses.
 //!

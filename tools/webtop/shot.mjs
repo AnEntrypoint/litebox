@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // usage: node shot.mjs URL out.png [waitSeconds]
 import fs from 'node:fs';
 const [url, out, wait='20'] = process.argv.slice(2);

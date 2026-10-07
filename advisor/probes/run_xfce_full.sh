@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # run_xfce_xwm.sh + THREE FIXES: gsettings schema compile, gdk-pixbuf cache, and xfwm4 --replace.
 #
 # Evidence for each, from a full headless boot of the pixbuf-only variant (all stages reached,

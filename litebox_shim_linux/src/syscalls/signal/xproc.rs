@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Cross-process process registry and signal delivery.
 //!
 //! Under `LITEBOX_PROCESS_FORK=1` a guest `fork()` child can be a separate host process, so the

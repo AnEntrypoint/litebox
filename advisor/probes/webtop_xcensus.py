@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 """Census the X server's window tree and its client list, through libX11 via ctypes.
 
 `xlsclients` is not in this image and `xwininfo` cannot be relied on either, so "is anything

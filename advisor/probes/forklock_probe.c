@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Freestanding guest probe: does a fork() child's writes leak into the PARENT's memory?
 //
 // This is the 30-line version of the xfce4-session futex deadlock. musl's fork() has the child

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Verifies genuine CROSS-PROCESS pty I/O over `SharedPtyTable` (litebox_shim_linux/src/
 // syscalls/pty.rs, landed acb8615). That pass wired ptmx_open/pts_open/pty_master_read/write
 // into a shared-arena-native fixed table (8 slots, two SharedByteRings per slot) so a pty

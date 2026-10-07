@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // Guest-side conformance probe (Linux/musl): memfd + shared mappings must be coherent.
 // Build in the guest: cc -O1 -o memfd_probe memfd_probe.c
 // All checks pass on real Linux. Under litebox (as of 2026-09-03) the mmap-time sync and the

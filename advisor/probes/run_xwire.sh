@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # weston + Xwayland, then a RAW X client (no Xlib, no GTK) that creates a
 # window, maps it, and fills it bright green. Isolates "does the X path work"
 # from "does GTK work" -- no X client has ever drawn a pixel in this

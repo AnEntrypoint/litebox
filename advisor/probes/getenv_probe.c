@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 // LD_PRELOAD interposer: traces every getenv() call made by the process it is
 // preloaded into, and dumps the raw `environ` array at load time (constructor)
 // and at process exit (destructor). No libc headers, no sysroot needed on the

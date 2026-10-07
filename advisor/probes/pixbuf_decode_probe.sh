@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # libgdk_pixbuf has libglycin-2.so.0 as a DIRECT DT_NEEDED dep and its
 # gdk_pixbuf__glycin_* symbols are NOT exported -- so the glycin loader is a
 # built-in, needing no loaders.cache entry. The decode must therefore be failing

@@ -1,4 +1,8 @@
-#!/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # usage: runwt.sh WAIT  -> boots webtop /init under the Linux runner (env: LOGSPEC, TL)
 WAITS=${1:-120}
 ENVS=(--env PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/config --env LANG=en_US.UTF-8 --env TERM=xterm --env S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 --env S6_VERBOSITY=1 --env S6_STAGE2_HOOK=/docker-mods --env VIRTUAL_ENV=/lsiopy --env DISPLAY=:1 --env PERL5LIB=/usr/local/bin --env START_DOCKER=false --env PULSE_RUNTIME_PATH=/defaults --env SELKIES_INTERPOSER=/usr/lib/selkies_input_interposer.so --env DISABLE_DRI3=true --env SELKIES_ENABLE_BASIC_AUTH=false --env "SELKIES_ALLOWED_ORIGINS=*" --env "TITLE=Debian XFCE" --env LSIO_FIRST_PARTY=true --env PUID=1000 --env PGID=1000 --env TZ=UTC --env WAIT=$WAITS)
