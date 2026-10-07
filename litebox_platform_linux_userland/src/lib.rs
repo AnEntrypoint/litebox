@@ -1423,13 +1423,33 @@ syscall_callback:
     // This thread is done. Return.
     jmp .Ldone
 
-exception_callback:
+    exception_callback:
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
     mov rdi, [rsp] // pass thread_ctx
     call {exception_handler}
+    jmp .Ldone
+
+    // This entry point is reached from the host signal handler when a guest
+    // executes litebox's syscall trap (ICEBP;HLT = F1 F4) emitted by
+    // trap_all_syscalls_in_code for exec segments that could not be patched
+    // with a direct JMP (e.g. the dynamic loader / shared libs mapped by the
+    // guest at runtime, when no trampoline fits within JMP rel32 range). The
+    // kernel delivers this as SIGTRAP/#DB (icebp is trap-class, so the saved
+    // RIP already points past the 2-byte trap), and the guest register file at
+    // the trap holds the syscall number (rax) and arguments (rdi/rsi/rdx/
+    // r10/r8/r9), which `copy_signal_context` has already written into the TLS
+    // PtRegs. Emulate the syscall and let run_thread_arch re-enter the guest.
+    .globl syscall_trap_callback
+    syscall_trap_callback:
+    // Restore the stack and frame pointer.
+    mov     rsp, fs:host_sp@tpoff
+    mov     rbp, fs:host_bp@tpoff
+
+    mov rdi, [rsp] // pass thread_ctx
+    call {syscall_handler}
     jmp .Ldone
 
 interrupt_callback:
@@ -3073,6 +3093,7 @@ unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
     fn exception_callback();
+    fn syscall_trap_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
     fn switch_to_guest_end();
@@ -4284,12 +4305,32 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "x86_64")]
     {
         let sigctx = &context.uc_mcontext;
-        let (trapno, err, cr2) = (
-            sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
-            sigctx.gregs[libc::REG_ERR as usize].trunc(),
-            sigctx.gregs[libc::REG_CR2 as usize].trunc(),
-        );
-        set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+        let rip = sigctx.gregs[libc::REG_RIP as usize] as usize;
+        // litebox emits `ICEBP;HLT` (F1 F4) at unpatched syscall sites when a
+        // direct JMP trampoline could not be placed (e.g. the dynamic loader /
+        // shared libs the guest mmaps at runtime). icebp is trap-class, so the
+        // saved RIP points at the HLT (F4) byte; the full trap is the two bytes
+        // at RIP-1..RIP. Recognize it and emulate the syscall via the same TLS
+        // PtRegs that `copy_signal_context` just filled, instead of delivering
+        // a fatal SIGSEGV/SIGTRAP.
+        let is_syscall_trap = rip >= 1
+            && unsafe {
+                *(rip.wrapping_sub(1) as *const u8) == 0xF1 && *(rip as *const u8) == 0xF4
+            };
+        if is_syscall_trap {
+            // Resume the guest just past the 2-byte trap; `syscall_handler`
+            // reads the syscall number/args from the TLS PtRegs and writes the
+            // result back, then run_thread_arch re-enters the guest.
+            unsafe { (*regs).rip = rip + 1 };
+            set_signal_return(context, syscall_trap_callback, 0, 0, 0, 0);
+        } else {
+            let (trapno, err, cr2) = (
+                sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
+                sigctx.gregs[libc::REG_ERR as usize].trunc(),
+                sigctx.gregs[libc::REG_CR2 as usize].trunc(),
+            );
+            set_signal_return(context, exception_callback, 0, trapno, err, cr2);
+        }
     }
     // aarch64's SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP delivery carries the exception class and
     // fault address via siginfo/an extended sigcontext record, not fixed mcontext fields the
