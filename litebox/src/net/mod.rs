@@ -1257,6 +1257,28 @@ where
             // to the gateway, so a poll here would lose the frames it transmits.
             return smoltcp::iface::PollResult::None;
         }
+        // A STALL HERE STALLS THE WHOLE SESSION, so measure it instead of inferring it. Every
+        // other process returned above; this process's `interface.poll` is the only thing that
+        // moves a packet into or out of ANY fork family, so whatever keeps this process off its
+        // tick turns a connect to an armed, idle, accepting port into a TIMEOUT instead of a
+        // refusal -- chrF37 answered in 80 ms on 39 of 40 host probes and timed out for the full
+        // 20 s on the 40th, with two 8 s timeouts to two other ports from inside the guest, and
+        // nothing in any log said why. The gap is the whole explanation, so it is logged whenever
+        // this process was away for a second or more.
+        static LAST_POLL_MS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        let now_ms = self.now().millis();
+        let prev = LAST_POLL_MS.swap(now_ms, core::sync::atomic::Ordering::Relaxed);
+        if prev != 0 {
+            let gap_ms = now_ms.saturating_sub(prev);
+            if gap_ms >= 1000 {
+                litebox_util_log::warn!(
+                    gap_ms = gap_ms,
+                    uptime_ms = now_ms,
+                    owner_pid = self.litebox.platform().current_pid();
+                    "diag-poll-gap: the process that owns the IP interface went this long without polling it"
+                );
+            }
+        }
         self.interface
             .poll(self.now(), &mut self.device, &mut self.socket_set)
     }
