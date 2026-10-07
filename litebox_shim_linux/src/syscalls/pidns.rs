@@ -95,7 +95,31 @@ impl PidNamespaceTable {
     /// Slots are reclaimed, never refcounted: a namespace is dead once no live row mentions it
     /// (its init process, and every descendant, has exited), and a dead slot's id is never handed
     /// out twice while it is still referenced by a row.
-    pub(crate) fn create(&self, parent: u32) -> Option<u32> {
+    ///
+    /// `alive` names whether an internal pid is a process that still exists -- the SAME host-pid
+    /// liveness the shared process table, the flock/record-lock tables and the shared accept queue
+    /// each use to reclaim a dead holder. It is what makes this reclaim possible at all: a row is
+    /// released when a parent REAPS (`process.rs`'s `sys_wait4`), so a child nobody reaps keeps its
+    /// rows and would pin its namespace for the rest of the session.
+    pub(crate) fn create(&self, parent: u32, alive: &dyn Fn(i32) -> bool, reclaim: bool) -> Option<u32> {
+        static CREATES: AtomicU32 = AtomicU32::new(0);
+        let seen = CREATES.fetch_add(1, Ordering::Relaxed);
+        // Sweep periodically, not only when the table is full. A dead slot only BITES when the
+        // table is full, but the ROWS of the processes that pinned it are released by nobody until
+        // then (`release` runs on reap), and `MAX_MEMBERS` is the next cap a session can hit --
+        // measured: zygprobe2's rows reached 569 while only the slots were being recycled. 1 in 64
+        // creations is far below the rate a guest can fork at.
+        if reclaim && seen.wrapping_rem(64) == 0 {
+            let reclaimed = self.reclaim_dead(alive);
+            let (rows, namespaces) = self.occupancy();
+            litebox_util_log::warn!(
+                what = "sweep",
+                rows = rows,
+                namespaces = namespaces,
+                reclaimed = reclaimed;
+                "diag-pidtab: pid-namespace table occupancy"
+            );
+        }
         for attempt in 0..2 {
             for (index, slot) in self.namespaces.iter().enumerate() {
                 if slot.in_use.load(Ordering::Acquire) {
@@ -116,9 +140,95 @@ impl PidNamespaceTable {
                 slot.next_pid.store(1, Ordering::Release);
                 return Some(id);
             }
+            if attempt == 0 && reclaim {
+                let reclaimed = self.reclaim_dead(alive);
+                if reclaimed > 0 {
+                    litebox_util_log::warn!(
+                        reclaimed = reclaimed;
+                        "diag-pidtab: reclaimed pid-namespace slots whose every member is gone"
+                    );
+                }
+            }
         }
+        let (rows, namespaces) = self.occupancy();
+        litebox_util_log::warn!(
+            rows = rows,
+            namespaces = namespaces;
+            "diag-pidtab: CLONE_NEWPID refused - no namespace slot is free"
+        );
         None
     }
+
+    /// Frees every slot whose members are all gone, returning how many were freed.
+    ///
+    /// A namespace is alive exactly as long as a task in it is: its init, and every descendant,
+    /// each holds a row here named by its internal pid. So a slot is dead when no row naming it
+    /// belongs to a process that still exists -- which covers BOTH ways a namespace outlives its
+    /// usefulness: its processes exited and were reaped (no rows left), and its processes exited
+    /// and were never reaped (rows left, every one of them naming a process that is gone).
+    ///
+    /// Without this the table is not leaky but FINITE: `in_use` is set here and cleared nowhere
+    /// else, so `MAX_NAMESPACES` `CLONE_NEWPID` clones is a whole session's worth and every later
+    /// one comes back `EAGAIN`. Measured: zygprobe1 reached `namespaces=256` and the next
+    /// `CLONE_NEWPID` clone was refused, which is chromium's own
+    /// `Zygote could not fork: process_type utility numfds 7 child_pid -1`.
+    fn reclaim_dead(&self, alive: &dyn Fn(i32) -> bool) -> usize {
+        let mut reclaimed = 0;
+        for (index, slot) in self.namespaces.iter().enumerate() {
+            if !slot.in_use.load(Ordering::Acquire) {
+                continue;
+            }
+            let id = index as u32 + 1;
+            // `next_pid == 1` means the clone that created this slot has not registered its init
+            // yet: `create` and the `allocate` that follows it are two separate calls on shared
+            // state, so another host process can sit between them. Reclaiming there would hand
+            // one id to two namespaces.
+            if slot.next_pid.load(Ordering::Acquire) == 1 {
+                continue;
+            }
+            let mut any_live = false;
+            for row in self.members.iter() {
+                if row.ns_pid.load(Ordering::Acquire) == FREE_PID
+                    || row.ns.load(Ordering::Acquire) != id
+                {
+                    continue;
+                }
+                let internal = row.internal_pid.load(Ordering::Acquire);
+                if internal > 0 && alive(internal) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if any_live {
+                continue;
+            }
+            // Free the rows with it. They name processes that no longer exist, and a row left
+            // behind would make a LATER namespace that reuses this id look like it holds pid 1
+            // twice -- `translate`/`pid_in` would then answer for the wrong process. A parent
+            // still waiting on one of them is answered from its OWN namespace's row, not from
+            // this one, so nothing a live process can ask for is lost by freeing these.
+            for row in self.members.iter() {
+                if row.ns_pid.load(Ordering::Acquire) != FREE_PID
+                    && row.ns.load(Ordering::Acquire) == id
+                {
+                    row.internal_pid.store(FREE_PID, Ordering::Release);
+                    row.ns.store(INITIAL_NS, Ordering::Release);
+                    row.ns_pid.store(FREE_PID, Ordering::Release);
+                }
+            }
+            if slot
+                .in_use
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                slot.next_pid.store(1, Ordering::Release);
+                slot.parent.store(INITIAL_NS, Ordering::Release);
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
 
     /// The namespace `ns` was created inside -- the namespace its own creator lives in.
     ///

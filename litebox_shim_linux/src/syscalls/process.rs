@@ -5548,9 +5548,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `CLONE_NEWPID` creates one, whose first task is pid 1 there (and gets a pid in every
         // ancestor too, which is what lets the parent still `wait4` for it).
         let child_ns_id = if flags.contains(CloneFlags::NEWPID) {
+            // A namespace slot is held as long as a task in it exists, so it has to be recyclable
+            // or `MAX_NAMESPACES` `CLONE_NEWPID` clones is a whole session's budget. `alive` is
+            // host-pid liveness, the same test every other shared table reclaims a dead holder by.
+            let platform = self.global.platform;
+            let alive = |internal: i32| {
+                self.global
+                    .process_table
+                    .lookup(internal)
+                    .map_or(false, |view| platform.is_process_alive(view.host_pid))
+            };
+            // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (a slot is allocated
+            // once and never freed) so one binary proves both sides of this.
+            let reclaim = !self
+                .global
+                .platform
+                .env_flag("LITEBOX_PIDNS_RECLAIM_OFF");
             self.global
                 .pid_namespaces
-                .create(self.pid_ns.get())
+                .create(self.pid_ns.get(), &alive, reclaim)
                 .ok_or(Errno::EAGAIN)?
         } else {
             self.pid_ns.get()
