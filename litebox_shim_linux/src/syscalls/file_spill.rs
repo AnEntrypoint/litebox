@@ -86,6 +86,10 @@ pub(crate) struct SharedFileSpill {
 
 pub(crate) enum SpillEdit<'a> {
     Write { start: usize, bytes: &'a [u8] },
+    /// An `O_APPEND` write: `local_start` is where this process put the bytes, which is only a
+    /// guess at where they belong -- real Linux resolves an append's destination at write time, so
+    /// the store does too (see `apply`).
+    Append { bytes: &'a [u8], local_start: usize },
     Truncate(usize),
     Reset,
     Replace,
@@ -106,6 +110,9 @@ pub(crate) struct AppliedEdit {
     slot: usize,
     previous_generation: u64,
     new_generation: u64,
+    /// True when the store did NOT put this edit where this process's own copy put it, so the local
+    /// copy is now wrong and must be replaced from the store before it is read again.
+    local_diverged: bool,
 }
 
 impl SharedFileSpill {
@@ -201,6 +208,7 @@ impl SharedFileSpill {
             let slot_id = index as u32;
             let was_live = slot.state.load(Ordering::Relaxed) == SLOT_LIVE;
             let current_length = slot.length.load(Ordering::Relaxed);
+            let mut diverged = false;
             let new_length = if edit.needs_local_copy(was_live) {
                 copy_local_file(slot_id)?
             } else {
@@ -208,6 +216,18 @@ impl SharedFileSpill {
                     SpillEdit::Write { start, bytes } => {
                         platform.spill_write(slot_id, start as u64, bytes).then_some(())?;
                         current_length.max((start + bytes.len()) as u64)
+                    }
+                    // Real Linux resolves an `O_APPEND` write's destination AT WRITE TIME, under
+                    // the inode's own exclusion, which is why two appending writers never overwrite
+                    // each other. The spill lock is that exclusion here: `current_length` is read
+                    // and the new length published inside the same critical section, so a sibling
+                    // that appends next starts from this write's end, not from a snapshot of it.
+                    SpillEdit::Append { bytes, local_start } => {
+                        platform
+                            .spill_write(slot_id, current_length, bytes)
+                            .then_some(())?;
+                        diverged = local_start != current_length as usize;
+                        current_length + bytes.len() as u64
                     }
                     SpillEdit::Truncate(length) => {
                         platform.spill_set_len(slot_id, length as u64).then_some(())?;
@@ -232,6 +252,7 @@ impl SharedFileSpill {
                 slot: index,
                 previous_generation,
                 new_generation: previous_generation + 1,
+                local_diverged: diverged,
             })
         })
     }
@@ -410,7 +431,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         };
         let seen = &LOCALLY_SEEN_GENERATION[applied.slot];
-        if seen.load(Ordering::Acquire) == applied.previous_generation {
+        // Advancing `seen` claims "this process's private copy already matches the store". It only
+        // does when the copy was current as of `previous_generation` AND the store put this edit
+        // where this process put it; otherwise the next read must install the store's bytes, and
+        // leaving `seen` behind is exactly what makes `refresh_from_spill` do that.
+        if seen.load(Ordering::Acquire) == applied.previous_generation
+            && !applied.local_diverged
+        {
             seen.store(applied.new_generation, Ordering::Release);
         }
     }

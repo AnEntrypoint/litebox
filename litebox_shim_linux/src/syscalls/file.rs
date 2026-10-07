@@ -436,6 +436,11 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     /// resolve a path given relative to that fd (`dirfd`-relative resolution). Only file fds
     /// (as opposed to sockets/pipes/etc, which cannot serve as a `dirfd`) are ever inserted here.
     fd_paths: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, CString>>,
+    /// File fds that were opened `O_APPEND`, so a write on one can be published to the shared write
+    /// store as an append -- the store then picks the destination offset itself, which is the only
+    /// way two host processes appending to one file do not overwrite each other. Absent means "not
+    /// opened in append mode", which is the common case.
+    fd_append: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, bool>>,
     /// This process's own live SysV `shmat` attachments: THIS process's local mapping address ->
     /// `shmid`. `shmdt(shmaddr)` needs this to find which segment to detach, because (since the
     /// 51st pass, see `syscalls::mm::SysvShmSegment`'s own doc comment) a `shmat` address is now
@@ -565,6 +570,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(raw_descriptor_store),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
             fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
+            fd_append: litebox::sync::RwLock::new(self.fd_append.read().clone()),
             shm_attachments: litebox::sync::RwLock::new(shm_attachments),
         }
     }
@@ -579,6 +585,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             ),
             max_fd: AtomicUsize::new(usize::MAX),
             fd_paths: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            fd_append: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             shm_attachments: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         }
     }
@@ -597,8 +604,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.fd_paths.read().get(&raw_fd).cloned()
     }
 
+    /// Whether `raw_fd` was opened with `O_APPEND` -- see [`Self::fd_append`].
+    pub(crate) fn fd_was_opened_append(&self, raw_fd: usize) -> bool {
+        self.fd_append.read().get(&raw_fd).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn record_fd_append(&self, raw_fd: usize) {
+        self.fd_append.write().insert(raw_fd, true);
+    }
+
     fn forget_fd_path(&self, raw_fd: usize) {
         self.fd_paths.write().remove(&raw_fd);
+        self.fd_append.write().remove(&raw_fd);
     }
 
     /// Records that this process's own `shmat` mapped `shmid` at `addr` (a LOCAL address, valid
@@ -2337,6 +2354,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })?;
         if let Some(path) = path {
             files.record_fd_path(raw_fd, path);
+        }
+        if flags.contains(OFlags::APPEND) {
+            files.record_fd_append(raw_fd);
         }
         Ok(u32::try_from(raw_fd).unwrap())
     }
@@ -4378,7 +4398,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .and_then(|end| end.checked_sub(*n)),
             };
             if let Some(start) = start {
-                self.publish_spilled(path, SpillEdit::Write { start, bytes: &buf[..*n] });
+                // An `O_APPEND` fd's destination is the store's own end, not wherever this process's
+                // copy happened to end: publishing the local offset instead lets a sibling that
+                // appended in the same instant have its bytes overwritten (`SpillEdit::Append`).
+                let appending = offset.is_none()
+                    && self.files.borrow().fd_was_opened_append(raw_fd);
+                if appending {
+                    self.publish_spilled(
+                        path,
+                        SpillEdit::Append {
+                            bytes: &buf[..*n],
+                            local_start: start,
+                        },
+                    );
+                } else {
+                    self.publish_spilled(path, SpillEdit::Write { start, bytes: &buf[..*n] });
+                }
             }
         }
         if let Ok(n) = res
