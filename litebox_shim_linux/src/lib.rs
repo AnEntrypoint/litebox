@@ -2567,7 +2567,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `read()` of a subprocess's stdout pipe or a socket.
                     match self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset) {
                         Ok(cur_loc) => self
-                            .pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                            .pread_with_user_buf(
+                                fd,
+                                buf,
+                                count,
+                                i64::try_from(cur_loc).map_err(|_| Errno::EINVAL)?,
+                            )
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
                                 self.sys_lseek(
@@ -2575,19 +2580,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
                                 )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
-                                .expect("lseek failed");
+                                .map(|_| ())
+                                .unwrap_or(());
                             }),
                         Err(Errno::EBADF) => Err(Errno::EBADF),
                         Err(Errno::ESPIPE) => self.read_with_user_buf_no_offset(fd, buf, count),
-                        Err(Errno::EINVAL) => {
-                            unreachable!(
-                                "seekable file should not return EINVAL when getting current offset"
-                            );
-                        }
-                        Err(e) => {
-                            unimplemented!("unexpected error from lseek: {}", e);
-                        }
+                        Err(e) => Err(e),
                     }
                 }
             }

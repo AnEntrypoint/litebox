@@ -1804,7 +1804,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Capabilities are not modelled (see `CapBSetRead`): no ambient capability is ever
             // set, and lowering/clearing one is trivially satisfied.
             PrctlArg::CapAmbient(_) => Ok(0),
-            _ => unimplemented!(),
+            _ => Err(Errno::EINVAL),
         }
     }
 
@@ -1830,7 +1830,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
                 Err(Errno::EINVAL)
             }
-            _ => unimplemented!(),
+            _ => Err(Errno::EINVAL),
         }
     }
 }
@@ -7040,7 +7040,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
         if pid.is_some() {
-            unimplemented!("Getting robust list for a specific PID is not supported yet");
+            return Err(Errno::EPERM);
         }
         let head = self
             .thread
@@ -7316,8 +7316,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .create_timer(litebox_common_linux::signal::Signal::SIGALRM)
             {
                 Ok(handle) => alarm.handle = Some(handle),
-                Err(litebox::platform::TimerCreationError::Unsupported) => {}
-                Err(_) => unimplemented!(),
+                Err(_) => {}
             }
         }
         if let Some(handle) = &alarm.handle {
@@ -8355,7 +8354,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 0
             }
-            _ => unimplemented!("Unsupported futex operation"),
+            _ => return Err(Errno::ENOSYS),
         };
         Ok(res)
     }

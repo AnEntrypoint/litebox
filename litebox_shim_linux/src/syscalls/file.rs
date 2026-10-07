@@ -6940,7 +6940,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 Ok(new_file.try_into().unwrap())
             }
-            _ => unimplemented!(),
+            _ => Err(Errno::EINVAL),
         }
     }
 
@@ -8049,7 +8049,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -8065,7 +8065,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(major == 226 && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -8104,7 +8104,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok((major == 226, major == 13))
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -8124,7 +8124,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(is_input)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -8138,7 +8138,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(major == 4 && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(e) => Err(e.into()),
         }
     }
 

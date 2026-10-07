@@ -407,7 +407,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,
-            _ => unimplemented!(),
+            SockType::SeqPacket => {
+                let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
+                NetworkProxy::Datagram(proxy)
+            }
+            _ => NetworkProxy::Raw,
         };
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
         // can access it without holding the network lock and the network subsystem can access it without
@@ -588,7 +592,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         // SO_KEEPALIVE,&1,4)`, a real pattern in libraries that set a common
                         // socket-option baseline before checking the actual protocol.
                     }
-                    _ => unimplemented!(),
+                    other => return Err(other.into()),
                 }
             }
             Ok(())
@@ -872,7 +876,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                             litebox::net::CongestionControl::Reno => "reno",
                             litebox::net::CongestionControl::Cubic => "cubic",
                             litebox::net::CongestionControl::None => "none",
-                            _ => unimplemented!(),
+                            _ => "cubic",
                         };
                         let len = name.len().min(len as usize);
                         optval
@@ -919,8 +923,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     ) -> Result<SocketFd<Platform>, TryOpError<Errno>> {
         self.net_lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
-            AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
-            _ => unimplemented!(),
+            AcceptError::InvalidFd | AcceptError::NotListening | _ => {
+                TryOpError::Other(e.into())
+            }
         })
     }
 
@@ -1031,9 +1036,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         // Another thread bound it in the meantime - that's fine
                     }
                     litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
-                    litebox::net::errors::BindError::UnsupportedAddress(_)
-                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
-                    _ => unimplemented!(),
+                    _ => return Err(err.into()),
                 }
             }
             // Get the assigned port
@@ -1110,7 +1113,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
             match self.get_socket_type(fd)? {
-                SockType::Datagram | SockType::Raw => {
+                SockType::Datagram | SockType::Raw | SockType::SeqPacket => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
                 SockType::Stream => {
@@ -1238,7 +1241,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
                     Err(TryOpError::Other(Errno::EBADF))
                 }
-                Err(_) => unimplemented!(),
+                Err(e) => Err(TryOpError::Other(e.into())),
             },
         ) {
             Ok(()) => Ok(()),
@@ -1342,7 +1345,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         log_unsupported!("raw sockets (SOCK_RAW)");
                         return Err(Errno::EPERM);
                     }
-                    _ => unimplemented!(),
+                    _ => {
+                        log_unsupported!("socket(type = {ty:?})");
+                        return Err(Errno::EPROTONOSUPPORT);
+                    }
                 };
                 let socket = self.global.net_lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
@@ -1412,7 +1418,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })?
             }
 
-            _ => unimplemented!(),
+            _ => {
+                log_unsupported!("socket(domain = {domain:?})");
+                return Err(Errno::EAFNOSUPPORT);
+            }
         };
         Ok(u32::try_from(file).unwrap())
     }
