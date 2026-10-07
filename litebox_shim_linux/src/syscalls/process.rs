@@ -3870,6 +3870,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     };
                     let eof_probe = alloc::sync::Arc::clone(&end);
                     let pending_probe = alloc::sync::Arc::clone(&end);
+                    let peek_probe = alloc::sync::Arc::clone(&end);
+                    let shutdown_probe = alloc::sync::Arc::clone(&end);
                     let mut bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
                             litebox::platform::ForkPipeBridge::Sink(
@@ -3882,6 +3884,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     || false,
                                     || 0,
+                                    |_buf: &mut [u8]| 0,
+                                    || false,
                                     false,
                                 ),
                             )
@@ -3920,6 +3924,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     move || eof_probe.at_eof(),
                                     move || pending_probe.buffered_bytes(),
+                                    move |buf: &mut [u8]| peek_probe.peek(buf),
+                                    move || shutdown_probe.peer_shutdown(),
                                     // Only the child's stdin has a buffer that is waiting for the
                                     // child; every other inherited read end the parent may still
                                     // read itself, and a pump that drains it silently takes the
