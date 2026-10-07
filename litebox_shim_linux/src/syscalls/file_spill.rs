@@ -162,6 +162,44 @@ impl SharedFileSpill {
         Some(index)
     }
 
+    /// Move a file's store row to a new path instead of re-publishing this process's copy of it.
+    ///
+    /// A rename moves the file, it does not rewrite it, so the store's bytes for `from` ARE the
+    /// bytes the renamed file has. Re-publishing this process's local copy instead (`Replace`)
+    /// writes whatever this process last saw: another host process that published between this
+    /// process's `refresh_from_spill` and its `rename(2)` has its bytes silently reverted, which
+    /// real Linux cannot do. Moving the row cannot lose them, and the move happens under the spill
+    /// lock, so no writer can interleave with it.
+    fn move_slot(&self, from: &str, to: &str) -> Option<AppliedEdit> {
+        if from.len() > PATH_CAPACITY || to.len() > PATH_CAPACITY {
+            return None;
+        }
+        self.locked(|| {
+            let index = self.find(from)?;
+            // Renaming onto a live path replaces it, as Linux does: the destination's own row has to
+            // go, or two rows would claim the same path and `find` would answer either.
+            if let Some(victim) = self.find(to) {
+                if victim != index {
+                    let slot = &self.slots[victim];
+                    slot.path_len.store(0, Ordering::Relaxed);
+                    slot.length.store(0, Ordering::Relaxed);
+                    slot.state.store(SLOT_DELETED, Ordering::Release);
+                }
+            }
+            let slot = &self.slots[index];
+            slot.assign(to);
+            let previous_generation = slot.generation.load(Ordering::Relaxed);
+            slot.generation.store(previous_generation + 1, Ordering::Relaxed);
+            slot.state.store(SLOT_LIVE, Ordering::Release);
+            Some(AppliedEdit {
+                slot: index,
+                previous_generation,
+                new_generation: previous_generation + 1,
+                local_diverged: false,
+            })
+        })
+    }
+
     pub(crate) fn view(&self, path: &str) -> Option<SpillView> {
         if path.len() > PATH_CAPACITY {
             return None;
@@ -443,6 +481,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn publish_spilled_rename(&self, from: &str, to: &str) {
+        if !self.spill_enabled_for(from) && !self.spill_enabled_for(to) {
+            return;
+        }
+        if let Some(applied) = self.global.shared_file_spill.move_slot(from, to) {
+            // The move does not touch the bytes, so a local copy that already matched the store
+            // still matches it; one that was behind stays behind, so the next read installs.
+            let seen = &LOCALLY_SEEN_GENERATION[applied.slot];
+            if seen.load(Ordering::Acquire) == applied.previous_generation {
+                seen.store(applied.new_generation, Ordering::Release);
+            }
+            return;
+        }
+        // No row for `from` (never published): fall back to publishing this process's copy of `to`,
+        // which after the rename is the moved file.
         self.publish_spilled(from, SpillEdit::Remove);
         self.publish_spilled(to, SpillEdit::Replace);
     }
