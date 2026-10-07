@@ -509,6 +509,52 @@ pub fn record_syscall_trail(number: usize, args: [u64; 3]) {
     }
 }
 
+/// How many of a process's FIRST syscalls the child-exit diagnostic keeps.
+///
+/// The ring above is the right shape for a crash (what was it doing when it died) and the wrong
+/// shape for a fork child's LIFE: a chromium child ends on `clock_gettime`/`futex`/`epoll_wait`,
+/// which says nothing about what it did after the `fork()`. Measured on chrF44: 333
+/// `Chrome_ChildIOT` children, all exit 0, whose last-24 trails contain NOT ONE `execve`,
+/// `clone`, `socket`, `mmap` or `prctl` (148 had `read`, 130 `write`, 46 `sendto`). This buffer
+/// stops recording once it is full, so what it holds is always the beginning.
+const FIRST_TRAIL_LEN: usize = 512;
+
+struct FirstTrail {
+    entries: [SyscallTrailEntry; FIRST_TRAIL_LEN],
+    next: usize,
+}
+
+impl FirstTrail {
+    const EMPTY: SyscallTrailEntry = SyscallTrailEntry {
+        number: 0,
+        args: [0; 3],
+    };
+    const NEW: Self = Self {
+        entries: [Self::EMPTY; FIRST_TRAIL_LEN],
+        next: 0,
+    };
+}
+
+/// See [`FIRST_TRAIL_LEN`]. Also one per host process, also read at a fork child's exit.
+static FIRST_TRAIL: spin::Mutex<FirstTrail> = spin::Mutex::new(FirstTrail::NEW);
+
+/// Remembers a process's earliest syscalls, until [`FIRST_TRAIL_LEN`] of them have been seen.
+pub fn record_first_trail(number: usize, args: [u64; 3]) {
+    let mut trail = FIRST_TRAIL.lock();
+    if trail.next >= FIRST_TRAIL_LEN {
+        return;
+    }
+    let slot = trail.next;
+    trail.entries[slot] = SyscallTrailEntry { number, args };
+    trail.next = slot + 1;
+}
+
+/// The recorded prefix of this process's syscall history, oldest first.
+pub fn first_trail_oldest_first() -> Vec<SyscallTrailEntry> {
+    let trail = FIRST_TRAIL.lock();
+    trail.entries[..trail.next].to_vec()
+}
+
 /// The trail's entries, oldest first, for the fatal-exception diagnostic.
 pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     let trail = SYSCALL_TRAIL.lock();
@@ -605,7 +651,8 @@ static CHILD_EXIT_TRAIL_DUMPED: AtomicBool = AtomicBool::new(false);
 /// - unset or empty -> off
 /// - `1` / `true` / `yes` / `on` -> [`DEFAULT_CHILD_EXIT_TRAIL_BUDGET`] children
 /// - a number -> that many children (any child, in exit order)
-/// - anything else -> that `comm`, under [`CHILD_EXIT_TRAIL_COMM_BUDGET`]
+/// - `<comm>` -> that `comm`, under [`CHILD_EXIT_TRAIL_COMM_BUDGET`]
+/// - `<comm>:<count>` -> that `comm`, at most `count` of them
 ///
 /// Prints one `[diag-child-exit-init]` line per host process when it arms itself, so a run that
 /// produces no trails can be read as "the child never saw this variable" rather than "the child
@@ -625,13 +672,23 @@ pub fn init_child_exit_trail<Platform: litebox::platform::StdioProvider>(
         Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
             (DEFAULT_CHILD_EXIT_TRAIL_BUDGET, Vec::new())
         }
-        Some(v) => match v.trim().parse::<usize>() {
-            Ok(n) => (n, Vec::new()),
-            Err(_) => (
-                CHILD_EXIT_TRAIL_COMM_BUDGET,
-                v.trim().as_bytes().to_vec(),
-            ),
-        },
+        Some(v) => {
+            let v = v.trim();
+            match v.parse::<usize>() {
+                Ok(n) => (n, Vec::new()),
+                // `<comm>` or `<comm>:<count>` -- the count is what bounds a comm that matches
+                // hundreds of children (chromium's churn), since the default comm budget does not.
+                Err(_) => match v.rsplit_once(':') {
+                    Some((comm, n)) if !comm.is_empty() => (
+                        n.trim()
+                            .parse::<usize>()
+                            .unwrap_or(CHILD_EXIT_TRAIL_COMM_BUDGET),
+                        comm.as_bytes().to_vec(),
+                    ),
+                    _ => (CHILD_EXIT_TRAIL_COMM_BUDGET, v.as_bytes().to_vec()),
+                },
+            }
+        }
     };
     *CHILD_EXIT_TRAIL_COMM.lock() = comm;
     CHILD_EXIT_TRAIL_BUDGET.store(budget, Ordering::Release);
@@ -666,7 +723,7 @@ pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
         || trimmed == wanted.as_slice()
         || wanted.starts_with(trimmed);
     let budget = CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire);
-    let entries = syscall_trail_oldest_first();
+    let entries = first_trail_oldest_first();
     // One header per call, emitted BEFORE every gate on purpose: a header with `budget=0` means
     // the variable never reached this child, `comm_ok=false` means the comm filter rejected it,
     // `entries=0` means the trail was empty, and NO header at all means this child's exit never

@@ -2330,6 +2330,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ctx.syscall_arg(2) as u64,
             ],
         );
+        crate::diag::record_first_trail(
+            syscall_number,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
         // `syscall_number`-based, before dispatch, because a `CreateProcessW`-spawned fork child
         // never reaches the `IS_NATIVE_FORK_CHILD` exit sites -- see
         // `diag::maybe_dump_child_exit_trail`. A no-op unless that diagnostic is armed.
