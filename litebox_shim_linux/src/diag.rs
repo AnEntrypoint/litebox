@@ -13,7 +13,7 @@
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-syscall accounting, keyed by raw syscall number.
 #[derive(Default)]
@@ -520,6 +520,89 @@ pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     (0..trail.filled)
         .map(|i| trail.entries[(start + i) % SYSCALL_TRAIL_LEN])
         .collect()
+}
+
+/// How many cross-process fork children get their exit trail dumped when
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL` is armed without an explicit count.
+///
+/// A cross-process fork child is its own host process, so [`SYSCALL_TRAIL`] is unambiguously that
+/// child's own (see that static's comment), and the child's exit is the only moment its whole life
+/// is still in the trail. That is the one shape nothing else in this file can observe: chromium's
+/// ~1/s fork children exit 0 having apparently run the browser's thread-startup code without ever
+/// `execve`ing, they are not named in advance (so the comm and pid filters above cannot be aimed
+/// at them), and an unfiltered every-syscall timeline OOM'd the host once already. The budget
+/// bounds it the same way those filters do -- an explicit count, never "every child".
+const DEFAULT_CHILD_EXIT_TRAIL_BUDGET: usize = 40;
+
+static CHILD_EXIT_TRAIL_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_EXIT_TRAIL_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Call once, early, with a closure performing the platform's `env_value` lookup for
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL`. Idempotent, same lazy-latch pattern as
+/// [`init_syscall_timeline`], including why the argument is a closure.
+///
+/// - unset or empty -> off
+/// - `1` / `true` / `yes` / `on` -> [`DEFAULT_CHILD_EXIT_TRAIL_BUDGET`] children
+/// - a number -> that many children
+pub fn init_child_exit_trail(value: impl FnOnce() -> Option<String>) {
+    // Kept allocation-free: the budget is a `static` counter, so there is nothing here a
+    // native-`fork()` child's copy of the statics could alias the parent's through.
+    if CHILD_EXIT_TRAIL_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let budget = match value() {
+        None => 0,
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
+            DEFAULT_CHILD_EXIT_TRAIL_BUDGET
+        }
+        Some(v) => v.trim().parse::<usize>().unwrap_or(0),
+    };
+    CHILD_EXIT_TRAIL_BUDGET.store(budget, Ordering::Release);
+    CHILD_EXIT_TRAIL_INIT.store(true, Ordering::Release);
+}
+
+/// Prints this task's syscall trail to stderr, if [`init_child_exit_trail`] armed this diagnostic
+/// and a budget slot is still available.
+///
+/// Straight to stderr through the platform's stdio, not through `litebox_util_log`, for exactly
+/// the reason [`emit_timeline_line`] documents: an instrument gated by its own environment
+/// variable must not go silent because an unrelated one filtered its lines away.
+pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    pid: i32,
+    tid: i32,
+    status: i32,
+    comm: &[u8],
+) {
+    let mut budget = CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire);
+    while budget != 0 {
+        match CHILD_EXIT_TRAIL_BUDGET.compare_exchange_weak(
+            budget,
+            budget - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => budget = current,
+        }
+    }
+    if budget == 0 {
+        return;
+    }
+    let comm = String::from_utf8_lossy(comm);
+    for (i, entry) in syscall_trail_oldest_first().iter().enumerate() {
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-exit] pid={pid} tid={tid} comm={comm} status={status} i={i} syscall={} arg0={:#x} arg1={:#x} arg2={:#x}\n",
+                syscall_name(entry.number),
+                entry.args[0],
+                entry.args[1],
+                entry.args[2],
+            )
+            .as_bytes(),
+        );
+    }
 }
 
 fn syscall_name(number: usize) -> String {

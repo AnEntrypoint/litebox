@@ -2756,6 +2756,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "DIAG_TIMELINE exit"
         );
         self.print_diag_reports_if_bootstrap_process();
+        if IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+            );
+        }
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
         self.global.platform.end_fork_child_verification();
@@ -2773,6 +2782,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "DIAG_TIMELINE exit_group"
         );
         self.print_diag_reports_if_bootstrap_process();
+        if IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+            );
+        }
         // Tear down occurs similarly to `sys_exit`.
         self.global.platform.end_fork_child_verification();
         self.exit_group(ExitStatus::Exit(status.trunc()));

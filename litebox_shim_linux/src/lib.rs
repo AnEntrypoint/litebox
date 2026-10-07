@@ -2313,6 +2313,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .platform
                 .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
         });
+        crate::diag::init_child_exit_trail(|| {
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL")
+        });
         let comm_bytes = self.comm.get();
         crate::diag::record_syscall_trail(
             syscall_number,
