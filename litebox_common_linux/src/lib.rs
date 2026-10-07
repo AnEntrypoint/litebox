@@ -261,6 +261,7 @@ impl From<litebox::fs::FileType> for InodeType {
             litebox::fs::FileType::Directory => InodeType::Dir,
             litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
             litebox::fs::FileType::Symlink => InodeType::SymLink,
+            litebox::fs::FileType::Fifo => InodeType::NamedPipe,
             // `FileType` is `#[non_exhaustive]`; unlike `DirentType` (which has a legitimate
             // `DT_UNKNOWN` fallback matching real Linux `getdents` behavior, see the `From` impl
             // above), `st_mode`'s file-type bits have no safe "unknown" value -- every `stat()`
@@ -300,6 +301,7 @@ impl From<litebox::fs::FileType> for DirentType {
             litebox::fs::FileType::Directory => DirentType::Directory,
             litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
             litebox::fs::FileType::Symlink => DirentType::SymLink,
+            litebox::fs::FileType::Fifo => DirentType::NamedPipe,
             // `FileType` is `#[non_exhaustive]`; match Linux's own `getdents`-family behavior of
             // reporting `DT_UNKNOWN` for any type it can't otherwise classify rather than
             // panicking on a still-unmatched (but not-actually-invalid) directory entry. Real
@@ -399,6 +401,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let atime_nsec = i64::from(atime.nsec);
@@ -406,7 +409,11 @@ impl From<litebox::fs::FileStatus> for FileStat {
         Self {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
-            st_nlink: 1,
+            st_nlink: if file_type == litebox::fs::FileType::Directory {
+                <_>::try_from(nlink.max(3)).unwrap_or(3)
+            } else {
+                <_>::try_from(nlink).unwrap_or(1)
+            },
             st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
@@ -501,6 +508,41 @@ pub struct StatxTimestamp {
     pub __reserved: i32,
 }
 
+/// `struct statfs` as x86-64 Linux defines it, for `statfs`/`fstatfs`.
+///
+/// Callers use this to learn the filesystem's type and geometry. Reporting ENOSYS instead is
+/// user-visible (`stat -f /` prints "Function not implemented") and can make library code
+/// assume the worst about a path rather than merely lose an optimisation, so the honest
+/// answer -- a real description of the layered filesystem -- is better than a hard failure.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Statfs {
+    /// Filesystem type magic. See `f_type` values in `statfs(2)`.
+    pub f_type: i64,
+    /// Optimal transfer block size.
+    pub f_bsize: i64,
+    /// Total data blocks.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: u64,
+    /// Total inodes.
+    pub f_files: u64,
+    /// Free inodes.
+    pub f_ffree: u64,
+    /// Filesystem id.
+    pub f_fsid: [i32; 2],
+    /// Maximum filename length.
+    pub f_namelen: i64,
+    /// Fragment size.
+    pub f_frsize: i64,
+    /// Mount flags.
+    pub f_flags: i64,
+    /// Padding, reserved by the kernel ABI.
+    pub f_spare: [i64; 4],
+}
+
 /// Linux's `struct statx` (256 bytes, `linux/stat.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
@@ -553,6 +595,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             blksize,
             atime,
             mtime,
+            nlink,
             ..
         } = value;
         let dev = dev as u64;
@@ -572,7 +615,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             // this call path.
             stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
-            stx_nlink: 1,
+            stx_nlink: u32::try_from(nlink).unwrap_or(1),
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
             stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
@@ -650,12 +693,24 @@ pub enum FcntlArg {
     SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(UserPtr<Flock>),
+    /// `F_ADD_SEALS`: add memfd seals. Accepted and recorded as a no-op -- see
+    /// [`MfdFlags::ALLOW_SEALING`] on why seals are not enforced here.
+    ADD_SEALS(u32),
+    /// `F_GET_SEALS`: report the seals currently set.
+    GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
+    /// `F_SETOWN`: name the process to receive `SIGIO`/`SIGURG`. Accepted; those signals are
+    /// never generated.
+    SETOWN(i32),
+    /// `F_GETOWN`.
+    GETOWN,
+    /// `F_SETPIPE_SZ` / `F_GETPIPE_SZ`: pipe capacity is fixed, so both report it.
+    PIPE_SZ,
 }
 
 #[repr(i16)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
 pub enum FlockType {
     /// Shared or read lock
     ReadLock = 0,
@@ -688,6 +743,10 @@ pub struct Flock {
 
 const F_DUPFD: i32 = 0;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+/// `F_LINUX_SPECIFIC_BASE + 9`. memfd sealing.
+const F_ADD_SEALS: i32 = 1033;
+/// `F_LINUX_SPECIFIC_BASE + 10`.
+const F_GET_SEALS: i32 = 1034;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
@@ -695,6 +754,10 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_SETOWN: i32 = 8;
+const F_GETOWN: i32 = 9;
+const F_SETPIPE_SZ: i32 = 1031;
+const F_GETPIPE_SZ: i32 = 1032;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -724,6 +787,18 @@ impl FcntlArg {
                 cloexec: true,
                 min_fd: arg.trunc(),
             },
+            // Sealing is ACCEPTED rather than rejected, matching `MFD_ALLOW_SEALING` which this
+            // shim already accepts on `memfd_create`. Rejecting the follow-up fcntl with EINVAL
+            // while accepting the flag that advertises it is inconsistent, and EINVAL tells the
+            // caller its ARGUMENTS are malformed rather than that sealing is unavailable --
+            // callers that seal a buffer before sharing it (the Wayland/wl_shm idiom) can treat
+            // that as a fatal protocol error. No known client depends on seals being ENFORCED,
+            // only on the calls succeeding.
+            F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
+            F_GET_SEALS => Self::GET_SEALS,
+            F_SETOWN => Self::SETOWN(arg as i32),
+            F_GETOWN => Self::GETOWN,
+            F_SETPIPE_SZ | F_GETPIPE_SZ => Self::PIPE_SZ,
             _ => return None,
         })
     }
@@ -808,12 +883,71 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
-/// `c_oflag` bit: enable implementation-defined output processing.
-pub const OPOST: tcflag_t = 0o0000001;
-/// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`].
-pub const ONLCR: tcflag_t = 0o0000004;
-/// `c_lflag` bit: echo input characters back to the terminal as they're typed.
-pub const ECHO: tcflag_t = 0o0000010;
+bitflags::bitflags! {
+    /// `c_oflag` bits this codebase actually interprets. `Termios.c_oflag` itself stays a plain
+    /// `tcflag_t` (not this type) since the struct must stay `#[repr(C)]`/`FromBytes`/`IntoBytes`
+    /// -- an exact-layout transmute target for the real Linux `termios` ABI, not a place to
+    /// introduce a differently-shaped wrapper type. Callers wrap a raw `c_oflag` value with
+    /// `OFlagBits::from_bits_retain` at the point of use instead.
+    #[derive(Debug, Clone, Copy)]
+    pub struct OFlagBits: tcflag_t {
+        /// Enable implementation-defined output processing.
+        const OPOST = 0o0000001;
+        /// Map `\n` to `\r\n` on output. Only meaningful together with [`Self::OPOST`].
+        const ONLCR = 0o0000004;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_lflag` bits this codebase actually interprets -- see [`OFlagBits`]'s own doc comment
+    /// for why `Termios.c_lflag` itself stays a plain `tcflag_t`, not this type.
+    #[derive(Debug, Clone, Copy)]
+    pub struct LFlagBits: tcflag_t {
+        /// Generate `SIGINT`/`SIGQUIT`/`SIGTSTP` for the `VINTR`/`VQUIT`/`VSUSP` characters.
+        const ISIG = 0o0000001;
+        /// Echo input characters back to the terminal as they're typed.
+        const ECHO = 0o0000010;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_iflag` bits this codebase interprets -- see [`OFlagBits`] for why `Termios.c_iflag`
+    /// itself stays a plain `tcflag_t`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct IFlagBits: tcflag_t {
+        /// Translate carriage return to newline on input.
+        const ICRNL = 0o0000400;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// `c_cflag` of a fresh Linux terminal: `B38400 | CS8 | CREAD`.
+pub const DEFAULT_C_CFLAG: tcflag_t = 0o17 | 0o60 | 0o200;
+
+/// `c_cc` indices of the signal-generating special characters.
+pub const VINTR: usize = 0;
+pub const VQUIT: usize = 1;
+pub const VSUSP: usize = 10;
+/// Linux's default `c_cc` for a fresh terminal (`INIT_C_CC`): ^C ^\ DEL ^U ^D, VTIME 0,
+/// VMIN 1, VSWTC 0, ^Q ^S ^Z, VEOL 0, ^R ^O ^W ^V, VEOL2 0.
+pub const DEFAULT_C_CC: [u8; 19] = [
+    0x03, 0x1c, 0x7f, 0x15, 0x04, 0, 1, 0, 0x11, 0x13, 0x1a, 0, 0x12, 0x0f, 0x17, 0x16, 0, 0, 0,
+];
+
+/// `c_oflag` bit: enable implementation-defined output processing. Prefer [`OFlagBits::OPOST`]
+/// for new code; this bare constant remains for callers that only need the raw numeric value.
+pub const OPOST: tcflag_t = OFlagBits::OPOST.bits();
+/// `c_oflag` bit: map `\n` to `\r\n` on output. Only meaningful together with [`OPOST`]. Prefer
+/// [`OFlagBits::ONLCR`] for new code.
+pub const ONLCR: tcflag_t = OFlagBits::ONLCR.bits();
+/// `c_lflag` bit: echo input characters back to the terminal as they're typed. Prefer
+/// [`LFlagBits::ECHO`] for new code.
+pub const ECHO: tcflag_t = LFlagBits::ECHO.bits();
 
 #[derive(Debug, Clone, Default, FromBytes, IntoBytes)]
 #[repr(C)]
@@ -864,8 +998,26 @@ pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC004_64B4;
 pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC010_64B5;
 pub const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC020_64B6;
 pub const DRM_IOCTL_MODE_SETPLANE: u32 = 0xC030_64B7;
+/// `DRM_IOCTL_MODE_ADDFB = DRM_IOWR(0xae, struct drm_mode_fb_cmd)`, `size=28` -- legacy v1
+/// framebuffer attach, still sent by `xf86-video-modesetting` as a fallback when it does not use
+/// `DRM_IOCTL_MODE_ADDFB2` (see [`DrmModeFbCmd`]'s doc comment for the live evidence that this
+/// path is genuinely exercised, not dead).
+pub const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C_64AE;
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC068_64B8;
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC018_64B0;
+
+/// `DRM_IOCTL_MODE_DIRTYFB` -- the guest reports damaged regions of a framebuffer that is
+/// ALREADY being scanned out, rather than flipping to a different one.
+///
+/// Xorg's `modesetting` driver uses this, not `PAGE_FLIP`, whenever it is not double-buffering:
+/// with a single framebuffer and no compositor it draws into its shadow buffer and then flushes
+/// the damage with this ioctl. Without it the guest can paint continuously and nothing ever
+/// reaches the host surface, because presentation is driven solely by `PAGE_FLIP`.
+///
+/// Encoding derived from `DRM_IOCTL_MODE_PAGE_FLIP` above (`nr` `0xB0`, 24-byte payload):
+/// `DIRTYFB` is `nr` `0xB1` and `struct drm_mode_fb_dirty_cmd` is also 24 bytes, so only the
+/// `nr` byte differs.
+pub const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC018_64B1;
 /// `DRM_IOCTL_VERSION = DRM_IOWR(0x00, struct drm_version)`. `nr`/struct shape fetched live from
 /// the real kernel `drm.h` (`torvalds/linux` master), not guessed; `size=64` is `sizeof(struct
 /// drm_version)` on the LP64 ABI litebox targets (3 `int`s + 4 bytes of compiler-inserted padding
@@ -885,6 +1037,32 @@ pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640D;
 pub const DRM_IOCTL_SET_MASTER: u32 = 0x0000_641E;
 /// `DRM_IOCTL_DROP_MASTER = DRM_IO(0x1f)`.
 pub const DRM_IOCTL_DROP_MASTER: u32 = 0x0000_641F;
+/// `DRM_IOCTL_GET_MAGIC = DRM_IOR(0x02, struct drm_auth)`, `size=4` (one `__u32 magic`).
+/// wlroots' render allocator (`render/allocator/allocator.c`'s `allocator_autocreate_with_
+/// display()`, reached via the GBM allocator's `drmGetMagic()`/`drmAuthMagic()` legacy DRI
+/// client-authentication handshake) calls this on every render-node fd it opens, including
+/// the primary node when GBM falls back to it -- without a real implementation the ioctl
+/// falls through to this device's `ENOTTY` catch-all, which libdrm's `drmGetMagic()`
+/// surfaces as `EINVAL` ("Invalid argument"), confirmed live as the literal error text
+/// immediately preceding `render/allocator/allocator.c]"drmGetMagic failed"` /
+/// `../src/server.c]"unable to create allocator"`. This device has exactly one possible
+/// client (see [`DRM_IOCTL_SET_MASTER`]'s own doc comment on single-master semantics), so
+/// authentication has no real access-control decision to make -- a fixed non-zero magic
+/// value handed back here and trivially accepted by [`DRM_IOCTL_AUTH_MAGIC`] below is
+/// sufficient to satisfy the handshake's shape without modeling multi-client auth this
+/// device will never need.
+pub const DRM_IOCTL_GET_MAGIC: u32 = 0x8004_6402;
+/// `DRM_IOCTL_AUTH_MAGIC = DRM_IOW(0x11, struct drm_auth)`, `size=4`. The write half of the
+/// same legacy DRI authentication handshake [`DRM_IOCTL_GET_MAGIC`] starts -- a second
+/// client (or, as here, the same client re-authenticating a second fd against the same
+/// device) presents the magic value back to prove it can read what the first `GET_MAGIC`
+/// call returned. Always succeeds for the same single-client-device reason described on
+/// [`DRM_IOCTL_GET_MAGIC`].
+pub const DRM_IOCTL_AUTH_MAGIC: u32 = 0x4004_6411;
+/// The one fixed, arbitrary, non-zero magic value [`DRM_IOCTL_GET_MAGIC`] hands back and
+/// [`DRM_IOCTL_AUTH_MAGIC`] unconditionally accepts -- see those constants' own doc
+/// comments for why a real per-client-random value has nothing to protect here.
+pub const DRM_AUTH_MAGIC_VALUE: u32 = 0xd12d_0001;
 /// `DRM_IOCTL_MODE_GETPROPERTY = DRM_IOWR(0xaa, struct drm_mode_get_property)`, `size=64`
 /// (`nr`/struct shape fetched live from the real kernel `drm.h`; size independently re-verified
 /// via a standalone `size_of::<DrmModeGetProperty>()` compile: two `u64`s, two `u32`s, a 32-byte
@@ -906,6 +1084,51 @@ pub const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC040_64AA;
 /// (dumb buffers, page-flip) could even be attempted, regardless of how correct the rest of this
 /// device's ioctl coverage is.
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
+/// `DRM_IOCTL_MODE_SETPROPERTY = DRM_IOWR(0xab, struct drm_mode_connector_set_property)`,
+/// `size=16` (a `u64` then two `u32`s, `size_of::<DrmModeConnectorSetProperty>()`
+/// independently re-verified the same way as the other `DRM_IOCTL_MODE_*` constants here) --
+/// named `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` by libdrm/wlroots' own call sites, but the real
+/// kernel header (`include/uapi/drm/drm.h`) itself spells it `DRM_IOCTL_MODE_SETPROPERTY`; this
+/// constant keeps the wlroots-facing name since that's the call site this device exists to
+/// satisfy (verified against the real kernel header, not guessed -- an earlier attempt at this
+/// constant used a hand-remembered `nr=0xb1`, which silently fell through to the ioctl
+/// dispatch's `EINVAL` default arm with exactly the same "Invalid argument" symptom this ioctl
+/// was meant to fix, since a wrong `nr` means the real ioctl number the client sends never
+/// matches any dispatch arm at all).
+///
+/// The legacy (pre-atomic) per-connector property-set ioctl -- wlroots' `backend/drm/legacy.c`
+/// uses this specifically for DPMS (`connector Virtual-1: Failed to set DPMS property: Invalid
+/// argument`, confirmed live as labwc's exact failure when this ioctl was entirely unhandled and
+/// fell through to the dispatch's `EINVAL` default arm). See
+/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why accepting this is a safe,
+/// honest no-op in a single-address-space shim with no real hardware DPMS state to change.
+pub const DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY: u32 = 0xC010_64AB;
+/// `DRM_IOCTL_MODE_OBJ_SETPROPERTY = DRM_IOWR(0xba, struct drm_mode_obj_set_property)`,
+/// `size=24` (a `u64` then three `u32`s, rounded up to the next 8-byte-aligned multiple because
+/// of the leading `u64` -- `size_of::<DrmModeObjSetProperty>()` independently re-verified the
+/// same way as the other `DRM_IOCTL_MODE_*` constants here, and the exact reason this struct
+/// carries an explicit trailing `_pad` field rather than 20 bytes of implicit padding) -- the
+/// *generic*,
+/// object-type-carrying sibling of [`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`] above. Real clients
+/// do not always use the legacy connector-only setter: `drm-rs`'s own `Device::set_property`
+/// (used by `smithay`'s `backend_drm`, confirmed live via `docs/wayland-drm-backend-probe/`'s
+/// `DrmDevice::new(fd, true)` -> `LegacyDrmDevice::reset_state` -> `set_connector_state` call
+/// chain) calls `drm_ffi::mode::set_property`, which unconditionally issues THIS ioctl (nr
+/// `0xba`) with the object's type tagged alongside its id -- never the legacy `0xab` one, even
+/// when the target object is a connector. With this ioctl entirely unhandled, the real call fell
+/// through to the dispatch's `EINVAL` default arm with the exact same "Invalid argument" symptom
+/// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`'s own doc comment describes for the legacy ioctl --
+/// but this time from a caller that never sends the legacy ioctl at all, so implementing only
+/// the legacy one left this path completely uncovered. `DrmDevice::new` failed outright before
+/// any further DRM work (dumb buffers, page-flip) could be attempted, regardless of the legacy
+/// ioctl's own correctness.
+pub const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC018_64BA;
+/// `DRM_IOCTL_MODE_GETPROPBLOB = DRM_IOWR(0xac, struct drm_mode_get_blob)`, `size=16` (two
+/// `u32`s then a `u64`, same independent-re-verification discipline as the constant above). Real
+/// clients reach this after `OBJ_GETPROPERTIES` returns a blob-typed property (this device's
+/// [`VIRTUAL_CONNECTOR_EDID_PROP_ID`]) to fetch the blob's raw bytes -- see
+/// [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID this backs.
+pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC010_64AC;
 /// `DRM_MODE_OBJECT_CONNECTOR` -- the `obj_type` a real client passes when asking
 /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` about a connector (as opposed to a CRTC, encoder, or
 /// plane). This device only tracks connector-object property queries today (the only object type
@@ -932,6 +1155,27 @@ pub const VIRTUAL_PLANE_TYPE_PROP_ID: u32 = 100;
 /// `value` field, then reading that entry's `name` string (`"Primary"`) -- the raw number
 /// itself is driver-chosen and opaque, so any fixed, non-zero, mutually-distinct value is valid.
 pub const VIRTUAL_PLANE_TYPE_VALUE: u64 = 1;
+/// `DRM_MODE_PROP_BLOB` (`1<<4`, real kernel `drm_mode.h` value) -- marks a property's value as
+/// a blob ID to be resolved via [`DRM_IOCTL_MODE_GETPROPBLOB`], rather than an immediate scalar
+/// (as [`DRM_MODE_PROP_ENUM`]'s plane `type` property is).
+pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+/// A fixed, arbitrary, non-zero property ID for the virtual connector's `DPMS` property --
+/// see [`DrmSubsystem::obj_get_properties`]'s connector branch and
+/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why this device accepts a
+/// DPMS set as a no-op rather than tracking real display-power state.
+pub const VIRTUAL_CONNECTOR_DPMS_PROP_ID: u32 = 101;
+/// The on-the-wire value this device's connector reports for its `DPMS` property -- `DRM_MODE_
+/// DPMS_ON` (`0`, real kernel `drm_mode.h` value), matching a virtual display that is always
+/// "on" (there is no real backlight/power state to report otherwise).
+pub const VIRTUAL_CONNECTOR_DPMS_VALUE: u64 = 0;
+/// A fixed, arbitrary, non-zero property ID for the virtual connector's `EDID` blob property --
+/// see [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID bytes this
+/// resolves to.
+pub const VIRTUAL_CONNECTOR_EDID_PROP_ID: u32 = 102;
+/// A fixed, arbitrary, non-zero blob ID for the virtual connector's synthesized EDID -- real DRM
+/// blob IDs are driver-internal opaque values from userspace's perspective, resolved purely by
+/// round-tripping through [`DRM_IOCTL_MODE_GETPROPBLOB`], exactly like the property IDs above.
+pub const VIRTUAL_CONNECTOR_EDID_BLOB_ID: u32 = 200;
 /// `DRM_CAP_DUMB_BUFFER` -- the one allocation-related capability this device's
 /// `DRM_IOCTL_GET_CAP` genuinely supports (see [`DrmGetCap`]'s doc comment).
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
@@ -953,17 +1197,151 @@ pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 0x2;
 /// included) require this capability to be present at all just to initialize, and `0` is legacy
 /// behavior no current driver actually exercises.
 pub const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+/// `DRM_CAP_PRIME` (`include/uapi/drm/drm.h`) -- queried via `DRM_IOCTL_GET_CAP` to ask
+/// whether this device supports PRIME dma-buf import/export at all. wlroots' DRM backend
+/// (`backend/drm/drm.c`'s `check_drm_features()`, reached via `labwc`, distinct from
+/// weston's own DRM backend which never queries this) treats `DRM_CAP_PRIME` reporting
+/// neither [`DRM_PRIME_CAP_IMPORT`] nor [`DRM_PRIME_CAP_EXPORT`] set as fatal -- it logs
+/// "PRIME import not supported" and aborts backend creation entirely, since wlroots'
+/// renderer abstraction always needs to be able to import a dma-buf-backed buffer object
+/// for zero-copy client buffer handling. The value itself is a bitmask of the two
+/// capability bits below, not a boolean.
+pub const DRM_CAP_PRIME: u64 = 0x5;
+/// `DRM_PRIME_CAP_IMPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- this device's
+/// `DRM_IOCTL_GET_CAP` unconditionally reports this bit set (see `DrmGetCap`'s doc
+/// comment) purely to satisfy wlroots' capability gate at backend-creation time; no actual
+/// `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctl is implemented, since litebox never reaches a code
+/// path (client-side dma-buf import) that would exercise it.
+pub const DRM_PRIME_CAP_IMPORT: u64 = 0x1;
+/// `DRM_PRIME_CAP_EXPORT` bit within [`DRM_CAP_PRIME`]'s reported value -- see
+/// [`DRM_IOCTL_PRIME_HANDLE_TO_FD`] for the real handler this capability bit now backs.
+pub const DRM_PRIME_CAP_EXPORT: u64 = 0x2;
+/// `DRM_IOCTL_PRIME_HANDLE_TO_FD = DRM_IOWR(0x2d, struct drm_prime_handle)`, `size=12`
+/// (`nr`/struct shape from the real kernel `drm.h`; `struct drm_prime_handle { __u32 handle;
+/// __u32 flags; __s32 fd; }` is exactly 12 bytes, independently re-verified via a standalone
+/// `size_of::<DrmPrimeHandle>()` compile, no padding needed on the LP64 ABI litebox targets).
+/// wlroots' `render/allocator/drm_dumb.c` (`drmPrimeHandleToFD`) calls this once per dumb-buffer
+/// allocation to obtain a dma-buf fd it can hand to its renderer/swapchain machinery -- proven
+/// live-reachable (see `drm-prime-handle-to-fd-not-implemented-blocks-xfce-launch`'s own
+/// investigation): with this unimplemented, the call fell through to the generic ioctl
+/// catch-all's `EINVAL`, `allocator_buffer_create` failed, and `labwc` `SIGABRT`ed on the
+/// resulting `wlr_swapchain_create` assertion. litebox's virtual device has exactly one possible
+/// client (see [`DRM_IOCTL_SET_MASTER`]'s own doc comment on this device's single-client
+/// simplifications), so a real dma-buf subsystem is unnecessary: the handler hands back a second,
+/// real fd onto the SAME real host-backed shared memory the originating dumb buffer's
+/// `CREATE_DUMB`/`MAP_DUMB` path already established, satisfying every real client's actual use
+/// (mmap the fd, or pass it to another local subsystem for a shared read) without implementing
+/// dma-buf import/export semantics this single-client device never needs.
+pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
+/// `DRM_IOCTL_PRIME_FD_TO_HANDLE = DRM_IOWR(0x2e, struct drm_prime_handle)` -- the reverse
+/// direction of [`DRM_IOCTL_PRIME_HANDLE_TO_FD`] (same 12-byte `struct drm_prime_handle`, `nr`
+/// one higher per the real kernel `drm.h`). Confirmed live-reachable immediately after every
+/// `PRIME_HANDLE_TO_FD` call in this device's own real client traffic: wlroots'
+/// `render/allocator/drm_dumb.c` self-imports the fd it just exported to obtain a GEM handle for
+/// the new buffer object it constructs around it -- see [`DrmSubsystem::lookup_handle_by_map_offset`]
+/// (`litebox_shim_linux`) for why this device's single-client, no-real-dma-buf model makes that
+/// self-import a same-handle round-trip rather than needing genuine cross-device import.
+pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
+/// `DRM_IOCTL_GEM_CLOSE = DRM_IOW(0x09, struct drm_gem_close)`, `size=8` (`struct drm_gem_close {
+/// __u32 handle; __u32 pad; }`, real kernel `drm.h`). Confirmed live-reachable: wlroots'
+/// `backend/drm/fb.c` (`drmCloseBufferHandle`, called right after `ADDFB2` on the GEM handle
+/// [`DRM_IOCTL_PRIME_FD_TO_HANDLE`] just returned) calls this to release ITS local reference to
+/// an imported buffer object -- with this unimplemented the ioctl catch-all's `EINVAL` surfaced
+/// as wlroots' own logged "drmCloseBufferHandle failed: Invalid argument" (non-fatal in wlroots,
+/// but a real, silently-broken ioctl surface). This device has no per-handle GEM refcounting (a
+/// dumb-buffer handle's real lifetime is governed entirely by `DRM_IOCTL_MODE_DESTROY_DUMB`, see
+/// that ioctl's own handler) -- [`DrmSubsystem::gem_close`]'s own doc comment (`litebox_shim_linux`)
+/// explains why a real no-op-success is the correct, non-fabricated answer here rather than
+/// something requiring genuine reference-count bookkeeping.
+pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409;
+/// `struct drm_gem_close`. See [`DRM_IOCTL_GEM_CLOSE`]'s own doc comment.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmGemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+/// `struct drm_prime_handle` (`DRM_IOCTL_PRIME_HANDLE_TO_FD`/`DRM_IOCTL_PRIME_FD_TO_HANDLE`). See
+/// [`DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s own doc comment.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmPrimeHandle {
+    /// Input: the `CREATE_DUMB`-issued dumb-buffer handle to export as an fd.
+    pub handle: u32,
+    /// Input: real Linux accepts `DRM_CLOEXEC`/`DRM_RDWR` here; this device does not need to
+    /// distinguish them (the returned fd is always readable/writable, matching the underlying
+    /// dumb buffer's own real host-backed memory, and `DRM_CLOEXEC` is honored -- see the
+    /// handler's own doc comment), so the field is accepted but only `DRM_CLOEXEC` (bit 0) is
+    /// actually consulted.
+    pub flags: u32,
+    /// Output: the new fd referencing the same buffer, or left untouched (`-1` on a real kernel's
+    /// own uninitialized-on-error convention, not relied upon here since a real error always
+    /// short-circuits before this field would be written) on failure.
+    pub fd: i32,
+}
+/// `DRM_CAP_CRTC_IN_VBLANK_EVENT` (`include/uapi/drm/drm.h`) -- asks whether this driver's
+/// `DRM_IOCTL_MODE_PAGE_FLIP`/vblank-wait completion events populate `crtc_id` in the
+/// `struct drm_event_vblank` payload (kernels/drivers predating this cap only fill it in for
+/// multi-CRTC atomic setups). wlroots' `backend/drm/drm.c` (`check_drm_features()`) queries
+/// this right after `DRM_CAP_PRIME` and logs "DRM_CRTC_IN_VBLANK_EVENT unsupported" -- purely
+/// informational in real wlroots when unsupported (it falls back to matching the flip by fd
+/// instead of `crtc_id`), but litebox's page-flip completion event (`drm.rs`'s `page_flip`)
+/// already always stamps `crtc_id` with this device's one real CRTC, so reporting `1` here is
+/// simply true, not a fabrication -- no legacy no-`crtc_id` code path exists to preserve.
+pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
+
+/// `DRM_CAP_CURSOR_WIDTH` / `DRM_CAP_CURSOR_HEIGHT` (`include/uapi/drm/drm.h`) -- the real Linux
+/// kernel's `drm_ioctl_get_cap` (`drivers/gpu/drm/drm_ioctl.c`) special-cases these two: unlike
+/// every other unregistered capability (which falls through to reporting `0`), a driver that
+/// never sets `dev->mode_config.cursor_width`/`cursor_height` still gets back the kernel's own
+/// hardcoded default of `64`, never `0` -- these two are the one pair of "capabilities" whose
+/// unset value is a real, usable size rather than a boolean/bitmask "unsupported" signal.
+/// xf86-video-modesetting's `probe_hw`/`GetRec` path (`ms->cursor_width`/`cursor_height`, driver.c)
+/// queries exactly this: it seeds a sane 64x64 default, then does
+/// `ret = drmGetCap(fd, DRM_CAP_CURSOR_WIDTH, &value); if (!ret) ms->cursor_width = value;` --
+/// so an ioctl that succeeds (as this device's `get_cap` unconditionally does for every
+/// capability) with `value=0` REPLACES the driver's own safe default with a genuine zero. The
+/// driver then allocates each CRTC's hardware-cursor dumb buffer as
+/// `dumb_bo_create(fd, 0, 0, 32)` (`drmmode_allocate_bos`), which this device's own `create_dumb`
+/// correctly rejects (`width == 0 || height == 0` -> `EINVAL`) -- but `drmmode_allocate_bos`
+/// itself never checks `dumb_bo_create`'s return value, so `crtc->driver_private->cursor_bo`
+/// silently stays `NULL`. The very next `EnterVT` (real KMS re-entry, e.g. right after
+/// `SetMaster`) calls `drmmode_map_cursor_bos`, which unconditionally calls
+/// `dumb_bo_map(fd, drmmode_crtc->cursor_bo)` with NO null check either -- `dumb_bo_map`'s first
+/// line reads `bo->ptr` through the now-NULL `bo`, a genuine SIGSEGV at `NULL+8`. Live-confirmed
+/// as the exact root cause of a crash previously (mis)localized to a "DRI2 gate-check": the
+/// crashing instruction (`cmp qword [rsi+8], 0` inside `modesetting_drv.so`, matching
+/// `dumb_bo_map`'s `if (bo->dumb->ptr)`/inlined `bo->ptr` check byte-for-byte) always has
+/// `rsi == 0`, reached via `xf86_config->crtc[i]->driver_private->cursor_bo` with every
+/// intermediate pointer genuinely valid and non-null -- only `cursor_bo` itself is the
+/// unexpected `NULL`, exactly matching this capability-query gap. Reporting the kernel's real
+/// default of `64` for both caps (this device has no actual hardware cursor-size limit to report
+/// otherwise, and 64x64 matches every other software-only virtual DRM device's convention, e.g.
+/// `vkms`) closes the gap at its true source rather than papering over the upstream driver's own
+/// missing null-check.
+pub const DRM_CAP_CURSOR_WIDTH: u64 = 0x8;
+pub const DRM_CAP_CURSOR_HEIGHT: u64 = 0x9;
 
 /// VT (virtual terminal) ioctl request numbers, `include/uapi/linux/vt.h`. Unlike the DRM
 /// ioctls above, these are plain legacy-style constants (not `_IOWR`-encoded) -- verified live
 /// against the real kernel header (`torvalds/linux` master), not guessed. `seatd` (see
-/// `common/terminal.c`/`seatd/seat.c`) uses exactly these four to determine which VT is
-/// currently active (`VT_GETSTATE`) and to claim/release process-controlled VT switching
-/// (`VT_SETMODE`) around granting a client DRM device access; the remaining `VT_*` numbers
-/// (`VT_ACTIVATE`, `VT_WAITACTIVE`, ...) exist in the real kernel but are not on seatd's
-/// single-seat, no-real-hardware-switching call path and so are not implemented here.
-pub const VT_GETSTATE: u32 = 0x5603;
+/// `common/terminal.c`/`seatd/seat.c`) uses `VT_GETSTATE`/`VT_SETMODE` to determine which VT is
+/// currently active and to claim/release process-controlled VT switching around granting a
+/// client DRM device access; standalone Xorg's own `xf86OpenConsole` VT-claiming sequence
+/// additionally calls `VT_OPENQRY`, `VT_GETMODE`, `VT_ACTIVATE`, and `VT_WAITACTIVE`. The
+/// remaining `VT_*` numbers in the real kernel (`VT_RELDISP`, `VT_DISALLOCATE`, ...) are on
+/// neither call path and so are not implemented here.
+pub const VT_OPENQRY: u32 = 0x5600;
+pub const VT_GETMODE: u32 = 0x5601;
 pub const VT_SETMODE: u32 = 0x5602;
+pub const VT_GETSTATE: u32 = 0x5603;
+pub const VT_ACTIVATE: u32 = 0x5606;
+pub const VT_WAITACTIVE: u32 = 0x5607;
+/// `struct vt_mode.mode` value meaning "kernel-automatic VT switching" -- the only value
+/// [`VtGetMode`](crate::IoctlArg::VtGetMode) ever reports back, since nothing on this device
+/// tracks a client's own [`VT_SETMODE`](crate::IoctlArg::VtSetMode) request (see that ioctl's
+/// doc comment).
+pub const VT_AUTO: u8 = 0x00;
 /// KD (keyboard/display mode) ioctl request numbers, `include/uapi/linux/kd.h`.
 pub const KDSETMODE: u32 = 0x4B3A;
 pub const KDSKBMODE: u32 = 0x4B45;
@@ -1034,6 +1412,23 @@ pub struct DrmModeMapDumb {
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct DrmModeDestroyDumb {
+    pub handle: u32,
+}
+
+/// `struct drm_mode_fb_cmd` -- the legacy (v1, pre-multi-plane) `DRM_IOCTL_MODE_ADDFB` request.
+/// `xf86-video-modesetting`'s `drmmode_do_addfb` falls back to this ioctl when it decides not to
+/// (or cannot) use `drmModeAddFB2WithModifiers` -- observed live: a real Xorg run against this
+/// device sent exactly this ioctl (nr=0xAE, size=28) with no preceding ADDFB2 attempt at all, so
+/// this is a real, load-bearing call shape this device must answer, not a dead legacy path.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeFbCmd {
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub depth: u32,
     pub handle: u32,
 }
 
@@ -1242,6 +1637,46 @@ pub struct DrmModePropertyEnum {
     pub name: [u8; 32],
 }
 
+/// `struct drm_mode_connector_set_property` (`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`). See
+/// [`DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`]'s own doc comment for the real client (wlroots'
+/// legacy DPMS-set path) this exists to satisfy.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeConnectorSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub connector_id: u32,
+}
+
+/// `struct drm_mode_obj_set_property` (`DRM_IOCTL_MODE_OBJ_SETPROPERTY`). See
+/// [`DRM_IOCTL_MODE_OBJ_SETPROPERTY`]'s own doc comment for the real client (`drm-rs`'s generic
+/// `Device::set_property`, used by `smithay`'s `backend_drm`) this exists to satisfy -- field
+/// order matches the real kernel struct exactly (`value`, then `prop_id`/`obj_id`/`obj_type`).
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeObjSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub obj_id: u32,
+    pub obj_type: u32,
+    /// Compiler-inserted trailing padding (20 bytes of real fields, rounded up to the next
+    /// 8-byte-aligned multiple because of the leading `u64`) -- see [`DrmModeFbCmd2`]'s `_pad`
+    /// field doc comment for why this is made explicit rather than left implicit.
+    _pad: u32,
+}
+
+/// `struct drm_mode_get_blob` (`DRM_IOCTL_MODE_GETPROPBLOB`), same two-call size-probe pattern
+/// as every other variable-length query this device implements: a caller passes `length` set to
+/// its buffer size (0 to just probe the true length), and gets the true length written back to
+/// `length` regardless of whether it supplied a buffer.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeGetBlob {
+    pub blob_id: u32,
+    pub length: u32,
+    pub data: u64,
+}
+
 /// `struct drm_version` (`DRM_IOCTL_VERSION`) -- the two-call size-probe pattern applies to the
 /// three trailing `(len, ptr)` string pairs the same way it does to `drm_mode_card_res`'s object
 /// arrays: a caller passes `name_len`/`date_len`/`desc_len` set to its buffer sizes (0 to just
@@ -1273,6 +1708,16 @@ pub struct DrmGetCap {
     pub value: u64,
 }
 
+/// `struct drm_auth` (`DRM_IOCTL_GET_MAGIC`/`DRM_IOCTL_AUTH_MAGIC`) -- a single `__u32`
+/// magic value, OUT on `GET_MAGIC`, IN on `AUTH_MAGIC`. See [`DRM_IOCTL_GET_MAGIC`]'s doc
+/// comment for why this device's implementation always hands back/accepts the same fixed
+/// [`DRM_AUTH_MAGIC_VALUE`] rather than tracking real per-client state.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmAuth {
+    pub magic: u32,
+}
+
 /// `struct drm_set_client_cap` (`DRM_IOCTL_SET_CLIENT_CAP`). Identical field layout to
 /// [`DrmGetCap`] but write-only: `capability` is IN (a `DRM_CLIENT_CAP_*` constant, e.g.
 /// [`DRM_CLIENT_CAP_UNIVERSAL_PLANES`]), `value` is IN (the value being set; nothing is written
@@ -1293,6 +1738,21 @@ pub struct DrmModeCrtcPageFlip {
     pub flags: u32,
     pub reserved: u32,
     pub user_data: u64,
+}
+
+/// `struct drm_mode_fb_dirty_cmd` (`DRM_IOCTL_MODE_DIRTYFB`).
+///
+/// `clips_ptr` points at `num_clips` `drm_clip_rect`s in guest memory. This shim ignores them
+/// and treats every damage report as covering the whole framebuffer: a superset of the damaged
+/// region is always correct to present, merely not minimal.
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct DrmModeFbDirtyCmd {
+    pub fb_id: u32,
+    pub flags: u32,
+    pub color: u32,
+    pub num_clips: u32,
+    pub clips_ptr: u64,
 }
 
 /// `DRM_MODE_PAGE_FLIP_EVENT` flag bit -- caller wants a `DRM_EVENT_FLIP_COMPLETE` event queued
@@ -1453,11 +1913,16 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
+pub const FIONCLEX: u32 = 0x5450;
+pub const FIONREAD: u32 = 0x541B;
+pub const FIOASYNC: u32 = 0x5452;
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGPTN: u32 = 0x8004_5430;
 pub const TIOCSPTLCK: u32 = 0x4004_5431;
+pub const TIOCGPTPEER: u32 = 0x5441;
+pub const TIOCPKT: u32 = 0x5420;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -1494,6 +1959,33 @@ pub enum IoctlArg {
     /// always calls this right after `setsid()`; without it, every one of those fails to open a
     /// session on this pty.
     TIOCSCTTY(i32),
+    /// Atomically open the pty peer of a `/dev/ptmx` master (`ioctl(master_fd, TIOCGPTPEER,
+    /// flags)`), returning a fresh fd on the slave rather than writing through a pointer. The
+    /// third argument is the `open()` flags for that new fd (a plain scalar, like `TIOCSCTTY`
+    /// above), not a pointer.
+    ///
+    /// This is not a rare corner case: since Linux 4.13 (and unconditionally in glibc's
+    /// `openpty()` for a long time now), this ioctl is the FIRST and ONLY thing glibc issues to
+    /// get the slave -- it does not fall back to `ptsname()`+`open("/dev/pts/<n>")` if this
+    /// fails. A shim that only implements the older `TIOCGPTN`/`ptsname`-style path silently
+    /// breaks every real `openpty()`/`forkpty()` caller (Python's `os.openpty()`, `libvte`
+    /// underneath every GTK terminal, `tmux`, `script`) while `TIOCGPTN` itself looks perfectly
+    /// fine in isolation -- which is exactly what made `xfce4-terminal`'s "error creating pty"
+    /// survive the `/dev/ptmx`/`/dev/pts` stat fix untouched: that fix made the OLDER path work,
+    /// but real glibc was never taking it.
+    TIOCGPTPEER(i32),
+    /// Enable/disable packet mode on a pty master (`ioctl(master_fd, TIOCPKT, &nonzero_or_zero)`).
+    /// `libvte` (every GTK terminal, including `xfce4-terminal`) issues this immediately after
+    /// opening `/dev/ptmx`, before `TIOCGPTN`/`TIOCGPTPEER` -- to explicitly reset packet mode to
+    /// a known state, not because it uses packet mode's read-side control-byte prefixing (no
+    /// consumer in this codebase's actual terminal-emulation path does). Left unimplemented, this
+    /// ioctl fell into the generic "unsupported" bucket, and `libvte` treats that failure as
+    /// fatal and aborts the ENTIRE pty setup right there -- before ever reaching `TIOCGPTN` or
+    /// `TIOCGPTPEER` -- surfacing as `xfce4-terminal`'s "Failed to open PTY: Invalid argument"
+    /// with nothing to suggest a missing ioctl is the cause. This is why `openpty()` (glibc,
+    /// Python's `os.openpty()`) could work perfectly while every GTK terminal still failed:
+    /// `openpty()` never calls `TIOCPKT` at all.
+    TIOCPKT(UserPtr<i32>),
     /// Get the terminal's foreground process group ID (`tcgetpgrp`).
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the terminal's foreground process group ID (`tcsetpgrp`). A shell's job-control
@@ -1505,6 +1997,12 @@ pub enum IoctlArg {
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Clear close on exec
+    FIONCLEX,
+    /// Bytes waiting to be read
+    FIONREAD(UserPtrMut<i32>),
+    /// Enable or disable `O_ASYNC` (`SIGIO` delivery), which is never generated here
+    FIOASYNC(UserPtr<i32>),
     /// `DRM_IOCTL_MODE_GETRESOURCES` -- enumerate the virtual card's fb/CRTC/connector/encoder
     /// object IDs (two-call size-probe pattern, see [`DrmModeCardRes`]'s doc comment).
     DrmModeGetResources(UserPtrMut<DrmModeCardRes>),
@@ -1522,10 +2020,14 @@ pub enum IoctlArg {
     DrmModeMapDumb(UserPtrMut<DrmModeMapDumb>),
     /// `DRM_IOCTL_MODE_DESTROY_DUMB`.
     DrmModeDestroyDumb(UserPtr<DrmModeDestroyDumb>),
+    /// `DRM_IOCTL_MODE_ADDFB` -- legacy v1 attach of a dumb buffer as a scanout framebuffer,
+    /// still sent by real userspace (see [`DrmModeFbCmd`]'s doc comment).
+    DrmModeAddFb(UserPtrMut<DrmModeFbCmd>),
     /// `DRM_IOCTL_MODE_ADDFB2` -- attach a dumb buffer as a scanout framebuffer.
     DrmModeAddFb2(UserPtrMut<DrmModeFbCmd2>),
     /// `DRM_IOCTL_MODE_PAGE_FLIP`.
     DrmModePageFlip(UserPtr<DrmModeCrtcPageFlip>),
+    DrmModeDirtyFb(UserPtr<DrmModeFbDirtyCmd>),
     /// `DRM_IOCTL_MODE_GETPLANERESOURCES` -- enumerate the virtual card's plane object IDs
     /// (two-call size-probe pattern, see [`DrmModeGetPlaneRes`]'s doc comment).
     DrmModeGetPlaneResources(UserPtrMut<DrmModeGetPlaneRes>),
@@ -1545,12 +2047,38 @@ pub enum IoctlArg {
     DrmSetMaster,
     /// `DRM_IOCTL_DROP_MASTER`.
     DrmDropMaster,
+    /// `DRM_IOCTL_GET_MAGIC` -- see that constant's own doc comment.
+    DrmGetMagic(UserPtrMut<DrmAuth>),
+    /// `DRM_IOCTL_AUTH_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s doc comment.
+    DrmAuthMagic(UserPtr<DrmAuth>),
     /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` -- enumerate a KMS object's properties (two-call
     /// size-probe pattern for `props_ptr`/`prop_values_ptr`, same shape as `get_resources`'s
     /// object-ID arrays).
     DrmModeObjGetProperties(UserPtrMut<DrmModeObjGetProperties>),
     /// `DRM_IOCTL_MODE_GETPROPERTY` -- resolve a single property ID's name/values.
     DrmModeGetProperty(UserPtrMut<DrmModeGetProperty>),
+    /// `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` -- legacy per-connector property set (DPMS).
+    DrmModeConnectorSetProperty(UserPtr<DrmModeConnectorSetProperty>),
+    /// `DRM_IOCTL_MODE_OBJ_SETPROPERTY` -- generic, object-type-carrying property set (any KMS
+    /// object, not just a connector via the legacy ioctl above).
+    DrmModeObjSetProperty(UserPtr<DrmModeObjSetProperty>),
+    /// `DRM_IOCTL_MODE_GETPROPBLOB` -- resolve a blob property's raw bytes (two-call size-probe
+    /// pattern for `data`, same shape as [`DrmModeObjGetProperties`]'s own arrays).
+    DrmModeGetPropBlob(UserPtrMut<DrmModeGetBlob>),
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- export a dumb-buffer handle as a real fd onto the same
+    /// backing memory. See [`DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s own doc comment.
+    DrmPrimeHandleToFd(UserPtrMut<DrmPrimeHandle>),
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` -- resolve a (self-exported) PRIME fd back to its
+    /// originating GEM handle. See [`DRM_IOCTL_PRIME_FD_TO_HANDLE`]'s own doc comment.
+    DrmPrimeFdToHandle(UserPtrMut<DrmPrimeHandle>),
+    /// `DRM_IOCTL_GEM_CLOSE` -- release a local reference to a GEM handle. See
+    /// [`DRM_IOCTL_GEM_CLOSE`]'s own doc comment.
+    DrmGemClose(UserPtr<DrmGemClose>),
+    /// `VT_OPENQRY` -- report the number of a free (unused) VT. Standalone Xorg's own
+    /// `parse_vt_settings` (`hw/xfree86/os-support/linux/lnx_init.c`) calls this on `/dev/tty0`
+    /// before `VT_GETSTATE`/`VT_SETMODE`, unlike `seatd`'s call path which never queries for a
+    /// free VT at all (it always operates on a specific already-known `/dev/tty<N>`).
+    VtOpenQry(UserPtrMut<i32>),
     /// `VT_GETSTATE` -- report which VT is currently active. `seatd`'s `seat_update_vt` (see
     /// `seatd/seat.c`) calls this on `/dev/tty0` to learn which per-VT device (`/dev/tty<N>`)
     /// to subsequently open for a connecting client.
@@ -1558,6 +2086,22 @@ pub enum IoctlArg {
     /// `VT_SETMODE` -- claim (or release) process-controlled VT switching. `seatd`'s `vt_open`
     /// calls this on the client's assigned `/dev/tty<N>` once it grants the client the VT.
     VtSetMode(UserPtr<VtMode>),
+    /// `VT_GETMODE` -- read back the VT switching mode `VT_SETMODE` would set. Standalone Xorg's
+    /// `xf86OpenConsole` calls this on its assigned `/dev/tty<N>` as part of its own VT-claiming
+    /// sequence; `seatd` never reads this back (it only ever writes via `VT_SETMODE`).
+    VtGetMode(UserPtrMut<VtMode>),
+    /// `VT_ACTIVATE` -- switch to the given VT number (the target VT is the raw ioctl `arg`
+    /// value itself, not a pointer). Standalone Xorg's `xf86OpenConsole` calls this to activate
+    /// the VT it just opened; `seatd` never issues it (it has no VT-switch UI to trigger one).
+    /// This device has exactly one VT and no real switching to perform, so any request succeeds
+    /// unconditionally as a no-op.
+    VtActivate(i32),
+    /// `VT_WAITACTIVE` -- block until the given VT becomes the active one (same `arg`-is-the-
+    /// target-VT shape as `VT_ACTIVATE`). The usual immediate follow-up to `VT_ACTIVATE` in real
+    /// Xorg's own call sequence; since this device's one VT is always already "active" the
+    /// instant `VT_ACTIVATE` returns (see that variant's doc comment), this also succeeds
+    /// unconditionally with no actual wait.
+    VtWaitActive(i32),
     /// `KDSETMODE` -- switch a VT between text (`KD_TEXT`) and graphics (`KD_GRAPHICS`) mode.
     /// The third `ioctl()` argument is the mode value itself, not a pointer to one.
     KdSetMode(i32),
@@ -1624,6 +2168,40 @@ pub enum IoctlArg {
         len: u32,
         arg: UserPtrMut<u8>,
     },
+    /// `EVIOCGKEY(len)` -- report the bitmask of currently-pressed `EV_KEY` codes.
+    /// `libevdev_new_from_fd()`'s `sync_key_state()` issues this during device setup to seed its
+    /// internal key-state cache; unlike `EVIOCGPHYS`/`EVIOCGUNIQ`/`EVIOCGPROP`, a failure here is
+    /// NOT tolerated -- `sync_state()`'s error propagates straight out of `libevdev_new_from_fd()`,
+    /// which returns non-zero to `evdev_device_create()`, which `goto err`s before the udev-tag
+    /// check or `evdev_configure_device()` ever run (confirmed by direct source read of
+    /// `evdev_device_create()`, `libinput-1.31.3/src/evdev.c` lines 2314-2316). This previously
+    /// fell through to the `Raw` catch-all's `EINVAL`, which is exactly this failure -- an
+    /// unpressed device correctly has zero key bits set, matching real hardware at attach time.
+    /// Same variable-length encoding as `EVIOCGBIT`/`EVIOCGPROP` (`_IOC(_IOC_READ, 'E', 0x18,
+    /// len)`), decoded from the raw `cmd` at dispatch time.
+    EvdevGetKey {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
+    /// `EVIOCGLED(len)` -- report the bitmask of currently-lit `EV_LED` indicators (caps lock,
+    /// num lock, ...). Same `sync_state()` propagation as `EVIOCGKEY` (see that variant's doc
+    /// comment) -- `libevdev_new_from_fd()`'s internal sync calls `EVIOCGKEY` then `EVIOCGLED`
+    /// then `EVIOCGSW` in sequence, any one of which failing aborts the whole sync and hence
+    /// `libevdev_new_from_fd()` itself. A device with no LEDs lit at attach time correctly
+    /// reports an all-zero bitmap. Same variable-length encoding, `_IOC(_IOC_READ, 'E', 0x19,
+    /// len)`.
+    EvdevGetLed {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
+    /// `EVIOCGSW(len)` -- report the bitmask of currently-active `EV_SW` switches. Same
+    /// `sync_state()` propagation as `EVIOCGKEY`/`EVIOCGLED` (see their doc comments). A device
+    /// with no switches active at attach time correctly reports an all-zero bitmap. Same
+    /// variable-length encoding, `_IOC(_IOC_READ, 'E', 0x1b, len)`.
+    EvdevGetSwitch {
+        len: u32,
+        arg: UserPtrMut<u8>,
+    },
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -1662,6 +2240,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
@@ -1705,6 +2284,23 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    TTL = 2,
+    PKTINFO = 8,
+    MTU_DISCOVER = 10,
+    /// `IP_RECVERR`: queue ICMP errors on the socket error queue. glibc's resolver sets it on
+    /// every DNS socket and treats failure as fatal.
+    RECVERR = 11,
+}
+
+/// `IPPROTO_IPV6`-level options.
+#[repr(u32)]
+#[derive(Debug, IntEnum, Clone, Copy)]
+pub enum Ipv6Option {
+    UNICAST_HOPS = 16,
+    MULTICAST_HOPS = 18,
+    RECVERR = 25,
+    V6ONLY = 26,
+    RECVPKTINFO = 49,
 }
 
 #[repr(u32)]
@@ -1717,6 +2313,9 @@ pub enum SocketOption {
     SNDBUF = 7,
     RCVBUF = 8,
     KEEPALIVE = 9,
+    PRIORITY = 12,
+    REUSEPORT = 15,
+    PASSCRED = 16,
     /// This option controls the action taken when unsent messages queue on
     /// a socket and close() is performed. If SO_LINGER is set, the system
     /// shall block the process during close() until it can transmit the data
@@ -1725,6 +2324,13 @@ pub enum SocketOption {
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
+    /// `SO_PROTOCOL`: the protocol the socket was created with, read-only. Linux reports
+    /// `sk->sk_protocol`, which is 0 (`IPPROTO_IP`) for `AF_UNIX` -- unix sockets have no
+    /// protocol -- and e.g. `IPPROTO_TCP`/`IPPROTO_UDP` for an inet socket.
+    PROTOCOL = 38,
+    /// `SO_DOMAIN`: the socket's address family as passed to `socket(2)`, read-only
+    /// (`AF_UNIX`, `AF_INET`, ...).
+    DOMAIN = 39,
 }
 
 #[repr(u32)]
@@ -1745,6 +2351,7 @@ pub enum TcpOption {
 #[derive(Debug, Clone, Copy)]
 pub enum SocketOptionName {
     IP(IpOption),
+    IPV6(Ipv6Option),
     Socket(SocketOption),
     TCP(TcpOption),
 }
@@ -1756,6 +2363,7 @@ pub enum SocketOptionLevel {
     SOCKET = 1,
     TCP = 6,
     UDP = 17,
+    IPV6 = 41,
     RAW = 255,
 }
 
@@ -1764,6 +2372,7 @@ impl SocketOptionName {
         let level = SocketOptionLevel::try_from(level).ok()?;
         match level {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
+            SocketOptionLevel::IPV6 => Some(Self::IPV6(Ipv6Option::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
             _ => None,
@@ -1793,7 +2402,9 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
+#[derive(
+    Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable,
+)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -2428,6 +3039,7 @@ pub enum MadviseBehavior {
 }
 
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
+#[repr(C)]
 pub struct Sysinfo {
     /// Seconds since boot
     pub uptime: usize,
@@ -2449,6 +3061,9 @@ pub struct Sysinfo {
     pub procs: u16,
     /// Explicit padding for m68k
     pub pad: u16,
+    /// Alignment padding before `totalhigh` (explicit so the C layout has no implicit holes).
+    #[allow(clippy::pub_underscore_fields)]
+    pub _align: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
@@ -2458,6 +3073,9 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+    /// Tail padding up to `sizeof(struct sysinfo)` == 112.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _tail: u32,
 }
 
 bitflags::bitflags! {
@@ -2578,6 +3196,12 @@ pub enum FutexOperation {
     Wake = 1,
     Requeue = 3,
     CmpRequeue = 4,
+    /// `FUTEX_LOCK_PI`: block until the futex word can be claimed as an owned lock.
+    LockPi = 6,
+    /// `FUTEX_UNLOCK_PI`: release a lock claimed by [`Self::LockPi`] and wake a waiter.
+    UnlockPi = 7,
+    /// `FUTEX_TRYLOCK_PI`: attempt [`Self::LockPi`] without blocking.
+    TrylockPi = 8,
     WaitBitset = 9,
 }
 
@@ -2632,6 +3256,23 @@ pub enum FutexArgs {
     /// `FUTEX_CMP_REQUEUE`: identical to `Requeue`, but first atomically checks that the word at
     /// `addr` still equals `expected_value`, failing with `EAGAIN` otherwise (closes the race
     /// where the value changed between userspace's check and this syscall).
+    /// `FUTEX_LOCK_PI`: acquire the lock whose owner is recorded in the futex word, blocking
+    /// until it is free. See the shim's implementation for the word protocol.
+    LockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        timeout: TimeParam,
+    },
+    /// `FUTEX_UNLOCK_PI`: release the lock and wake one waiter.
+    UnlockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+    },
+    /// `FUTEX_TRYLOCK_PI`: acquire the lock if it is free, without blocking.
+    TrylockPi {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+    },
     CmpRequeue {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
@@ -2694,6 +3335,10 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    /// `PR_SET_PTRACER` (`0x59616d61`): Yama's "this process may be attached to by that pid".
+    /// Chromium's crashpad sets it on the browser so the crash handler it just started can
+    /// attach later, and logs `prctl: Invalid argument` on every launch without it.
+    SetPtracer = 0x59616d61,
 }
 
 #[non_exhaustive]
@@ -2702,6 +3347,36 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
+    /// PR_SET_NO_NEW_PRIVS: set the calling thread's no_new_privs bit, which a `seccomp` filter
+    /// install requires and which no `execve` may afterwards clear.
+    SetNoNewPrivs(usize),
+    /// PR_GET_NO_NEW_PRIVS: get the calling thread's no_new_privs bit.
+    GetNoNewPrivs,
+    /// PR_SET_SECCOMP: `SECCOMP_MODE_STRICT` (1) or `SECCOMP_MODE_FILTER` (2) with a
+    /// `struct sock_fprog *`. The legacy form of `seccomp(2)`: no flags, no `TSYNC`.
+    SetSeccomp { mode: u32, prog: usize },
+    /// PR_GET_SECCOMP: the calling thread's seccomp mode (0/1/2).
+    GetSeccomp,
+    /// `PR_SET_PDEATHSIG`: request a signal when the parent dies. Accepted, not delivered.
+    SetPDeathSig(i32),
+    /// `PR_SET_DUMPABLE`: whether this process may be core-dumped and ptrace-attached.
+    SetDumpable(usize),
+    /// `PR_GET_DUMPABLE`: read back what [`PrctlArg::SetDumpable`] last set.
+    GetDumpable,
+    /// `PR_SET_KEEPCAPS`: keep permitted capabilities across a uid change.
+    SetKeepCaps(usize),
+    /// `PR_GET_KEEPCAPS`.
+    GetKeepCaps,
+    /// `PR_GET_SECUREBITS`.
+    GetSecureBits,
+    /// `PR_SET_SECUREBITS`.
+    SetSecureBits(usize),
+    /// `PR_SET_PTRACER`: the pid allowed to ptrace this process (Yama). Accepted, not enforced:
+    /// this guest reports `ptrace_scope` 0 (no LSM restricting ptrace), which is exactly the
+    /// configuration where real Linux also accepts this without changing anything.
+    SetPtracer(usize),
+    /// `PR_CAP_AMBIENT` with its sub-operation (`PR_CAP_AMBIENT_IS_SET`/`RAISE`/`LOWER`/`CLEAR_ALL`).
+    CapAmbient(usize),
 }
 
 #[repr(i32)]
@@ -2900,6 +3575,36 @@ pub enum SyscallRequest {
     Close {
         fd: i32,
     },
+    /// `close_range(first, last, flags)` -- close (or mark close-on-exec) every open descriptor in
+    /// an inclusive range. See `sys_close_range` for why implementing it matters beyond saving the
+    /// caller some syscalls.
+    CloseRange {
+        first: u32,
+        last: u32,
+        flags: u32,
+    },
+    /// `getresuid` -- real, effective and saved user ids, all three of which are the one identity
+    /// this shim models. See the dispatch site.
+    Getresuid {
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    },
+    /// `getresgid` -- the group-id counterpart of [`SyscallRequest::Getresuid`].
+    Getresgid {
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
+    },
+    /// `sched_setaffinity` -- restrict a thread to a CPU set. See the dispatch site and
+    /// `sys_sched_setaffinity`.
+    SchedSetAffinity {
+        pid: Option<i32>,
+        len: usize,
+        mask: UserPtr<u8>,
+    },
+    /// `posix_fadvise` -- an access-pattern hint. Accepted and ignored; see the dispatch site.
+    Fadvise64,
     Fsync {
         fd: i32,
     },
@@ -2909,6 +3614,16 @@ pub enum SyscallRequest {
     Stat {
         pathname: UserPtr<c_char>,
         buf: UserPtrMut<FileStat>,
+    },
+    /// `statfs(path, buf)` -- filesystem statistics for the fs containing `pathname`.
+    Statfs {
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<Statfs>,
+    },
+    /// `fstatfs(fd, buf)` -- filesystem statistics for the fs containing `fd`.
+    Fstatfs {
+        fd: i32,
+        buf: UserPtrMut<Statfs>,
     },
     Fstat {
         fd: i32,
@@ -2932,7 +3647,24 @@ pub enum SyscallRequest {
         fd: u32,
         mode: u32,
     },
+    /// `chown`/`lchown`/`fchownat` -- see the dispatch site and handler for why this is always
+    /// a no-op success rather than genuinely tracking per-file ownership.
+    Fchownat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        owner: u32,
+        group: u32,
+    },
+    /// `fchown` -- see `Fchownat`'s doc comment.
+    Fchown {
+        fd: u32,
+        owner: u32,
+        group: u32,
+    },
     Chdir {
+        pathname: UserPtr<c_char>,
+    },
+    Chroot {
         pathname: UserPtr<c_char>,
     },
     Fchdir {
@@ -2971,6 +3703,25 @@ pub enum SyscallRequest {
         oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
+    RtSigtimedwait {
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<signal::Siginfo>>,
+        timeout: Option<UserPtr<Timespec>>,
+        sigsetsize: usize,
+    },
+    RtTgsigqueueinfo {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    },
+    RtSigqueueinfo {
+        pid: i32,
+        sig: i32,
+    },
+    RtSigsuspend {
+        mask: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    },
     RtSigaction {
         signum: signal::Signal,
         act: Option<UserPtr<signal::SigAction>>,
@@ -2981,6 +3732,49 @@ pub enum SyscallRequest {
     Wait4 {
         pid: i32,
         wstatus: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: Option<UserPtrMut<u8>>,
+    },
+    /// `waitid(idtype, id, infop, options, rusage)`.
+    ///
+    /// Distinct from `wait4` in three ways that matter to callers: it selects children by
+    /// `(idtype, id)` rather than an overloaded signed pid, it reports the result as a
+    /// `siginfo_t` rather than a packed status word, and it can observe a child WITHOUT
+    /// reaping it (`WNOWAIT`). CPython's asyncio relies on exactly that combination --
+    /// `waitid(P_PID, pid, WEXITED | WNOWAIT)` to await the exit, then a separate `waitpid`
+    /// to reap -- so an unimplemented `waitid` silently breaks every asyncio subprocess.
+    /// `shmget(key, size, shmflg)` -- System V shared memory.
+    ///
+    /// Needed by X11's MIT-SHM extension, which is how real screen-capture clients move
+    /// framebuffer bytes: selkies' `pixelflux` capture fails outright with "shmget failed" if
+    /// this is unimplemented, so no video ever reaches the browser.
+    Shmget {
+        key: i32,
+        size: usize,
+        shmflg: i32,
+    },
+    /// `shmat(shmid, shmaddr, shmflg)`.
+    Shmat {
+        shmid: i32,
+        shmaddr: usize,
+        shmflg: i32,
+    },
+    /// `shmdt(shmaddr)`.
+    Shmdt {
+        shmaddr: usize,
+    },
+    /// `shmctl(shmid, cmd, buf)`.
+    Shmctl {
+        shmid: i32,
+        cmd: i32,
+        buf: Option<UserPtrMut<u8>>,
+    },
+    Waitid {
+        idtype: i32,
+        id: u32,
+        /// `siginfo_t*`. Typed as `i32` because every field this fills is a 32-bit word at a
+        /// fixed offset (see `sys_waitid`).
+        infop: Option<UserPtrMut<i32>>,
         options: i32,
         rusage: Option<UserPtrMut<u8>>,
     },
@@ -3016,6 +3810,22 @@ pub enum SyscallRequest {
         buf: UserPtr<u8>,
         count: usize,
         offset: i64,
+    },
+    CopyFileRange {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    },
+    Splice {
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
     },
     Sendfile {
         out_fd: i32,
@@ -3057,6 +3867,28 @@ pub enum SyscallRequest {
         addr: UserPtrMut<u8>,
         length: usize,
         behavior: MadviseBehavior,
+    },
+    InotifyInit {
+        flags: u32,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: UserPtr<c_char>,
+        mask: u32,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
+    Mincore {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    },
+    Msync {
+        addr: UserPtrMut<u8>,
+        length: usize,
+        flags: u32,
     },
     Dup {
         oldfd: i32,
@@ -3233,6 +4065,26 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    /// `fallocate(fd, mode, offset, len)` -- ensure `[offset, offset+len)` is allocated.
+    /// litebox only ever needs to support `mode == 0` (the default allocate-and-grow mode,
+    /// which is exactly what `posix_fallocate()` translates to -- glibc/musl's
+    /// `posix_fallocate()` is a thin wrapper around this syscall, not a separate one). This is
+    /// the syscall weston's real `os_create_anonymous_file()` (`shared/os-compat.c`) calls
+    /// immediately after a successful `memfd_create()`, before ever seeing the fd -- unlike
+    /// `ftruncate`, its absence was previously silently swallowed as `ENOSYS` with a
+    /// `debug_assertions`-gated warning invisible in release builds (see `log_unsupported_fmt`),
+    /// making every `memfd_create`-backed shared-memory setup this path is used for (Wayland
+    /// keymap sharing, `wl_shm` buffers via `posix_fallocate`-using clients) fail with no visible
+    /// diagnostic at all in a release build -- confirmed live via added `sys_memfd_create`
+    /// tracing: `memfd_create` itself always returned success, yet weston's very next line was
+    /// "failed to create anonymous file for keymap", which is only possible if the syscall
+    /// immediately following it (`fallocate`) is unimplemented and returns `ENOSYS`.
+    Fallocate {
+        fd: i32,
+        mode: i32,
+        offset: i64,
+        len: i64,
+    },
     Mknodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -3290,6 +4142,7 @@ pub enum SyscallRequest {
         flags: SfdFlags,
     },
     TimerfdCreate {
+        clockid: i32,
         flags: TfdFlags,
     },
     TimerfdSettime {
@@ -3410,6 +4263,29 @@ pub enum SyscallRequest {
         egid: u32,
         sgid: u32,
     },
+    Setreuid {
+        ruid: u32,
+        euid: u32,
+    },
+    Setregid {
+        rgid: u32,
+        egid: u32,
+    },
+    Getpriority {
+        which: i32,
+        who: i32,
+    },
+    Setpriority {
+        which: i32,
+        who: i32,
+        prio: i32,
+    },
+    Setfsuid {
+        uid: u32,
+    },
+    Setfsgid {
+        gid: u32,
+    },
     Getgroups {
         size: i32,
         list: UserPtrMut<u32>,
@@ -3425,6 +4301,13 @@ pub enum SyscallRequest {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
     },
+    CapSet {
+        header: UserPtrMut<CapHeader>,
+        data: Option<UserPtr<CapData>>,
+    },
+    Personality {
+        persona: u32,
+    },
     GetDirent64 {
         fd: i32,
         dirp: UserPtrMut<u8>,
@@ -3436,6 +4319,14 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    PidfdOpen {
+        pid: i32,
+        flags: u32,
+    },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<u8>,
+    },
     SchedGetParam {
         pid: Option<i32>,
         param: UserPtrMut<i32>,
@@ -3443,6 +4334,14 @@ pub enum SyscallRequest {
     SchedSetParam {
         pid: Option<i32>,
         param: UserPtr<i32>,
+    },
+    /// `sched_get_priority_max`: highest priority value valid for `policy`.
+    SchedGetPriorityMax {
+        policy: i32,
+    },
+    /// `sched_get_priority_min`: lowest priority value valid for `policy`.
+    SchedGetPriorityMin {
+        policy: i32,
     },
     SchedGetScheduler {
         pid: Option<i32>,
@@ -3466,6 +4365,15 @@ pub enum SyscallRequest {
     Prctl {
         args: PrctlArg,
     },
+    Seccomp {
+        operation: u32,
+        flags: u32,
+        /// Guest address of the `struct sock_fprog` for `SECCOMP_SET_MODE_FILTER`.
+        args: usize,
+    },
+    Unshare {
+        flags: u64,
+    },
     Alarm {
         seconds: u32,
     },
@@ -3486,6 +4394,16 @@ pub enum SyscallRequest {
         mask: StatxMask,
         statxbuf: UserPtrMut<Statx>,
     },
+}
+
+/// The syscalls `seccomp(SECCOMP_SET_MODE_STRICT)` leaves callable: Linux's
+/// `__secure_computing_strict` allows `read`, `write`, `_exit`/`exit_group` and `sigreturn`, and
+/// kills the thread with `SIGSYS` on anything else.
+pub fn seccomp_strict_allows(syscall_number: usize) -> bool {
+    matches!(
+        Sysno::new(syscall_number),
+        Some(Sysno::read | Sysno::write | Sysno::exit | Sysno::exit_group | Sysno::rt_sigreturn)
+    )
 }
 
 impl SyscallRequest {
@@ -3580,9 +4498,16 @@ impl SyscallRequest {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::close_range => SyscallRequest::CloseRange {
+                first: ctx.sys_req_arg::<u32>(0),
+                last: ctx.sys_req_arg::<u32>(1),
+                flags: ctx.sys_req_arg::<u32>(2),
+            },
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             #[cfg(target_arch = "x86_64")]
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
@@ -3606,7 +4531,24 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(2),
             },
             Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+            },
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group }),
+            Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::chroot => sys_req!(Chroot { pathname:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -3626,6 +4568,12 @@ impl SyscallRequest {
                 oldset:*,
                 sigsetsize,
             }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout:*, sigsetsize })
+            }
+            Sysno::rt_tgsigqueueinfo => sys_req!(RtTgsigqueueinfo { tgid, tid, sig }),
+            Sysno::rt_sigqueueinfo => sys_req!(RtSigqueueinfo { pid, sig }),
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::rt_sigaction => sys_req!(RtSigaction {
                 signum:?,
                 act:*,
@@ -3636,6 +4584,21 @@ impl SyscallRequest {
             Sysno::wait4 => sys_req!(Wait4 {
                 pid,
                 wstatus:*,
+                options,
+                rusage:*
+            }),
+            Sysno::shmget => sys_req!(Shmget { key, size, shmflg }),
+            Sysno::shmat => sys_req!(Shmat {
+                shmid,
+                shmaddr,
+                shmflg
+            }),
+            Sysno::shmdt => sys_req!(Shmdt { shmaddr }),
+            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd, buf:* }),
+            Sysno::waitid => sys_req!(Waitid {
+                idtype,
+                id,
+                infop:*,
                 options,
                 rusage:*
             }),
@@ -3657,10 +4620,15 @@ impl SyscallRequest {
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
+                        TIOCGPTPEER => IoctlArg::TIOCGPTPEER(ctx.sys_req_arg(2)),
+                        TIOCPKT => IoctlArg::TIOCPKT(ctx.sys_req_ptr(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FIONCLEX => IoctlArg::FIONCLEX,
+                        FIONREAD => IoctlArg::FIONREAD(ctx.sys_req_ptr(2)),
+                        FIOASYNC => IoctlArg::FIOASYNC(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETRESOURCES => {
                             IoctlArg::DrmModeGetResources(ctx.sys_req_ptr(2))
                         }
@@ -3679,8 +4647,10 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_DESTROY_DUMB => {
                             IoctlArg::DrmModeDestroyDumb(ctx.sys_req_ptr(2))
                         }
+                        DRM_IOCTL_MODE_ADDFB => IoctlArg::DrmModeAddFb(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_ADDFB2 => IoctlArg::DrmModeAddFb2(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_PAGE_FLIP => IoctlArg::DrmModePageFlip(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_DIRTYFB => IoctlArg::DrmModeDirtyFb(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_GETPLANERESOURCES => {
                             IoctlArg::DrmModeGetPlaneResources(ctx.sys_req_ptr(2))
                         }
@@ -3688,19 +4658,39 @@ impl SyscallRequest {
                         DRM_IOCTL_MODE_SETPLANE => IoctlArg::DrmModeSetPlane(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_VERSION => IoctlArg::DrmVersion(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_GET_CAP => IoctlArg::DrmGetCap(ctx.sys_req_ptr(2)),
-                        DRM_IOCTL_SET_CLIENT_CAP => {
-                            IoctlArg::DrmSetClientCap(ctx.sys_req_ptr(2))
-                        }
+                        DRM_IOCTL_SET_CLIENT_CAP => IoctlArg::DrmSetClientCap(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_SET_MASTER => IoctlArg::DrmSetMaster,
                         DRM_IOCTL_DROP_MASTER => IoctlArg::DrmDropMaster,
+                        DRM_IOCTL_GET_MAGIC => IoctlArg::DrmGetMagic(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_AUTH_MAGIC => IoctlArg::DrmAuthMagic(ctx.sys_req_ptr(2)),
                         DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
                             IoctlArg::DrmModeObjGetProperties(ctx.sys_req_ptr(2))
                         }
                         DRM_IOCTL_MODE_GETPROPERTY => {
                             IoctlArg::DrmModeGetProperty(ctx.sys_req_ptr(2))
                         }
-                        VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
+                        DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY => {
+                            IoctlArg::DrmModeConnectorSetProperty(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                            IoctlArg::DrmModeObjSetProperty(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_MODE_GETPROPBLOB => {
+                            IoctlArg::DrmModeGetPropBlob(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                            IoctlArg::DrmPrimeHandleToFd(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                            IoctlArg::DrmPrimeFdToHandle(ctx.sys_req_ptr(2))
+                        }
+                        DRM_IOCTL_GEM_CLOSE => IoctlArg::DrmGemClose(ctx.sys_req_ptr(2)),
+                        VT_OPENQRY => IoctlArg::VtOpenQry(ctx.sys_req_ptr(2)),
+                        VT_GETMODE => IoctlArg::VtGetMode(ctx.sys_req_ptr(2)),
                         VT_SETMODE => IoctlArg::VtSetMode(ctx.sys_req_ptr(2)),
+                        VT_GETSTATE => IoctlArg::VtGetState(ctx.sys_req_ptr(2)),
+                        VT_ACTIVATE => IoctlArg::VtActivate(ctx.sys_req_arg(2)),
+                        VT_WAITACTIVE => IoctlArg::VtWaitActive(ctx.sys_req_arg(2)),
                         KDSETMODE => IoctlArg::KdSetMode(ctx.sys_req_arg(2)),
                         KDSKBMODE => IoctlArg::KdSkbMode(ctx.sys_req_arg(2)),
                         EVIOCREVOKE => IoctlArg::EvdevRevoke,
@@ -3741,6 +4731,33 @@ impl SyscallRequest {
                                 arg: ctx.sys_req_ptr(2),
                             }
                         }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x18
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetKey {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x19
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetLed {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        _ if (cmd >> 8) & 0xff == u32::from(b'E')
+                            && (cmd & 0xff) == 0x1b
+                            && (cmd >> 30) & 0x3 == 0x2 =>
+                        {
+                            IoctlArg::EvdevGetSwitch {
+                                len: (cmd >> 16) & 0x3fff,
+                                arg: ctx.sys_req_ptr(2),
+                            }
+                        }
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
@@ -3760,6 +4777,10 @@ impl SyscallRequest {
                 count,
                 offset
             }),
+            Sysno::copy_file_range => {
+                sys_req!(CopyFileRange { fd_in, off_in:*, fd_out, off_out:*, len, flags })
+            }
+            Sysno::splice => sys_req!(Splice { fd_in, off_in:*, fd_out, off_out:*, len, flags }),
             Sysno::sendfile => sys_req!(Sendfile { out_fd, in_fd, offset:*, count }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
@@ -3783,6 +4804,12 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::inotify_init => SyscallRequest::InotifyInit { flags: 0 },
+            Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
+            Sysno::mincore => sys_req!(Mincore { addr:*, length, vec:* }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -3898,8 +4925,36 @@ impl SyscallRequest {
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getpgid => sys_req!(Getpgid { pid }),
+            // `getpgrp()` is defined as exactly `getpgid(0)` -- it is the older, argument-less
+            // spelling of the same call. Without it, `dash`'s job-control setup compares
+            // `tcgetpgrp(fd)` against a failed `getpgrp()`, decides it is a background process,
+            // and sends itself SIGTTIN.
+            //
+            // x86_64-only, like the `time`/`readlink` arms above: the generic (aarch64, riscv64,
+            // ...) Linux syscall table has no `getpgrp` number at all -- libc there implements the
+            // function as a userspace `getpgid(0)`, so no guest on those architectures can issue
+            // it, and naming the nonexistent `Sysno` variant is a hard compile error rather than
+            // dead code.
+            #[cfg(target_arch = "x86_64")]
+            Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::setsid => SyscallRequest::Setsid,
+            // `getresuid`/`getresgid` report the real, effective and saved ids together. Every one
+            // of the three is the same single identity this shim models (see `Getuid` below), so
+            // the answer is that identity written three times -- which is exactly what real Linux
+            // reports for a process that has never changed ids. `ENOSYS` here is not neutral:
+            // these are read during startup by gnupg's and polkit's privilege checks, and a
+            // caller that cannot determine its own ids generally refuses to continue.
+            Sysno::getresuid => SyscallRequest::Getresuid {
+                ruid: ctx.sys_req_ptr(0),
+                euid: ctx.sys_req_ptr(1),
+                suid: ctx.sys_req_ptr(2),
+            },
+            Sysno::getresgid => SyscallRequest::Getresgid {
+                rgid: ctx.sys_req_ptr(0),
+                egid: ctx.sys_req_ptr(1),
+                sgid: ctx.sys_req_ptr(2),
+            },
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -3908,6 +4963,12 @@ impl SyscallRequest {
             Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
             Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
+            Sysno::setreuid => sys_req!(Setreuid { ruid, euid }),
+            Sysno::setregid => sys_req!(Setregid { rgid, egid }),
+            Sysno::getpriority => sys_req!(Getpriority { which, who }),
+            Sysno::setpriority => sys_req!(Setpriority { which, who, prio }),
+            Sysno::setfsuid => sys_req!(Setfsuid { uid }),
+            Sysno::setfsgid => sys_req!(Setfsgid { gid }),
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
             Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
@@ -3952,6 +5013,11 @@ impl SyscallRequest {
                     sigsetpack:*,
                 })
             }
+            Sysno::seccomp => SyscallRequest::Seccomp {
+                operation: ctx.sys_req_arg(0),
+                flags: ctx.sys_req_arg(1),
+                args: ctx.sys_req_arg(2),
+            },
             Sysno::prctl => {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
@@ -3964,6 +5030,79 @@ impl SyscallRequest {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::SetNoNewPrivs(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::GetNoNewPrivs,
+                        },
+                        PrctlOption::SetSeccomp => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSeccomp {
+                                mode: ctx.sys_req_arg(1),
+                                prog: ctx.sys_req_arg(2),
+                            },
+                        },
+                        PrctlOption::GetSeccomp => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSeccomp,
+                        },
+                        // `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` control whether a process may be
+                        // core-dumped and ptrace-attached. Both are read and written by ordinary
+                        // startup code (glibc clears it after a setuid exec; gnupg, systemd and
+                        // several session helpers set it deliberately), and a hard failure there
+                        // is a refusal where real Linux always succeeds.
+                        PrctlOption::SetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::SetDumpable(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
+                        },
+                        PrctlOption::SetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::SetKeepCaps(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::GetKeepCaps,
+                        },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
+                        },
+                        // `PR_SET_PDEATHSIG` asks for a signal when the PARENT dies. GLib's
+                        // `g_spawn_*` sets it in the child between fork and exec, and treats a
+                        // failure there as a spawn failure -- which is how a missing handler here
+                        // surfaced as glycin's "Could not spawn ... Invalid argument", blocking
+                        // all image decoding rather than merely losing a cleanup nicety.
+                        //
+                        // Accepted rather than refused: a guest child here does not outlive the
+                        // runner process, so the condition this signal guards against (an
+                        // orphaned child lingering after its parent exits) is already handled by
+                        // process teardown. The signal is not delivered, which is why this is
+                        // recorded as unsupported for the census while still succeeding -- a hard
+                        // EINVAL claims the caller's ARGUMENTS are malformed, which they are not.
+                        PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
+                        },
+                        // `PR_SET_PTRACER` names a pid permitted to ptrace this process. Real
+                        // Linux accepts it even where it changes nothing (no Yama, or Yama in
+                        // `ptrace_scope` 0), and a hard `EINVAL` here is a caller-visible refusal
+                        // rather than a no-op -- crashpad treats it as "the handler will not be
+                        // able to attach to us" and warns on every single launch.
+                        PrctlOption::SetPtracer => SyscallRequest::Prctl {
+                            args: PrctlArg::SetPtracer(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
@@ -4100,6 +5239,12 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fallocate => sys_req!(Fallocate {
+                fd,
+                mode,
+                offset,
+                len
+            }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
@@ -4111,6 +5256,7 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            #[cfg(target_arch = "x86_64")]
             Sysno::signalfd => SyscallRequest::Signalfd4 {
                 fd: ctx.sys_req_arg(0),
                 mask: ctx.sys_req_ptr(1),
@@ -4119,6 +5265,7 @@ impl SyscallRequest {
             },
             Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
             Sysno::timerfd_create => SyscallRequest::TimerfdCreate {
+                clockid: ctx.sys_req_arg(0),
                 flags: ctx.sys_req_arg(1),
             },
             Sysno::timerfd_settime => sys_req!(TimerfdSettime {
@@ -4222,10 +5369,24 @@ impl SyscallRequest {
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
+            Sysno::personality => sys_req!(Personality { persona }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
                 SyscallRequest::SchedGetAffinity {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    len: ctx.sys_req_arg(1),
+                    mask: ctx.sys_req_ptr(2),
+                }
+            }
+            // `sched_setaffinity` is the write side of `sched_getaffinity`, which IS implemented --
+            // so the read-narrow-write sequence every affinity-aware caller performs used to fail
+            // at the last step with `ENOSYS` after the first two succeeded. A real XFCE session
+            // was observed doing it 16 times in one boot.
+            Sysno::sched_setaffinity => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetAffinity {
                     pid: if pid == 0 { None } else { Some(pid) },
                     len: ctx.sys_req_arg(1),
                     mask: ctx.sys_req_ptr(2),
@@ -4252,6 +5413,12 @@ impl SyscallRequest {
                     pid: if pid == 0 { None } else { Some(pid) },
                 }
             }
+            Sysno::sched_get_priority_max => SyscallRequest::SchedGetPriorityMax {
+                policy: ctx.sys_req_arg::<i32>(0),
+            },
+            Sysno::sched_get_priority_min => SyscallRequest::SchedGetPriorityMin {
+                policy: ctx.sys_req_arg::<i32>(0),
+            },
             Sysno::sched_setscheduler => {
                 let pid = ctx.sys_req_arg(0);
                 SyscallRequest::SchedSetScheduler {
@@ -4276,8 +5443,78 @@ impl SyscallRequest {
                 mask,
                 statxbuf:*,
             }),
+            // `unshare(CLONE_NEWUSER)` creates a real user namespace: the caller keeps its ids but
+            // gains every capability inside the new one, and declares what its ids map to by
+            // writing `/proc/self/{uid_map,gid_map,setgroups}` (see
+            // `litebox_shim_linux::syscalls::process::Task::sys_unshare`). Chromium's sandbox
+            // needs exactly this and nothing else, and refuses to start without it.
+            Sysno::unshare => sys_req!(Unshare { flags }),
+            // `setns` joins an existing namespace and the remaining `unshare` namespace flags
+            // (mount, pid, net, ...) are not modelled: EPERM, not EINVAL/ENOSYS, because that
+            // DISTINCTION is load-bearing for callers. Sandboxing libraries probe for namespace
+            // support and degrade gracefully when REFUSED: glycin (which modern Alpine's
+            // gdk-pixbuf delegates all PNG/JPEG decoding to) string-matches bwrap's stderr for
+            // "No permissions to create a new namespace" and then proceeds unsandboxed, while
+            // EINVAL reads to it as "something is broken" and fails hard -- which is what made
+            // xfce4-panel abort on GTK's fallback icon decode. EPERM is also what real Linux
+            // reports for unprivileged namespace creation that is administratively disabled.
+            Sysno::setns => {
+                return Err(errno::Errno::EPERM);
+            }
+            // `membarrier` asks the kernel to establish memory ordering across all threads of
+            // the process. Every guest thread here runs in ONE host process sharing one address
+            // space, and the syscall boundary this request crosses is itself a full barrier on
+            // the host, so the ordering the caller asks for already holds by the time we return.
+            // Reporting ENOSYS instead is not a neutral "unimplemented": glib uses membarrier
+            // for the fast side of its thread-safe one-time initialisation (g_once and friends),
+            // which guards module registration among much else, so a hard failure there can
+            // silently skip initialisation rather than merely running slower.
+            //
+            // Returning 0 for the QUERY command would be a lie (it must report a bitmask of
+            // supported commands), so only the actual barrier requests succeed here; a query
+            // still falls through to the unsupported path below and gets ENOSYS, which callers
+            // correctly read as "no optional commands available".
+            Sysno::membarrier if ctx.sys_req_arg::<usize>(0) != 0 => SyscallRequest::SchedYield,
             // Noisy unsupported syscalls.
-            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            // `posix_fadvise` is PURELY ADVISORY -- it tells the kernel an access pattern so it
+            // can tune readahead. Ignoring the hint is always a valid implementation (real Linux
+            // ignores it on some filesystems), and the guest fs here is memory-backed anyway, so
+            // there is no readahead to tune. Failing it is pure downside: callers that check the
+            // return can conclude the fd is unusable, and there is no upside to refusing a hint
+            // whose entire contract is that it may be disregarded.
+            Sysno::fadvise64 => SyscallRequest::Fadvise64,
+            // The guest file systems carry no extended attributes: listing them yields an empty
+            // list (returned as length 0, which is what `SchedYield` answers), reading one is
+            // "no such attribute", and setting one is "not supported here" -- what a tmpfs
+            // without xattr support says. GIO asks for the list of every file it inspects
+            // (thousands of calls); failing them as unimplemented is only noise.
+            // Scheduling priority has no meaning here (every guest thread is an ordinary host
+            // thread, and the host scheduler is not the guest's to tune); accepting the request
+            // is what an unprivileged `nice` that happens to succeed looks like.
+            Sysno::setpriority => SyscallRequest::SchedYield,
+            // Tracing another process is not offered; `EPERM` is what a kernel with ptrace
+            // restricted (yama, or a container default) answers, which debuggers and crash
+            // handlers already handle, unlike an unimplemented-syscall error.
+            Sysno::ptrace => return Err(errno::Errno::EPERM),
+            // Guest memory is never swapped, so pinning it in RAM is already true of every page.
+            Sysno::mlock | Sysno::mlock2 | Sysno::munlock | Sysno::mlockall | Sysno::munlockall => {
+                SyscallRequest::SchedYield
+            }
+            Sysno::pidfd_open => sys_req!(PidfdOpen { pid, flags }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
+            Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => SyscallRequest::SchedYield,
+            Sysno::getxattr
+            | Sysno::lgetxattr
+            | Sysno::fgetxattr
+            | Sysno::removexattr
+            | Sysno::lremovexattr
+            | Sysno::fremovexattr => {
+                return Err(errno::Errno::ENODATA);
+            }
+            Sysno::setxattr | Sysno::lsetxattr | Sysno::fsetxattr => {
+                return Err(errno::Errno::EOPNOTSUPP);
+            }
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -4297,6 +5534,20 @@ impl SyscallRequest {
         let op_and_flags: i32 = ctx.sys_req_arg(1);
         let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
         let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
+        // The remaining priority-inheritance futex ops return EOPNOTSUPP, not EINVAL/ENOSYS --
+        // that errno choice is load-bearing (glibc's futex wrappers abort on an unexpected
+        // error), not incidental. See AGENTS.md's "Webtop browser-verified video pipeline" item 4
+        // for the full reasoning and measurements.
+        const FUTEX_PI_OPS: [i32; 3] = [
+            11, // FUTEX_WAIT_REQUEUE_PI
+            12, // FUTEX_CMP_REQUEUE_PI
+            13, // FUTEX_LOCK_PI2
+        ];
+        if FUTEX_PI_OPS.contains(&op) {
+            // Still routed through the unsupported-feature census; only the errno differs.
+            let _ = unsupported_einval(format_args!("futex(priority-inheritance op = {op})"));
+            return Err(errno::Errno::EOPNOTSUPP);
+        }
         let cmd = FutexOperation::try_from(op)
             .map_err(|_| unsupported_einval(format_args!("futex(op = {op})")))?;
         let flags = FutexFlags::from_bits(flags)
@@ -4327,6 +5578,13 @@ impl SyscallRequest {
                 flags,
                 count: val,
             },
+            FutexOperation::LockPi => FutexArgs::LockPi {
+                addr,
+                flags,
+                timeout: time_param(ctx.sys_req_ptr(3)),
+            },
+            FutexOperation::UnlockPi => FutexArgs::UnlockPi { addr, flags },
+            FutexOperation::TrylockPi => FutexArgs::TrylockPi { addr, flags },
             // Note: for FUTEX_REQUEUE/FUTEX_CMP_REQUEUE, the 4th syscall argument (normally a
             // `struct timespec *timeout` for FUTEX_WAIT) is instead a plain integer -- the
             // requeue count -- per futex(2)'s documented reuse of that argument slot. It must NOT

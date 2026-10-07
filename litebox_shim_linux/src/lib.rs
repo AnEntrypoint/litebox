@@ -46,11 +46,18 @@ macro_rules! log_unsupported {
 }
 
 pub(crate) mod channel;
+pub mod diag;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
 mod wait;
+
+// `syscalls::drm` is `pub(crate)` (its ioctl surface is not meant to be called directly from
+// outside this crate), but `ScanoutSnapshot` -- the one type a runner's control channel needs --
+// is re-exported here at the crate root so it is nameable without exposing the rest of that
+// module. See `LinuxShim::drm_scanout_snapshot`.
+pub use syscalls::drm::ScanoutSnapshot;
 
 use crate::syscalls::file::get_file_descriptor_flags;
 
@@ -86,6 +93,7 @@ pub trait ShimPlatform:
     + litebox::platform::CrngProvider
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ForkChildVerificationProvider
+    + litebox::platform::SharedKernelStateProvider
     + litebox::platform::StdioProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
@@ -106,6 +114,7 @@ impl<T> ShimPlatform for T where
         + litebox::platform::CrngProvider
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ForkChildVerificationProvider
+        + litebox::platform::SharedKernelStateProvider
         + litebox::platform::StdioProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
@@ -118,9 +127,15 @@ impl<T> ShimPlatform for T where
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    if cfg!(debug_assertions) {
-        litebox_util_log::warn!(feature:% = args; "unsupported");
-    }
+    // Unconditional, NOT gated on `debug_assertions`. An unsupported feature is a silent
+    // behavioural divergence from Linux -- the syscall returns an error the guest did not
+    // deserve -- so it is exactly what a release-build investigation most needs to see.
+    // Compiling it out of release builds cost a long hunt for a hang whose actual cause was
+    // `sys_tkill` to a remote tid returning ESRCH without sending the signal: that one
+    // load-bearing event was invisible at every `LITEBOX_LOG` level, and the search went to
+    // futex keying, lost wakeups and thread spawn instead. `warn!` already costs nothing when
+    // the level is filtered out, so there is no reason to also strip it at compile time.
+    litebox_util_log::warn!(feature:% = args; "unsupported");
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -146,6 +161,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        litebox_util_log::debug!("drm-diag: init() entry");
         self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
@@ -158,6 +174,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        litebox_util_log::debug!(
+            exception:? = info.exception, kernel_mode:% = info.kernel_mode;
+            "drm-diag: exception() entry"
+        );
         // The guest's synthesized sigreturn trampoline (see `ensure_sigreturn_trampoline`)
         // traps via `brk #0xdead` (SIGTRAP/BRK64) rather than the real `rt_sigreturn` syscall
         // number, which stays unconditionally seccomp-allowed on this platform (see the
@@ -168,6 +188,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         if info.exception == litebox::shim::Exception::BREAKPOINT_CURRENT_EL
             && ctx.pc == self.task.sigreturn_trampoline_addr()
             && ctx.pc != 0
+        {
+            return match self.task.sys_rt_sigreturn(ctx) {
+                Ok(_) => ContinueOperation::Resume,
+                Err(_) => ContinueOperation::Terminate,
+            };
+        }
+        // x86_64's synthesized sigreturn trampoline (see `ensure_sigreturn_trampoline`'s x86_64
+        // doc comment) holds the REAL glibc `__restore_rt` bytes verbatim but is mapped
+        // `PROT_READ` only, never `PROT_EXEC` -- reaching it via the signal handler's `ret`
+        // therefore always raises an instruction-fetch access violation (translated to
+        // `Exception::PAGE_FAULT` by the platform layer) at exactly this address, before the real
+        // `syscall` byte would ever be decoded. `ctx.rip` landing exactly on the trampoline's own
+        // address is this trap's unambiguous signature -- no other guest code legitimately
+        // fetches from this specific litebox-owned page.
+        #[cfg(target_arch = "x86_64")]
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && ctx.rip == self.task.sigreturn_trampoline_addr()
+            && ctx.rip != 0
         {
             return match self.task.sys_rt_sigreturn(ctx) {
                 Ok(_) => ContinueOperation::Resume,
@@ -204,6 +242,205 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 return ContinueOperation::Terminate;
             }
         }
+        // AGENTS.md pass 257: diagnostic for the still-open weston guest-side SIGSEGV (pass
+        // 249, confirmed the single dominant remaining blocker as of pass 256) -- the existing
+        // "fatal signal: terminating task" log (syscalls/signal/mod.rs) has no register/fault-
+        // address context, only the synthesized Linux signal number. This captures the real
+        // guest instruction pointer/stack pointer and the raw exception info BEFORE it's
+        // translated into a signal, so the next capture of this exact crash gives an actual
+        // faulting instruction address to investigate instead of just "Signal(11)".
+        #[cfg(target_arch = "x86_64")]
+        {
+            let comm = self.task.comm.get();
+            let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            let comm = core::str::from_utf8(&comm[..comm_end]).unwrap_or("?");
+            litebox_util_log::warn!(
+                pid:% = self.task.pid.get(), tid:% = self.task.tid.get(), comm:% = comm,
+                exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+                rip:% = format_args!("{:#x}", ctx.rip), rsp:% = format_args!("{:#x}", ctx.rsp),
+                cr2:% = format_args!("{:#x}", info.cr2), error_code:% = format_args!("{:#x}", info.error_code),
+                // 2026-09-09 Track-B Xvfb-crash investigation: added to test the "corrupted
+                // pointer, not a missing mapping" hypothesis (docs/track-b-fork-fix-progress.md,
+                // "closing synthesis" entry) against the decoded faulting instruction
+                // (`mov rax, [rdx + rax*8]`) -- rdx is the table base, rax the index; if rdx
+                // itself doesn't point anywhere a real relocation/GOT table for one of Xvfb's
+                // loaded libraries could plausibly live, that's direct evidence for corruption
+                // over a genuinely-missing-mapping explanation.
+                rax:% = format_args!("{:#x}", ctx.rax), rdx:% = format_args!("{:#x}", ctx.rdx),
+                rcx:% = format_args!("{:#x}", ctx.rcx), rsi:% = format_args!("{:#x}", ctx.rsi),
+                rdi:% = format_args!("{:#x}", ctx.rdi);
+                "diag-guest-exception: pre-signal snapshot"
+            );
+            for (i, entry) in crate::diag::syscall_trail_oldest_first().iter().enumerate() {
+                litebox_util_log::warn!(
+                    i:% = i,
+                    syscall:% = crate::diag::syscall_name_pub(entry.number),
+                    arg0:% = format_args!("{:#x}", entry.args[0]),
+                    arg1:% = format_args!("{:#x}", entry.args[1]),
+                    arg2:% = format_args!("{:#x}", entry.args[2]),
+                    arg0_as_path:? = UserPtr::<core::ffi::c_char>::from_usize(entry.args[0] as usize)
+                        .to_cstring::<Platform>()
+                        .map(|c| c.to_string_lossy().into_owned()),
+                    // 2026-10-04: arg1 is the path pointer for openat/newfstatat/stat/readlink,
+                    // and the only way to name the file a guest is opening when /proc is not
+                    // readable -- a library-loading crash is unidentifiable without it.
+                    arg1_as_path:? = UserPtr::<core::ffi::c_char>::from_usize(entry.args[1] as usize)
+                        .to_cstring::<Platform>()
+                        .map(|c| c.to_string_lossy().into_owned());
+                    "diag-guest-exception: syscall trail (oldest first)"
+                );
+            }
+            // AGENTS.md pass 257 follow-up: distinguish "genuine weston bug jumping to a real
+            // but corrupted pointer value" from "litebox emulation gap leaving cr2 unmapped
+            // when it should be mapped" -- dump every guest mapping overlapping a window around
+            // `cr2` (or note that NOTHING overlaps at all, i.e. genuinely unmapped address
+            // space) so the next capture answers this directly instead of needing a second pass.
+            let probe_range = info.cr2.saturating_sub(0x1000)..info.cr2.saturating_add(0x1000);
+            // `mappings()` (`litebox/src/mm/mod.rs`) already collects into an owned `Vec` and
+            // drops its internal `vmem.read()` lock before returning -- iterating it here holds
+            // NO lock, ruling out the "still-held mappings lock" half of the hang hypothesis
+            // the prior session recorded. The owned snapshot is kept (not just a bool) so the
+            // byte-dump below can reuse the already-confirmed-overlapping range instead of a
+            // second, redundant mappings() call.
+            let overlapping: Vec<_> = self
+                .process()
+                .0
+                .pm()
+                .mappings()
+                .into_iter()
+                .filter(|(r, _)| r.start < probe_range.end && r.end > probe_range.start)
+                .collect();
+            for (r, flags) in &overlapping {
+                litebox_util_log::warn!(
+                    range_start:% = format_args!("{:#x}", r.start),
+                    range_end:% = format_args!("{:#x}", r.end),
+                    flags:? = flags;
+                    "diag-guest-exception: mapping overlapping cr2"
+                );
+            }
+            if overlapping.is_empty() {
+                litebox_util_log::warn!(
+                    cr2:% = format_args!("{:#x}", info.cr2);
+                    "diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped)"
+                );
+            }
+            // Deliberately no raw byte-dump diagnostic of `*cr2` here: `cr2_mapped` (the mapping
+            // walk above) reflects litebox's own VMA tracking, which can diverge from real
+            // Windows memory, so a raw dereference "confirmed safe" by it can itself take a
+            // second, unrecoverable host-mode fault -- this previously turned an ordinary,
+            // gracefully-delivered guest SIGSEGV into a host crash. Do not re-add one without
+            // resolving that gap; see docs/track-b-fork-fix-progress.md's 2026-09-09 "symbolized
+            // the crash" entries for the full trace. (`rip_mapped`'s dump below is NOT subject to
+            // this: `rip`'s fault-free execution up to this instruction is a live guarantee it's
+            // genuinely mapped, not an assumption resting on possibly-stale tracking.)
+            let rip_range = self
+                .process()
+                .0
+                .pm()
+                .mappings()
+                .into_iter()
+                .find(|(r, _)| r.contains(&(ctx.rip as usize)));
+            if let Some((r, flags)) = &rip_range {
+                litebox_util_log::warn!(
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    range_start:% = format_args!("{:#x}", r.start),
+                    range_end:% = format_args!("{:#x}", r.end),
+                    flags:? = flags;
+                    "diag-guest-exception: mapping containing rip"
+                );
+            }
+            // 2026-10-04 headless-chromium pass: a cross-process fork child faults with
+            // `rip=0x0 cr2=0x0 error_code=0x14` -- an instruction fetch from a NON-PRESENT page at
+            // address 0, i.e. a call or a ret through a NULL pointer. rip is 0, so "mapping
+            // containing rip" and "rip byte dump" above both print nothing for it: the only way to
+            // name the CALL SITE is the 8 bytes immediately below rsp, which hold the return
+            // address a `call` pushed (or the address a `ret` popped).
+            let stack_lo = (ctx.rsp as usize).saturating_sub(0x40);
+            let stack = UserPtr::<u8>::from_usize(stack_lo).to_owned_slice::<Platform>(0x48);
+            litebox_util_log::warn!(
+                reg:% = "rsp-0x40", addr:% = format_args!("{:#x}", stack_lo),
+                bytes:% = format_args!("{:02x?}", stack.as_deref());
+                "diag-guest-exception: memory at register"
+            );
+            // A `ret`-through-NULL leaves the popped address at [rsp-8]; a `call *reg` pushes the
+            // return address, so it sits at [rsp]. Report both: [rsp-8] holding a STACK address is
+            // how chrshot7 proved the faulting instruction was a call, not a ret.
+            for (slot, delta) in [("rsp-8", 8usize), ("rsp+0", 0usize)] {
+                let addr = stack.as_deref().and_then(|s| {
+                    let off = (ctx.rsp as usize).saturating_sub(delta) - stack_lo;
+                    let w: [u8; 8] = s.get(off..off + 8)?.try_into().ok()?;
+                    Some(u64::from_le_bytes(w))
+                });
+                let Some(ret) = addr else { continue };
+                litebox_util_log::warn!(
+                    slot:% = slot, rip:% = format_args!("{:#x}", ctx.rip),
+                    value:% = format_args!("{:#x}", ret);
+                    "diag-guest-exception: candidate call site (NULL indirect call)"
+                );
+                if let Some((r, flags)) = self
+                    .process()
+                    .0
+                    .pm()
+                    .mappings()
+                    .into_iter()
+                    .find(|(r, _)| r.contains(&(ret as usize)))
+                {
+                    litebox_util_log::warn!(
+                        slot:% = slot, value:% = format_args!("{:#x}", ret),
+                        range_start:% = format_args!("{:#x}", r.start),
+                        range_end:% = format_args!("{:#x}", r.end),
+                        offset_in_range:% = format_args!("{:#x}", (ret as usize) - r.start),
+                        flags:? = flags;
+                        "diag-guest-exception: mapping containing that call site"
+                    );
+                }
+                // The instruction that faulted is the one BEFORE the return address. Dumping it
+                // names the addressing mode: `ff d0` is `call *rax` (a pointer loaded earlier),
+                // `ff 15 xx` is `call *[rip+disp]` (a GOT slot) -- and the displacement then gives
+                // the exact GOT entry that read as zero, which is the whole question.
+                if delta == 0 {
+                    let prologue = UserPtr::<u8>::from_usize((ret as usize).saturating_sub(32))
+                        .to_owned_slice::<Platform>(32);
+                    litebox_util_log::warn!(
+                        call_site:% = format_args!("{:#x}", ret),
+                        bytes_before:% = format_args!("{:02x?}", prologue.as_deref());
+                        "diag-guest-exception: bytes immediately before the call site"
+                    );
+                }
+            }
+            if rip_range.is_some() {
+                let dump = unsafe { core::slice::from_raw_parts(ctx.rip as *const u8, 64) };
+                litebox_util_log::warn!(
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    bytes:% = format_args!("{:02x?}", dump);
+                    "diag-guest-exception: rip byte dump"
+                );
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        for (name, value) in [("rdx", ctx.rdx), ("rdi", ctx.rdi), ("rsi", ctx.rsi)] {
+            let base = (value as usize) & !0xf;
+            let bytes = UserPtr::<u8>::from_usize(base.saturating_sub(0x10))
+                .to_owned_slice::<Platform>(0x40);
+            litebox_util_log::warn!(
+                reg:% = name, addr:% = format_args!("{:#x}", base.saturating_sub(0x10)),
+                bytes:% = format_args!("{:02x?}", bytes.as_deref());
+                "diag-guest-exception: memory at register"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let comm = self.task.comm.get();
+            let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            let comm = core::str::from_utf8(&comm[..comm_end]).unwrap_or("?");
+            litebox_util_log::warn!(
+                pid:% = self.task.pid.get(), tid:% = self.task.tid.get(), comm:% = comm,
+                exception:? = info.exception, kernel_mode:% = info.kernel_mode,
+                pc:% = format_args!("{:#x}", ctx.pc), sp:% = format_args!("{:#x}", ctx.sp),
+                fault_address:% = format_args!("{:#x}", info.fault_address);
+                "diag-guest-exception: pre-signal snapshot"
+            );
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
@@ -222,6 +459,75 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
     /// Linux exit status once `run_thread` has consumed the entrypoints it was called with -- see
     /// [`LinuxShimProcess::wait_for_encoded_cross_process_exit_status`]'s doc comment for why that
     /// status then needs to become this child's real Windows exit code.
+    /// Create a pipe in this (cross-process fork child) process, place its WRITE end at exactly
+    /// `target_fd`, and return a host-side handle on the READ end for a pump thread.
+    ///
+    /// Runs on this task's own thread by necessity -- `LinuxShimEntrypoints` is deliberately
+    /// `!Send`.
+    pub fn install_pipe_write_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        self.task.install_pipe_write_end_at_fd(target_fd)
+    }
+
+    /// Create a pipe in this (cross-process fork child) process, place its READ end at exactly
+    /// `target_fd`, and return a host-side handle on the WRITE end for a pump thread. The mirror
+    /// of [`Self::install_pipe_write_end_at_fd`]; same thread requirement.
+    pub fn install_pipe_read_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        self.task.install_pipe_read_end_at_fd(target_fd)
+    }
+
+    /// Mark the rebuilt guest fd `target_fd` close-on-exec (a carried pipe end that was).
+    pub fn mark_fd_cloexec(&self, target_fd: i32) {
+        self.task.mark_raw_fd_cloexec(target_fd);
+    }
+
+    /// Reopen an inherited regular file at exactly `target_fd`, positioned at `offset`. See
+    /// `Task::install_file_at_fd`. Same thread requirement as the pipe installers.
+    pub fn install_file_at_fd(
+        &self,
+        target_fd: i32,
+        path: &str,
+        flags: u32,
+        offset: u64,
+    ) -> Option<()> {
+        self.task.install_file_at_fd(target_fd, path, flags, offset)
+    }
+
+    /// Recreate an inherited eventfd at exactly `target_fd`. See `Task::install_eventfd_at_fd`.
+    /// Same thread requirement as the pipe and file installers.
+    pub fn install_eventfd_at_fd(&self, target_fd: i32, count: u64, flags: u32) -> Option<()> {
+        self.task.install_eventfd_at_fd(target_fd, count, flags)
+    }
+
+    /// Rebuild a carried shim-level fd (a unix socket) at exactly `target_fd` from the spec its
+    /// cross-process fork parent wrote. Same thread requirement as the other installers.
+    pub fn install_shim_fd_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        if let Some(state) = spec.strip_prefix("task-state:") {
+            return self.task.install_task_state(state);
+        }
+        if let Some(pty) = spec.strip_prefix("pty-master:") {
+            return self.task.install_pty_master_at_fd(target_fd, pty);
+        }
+        if let Some(shm) = spec.strip_prefix("shm:") {
+            return self.task.install_shm_at_fd(target_fd, shm);
+        }
+        if let Some(snap) = spec.strip_prefix("snap:") {
+            return self.task.install_snapshot_at_fd(target_fd, snap);
+        }
+        if let Some(inet) = spec.strip_prefix("inet:") {
+            return self.task.install_inet_at_fd(target_fd, inet);
+        }
+        if let Some(epoll) = spec.strip_prefix("epoll:") {
+            return self.task.install_epoll_at_fd(target_fd, epoll);
+        }
+        self.task.install_unix_at_fd(target_fd, spec)
+    }
+
     pub fn process(&self) -> LinuxShimProcess<Platform> {
         LinuxShimProcess(self.task.process().clone())
     }
@@ -248,6 +554,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
 pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    /// Shared with `GlobalState::proc_self_info` once `build()` runs -- created here (rather than
+    /// in `build()`) because `default_fs` (which mounts the `/proc/self` backend sharing this
+    /// same cell) always runs before `build()`. See `GlobalState::proc_self_info`'s doc comment.
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    /// Shared with `GlobalState::pts_registry` once `build()` runs, for the exact same reason as
+    /// `proc_self_info` above: `default_fs` mounts the `/dev/pts` backend sharing this cell, and
+    /// that always runs before `build()`. See `litebox::fs::devices::PtsRegistry`'s doc comment.
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -256,6 +570,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         Self {
             platform,
             litebox: LiteBox::new(platform),
+            proc_self_info: Arc::new(litebox::sync::RwLock::new(
+                litebox::fs::procfs::ProcSelfTable::default(),
+            )),
+            pts_registry: Arc::new(litebox::sync::RwLock::new(
+                litebox::fs::devices::PtsRegistry::new(),
+            )),
         }
     }
 
@@ -270,40 +590,357 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_data)
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            vec![tar_data],
+            // No caller of this single-pre-merged-tar path has any use for the resulting
+            // live-entry list (only the OCI multi-layer path's own redundant-rebuild problem
+            // needs it), so don't pay `live_entries_after_merge`'s own extra tree walk to produce
+            // one nobody will read.
+            MergeInput::BuildFresh {
+                capture_for_caller: false,
+            },
+            self.proc_self_info.clone(),
+            self.pts_registry.clone(),
+        )
+        .0
+    }
+
+    /// Create a default layered file system whose read-only lower layer is built from MULTIPLE
+    /// OCI-style layer tars (bottom-to-top), rather than a single pre-merged tar -- the runtime
+    /// OCI-image-loading path's entrypoint (see
+    /// `litebox_runner_linux_on_windows_userland`'s `--oci-image` option and
+    /// `litebox::fs::tar_ro::TarRo::from_layers`). Whiteout/opaque-whiteout merging across
+    /// `tar_layers` happens entirely inside `TarRo::from_layers`, so this crate never sees or
+    /// needs a pre-merged single tar for this path.
+    ///
+    /// The second return value is `Some(entries)` -- [`litebox::fs::tar_ro::TarRo::
+    /// live_entries_after_merge`]'s own output, captured as a side effect of the real
+    /// `TarRo::from_layers` build this method just did -- whenever the caller can usefully cache
+    /// it for a later, cheaper [`Self::default_fs_multi_layer_with_cached_merge`] call (see that
+    /// method's own doc comment for why). This crate has no on-disk cache of its own -- that
+    /// policy, and the disk I/O it needs, belongs to the caller (`litebox_runner_linux_on_
+    /// windows_userland`, which already owns `.litebox-cache`'s per-layer sibling cache).
+    pub fn default_fs_multi_layer(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_layers: Vec<Cow<'static, [u8]>>,
+    ) -> (DefaultFS<Platform>, Option<Cow<'static, [u8]>>) {
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            tar_layers,
+            MergeInput::BuildFresh {
+                capture_for_caller: true,
+            },
+            self.proc_self_info.clone(),
+            self.pts_registry.clone(),
+        )
+    }
+
+    /// Same as [`Self::default_fs_multi_layer`], but skips `TarRo::from_layers`'s own tar-parse
+    /// and whiteout-fold phases by building straight from an already-known
+    /// `TarRo::live_entries_after_merge` list instead (`TarRo::from_merged_live_entries`).
+    ///
+    /// Exists so a cross-process `LITEBOX_PROCESS_FORK=1` child -- which re-derives this SAME
+    /// read-only rootfs from scratch on every single fork, since each is a genuinely separate
+    /// Windows process with no shared heap for a `HashMap`/`BTreeMap`-shaped structure (see
+    /// `GlobalState`'s own "nested collections not actually shared" limitation) -- doesn't have
+    /// to pay `TarIndex::from_layers`'s full cost (measured live: 3.2-3.5s per fork, the dominant
+    /// share of total fork-child startup time) merely to rediscover a merge result that is, by
+    /// construction, bit-for-bit identical to the one the very first process in this fork tree
+    /// already computed. See `litebox::fs::tar_ro::TarRo::from_merged_live_entries`'s own doc
+    /// comment for why reusing that list instead of recomputing it is sound.
+    pub fn default_fs_multi_layer_with_cached_merge(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_layers: Vec<Cow<'static, [u8]>>,
+        flat_index: Cow<'static, [u8]>,
+    ) -> DefaultFS<Platform> {
+        default_fs(
+            &self.litebox,
+            self.platform,
+            in_mem_fs,
+            tar_layers,
+            MergeInput::UseCached(flat_index),
+            self.proc_self_info.clone(),
+            self.pts_registry.clone(),
+        )
+        .0
     }
 
     /// Build the shim.
+    ///
+    /// **Create-vs-attach** (`litebox::platform::SharedKernelStateProvider`,
+    /// `SharedKernelStateSlot::ShimGlobalState`): the very first process in a fork family (or any
+    /// process on a platform that never returns `true` from
+    /// `is_shared_kernel_state_attach_child`) constructs a fresh `GlobalState` exactly as this
+    /// always did before this trait existed. A cross-process-fork child that this platform has
+    /// confirmed can reach its ancestor's existing allocation instead ATTACHES to that SAME live
+    /// instance -- so every field below (`pipes`, `net`, the pid/tid allocator, every registry)
+    /// becomes genuinely, live, shared across the whole fork family, not merely placed at a
+    /// consistent address. See `Self::proc_self_info`'s own doc comment for the other known
+    /// exceptions, and `GlobalStateHandle`'s own doc comment's "Sixth instance" section for
+    /// `futex_manager`, which is deliberately NOT part of `GlobalState` at all.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new(&self.litebox);
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-        let global = Arc::new(GlobalState {
-            platform: self.platform,
-            bootstrap_process: once_cell::race::OnceBox::new(),
-            futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
-            net: litebox::sync::Mutex::new(net),
-            boot_time: self.platform.now(),
-            next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
-            unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
-            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            flock_registry: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
-            pty_registry: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            daemon_pty_masters: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            next_pty_id: core::sync::atomic::AtomicU32::new(0),
-            next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
-            next_memfd_id: core::sync::atomic::AtomicU64::new(0),
-            drm: syscalls::drm::DrmSubsystem::new(),
-            evdev: syscalls::evdev::EvdevSubsystem::new(),
-            memfds: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-        });
-        LinuxShim(global)
+        let platform = self.platform;
+        let slot = litebox::platform::SharedKernelStateSlot::ShimGlobalState;
+        // Captured BEFORE the create-vs-attach branch below (which may move `self.litebox` into
+        // the shared struct on the create path): this process's OWN `litebox` is what
+        // `GlobalStateHandle` uses from here on, regardless of which branch runs -- see that
+        // struct's own doc comment for why `GlobalState.litebox` itself must never be read again.
+        let my_litebox = self.litebox.clone();
+        // Same reasoning as `my_litebox` above -- see `GlobalStateHandle`'s doc comment's
+        // "Second instance of the SAME defect" section.
+        let my_proc_self_info = self.proc_self_info.clone();
+        let my_pts_registry = self.pts_registry.clone();
+        // Same reasoning as `my_litebox`/`my_proc_self_info` above -- see `GlobalStateHandle`'s
+        // doc comment's "Third instance of the SAME defect" section. Unlike those two, nothing
+        // needs to see this before `build()` runs, so it is constructed fresh right here rather
+        // than threaded through `LinuxShimBuilder`.
+        let my_elf_patch_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning as `my_elf_patch_cache` above -- see `GlobalStateHandle`'s doc comment's
+        // "Fourth instance of the SAME defect" section.
+        let my_exec_ranges_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning as `my_exec_ranges_cache` above -- see `GlobalStateHandle`'s doc
+        // comment's "Fifth instance of the SAME defect" section.
+        let my_segment_scan_cache = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
+        // comment's "Sixth instance of the SAME defect" section. Unlike `Network`/`Pipes` (which
+        // are genuinely, correctly meant to be one shared instance for the whole fork family and
+        // so are REBOUND in place, not shadowed), `FutexManager`'s own doc comment already scopes
+        // it to "private" (single-process) futexes only -- so a fresh per-process instance is not
+        // a workaround, it IS the intended semantics (`FUTEX_PRIVATE_FLAG`-equivalent), and it
+        // sidesteps the deeper structural problem entirely: `LoanList`'s entries are pinned on the
+        // WAITING THREAD'S OWN STACK by design (its own doc comment), so they can never be safely
+        // relocated into cross-process-shared memory or referenced from a different process at all
+        // -- unlike a `BTreeMap`, there is no "move the collection into the shared arena" fix
+        // available here even in principle.
+        // Allocated privately (never in the shared arena): a native-fork child gets its own
+        // copy-on-write duplicate, and `reinit_as_native_fork_child` empties it, so waiters
+        // pinned on one process's stacks are never reachable from another process.
+        let my_futex_manager = {
+            let _private = litebox_util_log::PrivateAllocGuard::new();
+            Arc::new(FutexManager::new())
+        };
+        // Same reasoning as `my_elf_patch_cache`/etc above -- see `GlobalStateHandle`'s doc
+        // comment's "Seventh and eighth instances of the SAME defect" section.
+        let my_memfds = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_shared_files = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Same reasoning again for the inotify registry and its "anything watched" counter.
+        let my_inotify = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_inotify_watching = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        // Ninth instance of the SAME defect -- see `GlobalStateHandle::unix_addr_table`'s doc
+        // comment (2026-09-18 systematic audit).
+        let my_unix_addr_table = Arc::new(litebox::sync::RwLock::new(
+            syscalls::unix::UnixAddrTable::new(),
+        ));
+        // Tenth instance of the SAME defect -- see `GlobalStateHandle::fifo_registry`'s doc
+        // comment (2026-09-18 systematic audit).
+        let my_fifo_registry = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Eleventh instance of the SAME defect -- see `GlobalStateHandle::pty_registry`'s doc
+        // comment. The genuine cross-process capability these two fields' ORIGINAL doc comments
+        // (also preserved there) actually need is restored separately by `GlobalState::
+        // shared_pty` below, not by these per-process copies.
+        let my_pty_registry = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_daemon_pty_masters = Arc::new(litebox::sync::RwLock::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_xproc_local = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        let my_flock_registry = Arc::new(litebox::sync::Mutex::new(
+            alloc::collections::BTreeMap::new(),
+        ));
+        // Which branch this process takes is the one number that decides whether the 128 MiB
+        // shared kernel arena can run out: a `create` costs ~48.5 MiB of it (a 29 MiB
+        // `SharedUnixConnTable` plus a 16 MiB socket data pool), so two fills it and a third
+        // cannot be placed at all, while an `attach` costs nothing. Nothing logged it, so "how
+        // many creates did this run make" was unmeasurable -- say it once per process, before
+        // either branch runs.
+        let attached = platform
+            .is_shared_kernel_state_attach_child(slot)
+            .then(|| platform.attach_shared_kernel_state(slot))
+            .flatten();
+        litebox_util_log::warn!(
+            branch:% = if attached.is_some() { "attach" } else { "create" },
+            host_pid:% = platform.current_host_pid(),
+            slot:? = slot;
+            "shared kernel state: branch taken"
+        );
+        let inner = attached.unwrap_or_else(|| {
+                let mut net = Network::new(&self.litebox);
+                net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+                platform.create_shared_kernel_state(
+                    slot,
+                    GlobalState {
+                        platform: self.platform,
+                        _fs: core::marker::PhantomData,
+                        pipes: Pipes::new(),
+                        net: litebox::sync::Mutex::new(net),
+                        boot_time: self.platform.now(),
+                        next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+                        cross_process_fork_slots: core::array::from_fn(|_| {
+                            core::sync::atomic::AtomicU32::new(CROSS_PROCESS_FORK_SLOT_FREE)
+                        }),
+                        native_vfork_gates: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        process_registry: litebox::sync::Mutex::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
+                        unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
+                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(&platform),
+                        unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
+                        shared_file_publish: syscalls::file::SharedFilePublishTable::new(),
+                        shared_file_spill: syscalls::file_spill::SharedFileSpill::new(),
+                        sysv_shm: litebox::sync::Mutex::new(syscalls::mm::SysvShmTable::new()),
+                        next_shmid: core::sync::atomic::AtomicI32::new(1),
+                        next_flock_holder_id: core::sync::atomic::AtomicU64::new(1),
+                        // See `syscalls::file::SharedFlockTable`'s own doc comment: the slot
+                        // array is itself in the shared arena, so this field is just its
+                        // (fixed-address, so cross-process-valid) region pointer plus one counter
+                        // -- same shape as `unix_shared_conn_table` above, and same reason it can
+                        // be a plain field here while `flock_registry` cannot.
+                        shared_flock: syscalls::file::SharedFlockTable::new(&platform),
+                        record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                        record_lock_pollee: litebox::event::polling::Pollee::new(),
+                        shared_pty: syscalls::pty::SharedPtyTable::new(),
+                        process_table: syscalls::signal::xproc::SharedProcessTable::new(
+                            self.platform,
+                        ),
+                        pid_namespaces: syscalls::pidns::PidNamespaceTable::new(),
+                        next_pty_id: core::sync::atomic::AtomicU32::new(0),
+                        next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
+                        next_memfd_id: core::sync::atomic::AtomicU64::new(0),
+                        drm: syscalls::drm::DrmSubsystem::new(),
+                        evdev: syscalls::evdev::EvdevSubsystem::new(),
+                    },
+                )
+            });
+        // `/proc/self/{uid_map,gid_map,setgroups}` and the user namespaces they describe are
+        // credentials, not files: the fs layer owns the paths, so it calls back into the shim,
+        // which owns the task those files belong to. Registered per process (each fork child runs
+        // `build()` too) because the fs module stores them as plain function pointers.
+        litebox::fs::ident::set_id_map_write_fn(syscalls::process::apply_id_map_write);
+        litebox::fs::ident::set_id_map_read_fn(syscalls::process::read_id_map_file);
+        // Same shape, for `/proc/<pid>`: whether a pid exists is a fact only the process model
+        // owns, and under `LITEBOX_PROCESS_FORK=1` the pid may be running in a DIFFERENT host
+        // process than the one asking. `proc_self_info` is per host process, so it cannot answer
+        // that -- the cross-process table can, and it lives in `GlobalState`, which `/proc` (built
+        // by `default_fs`, before `GlobalState` exists) can only reach through a hook like this.
+        syscalls::signal::xproc::publish_process_table(&inner.process_table);
+        litebox::fs::procfs::set_pid_known_fn(syscalls::signal::xproc::pid_is_known);
+        // Same hook, the other two questions `/proc` has no way to answer from inside `litebox`:
+        // WHICH pids exist across the fork family (`ls /proc`), and what a pid running in another
+        // host process is CALLED (`/proc/<pid>/{comm,cmdline,stat}`). Without the first, `ps` sees
+        // a one-process system; without the second, every foreign pid is nameless.
+        litebox::fs::procfs::set_pid_list_fn(syscalls::signal::xproc::live_pids);
+        litebox::fs::procfs::set_pid_identity_fn(syscalls::signal::xproc::pid_identity);
+        LinuxShim(GlobalStateHandle {
+            inner,
+            litebox: my_litebox,
+            proc_self_info: my_proc_self_info,
+            pts_registry: my_pts_registry,
+            elf_patch_cache: my_elf_patch_cache,
+            exec_ranges_cache: my_exec_ranges_cache,
+            segment_scan_cache: my_segment_scan_cache,
+            futex_manager: my_futex_manager,
+            memfds: my_memfds,
+            inotify: my_inotify,
+            inotify_watching: my_inotify_watching,
+            shared_files: my_shared_files,
+            unix_addr_table: my_unix_addr_table,
+            fifo_registry: my_fifo_registry,
+            pty_registry: my_pty_registry,
+            daemon_pty_masters: my_daemon_pty_masters,
+            xproc_local: my_xproc_local,
+            record_locks_local: Arc::new(litebox::sync::Mutex::new(alloc::vec::Vec::new())),
+            record_lock_pollee_local: Arc::new(litebox::event::polling::Pollee::new()),
+            flock_registry: my_flock_registry,
+            bootstrap_process: Arc::new(once_cell::race::OnceBox::new()),
+        })
     }
 }
 
-pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
+pub struct LinuxShim<Platform: ShimPlatform, FS: ShimFS>(GlobalStateHandle<Platform, FS>);
+
+impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// Diagnostic-only read of the shim-wide `next_thread_id` allocator (`LITEBOX_DIAG_
+    /// GLOBALSTATE_SHARE_PROBE=1`'s decisive live cross-process `GlobalState` create-vs-attach
+    /// proof -- see `syscalls::process::Task::try_cross_process_fork`'s matching parent-side
+    /// bump). Not gated itself (a plain atomic load is cheap and side-effect-free); the
+    /// PARENT-side bump this is meant to observe is what's gated.
+    pub fn diag_next_thread_id(&self) -> i32 {
+        self.0
+            .next_thread_id
+            .load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Diagnostic-only insert into `unix_addr_presence` (`LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE=1`'s
+    /// decisive live cross-process presence-table proof -- see
+    /// `syscalls::process::Task::try_cross_process_fork`'s matching parent-side inserts, mirroring
+    /// `diag_next_thread_id`'s own `GLOBALSTATE_SHARE_PROBE` pattern exactly). `kind` is
+    /// [`syscalls::unix::UNIX_ADDR_KIND_PATH`]/[`syscalls::unix::UNIX_ADDR_KIND_ABSTRACT`].
+    pub fn diag_unix_addr_presence_insert(&self, kind: u32, key: &[u8], owner_pid: u32) -> bool {
+        self.0.unix_addr_presence.insert(kind, key, owner_pid)
+    }
+
+    /// Diagnostic-only lookup into `unix_addr_presence`, the child-side half of the same proof.
+    pub fn diag_unix_addr_presence_lookup(&self, kind: u32, key: &[u8]) -> Option<u32> {
+        self.0.unix_addr_presence.lookup(kind, key)
+    }
+
+    /// Build a `WaitContext` for host-side pipe I/O.
+    ///
+    /// A pump thread has no `Task` to borrow one from, and `WaitState` is deliberately per-thread
+    /// (`Send` but not `Sync`), so each call makes its own. `WaitState::new` takes the `&'static`
+    /// platform, which is exactly what is available here.
+    fn host_wait_state(&self) -> litebox::event::wait::WaitState<Platform> {
+        litebox::event::wait::WaitState::new(self.0.platform)
+    }
+
+    /// Read from a detached pipe end on the HOST side, for a cross-process fork pump thread.
+    /// Mirrors the existing `pty_master_read`, which is how the runner already bridges a guest
+    /// stream to a real OS handle for stdio.
+    pub fn detached_pipe_read(
+        &self,
+        end: &litebox::pipes::DetachedPipeEnd<Platform>,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        let wait_state = self.host_wait_state();
+        end.read(&wait_state.context(), buf).ok()
+    }
+
+    /// Write into a detached pipe end on the HOST side. See [`Self::detached_pipe_read`].
+    pub fn detached_pipe_write(
+        &self,
+        end: &litebox::pipes::DetachedPipeEnd<Platform>,
+        buf: &[u8],
+    ) -> Option<usize> {
+        let wait_state = self.host_wait_state();
+        end.write(&wait_state.context(), buf).ok()
+    }
+}
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -312,24 +949,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Install (or replace) the host-side callback invoked on every real DRM page-flip (see
-    /// [`syscalls::drm::DrmSubsystem::set_flip_callback`]'s doc comment for the exact contract and
+    /// [`syscalls::drm::DrmSubsystem::add_flip_callback`]'s doc comment for the exact contract and
     /// why it deliberately takes plain pixel bytes rather than a platform-specific handle) -- the
     /// sole public entry point into the shim's own `/dev/dri/card0` emulation, since
     /// `DrmSubsystem` itself stays a private implementation detail. A runner binary that depends
     /// on a concrete presentation layer (e.g. `litebox_platform_windows_userland`'s wgpu-backed
     /// `Presenter`) calls this once, right after [`LinuxShimBuilder::build`], to make flipped
     /// frames actually visible; a runner target with no GUI story simply never calls it.
-    pub fn set_drm_flip_callback(
+    ///
+    /// ADDITIVE: each call installs an ADDITIONAL observer rather than replacing the previous
+    /// one, so a `--gui` window and a `LITEBOX_DUMP_FRAMES` capture can both watch the same
+    /// frames. See [`syscalls::drm::DrmSubsystem::flip_callbacks`] for why that matters.
+    pub fn add_drm_flip_callback(
         &self,
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
-        self.0.drm.set_flip_callback(callback);
+        self.0.drm.add_flip_callback(callback);
+    }
+
+    /// The current front buffer's identity (platform shared-memory handle plus geometry and
+    /// frame sequence number), for a host-side `ControlServer` to hand off to an external
+    /// presenter process -- see [`syscalls::drm::ScanoutSnapshot`] and
+    /// `docs/presenter-process-design.md` section 2.2/2.3. Unlike
+    /// [`Self::add_drm_flip_callback`], this is a plain on-demand query, not a per-flip observer:
+    /// a control channel calls it once when handling a `scanout` command, and again whenever it
+    /// wants to check whether the buffer identity changed (a mode change/reallocation) after
+    /// observing `seq` advance. `None` until the guest has attached a framebuffer to the CRTC at
+    /// least once.
+    pub fn drm_scanout_snapshot(&self) -> Option<syscalls::drm::ScanoutSnapshot<Platform>> {
+        self.0.drm.scanout_snapshot()
     }
 
     /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --
     /// see [`syscalls::evdev::EvdevSubsystem::push_key`]'s doc comment for the `code`/`value`
     /// contract. The sole public entry point into the shim's own evdev emulation, mirroring
-    /// [`Self::set_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
+    /// [`Self::add_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
     /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
     /// calls this from its own keyboard/mouse-button event handler.
     pub fn push_input_key(&self, code: u16, value: i32) {
@@ -341,6 +995,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// `code`/`value` contract.
     pub fn push_input_rel(&self, code: u16, value: i32) {
         self.0.evdev.push_rel(code, value);
+    }
+
+    /// Push one 2D mouse movement as a SINGLE evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`),
+    /// which is what real hardware emits for one physical motion -- see
+    /// [`syscalls::evdev::EvdevSubsystem::push_rel_motion`]. Prefer this over two `push_input_rel`
+    /// calls for cursor movement: those produce two separately-synced reports, making a client
+    /// process the motion twice.
+    pub fn push_input_rel_motion(&self, dx: i32, dy: i32) {
+        self.0.evdev.push_rel_motion(dx, dy);
     }
 
     /// Loads the program at `path` as the shim's initial task, returning the
@@ -429,29 +1092,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(
+                thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.0.litebox)),
                     false,
                     None,
                     bootstrap_shared_pending.clone(),
                     None,
-                ),
-                wait_state: wait::WaitState::new(self.0.platform),
-                pid,
-                ppid,
-                tid: pid,
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
-                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                )),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
+                pid: Cell::new(pid),
+                ppid: Cell::new(ppid),
+                tid: Cell::new(pid),
+                pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    uid, euid, gid, egid,
+                ))),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(bootstrap_shared_pending),
+                signals: RefCell::new(syscalls::signal::SignalState::new_process(
+                    bootstrap_shared_pending,
+                )),
                 attached_pty_id: Cell::new(None),
             },
         };
@@ -463,6 +1128,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
             .0
             .bootstrap_process
             .set(alloc::boxed::Box::new(entrypoints.task.process().clone()));
+        entrypoints.task.xproc_register_self(false);
+        self.0
+            .registry_insert(entrypoints.task.pid.get(), entrypoints.task.process());
 
         let (path, argv) = entrypoints
             .task
@@ -492,12 +1160,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
     /// Read bytes from the master side of a pty allocated via [`Self::load_program_attach_pty`],
     /// keyed by the pty id that call returned. Callable from any thread with no `Task` in scope
-    /// (see `GlobalState::daemon_pty_masters`'s doc comment) -- this is what lets a plain
+    /// (see `GlobalStateHandle::daemon_pty_masters`'s doc comment) -- this is what lets a plain
     /// background thread in the runner drain a session's pty output concurrently with
     /// `run_thread` running the guest on its own thread. Blocking: waits for at least one byte
     /// using a throwaway, this-call-only `litebox::event::wait::WaitState` (never the guest's own), matching
     /// [`Self::perform_network_interaction`]'s precedent of driving shim-internal I/O from a
     /// caller with no guest `Task` in scope.
+    ///
+    /// Cross-process fallback: if `pty_id` is absent from THIS process's own local
+    /// `daemon_pty_masters` (it was allocated by a DIFFERENT process in the fork family, or this
+    /// process attached to the shared kernel state after `attach_pty_stdio` already ran
+    /// elsewhere), reads directly from `syscalls::pty::SharedPtyTable` instead -- see that type's
+    /// own doc comment for the full design and explicit scope limits.
     pub fn pty_master_read(&self, pty_id: u32, buf: &mut [u8]) -> Result<usize, Errno> {
         // Resolve the master's `EntryHandle` (which holds its own `Arc` clone of the entry's
         // lock, independent of the descriptor table itself -- see `EntryHandle`'s doc comment)
@@ -514,35 +1188,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         // dropping the table guards before the blocking call fixes it.
         let handle = {
             let masters = self.0.daemon_pty_masters.read();
-            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
-            self.0
-                .litebox
-                .descriptor_table()
-                .entry_handle(master)
-                .ok_or(Errno::ENXIO)?
+            masters
+                .get(&pty_id)
+                .and_then(|master| self.0.litebox.descriptor_table().entry_handle(master))
         };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.read(&cx, buf))
+        match handle {
+            Some(handle) => handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                end.read(&cx, buf, &self.0.pty_io())
+            }),
+            None => syscalls::pty::poll_shared(&cx, false, || {
+                self.0
+                    .shared_pty
+                    .try_read_side(pty_id, true, buf, &self.0.pty_io())
+            }),
+        }
     }
 
     /// Write bytes to the master side of a pty allocated via [`Self::load_program_attach_pty`].
-    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale AND
-    /// (as of the fix noted there) the lock-ordering rationale for resolving the `EntryHandle`
-    /// and dropping the table guards before the blocking `end.write(&cx, buf)` call below.
+    /// See [`Self::pty_master_read`]'s doc comment for the threading/host-caller rationale, the
+    /// lock-ordering rationale for resolving the `EntryHandle` and dropping the table guards
+    /// before the blocking `end.write(&cx, buf, ...)` call below, AND the cross-process fallback.
     pub fn pty_master_write(&self, pty_id: u32, buf: &[u8]) -> Result<usize, Errno> {
         let handle = {
             let masters = self.0.daemon_pty_masters.read();
-            let master = masters.get(&pty_id).ok_or(Errno::ENXIO)?;
-            self.0
-                .litebox
-                .descriptor_table()
-                .entry_handle(master)
-                .ok_or(Errno::ENXIO)?
+            masters
+                .get(&pty_id)
+                .and_then(|master| self.0.litebox.descriptor_table().entry_handle(master))
         };
         let wait_state = litebox::event::wait::WaitState::new(self.0.platform);
         let cx = wait_state.context();
-        handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| end.write(&cx, buf))
+        match handle {
+            Some(handle) => handle.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
+                end.write(&cx, buf, &self.0.pty_io(), &|pgid, sig| {
+                    self.0.xproc_signal_group(pgid, sig)
+                })
+            }),
+            None => syscalls::pty::poll_shared(&cx, false, || {
+                self.0
+                    .shared_pty
+                    .try_write_side(pty_id, true, buf, false, &self.0.pty_io())
+            }),
+        }
     }
 
     /// Constructs a `LinuxShimEntrypoints`/`Task` for a process-based-fork child whose guest
@@ -557,18 +1245,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// `load_program`/ELF-loads a forked child -- it constructs a `Task` directly from the
     /// parent's already-running state. The difference here is that there is no parent `Task` in
     /// this process to copy from (the parent lives in a different OS process); every field is
-    /// built fresh from the caller-supplied `pm`/`pid`/`ppid`/credentials, mirroring a stdio-only,
-    /// single-thread, freshly-execve'd-looking process shape.
+    /// built fresh from the caller-supplied `pm`/`pid`/`ppid`/credentials/`comm`, mirroring a
+    /// stdio-only, single-thread, freshly-execve'd-looking process shape -- `comm` and
+    /// `sigreturn_trampoline` are the two fields real-Linux `fork()` semantics say must instead
+    /// carry the PARENT's actual value, so both are threaded through explicitly by the caller
+    /// rather than left at a fresh-process default (see each parameter's own doc below).
     ///
     /// Returns bare `LinuxShimEntrypoints`, not a `LoadedProgram` -- there is no ELF-derived
     /// initial register state to report (the caller already has the forked child's own translated
     /// `PtRegs`, captured at the parent's `fork()` call site) and no argv/envp/entry point to
     /// resolve.
+    ///
+    /// `comm` is the PARENT's own current `comm` bytes -- on real Linux a forked child's `comm` is
+    /// the parent's, verbatim, until the child's own `execve`/`PR_SET_NAME`. See
+    /// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s doc comment on its
+    /// own `comm` parameter for the bug this closes: this function used to unconditionally build
+    /// the child with an EMPTY `comm`, unlike `do_clone`'s thread-based path's correct
+    /// `comm: self.comm.clone()` -- confirmed live (every cross-process fork child showed a blank
+    /// `comm` in `DIAG_TIMELINE`/`LITEBOX_DIAG_SYSCALL_TIMELINE` regardless of its parent's real
+    /// name) before being misread as "comm is never inherited at fork" in general.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (`0` if the parent never established one) --
+    /// see `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s doc comment
+    /// on its own `sigreturn_trampoline` parameter for why this must be threaded all the way from
+    /// the parent through to here rather than left at `SignalState::new_process`'s own default of
+    /// `0` (found live investigating the `LITEBOX_LAZY_FORK_COMMIT=1` subshell crash: a real,
+    /// 100%-reproducible `SIGSEGV` on a fork-without-`execve()` child needing to return from a
+    /// signal via the trampoline its own already-copied guest memory correctly still has the real
+    /// bytes for, but whose ADDRESS this process's own fresh `SignalState` no longer recognizes).
     pub fn adopt_forked_process(
         &self,
         fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         pm: PageManager<Platform, PAGE_SIZE>,
+        comm: [u8; litebox_common_linux::TASK_COMM_LEN],
+        sigreturn_trampoline: usize,
+        pgid: Option<i32>,
+        // The PID namespace this child was born into and the pid/tid it holds there, as the parent
+        // that forked it computed them (its rows in the shared namespace table are already
+        // registered by then -- see `syscalls::pidns`). `None` for the initial namespace, where a
+        // task's guest pid is its internal one.
+        pid_namespace: Option<(u32, i32, i32)>,
     ) -> LinuxShimEntrypoints<Platform, FS> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -586,37 +1304,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let shared_pending = Arc::new(litebox::sync::Mutex::new(
             syscalls::signal::PendingSignals::new(),
         ));
+        let thread_state = syscalls::process::ThreadState::new_process(
+            pid,
+            Arc::new(pm),
+            false,
+            None,
+            shared_pending.clone(),
+            None,
+        );
+        let signals = syscalls::signal::SignalState::new_process(shared_pending);
+        // See this function's own doc comment on `sigreturn_trampoline` -- `new_process` above
+        // always starts this at `0`; override it with the parent's real, already-established
+        // value (a no-op when the parent never established one, matching a fresh process' own
+        // starting state exactly).
+        signals.set_sigreturn_trampoline_for_fork_adoption(sigreturn_trampoline);
 
-        LinuxShimEntrypoints {
+        let entrypoints = LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(
-                    pid,
-                    Arc::new(pm),
-                    false,
-                    None,
-                    shared_pending.clone(),
-                    None,
-                ),
-                wait_state: wait::WaitState::new(self.0.platform),
-                pid,
-                ppid,
-                tid: pid,
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
-                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(),
+                thread: RefCell::new(thread_state),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.0.platform)),
+                pid: Cell::new(pid),
+                ppid: Cell::new(ppid),
+                tid: Cell::new(pid),
+                pid_ns: Cell::new(pid_namespace.map_or(syscalls::pidns::INITIAL_NS, |ns| ns.0)),
+                ns_pid: Cell::new(pid_namespace.map_or(pid, |ns| ns.1)),
+                ns_tid: Cell::new(pid_namespace.map_or(pid, |ns| ns.2)),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    uid, euid, gid, egid,
+                ))),
+                comm: comm.into(),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(shared_pending),
+                signals: RefCell::new(signals),
                 attached_pty_id: Cell::new(None),
             },
+        };
+        if let Some(pgid) = pgid {
+            entrypoints
+                .task
+                .process()
+                .pgid
+                .store(pgid, core::sync::atomic::Ordering::Relaxed);
         }
+        // This process is the whole of its own host process, so a remote `SIGKILL` may end it
+        // by terminating the host process.
+        entrypoints.task.xproc_register_self(true);
+        // The rootfs the admission bound protects is already rebuilt here, so the slot is given
+        // back now rather than at a `wait4()` a long-lived child may never reach. See
+        // `cross_process_fork_slots`.
+        self.0.release_cross_process_fork_slot_for_child(self.0.platform.current_host_pid());
+        entrypoints
     }
 
     /// Get the page manager for the shim's bootstrap process (the one created by the first
@@ -644,7 +1384,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        let advice = self.0.net_lock().perform_platform_interaction();
+        if matches!(
+            advice,
+            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        ) {
+            self.0.xproc_poke_other_hosts();
+        }
+        advice
+    }
+
+    /// Force the exact same recovery [`GlobalStateHandle::net_lock`]'s own dead-holder path
+    /// already performs (see `litebox::net::Network::reset_after_poisoning`'s doc comment) --
+    /// for a caller that caught a panic escaping [`Self::perform_network_interaction`] (e.g.
+    /// smoltcp's own `"handle does not refer to a valid socket"`, `socket_set.rs:116`, seen live
+    /// 2026-09-18 during a `LITEBOX_PROCESS_FORK=1` full webtop boot).
+    ///
+    /// # Why this is needed
+    ///
+    /// A panic that unwinds through `perform_network_interaction`'s `MutexGuard` releases the
+    /// lock normally (the holding thread is still alive, just unwinding) -- `RawMutex`'s own
+    /// dead-holder poisoning is an OS-level "the recorded holder PROCESS died" signal and is
+    /// never set by an ordinary same-process panic, so the very next `net_lock()` call would NOT
+    /// see `recovered_from_dead_holder` and would NOT reset anything, leaving whatever stale
+    /// `SocketHandle` caused the panic still in place. Every future tick (this process's own next
+    /// `wait_on_tun` cycle, and every OTHER process's, since `Network` is shared across the whole
+    /// fork family) would panic on the exact same handle again. Left unaddressed, each process's
+    /// own `net_worker` thread panics and dies in turn the first time it touches the same stale
+    /// handle, until every process's worker has died and networking is silently gone
+    /// platform-wide with no further log output at all -- live-confirmed as the mechanism behind
+    /// a genuine full-boot stall: this exact panic was the LAST thing ever logged before total,
+    /// permanent log silence (`docs/AGENTS_ARCHIVE_2026-09-18.md`, fifteenth pass).
+    ///
+    /// Calling this after catching such a panic is the same trade-off `reset_after_poisoning`
+    /// itself already discloses (a real loss of in-flight connections, in exchange for
+    /// self-consistent state for every future caller) -- just triggered by a live in-process
+    /// panic instead of an OS-level dead-holder signal. The caller (necessarily `std`-enabled,
+    /// since this `no_std` crate cannot itself call `catch_unwind`) is expected to wrap its own
+    /// call to [`Self::perform_network_interaction`] in `std::panic::catch_unwind` and call this
+    /// method from the `Err` arm before resuming its polling loop.
+    pub fn force_reset_network_after_panic(&self) {
+        self.0.net_lock().reset_after_poisoning();
     }
 
     /// Establish a TCP connection to the given address.
@@ -716,12 +1496,64 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create a default layered file system with the given in-memory layer and tar data.
+/// How [`default_fs`] should obtain its `/`-mount `TarRo` backend.
+enum MergeInput {
+    /// Call `TarRo::from_layers` for real. `capture_for_caller` says whether to ALSO pay
+    /// `TarRo::live_entries_after_merge`'s own extra `O(final entry count)` tree walk afterward
+    /// and hand the result back through [`default_fs`]'s second return value -- worth it for
+    /// [`LinuxShimBuilder::default_fs_multi_layer`] (whose caller can cache the result for a
+    /// later, far cheaper rebuild), wasted work for [`LinuxShimBuilder::default_fs`]'s single-
+    /// pre-merged-tar callers, none of which have any use for it.
+    BuildFresh { capture_for_caller: bool },
+    /// Skip `TarRo::from_layers` entirely and build straight from an already-known
+    /// `live_entries_after_merge` list via `TarRo::from_merged_live_entries` -- see that
+    /// function's own doc comment for the soundness argument.
+    UseCached(Cow<'static, [u8]>),
+}
+
+/// Create a default layered file system with the given in-memory layer and one or more
+/// (bottom-to-top) tar layers backing the read-only lower layer.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
+    platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> LinuxFS<Platform> {
+    tar_layers: Vec<Cow<'static, [u8]>>,
+    merge_input: MergeInput,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+) -> (LinuxFS<Platform>, Option<Cow<'static, [u8]>>) {
+    // Populated as a side effect of the `/`-mount closure below, ONLY on the
+    // `BuildFresh { capture_for_caller: true }` branch -- `Composer::builder().mount`'s closure
+    // must return just the backend itself (`TarRo`), so there is no direct return path for this;
+    // a `RefCell` captured by reference is the plainest way to smuggle a second output out of a
+    // closure whose signature the caller (`Composer`) fixes. Read back once, immediately after
+    // `.build()` below returns (single-threaded, synchronous -- the closure has already run by
+    // then), never touched concurrently.
+    let freshly_built_entries: core::cell::RefCell<Option<Cow<'static, [u8]>>> =
+        core::cell::RefCell::new(None);
+    // Real host logical-CPU count -- see `litebox::platform::SystemInfoProvider::cpu_count`'s doc
+    // comment for why GLib's thread-pool sizing needs this to be accurate, not just present.
+    let cpu_count = platform.cpu_count();
+    // No live guest-visible memory-pressure tracking exists in this shim; a large fixed value
+    // (4 GiB) is a safe, always-parseable `/proc/meminfo` stand-in -- see `format_meminfo`'s doc
+    // comment for why the exact value is not load-bearing for any known consumer.
+    // Real host memory, queried from the platform (Windows: `GlobalMemoryStatusEx`), NOT a fixed
+    // constant. The previous hardcoded 4 GiB -- combined with `format_meminfo`'s old 3/4-of-total
+    // formula -- advertised exactly 3 GiB free to every guest regardless of what the host actually
+    // had. Xorg sized an allocation to precisely that figure and repeatedly got the whole guest
+    // killed by the host's low-memory watchdog. See `SystemInfoProvider::memory_info_kb`.
+    let (mem_total_kb, mem_avail_kb) = platform.memory_info_kb();
+    // No live wall-clock uptime source is reachable from this `no_std` shim at `default_fs` time
+    // (before `GlobalState::boot_time` exists) -- a fixed placeholder is fine, see
+    // `format_uptime`'s doc comment.
+    const BOOT_UPTIME_SECS: u64 = litebox::fs::procfs::FAKE_BOOT_UPTIME_SECS;
+    let boot_unix_secs = {
+        use litebox::platform::SystemTime as _;
+        <Platform as litebox::platform::TimeProvider>::current_time(platform)
+            .duration_since(&<Platform as litebox::platform::TimeProvider>::SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+            .saturating_sub(BOOT_UPTIME_SECS)
+    };
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -733,6 +1565,13 @@ fn default_fs<Platform: ShimPlatform>(
             })
             .mount("/dev/input", |allocator| {
                 litebox::fs::devices::InputDevices::new(litebox, allocator)
+            })
+            // See `litebox::fs::devices::PtsDevices`'s doc comment: without this, `/dev/pts/<id>`
+            // and `stat("/dev/pts")` both work (the shim intercepts those directly), but
+            // `open("/dev/pts", O_DIRECTORY)` does not -- which is what glibc's real `openpty()`
+            // needs (via `ttyname_r`'s directory-scan cross-check) to succeed at all.
+            .mount("/dev/pts", |allocator| {
+                litebox::fs::devices::PtsDevices::new(litebox, allocator, pts_registry.clone())
             })
             .mount("/sys/class/drm", |allocator| {
                 litebox::fs::devices::SysClassDrm::new(litebox, allocator)
@@ -746,19 +1585,223 @@ fn default_fs<Platform: ShimPlatform>(
             .mount("/sys/dev/char", |allocator| {
                 litebox::fs::devices::SysDevChar::new(litebox, allocator)
             })
+            // Every `/proc/sys` file whose value is fixed for the life of a guest, in one
+            // table-driven backend (see `litebox::fs::static_files`). This replaces a dedicated
+            // ~270-line `Backend` implementation that served `overflowuid`/`overflowgid` and
+            // nothing else -- adding the three files below to it would have meant either
+            // extending that one-off or writing more of them, and a live XFCE session was
+            // observed asking for eleven distinct constant `/proc`+`/sys` paths and getting
+            // `ENOENT` for every one.
+            .mount("/proc/sys", |allocator| {
+                litebox::fs::static_files::StaticFiles::new(
+                    litebox,
+                    allocator,
+                    alloc::vec![
+                        // The traditional fixed "nobody" ids, `65534` on every Linux kernel --
+                        // what a user namespace maps anything outside its own uid/gid range to.
+                        // `bwrap` (bubblewrap, behind `glycin`'s per-format sandboxed image
+                        // decoders, which is what `gdk-pixbuf` uses in place of its old
+                        // in-process loader modules) reads both while setting up its sandbox,
+                        // right after `prctl(PR_SET_NO_NEW_PRIVS, 1)`. Without them it fails
+                        // outright ("bwrap: Can't read /proc/sys/kernel/overflowuid"), which
+                        // breaks sandboxed decode entirely and surfaces as a `Gtk:ERROR`
+                        // assertion abort in any GTK app that has to decode a PNG -- confirmed
+                        // live as what was crashing `xfce4-panel` on its own bundled
+                        // `image-missing.png` fallback icon.
+                        litebox::fs::static_files::file(
+                            "kernel/overflowuid",
+                            b"65534
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/overflowgid",
+                            b"65534
+"
+                        ),
+                        // The highest capability number this "kernel" knows. `40` is
+                        // `CAP_CHECKPOINT_RESTORE`, the last one defined as of Linux 5.9 and
+                        // still the last in 6.x. libcap reads this to size its own capability
+                        // bitmaps and to bound `cap_get_bound` loops.
+                        litebox::fs::static_files::file(
+                            "kernel/cap_last_cap",
+                            b"40
+"
+                        ),
+                        // Not a FIPS build. OpenSSL and GnuTLS both read this at init; absent, at
+                        // least one of them logs a startup complaint on every process.
+                        litebox::fs::static_files::file(
+                            "crypto/fips_enabled",
+                            b"0
+"
+                        ),
+                        // Heuristic overcommit (the Linux default). Read by allocators deciding
+                        // whether a large speculative reservation will be honoured -- which, on
+                        // this platform, it is, since `allocate_pages` reserves without
+                        // committing until touched.
+                        litebox::fs::static_files::file(
+                            "vm/overcommit_memory",
+                            b"0
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "vm/max_map_count",
+                            b"1048576
+"
+                        ),
+                        // Limits programs read to size their own tables or loops (inotify
+                        // watch budgets, supplementary-group arrays, fd ceilings, pid space).
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_user_watches",
+                            b"524288
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_user_instances",
+                            b"128
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/inotify/max_queued_events",
+                            b"16384
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "fs/nr_open",
+                            b"1048576
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/ngroups_max",
+                            b"65536
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/pid_max",
+                            b"4194304
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "kernel/threads-max",
+                            b"1048576
+"
+                        ),
+                        // Yama's ptrace restriction level, `0` = the classic "any process may
+                        // ptrace any other with the usual uid checks" (a kernel built without
+                        // Yama, and what a Yama build reports until something raises it).
+                        // Chromium's crashpad reads this while deciding whether a crash handler
+                        // it has just started will be able to attach to the browser process,
+                        // and `IMMEDIATE_CRASH`es (`int3`, no log line) when the file is absent
+                        // -- the whole browser dies 3s into a sandbox-enabled start. `0` is also
+                        // the honest answer here: litebox has no LSM to restrict ptrace with.
+                        litebox::fs::static_files::file(
+                            "kernel/yama/ptrace_scope",
+                            b"0
+"
+                        ),
+                    ],
+                )
+            })
+            // Sandboxing-capability probes. `N` is what a kernel built without AppArmor reports,
+            // and it is the truth here: litebox has no LSM. Absent, these read as `ENOENT`, which
+            // some probes treat as "unknown" and retry rather than as a settled "no".
+            .mount("/sys/module/apparmor/parameters", |allocator| {
+                litebox::fs::static_files::StaticFiles::new(
+                    litebox,
+                    allocator,
+                    alloc::vec![
+                        litebox::fs::static_files::file(
+                            "enabled", b"N
+"
+                        ),
+                        litebox::fs::static_files::file(
+                            "available",
+                            b"N
+"
+                        ),
+                    ],
+                )
+            })
+            // CPU topology. Fixed for the life of the guest but not at compile time, which is why
+            // `StaticFiles` owns its table rather than borrowing a `&'static` one. GLib and
+            // libstdc++ both prefer these over `sysconf` when present, and a wrong or missing
+            // answer here sizes every thread pool in the session.
+            .mount("/sys/devices/system/cpu", |allocator| {
+                let range = if cpu_count > 1 {
+                    alloc::format!(
+                        "0-{}
+",
+                        cpu_count - 1
+                    )
+                } else {
+                    alloc::string::String::from(
+                        "0
+",
+                    )
+                };
+                let mut entries = alloc::vec![
+                    litebox::fs::static_files::file("online", range.as_bytes()),
+                    litebox::fs::static_files::file("possible", range.as_bytes()),
+                    // Same range as `online`: CPUs that are present but offline exist in
+                    // `present` too, and nothing here is ever offlined, so all three agree.
+                    litebox::fs::static_files::file("present", range.as_bytes()),
+                    // `NR_CPUS - 1` of a distro kernel, i.e. the highest CPU index the kernel's
+                    // static tables admit -- unrelated to how many are actually present.
+                    litebox::fs::static_files::file("kernel_max", b"8191\n"),
+                ];
+                // One `cpuN/cpu_capacity` per CPU, not just `cpu0`. Declaring only `cpu0` was a
+                // real gap, not a simplification: a live session was observed reading
+                // `cpu1/cpu_capacity` and getting `ENOENT`, because a reader that finds the file
+                // for one CPU reasonably expects it for all of them. `1024` is the scheduler's
+                // "full capacity" reference value, what every core on a uniform
+                // (non-big.LITTLE) machine reports.
+                for cpu in 0..cpu_count {
+                    entries.push(litebox::fs::static_files::file(
+                        &alloc::format!("cpu{cpu}/cpu_capacity"),
+                        b"1024
+",
+                    ));
+                }
+                litebox::fs::static_files::StaticFiles::new(litebox, allocator, entries)
+            })
+            .mount("/proc", |allocator| {
+                litebox::fs::procfs::Procfs::new(
+                    litebox,
+                    allocator,
+                    cpu_count,
+                    mem_total_kb,
+                    mem_avail_kb,
+                    BOOT_UPTIME_SECS,
+                    boot_unix_secs,
+                    proc_self_info.clone(),
+                )
+            })
+            .mount("/proc/self", |allocator| {
+                litebox::fs::procfs::ProcSelf::new(litebox, allocator, proc_self_info)
+            })
             .build()
             .unwrap(),
     );
     let tar_ro = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
-                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
+            .mount("/", |allocator| match merge_input {
+                MergeInput::UseCached(flat) => {
+                    litebox::fs::tar_ro::TarRo::from_flat_index(tar_layers, flat, allocator)
+                        .expect("the caller checked the flat index")
+                }
+                MergeInput::BuildFresh { capture_for_caller } => {
+                    let built = litebox::fs::tar_ro::TarRo::from_layers(tar_layers, allocator);
+                    if capture_for_caller {
+                        *freshly_built_entries.borrow_mut() =
+                            Some(Cow::Owned(built.flat_index().to_vec()));
+                    }
+                    built
+                }
             })
             .build()
             .unwrap(),
     );
-    litebox::fs::layered::FileSystem::new(
+    let fs = litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
@@ -768,7 +1811,36 @@ fn default_fs<Platform: ShimPlatform>(
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    )
+    );
+    (fs, freshly_built_entries.into_inner())
+}
+
+/// The `(min, max)` priority values Linux reports for a scheduling `policy`.
+///
+/// These are the real kernel's numbers, not placeholders: the real-time policies span 1..=99 and
+/// every non-real-time policy is fixed at 0..=0. glibc reads both at startup and stores them, then
+/// ASSERTS against them whenever a thread's priority changes -- so getting them wrong is not a
+/// cosmetic inaccuracy.
+///
+/// Neither syscall was implemented, which left glibc with whatever the unsupported-syscall path
+/// returned and produced, on a plain `PTHREAD_PRIO_INHERIT` mutex:
+///
+/// ```text
+/// Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority): assertion failed:
+///   new_prio == -1 || (new_prio >= fifo_min_prio && new_prio <= fifo_max_prio)
+/// ```
+///
+/// Reporting the range faithfully costs nothing and does not claim litebox honours priorities: a
+/// guest may ask what the valid range IS and still find that scheduling behaves uniformly, exactly
+/// as it does on a machine where every thread happens to run at the same priority.
+fn sched_priority_range(policy: i32) -> Result<(i32, i32), Errno> {
+    match policy {
+        // SCHED_FIFO, SCHED_RR
+        1 | 2 => Ok((1, 99)),
+        // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE
+        0 | 3 | 5 | 6 => Ok((0, 0)),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
@@ -811,7 +1883,14 @@ impl Default for TermiosState {
 pub(crate) struct ForegroundPgid(pub(crate) i32);
 
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform, FS>) {
+    /// Takes `&GlobalStateHandle`, deliberately NOT `&GlobalState` -- `global.litebox` below must
+    /// resolve to `GlobalStateHandle`'s own, always-locally-valid `litebox` field (see that
+    /// struct's doc comment), not `GlobalState`'s shared/cross-process-unsafe one (which no
+    /// longer exists as a field at all, precisely to make that mistake impossible here).
+    fn initialize_stdio_in_shared_descriptors_table(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
@@ -929,10 +2008,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .and_then(|h| {
                             h.with_entry(|end: &syscalls::pty::PtyEnd<Platform>| {
-                                end.is_slave().then(|| end.pair().clone())
+                                end.is_slave().then(|| end.local_pair().cloned()).flatten()
                             })
                         })
                 },
+                |_| None,
                 |_| None,
                 |_| None,
             );
@@ -962,6 +2042,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_| false,
                     |_| false,
                     |_| false,
+                    |_| false,
                 )
                 .unwrap_or(false);
             if is_network_fd {
@@ -972,14 +2053,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     drop(rds);
                     let _ = self
                         .global
-                        .net
-                        .lock()
-                        .close(&fd, litebox::net::CloseBehavior::Immediate);
+                        .net_lock()
+                        .close(&fd, litebox::net::CloseBehavior::Graceful);
                 }
             } else {
                 let _ = self.do_close(raw_fd);
             }
-            if let Ok(Some(pair)) = slave_pair {
+            if let Ok(Some(pair)) = slave_pair
+                && self.is_session_leader()
+            {
                 self.global.hangup_slave(&pair);
             }
         }
@@ -1000,6 +2082,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         pty: impl FnOnce(&TypedFd<syscalls::pty::PtySubsystem<Platform>>) -> R,
         signalfd: impl FnOnce(&TypedFd<syscalls::signalfd::SignalfdSubsystem<Platform>>) -> R,
         timerfd: impl FnOnce(&TypedFd<syscalls::timerfd::TimerfdSubsystem<Platform>>) -> R,
+        netlink: impl FnOnce(&TypedFd<syscalls::netlink::NetlinkSocketSubsystem>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1038,6 +2121,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
             drop(rds);
             return Ok(timerfd(&fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(netlink(&fd));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -1066,6 +2153,39 @@ impl ToSyscallResult for Result<u32, Errno> {
     fn to_syscall_result(self) -> Result<usize, Errno> {
         self.map(|v| v as usize)
     }
+}
+
+/// Builds the canned tmpfs-shaped `statfs`/`fstatfs` reply and writes it to `buf` -- shared by
+/// `SyscallRequest::Statfs`/`SyscallRequest::Fstatfs`, each of which validates its own target
+/// (path via `sys_stat`, fd via `sys_fstat`) exists/is open BEFORE calling this, so a nonexistent
+/// path or a stale/never-opened fd gets a real `ENOENT`/`EBADF` instead of this canned success
+/// (previously `pathname`/`fd` were ignored entirely -- `Statfs { pathname: _, .. }` -- so ANY
+/// path or fd number, including ones that don't exist, reported a successful tmpfs statfs).
+fn write_tmpfs_statfs<Platform: ShimPlatform>(
+    buf: UserPtrMut<litebox_common_linux::Statfs>,
+) -> Result<usize, Errno> {
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const BSIZE: i64 = 4096;
+    // 16 GiB of 4 KiB blocks, all reported free. Any caller doing a real capacity check gets a
+    // plausible answer; nothing here is a durable store to fill up.
+    const BLOCKS: u64 = (16 * 1024 * 1024 * 1024) / 4096;
+    let statfs = litebox_common_linux::Statfs {
+        f_type: TMPFS_MAGIC,
+        f_bsize: BSIZE,
+        f_blocks: BLOCKS,
+        f_bfree: BLOCKS,
+        f_bavail: BLOCKS,
+        f_files: 1 << 20,
+        f_ffree: 1 << 20,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: BSIZE,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    buf.write_at_offset::<Platform>(0, statfs)
+        .ok_or(Errno::EFAULT)
+        .map(|()| 0)
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -1129,18 +2249,173 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let return_value = match self.do_syscall(ctx) {
+        // Advisor-db diagnostics item 1 (`LITEBOX_STRACE_SUMMARY=1`): lazily latch the env flag
+        // on first dispatch (this `#![no_std]` crate has no other way to observe the host
+        // process environment -- see `diag`'s module doc comment) and, when enabled, time this
+        // dispatch and record the outcome. Zero overhead beyond one relaxed atomic load when
+        // unset.
+        crate::diag::init_strace_summary(|| {
+            self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY")
+        });
+        let timed = crate::diag::strace_summary_enabled();
+        #[cfg(target_arch = "x86_64")]
+        let syscall_number = ctx.orig_rax;
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
+        let start = timed.then(|| self.global.platform.now());
+        litebox::fs::set_effective_identity(self.creds().fsuid, self.creds().fsgid);
+        // A write to `/proc/self/uid_map` is a credentials change, so the fs layer hands it to the
+        // shim, which needs to know WHOSE syscall is running to answer it. Published for this
+        // dispatch only (restored on drop), and only the id-map files read it.
+        let _current_credentials =
+            crate::syscalls::process::publish_current_credentials(&self.credentials);
+
+        // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`: log syscall ENTRY (before dispatch, so a syscall
+        // that blocks forever still shows up -- `LITEBOX_STRACE_SUMMARY`'s aggregate-only
+        // exit-time recording above cannot show this) with pid/comm/syscall name/timestamp, for
+        // processes whose `comm` matches [`crate::diag::is_syscall_timeline_target_comm`] only.
+        // Built for the "what is this specific client process blocked on" question -- see
+        // AGENTS.md's "Rendering/scanout blocker" section: a client's last X11 write is known
+        // precisely (from the unix-stream byte trace), but not what it does afterward. An
+        // unfiltered every-process version was tried first and OOM'd the host runner process (a
+        // 1.25GB single allocation failure, ~21s into a busy full-desktop run, ~26000 log lines
+        // already emitted by then) -- logging every syscall of every guest process on a busy
+        // multi-process desktop session is not viable. Filtering by comm keeps this proportional
+        // to the specific client processes under investigation.
+        //
+        // WHICH comms is now the env var's VALUE, not a `const` in `diag.rs`. That constant was
+        // four hard-coded XFCE names, and this comment used to explain that a configurable filter
+        // was "avoided here specifically because that trait is in `litebox/src/platform/mod.rs`,
+        // mid-edit by a peer session this pass" -- a scheduling accident, recorded honestly, that
+        // then outlived its cause and made the shim's most useful instrument answer questions
+        // about exactly one desktop. `SystemInfoProvider::env_value` now exists and this reads it;
+        // see `diag::init_syscall_timeline` for why the bound is unchanged by that.
+        crate::diag::init_syscall_timeline(|| {
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE")
+        });
+        // 74th pass: same lazy-latch shape, for the `litebox_diag::socket_read` payload-preview
+        // diagnostic's own optional comm filter -- see `diag::init_socket_read_filter`'s doc
+        // comment for what problem this solves (blanket-on-every-process cost once that
+        // tracing target is enabled) and why unset is a no-op, not a behavior change.
+        crate::diag::init_socket_read_filter(|| {
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SOCKET_READ_TARGET")
+        });
+        // 113th pass: companion pid-based filter (see `init_syscall_timeline_pids`'s own doc
+        // comment) -- necessary because `comm` is never inherited at fork time in this codebase,
+        // so a forked child's own pre-`execve` syscalls can never match a comm-based target.
+        crate::diag::init_syscall_timeline_pids(|| {
+            self.global
+                .platform
+                .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
+        });
+        let comm_bytes = self.comm.get();
+        crate::diag::record_syscall_trail(
+            syscall_number,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
+        let is_target = crate::diag::syscall_timeline_enabled()
+            && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
+                || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
+                || crate::diag::is_ipc_timeline_syscall(syscall_number));
+        if is_target {
+            // Straight to stderr, not through `litebox_util_log` -- see
+            // `diag::emit_timeline_line` for why (the log macros are gated on `LITEBOX_LOG`,
+            // so this instrument used to accept its own env var and then print nothing).
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-enter] pid={} tid={} comm={} syscall={} syscall_num={}",
+                    self.pid.get(),
+                    self.tid.get(),
+                    alloc::string::String::from_utf8_lossy(&comm_bytes),
+                    crate::diag::syscall_name_pub(syscall_number),
+                    syscall_number,
+                ),
+            );
+        }
+
+        let result = self.do_syscall(ctx);
+
+        if is_target {
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-exit] pid={} tid={} comm={} syscall={} ok={} result={:?}",
+                    self.pid.get(),
+                    self.tid.get(),
+                    alloc::string::String::from_utf8_lossy(&comm_bytes),
+                    crate::diag::syscall_name_pub(syscall_number),
+                    result.is_ok(),
+                    result,
+                ),
+            );
+        }
+
+        if let Some(start) = start {
+            let elapsed =
+                litebox::platform::Instant::duration_since(&self.global.platform.now(), &start);
+            let err_debug = result.as_ref().err().map(|e| alloc::format!("{e:?}"));
+            crate::diag::record_syscall(
+                syscall_number,
+                elapsed.as_nanos().try_into().unwrap_or(u64::MAX),
+                err_debug,
+            );
+        }
+
+        let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
+            if let Some(sp) = syscalls::process::take_native_child_sp() {
+                ctx.rsp = sp;
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
             ctx.regs[0] = return_value;
         }
+    }
+
+    fn decode_path_arguments(request_debug: &str) -> alloc::string::String {
+        const PATH_FIELDS: [&str; 3] = [
+            "pathname: UserPtr(",
+            "oldpath: UserPtr(",
+            "newpath: UserPtr(",
+        ];
+        let mut decoded = alloc::string::String::new();
+        for field in PATH_FIELDS {
+            let Some(start) = request_debug.find(field) else {
+                continue;
+            };
+            let digits = &request_debug[start + field.len()..];
+            let Some(address) = digits
+                .split(')')
+                .next()
+                .and_then(|text| text.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let path = UserPtr::<core::ffi::c_char>::from_usize(address)
+                .to_cstring::<Platform>()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|| alloc::string::String::from("<unreadable>"));
+            decoded.push_str(&alloc::format!(
+                "{}={path:?} ",
+                field.split(':').next().unwrap_or("")
+            ));
+        }
+        decoded
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -1155,17 +2430,87 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
-        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        // seccomp is evaluated on the RAW syscall number, before `try_from_raw` decodes it: a
+        // filter must also see the syscalls this shim has no request type for, exactly as Linux
+        // runs its filters before `sys_call_table` dispatch.
+        let verdict = self.seccomp_verdict(ctx, syscall_number as i32);
+        if let Some(verdict) = verdict {
+            match verdict {
+                crate::syscalls::seccomp::Verdict::Allow => {}
+                crate::syscalls::seccomp::Verdict::Log => litebox_util_log::debug!(
+                    nr:% = syscall_number, pid:% = self.pid.get();
+                    "seccomp: SECCOMP_RET_LOG"
+                ),
+                other => {
+                    return self.apply_seccomp_verdict(other, syscall_number as i32, ctx.get_ip());
+                }
+            }
+        }
+        let request = match SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt) {
+            Ok(r) => r,
+            Err(e) => {
+                if crate::diag::strace_summary_enabled() {
+                    crate::diag::record_unresolved_syscall(
+                        syscall_number,
+                        self.pid.get(),
+                        &alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        // `LITEBOX_DIAG_SYSCALL_TIMELINE=1`, matching comm only (see `handle_syscall_request`'s
+        // own copy of this gate/comment): log the full, typed request args here (not just the
+        // syscall name, as the earlier version in `handle_syscall_request` did) -- this is
+        // AFTER `SyscallRequest::try_from_raw` has decoded e.g. an `Open`'s path string, so it
+        // answers "which file/library" a hanging `open`->`dlopen` sequence was for, not just
+        // that some `open` happened. Truncated: some variants (e.g. a `write` with a large
+        // buffer) could otherwise produce a huge line.
+        if crate::diag::is_syscall_timeline_target_comm(&self.comm.get())
+            || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
+            || crate::diag::is_ipc_timeline_syscall(syscall_number)
+        {
+            let mut debug_str = alloc::format!("{request:?}");
+            if let SyscallRequest::Prctl {
+                args: litebox_common_linux::PrctlArg::SetName(ptr),
+            } = &request
+                && let Some(c) = ptr.to_owned_slice::<Platform>(16)
+            {
+                debug_str = alloc::format!(
+                    "{debug_str} name={:?}",
+                    alloc::string::String::from_utf8_lossy(&c)
+                );
+            }
+            let truncated = if debug_str.len() > 320 {
+                alloc::format!("{}...", &debug_str[..320])
+            } else {
+                debug_str.clone()
+            };
+            let truncated =
+                alloc::format!("{truncated} {}", Self::decode_path_arguments(&debug_str));
+            crate::diag::emit_timeline_line(
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-syscall-request-detail] pid={} tid={} comm={} request={}",
+                    self.pid.get(),
+                    self.tid.get(),
+                    alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    truncated,
+                ),
+            );
+        }
         if matches!(
             request,
             SyscallRequest::Clone { .. }
                 | SyscallRequest::Clone3 { .. }
                 | SyscallRequest::Execve { .. }
                 | SyscallRequest::Wait4 { .. }
+                | SyscallRequest::Waitid { .. }
                 | SyscallRequest::Exit { .. }
                 | SyscallRequest::ExitGroup { .. }
                 | SyscallRequest::Openat { .. }
                 | SyscallRequest::Close { .. }
+                | SyscallRequest::CloseRange { .. }
                 | SyscallRequest::Mkdirat { .. }
                 | SyscallRequest::Renameat { .. }
                 | SyscallRequest::Symlinkat { .. }
@@ -1251,6 +2596,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 None => Err(Errno::EFAULT),
             },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::CloseRange { first, last, flags } => {
+                syscall!(sys_close_range(first, last, flags))
+            }
             SyscallRequest::Fsync { fd } => syscall!(sys_fsync(fd)),
             SyscallRequest::Fdatasync { fd } => syscall!(sys_fdatasync(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
@@ -1278,9 +2626,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     syscall!(sys_fchmodat(dirfd, path, mode))
                 }),
             SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
+            SyscallRequest::Fchownat {
+                dirfd,
+                pathname,
+                owner,
+                group,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_fchownat(dirfd, path, owner, group))
+                }),
+            SyscallRequest::Fchown { fd, owner, group } => syscall!(sys_fchown(fd, owner, group)),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Chroot { pathname } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chroot(path))),
             SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
@@ -1288,6 +2650,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 oldset,
                 sigsetsize,
             } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
+            SyscallRequest::RtTgsigqueueinfo { tgid, tid, sig } => {
+                self.sys_rt_tgsigqueueinfo(tgid, tid, sig)
+            }
+            SyscallRequest::RtSigqueueinfo { pid, sig } => self.sys_rt_sigqueueinfo(pid, sig),
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(ctx, mask, sigsetsize)
+            }
             SyscallRequest::RtSigaction {
                 signum,
                 act,
@@ -1311,6 +2686,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
+            SyscallRequest::CopyFileRange {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_copy_file_range(
+                fd_in, off_in, fd_out, off_out, len, flags
+            )),
+            SyscallRequest::Splice {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => syscall!(sys_splice(fd_in, off_in, fd_out, off_out, len, flags)),
             SyscallRequest::Sendfile {
                 out_fd,
                 in_fd,
@@ -1372,6 +2765,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 behavior,
             } => syscall!(sys_madvise(addr, length, behavior)),
+            SyscallRequest::InotifyInit { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                syscall!(sys_inotify_add_watch(fd, pathname, mask))
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
+            SyscallRequest::Mincore { addr, length, vec } => {
+                syscall!(sys_mincore(addr, length, vec))
+            }
+            SyscallRequest::Msync {
+                addr,
+                length,
+                flags,
+            } => syscall!(sys_msync(addr, length, flags)),
             SyscallRequest::Dup {
                 oldfd,
                 newfd,
@@ -1497,6 +2903,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
+            SyscallRequest::Unshare { flags } => syscall!(sys_unshare(flags)),
+            SyscallRequest::Seccomp {
+                operation,
+                flags,
+                args,
+            } => self.sys_seccomp(operation, flags, args),
             SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
             SyscallRequest::Readlink {
                 pathname,
@@ -1587,6 +2999,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     syscall!(sys_openat(dirfd, path, flags, mode))
                 }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Fallocate {
+                fd,
+                mode,
+                offset,
+                len,
+            } => syscall!(sys_fallocate(fd, mode, offset, len)),
             SyscallRequest::Mknodat {
                 dirfd,
                 pathname,
@@ -1671,6 +3089,51 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                     })
             }
+            // `statfs`/`fstatfs` describe the FILESYSTEM rather than a file. litebox's guest fs
+            // is a layered in-memory/tar-backed overlay with no fixed device behind it, so there
+            // are no true block counts to report -- but ENOSYS is the wrong answer: it is
+            // user-visible (`stat -f /` printed "Function not implemented") and library code
+            // that probes the filesystem can take a pessimistic path on failure rather than
+            // merely losing an optimisation. Report an honest description instead.
+            //
+            // `f_type` is TMPFS_MAGIC: the guest fs really does behave like a memory-backed
+            // filesystem (contents live in host memory, nothing is durable across runs), so
+            // callers that special-case tmpfs -- skipping fsync-heavy durability paths, or
+            // declining to place lock files -- get the behaviour that is actually correct here.
+            // Block counts are reported as a large, non-zero capacity rather than 0: callers
+            // routinely treat 0 free blocks as "disk full" and refuse to write.
+            //
+            // Both arms validate FIRST (`sys_stat`/`sys_fstat`) that the target actually exists /
+            // the fd is actually open before reporting this canned success -- this used to ignore
+            // `pathname`/`fd` entirely (`pathname: _`/`fd: _`) and report a successful tmpfs-shaped
+            // statfs for ANY path or fd number, including ones that don't exist/aren't open. That
+            // is genuinely wrong on its own (a `statfs()` existence probe on a nonexistent path,
+            // or an `fstatfs()` on a stale/closed/never-opened fd, must fail, not silently
+            // succeed) and was specifically investigated as a candidate for the Xvfb
+            // `ProcSELinuxGetClientContext` SIGSEGV (39th pass): libselinux's `is_selinux_enabled()`
+            // (`libselinux/src/init.c` `verify_selinuxmnt`) calls `statfs("/sys/fs/selinux", ...)`
+            // and only treats SELinux as present if `f_type == SELINUX_MAGIC` (0xf97cff8c) --
+            // since this handler always returns `TMPFS_MAGIC` (0x01021994), the magic never
+            // matches even with the existence bug, so that specific theory does NOT hold (the
+            // XSELinux protocol extension's own `AddExtension` call is gated on
+            // `is_selinux_enabled()` in `Xext/xselinux_ext.c`'s `SELinuxExtensionInit` and should
+            // never even run in this guest) -- but the existence-blind behavior is a real,
+            // independent correctness bug on its own and is fixed here regardless.
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_stat(path)?;
+                        write_tmpfs_statfs::<Platform>(buf)
+                    })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => {
+                self.sys_fstat(fd)?;
+                write_tmpfs_statfs::<Platform>(buf)
+            }
+            // Advisory only: the hint is accepted and deliberately ignored (see the dispatch
+            // site's comment on why refusing an advisory hint is pure downside).
+            SyscallRequest::Fadvise64 => Ok(0),
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
                 buf.write_at_offset::<Platform>(0, stat)
                     .ok_or(Errno::EFAULT)
@@ -1695,22 +3158,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pathname,
                 times,
                 flags,
-            } => pathname
-                .to_cstring::<Platform>()
-                .map_or(Err(Errno::EFAULT), |path| {
-                    let times = if times.is_null() {
-                        None
-                    } else {
-                        let Some(atime) = times.read_at_offset::<Platform>(0) else {
-                            return Err(Errno::EFAULT);
-                        };
-                        let Some(mtime) = times.read_at_offset::<Platform>(1) else {
-                            return Err(Errno::EFAULT);
-                        };
-                        Some((atime, mtime))
+            } => {
+                // `utimensat(dirfd, NULL, times, flags)` is legal and means "operate on `dirfd`
+                // itself" -- it is exactly what `futimens(fd, times)` compiles down to on musl
+                // (see `sys_utimensat`'s own doc comment, which already documents this), and
+                // coreutils' `touch` reaches it too. A NULL `pathname` is therefore NOT a bad
+                // address: it must be forwarded as an EMPTY path, which `FsPath::new` already
+                // maps to `FsPath::Fd(dirfd)`/`FsPath::Cwd`, rather than rejected.
+                //
+                // Previously this arm called `to_cstring()` unconditionally and returned
+                // `EFAULT` on the resulting `None`, so every `futimens`/NULL-path `utimensat`
+                // failed with `Bad address` without ever reaching `sys_utimensat`, whose
+                // `AT_EMPTY_PATH` handling for this case was consequently dead code. Confirmed
+                // live via `touch` under `--oci-image webtop:debian-i3`: `pathname=0x0`,
+                // `path_ok=0x0`, guest reports "setting times of '/tmp/direct_touch': Bad
+                // address".
+                let path = if pathname.is_null() {
+                    Some(alloc::ffi::CString::default())
+                } else {
+                    pathname.to_cstring::<Platform>()
+                };
+                path
+            }
+            .map_or(Err(Errno::EFAULT), |path| {
+                let times = if times.is_null() {
+                    None
+                } else {
+                    let Some(atime) = times.read_at_offset::<Platform>(0) else {
+                        return Err(Errno::EFAULT);
                     };
-                    syscall!(sys_utimensat(dirfd, path, times, flags))
-                }),
+                    let Some(mtime) = times.read_at_offset::<Platform>(1) else {
+                        return Err(Errno::EFAULT);
+                    };
+                    Some((atime, mtime))
+                };
+                syscall!(sys_utimensat(dirfd, path, times, flags))
+            }),
             SyscallRequest::Statx {
                 dirfd,
                 pathname,
@@ -1746,8 +3229,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 syscall!(sys_signalfd4(fd, mask, sizemask, flags))
             }
-            SyscallRequest::TimerfdCreate { flags } => {
-                syscall!(sys_timerfd_create(flags))
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                syscall!(sys_timerfd_create(clockid, flags))
             }
             SyscallRequest::TimerfdSettime {
                 fd,
@@ -1763,7 +3246,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // pointer must still surface as a real `EFAULT`, matching real Linux, rather than
                 // being silently ignored.
                 name.to_cstring::<Platform>()
-                    .map_or(Err(Errno::EFAULT), |_name| syscall!(sys_memfd_create(flags)))
+                    .map_or(Err(Errno::EFAULT), |_name| {
+                        syscall!(sys_memfd_create(flags))
+                    })
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
@@ -1825,6 +3310,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             SyscallRequest::Setsid => Ok(self.sys_setsid()?.reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getresuid { ruid, euid, suid } => {
+                syscall!(sys_getresuid(ruid, euid, suid))
+            }
+            SyscallRequest::Getresgid { rgid, egid, sgid } => {
+                syscall!(sys_getresgid(rgid, egid, sgid))
+            }
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1837,6 +3328,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Setresgid { rgid, egid, sgid } => {
                 syscall!(sys_setresgid(rgid, egid, sgid))
             }
+            SyscallRequest::Setreuid { ruid, euid } => syscall!(sys_setreuid(ruid, euid)),
+            SyscallRequest::Setregid { rgid, egid } => syscall!(sys_setregid(rgid, egid)),
+            SyscallRequest::Getpriority { which, who } => syscall!(sys_getpriority(which, who)),
+            SyscallRequest::Setpriority { which, who, prio } => {
+                syscall!(sys_setpriority(which, who, prio))
+            }
+            SyscallRequest::Setfsuid { uid } => Ok(self.sys_setfsuid(uid) as usize),
+            SyscallRequest::Setfsgid { gid } => Ok(self.sys_setfsgid(gid) as usize),
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
             SyscallRequest::Setgroups { size, list } => syscall!(sys_setgroups(size, list)),
             SyscallRequest::Sysinfo { buf } => {
@@ -1846,8 +3345,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|()| 0)
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
+            SyscallRequest::Personality { persona } => Ok(self.sys_personality(persona) as usize),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
+            }
+            SyscallRequest::SchedSetAffinity { pid, len, mask } => {
+                syscall!(sys_sched_setaffinity(pid, len, mask))
             }
             SyscallRequest::SchedGetAffinity { pid, len, mask } => {
                 const BITS_PER_BYTE: usize = 8;
@@ -1863,6 +3367,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EFAULT)
                 }
             }
+            SyscallRequest::Getrusage { who, usage } => {
+                // RUSAGE_CHILDREN = -1, RUSAGE_SELF = 0, RUSAGE_THREAD = 1. No per-process
+                // accounting exists here, so every counter reads zero.
+                if !(-1..=1).contains(&who) {
+                    return Err(Errno::EINVAL);
+                }
+                usage
+                    .write_slice_at_offset::<Platform>(0, &[0u8; 144])
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
+            SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
             SyscallRequest::SchedYield => {
                 // Do nothing until we have more scheduler integration with the
                 // platform.
@@ -1883,6 +3399,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::SchedGetScheduler { pid } => {
                 Ok(self.sys_sched_getscheduler(pid).reinterpret_as_unsigned() as usize)
             }
+            SyscallRequest::SchedGetPriorityMax { policy } => {
+                Ok(sched_priority_range(policy)?.1 as usize)
+            }
+            SyscallRequest::SchedGetPriorityMin { policy } => {
+                Ok(sched_priority_range(policy)?.0 as usize)
+            }
             SyscallRequest::SchedSetScheduler { pid, policy, param } => {
                 let sched_priority = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 self.sys_sched_setscheduler(pid, policy, sched_priority);
@@ -1899,6 +3421,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 options,
                 rusage,
             } => self.sys_wait4(pid, wstatus, options, rusage),
+            SyscallRequest::Shmget { key, size, shmflg } => self.sys_shmget(key, size, shmflg),
+            SyscallRequest::Shmat {
+                shmid,
+                shmaddr,
+                shmflg,
+            } => self.sys_shmat(shmid, shmaddr, shmflg),
+            SyscallRequest::Shmdt { shmaddr } => self.sys_shmdt(shmaddr),
+            SyscallRequest::Shmctl { shmid, cmd, buf } => self.sys_shmctl(shmid, cmd, buf),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+                rusage,
+            } => self.sys_waitid(idtype, id, infop, options, rusage),
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
@@ -1915,6 +3452,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => syscall!(sys_setitimer(which, new_value, old_value)),
             _ => {
                 log_unsupported!("{request:?}");
+                if crate::diag::strace_summary_enabled() {
+                    crate::diag::record_unsupported_subcommand(
+                        &alloc::format!("{request:?}"),
+                        "ENOSYS",
+                        self.pid.get(),
+                        &alloc::string::String::from_utf8_lossy(&self.comm.get()),
+                    );
+                }
                 Err(Errno::ENOSYS)
             }
         }
@@ -1922,13 +3467,594 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 /// Global shim state, shared across all tasks.
+/// The pipe standing behind one open FIFO: both ends, held for the FIFO's lifetime.
+///
+/// See `GlobalState::fifo_registry` for why both are kept rather than just the one an opener asked
+/// for.
+struct FifoPipe<Platform: ShimPlatform> {
+    reader: litebox::pipes::PipeFd<Platform>,
+    writer: litebox::pipes::PipeFd<Platform>,
+}
+
+/// Cross-process-shareable handle to the shim-wide [`GlobalState`] singleton (see
+/// `litebox::platform::SharedKernelStateProvider`'s own doc comment) -- mirrors
+/// `litebox::LiteBox`'s own `Platform::Handle<LiteBoxX<Platform>>`-wrapping shape exactly, as a
+/// named type since `GlobalState` is referenced across many files/fields in this crate the same
+/// way `Arc<GlobalState<Platform, FS>>` was referenced before this trait existed -- every such
+/// call site needs no further change: `Clone`/`Deref` below give it identical ergonomics.
+///
+/// # ROOT-CAUSE FIX (2026-09-17): `litebox` is a SEPARATE, always-locally-valid field here, not
+/// read from the shared `GlobalState.litebox` field it shadows
+///
+/// `GlobalState`'s own `litebox: LiteBox<Platform>` field is placed INLINE in the cross-process
+/// shared kernel arena by `create_shared_kernel_state` (see `LinuxShimBuilder::build`) -- but
+/// `LiteBox<Platform>` is `Platform::Handle<LiteBoxX<Platform>>` (effectively an `Arc` pointer):
+/// `SharedArc::new`/`create_shared_kernel_state` places only the pointer's literal inline bytes,
+/// never what it points to (see `AGENTS.md`'s "Does NOT close XVFB_FAILED/DBUS_FAILED" section --
+/// the SAME defect class already documented for `unix_addr_table`/`pty_registry`/etc: "an
+/// attaching process's copy of the root pointer is meaningless in its own address space"). A
+/// cross-process-fork child that ATTACHES (rather than creates) the shared `GlobalState` was
+/// therefore reading the FIRST creator's private-heap `LiteBox` pointer value -- meaningless, and
+/// dereferencing effectively garbage memory in the attaching child's own address space.
+///
+/// Live-confirmed root cause of the pre-existing, load-scaling stack-overflow class this session
+/// was tasked with root-causing: bisection (temporary `[bisect1..5]` diagnostic logging, since
+/// removed) proved the very FIRST cross-process fork child in a boot always completes cleanly (it
+/// takes the CREATE branch, so its own `litebox` value is genuinely its own), while every
+/// SUBSEQUENT one -- deterministically, regardless of guest program complexity, reproduced by
+/// `mkdir`/`rm -rf` as readily as `xset q` -- died with a real host `STATUS_STACK_OVERFLOW` inside
+/// `initialize_stdio_in_shared_descriptors_table`'s very first `descriptor_table_mut()`/
+/// `set_entry_metadata` call, i.e. the first real use of the ATTACHED, cross-process-garbage
+/// `litebox` pointer's `RwLock`. Chasing that garbage pointer's lock/wait-queue bookkeeping is
+/// what actually consumed the stack, not guest instruction count or fork-verify single-stepping
+/// (both independently ruled out live before this was found).
+///
+/// Fix: `GlobalStateHandle` keeps its OWN `litebox` field, populated from THIS process's own
+/// `LinuxShimBuilder::litebox` (always freshly, validly constructed in `LinuxShimBuilder::new`,
+/// every process, attach or create alike) rather than ever reading `GlobalState`'s shared copy.
+/// Rust's field-resolution rules try the receiver's own concrete type before auto-`Deref`ing, so
+/// this SHADOWS `GlobalState.litebox` transparently for every one of this crate's existing
+/// `xxx.litebox` call sites -- none of them needed to change.
+/// # Second instance of the SAME defect, fixed the SAME way: `proc_self_info`/`pts_registry`
+///
+/// `GlobalState`'s own doc comments already named this "known cross-process-attach gap" (2026-
+/// 09-17 create-vs-attach pass) before this session started: `LinuxShimBuilder::default_fs`/
+/// `default_fs_multi_layer` mounts the `/proc/self` and `/dev/pts` backends with a clone of
+/// `LinuxShimBuilder::proc_self_info`/`pts_registry` BEFORE `build()` (and hence before the
+/// create-vs-attach decision) ever runs -- so an attaching child's own mounted FS backend keeps
+/// pointing at ITS OWN fresh, per-process table while a `proc_self_info`/`pts_registry` field on
+/// the shared `GlobalState` struct would be whichever one the ORIGINAL creator made, exactly
+/// like `litebox` above. Live-confirmed THIS session: with the `litebox` fix above alone, the
+/// SECOND cross-process-forked guest process to ever call `execve` (i.e. the second real command
+/// in a boot) hit a clean, host-diagnosed `STATUS_ACCESS_VIOLATION` (`addr=0xffffffffffffffff`)
+/// inside `<litebox::fs::procfs::ProcSelfTable>::set`, called from `Task::load_program` through
+/// `self.global.proc_self_info` -- the exact mechanism this pre-existing doc comment predicted.
+/// Fixed the same way as `litebox`: `GlobalStateHandle` keeps its own copies, populated from
+/// `LinuxShimBuilder`'s per-process fields (the SAME instances `default_fs`/`default_fs_multi_
+/// layer` already mounted), never from `GlobalState`'s shared/cross-process-stale ones.
+///
+/// # Third instance of the SAME defect: `elf_patch_cache`
+///
+/// Live-diagnosed 2026-09-17, same session as `unix_addr_table` presence sharing: with the
+/// `litebox`/`proc_self_info`/`pts_registry` fixes above landed, a cross-process-fork boot
+/// progressed to the first `execve` of a plain external command (`mkdir`, reproduced equally by
+/// any exec) and hit a real `alloc::collections::btree::node.rs` panic ("range end index ... out
+/// of range for slice of length ...") inside `BTreeMap::entry(...).or_insert(...)` on
+/// `GlobalState::elf_patch_cache` -- a corrupted-node read exactly like the `litebox` stack
+/// overflow, just one field deeper. Unlike `unix_addr_table` et al., this field does not need a
+/// `SharedUnixAddrPresenceTable`-style flat rebuild: every key is `(pid, fd)` and no call site
+/// ever looks up another process's entry (see `GlobalState`'s own removed-field note above), so
+/// it is fixed the SAME way as `litebox`/`proc_self_info`/`pts_registry`: `GlobalStateHandle`
+/// carries its own `elf_patch_cache`, freshly constructed once per process in
+/// `LinuxShimBuilder::build`, attach or create alike, shadowing `GlobalState`'s (now removed)
+/// field for every existing `self.global.elf_patch_cache` call site with no further change.
+///
+/// # Fourth instance of the SAME defect: `exec_ranges_cache`
+///
+/// Live-diagnosed 2026-09-17, immediately after the `elf_patch_cache` fix above unblocked the
+/// next `execve`: fixed the identical way, for a performance-only (not per-process-identity)
+/// reason -- see `GlobalState`'s own removed-field note for `exec_ranges_cache`.
+///
+/// # Fifth instance of the SAME defect: `segment_scan_cache`
+///
+/// Live-diagnosed 2026-09-17, immediately after the `exec_ranges_cache` fix above: the same
+/// mkdir repro stopped panicking but started HANGING instead (host CPU climbing, zero new log
+/// output) -- see `GlobalState`'s own removed-field note for `segment_scan_cache` for why a
+/// corrupted `BTreeMap` can hang instead of panicking. Fixed the identical way.
+///
+/// # Sixth instance of the SAME defect, different underlying shape: `futex_manager`
+///
+/// Live-diagnosed 2026-09-17 via two `cdb -p` snapshots 20s apart with identical stacks (confirmed
+/// genuine hang, not slow progress): with the fifth instance above and the separate `RawMutex`/
+/// `Pipes` fixes all landed, the same repro hung one step later inside `FutexManager::wake` ->
+/// `LoanList::extract_if` -> `RawMutex::block`. `FutexManager.table: Box<[LoanList<...>; 256]>` is
+/// process-private-heap exactly like `elf_patch_cache` et al. above, but `LoanList` itself is
+/// structurally deeper, not just "a `BTreeMap` whose nodes happen to be on the wrong heap": its own
+/// doc comment says entries are "allocated once by the caller, potentially on the stack", and
+/// `FutexManager::wait` does exactly that (`pin!(LoanListEntry::new(...))` on the waiting guest
+/// thread's own stack). A stack address is fork-family-address-identical only for the ONE thread
+/// that actually called `fork()`; any OTHER thread's stack-resident entry, or lock state a
+/// non-forking thread held at fork time, becomes permanently unrecoverable garbage to every other
+/// process in the family -- classic post-fork "the lock's owner doesn't exist here" deadlock, not a
+/// relocatable-pointer bug. There is no "move it into the shared arena" fix available even in
+/// principle. Resolved the same way as `elf_patch_cache`: `FutexManager`'s own pre-existing doc
+/// comment already scopes it to "private" (single-process) futexes only ("this only supports
+/// 'private' futexes, since it assumes only a single process"), so giving each process in the fork
+/// family its own fresh `FutexManager` is not a workaround, it is the already-documented intended
+/// semantics -- `GlobalStateHandle` carries its own, always-freshly-constructed `futex_manager`
+/// field, shadowing `GlobalState`'s (now removed) field for every existing
+/// `self.global.futex_manager` call site with no further change.
+pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
+    inner: Platform::Handle<GlobalState<Platform, FS>>,
+    litebox: litebox::LiteBox<Platform>,
+    proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
+    pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
+    elf_patch_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>>,
+    exec_ranges_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::ExecRangesCache>>,
+    segment_scan_cache: Arc<litebox::sync::Mutex<Platform, syscalls::mm::SegmentScanCache>>,
+    futex_manager: Arc<FutexManager<Platform>>,
+    /// Seventh/eighth instances of the SAME defect this struct's own doc comment already
+    /// documents six times over: see `LinuxShimBuilder::build`'s `my_memfds`/`my_shared_files`
+    /// for the live-caught 2026-09-18 evidence (`sed`/`xset` both died on this, a corrupted-
+    /// `BTreeMap`-node panic in `syscalls::mm::MemfdRegistry`, fixed the identical way).
+    memfds: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    /// Every inotify instance (see `syscalls::inotify`), shared by all processes.
+    inotify: Arc<litebox::sync::Mutex<Platform, syscalls::inotify::InotifyRegistry<Platform>>>,
+    /// How many watches exist; file-system syscalls skip event delivery when it is zero.
+    inotify_watching: Arc<core::sync::atomic::AtomicUsize>,
+    shared_files: Arc<litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>>,
+    /// Ninth instance of the SAME defect class this struct's own doc comment documents eight
+    /// times over, found during the 2026-09-18 systematic `GlobalState`-field audit: this table's
+    /// own doc comment (`syscalls::unix::SharedUnixAddrPresenceTable`'s, on the removed
+    /// `GlobalState` field below) already says the real per-address bind/listen entries are kept
+    /// "alongside (never instead of) each process's OWN real `UnixAddrTable`" -- i.e. this was
+    /// always intended to be per-process private state, with `unix_addr_presence`/
+    /// `unix_shared_conn_table` below (both flat, pointer-free, and correctly left as plain
+    /// `GlobalState` fields) doing all of the genuine cross-process work. Leaving the real
+    /// `BTreeMap` itself as a byte-shared `GlobalState` field was still the same live hazard as
+    /// `elf_patch_cache` et al.: an attaching cross-process-fork child's copy of its root pointer
+    /// is the first creator's, meaningless in its own address space, on the very first `bind()`/
+    /// `connect()`/`listen()` that child performs. Fixed the identical way: `GlobalStateHandle`
+    /// carries its own, always-freshly-constructed-per-process `unix_addr_table`, shadowing
+    /// `GlobalState`'s (now removed) field for every existing `self.global.unix_addr_table` call
+    /// site with no further change.
+    unix_addr_table:
+        Arc<litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>>,
+    /// Tenth instance of the SAME defect class, found in the same audit: `GlobalState::
+    /// fifo_registry`'s own doc comment already says outright "shared by every thread of this
+    /// process -- but NOT across processes" -- i.e. this too was always meant to be per-process
+    /// private state, mistakenly placed as a byte-shared `GlobalState` field. Fixed the identical
+    /// way, shadowing `GlobalState`'s (now removed) field.
+    fifo_registry: Arc<
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
+        >,
+    >,
+    /// Eleventh instance of the SAME defect class this struct's own doc comment documents ten
+    /// times over: a real cross-process-forked child's copy of this `BTreeMap<u32,
+    /// syscalls::pty::PtyFd<Platform>>`'s root pointer is the first creator's, meaningless in its
+    /// own address space -- the exact same live hazard as `elf_patch_cache`/`unix_addr_table`/etc,
+    /// just never yet caught live for pty because no earlier pass's boot reached a cross-process
+    /// pty touch. Unlike `fifo_registry` (whose own doc comment explicitly disclaimed any
+    /// cross-process need), `syscalls::pty::SharedPtyTable`'s own doc comment on `GlobalState`
+    /// below establishes real cross-process pty registration/data specifically because
+    /// `pty_registry`'s doc comment (right below) DOES claim genuine cross-process need ("any
+    /// process that knows the id ... can open it", matching real devpts) -- so this field alone is
+    /// shadowed per-process exactly like the ten before it (fixing the crash), while
+    /// `SharedPtyTable` (a plain, pointer-free `GlobalState` field, same free-riding-on-
+    /// `GlobalState`'s-own-sharing rationale as `unix_addr_presence`) separately restores the
+    /// genuine cross-process capability this one alone can no longer provide.
+    ///
+    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value). The slave
+    /// fd held here is never installed into any process's own fd table directly; each
+    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
+    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
+    /// underlying entry, for every open THIS process itself performs. A DIFFERENT process's
+    /// `open("/dev/pts/<id>")` for an id THIS process allocated instead takes
+    /// `GlobalStateHandle::pts_open`'s `SharedPtyTable`-backed cross-process fallback.
+    pty_registry: Arc<
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+        >,
+    >,
+    /// Same reasoning as [`Self::pty_registry`] immediately above. Registry of allocated ptys'
+    /// master-side fd, keyed by pty id, populated only for a pty created via
+    /// `Task::attach_pty_stdio` (the session-daemon `--pty-mode` path) -- see that field's
+    /// original doc comment (preserved verbatim on `LinuxShim::pty_master_read`'s own doc comment)
+    /// for the full rationale. `LinuxShim::pty_master_read`/`pty_master_write` fall back to
+    /// `SharedPtyTable` directly when THIS process's own copy of this map doesn't have the
+    /// requested id (i.e. it was allocated by a different process in the fork family).
+    daemon_pty_masters: Arc<
+        litebox::sync::RwLock<
+            Platform,
+            alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
+        >,
+    >,
+    /// The guest processes running in THIS host process, by pid -- per-process by design (it
+    /// holds `Weak` pointers into this process's heap); the cross-process view is
+    /// `GlobalState::process_table`.
+    pub(crate) xproc_local: Arc<syscalls::signal::xproc::LocalProcessMap<Platform>>,
+    /// This process's own record-lock table and waiter list, used where processes do not share one
+    /// kernel heap (a `Vec` buffer and a `Pollee`'s observers live on the private heap of the
+    /// process that touched them, so they cannot sit in `GlobalState` there).
+    record_locks_local:
+        Arc<litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>>,
+    record_lock_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
+    /// This process's own `flock(2)` registry (see `syscalls::file::FlockRegistry`), kept here
+    /// rather than on `GlobalState` because both halves of it -- the `BTreeMap`'s nodes and the
+    /// `Arc<FlockFile>`'s `Pollee` observers -- come from the ordinary private heap of whichever
+    /// process allocated them, so a byte-shared copy of the root pointer is garbage in every other
+    /// process of the fork family (twelfth instance of the defect class this struct's own doc
+    /// comment documents; see `GlobalState`'s matching removed-field note for the live panic).
+    /// Shadowing works by name, exactly like `pty_registry`/`fifo_registry`/`unix_addr_table`:
+    /// Rust resolves the field on this concrete type before auto-`Deref`ing to `GlobalState`, so
+    /// every existing `xxx.flock_registry` call site keeps compiling unchanged.
+    flock_registry: Arc<litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>>,
+    bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
+    fn clone(&self) -> Self {
+        GlobalStateHandle {
+            inner: self.inner.clone(),
+            litebox: self.litebox.clone(),
+            proc_self_info: self.proc_self_info.clone(),
+            pts_registry: self.pts_registry.clone(),
+            elf_patch_cache: self.elf_patch_cache.clone(),
+            exec_ranges_cache: self.exec_ranges_cache.clone(),
+            segment_scan_cache: self.segment_scan_cache.clone(),
+            futex_manager: self.futex_manager.clone(),
+            memfds: self.memfds.clone(),
+            inotify: self.inotify.clone(),
+            inotify_watching: self.inotify_watching.clone(),
+            shared_files: self.shared_files.clone(),
+            unix_addr_table: self.unix_addr_table.clone(),
+            fifo_registry: self.fifo_registry.clone(),
+            pty_registry: self.pty_registry.clone(),
+            daemon_pty_masters: self.daemon_pty_masters.clone(),
+            xproc_local: self.xproc_local.clone(),
+            record_locks_local: self.record_locks_local.clone(),
+            record_lock_pollee_local: self.record_lock_pollee_local.clone(),
+            flock_registry: self.flock_registry.clone(),
+            bootstrap_process: self.bootstrap_process.clone(),
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> core::ops::Deref for GlobalStateHandle<Platform, FS> {
+    type Target = GlobalState<Platform, FS>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
+    pub(crate) fn record_locks(
+        &self,
+    ) -> &litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>> {
+        if self.platform.has_native_fork() {
+            &self.inner.record_locks
+        } else {
+            &self.record_locks_local
+        }
+    }
+
+    pub(crate) fn record_lock_pollee(&self) -> &litebox::event::polling::Pollee<Platform> {
+        if self.platform.has_native_fork() {
+            &self.inner.record_lock_pollee
+        } else {
+            &self.record_lock_pollee_local
+        }
+    }
+
+    /// Lock the shared `Network` and rebind its process-relative fields (`litebox`, `device`) to
+    /// THIS process's own, always-locally-valid state before handing out the guard -- sixth and
+    /// seventh instances of the SAME cross-process-stale-pointer defect class documented on this
+    /// struct's own doc comment, found one (or two) levels deeper than the `GlobalState` fields
+    /// above: `Network` itself is genuinely, correctly meant to be shared across the whole fork
+    /// family (one virtual NIC for the whole guest), but two of its OWN fields are raw pointers
+    /// captured once by whichever process constructed `GlobalState` first, meaningless (or, after
+    /// that process exits, genuinely dangling) in every other process's address space. Every call
+    /// site that used to reach `GlobalState.net.lock()` directly must go through this instead --
+    /// see `litebox::net::Network::rebind_per_process_fields`'s own doc comment for the live crash
+    /// evidence (first `STATUS_ACCESS_VIOLATION` inside `Descriptors::iter_mut`, reached via
+    /// `close_pending_sockets`; second, immediately after that fix landed, inside
+    /// `litebox_platform_windows_userland::net::receive_ip_packet` via `phy::Device::receive` --
+    /// both on a plain `mkdir` fork child with zero sockets of its own).
+    ///
+    /// Also the sole call site that consults [`litebox::sync::Mutex::lock_recovering_poison`] for
+    /// this particular lock: if acquiring it required forcing open a lock whose recorded holder
+    /// was confirmed dead mid-hold (`platform::RawMutex::take_poison`, set by
+    /// `litebox_platform_windows_userland`'s `try_recover_from_dead_holder_unregistered`), the
+    /// `Network` this guard protects may be torn -- some handle removed from `socket_set` but
+    /// still named in `closing_in_background`, or vice versa -- so it is wholesale reset to a safe
+    /// empty state (`Network::reset_after_poisoning`, see its own doc comment for the full defect
+    /// and the accepted, disclosed loss of in-flight connections this trades for) before this
+    /// guard is ever handed to a caller. Live evidence this closes: every occurrence of
+    /// `smoltcp::iface::socket_set.rs:103`'s `"handle does not refer to a valid socket"` panic seen
+    /// so far was immediately preceded in the log by exactly this dead-holder-recovery warning.
+    pub(crate) fn net_lock(
+        &self,
+    ) -> litebox::sync::MutexGuard<'_, Platform, litebox::net::Network<Platform>> {
+        let (mut guard, recovered_from_dead_holder) = self.net.lock_recovering_poison();
+        if recovered_from_dead_holder {
+            litebox_util_log::warn!(
+                "GlobalStateHandle::net_lock: acquired a Network lock recovered from a dead holder -- resetting Network to a safe empty state to avoid reading torn socket_set/closing_in_background/local_port_allocator state"
+            );
+            guard.reset_after_poisoning();
+        }
+        guard.rebind_per_process_fields(&self.litebox);
+        guard
+    }
+
+    /// The process registry is a `BTreeMap` of `Arc<Process>` whose nodes live on the private heap
+    /// of the process that inserted them, so it is only sound where every process shares one kernel
+    /// heap (a native-`fork()` platform). Elsewhere the cross-process registry (`xproc`) is
+    /// authoritative and these helpers see an empty registry.
+    pub(crate) fn registry_insert(
+        &self,
+        pid: i32,
+        process: Arc<syscalls::process::Process<Platform>>,
+    ) {
+        if self.platform.has_native_fork() {
+            self.process_registry.lock().insert(pid, process);
+        }
+    }
+
+    pub(crate) fn registry_remove(&self, pid: i32) {
+        if self.platform.has_native_fork() {
+            self.process_registry.lock().remove(&pid);
+        }
+    }
+
+    pub(crate) fn registry_get(
+        &self,
+        pid: i32,
+    ) -> Option<Arc<syscalls::process::Process<Platform>>> {
+        if !self.platform.has_native_fork() {
+            return None;
+        }
+        self.process_registry.lock().get(&pid).cloned()
+    }
+
+    pub(crate) fn registry_entries(
+        &self,
+    ) -> alloc::vec::Vec<(i32, Arc<syscalls::process::Process<Platform>>)> {
+        if !self.platform.has_native_fork() {
+            return alloc::vec::Vec::new();
+        }
+        self.process_registry
+            .lock()
+            .iter()
+            .map(|(p, q)| (*p, q.clone()))
+            .collect()
+    }
+
+    /// The shared `Pipes`, paired with THIS process's own `LiteBox`. `Pipes` itself holds no
+    /// process-relative state (see [`litebox::pipes::Pipes`]), so nothing about the pairing can
+    /// be overwritten by another process between obtaining it and using it.
+    pub(crate) fn pipes(&self) -> PipesHandle<'_, Platform> {
+        PipesHandle {
+            pipes: &self.pipes,
+            litebox: &self.litebox,
+        }
+    }
+
+    /// See `cross_process_fork_slots` for what a slot bounds and why it is keyed, not counted.
+    pub(crate) fn try_take_cross_process_fork_slot(&self) -> Option<usize> {
+        use core::sync::atomic::Ordering;
+        for (idx, slot) in self.cross_process_fork_slots.iter().enumerate() {
+            if slot
+                .compare_exchange(
+                    CROSS_PROCESS_FORK_SLOT_FREE,
+                    CROSS_PROCESS_FORK_SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// A no-op if the child already released the slot itself: it does that as soon as it has its
+    /// own `GlobalState`, which can beat this call.
+    pub(crate) fn bind_cross_process_fork_slot(&self, idx: usize, child_host_pid: u32) {
+        use core::sync::atomic::Ordering;
+        if child_host_pid == CROSS_PROCESS_FORK_SLOT_FREE
+            || child_host_pid == CROSS_PROCESS_FORK_SLOT_RESERVED
+        {
+            return;
+        }
+        if let Some(slot) = self.cross_process_fork_slots.get(idx) {
+            let _ = slot.compare_exchange(
+                CROSS_PROCESS_FORK_SLOT_RESERVED,
+                child_host_pid,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub(crate) fn release_unbound_cross_process_fork_slot(&self, idx: usize) {
+        if let Some(slot) = self.cross_process_fork_slots.get(idx) {
+            slot.store(
+                CROSS_PROCESS_FORK_SLOT_FREE,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    pub(crate) fn release_cross_process_fork_slot_for_child(&self, child_host_pid: u32) {
+        use core::sync::atomic::Ordering;
+        if child_host_pid == CROSS_PROCESS_FORK_SLOT_FREE
+            || child_host_pid == CROSS_PROCESS_FORK_SLOT_RESERVED
+        {
+            return;
+        }
+        for slot in &self.cross_process_fork_slots {
+            if slot
+                .compare_exchange(
+                    child_host_pid,
+                    CROSS_PROCESS_FORK_SLOT_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Only read by `reserve_cross_process_fork_slot`'s admission-timeout warning, at most once per
+    /// 8s per fork, so the linear scan is free.
+    pub(crate) fn cross_process_fork_slots_occupied(&self) -> usize {
+        self.cross_process_fork_slots
+            .iter()
+            .filter(|slot| {
+                slot.load(core::sync::atomic::Ordering::Acquire) != CROSS_PROCESS_FORK_SLOT_FREE
+            })
+            .count()
+    }
+}
+
+/// The shared `Pipes` bound to the calling process's `LiteBox`; forwards each operation with it.
+pub(crate) struct PipesHandle<'a, Platform: ShimPlatform> {
+    pipes: &'a litebox::pipes::Pipes<Platform>,
+    litebox: &'a LiteBox<Platform>,
+}
+
+impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
+    pub(crate) fn create_pipe(
+        &self,
+        capacity: usize,
+        flags: litebox::pipes::Flags,
+        atomic_slice_guarantee_size: Option<core::num::NonZeroUsize>,
+    ) -> (
+        litebox::pipes::PipeFd<Platform>,
+        litebox::pipes::PipeFd<Platform>,
+    ) {
+        self.pipes
+            .create_pipe(self.litebox, capacity, flags, atomic_slice_guarantee_size)
+    }
+
+    pub(crate) fn close(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<(), litebox::pipes::errors::CloseError> {
+        self.pipes.close(self.litebox, fd)
+    }
+
+    pub(crate) fn read(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox::pipes::errors::ReadError> {
+        self.pipes.read(self.litebox, cx, fd, buf)
+    }
+
+    pub(crate) fn write(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        buf: &[u8],
+    ) -> Result<usize, litebox::pipes::errors::WriteError> {
+        self.pipes.write(self.litebox, cx, fd, buf)
+    }
+
+    pub(crate) fn detach_end(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::DetachedPipeEnd<Platform>, litebox::pipes::errors::ClosedError>
+    {
+        self.pipes.detach_end(self.litebox, fd)
+    }
+
+    pub(crate) fn readable_bytes(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<usize, litebox::pipes::errors::ClosedError> {
+        self.pipes.readable_bytes(self.litebox, fd)
+    }
+
+    pub(crate) fn half_pipe_type(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::HalfPipeType, litebox::pipes::errors::ClosedError> {
+        self.pipes.half_pipe_type(self.litebox, fd)
+    }
+
+    pub(crate) fn get_flags(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+    ) -> Result<litebox::pipes::Flags, litebox::pipes::errors::ClosedError> {
+        self.pipes.get_flags(self.litebox, fd)
+    }
+
+    pub(crate) fn update_flags(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        mask: litebox::pipes::Flags,
+        on: bool,
+    ) -> Result<(), litebox::pipes::errors::ClosedError> {
+        self.pipes.update_flags(self.litebox, fd, mask, on)
+    }
+
+    pub(crate) fn with_iopollable<R>(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        f: impl FnOnce(&dyn litebox::event::IOPollable) -> R,
+    ) -> Result<R, litebox::pipes::errors::ClosedError> {
+        self.pipes.with_iopollable(self.litebox, fd, f)
+    }
+}
+/// Bounds how many cross-process-fork children may be starting at once; see
+/// `cross_process_fork_slots` for what "starting" costs and why it is bounded.
+pub(crate) const CROSS_PROCESS_FORK_SLOT_COUNT: usize = 6;
+const CROSS_PROCESS_FORK_SLOT_FREE: u32 = 0;
+/// Needed as a distinct state because the reservation is made before `CreateProcessW`, so there is
+/// no host pid to key the slot by until it returns.
+const CROSS_PROCESS_FORK_SLOT_RESERVED: u32 = u32::MAX;
+
 struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
-    /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
-    /// The futex manager for handling futex operations.
-    futex_manager: FutexManager<Platform>,
+    // `FS` is no longer used by any field of this struct as of the 2026-09-18 systematic audit:
+    // its last use (`unix_addr_table: RwLock<Platform, UnixAddrTable<Platform, FS>>`) moved to
+    // `GlobalStateHandle` (see that struct's `unix_addr_table` field doc comment) since it was
+    // always meant to be per-process-private state, not a genuinely shared `GlobalState` field.
+    // Kept as a zero-sized marker rather than dropped from this struct's generics entirely,
+    // since every caller already threads `FS` through `GlobalState<Platform, FS>` and removing
+    // the parameter would be a wider, purely-cosmetic churn for no behavior change.
+    _fs: core::marker::PhantomData<FS>,
+    // NOTE: this struct deliberately has NO `litebox` field. `LiteBox<Platform>` is
+    // `Platform::Handle<LiteBoxX<Platform>>` (effectively an `Arc` pointer); a value placed here
+    // would be copied byte-for-byte into the cross-process shared kernel arena on the CREATE
+    // path, and a later ATTACHing cross-process-fork child would read back the FIRST creator's
+    // pointer -- meaningless in its own address space (the same defect class already documented
+    // for `unix_addr_table`/`pty_registry`/etc, see `docs/AGENTS_ARCHIVE_2026-09-17.md`), root-
+    // caused THIS session as the actual mechanism behind a genuine, load-scaling, live host
+    // `STATUS_STACK_OVERFLOW`. Every reader of "the shim-wide `LiteBox`" instead goes through
+    // `GlobalStateHandle`'s own separate, always-locally-valid `litebox` field (see its doc
+    // comment) -- do not re-add a field with this name here.
+    // NOTE: this struct deliberately has NO `futex_manager` field -- SIXTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment (`litebox`/`proc_self_info`/`pts_registry`/`elf_patch_cache`/etc), live-diagnosed
+    // 2026-09-17 via `cdb -p`: a hang inside `FutexManager::wake` -> `LoanList::extract_if` ->
+    // `RawMutex::block`. `FutexManager` itself already only supports `FUTEX_PRIVATE_FLAG`-style
+    // per-process futexes (see its own doc comment), and `LoanList` entries are pinned on the
+    // WAITING THREAD'S OWN STACK by design, so there is no way to relocate them into shared memory
+    // even in principle -- unlike `Network`/`Pipes`, this one genuinely cannot be rebound, only
+    // kept per-process. `GlobalStateHandle` carries its own, always-freshly-constructed
+    // `futex_manager` field instead (populated once per process in `LinuxShimBuilder::build`,
+    // attach or create alike) -- do not re-add a field with this name here.
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
     /// The network subsystem.
@@ -1938,49 +4064,222 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
-    /// UNIX domain socket address table
-    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
-    /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
-    /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`.
+    /// Admission slots bounding how many cross-process-fork children (`LITEBOX_PROCESS_FORK=1`) may
+    /// be STARTING at once -- [`CROSS_PROCESS_FORK_SLOT_FREE`] once released,
+    /// [`CROSS_PROCESS_FORK_SLOT_RESERVED`] from the moment a parent reserves one until it learns
+    /// the spawned child's host pid, then that pid until the slot is released. A fixed-size array
+    /// of plain `AtomicU32`s inside this same struct, free-riding on `GlobalState`'s own cross-
+    /// process sharing exactly like `unix_addr_presence` below, so every process in the fork FAMILY
+    /// (not just direct parent/child pairs) observes the same slots.
     ///
-    /// This is deliberately shim-wide (not per-`FilesState`/per-process): real `flock()` locks
-    /// must contend across *any* two open file descriptions of the same underlying file, even ones
-    /// reached from independent `open()` calls in different (e.g. `fork()`-created) processes, not
-    /// just fds `dup()`-derived from a single `open()`. See [`syscalls::file::FlockFile`].
-    flock_registry: litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>,
+    /// What the bound protects is each child's from-scratch rebuild of the merged/rewritten OCI
+    /// rootfs into its own private heap, which desktop-startup scripts multiply by forking a TREE
+    /// (nested command substitutions/subshells), not a flat sequence. `reserve_cross_process_fork_
+    /// slot` (see `syscalls::process`) gates `spawn_cross_process_fork_child` on one, bounding peak
+    /// transient RAM without changing fork correctness. Measured sizes, and the open deeper fix
+    /// (share the parsed rootfs instead of re-deriving it per child), live in AGENTS.md.
+    ///
+    /// Keyed by pid rather than counted, and held from spawn to STARTUP-COMPLETE rather than to
+    /// reap: the rebuild is over within about a second of a child's life, so a slot held until
+    /// `wait4()` would bill every long-lived child (Xvfb, dbus-daemon, selkies, xfce4-session, ...)
+    /// for its whole lifetime against a budget of six. `release_cross_process_fork_slot_for_child`
+    /// is therefore idempotent and runs from BOTH sides -- the child once it has its own
+    /// `GlobalState`, the parent's reap for a child that died before that -- and clearing by pid
+    /// makes the second call a no-op instead of an undercount that would quietly disable the bound.
+    cross_process_fork_slots: [core::sync::atomic::AtomicU32; CROSS_PROCESS_FORK_SLOT_COUNT],
+    /// One gate per native-`fork()` child that was created by `vfork()`/`clone(CLONE_VFORK)`,
+    /// keyed by the child's pid. The parent blocks on it (`vfork()` suspends the caller until the
+    /// child execs or exits); the child opens it. Lives in the shared kernel heap so the two
+    /// processes see the same futex word.
+    native_vfork_gates: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            i32,
+            Arc<<Platform as litebox::platform::RawMutexProvider>::RawMutex>,
+        >,
+    >,
+    /// Every live guest process that is not a thread-based child of its parent -- the bootstrap
+    /// process and each native-`fork()` child -- by pid. `getpgid`/`setpgid`/`kill` use it to
+    /// reach a process that is not a direct child of the caller. Lives in the shared kernel heap.
+    process_registry: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<i32, Arc<syscalls::process::Process<Platform>>>,
+    >,
+    // NOTE: this struct deliberately has NO `unix_addr_table` field -- NINTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, found in the 2026-09-18 systematic audit. See `GlobalStateHandle::unix_addr_table`'s
+    // own doc comment for the full reasoning (this was always meant to be per-process private
+    // state, per `SharedUnixAddrPresenceTable`'s own doc comment) -- do not re-add a field with
+    // this name here.
+    /// Cross-process-visible companion to the real per-process `unix_addr_table` (see
+    /// `syscalls::unix::SharedUnixAddrPresenceTable`'s own doc comment for exactly what it does
+    /// and does not close): a plain, no-pointer-indirection fixed-size field of this SAME struct,
+    /// so it inherits whatever cross-process sharing `GlobalState` itself already gets (real on
+    /// `WindowsUserland`'s cross-process-fork path, an ordinary unshared value everywhere else)
+    /// for free -- no second `SharedKernelStateProvider` slot needed, unlike `unix_addr_table`
+    /// itself, whose `BTreeMap` nodes remain private-heap-allocated regardless.
+    unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable,
+    /// Shared-arena-native pool of cross-process AF_UNIX connection byte-transport slots -- see
+    /// `syscalls::unix::SharedUnixConnTable`'s own doc comment (the "Shared cross-process AF_UNIX
+    /// connection data plane" section of `syscalls/unix.rs`) for the full rendezvous design this
+    /// and `unix_shared_connect_queue` below implement together. A plain field of this same
+    /// struct, same free-riding-on-`GlobalState`'s-own-sharing rationale as `unix_addr_presence`.
+    unix_shared_conn_table: syscalls::unix::SharedUnixConnTable<Platform>,
+    /// Cross-process `connect()`/`accept()` rendezvous queue -- see `unix_shared_conn_table`'s doc
+    /// comment above.
+    unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue,
+    /// Cross-process-visible side channel for the small handful of named byte-string files a
+    /// long-lived, never-exiting daemon publishes that a short-lived sibling needs to read (e.g.
+    /// D-Bus's `/tmp/addr`) -- see `syscalls::file::SharedFilePublishTable`'s own doc comment for
+    /// the full mechanism and scope boundary. Same free-riding-on-`GlobalState`'s-own-sharing
+    /// rationale as `unix_addr_presence` above: a plain, pointer-free field of this same struct.
+    shared_file_publish: syscalls::file::SharedFilePublishTable,
+    shared_file_spill: syscalls::file_spill::SharedFileSpill,
+    // NOTE: this struct deliberately has NO `elf_patch_cache` field -- THIRD instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment (`litebox`/`proc_self_info`/`pts_registry`), live-diagnosed 2026-09-17: an attaching
+    // cross-process-fork child's copy of this `BTreeMap<(pid, fd), ElfPatchState>`'s root pointer
+    // is the FIRST creator's, meaningless in its own address space (real panic:
+    // `alloc::collections::btree::node.rs` `insert_recursing`, "range end index ... out of range
+    // for slice of length ...", from `Task::do_mmap_file`'s `elf_patch_cache.entry(...)
+    // .or_insert(...)` on the very first `execve` any cross-process-fork child performs). Unlike
+    // `unix_addr_table` et al., this one genuinely does NOT need true cross-process visibility to
+    // begin with: every key is `(self.pid.get(), fd)` (see `Task::elf_patch_key`) and no call site
+    // ever looks up another pid's entry -- the doc comment on `syscalls::mm::ElfPatchKey` explains
+    // the `pid` component exists only to stop two DIFFERENT processes' entries from colliding on
+    // one fd number, not to let one process observe another's state. `ElfPatchState` itself also
+    // holds absolute per-process addresses (`trampoline_addr`, `file_mappings`, `patched_ranges`)
+    // that are meaningless outside the process that produced them, and re-running the patcher on
+    // already-patched code is documented as idempotent/safe (`ElfPatchState`'s own doc comment on
+    // `patched_ranges`) -- so a fork child starting with an empty local cache is safe by
+    // construction, exactly like `litebox`/`proc_self_info`/`pts_registry` above.
+    // `GlobalStateHandle` carries its own, always-freshly-constructed `elf_patch_cache` field
+    // instead (populated once per process in `LinuxShimBuilder::build`, attach or create alike) --
+    // do not re-add a field with this name here.
+    // NOTE: this struct deliberately has NO `segment_scan_cache` field either -- FIFTH instance of
+    // the SAME defect class, live-diagnosed 2026-09-17 immediately after the `exec_ranges_cache`
+    // fix above: with that fix landed, the identical minimal `mkdir` repro no longer panicked but
+    // instead HUNG (host CPU climbing with zero new log output for 90+s, no crash) -- a corrupted-
+    // BTreeMap symptom one step worse than a clean `navigate.rs`/`node.rs` panic (a garbage root
+    // pointer can just as easily walk into a long or cyclic chain as into an out-of-bounds
+    // `unwrap`/slice index), inside `do_mmap_file`'s `segment_scan_cache.get(&key)`/`.insert(...)`
+    // -- the only other shared `BTreeMap` still on this file's hot path for every fresh `execve`.
+    // Originally kept shared for a real performance reason (was: "shared by every mapping of it in
+    // every guest process... `xfwm4` mapped `libLLVM` 130 MB 74 times and spent 225.9s patching"),
+    // but that reuse is dominated by REPEATED mappings of the same big library WITHIN one process
+    // (a single process's own `dlopen` probing loop), which a per-process cache still fully
+    // captures -- only cross-PROCESS reuse of an already-scanned file is lost, a real but strictly
+    // secondary regression next to a live hang. `GlobalStateHandle` carries its own, always-
+    // freshly-constructed `segment_scan_cache` field instead, same as `elf_patch_cache`/
+    // `exec_ranges_cache` above -- do not re-add a field with this name here. Restoring genuine
+    // cross-process reuse (a flat, pointer-free `SharedUnixAddrPresenceTable`-style redesign, or a
+    // real shared-`Arc`-capable allocator) is real, separate, follow-on performance work.
+    // NOTE: this struct deliberately has NO `exec_ranges_cache` field -- FOURTH instance of the
+    // SAME defect class, live-diagnosed 2026-09-17 immediately after the `elf_patch_cache` fix
+    // above unblocked the next `execve`: real panic `alloc::collections::btree::node.rs`
+    // `insert_recursing`, "range end index ... out of range for slice of length ...", inside
+    // `BTreeMap<(u64, u64), Arc<Vec<Range<u64>>>>::insert` -- the exact type of
+    // `syscalls::mm::ExecRangesCache` -- from the ELF-load path's exec-ranges lookup/insert.
+    // Unlike `segment_scan_cache` just above (kept shared: performance-critical across processes,
+    // per its own doc comment, not yet fixed), this cache's correctness does not depend on
+    // cross-process sharing -- every value is a pure, deterministic function of the keyed file's
+    // own on-disk section headers (`litebox_syscall_rewriter::executable_section_file_ranges`), so
+    // a fork child starting with an empty local cache simply re-derives it correctly on first use,
+    // exactly as safe as `elf_patch_cache`'s fix above, just for a performance-only reason instead
+    // of a per-process-identity one. `GlobalStateHandle` carries its own, always-freshly-
+    // constructed `exec_ranges_cache` field instead -- do not re-add a field with this name here.
+    /// System V shared-memory segments, keyed by `shmid`.
+    ///
+    /// Shim-wide because SysV shm is a global namespace by definition -- any process that knows
+    /// the key or id can attach. See [`syscalls::mm::SysvShmSegment`].
+    sysv_shm: litebox::sync::Mutex<Platform, syscalls::mm::SysvShmTable>,
+    /// Next `shmid` to hand out.
+    next_shmid: core::sync::atomic::AtomicI32,
+    // NOTE: this struct deliberately has NO `flock_registry` field -- TWELFTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, live-diagnosed 2026-10-04 (chr34, `RUST_BACKTRACE=full`): a cross-process-fork
+    // child's very first `flock()` panicked inside `BTreeMap<(usize, usize), Arc<FlockFile>>::
+    // entry(..).or_insert_with(..)` with `range end index 65529 out of range for slice of length
+    // 11` -- its copy of this map's root pointer is the first creator's, and the nodes behind it
+    // are private-heap addresses meaningless in the child's own address space. Same mechanism as
+    // `elf_patch_cache`/`record_locks`/etc, one field deeper: the map's nodes come from the
+    // allocating process's ordinary heap, and `Arc<FlockFile>`'s `Pollee` observer list does too.
+    // Every process therefore gets its own, always-freshly-constructed registry (see
+    // `GlobalStateHandle::flock_registry`), which is what fixed the crash. The genuine cross-process
+    // contention that field can no longer provide is restored by `shared_flock` below -- do not
+    // re-add a field with this name here.
     /// Next id to hand out to a `flock()` holder, identifying an open file description to the
     /// `flock()` implementation (see `syscalls::file`). Shim-wide (rather than a function-local
     /// `static`) so it composes with the crate's existing "no bare `static`s outside of the
     /// ratcheted set" discipline.
     next_flock_holder_id: core::sync::atomic::AtomicU64,
-    /// Registry of allocated ptys' slave-side fd, keyed by pty id (`TIOCGPTN`'s value).
-    ///
-    /// The slave fd held here is never installed into any process's own fd table directly; each
-    /// `open("/dev/pts/<id>")` duplicates it (via [`litebox::fd::Descriptors::duplicate`], the
-    /// same mechanism `dup()`/`fork()` use) to produce an independent fd sharing the same
-    /// underlying entry. Shim-wide (not per-process) because `/dev/pts/<id>` is a global
-    /// namespace: any process that knows the id (e.g. via a fd inherited across `fork()`, or by
-    /// reading `/proc/self/fd` in a real Linux guest) can open it.
-    pty_registry: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
-    >,
-    /// Registry of allocated ptys' master-side fd, keyed by pty id, populated only for a pty
-    /// created via `Task::attach_pty_stdio` (the session-daemon `--pty-mode` path).
-    /// Ordinary guest-driven `/dev/ptmx` opens (`ptmx_open`) never populate this -- the master fd
-    /// there lives purely in the opening process's own fd table, reachable only via the guest's
-    /// own syscalls, matching real Linux. This registry exists so a HOST-side caller (the runner,
-    /// via [`LinuxShim::pty_master_read`]/[`LinuxShim::pty_master_write`]) can drive the master
-    /// side of a session-daemon pty from a plain background thread with no `Task` in scope --
-    /// `PtyFd` read/write only need the shared `syscalls::pty::PtyEnd` entry itself, not a
-    /// process's fd table, so no per-thread `Task` is needed to use it.
-    daemon_pty_masters: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<u32, syscalls::pty::PtyFd<Platform>>,
-    >,
+    /// Cross-process `flock(2)` exclusion: a fixed array of flat, pointer-free slots in the shared
+    /// kernel arena, one per locked file, with cross-process waiter wakeup -- see
+    /// [`syscalls::file::SharedFlockTable`]'s own doc comment for the whole design (why the
+    /// `BTreeMap` this replaces could not live here, how a waiter in another host process is woken,
+    /// and how a holder killed without running `Drop` is reclaimed). This is what makes a fork
+    /// child's `LOCK_EX|LOCK_NB` fail `EWOULDBLOCK` while its parent holds `LOCK_EX`, which
+    /// `flock_registry` alone had stopped doing (`.wfgy/flockx1.sh`).
+    shared_flock: syscalls::file::SharedFlockTable<Platform>,
+    /// POSIX (`fcntl`) record locks held by any guest process, owned by pid.
+    record_locks: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>,
+    /// Woken whenever a record lock is released, so `F_SETLKW` waiters retry.
+    record_lock_pollee: litebox::event::polling::Pollee<Platform>,
+    // NOTE: this struct deliberately has NO `pty_registry`/`daemon_pty_masters` fields --
+    // ELEVENTH instance of the SAME cross-process-garbage-pointer defect class documented on
+    // `GlobalStateHandle`'s own doc comment. Unlike `fifo_registry` (whose own doc comment
+    // explicitly disclaimed any cross-process need), `pty_registry`'s ORIGINAL doc comment here
+    // (preserved on `GlobalStateHandle::pty_registry`) explicitly claimed one: "any process that
+    // knows the id ... can open it", matching real devpts. `GlobalStateHandle` carries its own,
+    // always-freshly-constructed-per-process `pty_registry`/`daemon_pty_masters` fields instead
+    // (fixing the crash, exactly like the ten instances before it), and the genuine cross-process
+    // capability those two fields' doc comments actually need is restored separately by
+    // `shared_pty` below -- do not re-add fields with these names here.
+    /// Shared-arena-native, fixed-capacity, pointer-free companion to the per-process
+    /// `pty_registry`/`daemon_pty_masters` (see [`syscalls::pty::SharedPtyTable`]'s own doc
+    /// comment for the full design and its explicit scope limits): existence, control state
+    /// (termios/winsize/locked/fg_pgid/packet-mode), and the master<->slave byte data plane for
+    /// every currently-allocated pty, visible to every process in the fork family regardless of
+    /// which one allocated it. A plain field of this same struct, same free-riding-on-
+    /// `GlobalState`'s-own-sharing rationale as `unix_addr_presence`.
+    shared_pty: syscalls::pty::SharedPtyTable<Platform>,
+    /// Every guest process in the fork family, by guest pid: which host process runs it, its
+    /// process group, and signals posted to it from other host processes. Pointer-free, so it is
+    /// shared across host processes along with the rest of this struct. See
+    /// [`syscalls::signal::xproc`].
+    pub(crate) process_table: syscalls::signal::xproc::SharedProcessTable,
+    /// Every PID namespace in the fork family and the pid each process has in each of them.
+    /// Pointer-free, so it is shared across host processes along with the rest of this struct --
+    /// which is what lets a parent in one host process wait for and signal a child running in
+    /// another while both name it by the pid they see. See [`syscalls::pidns`].
+    pub(crate) pid_namespaces: syscalls::pidns::PidNamespaceTable,
     /// Next id to hand out to a freshly `open("/dev/ptmx")`-allocated pty pair.
     next_pty_id: core::sync::atomic::AtomicU32,
+    /// The live pipe behind each open FIFO, keyed by the FIFO's `(dev, ino)`.
+    ///
+    /// A FIFO is a filesystem entry (see `litebox::fs::FileType::Fifo`) with no data of its own;
+    /// what `open()` on one has to produce is a PIPE. This registry is what makes every open of
+    /// the same path land on the same pipe: the first one creates it, and each open thereafter
+    /// duplicates the end its access mode calls for -- exactly the mechanism `pty_registry` uses
+    /// for `/dev/pts/<id>`, and for the same reason (a shared namespace any process can open by
+    /// name).
+    ///
+    /// Both ends are held here for the FIFO's lifetime, deliberately. A real FIFO's reader blocks
+    /// until a writer appears rather than seeing EOF, and the registry's own writer reference is
+    /// what keeps that true when no guest process currently holds one open.
+    ///
+    /// Shim-wide, so it is shared by every thread of this process -- but NOT across processes. A
+    /// cross-process `fork()` child recognises the FIFO (its type travels with the writable layer)
+    /// and gets a pipe of its own, so data written by one process does not reach a reader in
+    /// another. See `Task::open_fifo`.
+    // NOTE: this struct deliberately has NO `fifo_registry` field -- TENTH instance of the SAME
+    // cross-process-garbage-pointer defect class documented on `GlobalStateHandle`'s own doc
+    // comment, found in the 2026-09-18 systematic audit: this field's own doc comment (above)
+    // already says outright it is shared "by every thread of this process -- but NOT across
+    // processes", i.e. it was always meant to be per-process private state, mistakenly placed as
+    // a byte-shared `GlobalState` field. `GlobalStateHandle` carries its own, always-freshly-
+    // constructed-per-process `fifo_registry` field instead -- do not re-add a field with this
+    // name here.
     /// Next id to hand out for AF_UNIX socket "autobind" (`bind()` called with no address),
     /// formatted the same way real Linux formats its autobind abstract-namespace names: a
     /// leading NUL byte followed by 5 lowercase hex digits (see `unix(7)`). Real Linux starts
@@ -1993,16 +4292,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// (see `Task::sys_memfd_create`) -- guarantees two concurrent calls never collide on the
     /// same path even with an identical (or empty) guest-supplied name.
     next_memfd_id: core::sync::atomic::AtomicU64,
-    /// The first process created by [`LinuxShim::load_program`], set once and kept for the
-    /// lifetime of the shim.
-    ///
-    /// Since real `fork()` (see [`syscalls::process::Process`]) gives each process its own
-    /// [`litebox::mm::PageManager`], there is no longer a single shim-wide page manager -- code
-    /// with a [`Task`]/[`syscalls::process::Process`] in scope reaches its own via
-    /// `task.process().pm`. This field exists solely for the narrow single-process callers (e.g.
-    /// `litebox_runner_snp`'s kernel-context page-fault handler) that have no `Task` in scope and
-    /// only ever run a single bootstrap process, exposed via [`LinuxShim::page_manager`].
-    bootstrap_process: once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>,
     /// The one virtual DRM/KMS device's state (`/dev/dri/card0`). Shim-wide, not per-process,
     /// since real DRM device state (allocated buffers, current mode/framebuffer) is genuinely
     /// global -- any process holding a fd to the card sees the same connector/CRTC/buffers, just
@@ -2014,35 +4303,211 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// matching how a real kernel input device is one object regardless of how many processes
     /// have it open.
     evdev: syscalls::evdev::EvdevSubsystem<Platform>,
-    /// Real shared-memory state for every live `memfd_create` fd, keyed by the backing in-mem
-    /// file's own `(dev, ino)` -- shim-wide for the same `(dev, ino)`-keying rationale as
-    /// `flock_registry` (any fd sharing the same underlying open file description, e.g. via
-    /// `dup()`/`fork()`, must resolve to the SAME real shared-memory handle, not a fresh one per
-    /// fd number). See `syscalls::mm::MemfdRegistry`'s own doc comment for the full shape.
-    memfds: litebox::sync::Mutex<Platform, syscalls::mm::MemfdRegistry<Platform>>,
+    // NOTE: this struct deliberately has NO `memfds`/`shared_files` fields -- SEVENTH and EIGHTH
+    // instances of the SAME cross-process-garbage-pointer defect class documented on
+    // `GlobalStateHandle`'s own doc comment (`litebox`/`proc_self_info`/`pts_registry`/
+    // `elf_patch_cache`/etc), live-caught 2026-09-18 under `cdb -o` child-process debugging: a
+    // real `alloc::collections::btree::node.rs:1232` "range end index 25710 out of range for
+    // slice of length 11" panic inside `MemfdRegistry`'s `BTreeMap::insert`/`get_mut`, hit by a
+    // cross-process-fork child's `try_memfd_mmap`/`try_shared_file_mmap` (`syscalls::mm`) on the
+    // very first file-backed `mmap()` it performed post-fork (i.e. essentially every exec'd guest
+    // binary's own dynamic linker mapping its shared libraries -- confirmed live on both `sed`
+    // and, matching the same-day investigation this closes, `xset`). The panic unwound to the
+    // guest-execution thread's `.join().expect(...)` in
+    // `litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe`, which
+    // re-panicked on the process's own `main` thread uncaught -- a clean Rust
+    // `std::process::exit(101)` after printing the panic (see that panic message's own stack
+    // trace for confirmation), NOT a hardware fault, which is exactly why this crash never showed
+    // up in litebox's VEH-based `RECENT_FAULTS`/`RECOVERY_LOG` machinery (nothing there to catch:
+    // there was no CPU exception, just a controlled panicking exit) -- the parent's `wait4()`
+    // emulation then reports that unrecognized host exit code to the guest shell as a bare
+    // `Killed`, with zero further diagnostic. `GlobalStateHandle` carries its own, always-
+    // freshly-constructed-per-process `memfds`/`shared_files` fields instead (below), shadowing
+    // these (now removed) fields for every existing `self.global.memfds`/`self.global.
+    // shared_files` call site with no further change -- same fix shape as `elf_patch_cache`
+    // above, and the same accepted tradeoff: a memfd/shared-file mapping created by one process
+    // in a cross-process-fork family is no longer visible to another member of that family (it
+    // never safely was -- it panicked instead), rather than losing the WITHIN-one-process
+    // dup()/thread-fork sharing `memfds`'s own doc comment used to describe, which is unaffected
+    // since it never crossed a `GlobalStateHandle` instance to begin with.
+    // NOTE: this struct deliberately has NO `proc_self_info`/`pts_registry` fields either, for
+    // the SAME reason it has no `litebox` field above -- see `GlobalStateHandle`'s doc comment's
+    // "Second instance of the SAME defect" section. `GlobalStateHandle` carries its OWN, always
+    // per-process-correct copies (the same instances `LinuxShimBuilder::default_fs`/
+    // `default_fs_multi_layer` already mounted the `/proc/self`/`/dev/pts` backends with).
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
+    /// Runs `f` with every shim-WIDE lock held, for the one caller that genuinely needs it:
+    /// [`syscalls::process::Task::try_cross_process_fork`]'s native-`fork()` path (see
+    /// [`litebox::platform::ForkChildVerificationProvider::native_fork`]'s doc comment).
+    ///
+    /// This is the shim-level half of the same discipline glibc's own `__libc_fork` uses
+    /// internally before calling the kernel's `fork()`: a REAL `fork()` duplicates the calling
+    /// thread only, so a lock some OTHER host thread happened to be holding at that instant is
+    /// held forever in the child -- the thread that would have released it does not exist there.
+    /// Acquiring every such lock first (which, for a `spin`-backed `RawMutex`, simply waits for
+    /// whichever thread currently holds it to finish its critical section and release) guarantees
+    /// none of them can be caught mid-hold at the instant `fork()` actually runs; `f` (the
+    /// `fork()` call itself) then executes with the whole set quiesced, and every guard is
+    /// dropped -- an ordinary, syscall-free unlock -- when this function returns, in BOTH the
+    /// parent and, since `fork()` duplicates this stack frame verbatim, the child.
+    ///
+    /// **Scope, stated rather than left implicit.** This covers every lock that is genuinely
+    /// SHIM-WIDE -- reachable from more than one guest process under this architecture's single
+    /// shared address space, which is the one hazard a real `fork()` on genuine, independent-
+    /// address-space Linux would never have (unrelated processes there share no locks at all).
+    /// It deliberately does NOT reach into `litebox` (per-process `PageManager`/descriptor-table
+    /// locks live under each `Arc<Process>`, not here), `futex_manager`, or `pipes`. A lock held
+    /// by a SIBLING thread of the SAME forking guest process at fork time is the ordinary,
+    /// general "`fork()` in a multithreaded program" hazard POSIX itself documents -- no worse
+    /// than a real multithreaded guest program forking on real Linux already has to be written to
+    /// tolerate, and not specific to litebox. Extending coverage into those structures is real,
+    /// separate follow-on work, not silently claimed here.
+    ///
+    /// **Why this, and not the standard `pthread_atfork(prepare, parent, child)` registration**
+    /// the glibc comparison above might suggest reaching for instead. `pthread_atfork` exists to
+    /// decouple "who calls `fork()`" from "who needs to prepare" -- essential when `fork()` may
+    /// be invoked by code you do not control (a library calling it on your behalf, or several
+    /// independent call sites). Neither applies here: `native_fork` has exactly one caller in the
+    /// entire codebase (`try_native_cross_process_fork`, always reaching it through this very
+    /// function), so there is nothing to decouple. Registering real handlers instead would add a
+    /// DOCUMENTED hazard for no offsetting benefit: POSIX's own `pthread_atfork` guidance warns
+    /// that handlers "should not call library functions... This includes avoiding the use of any
+    /// interfaces which may directly or indirectly attempt to allocate memory" specifically
+    /// because other already-registered handlers (glibc's own malloc-arena ones, or a linked
+    /// library's) can deadlock against a handler that allocates -- and acquiring any of this
+    /// crate's own locks is not provably allocation-free. A plain closure sidesteps that whole
+    /// hazard class: it participates in no global registration, runs only around this one call,
+    /// and never interleaves with any other library's own atfork handlers' acquisition order.
+    /// Real `fork()`'s OWN internal glibc/libc atfork handlers (malloc's included) still run
+    /// normally, inside the `libc::fork()` call this wraps -- nothing here replaces those, only
+    /// adds to them, narrowly, for the one thing this crate owns that they don't: its own
+    /// shim-wide locks.
+    fn with_shimwide_locks_held<R>(
+        &self,
+        f: impl FnOnce() -> R,
+        is_forked_child: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let guards = (
+            self.net_lock(),
+            self.unix_addr_table.write(),
+            self.elf_patch_cache.lock(),
+            self.segment_scan_cache.lock(),
+            self.exec_ranges_cache.lock(),
+            self.sysv_shm.lock(),
+            self.flock_registry.lock(),
+            self.pty_registry.write(),
+            self.daemon_pty_masters.write(),
+            self.memfds.lock(),
+            self.shared_files.lock(),
+            self.proc_self_info.write(),
+        );
+        let result = f();
+        if is_forked_child(&result) && self.platform.native_fork_shares_kernel_state() {
+            // The kernel state these guards protect lives in memory the parent and child share,
+            // so the parent's own drop of its guards is the one and only unlock. Dropping them
+            // here as well would release a lock the parent may since have re-taken.
+            core::mem::forget(guards);
+        }
+        result
+    }
+}
+
+/// A [`wait::WaitState`] that the one native-`fork()` child path can swap for a fresh one.
+///
+/// The wait state's inner `Arc` is what other threads use to wake this host thread. When the
+/// kernel heap is shared across a `fork()`, the child's copy of the `Task` points at the SAME
+/// inner state as the parent's, so a wake meant for one would land on the other; the child gives
+/// itself a new one. Dereferences like a plain `WaitState`.
+struct ReplaceableWaitState<Platform: ShimPlatform>(
+    core::cell::UnsafeCell<wait::WaitState<Platform>>,
+);
+
+impl<Platform: ShimPlatform> ReplaceableWaitState<Platform> {
+    fn new(inner: wait::WaitState<Platform>) -> Self {
+        Self(core::cell::UnsafeCell::new(inner))
+    }
+
+    /// Replaces the wait state and forgets the old one without dropping it (its `Arc` is shared
+    /// with the parent process, which still owns that reference).
+    ///
+    /// # Safety
+    /// No reference obtained through `Deref` may be live across this call.
+    unsafe fn replace_forgetting_old(&self, new: wait::WaitState<Platform>) {
+        // SAFETY: the caller guarantees no outstanding borrow.
+        core::mem::forget(unsafe { core::ptr::replace(self.0.get(), new) });
+    }
+}
+
+impl<Platform: ShimPlatform> core::ops::Deref for ReplaceableWaitState<Platform> {
+    type Target = wait::WaitState<Platform>;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: only `replace_forgetting_old` mutates, under its own contract.
+        unsafe { &*self.0.get() }
+    }
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
-    wait_state: wait::WaitState<Platform>,
-    thread: syscalls::process::ThreadState<Platform>,
-    /// Process ID
-    pid: i32,
-    /// Parent Process ID
-    ppid: i32,
-    /// Thread ID
-    tid: i32,
+    global: GlobalStateHandle<Platform, FS>,
+    /// Unlike [`Self::pid`]/[`Self::thread`]/[`Self::signals`], this does NOT need to become
+    /// replaceable for a native fork() child: it describes THIS HOST THREAD's own park/wake
+    /// primitives, which a real `fork()` leaves completely unaffected -- only which GUEST
+    /// PROCESS the thread belongs to changes, never its own interruptibility. The existing
+    /// value stays exactly as correct for the child as it was for the parent.
+    wait_state: ReplaceableWaitState<Platform>,
+    /// `RefCell` for the same reason as [`Self::pid`]: a native fork() child needs its own
+    /// [`syscalls::process::Process`] (fresh children list, parent pointing at the process that
+    /// forked it, its own adopted [`litebox::mm::PageManager`]) in place of the one it continues
+    /// to hold immediately after `fork()` returns, which is still this SAME process's own.
+    thread: RefCell<syscalls::process::ThreadState<Platform>>,
+    /// Process ID. `Cell`, not a plain `i32`: a native `fork()` continues this exact host
+    /// thread, at this exact `Task`'s fixed address, as the CHILD -- there is no other storage
+    /// to construct a fresh identity into. See
+    /// [`Task::reinit_as_native_fork_child`].
+    pid: Cell<i32>,
+    /// Parent Process ID. `Cell` for the same reason as [`Self::pid`].
+    ppid: Cell<i32>,
+    /// Thread ID. `Cell` for the same reason as [`Self::pid`].
+    tid: Cell<i32>,
+    /// The PID namespace this task belongs to: [`syscalls::pidns::INITIAL_NS`] unless it (or an
+    /// ancestor) was created by a `clone(CLONE_NEWPID)`. Shared by every thread of a process, and
+    /// inherited by its children, exactly as on Linux.
+    ///
+    /// `Cell` for the same reason as [`Self::pid`].
+    pid_ns: Cell<u32>,
+    /// This task's pid as THE GUEST sees it: the pid it holds in [`Self::pid_ns`], which is what
+    /// Linux's `getpid()` reports and what `fork()` returns to this task's parent -- not the
+    /// internal pid in [`Self::pid`], which is the one every cross-process registry keys on.
+    ns_pid: Cell<i32>,
+    /// [`Self::ns_pid`] for this task's thread id (identical to it for a process's initial thread,
+    /// which is what makes a fresh namespace's first task `pid == tid == 1`).
+    ns_tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    credentials: RefCell<Arc<syscalls::process::Credentials>>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
+    /// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` state, per process.
+    ///
+    /// Tracked rather than refused because the pair is read-write and callers check what they set:
+    /// glibc clears it after a privileged exec, gnupg and several session helpers set it
+    /// deliberately, and a `prctl` that fails where real Linux always succeeds is a refusal they
+    /// have no reason to expect. It changes nothing observable here -- litebox has no core dumps
+    /// and no `ptrace` -- so honouring it means storing it faithfully and reading it back.
+    ///
+    /// `1` is Linux's own default (`SUID_DUMP_USER`).
+    dumpable: Cell<u32>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
     fs: RefCell<Arc<syscalls::file::FsState<Platform>>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
-    /// Signal state
-    signals: syscalls::signal::SignalState<Platform>,
+    /// Signal state. `RefCell` for the same reason as [`Self::pid`]: a native fork() child's
+    /// pending signals must be cleared and its `shared_pending` repointed at the fresh child
+    /// `Process`'s own queue (see [`syscalls::signal::SignalState::clone_for_new_task`], already
+    /// used -- at ordinary Task-construction time, never in place -- by the thread-based fork
+    /// path this one can't use).
+    signals: RefCell<syscalls::signal::SignalState<Platform>>,
     /// Set by [`LinuxShim::load_program_attach_pty`]'s internal call to `Self::attach_pty_stdio`
     /// once this task's stdio has been attached to a fresh pty's slave -- the pty id a host-side
     /// caller (with no `Task` in scope) should pass to
@@ -2057,17 +4522,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
     }
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// The PID namespace this task belongs to: [`syscalls::pidns::INITIAL_NS`] unless a
+    /// `clone(CLONE_NEWPID)` created the one it lives in.
+    pub(crate) fn pid_namespace(&self) -> u32 {
+        self.pid_ns.get()
+    }
+
+    /// Linux's `getpid()`: the pid this task holds in its own PID namespace, not the internal pid.
+    pub(crate) fn guest_pid(&self) -> i32 {
+        self.ns_pid.get()
+    }
+
+    /// Linux's `gettid()`: [`Self::guest_pid`] for a process's initial thread.
+    pub(crate) fn guest_tid(&self) -> i32 {
+        self.ns_tid.get()
+    }
+
+    /// Which internal pid a caller in this task's namespace means by `guest`: `None` when this
+    /// namespace cannot see that pid at all, which is Linux's `ESRCH` for `kill`/`wait4`.
+    pub(crate) fn resolve_guest_pid(&self, guest: i32) -> Option<i32> {
+        self.global
+            .pid_namespaces
+            .translate(guest, self.pid_ns.get())
+    }
+
+    /// How `internal` is spelled in this task's namespace -- `wait4`'s return value, `siginfo`'s
+    /// `si_pid` and `SCM_CREDENTIALS`' `pid` all report this rather than the internal pid.
+    pub(crate) fn guest_pid_of(&self, internal: i32) -> Option<i32> {
+        self.global
+            .pid_namespaces
+            .pid_in(internal, self.pid_ns.get())
+    }
+
+    /// How `internal` (a thread id) is spelled in this task's namespace.
+    pub(crate) fn guest_tid_of(&self, internal: i32) -> Option<i32> {
+        self.guest_pid_of(internal)
+    }
+}
+
 #[cfg(test)]
 mod test_utils {
     extern crate std;
     use super::*;
 
-    impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+    impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(
-            self: Arc<Self>,
-            fs: alloc::sync::Arc<FS>,
-        ) -> Task<Platform, FS> {
+        pub(crate) fn new_test_task(self, fs: alloc::sync::Arc<FS>) -> Task<Platform, FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2077,28 +4578,29 @@ mod test_utils {
                 syscalls::signal::PendingSignals::new(),
             ));
             Task {
-                wait_state: wait::WaitState::new(self.platform),
-                thread: syscalls::process::ThreadState::new_process(
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.platform)),
+                thread: RefCell::new(syscalls::process::ThreadState::new_process(
                     pid,
                     Arc::new(PageManager::new(&self.litebox)),
                     false,
                     None,
                     shared_pending.clone(),
                     None,
-                ),
-                pid,
-                ppid: 0,
-                tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                }),
+                )),
+                pid: Cell::new(pid),
+                ppid: Cell::new(0),
+                tid: Cell::new(pid),
+                pid_ns: Cell::new(syscalls::pidns::INITIAL_NS),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    0, 0, 0, 0,
+                ))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
+                dumpable: Cell::new(1),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(shared_pending),
+                signals: RefCell::new(syscalls::signal::SignalState::new_process(shared_pending)),
                 attached_pty_id: Cell::new(None),
                 global: self,
             }
@@ -2113,18 +4615,22 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
-                thread: self.thread.new_thread(tid)?,
-                pid: self.pid,
-                ppid: self.ppid,
-                tid,
-                credentials: self.credentials.clone(),
+                thread: RefCell::new(self.thread.borrow().new_thread(tid)?),
+                pid: Cell::new(self.pid.get()),
+                ppid: Cell::new(self.ppid.get()),
+                tid: Cell::new(tid),
+                pid_ns: self.pid_ns.clone(),
+                ns_pid: self.ns_pid.clone(),
+                ns_tid: Cell::new(tid),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
+                dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                // Always a same-process thread clone -- see `self.thread.new_thread(tid)` above.
-                signals: self.signals.clone_for_new_task(None),
+                // Always a same-process thread clone -- see `self.thread.borrow().new_thread(tid)` above.
+                signals: RefCell::new(self.signals.borrow().clone_for_new_task(None)),
                 attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
             Some(task)
@@ -2152,26 +4658,33 @@ mod test_utils {
                 pid,
                 Arc::new(PageManager::new(&self.global.litebox)),
                 false,
-                Some(Arc::downgrade(self.process())),
+                Some(Arc::downgrade(&self.process())),
                 shared_pending.clone(),
                 Some(litebox_common_linux::signal::Signal::SIGCHLD.as_i32()),
             );
             let child = Task {
-                wait_state: wait::WaitState::new(self.global.platform),
+                wait_state: ReplaceableWaitState::new(wait::WaitState::new(self.global.platform)),
                 global: self.global.clone(),
-                thread,
-                pid,
-                ppid: self.pid,
-                tid: pid,
-                credentials: self.credentials.clone(),
+                thread: RefCell::new(thread),
+                pid: Cell::new(pid),
+                ppid: Cell::new(self.pid.get()),
+                tid: Cell::new(pid),
+                pid_ns: self.pid_ns.clone(),
+                ns_pid: Cell::new(pid),
+                ns_tid: Cell::new(pid),
+                credentials: RefCell::new(self.creds()),
                 comm: self.comm.clone(),
+                dumpable: self.dumpable.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                signals: self.signals.clone_for_new_task(Some(shared_pending)),
+                signals: RefCell::new(
+                    self.signals
+                        .borrow()
+                        .clone_for_new_task(Some(shared_pending)),
+                ),
                 attached_pty_id: Cell::new(self.attached_pty_id.get()),
             };
-            self.process()
-                .add_child_for_test(pid, child.process().clone());
+            self.process().add_child_for_test(pid, child.process());
             child
         }
 
@@ -2205,6 +4718,7 @@ mod test_utils {
         /// run any guest code).
         pub(crate) fn set_thread_handle_for_test(&self) {
             self.thread
+                .borrow()
                 .remote_handle_cell()
                 .set(alloc::boxed::Box::new(self.wait_state.thread_handle()))
                 .ok();
@@ -2237,3 +4751,8 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
     }
 }
+
+/// Re-exported so the runner can forward `LITEBOX_COW_MMAP` into this `no_std` crate, mirroring
+/// how `litebox::mm::linux::set_mapping_guard_gap_disabled` is forwarded for
+/// `LITEBOX_NO_MAPPING_GUARD_GAP`. See `syscalls::mm::COW_MMAP_ENABLED` for why it defaults off.
+pub use syscalls::mm::set_cow_mmap_enabled;

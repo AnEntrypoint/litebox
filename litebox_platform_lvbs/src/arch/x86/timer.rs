@@ -31,8 +31,13 @@ use crate::mshv::{
     HV_FEATURE_REFERENCE_COUNTER, HV_FEATURE_STIMER_DIRECT, HV_FEATURE_SYNTHETIC_TIMER,
     HV_STIMER_CONFIG_DIRECT_MODE, HV_STIMER_CONFIG_ENABLE, HV_STIMER_CONFIG_VECTOR_SHIFT,
     HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HV_X64_MSR_TIME_REF_COUNT,
-    HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+    HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS,
 };
+// HYPERV_CPUID_FEATURES (leaf 0x40000003) is a Hyper-V-vendor-specific sub-leaf with no typed
+// accessor in `raw-cpuid` (which only models the generic hypervisor-presence/vendor-string leaf,
+// not arbitrary vendor feature leaves) -- reading it via a raw CPUID call remains the correct,
+// non-reinvented approach for this one leaf. Standard leaves (feature info, x2APIC) below use
+// `raw_cpuid::CpuId`'s typed accessors instead.
 use core::arch::x86_64::__cpuid_count as cpuid_count;
 
 /// Vector the preemption timer fires on. Above the 0..31 exception range and
@@ -51,10 +56,6 @@ const IA32_APIC_BASE_EXTD: u64 = 1 << 10; // x2APIC mode enable
 const X2APIC_SVR: u32 = 0x80f; // Spurious Interrupt Vector Register
 const X2APIC_SVR_ENABLE: u64 = 1 << 8; // APIC software-enable
 const X2APIC_EOI: u32 = 0x80b; // End-of-interrupt (write 0)
-
-// CPUID standard feature-information leaf (EAX=1) and the ECX bits we read.
-const CPUID_FEATURE_INFO: u32 = 1;
-const CPUID_FEATURE_INFO_ECX_X2APIC: u32 = 1 << 21;
 
 /// Per-entry execution budget in microseconds.
 ///
@@ -107,9 +108,10 @@ pub(crate) fn reference_time_100ns() -> u64 {
 /// Call once per CPU after the IDT is loaded.
 pub fn init() {
     // x2APIC software-enable is needed to EOI the direct-mode STIMER interrupt.
-    if cpuid_count(CPUID_FEATURE_INFO, 0x0).ecx & CPUID_FEATURE_INFO_ECX_X2APIC == 0
-        || !enable_x2apic()
-    {
+    let has_x2apic = raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|finfo| finfo.has_x2apic());
+    if !has_x2apic || !enable_x2apic() {
         crate::serial_println!("preemption disabled: x2APIC unavailable");
         return;
     }
@@ -153,7 +155,10 @@ fn enable_x2apic() -> bool {
 /// mode), log the raw feature leaf, and leave STIMER0 disabled (armed later via
 /// [`arm_preemption`]). Returns `false` if any capability is missing.
 fn init_stimer() -> bool {
-    if cpuid_count(CPUID_FEATURE_INFO, 0x0).ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0
+    let has_hypervisor = raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|finfo| finfo.has_hypervisor());
+    if !has_hypervisor
         || cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0).eax < HYPERV_CPUID_FEATURES
     {
         return false;

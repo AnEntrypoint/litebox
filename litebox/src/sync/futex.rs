@@ -109,13 +109,30 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // that we don't miss a wakeup.
         let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
         if value != expected_value {
+            // We were already visible to wakers, so a concurrent `wake` may have extracted this
+            // entry and spent one unit of its `num_to_wake` on a thread that is not going to sleep.
+            // Real Linux checks the value before the waiter is visible, so this can never happen
+            // there; here the wake must be passed on, or a genuinely sleeping waiter is never
+            // woken (a lost wakeup: the futex word is already changed, so no later wake follows).
+            if entry.get().done.load(Ordering::Acquire) {
+                let _ = self.wake(
+                    futex_addr,
+                    NonZeroU32::MIN,
+                    Some(NonZeroU32::new(bitset).unwrap_or(ALL_BITS)),
+                );
+            }
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
         // Only return when woken--don't reevaluate the futex word. This
         // ensures that the rate control mechanisms provided by the futex
         // interface are effective.
-        cx.wait_until(|| entry.get().done.load(Ordering::Acquire))
-            .map_err(FutexError::WaitError)
+        match cx.wait_until(|| entry.get().done.load(Ordering::Acquire)) {
+            Ok(()) => Ok(()),
+            // A wake that raced our timeout or interrupt has already consumed this entry: report
+            // success (as Linux does when the waker wins), otherwise the wake is silently lost.
+            Err(_) if entry.get().done.load(Ordering::Acquire) => Ok(()),
+            Err(e) => Err(FutexError::WaitError(e)),
+        }
     }
 
     /// Wakes waiters on the given futex word.
@@ -157,6 +174,21 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                 core::ops::ControlFlow::Continue(true)
             }
         });
+        // A wake that finds nothing is the interesting case: it distinguishes "a waiter was
+        // registered on this address but did not match" from "no waiter was there at all when
+        // the wake fired". The first is a queue/bitset bug; the second is a lost-wakeup race
+        // where the wake ran before the waiter parked. Reporting every address currently queued
+        // in this bucket separates them: an address close to the target means the waiter is
+        // present under a different key, while an empty or unrelated bucket means the waiter
+        // had not registered yet.
+        if woken == 0 {
+            litebox_util_log::debug!(
+                addr:% = addr,
+                requested:% = num_to_wake_up.get();
+                "futex: WAKE matched nothing"
+            );
+        }
+
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {

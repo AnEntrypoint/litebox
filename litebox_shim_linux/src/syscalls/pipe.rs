@@ -17,7 +17,7 @@ use litebox::{
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 /// Matches real Linux's default pipe capacity before any `fcntl(F_SETPIPE_SZ)`
 /// resize (16 pages on a 4KiB-page system -- see `man 7 pipe`). The previous
@@ -42,7 +42,7 @@ pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) writer: PipeFd<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     pub(crate) fn create_linux_pipe(
         &self,
         flags: OFlags,
@@ -67,7 +67,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             (pipe_flags, flags.contains(OFlags::CLOEXEC))
         };
 
-        let (writer, reader) = self.pipes.create_pipe(
+        let (writer, reader) = self.pipes().create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
@@ -99,7 +99,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     }
 
     pub(crate) fn close_linux_pipe(&self, fd: &PipeFd<Platform>) -> Result<(), Errno> {
-        self.pipes.close(fd).map_err(Errno::from)
+        self.pipes().close(fd).map_err(Errno::from)
     }
 
     pub(crate) fn read_linux_pipe(
@@ -108,7 +108,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         fd: &PipeFd<Platform>,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        self.pipes.read(cx, fd, buf).map_err(Errno::from)
+        self.pipes().read(cx, fd, buf).map_err(Errno::from)
     }
 
     pub(crate) fn write_linux_pipe(
@@ -117,7 +117,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         fd: &PipeFd<Platform>,
         buf: &[u8],
     ) -> Result<usize, Errno> {
-        self.pipes.write(cx, fd, buf).map_err(Errno::from)
+        self.pipes().write(cx, fd, buf).map_err(Errno::from)
     }
 
     pub(crate) fn linux_pipe_status_flags(&self, fd: &PipeFd<Platform>) -> Result<OFlags, Errno> {
@@ -135,7 +135,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         flags: OFlags,
         setfl_mask: OFlags,
     ) -> Result<(), Errno> {
-        self.pipes
+        self.pipes()
             .update_flags(fd, Flags::NON_BLOCKING, flags.intersects(OFlags::NONBLOCK))
             .map_err(Errno::from)?;
 
@@ -152,7 +152,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     }
 
     pub(crate) fn linux_pipe_mode_bits(&self, fd: &PipeFd<Platform>) -> Result<u32, Errno> {
-        let read_write_mode = match self.pipes.half_pipe_type(fd)? {
+        let read_write_mode = match self.pipes().half_pipe_type(fd)? {
             HalfPipeType::SenderHalf => Mode::WUSR,
             HalfPipeType::ReceiverHalf => Mode::RUSR,
         };
@@ -164,7 +164,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         fd: &PipeFd<Platform>,
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, Errno> {
-        self.pipes.with_iopollable(fd, f).map_err(Errno::from)
+        self.pipes().with_iopollable(fd, f).map_err(Errno::from)
     }
 }
 

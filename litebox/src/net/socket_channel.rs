@@ -292,6 +292,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
+    /// Bytes received and not yet read (`FIONREAD`): the queued stream bytes, or the size of the
+    /// next datagram.
+    #[must_use]
+    pub fn pending_rx_bytes(&self) -> usize {
+        match self {
+            NetworkProxy::Stream(channel) => channel.inner.rx_cons.lock().occupied_len(),
+            NetworkProxy::Datagram(channel) => channel
+                .inner
+                .rx_cons
+                .lock()
+                .iter()
+                .next()
+                .map_or(0, |m| m.data.len()),
+            NetworkProxy::Raw => 0,
+        }
+    }
+
     /// Check if there is data pending in the TX buffer to be sent.
     pub(super) fn has_pending_tx(&self) -> bool {
         match self {
@@ -328,10 +345,23 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     read_shutdown: AtomicBool,
     /// Whether the write side is shut down (SHUT_WR)
     write_shutdown: AtomicBool,
+    /// Whether the peer sent its FIN: once the RX buffer is drained a read reports end-of-file,
+    /// while writes stay possible (half-close).
+    peer_closed: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
+
+    /// Set once this socket's smoltcp socket gained a second referent in ANOTHER process of the
+    /// fork family. RX is then only drained into this proxy on demand (see
+    /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
+    shared_across_fork: AtomicBool,
+    /// Whether the smoltcp socket still holds bytes this process has not pulled into its own RX
+    /// buffer. Only ever set for a socket shared across the fork family, whose RX the tick leaves
+    /// in smoltcp so the process that reads it is the one that fetches it; this is how a
+    /// `poll`/`epoll`/`select` waiter learns the bytes are there without consuming them.
+    smoltcp_rx_pending: AtomicBool,
 
     /// Socket error.
     socket_error: SocketAsyncErrorState,
@@ -358,8 +388,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             state: AtomicU32::new(SocketState::Initial as u32),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
+
+            shared_across_fork: AtomicBool::new(false),
+            smoltcp_rx_pending: AtomicBool::new(false),
 
             socket_error: SocketAsyncErrorState::new(),
 
@@ -420,6 +454,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
+        if flags.contains(super::ReceiveFlags::PEEK) {
+            // `MSG_PEEK`: copy without consuming (and without touching the available count).
+            let (a, b) = rx_cons.as_slices();
+            let n1 = a.len().min(buf.len());
+            buf[..n1].copy_from_slice(&a[..n1]);
+            let n2 = b.len().min(buf.len() - n1);
+            buf[n1..n1 + n2].copy_from_slice(&b[..n2]);
+            let n = n1 + n2;
+            if n > 0 {
+                return Ok(n);
+            }
+            return match self.inner.state() {
+                SocketState::Connected => Ok(0),
+                SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
+                _ => Err(ChannelReadError::NotConnected),
+            };
+        }
         let n = if flags.contains(super::ReceiveFlags::DISCARD) {
             rx_cons.clear()
         } else if flags.contains(super::ReceiveFlags::TRUNC) {
@@ -440,6 +491,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         if n > 0 {
             return Ok(n);
+        }
+        // Everything the peer sent has been delivered and it has closed its side: end-of-file.
+        if self.inner.peer_closed.load(Ordering::Acquire) {
+            return Err(ChannelReadError::ReadShutdown);
         }
         match self.inner.state() {
             SocketState::Connected => Ok(0),
@@ -485,6 +540,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.tx_available.load(Ordering::Acquire) > 0
     }
 
+    /// Whether this socket's smoltcp socket is also referenced by another process of the fork
+    /// family, in which case a reader has to pull its RX for itself.
+    pub fn is_shared_across_fork(&self) -> bool {
+        self.inner.shared_across_fork.load(Ordering::Acquire)
+    }
+
+    /// Record that this socket's smoltcp socket is also referenced by another process of the fork
+    /// family.
+    pub fn mark_shared_across_fork(&self) {
+        self.inner.shared_across_fork.store(true, Ordering::Release);
+    }
+
     /// Shutdown the read side of the socket.
     pub fn shutdown_read(&self) {
         self.inner.read_shutdown.store(true, Ordering::Release);
@@ -493,6 +560,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Shutdown the write side of the socket.
     pub fn shutdown_write(&self) {
         self.inner.write_shutdown.store(true, Ordering::Release);
+    }
+
+    /// Whether the write side has been shut down (the FIN is owed once the TX buffer is empty).
+    pub(super) fn is_write_shutdown(&self) -> bool {
+        self.inner.write_shutdown.load(Ordering::Acquire)
     }
 }
 
@@ -624,9 +696,31 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         total
     }
 
-    /// Check if the socket has data available for reading.
+    /// Check if the socket has data available for reading (or an end-of-file to report).
+    ///
+    /// A socket shared across the fork family also reports readable while its bytes still sit in
+    /// smoltcp waiting for this process to pull them ([`Self::set_smoltcp_rx_pending`]), or a
+    /// `poll`/`epoll` waiter on it would never be told to run the read that fetches them.
     pub(super) fn is_readable(&self) -> bool {
         self.inner.rx_available.load(Ordering::Acquire) > 0
+            || self.inner.peer_closed.load(Ordering::Acquire)
+            || self.inner.smoltcp_rx_pending.load(Ordering::Acquire)
+    }
+
+    /// Record whether the smoltcp socket still holds bytes this process has not pulled, waking
+    /// any waiter when bytes appeared.
+    pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
+        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+            self.inner.pollee.notify_observers(Events::IN);
+        }
+    }
+
+    /// Record that the peer closed its side of the connection (its FIN arrived and all data it
+    /// sent has already been pushed into the RX buffer). Wakes readers so they observe the EOF.
+    pub(super) fn mark_peer_closed(&self) {
+        if !self.inner.peer_closed.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(Events::IN | Events::HUP);
+        }
     }
 
     /// Manually set the readable state.
@@ -739,6 +833,16 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// Space available in TX
     tx_space: AtomicUsize,
 
+    /// Set once this socket's smoltcp socket gained a second referent in ANOTHER process of the
+    /// fork family. RX is then drained into this proxy only by this process's own read (see
+    /// [`super::Network::drain_socket_channel_buffers`]), so a reader must pull for itself.
+    shared_across_fork: AtomicBool,
+    /// Whether the smoltcp socket still holds datagrams this process has not pulled into its own
+    /// RX queue. Only ever set for a socket shared across the fork family, whose RX the tick
+    /// leaves in smoltcp so the process that reads it is the one that fetches it; this is how a
+    /// `poll`/`epoll`/`select` waiter learns the datagrams are there without consuming them.
+    smoltcp_rx_pending: AtomicBool,
+
     /// Local port the socket is bound to (0 if unbound).
     /// This is set atomically when auto-binding during sendto.
     local_port: AtomicU16,
@@ -774,6 +878,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
 
             rx_count: AtomicUsize::new(0),
             tx_space: AtomicUsize::new(queue_size),
+
+            shared_across_fork: AtomicBool::new(false),
+            smoltcp_rx_pending: AtomicBool::new(false),
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
@@ -824,6 +931,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ) -> Result<usize, ChannelReadError> {
         let mut rx_cons = self.inner.rx_cons.lock();
 
+        if flags.contains(ReceiveFlags::PEEK) {
+            let Some(DatagramMessage { data, addr }) = rx_cons.iter().next() else {
+                return Ok(0);
+            };
+            if let Some(source_addr) = source_addr {
+                *source_addr = *addr;
+            }
+            if !flags.contains(ReceiveFlags::DISCARD) {
+                let to_copy = core::cmp::min(buf.len(), data.len());
+                buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            }
+            return Ok(data.len());
+        }
+
         if let Some(msg) = rx_cons.try_pop() {
             let DatagramMessage { data, addr } = msg;
             if let Some(source_addr) = source_addr {
@@ -871,8 +992,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     }
 
     /// Check if the socket is readable.
+    ///
+    /// A socket shared across the fork family also reports readable while its datagrams still sit
+    /// in smoltcp waiting for this process to pull them ([`Self::set_smoltcp_rx_pending`]), or a
+    /// `poll`/`epoll` waiter on it would never be told to run the read that fetches them.
     pub fn is_readable(&self) -> bool {
         self.inner.rx_count.load(Ordering::Acquire) > 0
+            || self.inner.smoltcp_rx_pending.load(Ordering::Acquire)
+    }
+
+    /// Record whether the smoltcp socket still holds datagrams this process has not pulled,
+    /// waking any waiter when one appeared.
+    pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
+        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+            self.inner.pollee.notify_observers(Events::IN);
+        }
     }
 
     /// Check if the socket is writable.
@@ -885,6 +1019,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Returns 0 if the socket is not yet bound.
     pub fn local_port(&self) -> u16 {
         self.inner.local_port.load(Ordering::Acquire)
+    }
+
+    /// Whether this socket's smoltcp socket is also referenced by another process of the fork
+    /// family, in which case a reader has to pull its RX for itself.
+    pub fn is_shared_across_fork(&self) -> bool {
+        self.inner.shared_across_fork.load(Ordering::Acquire)
+    }
+
+    /// Record that this socket's smoltcp socket is also referenced by another process of the fork
+    /// family.
+    pub fn mark_shared_across_fork(&self) {
+        self.inner.shared_across_fork.store(true, Ordering::Release);
     }
 
     /// Set the local port the socket is bound to.
@@ -917,7 +1063,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
 
-        if self.inner.rx_count.load(Ordering::Acquire) > 0 {
+        if self.is_readable() {
             events |= Events::IN;
         }
 

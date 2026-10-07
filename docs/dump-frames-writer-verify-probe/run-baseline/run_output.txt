@@ -1,0 +1,89 @@
+﻿OPEN_OK fd=3
+litebox_runner_linux_on_windows_userland.exe : [LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 
+distinct_colors_capped64=1
+At line:8 char:8
++ $out = & "C:\dev\litebox-main\target\release\litebox_runner_linux_on_ ...
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([LITEBOX_DUMP_F...lors_capped64=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+CONNECTOR(fill) mode[0]=1920x1080
+CREATE_DUMB handle=1 pitch=7680 size=8294400
+ADDFB2 fb_id=1
+SETCRTC_OK
+MULTIFLIP_START flip_count=20 flip_delay_ms=0
+PAGE_FLIP i=0 rc=0 color=0,0,0
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=1 rc=0 color=5,7,11
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=2 rc=0 color=10,14,22
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 4 (total dropped so far: 1)
+PAGE_FLIP i=3 rc=0 color=15,21,33
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 5 (total dropped so far: 2)
+PAGE_FLIP i=4 rc=0 color=20,28,44
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 6 (total dropped so far: 3)
+PAGE_FLIP i=5 rc=0 color=25,35,55
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 7 (total dropped so far: 4)
+PAGE_FLIP i=6 rc=0 color=30,42,66
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 8 (total dropped so far: 5)
+PAGE_FLIP i=7 rc=0 color=35,49,77
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] WARNING: writer backpressure, dropped frame 9 (total dropped so far: 6)
+PAGE_FLIP i=8 rc=0 color=40,56,88
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=9 rc=0 color=45,63,99
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_0.bmp (8294454 bytes, frame 0)
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_1.bmp (8294454 bytes, frame 1)
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_2.bmp (8294454 bytes, frame 2)
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_3.bmp (8294454 bytes, frame 3)
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_10.bmp (8294454 bytes, frame 10)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=10 rc=0 color=50,70,110
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_11.bmp (8294454 bytes, frame 11)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=11 rc=0 color=55,77,121
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_12.bmp (8294454 bytes, frame 12)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=12 rc=0 color=60,84,132
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_13.bmp (8294454 bytes, frame 13)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=13 rc=0 color=65,91,143
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_14.bmp (8294454 bytes, frame 14)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=14 rc=0 color=70,98,154
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_15.bmp (8294454 bytes, frame 15)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=15 rc=0 color=75,105,165
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_16.bmp (8294454 bytes, frame 16)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=16 rc=0 color=80,112,176
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_17.bmp (8294454 bytes, frame 17)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=17 rc=0 color=85,119,187
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_18.bmp (8294454 bytes, frame 18)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=18 rc=0 color=90,126,198
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_19.bmp (8294454 bytes, frame 19)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+PAGE_FLIP i=19 rc=0 color=95,133,209
+MULTIFLIP_DONE
+DONE
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_20.bmp (8294454 bytes, frame 20)
+[presenter-diag] creating surface
+[presenter-diag] requesting adapter
+[presenter-diag] request_adapter returned: true
+[presenter-diag] requesting device
+[presenter-diag] request_device returned: true
+[presenter-diag] device+queue obtained, continuing setup
+[presenter-diag] present_mode=Mailbox (available: [Mailbox, Fifo, Immediate])
+[presenter-diag] configuring surface, alpha_mode=Opaque (available: [Opaque])
+[presenter-diag] surface configured, setting up blit pipeline + texture pool
+[presenter-diag] surface configured, resumed() about to return
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_21.bmp (8294454 bytes, frame 21)

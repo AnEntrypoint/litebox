@@ -5,7 +5,6 @@
 
 use core::num::{NonZeroU16, NonZeroU64};
 
-use hashbrown::HashMap;
 use thiserror::Error;
 
 use crate::utils::rng::FastRng;
@@ -13,11 +12,22 @@ use crate::utils::rng::FastRng;
 /// An allocator for local ports, making sure that no already-allocated ports are given out either
 /// in case of ephemeral port allocation, or in the case of asking for a specific port.
 pub(crate) struct LocalPortAllocator {
-    // map from port number -> reference count
-    //
-    // using a non-zero u16 for the reference count is a memory optimization; if this is ever an
-    // issue, it can trivially be bumped up to a larger size.
-    refcount: HashMap<NonZeroU16, NonZeroU16>,
+    // refcount[port - 1] holds port `port`'s reference count (0 == free). A fixed, pointer-free
+    // 65535-entry array, NOT a `HashMap` (as this used to be) -- `Network` (and this field inline
+    // within it) now lives in the cross-process shared kernel arena as of the `socket_set`
+    // shared-arena-native fix (`GlobalState`'s `net: Mutex<Network<Platform>>` field, placed via
+    // `SharedKernelStateSlot::ShimGlobalState`). A `HashMap`'s backing table is a SEPARATE
+    // allocation on the constructing process's private heap, reachable only through a raw pointer
+    // stored inline in the map -- a cross-process-forked child that ATTACHES to (rather than
+    // constructs) the shared `GlobalState` reads that same pointer VALUE, meaningless in its own
+    // address space, so `hashbrown`'s SIMD probe loop reads garbage control bytes with no
+    // guaranteed EMPTY sentinel and can spin forever. Confirmed live via cdb CPU sampling
+    // (2026-09-17, `.wfgy/cpu_profile_session`): a forked child burned an entire CPU core for 6+
+    // real minutes, RIP always inside this exact hashbrown group-scan code
+    // (`LocalPortAllocator::ephemeral_port`/`deallocate`) -- the same "stale cross-process
+    // pointer" bug class already fixed a dozen times elsewhere today (see this crate's
+    // `MAX_SOCKETS` doc comment / AGENTS.md), just not yet audited for this nested field.
+    refcount: [u16; Self::PORT_COUNT],
     rng: FastRng,
 }
 
@@ -28,12 +38,19 @@ impl Default for LocalPortAllocator {
 }
 
 impl LocalPortAllocator {
+    /// Number of valid port values (1..=65535); index `port.get() - 1` into `refcount`.
+    const PORT_COUNT: usize = u16::MAX as usize;
+
     /// Sets up a new local port allocator
     pub(crate) fn new() -> Self {
         Self {
-            refcount: HashMap::new(),
+            refcount: [0; Self::PORT_COUNT],
             rng: FastRng::new_from_seed(NonZeroU64::new(0x13374a4159421337).unwrap()),
         }
+    }
+
+    fn index(port: NonZeroU16) -> usize {
+        (port.get() - 1) as usize
     }
 
     /// Allocate a new ephemeral local port (i.e., port in the range 49152 and 65535)
@@ -63,10 +80,11 @@ impl LocalPortAllocator {
         &mut self,
         port: NonZeroU16,
     ) -> Result<LocalPort, LocalPortAllocationError> {
-        if self.refcount.contains_key(&port) {
+        let slot = &mut self.refcount[Self::index(port)];
+        if *slot != 0 {
             Err(LocalPortAllocationError::AlreadyInUse(port.get()))
         } else {
-            self.refcount.insert(port, NonZeroU16::new(1).unwrap());
+            *slot = 1;
             Ok(LocalPort { port })
         }
     }
@@ -85,33 +103,36 @@ impl LocalPortAllocator {
     /// Increments the ref-count for a local port, producing a new [`LocalPort`] token to be used
     #[must_use]
     pub(crate) fn allocate_same_local_port(&mut self, port: &LocalPort) -> LocalPort {
-        let Some(refcount) = self.refcount.get_mut(&port.port) else {
-            // Because we have a `LocalPort`, it is (as an invariant) impossible to have the value
-            // be missing from the refcount.
-            unreachable!()
+        let slot = &mut self.refcount[Self::index(port.port)];
+        // Ordinarily, having a live `LocalPort` token makes a `0` refcount here impossible -- but
+        // see `deallocate`'s own doc comment: a dead-holder `reset_after_poisoning()` elsewhere
+        // can zero this whole table out from under a token minted before it. Rebuild as if this
+        // call were the first holder of the port instead of panicking on a guest-reachable path.
+        *slot = if *slot == 0 {
+            1
+        } else {
+            slot.checked_add(1).unwrap()
         };
-        // We just bump the refcount, making sure there is no overflow, and then produce the new
-        // `LocalPort` token.
-        *refcount = refcount.checked_add(1).unwrap();
         LocalPort { port: port.port }
     }
 
     /// Consumes a [`LocalPort`], possibly marking it as available again.
     pub(crate) fn deallocate(&mut self, port: LocalPort) {
-        let Some(refcount) = self.refcount.get_mut(&port.port) else {
-            // Because we have a `LocalPort`, it is (as an invariant) impossible to have the value
-            // be missing from the refcount.
-            unreachable!()
-        };
-        match refcount.get() {
-            0 => unreachable!(),
-            1 => {
-                // Need to drop
-                self.refcount.remove(&port.port);
-            }
-            _ => {
-                *refcount = NonZeroU16::new(refcount.get() - 1).unwrap();
-            }
+        let slot = &mut self.refcount[Self::index(port.port)];
+        match *slot {
+            // Live-caught (twenty-eighth pass), exactly as this struct's own
+            // `reset_after_poisoning` doc comment already predicted: a `LocalPort` token minted
+            // BEFORE a dead-holder `reset_after_poisoning()` elsewhere zeroed this whole table can
+            // still be deallocated afterward by whichever (possibly different) process still
+            // holds it -- its slot's refcount no longer matches reality by construction, not a
+            // genuine double-free. Since the table has already been reset to "every port free",
+            // there is nothing left here to double-decrement; a no-op is the correct, safe
+            // response, matching this codebase's own established trade-off for this whole
+            // poisoning-recovery class (`Network::close`/`close_handle`, `queued_for_closure`)
+            // rather than a panic on a guest-reachable path.
+            0 => {}
+            1 => *slot = 0,
+            n => *slot = n - 1,
         }
     }
 
@@ -120,6 +141,23 @@ impl LocalPortAllocator {
         if let Some(port) = NonZeroU16::new(port) {
             self.deallocate(LocalPort { port });
         }
+    }
+
+    /// Resets every port back to free (refcount 0), the same starting point [`Self::new`] itself
+    /// establishes, without touching `rng` (no correctness reason to re-seed it). Part of
+    /// [`crate::net::Network::reset_after_poisoning`] -- see that method's own doc comment for why
+    /// this exists: a dead lock holder can die mid-`allocate`/`deallocate`, leaving some slot's
+    /// refcount not matching the real number of live [`LocalPort`] tokens still referencing it, in
+    /// either direction. A *pre-existing* [`LocalPort`] token minted before the crash later
+    /// hitting a refcount that no longer matches (that token's issuing `Network` state is itself
+    /// being wholesale reset by the same caller) was live-caught exactly as this comment once
+    /// predicted (twenty-eighth pass) -- `deallocate`/`allocate_same_local_port` no longer panic
+    /// on it (see their own doc comments: a no-op, or rebuilding as the first holder,
+    /// respectively), so this reset only needs to guarantee every NEW allocation after this point
+    /// starts from a clean, self-consistent table, not that every pre-existing token's later use
+    /// stays fully correct.
+    pub(crate) fn reset_after_poisoning(&mut self) {
+        self.refcount = [0; Self::PORT_COUNT];
     }
 }
 

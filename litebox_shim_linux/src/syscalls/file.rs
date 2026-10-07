@@ -9,28 +9,32 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{Events, wait::CheckForInterrupt, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{Mode, OFlags, SeekWhence},
+    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
-    platform::{Instant as _, StdioStream, TimeProvider},
+    platform::{
+        Instant as _, RawConstPointer as _, RawMutPointer as _, RawMutex as _, StdioStream,
+        TimeProvider,
+    },
     sync::RawSyncPrimitivesProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, MfdFlags, SfdFlags, TfdFlags,
-    TfdSettimeFlags, Statx, StatxMask, TimeParam,
+    AccessFlags, AtFlags, DrmPrimeHandle, EfdFlags, EpollCreateFlags, FcntlArg,
+    FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec,
+    MfdFlags, SfdFlags, Statx, StatxMask, TfdFlags, TfdSettimeFlags, TimeParam,
     errno::Errno,
-    signal::{Signal, SigSet},
+    signal::{SigSet, Signal},
 };
 use thiserror::Error;
 
 use crate::{
-    GlobalState, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut, syscalls::signal,
+    GlobalStateHandle, ShimFS, ShimPlatform, Task, TermiosState, UserPtr, UserPtrMut,
+    syscalls::{file_spill::SpillEdit, signal},
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -47,13 +51,299 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
     }
 }
 
+/// Longest path key [`SharedFilePublishTable`] indexes by. Matches
+/// `syscalls::unix::UNIX_ADDR_KEY_MAX` for consistency -- there's no principled reason for either
+/// bound to differ, and both simply cap a fixed-size atomic byte array.
+const FILE_PUBLISH_PATH_MAX: usize = 108;
+
+/// Longest content [`SharedFilePublishTable`] stores per entry. A D-Bus session address string
+/// (`unix:path=/tmp/dbus-XXXXXXXXXX,guid=<32 hex chars>\n`) is well under 128 bytes in practice;
+/// sized with headroom while staying tiny and fixed -- this table is not, and must never become,
+/// a general byte-content sharing mechanism (see the table's own doc comment).
+const FILE_PUBLISH_CONTENT_MAX: usize = 256;
+
+/// A small, fixed number of slots: this table exists for a FEW well-known daemon-published files
+/// per boot (today: exactly one, D-Bus's `/tmp/addr`), never a general "every small file" cache.
+const FILE_PUBLISH_CAPACITY: usize = 8;
+
+const FILE_PUBLISH_EMPTY: u32 = 0;
+const FILE_PUBLISH_WRITING: u32 = 1;
+const FILE_PUBLISH_OCCUPIED: u32 = 2;
+
+/// One slot of [`SharedFilePublishTable`]. Same shape, and same reasoning, as
+/// `syscalls::unix::UnixAddrPresenceSlot`: no `Vec`/`Box`/pointer anywhere, so the whole slot's
+/// live state is its own inline bytes and needs no second `SharedKernelStateProvider` slot to be
+/// genuinely cross-process-visible as an ordinary `GlobalState` field.
+struct FilePublishSlot {
+    state: AtomicU32,
+    path_len: AtomicU32,
+    content_len: AtomicU32,
+    owner_pid: AtomicU32,
+    path: [AtomicU8; FILE_PUBLISH_PATH_MAX],
+    content: [AtomicU8; FILE_PUBLISH_CONTENT_MAX],
+}
+
+impl FilePublishSlot {
+    fn new_empty() -> Self {
+        Self {
+            state: AtomicU32::new(FILE_PUBLISH_EMPTY),
+            path_len: AtomicU32::new(0),
+            content_len: AtomicU32::new(0),
+            owner_pid: AtomicU32::new(0),
+            path: core::array::from_fn(|_| AtomicU8::new(0)),
+            content: core::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+
+    fn matches_path(&self, path: &[u8]) -> bool {
+        self.path_len.load(Ordering::Relaxed) as usize == path.len()
+            && path
+                .iter()
+                .enumerate()
+                .all(|(i, b)| self.path[i].load(Ordering::Relaxed) == *b)
+    }
+}
+
+/// Cross-process-visible side channel for a SMALL, NAMED byte-string a long-lived, never-exiting
+/// daemon publishes (and may occasionally republish) that a short-lived sibling process needs to
+/// read -- the gap `syscalls::unix::SharedUnixAddrPresenceTable` deliberately left open (that
+/// table proves only that a path exists, never its content -- see its own doc comment).
+///
+/// **Why this exists.** Litebox's ordinary writable-layer content only crosses process
+/// boundaries at a cross-process `fork()`'s own spawn/exit instants
+/// (`litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s doc
+/// comment). `dbus-daemon --nofork --print-address > /tmp/addr` never forks or exits again once
+/// it starts, so its write to `/tmp/addr` never reaches that sync point -- and the parent shell's
+/// own poll loop (`webtop_stack.sh`, deliberately fork-free via `_nofork_tick`, to avoid the fork
+/// corruption class a naive `bash -c` retry loop otherwise hits) never gets one either. Confirmed
+/// live as the twenty-seventh pass's `DBUS_FAILED` root cause (`AGENTS.md` pickup item 3).
+///
+/// # Scope -- deliberately narrow
+///
+/// This is NOT a general writable-layer content-sync mechanism. That approach was tried, as a
+/// periodic per-process full-tree export/merge thread, and PROVEN to cause a worse,
+/// 100%-reproducible regression (a stale snapshot permanently clobbering a fresher one via
+/// `publish_as_container_fs_snapshot`'s size-based tie-breaker -- see the twenty-seventh pass's
+/// writeup in `docs/AGENTS_ARCHIVE_2026-09-18.md`). This table holds only a HANDFUL of entries
+/// ([`FILE_PUBLISH_CAPACITY`]), each capped at [`FILE_PUBLISH_CONTENT_MAX`] bytes, for paths this
+/// crate explicitly opts in via [`SHARED_PUBLISH_PATHS`] -- widening it to "every small file"
+/// would BE the general mechanism already ruled out.
+///
+/// # How it's used
+///
+/// `do_write` publishes into this table (never instead of the real per-process write -- the
+/// owning process's own filesystem view stays the actual source of truth) whenever a write to an
+/// opted-in path succeeds, at the real byte offset being written (so a caller that emits its
+/// publication across more than one `write()` call still ends up with the whole thing published,
+/// not just its last call -- see `Task::maybe_publish_shared_file`). `do_stat`/`do_access`/
+/// `do_open_resolved` consult it, on a real local `ENOENT`, to MATERIALIZE a genuine local copy
+/// (`Task::materialize_shared_publish`) rather than only synthesizing a stat result the way
+/// `cross_process_bound_unix_socket_status` does for an AF_UNIX bind path -- a bind path has no
+/// content to copy (litebox has no `FileType::Socket` at all), but a short byte string can be
+/// copied bit for bit, so the materialized file behaves completely normally for every subsequent
+/// `stat`/`open`/`read` in this process, with no further special-casing needed anywhere else.
+pub(crate) struct SharedFilePublishTable {
+    slots: [FilePublishSlot; FILE_PUBLISH_CAPACITY],
+}
+
+impl SharedFilePublishTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| FilePublishSlot::new_empty()),
+        }
+    }
+
+    /// Publishes `bytes` at `offset` within `path`'s published content (creating the entry on its
+    /// first call for a given path). An `offset` of `0` RESETS the published length to exactly
+    /// this write's own extent -- matching real Linux `O_TRUNC` + sequential-write-from-start
+    /// semantics, so a daemon that restarts and rewrites its address file from scratch doesn't
+    /// leak stale trailing bytes from a previous incarnation. Any other `offset` extends the
+    /// published length if this write reaches further than what's already recorded (a plain
+    /// append), without disturbing bytes outside `[offset, offset + bytes.len())`. Returns
+    /// `false` -- never panics, this is a guest-reachable path -- if `path` exceeds this table's
+    /// fixed bounds or every slot is occupied by a DIFFERENT path; either only degrades this side
+    /// channel, never the real per-process write a caller already performed first.
+    pub(crate) fn publish_at(
+        &self,
+        path: &[u8],
+        offset: usize,
+        bytes: &[u8],
+        owner_pid: u32,
+    ) -> bool {
+        if path.len() > FILE_PUBLISH_PATH_MAX || offset > FILE_PUBLISH_CONTENT_MAX {
+            return false;
+        }
+        let end = offset
+            .saturating_add(bytes.len())
+            .min(FILE_PUBLISH_CONTENT_MAX);
+        let bytes = &bytes[..end.saturating_sub(offset)];
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED
+                && slot.matches_path(path)
+            {
+                slot.state.store(FILE_PUBLISH_WRITING, Ordering::Release);
+                for (i, b) in bytes.iter().enumerate() {
+                    slot.content[offset + i].store(*b, Ordering::Relaxed);
+                }
+                let existing_len = slot.content_len.load(Ordering::Relaxed) as usize;
+                let new_len = if offset == 0 {
+                    end
+                } else {
+                    existing_len.max(end)
+                };
+                slot.content_len.store(new_len as u32, Ordering::Relaxed);
+                slot.owner_pid.store(owner_pid, Ordering::Relaxed);
+                slot.state.store(FILE_PUBLISH_OCCUPIED, Ordering::Release);
+                return true;
+            }
+        }
+        for slot in &self.slots {
+            if slot
+                .state
+                .compare_exchange(
+                    FILE_PUBLISH_EMPTY,
+                    FILE_PUBLISH_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                for (i, b) in path.iter().enumerate() {
+                    slot.path[i].store(*b, Ordering::Relaxed);
+                }
+                slot.path_len.store(path.len() as u32, Ordering::Relaxed);
+                for (i, b) in bytes.iter().enumerate() {
+                    slot.content[offset + i].store(*b, Ordering::Relaxed);
+                }
+                slot.content_len.store(end as u32, Ordering::Relaxed);
+                slot.owner_pid.store(owner_pid, Ordering::Relaxed);
+                slot.state.store(FILE_PUBLISH_OCCUPIED, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Looks up `path`; returns its published content (owned, copied out of the shared slot) if
+    /// ANY process in the fork family has published it.
+    pub(crate) fn lookup(&self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+        if path.len() > FILE_PUBLISH_PATH_MAX {
+            return None;
+        }
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == FILE_PUBLISH_OCCUPIED
+                && slot.matches_path(path)
+            {
+                let len = (slot.content_len.load(Ordering::Relaxed) as usize)
+                    .min(FILE_PUBLISH_CONTENT_MAX);
+                let mut out = alloc::vec::Vec::with_capacity(len);
+                for slot_byte in &slot.content[..len] {
+                    out.push(slot_byte.load(Ordering::Relaxed));
+                }
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
+/// Paths a long-lived, non-forking daemon publishes that a short-lived sibling process needs to
+/// read -- see [`SharedFilePublishTable`]'s own doc comment for why this is a fixed, explicit
+/// list rather than a general "every small write" mechanism. Extend this list, not the mechanism,
+/// for the next daemon-published-file gap this shape fits.
+const SHARED_PUBLISH_PATHS: &[&str] = &["/tmp/addr"];
+
+/// LOUD, allocation-free diagnostic for an `open`/`openat` on a `/proc/` or `/sys/` path that
+/// falls through to a generic error (almost always `ENOENT`) instead of being served by one of
+/// the synthesized entries in `litebox::fs::procfs`/`litebox::fs::devices` -- see this codebase's
+/// established convention for exactly this kind of "make an otherwise-silent failure observable"
+/// print (`litebox_platform_windows_userland::diag_raw_print`,
+/// `common_providers::userspace_pointers::diag_near_null_write`,
+/// `litebox::fs::devices`'s own `diag_raw_print_dev_open_miss` for `/dev/<name>`). Without this, a
+/// guest desktop session (XFCE/GLib/dbus) failing to start over a missing `/proc`/`/sys` path
+/// surfaces no clue which path was missing -- only a generic ENOENT indistinguishable from any
+/// other missing-file failure. Writes directly to stderr via
+/// [`litebox::platform::StdioProvider::write_to`] using a fixed stack buffer -- no `format!`, no
+/// heap allocation -- so this is safe to call from any open path, however early/constrained.
+fn diag_raw_print_proc_sys_open_miss<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    path: &str,
+    errno: Errno,
+) {
+    if !(path.starts_with("/proc/") || path.starts_with("/sys/")) {
+        return;
+    }
+    const PREFIX: &[u8] = b"[diag-proc-sys-open-miss] unregistered path opened: ";
+    const ERRNO_MARK: &[u8] = b" errno=";
+    let mut line = [0u8; 256];
+    let mut pos = 0usize;
+    let n = PREFIX.len().min(line.len());
+    line[..n].copy_from_slice(&PREFIX[..n]);
+    pos += n;
+    let path_bytes = path.as_bytes();
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let take = path_bytes.len().min(avail);
+    line[pos..pos + take].copy_from_slice(&path_bytes[..take]);
+    pos += take;
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let n = ERRNO_MARK.len().min(avail);
+    line[pos..pos + n].copy_from_slice(&ERRNO_MARK[..n]);
+    pos += n;
+    // Errno's numeric value, formatted by hand (no `format!`) -- at most 3 decimal digits for
+    // every real errno value, so a small fixed local buffer suffices.
+    let errno_val = i32::from(errno);
+    let mut digits = [0u8; 10];
+    let mut digit_count = 0usize;
+    let mut v = errno_val.unsigned_abs();
+    if v == 0 {
+        digits[0] = b'0';
+        digit_count = 1;
+    } else {
+        while v > 0 && digit_count < digits.len() {
+            digits[digit_count] = b'0' + u8::try_from(v % 10).unwrap_or(0);
+            v /= 10;
+            digit_count += 1;
+        }
+    }
+    if errno_val < 0 && pos < line.len() {
+        line[pos] = b'-';
+        pos += 1;
+    }
+    for i in (0..digit_count).rev() {
+        if pos >= line.len() {
+            break;
+        }
+        line[pos] = digits[i];
+        pos += 1;
+    }
+    if pos < line.len() {
+        line[pos] = b'\n';
+        pos += 1;
+    }
+    let _ = platform.write_to(litebox::platform::StdioOutStream::Stderr, &line[..pos]);
+}
+
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
     /// The current working directory
     ///
     /// Must end with a '/'.
-    cwd: litebox::sync::RwLock<Platform, String>,
+    ///
+    /// An absolute path in ROOT-space -- the way the guest spells it, so `/` means the chroot
+    /// root, not the backend's own root -- which is what `getcwd` reports verbatim and what
+    /// [`join_root`] turns into a backend path. `sys_chdir`/`sys_fchdir` therefore translate the
+    /// path they validated back into this space with [`strip_root`].
+    pub(crate) cwd: litebox::sync::RwLock<Platform, String>,
+    /// The process's root directory (`chroot(2)`), as an absolute path that must end with '/'.
+    ///
+    /// Every guest-visible absolute path is resolved inside it (see [`join_root`]), so `"/"` means
+    /// "no chroot in effect" and is the only value this ever holds until a `chroot` succeeds.
+    /// Lives here, next to `cwd`, because `CLONE_FS` shares this whole struct's `Arc` between
+    /// parent and child: a `clone(CLONE_FS)` child's `chroot` therefore changes its parent's root
+    /// too, which is exactly what Chromium's zygote relies on when it drops filesystem access in a
+    /// `CLONE_FS|CLONE_VFORK` child and then expects the parent to be rooted as well.
+    pub(crate) root: litebox::sync::RwLock<Platform, String>,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
@@ -61,6 +351,7 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            root: litebox::sync::RwLock::new(self.root.read().clone()),
         }
     }
 }
@@ -70,12 +361,66 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            root: litebox::sync::RwLock::new(String::from("/")),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }
+}
+
+/// Resolve the guest-visible absolute path `abs` inside the chroot `root` (which ends with '/'),
+/// returning the path the fs backend actually sees.
+///
+/// `root == "/"` is the common case (no `chroot` in effect) and returns `abs` as-is -- every path
+/// resolution in the whole shim goes through here, so that case must stay a plain copy.
+///
+/// Lexically normalised (`.` dropped, `..` popping one component) and clamped at the root: `..`
+/// can never walk out of the chroot, matching the kernel, which resolves `..` against the root
+/// vfsmount and so turns `/..` into `/` for a `chroot`ed process.
+fn join_root(root: &str, abs: &str) -> String {
+    if root == "/" {
+        return String::from(abs);
+    }
+    let mut components: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in abs.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    let mut joined = String::from(root);
+    joined.push_str(&components.join("/"));
+    joined
+}
+
+/// The inverse of [`join_root`]: the guest-visible spelling of a path the backend holds, i.e. the
+/// chroot `root` prefix taken off.
+///
+/// A path that is not inside the root -- a directory reached by a relative `chdir` from a CWD the
+/// `chroot` left outside it, or through an `fchdir` to an fd opened before the `chroot` -- has no
+/// spelling in that view, which is [`Errno::ENOENT`].
+fn strip_root(root: &str, abs: &str) -> Result<String, Errno> {
+    if root == "/" {
+        return Ok(String::from(abs));
+    }
+    // `root` always ends in '/', but a path that has been through `normalized()` need not: the
+    // root directory itself comes back as `/tmp/jail`, with no trailing slash of its own.
+    let Some(rest) = abs.strip_prefix(root.trim_end_matches('/')) else {
+        return Err(Errno::ENOENT);
+    };
+    if rest.is_empty() {
+        return Ok(String::from("/"));
+    }
+    if !rest.starts_with('/') {
+        // `/tmp/jail3` is NOT inside `/tmp/jail`, however much their prefixes agree.
+        return Err(Errno::ENOENT);
+    }
+    Ok(String::from(rest))
 }
 
 /// Task state shared by `CLONE_FILES`.
@@ -89,6 +434,17 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     /// resolve a path given relative to that fd (`dirfd`-relative resolution). Only file fds
     /// (as opposed to sockets/pipes/etc, which cannot serve as a `dirfd`) are ever inserted here.
     fd_paths: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, CString>>,
+    /// This process's own live SysV `shmat` attachments: THIS process's local mapping address ->
+    /// `shmid`. `shmdt(shmaddr)` needs this to find which segment to detach, because (since the
+    /// 51st pass, see `syscalls::mm::SysvShmSegment`'s own doc comment) a `shmat` address is now
+    /// per-process, not a single value shared cross-process via `GlobalState`. Deliberately lives
+    /// here rather than on `GlobalState`: it is address-space-scoped state, and piggybacking on
+    /// `FilesState`'s own existing `CLONE_FILES`-vs-`fork_duplicate` split (see that type's own
+    /// doc comment) gives it the same sharing shape address-space-scoped state needs for free
+    /// -- shared with a real thread (`CLONE_FILES`, same process), copied (not aliased) into a
+    /// forked child, exactly matching that a fork's child starts with the SAME attachments at the
+    /// SAME (snapshot-carried) addresses, but diverges independently after that.
+    shm_attachments: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<usize, i32>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
@@ -116,7 +472,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     /// the *other* (see `fork_duplicate`'s doc comment for the full failure mode this avoids --
     /// this was the actual root cause of `dup2()` returning `EBADF` for shell output-redirection
     /// fds surviving a `fork()`).
-    pub(crate) fn fork_duplicate(&self, litebox: &litebox::LiteBox<Platform>) -> Self {
+    /// `sysv_shm` is the byte-shared cross-process segment table this copy's attachments have to
+    /// be registered against -- see the `shm_attachments` handling inside for why a fork cannot
+    /// simply clone the map and stop there.
+    pub(crate) fn fork_duplicate(
+        &self,
+        litebox: &litebox::LiteBox<Platform>,
+        sysv_shm: &litebox::sync::Mutex<Platform, super::mm::SysvShmTable>,
+    ) -> Self {
         // `Descriptors::duplicate` (used per-subsystem below) is also `dup()`/`dup2()`'s own
         // primitive, and by design does *not* propagate `FD_CLOEXEC` -- POSIX requires a
         // duplicated fd to never inherit the original's close-on-exec flag. `fork()`, however, has
@@ -141,11 +504,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC)
                 })
                 .unwrap_or(false);
+            let narrowed = dt.with_metadata(fd, |ReopenedAccess(a)| *a).ok();
             let new_fd = dt.duplicate(fd)?;
             if cloexec {
                 dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
             }
+            if let Some(a) = narrowed {
+                dt.set_fd_metadata(&new_fd, ReopenedAccess(a));
+            }
             Some(new_fd)
+        }
+
+        // SysV shm: this copy is what makes the child hold the SAME attachments the parent does,
+        // and the child's own exit decrements each one once (`take_all_shm_attachments` ->
+        // `mm::Task::detach_sysv_shm_on_process_exit`). Real Linux is symmetric about that pair:
+        // `dup_mmap()` calls `shm_open()` for every VMA it copies, i.e. a fork INCREMENTS
+        // `shm_nattch` once per inherited attachment, and `exit_shm()`'s `shm_close()` is the
+        // thing that takes it away. Cloning the records without the matching increment let a
+        // child that merely INHERITED an attachment drive its segment's count down on exit: a
+        // parent that did shmget+shmat+shmctl(IPC_RMID) and then forked -- chromium's
+        // zygote/renderer, every XShm client -- saw `attaches` hit zero while IT still mapped
+        // the segment, so the slot was freed and the backing store unlinked underneath it.
+        //
+        // Done FIRST, and released before the fd duplication below, for two reasons: (1)
+        // `sysv_shm` is one of the shim-wide locks
+        // `GlobalStateHandle::with_shimwide_locks_held` acquires around the native `fork()` call
+        // itself, so it must never still be held when that runs -- and a native `fork()` child
+        // resumes on this very stack, where a held guard would be duplicated mid-hold; (2) it
+        // keeps this lock's critical section from overlapping the descriptor-table lock
+        // `dup_preserving_cloexec` takes below. Nothing under it does host file IO either, the
+        // same rule `sys_shmget`/`sys_shmdt` obey.
+        //
+        // One increment per RECORD, and the child's map is this same snapshot, so the child's
+        // later decrement lands on exactly the entries charged here.
+        let shm_attachments = self.shm_attachments.read().clone();
+        if !shm_attachments.is_empty() {
+            let mut table = sysv_shm.lock();
+            table.record_inherited_attachments(shm_attachments.values().copied());
         }
 
         let raw_descriptor_store = self.raw_descriptor_store.read().fork_duplicate(
@@ -168,6 +563,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(raw_descriptor_store),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
             fd_paths: litebox::sync::RwLock::new(self.fd_paths.read().clone()),
+            shm_attachments: litebox::sync::RwLock::new(shm_attachments),
         }
     }
 }
@@ -181,6 +577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             ),
             max_fd: AtomicUsize::new(usize::MAX),
             fd_paths: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            shm_attachments: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         }
     }
 
@@ -194,7 +591,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.fd_paths.write().insert(raw_fd, path);
     }
 
-    /// Look up the absolute path a raw file fd was opened with, if any.
     pub(crate) fn lookup_fd_path(&self, raw_fd: usize) -> Option<CString> {
         self.fd_paths.read().get(&raw_fd).cloned()
     }
@@ -203,8 +599,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.fd_paths.write().remove(&raw_fd);
     }
 
-    // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
-    // Err(typed_fd)
+    /// Records that this process's own `shmat` mapped `shmid` at `addr` (a LOCAL address, valid
+    /// only in this process -- see [`Self::shm_attachments`]'s own doc comment).
+    pub(crate) fn record_shm_attachment(&self, addr: usize, shmid: i32) {
+        self.shm_attachments.write().insert(addr, shmid);
+    }
+
+    /// `shmdt(shmaddr)`'s lookup: consumes and returns the `shmid` this process's `shmat`
+    /// attached at `addr`, or `None` if this process never attached anything there.
+    pub(crate) fn take_shm_attachment(&self, addr: usize) -> Option<i32> {
+        self.shm_attachments.write().remove(&addr)
+    }
+
+    /// Process-exit teardown: consumes EVERY `shmid` this process still had attached, one entry
+    /// per live attachment record (a process that `shmat`'d the same segment twice yields it
+    /// twice, matching real Linux's one-`shm_nattch`-per-VMA accounting). Real Linux does the
+    /// same in `exit_shm()` when a process's last thread drops its address space; see
+    /// `mm::Task::detach_sysv_shm_on_process_exit` for what leaving this out costs.
+    pub(crate) fn take_all_shm_attachments(&self) -> alloc::vec::Vec<i32> {
+        let mut attachments = self.shm_attachments.write();
+        let shmids: alloc::vec::Vec<i32> = attachments.values().copied().collect();
+        attachments.clear();
+        shmids
+    }
+
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
         &self,
         typed_fd: TypedFd<Subsystem>,
@@ -223,18 +641,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 }
 
 /// Registry of `flock(2)` advisory-lock state, keyed by the underlying file's `(dev, ino)`. See
-/// `GlobalState::flock_registry`'s doc comment for why this is shim-wide rather than per-process.
+/// `GlobalStateHandle::flock_registry`'s doc comment for why it lives per host process rather than
+/// on the byte-shared `GlobalState`: both halves of it -- the `BTreeMap`'s nodes and the
+/// `Arc<FlockFile>`'s `Pollee` observers -- come from the ordinary private heap of whichever process
+/// allocated them, so a byte-shared copy of the root pointer is garbage in every other process of
+/// the fork family (twelfth instance of that defect class; the live panic was
+/// `btree/node.rs` "range end index out of range for slice of length ...").
+///
+/// It is therefore only the FALLBACK: genuine cross-process contention is
+/// [`SharedFlockTable`]'s job, and this registry serves a file only when that table cannot
+/// represent it (see [`SharedFlockTable::lock`]'s `None` return) -- in which case `flock(2)`
+/// degrades to excluding within this host process, exactly as it did before `SharedFlockTable`
+/// existed, rather than failing the guest.
 pub(crate) type FlockRegistry<Platform> =
     alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FlockFile<Platform>>>;
 
-/// `flock(2)` operation: request a shared lock.
-const LOCK_SH: i32 = 1;
-/// `flock(2)` operation: request an exclusive lock.
-const LOCK_EX: i32 = 2;
-/// `flock(2)` operation: release an existing lock.
-const LOCK_UN: i32 = 8;
-/// `flock(2)` operation flag: don't block if the lock can't be acquired immediately.
-const LOCK_NB: i32 = 4;
+bitflags::bitflags! {
+    /// `flock(2)` `operation` argument bits. `SH`/`EX`/`UN` are mutually exclusive operations while
+    /// `NB` is a modifier flag that can be OR'd onto any of them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FlockOp: i32 {
+        /// Request a shared lock.
+        const SH = 1;
+        /// Request an exclusive lock.
+        const EX = 2;
+        /// Don't block if the lock can't be acquired immediately.
+        const NB = 4;
+        /// Release an existing lock.
+        const UN = 8;
+    }
+}
 
 /// Identifies a single open file description to a [`FlockFile`], so that `flock()` calls made
 /// through fds that are `dup()`-derived from the same `open()` (which share one `FlockHolder`, as
@@ -252,22 +688,84 @@ const LOCK_NB: i32 = 4;
 /// calls -- is actually dropped), matching the kernel's "closing any fd referring to the open file
 /// description drops its flock" behavior, without needing a separate explicit close-time hook into
 /// every filesystem backend's `close()` implementation.
+/// That release has to reach whichever table the lock was taken in: [`SharedFlockTable`] normally,
+/// this process's own [`FlockFile`] when that table could not serve this file. So the holder stores
+/// the shared region's ADDRESS instead of reaching it through `GlobalState` -- `Drop` runs without
+/// one, and `(dev, ino)` plus this process's host pid identify the holding inside that region.
 type FlockHolder<Platform> = alloc::sync::Arc<FlockHolderInner<Platform>>;
 
-struct FlockHolderInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+struct FlockHolderInner<Platform: ShimPlatform> {
     id: u64,
-    file: alloc::sync::Arc<FlockFile<Platform>>,
+    /// This process's host pid, pairing with `id` to identify this open file description in
+    /// [`SharedFlockTable`] (ids are handed out by a shim-wide counter shared by the whole fork
+    /// family, so two processes never collide even though each numbers its own holders from 1).
+    host: u32,
+    dev: usize,
+    /// The path this descriptor was opened with -- the part of the lock's key that survives a
+    /// cross-process `fork()`, unlike `ino` (see [`SharedFlockSlot`]'s doc comment). Empty when this
+    /// process has no name for the descriptor, which means the shared table cannot key it.
+    path: [u8; SHARED_FLOCK_PATH_MAX],
+    path_len: usize,
+    /// Address of the [`SharedFlockRegion`] this holder takes its cross-process lock in, recorded
+    /// at creation because `Drop` has neither a `&Platform` nor a `&GlobalState` to find it with.
+    /// Zero when the file was never locked through the shared table (`flock(2)` was never called,
+    /// or only `LOCK_UN` was), which `release` treats as "nothing to release there".
+    region: usize,
+    /// Non-`None` only on the fallback path, and holds the SAME `Arc<FlockFile>` this file's entry
+    /// in `GlobalStateHandle::flock_registry` holds -- kept here because `Drop` has no way to reach
+    /// that registry, exactly as it had no way to reach `GlobalState` before.
+    local: litebox::sync::Mutex<Platform, Option<alloc::sync::Arc<FlockFile<Platform>>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockHolderInner<Platform> {
-    fn new(id: u64, file: alloc::sync::Arc<FlockFile<Platform>>) -> FlockHolder<Platform> {
-        alloc::sync::Arc::new(Self { id, file })
+impl<Platform: ShimPlatform> FlockHolderInner<Platform> {
+    fn new(id: u64, host: u32, dev: usize, path: &[u8], region: usize) -> FlockHolder<Platform> {
+        let mut stored = [0u8; SHARED_FLOCK_PATH_MAX];
+        let len = path.len().min(SHARED_FLOCK_PATH_MAX);
+        stored[..len].copy_from_slice(&path[..len]);
+        alloc::sync::Arc::new(Self {
+            id,
+            host,
+            dev,
+            path: stored,
+            path_len: len,
+            region,
+            local: litebox::sync::Mutex::new(None),
+        })
+    }
+
+    /// This holder's key in [`SharedFlockTable`], possibly empty (see `path`'s own doc comment).
+    fn key(&self) -> &[u8] {
+        &self.path[..self.path_len]
+    }
+
+    /// The shared region this holder's cross-process lock lives in, if it has one.
+    ///
+    /// SAFETY-free alternative to a process-global "current table" static: the address was recorded
+    /// by the process that created this holder, and the shared kernel arena is mapped at the same
+    /// address in every process of a fork family, so it stays valid if a fork carries the holder
+    /// into a child.
+    fn shared_region(&self) -> Option<&'static SharedFlockRegion<Platform>> {
+        // SAFETY: `self.region` is either 0 (checked) or the address `SharedFlockTable::new` got
+        // from `shared_kernel_arena_alloc_bytes` (or, on the arena-exhausted path, a leaked
+        // `alloc_zeroed`). That region is never freed and is only ever mutated under `guard`, so
+        // re-forming a shared reference to it from its address is sound.
+        (self.region != 0).then(|| unsafe { &*(self.region as *const SharedFlockRegion<Platform>) })
+    }
+
+    /// Releases whatever lock this open file description holds, in whichever table it took it.
+    fn release(&self) {
+        if let Some(region) = self.shared_region() {
+            region.release(self.dev, self.key(), self.host, self.id);
+        }
+        if let Some(file) = self.local.lock().take() {
+            file.unlock(self.id);
+        }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for FlockHolderInner<Platform> {
+impl<Platform: ShimPlatform> Drop for FlockHolderInner<Platform> {
     fn drop(&mut self) {
-        self.file.unlock(self.id);
+        self.release();
     }
 }
 
@@ -283,7 +781,7 @@ enum FlockLockState {
 /// Advisory-lock state for a single underlying file (identified by `(dev, ino)`), shared by every
 /// open file description of that file -- including ones from entirely independent `open()` calls,
 /// which is where real contention (as opposed to `dup()`-sharing, handled by [`FlockHolder`])
-/// happens. One instance lives in `GlobalState::flock_registry` per distinct locked file.
+/// happens. One instance lives in `GlobalStateHandle::flock_registry` per distinct locked file.
 pub(crate) struct FlockFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     state: litebox::sync::Mutex<Platform, FlockLockState>,
     /// Woken whenever the lock is released or downgraded, so blocked waiters can retry.
@@ -394,16 +892,658 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> FlockFile<Platform> {
     }
 }
 
-/// Path in the file system
+/// Cross-process `flock(2)` lock table: the genuinely shared half of `flock(2)`'s state.
+///
+/// `flock(2)` has to EXCLUDE across a fork family: a fork child runs in ITS OWN HOST PROCESS
+/// (`LITEBOX_PROCESS_FORK`), so a lock the parent took is only visible to the child through memory
+/// every process of the family maps at the same address -- the shared kernel arena. `GlobalState`'s
+/// bytes are shared, but anything holding a POINTER is not: the per-process `FlockRegistry`'s
+/// `BTreeMap` nodes and every `FlockFile`'s `Pollee` observers are heap addresses that mean nothing
+/// in a fork child. That is why `f5d73ff` moved the registry off `GlobalState` -- and why a child
+/// that nonetheless touched it panicked in `btree/node.rs` with a garbage slice length.
+///
+/// So this table is POINTER-FREE: fixed slots of plain atomics, the `SharedUnixConnTable` shape.
+/// Two consequences worth stating:
+///
+/// * The whole table is guarded by ONE cross-process mutex, and every slot lookup, claim and state
+///   transition happens inside that single critical section, so there is no window in which two
+///   processes can disagree about which slot owns which file. The sections are a handful of atomic
+///   stores, so the coarse lock costs microseconds and buys an argument that is easy to check.
+/// * A waiter cannot be woken through `Pollee`/`Waker` (those are process-local), so the table
+///   carries a `RawMutex` used purely as a FUTEX WORD: a release bumps the word and `wake_all`s; a
+///   waiter samples the word and then `block_or_timeout`s on the sample, which returns immediately
+///   for a bump that already happened and cannot miss one that happens afterwards. The 25ms chunk
+///   is the bound on how long a waiter can sit on a wakeup the platform lost, and it doubles as the
+///   interrupt poll.
+const SHARED_FLOCK_CAPACITY: usize = 128;
+/// Longest path the table can key a lock on. A longer path degrades to the per-process `FlockFile`
+/// (still correct within the host process) rather than being silently truncated into a key that
+/// could collide with a different file's.
+const SHARED_FLOCK_PATH_MAX: usize = 128;
+/// Concurrent `LOCK_SH` holders one file can track. A guest SESSION -- the full XFCE stack runs
+/// ~38 processes -- shares far more often than it excludes, and 32 keeps a slot a fixed, arena-sized
+/// thing. A 33rd `LOCK_SH` holder degrades to the per-process `FlockFile`: still correct, because
+/// `LOCK_SH` is compatible with `LOCK_SH` anyway.
+const SHARED_FLOCK_SHARED_HOLDERS: usize = 32;
+/// The bound on a lost wakeup, and the granularity at which a blocked `flock(2)` notices a signal.
+const SHARED_FLOCK_WAIT_CHUNK: core::time::Duration = core::time::Duration::from_millis(25);
+/// A waiter reaps holdings of processes that died without unlocking every Nth chunk (~1s).
+const SHARED_FLOCK_RECLAIM_EVERY: u32 = 40;
+
+const FLOCK_SLOT_FREE: u32 = 0;
+const FLOCK_SLOT_RESERVED: u32 = 1;
+const FLOCK_SLOT_SHARED: u32 = 2;
+const FLOCK_SLOT_EXCLUSIVE: u32 = 3;
+
+/// One attempt to take a slot, in the only terms its caller can act on.
+enum SharedFlockOutcome {
+    /// The lock is ours.
+    Acquired,
+    /// Somebody else holds it incompatibly.
+    Conflict,
+    /// The table cannot represent this lock (it is full, or out of shared-holder rows): the caller
+    /// falls back to the per-process `FlockFile` rather than failing the guest.
+    Unavailable,
+}
+
+pub(crate) struct SharedFlockTable<Platform: ShimPlatform> {
+    region: &'static mut SharedFlockRegion<Platform>,
+    /// Count of locks this process has had to degrade to the per-process `FlockFile`. Logged
+    /// gap-filtered: a full table is a real (if soft) capacity signal, not a per-call event.
+    degraded: AtomicU32,
+}
+
+/// The arena-resident half: ONE critical section, ONE futex word, and the pointer-free slots.
+struct SharedFlockRegion<Platform: ShimPlatform> {
+    /// Whether this region's bytes are in memory EVERY process that could contend for these locks
+    /// can see -- the cross-process shared kernel arena in production. `false` means the arena was
+    /// exhausted at construction, so every lock degrades to the per-process `FlockFile`: granting an
+    /// "exclusive" lock out of process-private memory is a lie two processes could both act on. It
+    /// lives here rather than on the table because a `FlockHolder`'s `Drop` reaches only the region.
+    excludes: AtomicBool,
+    /// Serializes every slot lookup, claim and transition in the whole family. Held for a handful
+    /// of atomic stores; a holder killed mid-section is recovered by `RawMutex`'s `holder_pid`
+    /// dead-holder path (see that platform's own `RawMutex::block` doc comment).
+    guard: litebox::sync::Mutex<Platform, ()>,
+    /// Futex word, never actually locked: `underlying_atomic()` is bumped on every release and
+    /// `wake_all` unparks whoever is `block_or_timeout`ing on it.
+    wake: Platform::RawMutex,
+    slots: [SharedFlockSlot; SHARED_FLOCK_CAPACITY],
+}
+
+/// One locked file, identified by `(dev, path)` -- NOT by `(dev, ino)`.
+///
+/// Why the path and not the inode number: `ino` is NOT a cross-process-stable identity in litebox.
+/// `litebox::fs::InodeAllocator` numbers entries from a per-backend-instance counter starting at 1,
+/// and a cross-process `fork()` child rebuilds its filesystem from scratch -- a fresh
+/// `in_mem::FileSystem`, the parent's writable layer imported back out of a tar
+/// (`litebox_runner_linux_on_windows_userland::import_writable_layer`) -- so a file the parent
+/// created at runtime is renumbered on the way in. Measured with `.wfgy/flockx2.sh` on
+/// `/tmp/flockx/f`: `dev` is the same on both sides (1283027571) but `ino` is 527 in the parent and
+/// 1 in the fork child. A shared table keyed on `(dev, ino)` therefore cannot exclude across a fork
+/// family even when its memory genuinely is shared -- and could not have done so before `f5d73ff`
+/// either. The path a descriptor was opened with (`FilesState::lookup_fd_path`, the same record
+/// `readlink("/proc/self/fd/N")` reports) is the one file identity that survives that rebuild.
+///
+/// Known deviations this buys, both narrower than "no cross-process exclusion at all": two
+/// hard links to one inode do not contend with each other, and a file deleted and recreated at the
+/// same path does.
+struct SharedFlockSlot {
+    dev: AtomicUsize,
+    path: [AtomicU8; SHARED_FLOCK_PATH_MAX],
+    /// `0` marks a slot no one has claimed, which no real path can be.
+    path_len: AtomicU32,
+    kind: AtomicU32,
+    reserver_pid: AtomicU32,
+    exclusive_id: AtomicU64,
+    exclusive_pid: AtomicU32,
+    shared_ids: [AtomicU64; SHARED_FLOCK_SHARED_HOLDERS],
+    shared_pids: [AtomicU32; SHARED_FLOCK_SHARED_HOLDERS],
+}
+
+impl SharedFlockSlot {
+    fn new() -> Self {
+        Self {
+            dev: AtomicUsize::new(0),
+            path: core::array::from_fn(|_| AtomicU8::new(0)),
+            path_len: AtomicU32::new(0),
+            kind: AtomicU32::new(FLOCK_SLOT_FREE),
+            reserver_pid: AtomicU32::new(0),
+            exclusive_id: AtomicU64::new(0),
+            exclusive_pid: AtomicU32::new(0),
+            shared_ids: core::array::from_fn(|_| AtomicU64::new(0)),
+            shared_pids: core::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    /// Whether this slot is the one holding `(dev, path)`.
+    fn key_matches(&self, dev: usize, path: &[u8]) -> bool {
+        self.dev.load(Ordering::Acquire) == dev
+            && self.path_len.load(Ordering::Acquire) as usize == path.len()
+            && self
+                .path
+                .iter()
+                .zip(path.iter())
+                .all(|(stored, b)| stored.load(Ordering::Relaxed) == *b)
+    }
+
+    /// Writes this slot's key. Callers hold `guard` and pass a path of at least one byte.
+    fn set_key(&self, dev: usize, path: &[u8]) {
+        self.dev.store(dev, Ordering::Release);
+        for (i, b) in path.iter().enumerate() {
+            self.path[i].store(*b, Ordering::Release);
+        }
+        self.path_len.store(path.len() as u32, Ordering::Release);
+    }
+
+    fn shared_holder_count(&self) -> usize {
+        self.shared_ids
+            .iter()
+            .filter(|id| id.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
+    fn holds_shared(&self, host: u32, id: u64) -> bool {
+        self.shared_pids
+            .iter()
+            .zip(self.shared_ids.iter())
+            .any(|(pid, sid)| {
+                pid.load(Ordering::Acquire) == host && sid.load(Ordering::Acquire) == id
+            })
+    }
+
+    fn first_free_shared(&self) -> Option<usize> {
+        self.shared_ids
+            .iter()
+            .position(|id| id.load(Ordering::Acquire) == 0)
+    }
+
+    /// Clears one shared-holder row. Returns whether it was ours.
+    fn clear_shared(&self, host: u32, id: u64) -> bool {
+        for (pid, sid) in self.shared_pids.iter().zip(self.shared_ids.iter()) {
+            if pid.load(Ordering::Acquire) == host && sid.load(Ordering::Acquire) == id {
+                sid.store(0, Ordering::Release);
+                pid.store(0, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<Platform: ShimPlatform> SharedFlockRegion<Platform> {
+    fn holds_key(&self, i: usize, dev: usize, path: &[u8]) -> bool {
+        self.slots[i].key_matches(dev, path)
+    }
+
+    /// Bump the futex word and unpark every waiter. Callers hold `guard`.
+    fn bump(&self) {
+        self.wake
+            .underlying_atomic()
+            .fetch_add(1, Ordering::Release);
+        self.wake.wake_all();
+    }
+
+    /// Releases `host`/`id`'s hold on slot `i`. Returns whether it held anything.
+    /// Callers hold `guard`.
+    fn release_slot(&self, i: usize, host: u32, id: u64) -> bool {
+        let slot = &self.slots[i];
+        let released = match slot.kind.load(Ordering::Acquire) {
+            FLOCK_SLOT_RESERVED => {
+                if slot.reserver_pid.load(Ordering::Acquire) == host
+                    && slot.exclusive_id.load(Ordering::Acquire) == id
+                {
+                    slot.exclusive_id.store(0, Ordering::Release);
+                    slot.exclusive_pid.store(0, Ordering::Release);
+                    slot.reserver_pid.store(0, Ordering::Release);
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            }
+            FLOCK_SLOT_EXCLUSIVE => {
+                if slot.exclusive_pid.load(Ordering::Acquire) == host
+                    && slot.exclusive_id.load(Ordering::Acquire) == id
+                {
+                    slot.exclusive_id.store(0, Ordering::Release);
+                    slot.exclusive_pid.store(0, Ordering::Release);
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            }
+            FLOCK_SLOT_SHARED => {
+                let cleared = slot.clear_shared(host, id);
+                if cleared && slot.shared_holder_count() == 0 {
+                    slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                }
+                cleared
+            }
+            _ => false,
+        };
+        if released {
+            self.bump();
+        }
+        released
+    }
+
+    /// Releases `host`/`id`'s hold on `(dev, path)`, if this region holds one.
+    fn release(&self, dev: usize, path: &[u8], host: u32, id: u64) -> bool {
+        if !self.excludes.load(Ordering::Acquire) || path.is_empty() {
+            return false;
+        }
+        let _guard = self.guard.lock();
+        for i in 0..SHARED_FLOCK_CAPACITY {
+            if self.holds_key(i, dev, path) && self.release_slot(i, host, id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Frees every holding whose host process is gone. Callers hold `guard`.
+    ///
+    /// A fork child that is killed never runs `Drop`, and a child's exit path does not reach back
+    /// into this table, so without this a dead process's lock would pin its file for the rest of
+    /// the session. `is_process_alive` is the same check the platform's own dead-`RawMutex`-holder
+    /// recovery makes. Pid 0 means "no holder recorded" and is skipped.
+    fn reclaim_dead(&self, platform: &Platform) -> bool {
+        let mut reclaimed = false;
+        for slot in self.slots.iter() {
+            match slot.kind.load(Ordering::Acquire) {
+                FLOCK_SLOT_RESERVED | FLOCK_SLOT_EXCLUSIVE => {
+                    let pid = slot.exclusive_pid.load(Ordering::Acquire);
+                    if pid != 0 && !platform.is_process_alive(pid) {
+                        slot.exclusive_id.store(0, Ordering::Release);
+                        slot.exclusive_pid.store(0, Ordering::Release);
+                        slot.reserver_pid.store(0, Ordering::Release);
+                        slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                        reclaimed = true;
+                    }
+                }
+                FLOCK_SLOT_SHARED => {
+                    let mut dropped = false;
+                    for (pid, sid) in slot.shared_pids.iter().zip(slot.shared_ids.iter()) {
+                        let p = pid.load(Ordering::Acquire);
+                        if p != 0 && !platform.is_process_alive(p) {
+                            sid.store(0, Ordering::Release);
+                            pid.store(0, Ordering::Release);
+                            dropped = true;
+                        }
+                    }
+                    if dropped {
+                        reclaimed = true;
+                        if slot.shared_holder_count() == 0 {
+                            slot.kind.store(FLOCK_SLOT_FREE, Ordering::Release);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if reclaimed {
+            self.bump();
+        }
+        reclaimed
+    }
+}
+
+impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
+    /// Allocates the region in the cross-process SHARED kernel arena and initializes it.
+    ///
+    /// Runs exactly once per fork family, from `LinuxShimBuilder::build`'s create branch: every
+    /// other process in the family attaches to the already-built `GlobalState` and never calls this
+    /// (the same create-vs-attach split `SharedUnixConnTable::new` relies on).
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let (ptr, excludes) = match arena {
+            Some(ptr) => (ptr.cast::<SharedFlockRegion<Platform>>(), true),
+            None => {
+                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+                // process IS the whole guest session). Leak a process-private allocation so every
+                // later access stays memory-safe, and let `excludes` disable the table.
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
+                     this host process only"
+                );
+                (
+                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                        .expect("shared flock table: fallback allocation failed")
+                        .cast::<SharedFlockRegion<Platform>>(),
+                    false,
+                )
+            }
+        };
+        Self::new_in(ptr, excludes)
+    }
+
+    /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
+    ///
+    /// `excludes` is the caller's answer to "can every process that could contend for these locks
+    /// see this memory?" -- see `SharedFlockRegion::excludes`. A unit test passes process-private
+    /// memory and `true`, which is the honest answer for it: every contender it can create lives in
+    /// its own process.
+    fn new_in(ptr: core::ptr::NonNull<SharedFlockRegion<Platform>>, excludes: bool) -> Self {
+        // SAFETY (all three writes): `ptr` names one contiguous, uninitialized `SharedFlockRegion`
+        // sized by [`Self::new`]'s `layout`, and writing a freshly built value into uninitialized
+        // memory is what `write` is for. Initializing through the pointer ONE FIELD AT A TIME is
+        // also the whole point: a `SharedFlockRegion` value is tens of KiB of stack at once, and
+        // `GlobalState` is built by value on a stack that is already near its documented limit.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).excludes).write(AtomicBool::new(excludes));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).guard).write(litebox::sync::Mutex::new(()));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).wake)
+                .write(<Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT);
+            for i in 0..SHARED_FLOCK_CAPACITY {
+                core::ptr::addr_of_mut!((*ptr.as_ptr()).slots[i]).write(SharedFlockSlot::new());
+            }
+        }
+        Self {
+            // SAFETY: `ptr` is non-null and suitably aligned, and the region at it was just
+            // initialized field-by-field above. `'static` is sound because this allocation is
+            // arena-backed (or a deliberately leaked one) and never reclaimed, and nothing else
+            // holds a reference to it.
+            region: unsafe { &mut *ptr.as_ptr() },
+            degraded: AtomicU32::new(0),
+        }
+    }
+
+    /// Test-only: the same table over the process heap instead of the shared arena.
+    ///
+    /// A unit test cannot produce a second host process, so process-private memory exercises exactly
+    /// the same exclusion and wakeup logic -- and it keeps the test from spending any of the one
+    /// 128 MiB arena a test process shares between every `GlobalState` it builds, which the six
+    /// `flock_tests` in this crate already use to the brim. What this cannot cover is the arena's
+    /// cross-process visibility itself: that is what `.wfgy/flockx1.sh` is for.
+    #[cfg(test)]
+    pub(crate) fn new_local() -> Self {
+        let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
+        let ptr = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+            .expect("shared flock table: test allocation failed")
+            .cast::<SharedFlockRegion<Platform>>();
+        Self::new_in(ptr, true)
+    }
+
+    /// The region's address, for a [`FlockHolder`] to record so that its `Drop` can release the
+    /// lock without a `&Platform` or a `&GlobalState`.
+    fn region_addr(&self) -> usize {
+        self.region as *const SharedFlockRegion<Platform> as usize
+    }
+
+    /// Lowest-index slot currently carrying `dev`/`path` in a non-free state. Callers hold `guard`.
+    fn find_held(&self, dev: usize, path: &[u8]) -> Option<usize> {
+        (0..SHARED_FLOCK_CAPACITY).find(|i| {
+            self.region.holds_key(*i, dev, path)
+                && self.region.slots[*i].kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE
+        })
+    }
+
+    /// Claims the lowest free slot for `dev`/`path` and reserves it. Callers hold `guard`.
+    fn claim_free(&self, dev: usize, path: &[u8], host: u32, id: u64) -> Option<usize> {
+        for i in 0..SHARED_FLOCK_CAPACITY {
+            let slot = &self.region.slots[i];
+            if slot.kind.load(Ordering::Acquire) != FLOCK_SLOT_FREE {
+                continue;
+            }
+            slot.set_key(dev, path);
+            slot.reserver_pid.store(host, Ordering::Release);
+            slot.exclusive_id.store(id, Ordering::Release);
+            slot.exclusive_pid.store(host, Ordering::Release);
+            slot.kind.store(FLOCK_SLOT_RESERVED, Ordering::Release);
+            return Some(i);
+        }
+        None
+    }
+
+    /// One critical section that finds the slot for `dev`/`ino` (claiming a free one if this file is
+    /// new here) AND applies the state transition. Doing both under one lock is what makes the
+    /// "which slot owns this file" question unarguable.
+    fn try_lock(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        id: u64,
+        exclusive: bool,
+    ) -> SharedFlockOutcome {
+        let _guard = self.region.guard.lock();
+        let idx = match self.find_held(dev, path) {
+            Some(i) => i,
+            None => match self.claim_free(dev, path, host, id) {
+                Some(i) => i,
+                // Table full: try once to take back holdings of processes that died without
+                // unlocking, since those would otherwise pin their files for the whole session.
+                None if self.region.reclaim_dead(platform) => {
+                    match self.claim_free(dev, path, host, id) {
+                        Some(i) => i,
+                        None => {
+                            self.log_degraded();
+                            return SharedFlockOutcome::Unavailable;
+                        }
+                    }
+                }
+                None => {
+                    self.log_degraded();
+                    return SharedFlockOutcome::Unavailable;
+                }
+            },
+        };
+        let slot = &self.region.slots[idx];
+        match slot.kind.load(Ordering::Acquire) {
+            FLOCK_SLOT_RESERVED => {
+                // The slot this call just reserved. (`flock(2)` never yields mid-syscall, so a
+                // reservation is only ever observed by the process that made it.)
+                if slot.reserver_pid.load(Ordering::Acquire) != host
+                    || slot.exclusive_id.load(Ordering::Acquire) != id
+                {
+                    return SharedFlockOutcome::Conflict;
+                }
+                slot.kind.store(
+                    if exclusive {
+                        FLOCK_SLOT_EXCLUSIVE
+                    } else {
+                        FLOCK_SLOT_SHARED
+                    },
+                    Ordering::Release,
+                );
+                if !exclusive {
+                    self.move_to_shared(slot, host, id);
+                }
+                self.region.bump();
+                SharedFlockOutcome::Acquired
+            }
+            FLOCK_SLOT_EXCLUSIVE => {
+                if slot.exclusive_pid.load(Ordering::Acquire) != host
+                    || slot.exclusive_id.load(Ordering::Acquire) != id
+                {
+                    return SharedFlockOutcome::Conflict;
+                }
+                // Re-locking our own exclusive hold: `LOCK_SH` downgrades it and `LOCK_EX` keeps
+                // it, exactly as Linux's own `flock(2)` conversion rules say.
+                if !exclusive {
+                    slot.kind.store(FLOCK_SLOT_SHARED, Ordering::Release);
+                    self.move_to_shared(slot, host, id);
+                }
+                self.region.bump();
+                SharedFlockOutcome::Acquired
+            }
+            FLOCK_SLOT_SHARED => {
+                if slot.holds_shared(host, id) {
+                    if exclusive {
+                        // Upgrade, legal only when we are the sole holder -- same as Linux.
+                        if slot.shared_holder_count() != 1 {
+                            return SharedFlockOutcome::Conflict;
+                        }
+                        slot.clear_shared(host, id);
+                        slot.exclusive_id.store(id, Ordering::Release);
+                        slot.exclusive_pid.store(host, Ordering::Release);
+                        slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
+                    }
+                    // Already ours: Linux's `flock(2)` on an fd that already holds it is a no-op,
+                    // not a second hold.
+                    self.region.bump();
+                    return SharedFlockOutcome::Acquired;
+                }
+                if exclusive {
+                    return SharedFlockOutcome::Conflict;
+                }
+                match slot.first_free_shared() {
+                    Some(j) => {
+                        slot.shared_ids[j].store(id, Ordering::Release);
+                        slot.shared_pids[j].store(host, Ordering::Release);
+                        self.region.bump();
+                        SharedFlockOutcome::Acquired
+                    }
+                    // Out of shared-holder rows. `LOCK_SH` is compatible with `LOCK_SH` anyway, so
+                    // the caller's per-process fallback cannot produce a wrong answer here.
+                    None => {
+                        self.log_degraded();
+                        SharedFlockOutcome::Unavailable
+                    }
+                }
+            }
+            _ => SharedFlockOutcome::Conflict,
+        }
+    }
+
+    /// Moves a slot's single exclusive holder into a shared-holder row. Callers hold `guard`.
+    ///
+    /// Leaves the hold EXCLUSIVE if there is no row to put it in: stronger than the `LOCK_SH` that
+    /// was asked for, but never a lost lock.
+    fn move_to_shared(&self, slot: &SharedFlockSlot, host: u32, id: u64) {
+        match slot.first_free_shared() {
+            Some(j) => {
+                slot.exclusive_id.store(0, Ordering::Release);
+                slot.exclusive_pid.store(0, Ordering::Release);
+                slot.shared_ids[j].store(id, Ordering::Release);
+                slot.shared_pids[j].store(host, Ordering::Release);
+            }
+            None => {
+                slot.exclusive_id.store(id, Ordering::Release);
+                slot.exclusive_pid.store(host, Ordering::Release);
+                slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
+                self.log_degraded();
+            }
+        }
+    }
+
+    /// Takes `flock(2)`'s cross-process lock on `(dev, path)` for holder `host`/`id`.
+    ///
+    /// Returns `None` when the table cannot represent this lock, meaning the caller must fall back
+    /// to the per-process `FlockFile`; never a panic. `interrupted` is the task's own
+    /// `check_for_interrupt`, so a blocked `flock(2)` stays responsive to signals.
+    pub(crate) fn lock(
+        &self,
+        platform: &Platform,
+        dev: usize,
+        path: &[u8],
+        host: u32,
+        id: u64,
+        exclusive: bool,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Option<Result<(), Errno>> {
+        if path.is_empty() || path.len() > SHARED_FLOCK_PATH_MAX {
+            // No path to key on (a descriptor opened from `/proc/self/fd/N`, or one whose name this
+            // process never recorded), or one too long to store: the per-process `FlockFile` is the
+            // honest answer, not a truncated key.
+            self.log_degraded();
+            return None;
+        }
+        if !self.region.excludes.load(Ordering::Acquire) {
+            self.log_degraded();
+            return None;
+        }
+        let mut chunks = 0u32;
+        loop {
+            match self.try_lock(platform, dev, path, host, id, exclusive) {
+                SharedFlockOutcome::Acquired => return Some(Ok(())),
+                SharedFlockOutcome::Unavailable => return None,
+                SharedFlockOutcome::Conflict => {
+                    if nonblock {
+                        return Some(Err(Errno::EWOULDBLOCK));
+                    }
+                    if interrupted() {
+                        return Some(Err(Errno::EINTR));
+                    }
+                    // Sample BEFORE blocking: a bump that already happened shows up as an immediate
+                    // return, and one that happens after the sample sets this waiter's event, so a
+                    // release cannot be missed in either order. The chunk bounds how long a waiter
+                    // can sit on a wakeup the platform lost, and is the poll for `interrupted`.
+                    let sampled = self.region.wake.underlying_atomic().load(Ordering::Acquire);
+                    let _ = self
+                        .region
+                        .wake
+                        .block_or_timeout(sampled, SHARED_FLOCK_WAIT_CHUNK);
+                    chunks = chunks.wrapping_add(1);
+                    if chunks % SHARED_FLOCK_RECLAIM_EVERY == 0 {
+                        let _guard = self.region.guard.lock();
+                        self.region.reclaim_dead(platform);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Releases `host`/`id`'s hold on `(dev, path)`, if this table holds one.
+    ///
+    /// `FlockHolderInner::drop` reaches the same thing through the region address it recorded, so
+    /// this is the spelled-out form, for the tests, which drive the table without a holder.
+    #[cfg(test)]
+    pub(crate) fn unlock(&self, dev: usize, path: &[u8], host: u32, id: u64) -> bool {
+        self.region.release(dev, path, host, id)
+    }
+
+    /// Whether the table can exclude at all (i.e. whether its region is in memory every contending
+    /// process can see).
+    #[cfg(test)]
+    pub(crate) fn excludes(&self) -> bool {
+        self.region.excludes.load(Ordering::Acquire)
+    }
+
+    fn log_degraded(&self) {
+        let n = self.degraded.fetch_add(1, Ordering::Relaxed);
+        // Gap-filtered: a full table is a capacity signal worth seeing, not a per-call event.
+        if n & 0x3f == 0 {
+            litebox_util_log::warn!(
+                capacity:% = SHARED_FLOCK_CAPACITY,
+                degraded:% = n + 1;
+                "flock(2): shared lock table cannot hold this file; excluding within this host \
+                 process only"
+            );
+        }
+    }
+}
+
+/// One POSIX record lock: `pid`'s claim on bytes `start..end` of the file `key`.
+#[derive(Clone)]
+pub(crate) struct RecordLock {
+    key: (usize, usize),
+    pid: i32,
+    write: bool,
+    start: u64,
+    /// Exclusive; `u64::MAX` means "to end of file".
+    end: u64,
+}
+
+impl RecordLock {
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start < end && start < self.end
+    }
+}
+
 #[derive(Debug)]
 enum FsPath {
-    /// Absolute path
     Absolute { path: CString },
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
     FdRelative { fd: u32, path: CString },
-    /// Fd
     Fd(u32),
 }
 
@@ -414,17 +1554,28 @@ impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
     /// CWD-relative paths are resolved immediately to absolute paths.
+    ///
+    /// `root` is the calling task's chroot (see [`join_root`]); it is applied to every path that
+    /// is NOT resolved through a `dirfd`, because a `dirfd`-relative lookup starts from a directory
+    /// an earlier `open` already reached, and on real Linux such an fd keeps reaching outside a
+    /// later `chroot` (the fd predates the root change, and `*at` resolution is relative to the
+    /// fd's own dentry, not to the process root).
     fn new(
         dirfd: i32,
         path: impl path::Arg,
         get_cwd: impl FnOnce() -> String,
+        root: &str,
     ) -> Result<Self, Errno> {
         let path_str = path.as_rust_str()?;
         if path_str.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         let fs_path = if path_str.starts_with('/') {
-            let cpath = path.to_c_str()?.into_owned();
+            let cpath = if root == "/" {
+                path.to_c_str()?.into_owned()
+            } else {
+                CString::new(join_root(root, path_str)).map_err(|_| Errno::EINVAL)?
+            };
             FsPath::Absolute { path: cpath }
         } else if dirfd >= 0 {
             let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
@@ -441,9 +1592,12 @@ impl FsPath {
             if path_str.is_empty() {
                 FsPath::Cwd
             } else {
-                // Resolve CWD-relative path to absolute.
+                // Resolve CWD-relative path to absolute. The CWD is itself an absolute path in
+                // root-space (after `chroot` + `chdir("/")` it is "/"), so the result needs the
+                // same root prefix any other guest-visible absolute path gets.
                 let mut abs = get_cwd();
                 abs.push_str(path_str);
+                let abs = join_root(root, &abs);
                 let cpath = CString::new(abs).map_err(|_| Errno::EINVAL)?;
                 FsPath::Absolute { path: cpath }
             }
@@ -459,19 +1613,105 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.fs.borrow().umask()
     }
 
-    /// Resolve a path against the current working directory.
+    fn proc_fd_target(&self, files: &FilesState<Platform, FS>, fd: usize) -> String {
+        let stdio_default = match fd {
+            0 => Some("/dev/stdin"),
+            1 => Some("/dev/stdout"),
+            2 => Some("/dev/stderr"),
+            _ => None,
+        };
+        files
+            .lookup_fd_path(fd)
+            .and_then(|p| p.into_string().ok())
+            .unwrap_or_else(|| match stdio_default {
+                Some(default) => default.to_string(),
+                None => alloc::format!("anon_inode:[fd{fd}]"),
+            })
+    }
+
+    /// Publishes this process's open descriptors to the `/proc/<pid>/fd` directory backend
+    /// whenever `path` names something under it.
+    fn refresh_proc_fd_snapshot(&self, path: &str) {
+        let Some(rest) = path.strip_prefix("/proc/") else {
+            return;
+        };
+        let Some((owner, tail)) = rest.split_once('/') else {
+            return;
+        };
+        let own_pid = self.pid.get().to_string();
+        if owner != "self" && owner != "thread-self" && owner != own_pid {
+            return;
+        }
+        // `fdinfo` needs the same snapshot `fd` does: it is the same list of live descriptors.
+        if !matches!(tail, "fd" | "fdinfo")
+            && !tail.starts_with("fd/")
+            && !tail.starts_with("fdinfo/")
+        {
+            return;
+        }
+        let snapshot: alloc::vec::Vec<(u32, String)> = {
+            let files = self.files.borrow();
+            let alive: alloc::vec::Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+            alive
+                .into_iter()
+                .filter_map(|raw| {
+                    let fd = u32::try_from(raw).ok()?;
+                    Some((fd, self.proc_fd_target(&files, raw)))
+                })
+                .collect()
+        };
+        let fds: alloc::vec::Vec<(i32, String)> = snapshot
+            .into_iter()
+            .filter_map(|(fd, target)| Some((i32::try_from(fd).ok()?, target)))
+            .collect();
+        self.global
+            .proc_self_info
+            .write()
+            .with_mut(self.pid.get(), |info| {
+                info.fds = Some(alloc::sync::Arc::new(move || fds.clone()));
+            });
+    }
+
+    /// Resolve a path against the current working directory and the current chroot.
+    ///
+    /// Both spellings get the root prefix: the CWD is kept in root-space too (see
+    /// [`FsState::cwd`]), so it is a guest-visible absolute path exactly like the other branch.
     pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
         if path_str.is_empty() {
             return Err(Errno::ENOENT);
         }
+        let root = self.fs.borrow().root.read().clone();
         if path_str.starts_with('/') {
-            CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
+            // The `/proc/<pid>/fd` snapshot is published under the path the GUEST named, so it is
+            // refreshed with the pre-root path: what the guest can see through `/proc/self/fd` is
+            // its own namespace's view, not the backend's.
+            self.refresh_proc_fd_snapshot(path_str);
+            CString::new(join_root(&root, path_str)).map_err(|_| Errno::EINVAL)
         } else {
             let mut cwd = self.fs.borrow().cwd.read().clone();
             cwd.push_str(path_str);
-            CString::new(cwd).map_err(|_| Errno::EINVAL)
+            CString::new(join_root(&root, &cwd)).map_err(|_| Errno::EINVAL)
         }
+    }
+
+    /// The one place a `dirfd` + pathname pair becomes an [`FsPath`] with the caller's chroot
+    /// applied, so no syscall has to remember to do it itself.
+    fn fs_path(&self, dirfd: i32, pathname: impl path::Arg) -> Result<FsPath, Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        // Held only for the duration of the classification below: `FsPath::new` reads it, and
+        // every caller goes on to call into the fs backend (which may block) without it.
+        let root = self.fs.borrow().root.read().clone();
+        FsPath::new(dirfd, pathname, get_cwd, &root)
+    }
+
+    /// The current working directory as a path the fs backend can resolve: the CWD is an absolute
+    /// path in root-space, so it takes the same root prefix as any other guest-visible one.
+    fn rooted_cwd(&self) -> String {
+        let fs = self.fs.borrow();
+        let root = fs.root.read().clone();
+        let cwd = fs.cwd.read().clone();
+        join_root(&root, &cwd)
     }
 
     /// Join a directory's absolute path with a path given relative to it, matching the semantics
@@ -498,16 +1738,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
     fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => Ok(path),
-            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+        let fs_path = self.fs_path(dirfd, pathname)?;
+        let resolved = match fs_path {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
-                Self::join_dir_relative_path(&dir_path, &path)
+                Self::join_dir_relative_path(&dir_path, &path)?
             }
+        };
+        if let Ok(resolved_str) = resolved.to_str() {
+            self.refresh_proc_fd_snapshot(resolved_str);
         }
+        Ok(resolved)
     }
 
     pub(crate) fn do_open(
@@ -596,6 +1839,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .set_entry_metadata(&file, EvdevFd);
         }
+        // See `DriFd`'s own doc comment for why this tag exists -- identical structural need to
+        // `EvdevFd` just above, for `/dev/dri/card0` instead of `/dev/input/event0`.
+        if let Some(path) = &path
+            && is_dri_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, DriFd);
+        }
+        // `/dev/shm` is real Linux's own tmpfs mount (see the runner's `initialize_root_in_mem_layer`
+        // doc comment for the directory itself), so unlike an ordinary regular file, ANY file
+        // created under it is real shared memory as a matter of course -- glibc's `shm_open`
+        // (there is no real `shm_open` syscall; it is `open("/dev/shm/<name>", O_CREAT, ...)`
+        // under the hood) relies on exactly this property, which is otherwise reserved for
+        // `memfd_create`-tagged files (see [`MemfdMarker`]'s own doc comment). Tagging here at
+        // OPEN time (not just creation) mirrors `DriFd`/`EvdevFd` above and correctly handles a
+        // second process opening the SAME already-existing `/dev/shm` path (the real wl_shm
+        // pattern this exists to support: a compositor creates the keymap file, a client opens
+        // it by the SAME name to map it -- both fds need this tag, not just the creator's).
+        if let Some(path) = &path
+            && is_dev_shm_path(path)
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, MemfdMarker);
+        }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
@@ -607,7 +1880,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
-    /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
         let old_mask = self
@@ -618,13 +1890,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Mode::from_bits_retain(old_mask)
     }
 
-    /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        self.do_open_resolved(path, flags, mode)
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), flags:? = flags;
+            "DIAG sys_open: resolved path"
+        );
+        let result = self.do_open_resolved(path, flags, mode);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), result:? = result;
+            "DIAG sys_open: result"
+        );
+        result
     }
 
-    /// Handle syscall `openat`
     pub fn sys_openat(
         &self,
         dirfd: i32,
@@ -633,16 +1912,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        if flags.contains(OFlags::TMPFILE) {
+            return self.open_tmpfile(&path, flags, mode);
+        }
+        let watching =
+            self.inotify_is_watching() && flags.intersects(OFlags::CREAT | OFlags::TRUNC);
+        let existed = watching && self.files.borrow().fs.file_status(path.clone()).is_ok();
         let result = self.do_open_resolved(path.clone(), flags, mode);
+        if watching && result.is_ok() {
+            use super::inotify::{IN_CREATE, IN_MODIFY};
+            if !existed && flags.contains(OFlags::CREAT) {
+                self.inotify_path(&path, IN_CREATE, false);
+            } else if existed && flags.contains(OFlags::TRUNC) {
+                self.inotify_path(&path, IN_MODIFY, false);
+            }
+        }
         // Matches `sys_mmap`/`sys_munmap`'s own debug-log pattern (added the same investigation
         // session): without this, no trace can ever map an `init_elf_patch_state`/`sys_mmap`
         // log line's numeric `fd` back to the real file it refers to, blocking correlation of a
         // crashing memory region against which shared library/ELF actually backs it.
         litebox_util_log::debug!(
-            tid:% = self.tid, path:% = path.to_string_lossy(), fd:? = result.as_ref().ok();
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), fd:? = result.as_ref().ok(), flags:? = flags;
             "sys_openat"
         );
         result
+    }
+
+    /// `O_TMPFILE`: an unnamed regular file in directory `dir`, i.e. a file created under a private
+    /// name and unlinked while still open.
+    fn open_tmpfile(&self, dir: &CString, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if !flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
+            return Err(Errno::EINVAL);
+        }
+        let dir_str = dir.to_str().map_err(|_| Errno::EINVAL)?;
+        let is_dir = self
+            .files
+            .borrow()
+            .fs
+            .file_status(dir.clone())
+            .is_ok_and(|st| st.file_type == litebox::fs::FileType::Directory);
+        if !is_dir {
+            return Err(Errno::ENOTDIR);
+        }
+        let name = alloc::format!(
+            "{}/.litebox-tmpfile-{}-{}",
+            dir_str.trim_end_matches('/'),
+            self.pid.get(),
+            NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let path = CString::new(name).map_err(|_| Errno::EINVAL)?;
+        let open_flags = (flags & !(OFlags::TMPFILE)) | OFlags::CREAT | OFlags::EXCL;
+        let fd = self.do_open_resolved(path.clone(), open_flags, mode)?;
+        self.files.borrow().fs.unlink(path).map_err(Errno::from)?;
+        Ok(fd)
     }
 
     /// Open an already-resolved absolute `path`, routing `/dev/ptmx` and `/dev/pts/<id>` to the
@@ -662,16 +1985,230 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let slave = self.global.pts_open(id)?;
             return self.insert_raw_pty_fd(slave, flags, path);
         }
-        let file = self.do_open(path.clone(), flags, mode)?;
+        // `open("/proc/self/fd/N")` re-opens whatever `N` names, as a new open file description.
+        // Programs use it to reopen a memfd with different access (PulseAudio's shared memory
+        // pool) or to get a fresh handle on a file they hold open.
+        if let Some(fd_str) = path_str
+            .strip_prefix("/proc/self/fd/")
+            .or_else(|| path_str.strip_prefix("/dev/fd/"))
+            .or_else(|| {
+                path_str.strip_prefix("/proc/").and_then(|rest| {
+                    rest.strip_prefix(alloc::format!("{}/fd/", self.pid.get()).as_str())
+                })
+            })
+            && let Ok(fd) = fd_str.parse::<usize>()
+        {
+            self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::ENOENT)?)
+                .map_err(|_| Errno::ENOENT)?;
+            let target = self.files.borrow().lookup_fd_path(fd);
+            return match target {
+                Some(target) if target != path => self.do_open_resolved(
+                    target,
+                    flags & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC),
+                    mode,
+                ),
+                // An unnamed file (a memfd, or an unlinked file) or a pipe end: the new descriptor
+                // shares the underlying object, which is all a reopen means for these.
+                None => {
+                    let reopenable = self
+                        .files
+                        .borrow()
+                        .run_on_raw_fd(
+                            fd,
+                            |_fd| true,
+                            |_fd| false,
+                            |_fd| true,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                            |_fd| false,
+                        )
+                        .unwrap_or(false);
+                    if !reopenable {
+                        return Err(Errno::ENXIO);
+                    }
+                    let new_fd = self
+                        .do_dup_inner(
+                            fd,
+                            if flags.contains(OFlags::CLOEXEC) {
+                                OFlags::CLOEXEC
+                            } else {
+                                OFlags::empty()
+                            },
+                            DupFdRequest::LowestAtOrAbove(0),
+                        )
+                        .map_err(|_| Errno::EMFILE)?;
+                    let access = flags & ACCESS_MODE_MASK;
+                    if access != OFlags::RDWR {
+                        let files = self.files.borrow();
+                        let _ = files.run_on_raw_fd(
+                            new_fd,
+                            |typed| {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .set_fd_metadata(typed, ReopenedAccess(access));
+                            },
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                        );
+                    }
+                    Ok(u32::try_from(new_fd).unwrap())
+                }
+                // Sockets, epoll and other descriptors with no filesystem name cannot be reopened.
+                _ => Err(Errno::ENXIO),
+            };
+        }
+        // A FIFO is a filesystem entry, but opening one has to produce a PIPE. Checked here,
+        // alongside `/dev/ptmx` and `/dev/pts/<id>` above and for the same reason: the underlying
+        // `FileSystem` has no live per-open state to hand back, so these paths never reach
+        // `do_open` at all.
+        if let Ok(status) = self.files.borrow().fs.symlink_metadata(path.as_c_str())
+            && status.file_type == litebox::fs::FileType::Fifo
+        {
+            return self.open_fifo(status.node_info, flags, path);
+        }
+        self.refresh_from_spill(path_str);
+        let creating_spilled_file = flags.contains(OFlags::CREAT)
+            && self.spill_enabled_for(path_str)
+            && self.files.borrow().fs.file_status(path.as_c_str()).is_err();
+        let file = match self.do_open(path.clone(), flags, mode) {
+            Ok(file) => file,
+            // A real local `ENOENT` on a path a sibling has published content for (see
+            // `SharedFilePublishTable`'s own doc comment): materialize a genuine local copy, then
+            // retry the SAME open once against that now-real file -- e.g. `read -r A < /tmp/addr`
+            // in `webtop_stack.sh` reaching here after `[ -s /tmp/addr ]` already saw the
+            // materialized stat from `do_stat`'s matching fallback.
+            Err(Errno::ENOENT) if self.materialize_shared_publish(path_str) => {
+                match self.do_open(path.clone(), flags, mode) {
+                    Ok(file) => file,
+                    Err(errno) => {
+                        diag_raw_print_proc_sys_open_miss(self.global.platform, path_str, errno);
+                        return Err(errno);
+                    }
+                }
+            }
+            Err(errno) => {
+                diag_raw_print_proc_sys_open_miss(self.global.platform, path_str, errno);
+                return Err(errno);
+            }
+        };
+        let truncating = flags.contains(OFlags::TRUNC)
+            && flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        if creating_spilled_file || truncating {
+            self.publish_spilled(path_str, SpillEdit::Reset);
+        }
         self.insert_raw_file_fd_with_path(file, flags, Some(path))
     }
 
-    /// Install a freshly allocated/looked-up pty fd (master via `/dev/ptmx`, slave via
-    /// `/dev/pts/<id>`) into this process's raw fd table, mirroring
-    /// `insert_raw_file_fd_with_path`'s `O_CLOEXEC`/path-bookkeeping handling for regular files.
-    fn insert_raw_pty_fd(
+    /// Open a FIFO: hand back a descriptor on the pipe that stands behind it.
+    ///
+    /// Every open of the same `(dev, ino)` shares one pipe, created on the first open and kept
+    /// alive by `GlobalState::fifo_registry` afterwards -- the same mechanism `/dev/pts/<id>` uses,
+    /// and for the same reason: a shared namespace any opener can reach by name.
+    ///
+    /// Which END an opener gets follows its access mode, as on real Linux: `O_WRONLY` writes,
+    /// anything else reads. `O_RDWR` on a FIFO is Linux-specific and gets the read end here, the
+    /// half a reader-writer actually blocks on.
+    ///
+    /// **Within one process only.** The registry is shim-wide, which covers every thread of this
+    /// process -- but a cross-process `fork()` child is a genuinely separate OS process with its
+    /// own registry, so a reader there does not see a writer here. The FIFO's existence and type
+    /// do travel between them (they are filesystem state, carried by the writable layer), so a
+    /// child opens a FIFO rather than a plain file and gets pipe semantics; only the bytes stay
+    /// local. Making them meet needs a host transport shared by the whole guest, which does not
+    /// exist yet -- until it does, a reader in one process and a writer in another wait on each
+    /// other for ever, exactly as two processes on a real machine would if their FIFOs were
+    /// somehow different objects.
+    ///
+    /// The open itself never blocks, unlike a real FIFO's rendezvous. The registry holds a
+    /// reference to BOTH ends for the FIFO's lifetime, so the observable difference is confined to
+    /// that -- a reader still blocks in `read()` rather than seeing a spurious EOF, which is the
+    /// property programs actually depend on.
+    fn open_fifo(
         &self,
-        fd: super::pty::PtyFd<Platform>,
+        node_info: litebox::fs::NodeInfo,
+        flags: OFlags,
+        path: CString,
+    ) -> Result<u32, Errno> {
+        let key = (node_info.dev, node_info.ino);
+        let want_write = flags.contains(OFlags::WRONLY);
+        {
+            let registry = self.global.fifo_registry.read();
+            if let Some(fifo) = registry.get(&key) {
+                let end = if want_write {
+                    &fifo.writer
+                } else {
+                    &fifo.reader
+                };
+                let dup = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .duplicate(end)
+                    .ok_or(Errno::ENXIO)?;
+                drop(registry);
+                self.apply_fifo_open_status(&dup, flags)?;
+                return self.insert_raw_fifo_fd(dup, flags, path);
+            }
+        }
+        // First open of this FIFO here: create its pipe, re-checking under the write lock since
+        // another thread may have got there in between.
+        let ends = self.global.create_linux_pipe(OFlags::empty())?;
+        let mut registry = self.global.fifo_registry.write();
+        let fifo = registry.entry(key).or_insert(crate::FifoPipe {
+            reader: ends.reader,
+            writer: ends.writer,
+        });
+        let end = if want_write {
+            &fifo.writer
+        } else {
+            &fifo.reader
+        };
+        let dup = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(end)
+            .ok_or(Errno::ENXIO)?;
+        drop(registry);
+        self.apply_fifo_open_status(&dup, flags)?;
+        self.insert_raw_fifo_fd(dup, flags, path)
+    }
+
+    /// Applies an `open()`'s `O_NONBLOCK` to the FIFO end it was handed.
+    ///
+    /// Blocking mode belongs to an open file description on Linux, so every `open()` of a FIFO gets
+    /// its own. This implementation hands each opener a duplicate of ONE registry-held pipe end,
+    /// which is a single description: the mode is therefore shared, and the most recent `open()`
+    /// wins. That is exact for the usual pattern (a daemon opens its control FIFO `O_NONBLOCK`
+    /// and clients write to a different end) and wrong only when two openers of the SAME end ask
+    /// for different modes. Without this the flag was dropped entirely, so a non-blocking reader
+    /// (`s6-svscan` draining its control FIFO until `EAGAIN`) blocked forever in `read`.
+    fn apply_fifo_open_status(
+        &self,
+        fd: &litebox::pipes::PipeFd<Platform>,
+        flags: OFlags,
+    ) -> Result<(), Errno> {
+        self.global
+            .set_linux_pipe_status_flags(fd, flags & OFlags::NONBLOCK, OFlags::NONBLOCK)
+    }
+
+    /// Install a FIFO's pipe end into this process's raw fd table, mirroring
+    /// `insert_raw_file_fd_with_path`'s `O_CLOEXEC`/path bookkeeping.
+    fn insert_raw_fifo_fd(
+        &self,
+        fd: litebox::pipes::PipeFd<Platform>,
         flags: OFlags,
         path: CString,
     ) -> Result<u32, Errno> {
@@ -692,13 +2229,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
-    /// Handle syscall `ftruncate`
+    /// Install a freshly allocated/looked-up pty fd (master via `/dev/ptmx`, slave via
+    /// `/dev/pts/<id>`) into this process's raw fd table, mirroring
+    /// `insert_raw_file_fd_with_path`'s `O_CLOEXEC`/path-bookkeeping handling for regular files.
+    fn insert_raw_pty_fd(
+        &self,
+        fd: super::pty::PtyFd<Platform>,
+        flags: OFlags,
+        path: CString,
+    ) -> Result<u32, Errno> {
+        if flags.contains(OFlags::CLOEXEC) {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        // `open(.., O_NONBLOCK)` (vte opens its master this way) must start the description
+        // non-blocking, not only fcntl(F_SETFL).
+        if flags.contains(OFlags::NONBLOCK)
+            && let Some(h) = self.global.litebox.descriptor_table().entry_handle(&fd)
+        {
+            h.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                end.set_status(OFlags::NONBLOCK, true);
+            });
+        }
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(fd).map_err(|fd| {
+            drop(self.global.litebox.descriptor_table_mut().remove(&fd));
+            Errno::EMFILE
+        })?;
+        files.record_fd_path(raw_fd, path);
+        Ok(u32::try_from(raw_fd).unwrap())
+    }
+
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), fd:% = fd, length:% = length;
+            "sys_ftruncate: entry"
+        );
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        let spilled_path = self.spilled_path_of_fd(raw_fd);
         let files = self.files.borrow();
-        files
+        let truncated = files
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
@@ -729,7 +2305,79 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             )
+            .flatten();
+        drop(files);
+        if truncated.is_ok() {
+            if let Some(path) = spilled_path {
+                self.publish_spilled(&path, SpillEdit::Truncate(length));
+            }
+            self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
+        }
+        truncated
+    }
+
+    /// Handle syscall `fallocate` -- ensure `[offset, offset+len)` is allocated in `fd`.
+    ///
+    /// litebox only supports `mode == 0` (the default allocate-and-grow mode; every real caller
+    /// this shim needs to support -- `posix_fallocate()`, and weston's `os_create_anonymous_file()`
+    /// via it -- uses exactly this mode). Real `fallocate(mode=0)` never shrinks the file even if
+    /// `offset+len` is smaller than the current size, unlike `ftruncate`; this only grows.
+    pub(crate) fn sys_fallocate(
+        &self,
+        fd: i32,
+        mode: i32,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), Errno> {
+        litebox_util_log::debug!(fd:% = fd, mode:% = mode, offset:% = offset, len:% = len; "sys_fallocate: entry");
+        if mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target_len = usize::try_from(offset)
+            .ok()
+            .and_then(|o| usize::try_from(len).ok().and_then(|l| o.checked_add(l)))
+            .ok_or(Errno::EFBIG)?;
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let current_len = files.fs.fd_file_status(fd).map_err(Errno::from)?.size;
+                    litebox_util_log::debug!(current_len:% = current_len, target_len:% = target_len; "sys_fallocate: pre-truncate");
+                    if target_len <= current_len {
+                        return Ok(());
+                    }
+                    files.fs.truncate(fd, target_len, false)?;
+                    // Same real-shared-memory-backing follow-up `sys_ftruncate` performs for a
+                    // `memfd_create` fd -- see its own doc comment on why this is needed.
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &MemfdMarker| ())
+                        .is_ok()
+                    {
+                        self.resize_memfd_shared_backing(fd, target_len)?;
+                    }
+                    Ok(())
+                },
+                |_fd| todo!("net"),
+                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL))
             .flatten()
     }
 
@@ -737,31 +2385,729 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `memfd_create` fd. Registered/updated in `GlobalState::memfds`, keyed by the file's own
     /// `(dev, ino)` (stable across `dup()`/`fork()`, unlike the raw fd number).
     ///
-    /// This handle starts independent of the in-mem file's own `Vec<u8>` bytes that ordinary
-    /// `write()`/`read()` on this same fd still go through (an ordinary regular file has no such
-    /// real shared-memory backing at all -- see `syscalls::mm::try_memfd_mmap`'s own doc comment
-    /// for why memfd needs one in the first place); `try_memfd_mmap` itself is what closes this
-    /// gap, by syncing the file's CURRENT bytes into the real handle at `mmap()` time, so a guest
-    /// that writes pixel bytes via plain `write()` and only later has a peer `mmap()` the same fd
-    /// (the real `wl_shm` pattern this exists to support) observes them correctly.
+    /// This handle is a sized memfd's ONE store, and the in-mem file is only its mirror: the
+    /// object is seeded from the file here (so a `write(2)` made before this `ftruncate` survives)
+    /// and carried across a resize, and from then on `Task::memfd_write_through` /
+    /// `Task::memfd_read_through` keep `write(2)`/`read(2)` on the object rather than on the file.
+    /// The file keeps doing what it always did for `fstat`'s size and the fd's read/write
+    /// position; it is never again copied over the object, since it cannot reflect anyone's
+    /// `mmap`'d writes (see `syscalls::mm::try_memfd_mmap`).
     fn resize_memfd_shared_backing(&self, fd: &TypedFd<FS>, length: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
         let status = files.fs.fd_file_status(fd).map_err(Errno::from)?;
         let key = (status.node_info.dev, status.node_info.ino);
+        drop(files);
         let page_aligned_size = length.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
-        let handle = self
+
+        // A Windows file mapping's size is fixed at creation (see `create_shared_memory`'s own
+        // doc comment), so growing/shrinking a memfd genuinely requires a new handle -- but a
+        // resize must not silently orphan whatever any existing mapper (the guest's own earlier
+        // mapping, or a peer's, e.g. the compositor already holding the client's previous-size
+        // `wl_shm` pool mapped) already wrote there. `libwayland-cursor`'s own pool-growth path
+        // (`shm_pool_resize`: `ftruncate` then re-`mmap`) is exactly this pattern live. Copy the
+        // OLD handle's real, live content into the new one before swapping the registry entry,
+        // via the same private-transient-mapping trick `try_memfd_mmap` already uses -- copying
+        // from the shared object itself, never from the (possibly stale) in-mem `Vec<u8>`.
+        let old_entry = {
+            let memfds = self.global.memfds.lock();
+            memfds.get(&key).map(|e| (e.handle, e.size, e.mapped))
+        };
+        let old_was_mapped = old_entry.map(|(_, _, mapped)| mapped).unwrap_or(false);
+        let old_entry = old_entry.map(|(handle, size, _)| (handle, size));
+        let mut carry_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if let Some((old_handle, old_size)) = old_entry
+            && let Some(old_len) = litebox::mm::linux::NonZeroPageSize::new(
+                old_size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE),
+            )
+        {
+            // SAFETY: a fresh, private, non-fixed, read-only-intent mapping of `old_handle` --
+            // no guest code has ever observed this address; read and unmap immediately.
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    old_len,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    old_handle,
+                )
+            } {
+                let readable_len = old_size.min(old_len.as_usize());
+                let mut buf = alloc::vec![0u8; readable_len];
+                for (offset, slot) in buf.iter_mut().enumerate() {
+                    if let Some(v) = ptr.read_at_offset(isize::try_from(offset).unwrap_or(0)) {
+                        *slot = v;
+                    }
+                }
+                carry_bytes = buf;
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    old_len.as_usize(),
+                );
+            }
+        } else if old_entry.is_none() {
+            // No object existed yet, so every byte the guest has written so far lives ONLY in the
+            // in-mem file -- the store `write(2)`/`read(2)` use until one appears. Seed the new
+            // object from those bytes, because from here on the OBJECT is the one store all three
+            // of `read(2)`, `write(2)` and `mmap` share (see `memfd_read_through`): starting from a
+            // fresh zeroed object here would silently discard a `write(2)` that happened before
+            // this `ftruncate`, which is `shmvis9`'s write-then-grow case.
+            let files = self.files.borrow();
+            let size = files.fs.fd_file_status(fd).map_or(0, |s| s.size);
+            if size > 0 {
+                let mut buf = alloc::vec![0u8; size];
+                let n = files.fs.read(fd, &mut buf, Some(0)).unwrap_or(0);
+                buf.truncate(n);
+                carry_bytes = buf;
+            }
+        }
+
+        let object_name = alloc::format!(
+            "Local\\litebox_memfd_{}_{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let (handle, object_name) = match self
             .global
             .platform
-            .create_shared_memory(page_aligned_size)
-            .map_err(|_| Errno::ENOMEM)?;
+            .create_named_shared_memory(&object_name, page_aligned_size)
+        {
+            Ok(handle) => (handle, Some(object_name)),
+            Err(_) => (
+                self.global
+                    .platform
+                    .create_shared_memory(page_aligned_size)
+                    .map_err(|_| Errno::ENOMEM)?,
+                None,
+            ),
+        };
+        if !carry_bytes.is_empty()
+            && let Some(new_len) = litebox::mm::linux::NonZeroPageSize::new(page_aligned_size)
+        {
+            // SAFETY: same transient-private-mapping pattern as the read above, on the freshly
+            // created (so definitely unobserved) `handle`.
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    new_len,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            } {
+                let copy_len = carry_bytes.len().min(page_aligned_size);
+                let _ = ptr.write_slice_at_offset(0, &carry_bytes[..copy_len]);
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    page_aligned_size,
+                );
+            }
+        }
         self.global.memfds.lock().insert(
             key,
             super::mm::MemfdEntry {
                 handle,
                 size: length,
+                // Carry `old_was_mapped` forward, NOT unconditionally `false` (a real gap in an
+                // earlier version of this fix, caught in review): once ANY second party has ever
+                // `mmap`'d this memfd, the shared object may hold writes that never went through
+                // this fd's own `write()`/`pwrite()` (the compositor drawing directly into a
+                // `wl_shm` pool it mapped itself is exactly this) -- the in-mem file's `Vec<u8>`
+                // does not and cannot reflect those, so it must never again be allowed to
+                // overwrite the shared object once that has happened, resize or not. The
+                // `carry_bytes` copy above already preserved that content into the new handle;
+                // marking the new entry `mapped: true` here (when `old_was_mapped`) is what keeps
+                // it preserved through the FIRST mmap after this resize too. Only when the old
+                // entry was NEVER mapped by more than this fd's own writer (`old_was_mapped ==
+                // false`, e.g. a fresh memfd's very first `ftruncate`) does `mapped: false` remain
+                // correct/needed, so the eventual first `mmap` still runs the ordinary
+                // `write()`-then-`mmap()` sync path once.
+                mapped: old_was_mapped,
+                name: object_name,
             },
         );
         Ok(())
+    }
+
+    /// `(dev, ino)` identity of the file behind `raw_fd`, the key every shared-memory registry in
+    /// this shim is keyed by. `None` for any fd that is not a live `FS`-subsystem fd.
+    fn memfd_key_for_raw_fd(&self, raw_fd: usize) -> Option<(usize, usize)> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    Some((status.node_info.dev, status.node_info.ino))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Whether any fd in this process has a memfd backing object registered, so the `write(2)`
+    /// path can skip the lookup entirely in the overwhelmingly common case -- the same gate
+    /// [`Self::has_shared_file_mappings`] already is for the `shared_files` registry.
+    pub(crate) fn has_memfd_backings(&self) -> bool {
+        !self.global.memfds.lock().is_empty()
+    }
+
+    /// Mirror `bytes` into the shared-memory object backing the memfd at `raw_fd`, at `start`.
+    ///
+    /// The OBJECT -- not the in-mem file -- is a sized memfd's ONE store: `mmap(MAP_SHARED)`
+    /// reads and writes it directly (`syscalls::mm::try_memfd_mmap`), and it is the only thing a
+    /// `fork` child or an `SCM_RIGHTS` receiver ever sees, since both rebuild the fd from the
+    /// object's NAME (`install_shm_file`), never from this process's private writable layer. A
+    /// `write(2)` that stayed in that layer would therefore be invisible to every other view and
+    /// to every other process, with no errno -- measured in `shmvis10`: an `mmap` write followed
+    /// by `read(2)` returned zeros, and a fork child read a zeroed buffer while the parent still
+    /// read its own bytes back. Writing through here on every successful file write keeps the
+    /// object (and so every other view and process) current; the in-mem file stays a mirror whose
+    /// only remaining jobs are `fstat`'s size and the fd's position.
+    ///
+    /// `Ok(())` when the bytes reached the object (or the fd has no backing object at all, so the
+    /// in-mem file is legitimately the only store); `Err` when they could not be, which the caller
+    /// must surface rather than swallow -- a `write(2)` that reports success while its bytes exist
+    /// only in this process's private file is the silent divergence this whole path exists to
+    /// prevent.
+    ///
+    /// A `write(2)` past EOF GROWS a memfd on real Linux (a memfd is a shmem-backed FILE, not a
+    /// fixed-size buffer), and this object is its ONE store, so a write that would run past the
+    /// object's page-rounded capacity grows the store here instead of being clipped to it. A
+    /// Windows file mapping's size is fixed at creation (see `create_shared_memory`'s own doc
+    /// comment), so growing means a NEW object seeded from the old one -- exactly the
+    /// `resize_memfd_shared_backing` path `ftruncate`/`fallocate` growth already uses. Leaving the
+    /// tail clipped (the previous behaviour) put those bytes in the in-mem file alone, where
+    /// `mmap(MAP_SHARED)`, a fork child and an `SCM_RIGHTS` receiver never see them: `write` 1MB
+    /// into a memfd last `ftruncate`d to 0 reported 1MB and grew `fstat`'s size, while `read(2)`
+    /// -- which answers from the object -- returned one page.
+    ///
+    /// KNOWN LIMITATION, not papered over: the grown store is a NEW object, so a `MAP_SHARED`
+    /// mapping established BEFORE the growth still points at the old one and silently diverges
+    /// from `read(2)`/`write(2)` afterwards. That is pre-existing and not specific to this path --
+    /// `ftruncate`-growth has always replaced the object the same way -- and closing it needs the
+    /// mmapper to re-map, which nothing here can force.
+    pub(crate) fn memfd_write_through(
+        &self,
+        raw_fd: usize,
+        start: usize,
+        bytes: &[u8],
+    ) -> Result<(), Errno> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let Some(key) = self.memfd_key_for_raw_fd(raw_fd) else {
+            return Ok(());
+        };
+        // Real Linux: `size = max(old size, start + n)`. `start` is where this write actually
+        // landed (the caller derived it from the post-write position), so this is exact for
+        // `write(2)`, `pwrite(2)` and an `O_APPEND` fd alike -- unlike any start guessed before
+        // the write, which would have to second-guess append mode.
+        let needed_end = start.checked_add(bytes.len()).ok_or(Errno::EFBIG)?;
+        let grow_to = {
+            let memfds = self.global.memfds.lock();
+            match memfds.get(&key) {
+                // No backing object at all (an unsized memfd): the in-mem file IS this fd's only
+                // store and `shared_files` covers any later `mmap`, so there is nothing to grow.
+                None => return Ok(()),
+                Some(entry) => {
+                    // The object was created at `size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE)`
+                    // and `entry.size` only ever grows up to that, so this is its real capacity.
+                    let capacity = entry.size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+                    (needed_end > capacity).then_some(needed_end)
+                }
+            }
+        };
+        if let Some(new_len) = grow_to {
+            // `usize::next_multiple_of` panics on overflow and `resize_memfd_shared_backing`
+            // rounds with it, so refuse the absurd size here -- guest-reachable code returns an
+            // errno, never a panic, and the host process is the whole guest session.
+            if new_len > usize::MAX - PAGE_SIZE {
+                return Err(Errno::EFBIG);
+            }
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| self.resize_memfd_shared_backing(fd, new_len),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                    |_| Err(Errno::EINVAL),
+                )
+                .flatten()?;
+        }
+        let (handle, end) = {
+            let mut memfds = self.global.memfds.lock();
+            match memfds.get_mut(&key) {
+                Some(entry) => {
+                    // The object's size is fixed at creation (see `create_shared_memory`'s own doc
+                    // comment), so a write can reach at most its capacity -- which the growth
+                    // above just made at least `needed_end`. Within that, writing past the last
+                    // `ftruncate`d length extends the memfd exactly as on real Linux -- a memfd is
+                    // a file and `write(2)` past EOF grows it -- which is what `entry.size`
+                    // records for later `read(2)`s.
+                    let capacity = entry.size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+                    let end = start.saturating_add(bytes.len()).min(capacity);
+                    if start >= end {
+                        return Ok(());
+                    }
+                    entry.size = entry.size.max(end);
+                    (entry.handle, end)
+                }
+                None => return Ok(()),
+            }
+        };
+        let Some(length) =
+            litebox::mm::linux::NonZeroPageSize::new(end.next_multiple_of(PAGE_SIZE))
+        else {
+            return Ok(());
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, written and unmapped here; no
+        // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
+        // this transient mapping.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let _ = ptr.write_slice_at_offset(start as isize, &bytes[..end - start]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(
+                &self.process().pm(),
+                user_ptr,
+                end.next_multiple_of(PAGE_SIZE),
+            );
+        }
+        Ok(())
+    }
+
+    /// Read a memfd's bytes from its shared-memory object -- the ONE store -- rather than from the
+    /// per-process in-mem file. Returns `None` when `raw_fd` has no registered backing object (an
+    /// unsized memfd, or an ordinary file), so the caller falls through to the ordinary file read.
+    ///
+    /// The read half of [`Self::memfd_write_through`], needed for the same reason: a `write(2)`
+    /// and an `mmap` write must be the same bytes to `read(2)` as to each other, and a `fork`
+    /// child / `SCM_RIGHTS` receiver -- whose fd is rebuilt from the object, never from this
+    /// process's file -- must see them too. Answering from the in-mem file would read a store the
+    /// mmapper's writes never reach, which is `shmvis10`'s `mmap`-write-then-`read(2)` zeros and
+    /// its zeroed child buffer.
+    fn memfd_read_through(
+        &self,
+        key: (usize, usize),
+        raw_fd: usize,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Option<Result<usize, Errno>> {
+        let (handle, size) = {
+            let memfds = self.global.memfds.lock();
+            match memfds.get(&key) {
+                Some(entry) => (entry.handle, entry.size),
+                None => return None,
+            }
+        };
+        // `read(2)` with no explicit offset reads at the fd's own current position; the shared
+        // object carries no position of its own, so ask the file for it. A pure query -- it moves
+        // nothing, and the caller advances the position by what was actually read.
+        let start = match offset {
+            Some(explicit) => explicit,
+            None => i32::try_from(raw_fd)
+                .ok()
+                .and_then(|raw| self.sys_lseek(raw, 0, SeekWhence::RelativeToCurrentOffset).ok())
+                .unwrap_or(0),
+        };
+        // Past the memfd's length is EOF, exactly as for a read of a real file.
+        let n = buf.len().min(size.saturating_sub(start));
+        if n == 0 {
+            return Some(Ok(0));
+        }
+        let mapped_len = (start + n).next_multiple_of(PAGE_SIZE);
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(mapped_len) else {
+            return None;
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, read and unmapped here; no
+        // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
+        // this transient mapping.
+        let ptr = match unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            Ok(ptr) => ptr,
+            // Fall through to the ordinary file read rather than failing a read the fd can still
+            // serve from its own bytes.
+            Err(_) => return None,
+        };
+        let mut read = 0usize;
+        for (i, slot) in buf[..n].iter_mut().enumerate() {
+            match ptr.read_at_offset(isize::try_from(start + i).unwrap_or(isize::MAX)) {
+                Some(v) => {
+                    *slot = v;
+                    read += 1;
+                }
+                None => break,
+            }
+        }
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, mapped_len);
+        Some(Ok(read))
+    }
+
+    /// `(host-wide object name, size, open flags)` of a `memfd_create`/`/dev/shm` fd whose shared
+    /// backing is a named object, else `None`. Such a descriptor can be handed to another host
+    /// process, which opens the same object by name and so shares the memory rather than a copy.
+    pub(crate) fn carriable_shm_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, usize, u32)> {
+        let files = self.files.borrow();
+        let (key, flags) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &MemfdMarker| ())
+                        .ok()?;
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let flags = files.fs.open_flags(fd)?;
+                    Some(((status.node_info.dev, status.node_info.ino), flags.bits()))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        drop(files);
+        let memfds = self.global.memfds.lock();
+        let entry = memfds.get(&key)?;
+        Some((entry.name.clone()?, entry.size, flags))
+    }
+
+    /// Builds a descriptor for the named shared object `name` in this process and returns its raw
+    /// fd. The backing file is an anonymous `/dev/shm` file (created then unlinked, exactly what
+    /// `memfd_create` does here) sized to `size` without allocating a new object, and its registry
+    /// entry points at the existing object, marked as already mapped so the first `mmap` here
+    /// never overwrites the live shared contents with this file's empty bytes.
+    pub(crate) fn install_shm_file(
+        &self,
+        name: &str,
+        size: usize,
+        flags: u32,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        let path = alloc::format!(
+            "/dev/shm/.litebox-carried-{}-{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(name, size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
+            .map_err(|_| Errno::ENOMEM)?;
+        let create_flags = OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC;
+        let creator =
+            self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)?;
+        let key = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    creator as usize,
+                    |fd| {
+                        files.fs.truncate(fd, size, false).ok()?;
+                        let status = files.fs.fd_file_status(fd).ok()?;
+                        Some((status.node_info.dev, status.node_info.ino))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()
+        };
+        let mut reopen_flags =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        if cloexec {
+            reopen_flags |= OFlags::CLOEXEC;
+        }
+        let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen_flags, Mode::empty());
+        let _ = self.sys_close(i32::try_from(creator).map_err(|_| Errno::EINVAL)?);
+        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        let raw = raw?;
+        let key = key.ok_or_else(|| {
+            let _ = i32::try_from(raw).map(|fd| self.sys_close(fd));
+            Errno::EBADF
+        })?;
+        self.global.memfds.lock().insert(
+            key,
+            super::mm::MemfdEntry {
+                handle,
+                size,
+                mapped: true,
+                name: Some(alloc::string::String::from(name)),
+            },
+        );
+        usize::try_from(raw).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Cap on a [`Self::snapshot_nameless_file_for_carry`] payload. Module-level so the fork-side
+    /// eligibility check and the snapshot itself can never drift apart on what size still travels.
+    const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Whether `raw_fd` is a regular file whose bytes could still travel as a
+    /// [`Self::snapshot_nameless_file_for_carry`] snapshot.
+    ///
+    /// This is the fork-side counterpart of `scm_carry_spec`'s `T|` fallback and exists for one
+    /// measured reason: a `memfd_create` fd is an unlinked regular file (see that syscall's own doc
+    /// comment), so `carriable_file_for_raw_fd` cannot name it and -- until something calls
+    /// `ftruncate`/`fallocate` -- `carriable_shm_for_raw_fd` has no named object to hand over
+    /// either. Such an fd therefore fell through to "uncarriable" in `clone`, which REFUSED the
+    /// cross-process fork and forced the thread-based relocating fallback; that fallback is what
+    /// actually faults the child (`shmvis3`: every child of a process holding a memfd died with
+    /// SIGSEGV, while `shmvis4`'s children -- whose parent had closed its memfd first -- all
+    /// reached status=0). Cheap preconditions only; the real snapshot is built after the fork is
+    /// known eligible, mirroring `raw_fd_unix_carry_check`/`raw_fd_unix_carry`.
+    pub(crate) fn snapshot_carriable_file_for_raw_fd(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    if status.file_type != litebox::fs::FileType::RegularFile
+                        || status.size > Self::SNAPSHOT_MAX_BYTES
+                    {
+                        return None;
+                    }
+                    Some(())
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Content of a regular file that has no name left (unlinked temporary files Chromium hands to
+    /// its children), copied into a fresh named shared object so the receiving process can rebuild
+    /// a private copy: `T|<flags>|<size>|<object name>`. A read-only handoff is exact; writes made
+    /// afterwards by either side are not shared.
+    pub(crate) fn snapshot_nameless_file_for_carry(
+        &self,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
+        let (flags, bytes) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        let status = files.fs.fd_file_status(fd).ok()?;
+                        if status.file_type != litebox::fs::FileType::RegularFile
+                            || status.size > Self::SNAPSHOT_MAX_BYTES
+                        {
+                            return None;
+                        }
+                        let flags = files.fs.open_flags(fd)?;
+                        let mut buf = alloc::vec![0u8; status.size];
+                        let n = files.fs.read(fd, &mut buf, Some(0)).ok()?;
+                        buf.truncate(n);
+                        Some((flags.bits(), buf))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()?
+        };
+        let name = alloc::format!(
+            "Local\\litebox_snap_{}_{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let aligned = bytes.len().next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(&name, aligned)
+            .ok()?;
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned)?;
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        let ptr = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        }
+        .ok()?;
+        let written = ptr.write_slice_at_offset(0, &bytes);
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
+        written?;
+        Some(alloc::format!("T|{flags}|{}|{name}", bytes.len()))
+    }
+
+    fn rebuild_snapshot_file(
+        &self,
+        flags: u32,
+        size: usize,
+        name: &str,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        let aligned = size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
+        let handle = self
+            .global
+            .platform
+            .create_named_shared_memory(name, aligned)
+            .map_err(|_| Errno::ENOMEM)?;
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned).ok_or(Errno::EINVAL)?;
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        let ptr = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        }
+        .map_err(|_| Errno::ENOMEM)?;
+        let mut bytes = alloc::vec![0u8; size];
+        for (offset, slot) in bytes.iter_mut().enumerate() {
+            if let Some(v) = ptr.read_at_offset(isize::try_from(offset).unwrap_or(0)) {
+                *slot = v;
+            }
+        }
+        let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+        let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
+        let path = alloc::format!(
+            "/dev/shm/.litebox-snapshot-{}-{}",
+            self.global.platform.current_host_pid(),
+            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let creator = self.sys_openat(
+            AT_FDCWD,
+            path.as_str(),
+            OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let creator = i32::try_from(creator).map_err(|_| Errno::EINVAL)?;
+        let written = self.sys_write(creator, &bytes, None);
+        let _ = self.sys_close(creator);
+        if let Err(e) = written {
+            let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+            return Err(e);
+        }
+        let mut reopen =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        if cloexec {
+            reopen |= OFlags::CLOEXEC;
+        }
+        let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen, Mode::empty());
+        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        raw.map(|fd| fd as usize)
+    }
+
+    /// Fork-child form of [`Self::install_shm_file`]: `spec` is `<cloexec 0|1>|<flags>|<size>|<name>`,
+    /// installed at exactly `target_fd`.
+    pub(crate) fn install_shm_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let mut parts = spec.splitn(4, '|');
+        let cloexec = parts.next()? == "1";
+        let flags: u32 = parts.next()?.parse().ok()?;
+        let size: usize = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        let raw = i32::try_from(self.install_shm_file(name, size, flags, cloexec).ok()?).ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
+    }
+
+    /// Fork-child form of [`Self::rebuild_snapshot_file`]: `spec` is
+    /// `<cloexec 0|1>|T|<flags>|<size>|<object name>`, installed at exactly `target_fd`.
+    ///
+    /// The rebuilt file is created and then unlinked under `/dev/shm`, so
+    /// `sys_unlinkat`'s `tag_unlinked_regular_file_as_shm_like` tags it `MemfdMarker` -- the child
+    /// gets a memfd-shaped fd (bytes and all) whose later `ftruncate`/`mmap(MAP_SHARED)` gets real
+    /// shared-memory backing, exactly like the parent's.
+    pub(crate) fn install_snapshot_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let mut parts = spec.splitn(5, '|');
+        let cloexec = parts.next()? == "1";
+        // The `T` marker comes from `snapshot_nameless_file_for_carry`'s own spec, kept verbatim
+        // rather than re-derived so the two ends cannot disagree on what was snapshotted.
+        if parts.next()? != "T" {
+            return None;
+        }
+        let flags: u32 = parts.next()?.parse().ok()?;
+        let size: usize = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        let raw = i32::try_from(self.rebuild_snapshot_file(flags, size, name, cloexec).ok()?).ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
     }
 
     /// Handle syscall `mknodat` — create a filesystem node.
@@ -793,18 +3139,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let files = self.files.borrow();
                 let _ = files.fs.close(&file);
             }
-            // TODO: Named pipe, socket, block and char files are not supported
-            InodeType::NamedPipe
-            | InodeType::Socket
-            | InodeType::BlockDevice
-            | InodeType::CharDevice
-            | InodeType::Dir => return Err(Errno::EPERM),
+            InodeType::NamedPipe => {
+                let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
+                let path = self.resolve_path_at(dirfd, pathname)?;
+                self.files
+                    .borrow()
+                    .fs
+                    .make_fifo(path, mode & !self.get_umask())
+                    .map_err(Errno::from)?;
+            }
+            // TODO: socket, block and char files are not supported
+            InodeType::Socket | InodeType::BlockDevice | InodeType::CharDevice | InodeType::Dir => {
+                return Err(Errno::EPERM);
+            }
             InodeType::SymLink => return Err(Errno::EINVAL),
         }
         Ok(())
     }
 
-    /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,
         dirfd: i32,
@@ -816,14 +3168,131 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let path = self.resolve_path_at(dirfd, pathname)?;
-        if flags.contains(AtFlags::AT_REMOVEDIR) {
-            self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+        let result = if flags.contains(AtFlags::AT_REMOVEDIR) {
+            self.files
+                .borrow()
+                .fs
+                .rmdir(path.clone())
+                .map_err(Errno::from)
         } else {
-            self.files.borrow().fs.unlink(path).map_err(Errno::from)
+            // Capture the about-to-be-unlinked file's `(dev, ino)` BEFORE calling `unlink` (the
+            // path won't resolve afterwards) so a successful unlink can tag any fd(s) still open
+            // on this same file (see `self.tag_unlinked_regular_file_as_shm_like` below) -- a
+            // failed lookup here (e.g. the path is a directory, or doesn't exist) just means
+            // there is nothing to tag; `unlink` itself still runs and reports its own real error.
+            let node_info = self
+                .files
+                .borrow()
+                .fs
+                .symlink_metadata(path.clone())
+                .ok()
+                .filter(|status| status.file_type == litebox::fs::FileType::RegularFile)
+                .map(|status| status.node_info);
+            self.refresh_from_spill(path.to_str().unwrap_or_default());
+            let result = self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from);
+            if result.is_ok()
+                && let Some(node_info) = node_info
+            {
+                self.tag_unlinked_regular_file_as_shm_like(node_info);
+            }
+            if result.is_ok() {
+                self.publish_spilled(path.to_str().unwrap_or_default(), SpillEdit::Remove);
+            }
+            result
+        };
+        if result.is_ok() {
+            self.inotify_path(
+                &path,
+                super::inotify::IN_DELETE,
+                flags.contains(AtFlags::AT_REMOVEDIR),
+            );
+        }
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), path:% = path.to_string_lossy(), ok:? = result.is_ok(), err:? = result.as_ref().err();
+            "sys_unlinkat"
+        );
+        result
+    }
+
+    /// After a regular file at `node_info` has just been `unlink`ed, tag any fd(s) STILL OPEN on
+    /// it (in this process's own fd table) with [`MemfdMarker`] -- the same tag
+    /// `sys_memfd_create` applies at creation time -- so a later `ftruncate`/`fallocate` on that
+    /// fd goes through `resize_memfd_shared_backing` and gets real
+    /// `PageManagementProvider::create_shared_memory` backing (see `syscalls::mm::try_memfd_mmap`)
+    /// instead of `sys_mmap`'s `ENODEV` rejection of `MAP_SHARED|PROT_WRITE` on an ordinary file.
+    ///
+    /// This closes the real gap wlroots' (and weston's) `allocate_shm_file_pair`/
+    /// `os_create_anonymous_file` hit: both build their shm fd by hand with the EXACT SAME
+    /// `open` + `unlink` + `fchmod`/`ftruncate` recipe `sys_memfd_create` itself uses internally
+    /// (see that function's own doc comment) -- they just do it via plain `open`/`unlink` instead
+    /// of the `memfd_create` syscall, so the fd was never tagged. Structurally, "a regular file
+    /// whose directory entry is gone while a fd is still open on it" IS this shim's definition of
+    /// an anonymous/memfd-shaped file (`sys_memfd_create` has no other distinguishing state of
+    /// its own) -- there is no other real use of `unlink`-while-still-open in this codebase for
+    /// which becoming real-shared-memory-backed on a later `ftruncate` would be observably wrong:
+    /// an ordinary already-closed file's bytes stay exactly the in-mem `Vec<u8>` they always were
+    /// (an untagged fd's `ftruncate`/`fallocate` path is entirely unchanged, see their own doc
+    /// comments), and a still-open, never-mmapped-shared-write fd pays only a `symlink_metadata`
+    /// lookup here plus a bounded scan of this process's OWN (not global) alive fd table below --
+    /// never unbounded, since a real process holds at most a few hundred fds.
+    fn tag_unlinked_regular_file_as_shm_like(&self, node_info: litebox::fs::NodeInfo) {
+        let files = self.files.borrow();
+        let alive_fds: alloc::vec::Vec<usize> =
+            files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            let matches = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        files
+                            .fs
+                            .fd_file_status(fd)
+                            .is_ok_and(|status| status.node_info == node_info)
+                    },
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                    |_fd| false,
+                )
+                .unwrap_or(false);
+            if matches {
+                // Best-effort: `run_on_raw_fd` above already proved this fd is currently a live
+                // `FS`-subsystem fd, but re-resolve it fresh here rather than threading a
+                // borrowed `TypedFd` out of the closure above (its lifetime is tied to the
+                // `raw_descriptor_store` read lock, which `set_entry_metadata` below cannot be
+                // called while holding, since it needs the litebox-wide descriptor table's own
+                // write lock instead). A fd closed concurrently between the two lookups just
+                // means `with_metadata`'s callers below silently observe the untagged/closed fd,
+                // same as any other close-race.
+                let _ = files.run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        let old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_entry_metadata(fd, MemfdMarker);
+                        debug_assert!(old.is_none());
+                    },
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                    |_fd| {},
+                );
+            }
         }
     }
 
-    /// Handle syscall `renameat`/`renameat2`
     pub(crate) fn sys_renameat(
         &self,
         olddirfd: i32,
@@ -841,14 +3310,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
-        self.files
+        self.refresh_from_spill(old_path.to_str().unwrap_or_default());
+        let moved_is_dir = self.inotify_is_watching()
+            && self
+                .files
+                .borrow()
+                .fs
+                .symlink_metadata(old_path.clone())
+                .is_ok_and(|s| s.file_type == litebox::fs::FileType::Directory);
+        let result = self
+            .files
             .borrow()
             .fs
-            .rename(old_path, new_path)
-            .map_err(Errno::from)
+            .rename(old_path.clone(), new_path.clone())
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.publish_spilled_rename(
+                old_path.to_str().unwrap_or_default(),
+                new_path.to_str().unwrap_or_default(),
+            );
+        }
+        if result.is_ok() && self.inotify_is_watching() {
+            let cookie = Self::inotify_cookie();
+            if let (Ok(from), Ok(to)) = (old_path.to_str(), new_path.to_str()) {
+                self.inotify_notify(from, super::inotify::IN_MOVED_FROM, moved_is_dir, cookie);
+                self.inotify_notify(to, super::inotify::IN_MOVED_TO, moved_is_dir, cookie);
+            }
+        }
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            from:% = old_path.to_string_lossy(),
+            to:% = new_path.to_string_lossy(),
+            err:? = result.as_ref().err();
+            "sys_renameat"
+        );
+        result
     }
 
-    /// Handle syscall `linkat`
     pub(crate) fn sys_linkat(
         &self,
         olddirfd: i32,
@@ -869,14 +3367,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let old_path = self.resolve_path_at(olddirfd, oldpath)?;
         let new_path = self.resolve_path_at(newdirfd, newpath)?;
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .link(old_path, new_path)
-            .map_err(Errno::from)
+            .link(old_path, new_path.clone())
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&new_path, super::inotify::IN_CREATE, false);
+        }
+        result
     }
 
-    /// Handle syscall `symlinkat`
     pub(crate) fn sys_symlinkat(
         &self,
         target: impl path::Arg,
@@ -884,11 +3386,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         linkpath: impl path::Arg,
     ) -> Result<(), Errno> {
         let linkpath = self.resolve_path_at(newdirfd, linkpath)?;
-        self.files
+        let target = target.to_c_str()?.into_owned();
+        let result = self
+            .files
             .borrow()
             .fs
-            .symlink(target, linkpath)
-            .map_err(Errno::from)
+            .symlink(&target, linkpath.clone())
+            .map_err(Errno::from);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            link:% = linkpath.to_string_lossy(),
+            target:% = target.to_string_lossy(),
+            err:? = result.as_ref().err();
+            "sys_symlinkat"
+        );
+        if result.is_ok() {
+            self.inotify_path(&linkpath, super::inotify::IN_CREATE, false);
+        }
+        result
     }
 
     /// Handle syscall `read`
@@ -901,7 +3416,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let result = self.do_read(raw_fd, buf, offset);
         litebox_util_log::debug!(
-            tid:% = self.tid,
+            tid:% = self.tid.get(),
             fd:% = fd,
             len:% = buf.len(),
             offset:? = offset,
@@ -920,6 +3435,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+        // Resolve the raw fd number once: `run_on_raw_fd`'s closures take a `TypedFd` named `fd`
+        // too, and the memfd read hook below needs the NUMBER, not the typed handle.
+        let raw_fd_num = fd as usize;
         let n = files
             .run_on_raw_fd(
                 fd as usize,
@@ -963,7 +3481,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `DrmSubsystem`'s event queue (a higher-crate-layer state, `litebox` cannot
                     // depend on `litebox_shim_linux`). Intercept here instead, the same layer
                     // that already special-cases DRI-fd `ioctl`/`mmap`.
-                    if self.is_dri_device(&files.fs, fd)? {
+                    // One stat answers both device questions (see `classify_device_fd`);
+                    // this read path previously paid two full fd_file_status lookups.
+                    let (is_dri, is_input) = self.classify_device_fd(&files.fs, fd)?;
+                    if is_dri {
                         let Some(event_bytes) = self.global.drm.pop_flip_event_bytes() else {
                             // Real Linux blocks here until an event arrives; this device
                             // completes every flip synchronously inside the PAGE_FLIP ioctl
@@ -986,7 +3507,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `litebox::fs::devices::InputDevices`'s own `read` deliberately rejects
                     // every read outright (it has no reach into `EvdevSubsystem`'s event queue,
                     // a higher-crate-layer state `litebox` cannot depend on), so intercept here.
-                    if self.is_input_device(&files.fs, fd)? {
+                    if is_input {
                         let Some(event_bytes) = self.global.evdev.pop_event_bytes() else {
                             // Real Linux blocks a blocking-mode `read()` here until an event
                             // arrives; this shim has no real blocking-wait wired for evdev yet
@@ -1003,20 +3524,94 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         out[..n].copy_from_slice(&event_bytes[..n]);
                         return Ok(n);
                     }
+                    // A memfd whose backing object exists reads from THAT, not from the in-mem
+                    // file -- the object is the one store `read(2)`, `write(2)` and `mmap` share,
+                    // and the only one a fork child / SCM_RIGHTS receiver ever sees (see
+                    // `memfd_read_through`). `None` means "not a backed memfd": fall through to
+                    // the ordinary file read below.
+                    let key = files
+                        .fs
+                        .fd_file_status(fd)
+                        .ok()
+                        .map(|s| (s.node_info.dev, s.node_info.ino));
+                    if let Some(key) = key
+                        && let Some(result) =
+                            self.memfd_read_through(key, raw_fd_num, &mut buf.borrow_mut(), offset)
+                    {
+                        // `read(2)` (no explicit offset) advances the fd's position by what it
+                        // got; `pread(2)` deliberately does not.
+                        if offset.is_none()
+                            && let Ok(n) = result
+                            && n > 0
+                            && let Ok(raw) = i32::try_from(raw_fd_num)
+                        {
+                            let _ = self.sys_lseek(
+                                raw,
+                                isize::try_from(n).unwrap_or(0),
+                                SeekWhence::RelativeToCurrentOffset,
+                            );
+                        }
+                        return result;
+                    }
                     files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
                         .map_err(Errno::from)
                 },
-                |fd| {
+                |sock_fd| {
                     espipe_for_non_seekable_offset(offset)?;
-                    self.global.receive(
+                    let result = self.global.receive(
                         &self.wait_cx(),
-                        fd,
+                        sock_fd,
                         &mut buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
-                    )
+                    );
+                    // Mirrors sys_recvmsg's own hex-payload-preview diagnostic
+                    // (net.rs::do_recvmsg, 69th pass) -- plain read(2) on a socket fd is a
+                    // SEPARATE code path (GlobalState::receive here, never do_recvmsg), so a
+                    // trace that only enabled recvmsg-side logging silently missed every byte a
+                    // caller receives via read() specifically. Real X11 clients' Xtrans Unix-socket
+                    // transport calls plain read()/write(), not recvmsg()/sendmsg() -- root-caused
+                    // (71st pass) as the true cause of the 70th pass's own X11-stream-reassembly
+                    // desync: a stream built from recvmsg previews ALONE is a fragmentary, gapped
+                    // subset of the real bytes (missing every read()-delivered chunk entirely), not
+                    // evidence of a real X11 framing/protocol gap.
+                    // Uses a DEDICATED tracing target ("litebox_diag::socket_read"), deliberately
+                    // NOT nested under `litebox_shim_linux::syscalls::file` -- that parent target's
+                    // own pre-existing `sys_read` debug log fires on EVERY read() of EVERY fd kind
+                    // system-wide (regular files, pipes, ttys, ...), which is what makes a blanket
+                    // `syscalls::file=debug` filter cost 50MB+/s of guest time (AGENTS.md's own
+                    // standing note) and, live-observed this same pass, slow/destabilize a full
+                    // `webtop_stack.sh` boot badly enough to perturb its own timing (an `xdpyinfo`
+                    // pre-DE probe that normally succeeds failed with "unable to open display"
+                    // under that blanket filter). A caller only investigating a SPECIFIC socket's
+                    // read-side wire bytes (X11, D-Bus, ...) can enable just
+                    // `litebox_diag::socket_read=debug` and get complete, low-overhead coverage of
+                    // every read()/readv() delivered chunk on that fd without paying for every
+                    // other process's file I/O too.
+                    //
+                    // 74th pass: `is_socket_read_target_comm` is an additional, OPTIONAL gate
+                    // (via `LITEBOX_DIAG_SOCKET_READ_TARGET`) checked before the hex-format
+                    // below runs at all -- unset, it is a single relaxed atomic load that
+                    // always returns true (no behavior change); set (e.g. to `xfwm4` for this
+                    // investigation), every other process's socket reads skip the format!/
+                    // event! work entirely instead of relying on the tracing target's own
+                    // enabled-check, which still costs a per-event interest lookup across
+                    // every process once the target itself is on.
+                    if let Ok(n) = result
+                        && crate::diag::is_socket_read_target_comm(&self.comm.get())
+                    {
+                        litebox_util_log::__private::tracing::event!(
+                            target: "litebox_diag::socket_read",
+                            litebox_util_log::__private::tracing::Level::DEBUG,
+                            tid = %self.tid.get(),
+                            fd = %fd,
+                            preview = ?alloc::format!("{:02x?}", &buf.borrow()[..n.min(4096)]),
+                            "DIAG sys_read: payload"
+                        );
+                    }
+                    result
                 },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
@@ -1042,22 +3637,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 },
                 |_fd| Err(Errno::EINVAL),
-                |fd| {
+                |unix_fd| {
                     let handle = self
                         .global
                         .litebox
                         .descriptor_table()
-                        .entry_handle(fd)
+                        .entry_handle(unix_fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|file| {
+                    let result = handle.with_entry(|file| {
                         file.recvfrom(
+                            &self.global,
                             &self.wait_cx(),
                             &mut buf.borrow_mut(),
                             litebox_common_linux::ReceiveFlags::empty(),
                             None,
                         )
-                    })
+                    });
+                    // AF_UNIX's own read() branch -- a plain read(2) on a Unix-domain socket fd
+                    // (X11's real Xtrans transport, confirmed 71st pass) dispatches HERE, through
+                    // `run_on_raw_fd`'s dedicated `unix` closure, never through the `net` closure
+                    // immediately above (that one's plain-TCP/generic-Network `sock_fd` path,
+                    // where the 71st pass's own diagnostic was actually placed). Zero
+                    // `litebox_diag::socket_read` events were ever emitted for a live X11 stream
+                    // as a direct result -- this is the missing half of that same diagnostic,
+                    // same target, same shape, covering the code path X11 actually uses.
+                    //
+                    // 74th pass: same optional comm-scoped gate as the plain-socket branch
+                    // above -- see that branch's own comment.
+                    if let Ok(n) = &result
+                        && crate::diag::is_socket_read_target_comm(&self.comm.get())
+                    {
+                        litebox_util_log::__private::tracing::event!(
+                            target: "litebox_diag::socket_read",
+                            litebox_util_log::__private::tracing::Level::DEBUG,
+                            tid = %self.tid.get(),
+                            fd = %fd,
+                            preview = ?alloc::format!("{:02x?}", &buf.borrow()[..(*n).min(4096)]),
+                            "DIAG sys_read (unix): payload"
+                        );
+                    }
+                    result
                 },
                 |fd| {
                     let handle = self
@@ -1067,7 +3687,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                    handle.with_entry(|end| {
+                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.pty_io())
+                    })
                 },
                 |fd| {
                     let handle = self
@@ -1097,6 +3719,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Ok(size_of::<u64>())
                     })
                 },
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()?;
         // For datagrams, the returned size represents the actual size of the message,
@@ -1110,14 +3733,101 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
     /// If `Some`, it will write to the specified offset without changing the current file position.
     pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+        let result = self.do_write(fd, buf, offset);
+        // A guest's own error text -- panics, assertion failures, library diagnostics -- reaches
+        // us only through this write, and 64 bytes truncates essentially all of it. A real
+        // example: a glycin decoder panic logged as
+        //   "thread 'main' (18) panicked at glycin-utils/src/instruction_han"
+        // cutting off exactly where the reason would have been. When a guest process writes to
+        // stderr and then dies, this line is frequently the ONLY record of why.
+        //
+        // Cap generously for stderr (fd 2), which is low-volume and diagnostic by definition,
+        // and keep stdout and files short so a chatty program does not flood the log.
+        let preview_len = buf.len().min(if fd == 2 { 4096 } else { 64 });
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = fd,
+            len:% = buf.len(),
+            offset:? = offset,
+            preview:? = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
+            result:? = result.as_ref().map(|n| *n);
+            "sys_write"
+        );
+        // Dedicated, separately-targeted event for stderr traffic only -- the `sys_write` event
+        // above shares a target (module path) with `sys_read`/every other `file.rs` syscall, so
+        // enabling it via `LITEBOX_LOG` to catch a guest's own crash-time stderr text (glibc
+        // `abort()`/`assert()`/Xorg `ErrorF` messages, all unbuffered writes to fd 2) also floods
+        // the log with every `sys_read` from every process in the boot -- a single `LITEBOX_LOG`
+        // grant that pulled in unrelated `sys_read` spam produced 400MB+ of log in under 9 real
+        // seconds on a real boot (2026-09-21, thirty-first pass). A distinct target lets a caller
+        // enable ONLY this signal (`litebox_diag::stderr_capture=debug`) at the volume stderr
+        // actually has (diagnostic by definition, never a hot loop).
+        if fd == 2 {
+            litebox_util_log::__private::tracing::event!(
+                target: "litebox_diag::stderr_capture",
+                litebox_util_log::__private::tracing::Level::DEBUG,
+                pid = self.pid.get(),
+                tid = self.tid.get(),
+                comm = core::str::from_utf8(&self.comm.get())
+                    .unwrap_or("<non-utf8>")
+                    .trim_end_matches('\0'),
+                text = core::str::from_utf8(&buf[..preview_len]).unwrap_or("<binary>"),
+                "stderr_write"
+            );
+        }
+        result
+    }
+    fn do_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        // `SharedFilePublishTable`'s write-side hook (see its own doc comment): resolve the real
+        // byte offset THIS write will land at, before performing it, only for a path this crate
+        // has explicitly opted in via `SHARED_PUBLISH_PATHS` -- `sys_lseek(fd, 0, CUR)` reports
+        // the current position without requiring read access on `fd` (unlike a real read-back
+        // would, and `dbus-daemon --print-address > /tmp/addr`'s fd is write-only), and without
+        // moving it either (`offset=0` on `SEEK_CUR` is a pure query on real Linux, mirrored by
+        // `sys_lseek`'s own implementation here).
+        let publish_target = {
+            let files = self.files.borrow();
+            files.lookup_fd_path(raw_fd).and_then(|p| {
+                let path = p.to_str().ok()?;
+                SHARED_PUBLISH_PATHS
+                    .contains(&path)
+                    .then(|| path.to_string())
+            })
+        };
+        let publish_offset = match (&publish_target, offset) {
+            (None, _) => None,
+            (Some(_), Some(explicit)) => Some(explicit),
+            (Some(_), None) => self
+                .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                .ok(),
+        };
+        let spilled_path = self.spilled_path_of_fd(raw_fd);
+        let mut wrote_file: Option<usize> = None;
         let files = self.files.borrow();
         let res = files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
+                |fd| {
+                    if let Ok(narrowed) = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |ReopenedAccess(a)| *a)
+                        && narrowed == OFlags::empty()
+                    {
+                        return Err(Errno::EBADF);
+                    }
+                    let r = files.fs.write(fd, buf, offset).map_err(Errno::from);
+                    if let Ok(n) = r
+                        && n > 0
+                    {
+                        wrote_file = Some(n);
+                    }
+                    r
+                },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
                     self.global.sendto(
@@ -1173,25 +3883,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|end| end.write(&self.wait_cx(), buf))
+                    handle.with_entry(|end| {
+                        end.write(&self.wait_cx(), buf, &self.global.pty_io(), &|pgid, sig| {
+                            self.global.xproc_signal_group(pgid, sig)
+                        })
+                    })
                 },
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
             )
             .flatten();
+        drop(files);
+        if wrote_file.is_some() {
+            self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
+        }
+        if let (Ok(n), Some(path)) = (&res, &spilled_path)
+            && n > &0
+        {
+            let start = match offset {
+                Some(explicit) => Some(explicit),
+                None => self
+                    .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .ok()
+                    .and_then(|end| end.checked_sub(*n)),
+            };
+            if let Some(start) = start {
+                self.publish_spilled(path, SpillEdit::Write { start, bytes: &buf[..*n] });
+            }
+        }
+        if let Ok(n) = res
+            && n > 0
+            && (self.has_shared_file_mappings() || self.has_memfd_backings())
+        {
+            let start = match offset {
+                Some(explicit) => Some(explicit),
+                None => self
+                    .sys_lseek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .ok()
+                    .and_then(|end| end.checked_sub(n)),
+            };
+            if let Some(start) = start {
+                self.shared_file_write_through(raw_fd, start, &buf[..n]);
+                // A sized memfd's object is its ONE store, so this write has to reach it too --
+                // otherwise `mmap`, and every other host process holding this memfd, never see it
+                // (see `memfd_write_through`). Its `Err` is propagated rather than ignored: the
+                // bytes are already in this process's in-mem file, but that file is the store
+                // `mmap`/a fork child/an `SCM_RIGHTS` receiver never read, so reporting success
+                // here is precisely the silent two-store divergence this path exists to prevent.
+                // It only fails when the backing object could not be grown (ENOMEM), i.e. a host
+                // condition, not a guest-reachable panic.
+                self.memfd_write_through(raw_fd, start, &buf[..n])?;
+            }
+        }
+        if let Ok(n) = res
+            && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
+        {
+            let published = self.global.shared_file_publish.publish_at(
+                path.as_bytes(),
+                pos,
+                &buf[..n],
+                self.pid.get() as u32,
+            );
+            if published {
+                litebox_util_log::warn!(
+                    path:% = path, offset:% = pos, len:% = n, self_pid:% = self.pid.get();
+                    "DIAG shared_file_publish: republished a sibling-visible file after a local write"
+                );
+            }
+        }
         if let Err(Errno::EPIPE) = res {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
 
-    /// Handle syscall `pread64`
     pub fn sys_pread64(&self, fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_read(fd, buf, Some(pos))
     }
 
-    /// Handle syscall `pwrite64`
     pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
@@ -1222,11 +3993,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()
     }
 
-    /// Handle syscall `sendfile`
     pub(crate) fn sys_sendfile(
         &self,
         out_fd: i32,
@@ -1270,6 +4041,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         in_raw_fd,
                         |fd| files.fs.read(fd, buf_slice, cur_off).map_err(Errno::from),
+                        |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
@@ -1323,6 +4095,99 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// `copy_file_range(2)` (`loop_until_done`) and `splice(2)` (one chunk): both are a read from
+    /// `fd_in` followed by a write of the same bytes to `fd_out`, with optional explicit offsets
+    /// on either side that are advanced in the caller's memory rather than in the fd.
+    fn copy_between_fds(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        loop_until_done: bool,
+    ) -> Result<usize, Errno> {
+        self.check_raw_fd_exists(fd_in)?;
+        self.check_raw_fd_exists(fd_out)?;
+        let read_off = |p: Option<UserPtrMut<i64>>| -> Result<Option<usize>, Errno> {
+            p.map(|p| {
+                let off = p.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                usize::try_from(off).map_err(|_| Errno::EINVAL)
+            })
+            .transpose()
+        };
+        let mut in_off = read_off(off_in)?;
+        let mut out_off = read_off(off_out)?;
+        let mut buf = vec![0u8; len.min(64 * 1024)];
+        let mut total = 0usize;
+        while total < len {
+            let want = (len - total).min(buf.len());
+            let n = match self.sys_read(fd_in, &mut buf[..want], in_off) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => break,
+            };
+            let mut written = 0;
+            while written < n {
+                match self.sys_write(fd_out, &buf[written..n], out_off.map(|o| o + written)) {
+                    Ok(0) => break,
+                    Ok(w) => written += w,
+                    Err(e) if total == 0 && written == 0 => return Err(e),
+                    Err(_) => break,
+                }
+            }
+            total += written;
+            if let Some(o) = in_off.as_mut() {
+                *o += written;
+            }
+            if let Some(o) = out_off.as_mut() {
+                *o += written;
+            }
+            if written < n || !loop_until_done {
+                break;
+            }
+        }
+        if let (Some(p), Some(o)) = (off_in, in_off) {
+            p.write_at_offset::<Platform>(0, i64::try_from(o).map_err(|_| Errno::EOVERFLOW)?)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if let (Some(p), Some(o)) = (off_out, out_off) {
+            p.write_at_offset::<Platform>(0, i64::try_from(o).map_err(|_| Errno::EOVERFLOW)?)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn sys_copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.copy_between_fds(fd_in, off_in, fd_out, off_out, len, true)
+    }
+
+    pub(crate) fn sys_splice(
+        &self,
+        fd_in: i32,
+        off_in: Option<UserPtrMut<i64>>,
+        fd_out: i32,
+        off_out: Option<UserPtrMut<i64>>,
+        len: usize,
+        _flags: u32,
+    ) -> Result<usize, Errno> {
+        self.copy_between_fds(fd_in, off_in, fd_out, off_out, len, false)
+    }
+}
+
 fn espipe_for_non_seekable_offset(offset: Option<usize>) -> Result<(), Errno> {
     if offset.is_some() {
         Err(Errno::ESPIPE)
@@ -1358,6 +4223,14 @@ fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
 #[derive(Clone, Copy)]
 pub(crate) struct EvdevFd;
 
+/// Marker metadata tagged onto a `/dev/dri/card0` fd at `open()` time -- mirrors [`EvdevFd`]'s
+/// identical role and identical reason for existing: a plain filesystem-backed fd's
+/// `poll`/`select`/`epoll_wait` readiness (`syscalls::epoll::EpollDescriptor::poll`'s `File` arm)
+/// is computed from `global`+the fd handle alone, with no reach into `DrmSubsystem`'s own
+/// `pending_flip_events` queue without this tag identifying which fd to check.
+#[derive(Clone, Copy)]
+pub(crate) struct DriFd;
+
 /// Marker metadata tagged onto a `memfd_create` fd's underlying entry at creation time --
 /// distinguishes it from an ordinary regular file so `sys_ftruncate` knows to also
 /// create/resize the real backing `PageManagementProvider::create_shared_memory` object it needs
@@ -1367,9 +4240,51 @@ pub(crate) struct EvdevFd;
 #[derive(Clone, Copy)]
 pub(crate) struct MemfdMarker;
 
+static MEMFD_OBJECT_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per-fd metadata: the access mode (`O_RDONLY`/`O_WRONLY`, as [`OFlags`]) a descriptor was
+/// REOPENED with via `open("/proc/self/fd/N", ...)` on a file that has no name to reopen by (a
+/// `memfd`). The reopen shares the underlying file, so this records the narrower access the new
+/// descriptor was promised: `F_GETFL` reports it, and `write`/`mmap(PROT_WRITE, MAP_SHARED)` honor
+/// it. Chromium's read-only shared-memory regions depend on exactly this (it verifies the
+/// read-only fd cannot be mapped writable, and aborts if it can).
+#[derive(Clone, Copy)]
+pub(crate) struct ReopenedAccess(pub OFlags);
+
+const ACCESS_MODE_MASK: OFlags = OFlags::WRONLY.union(OFlags::RDWR);
+
+/// Per-fd metadata (see [`litebox::fd::Descriptors::set_fd_metadata`]'s fd-vs-entry distinction)
+/// tagged onto a fd freshly opened by `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- carries the fake
+/// `MAP_DUMB`-style offset of the dumb buffer this PRIME fd exports, so `syscalls::mm`'s
+/// `try_dri_dumb_buffer_mmap` can resolve a real client's `mmap(prime_fd, ..., MAP_SHARED, 0)`
+/// (real PRIME/dma-buf fds are always mapped at offset 0 -- there is no second offset namespace
+/// the way `MAP_DUMB` has one for the original DRM device fd) back onto the SAME underlying
+/// dumb-buffer shared-memory handle, without requiring the caller to know or replay the
+/// `MAP_DUMB` offset itself. See `DRM_IOCTL_PRIME_HANDLE_TO_FD`'s own doc comment
+/// (`litebox_common_linux`) for why a real dma-buf subsystem is unnecessary here.
+#[derive(Clone, Copy)]
+pub(crate) struct DrmPrimeFdMarker {
+    pub(crate) map_offset: u64,
+}
+
 /// Mirrors [`stdio_stream_for_path`]'s shape for the one evdev device path this shim exposes.
 fn is_evdev_path(path: &CString) -> bool {
     path.to_str() == Ok("/dev/input/event0")
+}
+
+/// Mirrors [`is_evdev_path`]'s shape for the one DRM device path this shim exposes.
+fn is_dri_path(path: &CString) -> bool {
+    path.to_str() == Ok("/dev/dri/card0")
+}
+
+/// True for any path under `/dev/shm/` (but not `/dev/shm` itself, the directory) -- unlike
+/// [`is_evdev_path`]/[`is_dri_path`]'s single fixed path, `/dev/shm` is a real writable directory
+/// that can hold arbitrarily-named files (see `initialize_root_in_mem_layer`'s doc comment), so
+/// this checks a prefix rather than an exact match.
+fn is_dev_shm_path(path: &CString) -> bool {
+    path.to_str().is_ok_and(|p| {
+        p.strip_prefix("/dev/shm/")
+            .is_some_and(|rest| !rest.is_empty())
+    })
 }
 
 const SEEK_SET: i16 = 0;
@@ -1427,6 +4342,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
             )
             .flatten()
     }
@@ -1470,7 +4386,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `mkdirat`
     pub(crate) fn sys_mkdirat(
         &self,
         dirfd: i32,
@@ -1478,7 +4393,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, Mode::from_bits_retain(mode))
+        let result = self.do_mkdir(pathname.clone(), Mode::from_bits_retain(mode));
+        if result.is_ok() {
+            self.inotify_path(&pathname, super::inotify::IN_CREATE, true);
+        }
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), path:% = pathname.to_string_lossy(), err:? = result.as_ref().err();
+            "sys_mkdirat"
+        );
+        result
     }
 
     /// Handle syscall `chmod`/`fchmodat`/`fchmodat2`.
@@ -1495,30 +4418,172 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .chmod(pathname, Mode::from_bits_retain(mode))
-            .map_err(Errno::from)
+            .chmod(pathname.clone(), Mode::from_bits_retain(mode))
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&pathname, super::inotify::IN_ATTRIB, false);
+        }
+        result
     }
 
     /// Handle syscall `fchmod`.
     ///
-    /// Resolves the already-open file descriptor back to the absolute path it was opened at
-    /// (recorded by `do_open`, the same mechanism `fchdir`/`*at`-family dirfd resolution uses)
-    /// and applies the mode change through the same path-based `FileSystem::chmod` the fs layer
-    /// already implements.
+    /// Operates directly on the already-open file descriptor via `FileSystem::chmod_fd`,
+    /// mirroring `sys_ftruncate`'s `run_on_raw_fd`-based dispatch -- NOT by re-resolving `fd`
+    /// back to a path and calling the path-based `FileSystem::chmod` (as this used to before
+    /// `chmod_fd` existed). That re-resolution was a real, confirmed bug: a caller that
+    /// `unlink`s the file and then `fchmod`s the still-open fd (e.g. wlroots' `util/shm.c`
+    /// `allocate_shm_file_pair`, which does exactly `open`+`open`+`unlink`+`fchmod`+`ftruncate`
+    /// in that order to build its read-write/read-only shm fd pair) would always get `ENOENT`
+    /// from the path-based re-walk, since `unlink` immediately removes the directory entry --
+    /// silently breaking every `allocate_shm_file_pair` call (format-table and keymap shm
+    /// allocation both go through it) with no syscall-level error ever logged, because this
+    /// function previously had no `debug!` logging of its own to reveal it.
     pub(crate) fn sys_fchmod(&self, fd: u32, mode: u32) -> Result<(), Errno> {
-        let pathname = self.resolve_dirfd_path(fd)?;
-        self.files
-            .borrow()
-            .fs
-            .chmod(pathname, Mode::from_bits_retain(mode))
-            .map_err(Errno::from)
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), fd:% = fd, mode:% = mode;
+            "sys_fchmod: entry"
+        );
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let mode = Mode::from_bits_retain(mode);
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.chmod_fd(fd, mode).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
     }
 
+    pub(crate) fn sys_fchownat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        owner: u32,
+        group: u32,
+    ) -> Result<(), Errno> {
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        let pathname = self.resolve_final_symlinks(alloc::string::String::from(
+            pathname.to_str().map_err(|_| Errno::EINVAL)?,
+        ))?;
+        self.do_chown(&pathname, owner, group)
+    }
+
+    fn do_chown(&self, path: &str, owner: u32, group: u32) -> Result<(), Errno> {
+        let narrowed = |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX - 1));
+        let (user, group) = (narrowed(owner), narrowed(group));
+        self.refresh_from_spill(path);
+        let files = self.files.borrow();
+        let status = files.fs.file_status(path)?;
+        let unprivileged_owner_change =
+            self.creds().euid != 0 && user.is_some_and(|user| user != status.owner.user);
+        if unprivileged_owner_change {
+            return Err(Errno::EPERM);
+        }
+        if user.is_none() && group.is_none() {
+            return Ok(());
+        }
+        files.fs.chown(path, user, group).map_err(Errno::from)
+    }
+    pub(crate) fn sys_fchown(&self, fd: u32, owner: u32, group: u32) -> Result<(), Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let path = self
+            .files
+            .borrow()
+            .lookup_fd_path(raw_fd)
+            .and_then(|path| path.into_string().ok());
+        let is_file_fd = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        files
+                            .fs
+                            .fd_file_status(fd)
+                            .map(|_| true)
+                            .map_err(Errno::from)
+                    },
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                    |_fd| Ok(false),
+                )
+                .flatten()?
+        };
+        match path {
+            Some(path) if is_file_fd => self.do_chown(&path, owner, group),
+            _ => Ok(()),
+        }
+    }
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<FS>(raw_fd, None)
+        if !self.inotify_is_watching() {
+            return self.do_close_and_replace::<FS>(raw_fd, None);
+        }
+        // The path and access mode are gone once the descriptor is: read them first.
+        let (path, writable) = {
+            let files = self.files.borrow();
+            let path = files.lookup_fd_path(raw_fd);
+            let writable = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed| {
+                        files
+                            .fs
+                            .open_flags(typed)
+                            .is_some_and(|f| f.intersects(OFlags::WRONLY | OFlags::RDWR))
+                    },
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            (path, writable)
+        };
+        let result = self.do_close_and_replace::<FS>(raw_fd, None);
+        if result.is_ok()
+            && let Some(path) = path
+        {
+            use super::inotify::{IN_CLOSE_NOWRITE, IN_CLOSE_WRITE};
+            self.inotify_path(
+                &path,
+                if writable {
+                    IN_CLOSE_WRITE
+                } else {
+                    IN_CLOSE_NOWRITE
+                },
+                false,
+            );
+        }
+        result
     }
 
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
@@ -1580,16 +4645,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     rds.fd_consume_raw_integer::<super::pty::PtySubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Pty(fd)
-                } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem<Platform>>(
-                        raw_fd,
-                    )
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Signalfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(
-                        raw_fd,
-                    )
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Timerfd(fd)
                 } else if let Ok(fd) =
@@ -1597,7 +4658,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     ConsumedFd::Netlink(fd)
                 } else {
-                    unreachable!("all subsystems covered")
+                    // The raw number is in this process's descriptor store but no subsystem
+                    // enumerated here claims it, so there is nothing to close and the slot stays
+                    // occupied. This is `close(2)`-reachable, so answer EBADF -- what Linux
+                    // answers for a number nothing owns -- and leave the slot alone rather than
+                    // taking the whole session down over a subsystem this path does not know.
+                    return Err(Errno::EBADF);
                 }
             }
         };
@@ -1654,14 +4720,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
                 };
-                // Closing the *master* side's last reference releases this shim's own held
-                // template copy of the slave (see `GlobalState::ptmx_closed`); any fds a guest
-                // already obtained via `/dev/pts/<id>` keep working exactly like any other
-                // `dup()`'d fd surviving the original fd's close.
-                if let Some(end) = &entry
-                    && end.is_master()
-                {
-                    self.global.ptmx_closed(end.pair().id);
+                // The last close of a master releases the pty (see `GlobalState::ptmx_closed`);
+                // the last close of a shared slave drops it from the open-slave count that
+                // decides when master reads report `EIO`.
+                if let Some(end) = &entry {
+                    self.global.pty_description_closed(end);
                 }
                 // do not hold any locks while dropping the entry
                 drop(entry);
@@ -1697,12 +4760,139 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `close`
+    /// Handle syscall `close_range`
+    ///
+    /// Closes every open descriptor in `first..=last`, or -- with `CLOSE_RANGE_CLOEXEC` -- marks
+    /// them close-on-exec instead of closing them.
+    ///
+    /// # Why this is worth implementing rather than refusing
+    ///
+    /// It is not a convenience. `close_range` is how modern libc closes inherited descriptors
+    /// before `exec`, and when it is missing CPython (and glibc, and Go) fall back to listing
+    /// `/proc/self/fd` -- which this shim also does not serve as a directory -- and from there to
+    /// brute-forcing every integer up to `RLIMIT_NOFILE`. A live XFCE session was observed asking
+    /// for `/proc/self/fd` 282 times in one boot for exactly this reason, once per process spawn.
+    ///
+    /// Returning `ENOSYS` is also the wrong kind of answer for a caller that cannot proceed
+    /// without closing its descriptors: it is the difference between "this is slow" and "this
+    /// child inherits fds it must not have".
+    ///
+    /// A descriptor in the range that is not open is not an error, per Linux.
+    pub(crate) fn sys_close_range(&self, first: u32, last: u32, flags: u32) -> Result<(), Errno> {
+        /// `CLOSE_RANGE_UNSHARE` -- unshare the descriptor table from any `CLONE_FILES` sharer
+        /// before acting.
+        const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+        /// `CLOSE_RANGE_CLOEXEC` -- set close-on-exec rather than closing.
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // `CLOSE_RANGE_UNSHARE` only has meaning for a descriptor table shared via `CLONE_FILES`.
+        // Accepted and ignored rather than refused: the request is "do not let my sharer see
+        // this", and for a caller that has no sharer that is already true. Refusing would break
+        // the common `CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC` pairing that libcs use by
+        // default, over a flag that asks for nothing here.
+        let _ = CLOSE_RANGE_UNSHARE;
+
+        // Snapshot the alive fds first. Closing walks the same store this iterates, and the range
+        // is an inclusive `u32` range that can legitimately be `0..=u32::MAX` (the idiom for
+        // "close everything above my stdio"), so iterating the RANGE rather than the open
+        // descriptors would mean four billion lookups per spawn.
+        let targets: alloc::vec::Vec<usize> = {
+            let files = self.files.borrow();
+            let store = files.raw_descriptor_store.read();
+            store
+                .iter_alive()
+                .filter(|raw| u32::try_from(*raw).is_ok_and(|raw| raw >= first && raw <= last))
+                .collect()
+        };
+
+        for raw_fd in targets {
+            let Ok(fd) = i32::try_from(raw_fd) else {
+                continue;
+            };
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                // Same descriptor-table flag `ioctl(FIOCLEX)` and `fcntl(F_SETFD)` set, applied the
+                // same way for every fd type.
+                let files = self.files.borrow();
+                let _ = files.run_on_raw_fd(
+                    raw_fd,
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                    |fd| self.set_cloexec_on(fd),
+                );
+            } else {
+                // A close that fails (e.g. the fd was closed concurrently) is not a failure of
+                // `close_range` -- Linux reports success as long as the range is valid.
+                let _ = self.sys_close(fd);
+            }
+        }
+        Ok(())
+    }
+
+    /// Set `FD_CLOEXEC` on the descriptor at raw number `raw_fd`, whatever it is; a no-op when
+    /// nothing is open there.
+    pub(crate) fn mark_raw_fd_cloexec(&self, raw_fd: i32) {
+        let Ok(raw_fd) = usize::try_from(raw_fd) else {
+            return;
+        };
+        let files = self.files.borrow();
+        let _ = files.run_on_raw_fd(
+            raw_fd,
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+            |fd| self.set_cloexec_on(fd),
+        );
+    }
+
+    /// Set `FD_CLOEXEC` on one descriptor, whatever subsystem it belongs to.
+    ///
+    /// Close-on-exec is a property of the descriptor table entry, not of the file behind it, so
+    /// this is identical for every fd type -- which is why it is written once here instead of ten
+    /// times at each `run_on_raw_fd` arm that needs it.
+    fn set_cloexec_on<S: litebox::fd::FdEnabledSubsystem>(&self, fd: &litebox::fd::TypedFd<S>) {
+        let _old = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+    }
+
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        self.do_close(raw_fd)
+        // `close` had NO logging, so fd REUSE was invisible: a trace would show the same fd
+        // number opened twice with no close between, which reads as a collision bug when it is
+        // normal reuse. fd lifetime is exactly what matters when diagnosing an inherited-fd
+        // failure (a child getting EPIPE on a socket it was handed), so make it visible.
+        let result = self.do_close(raw_fd);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = fd,
+            result:? = result;
+            "sys_close"
+        );
+        result
     }
 
     /// Handle syscall `fsync`
@@ -1722,7 +4912,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.check_raw_fd_exists(fd)
     }
 
-    /// Handle syscall `preadv`
     pub(crate) fn sys_preadv(
         &self,
         fd: i32,
@@ -1743,7 +4932,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `pwritev`
     pub(crate) fn sys_pwritev(
         &self,
         fd: i32,
@@ -1764,7 +4952,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
-    /// Handle syscall `readv`
     pub(crate) fn sys_readv(
         &self,
         fd: i32,
@@ -1805,6 +4992,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
 /// with `EINVAL` for `readv`/`writev`/`preadv`/`pwritev`.
+/// The `O_*` bits `fcntl(F_SETFL)` is permitted to change on an already-open fd.
+///
+/// Real Linux ignores every other bit in the `F_SETFL` argument: the access mode
+/// (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) and the creation flags (`O_CREAT`, `O_EXCL`, `O_TRUNC`,
+/// `O_CLOEXEC`) are fixed at `open` time and cannot be changed afterwards.
+///
+/// Shared by `F_GETFL` and `F_SETFL` deliberately, rather than written out in each: the two have
+/// to agree on exactly which bits live in the mutable per-description state and which come from
+/// the filesystem record of the original `open`, and they did not. See `F_GETFL`'s raw-fd branch.
+const SETFL_MUTABLE_FLAGS: OFlags = OFlags::APPEND
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NDELAY)
+    .union(OFlags::DIRECT)
+    .union(OFlags::NOATIME);
+
 const IOV_MAX: usize = 1024;
 const SSIZE_MAX: usize = isize::MAX as usize;
 
@@ -1827,7 +5029,6 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
     Ok(())
 }
 
-/// Drain reads into a sequence of user iovecs.
 fn read_from_iovec<F, Platform: ShimPlatform>(
     iovs: &[IoReadVec],
     kernel_buffer: &mut [u8],
@@ -1925,7 +5126,6 @@ where
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `writev`
     pub(crate) fn sys_writev(
         &self,
         fd: i32,
@@ -1992,13 +5192,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
         if flags.contains(AtFlags::AT_EACCESS) {
             AccessUserInfo {
-                user: self.credentials.euid,
-                group: self.credentials.egid,
+                user: self.creds().euid,
+                group: self.creds().egid,
             }
         } else {
             AccessUserInfo {
-                user: self.credentials.uid,
-                group: self.credentials.gid,
+                user: self.creds().uid,
+                group: self.creds().gid,
             }
         }
     }
@@ -2009,12 +5209,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
-        let status = self.files.borrow().fs.file_status(pathname)?;
+        if let Ok(path_str) = pathname.as_rust_str() {
+            self.refresh_proc_fd_snapshot(path_str);
+            self.refresh_from_spill(path_str);
+        }
+        let status = match self.files.borrow().fs.file_status(&pathname) {
+            Ok(status) => status,
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => {
+                let path_str = pathname.as_rust_str()?;
+                if self.materialize_shared_publish(path_str)
+                    && let Ok(status) = self.files.borrow().fs.file_status(&pathname)
+                {
+                    status
+                } else {
+                    self.cross_process_bound_unix_socket_stat(path_str)
+                        .ok_or(Errno::ENOENT)?
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
 
-    /// Handle syscall `faccessat`
     pub(crate) fn sys_faccessat(
         &self,
         dirfd: i32,
@@ -2032,12 +5251,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         match fs_path {
             FsPath::Absolute { path } => self.do_access(path, mode, caller),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let cwd = get_cwd();
+                let cwd = self.rooted_cwd();
                 self.do_access(cwd, mode, caller)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -2054,9 +5272,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("fd-relative faccessat is not supported yet");
-                Err(Errno::EINVAL)
+            // Resolve exactly as `resolve_path_at` does for every other `*at` syscall -- the
+            // `dirfd`'s recorded path joined with the relative one. There was nothing special
+            // about `faccessat` here; it simply predated that helper.
+            //
+            // Returning `EINVAL` instead was not a harmless stub: `s6-rc-compile` checks each
+            // service definition with `faccessat(dirfd, "flag-essential", ...)`, and reported the
+            // errno verbatim as `unable to read /etc/s6-overlay/s6-rc.d/<svc>/flag-essential:
+            // Invalid argument`, which stops an s6-overlay container's boot outright.
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                let full = Self::join_dir_relative_path(&dir_path, &path)?;
+                self.do_access(full, mode, caller)
             }
         }
     }
@@ -2071,30 +5298,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => {
-                    // Any other fd: this used to unconditionally panic, crashing the whole
-                    // runner on something as ordinary as Python's
-                    // `os.readlink(f"/proc/self/fd/{fd}")` (used by e.g. introspection/sandboxing
-                    // libraries to see what a descriptor points to) or a shell's `<()` process
-                    // substitution. If the fd was opened from a real path, return that path (the
-                    // common case: a plain file); otherwise -- a pipe/socket/eventfd/pty/etc,
-                    // none of which have a filesystem path -- fall back to a synthetic
-                    // descriptor string, matching the *spirit* of real Linux's
-                    // "pipe:[12345]"/"socket:[12345]"/"anon_inode:[eventfd]" (without trying to
-                    // replicate its exact per-kind naming or inode numbers).
-                    self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
-                    return Ok(self
-                        .files
-                        .borrow()
-                        .lookup_fd_path(fd as usize)
-                        .and_then(|p| p.into_string().ok())
-                        .unwrap_or_else(|| alloc::format!("anon_inode:[fd{fd}]")));
-                }
+            if fd > 2 {
+                self.check_raw_fd_exists(i32::try_from(fd).map_err(|_| Errno::EBADF)?)?;
             }
+            return Ok(self.proc_fd_target(&self.files.borrow(), fd as usize));
         }
 
         self.files
@@ -2104,12 +5311,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(Errno::from)
     }
 
-    /// Handle syscall `readlink`
     pub fn sys_readlink(&self, pathname: impl path::Arg, buf: &mut [u8]) -> Result<usize, Errno> {
         self.sys_readlinkat(litebox_common_linux::AT_FDCWD, pathname, buf)
     }
 
-    /// Handle syscall `readlinkat`
     pub fn sys_readlinkat(
         &self,
         dirfd: i32,
@@ -2117,7 +5322,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_readlinkat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), path:? = pathname; "sys_readlinkat: entry");
         let result = (|| {
             let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
             let bytes = path.as_bytes();
@@ -2127,10 +5332,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })();
         match &result {
             Ok((len, target)) => {
-                litebox_util_log::debug!(tid:% = self.tid, len:% = len, target:? = target; "sys_readlinkat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), len:% = len, target:? = target; "sys_readlinkat: returning");
             }
             Err(e) => {
-                litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_readlinkat: error");
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_readlinkat: error");
             }
         }
         result.map(|(len, _)| len)
@@ -2185,6 +5390,23 @@ where
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
+            |fd| {
+                // A pty slave stats exactly like its `/dev/pts/<id>` path does, so glibc's
+                // `ttyname()` (fstat(fd) vs stat(readlink(/proc/self/fd/N))) recognizes it.
+                let slave_id = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .and_then(|h| h.with_entry(|end| end.is_slave().then(|| end.pty_id())));
+                Ok(match slave_id {
+                    Some(id) => T::from(litebox::fs::devices::devpts_slave_status(id)),
+                    None => T::from(synthetic(
+                        litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
+                        0,
+                    )),
+                })
+            },
             |_fd| {
                 Ok(T::from(synthetic(
                     litebox_common_linux::InodeType::CharDevice as u32 | rw_user_mode,
@@ -2209,13 +5431,13 @@ where
 
 pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
+    global: &GlobalStateHandle<Platform, FS>,
     files: &FilesState<Platform, FS>,
 ) -> Result<FileDescriptorFlags, Errno> {
     // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
     // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
     fn get_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: &TypedFd<S>,
     ) -> FileDescriptorFlags {
         global
@@ -2235,17 +5457,18 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
     )
 }
 
 fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
+    global: &GlobalStateHandle<Platform, FS>,
     files: &FilesState<Platform, FS>,
     flags: FileDescriptorFlags,
 ) -> Result<(), Errno> {
     fn set_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {
@@ -2266,6 +5489,7 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
     )?;
     Ok(())
 }
@@ -2274,19 +5498,170 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_stat<T: From<litebox::fs::FileStatus>>(
+    /// `FileStatus` for `/dev/pts` and `/dev/pts/<id>`, or `None` if `path` is neither.
+    ///
+    /// These are answered here rather than by the filesystem for the same reason `do_open_resolved`
+    /// intercepts them: a pty pair is live per-open state held in `GlobalState::pty_registry`, which
+    /// the stateless `litebox::fs::devices` table cannot represent. Answering from that registry
+    /// means `stat` agrees exactly with what `open` would do -- a slave that exists stats, one that
+    /// does not gets `ENOENT`, with no approximation either way.
+    ///
+    /// Why it matters: glibc's `openpty` calls `ptsname_r`, which issues `TIOCGPTN`, builds
+    /// `/dev/pts/<n>` and then STATS it before opening it. With nothing answering that stat, the
+    /// stat failed, `openpty` failed, and `xfce4-terminal` reported "error creating pty" -- on a
+    /// shim whose pty subsystem works. `/dev/ptmx` itself is a static node and lives in the device
+    /// table proper; only the dynamic half is here.
+    fn devpts_stat(&self, path: &str) -> Option<litebox::fs::FileStatus> {
+        // The devpts mount point itself. `grantpt` and several shells probe for it to decide
+        // whether ptys are available at all.
+        if path == "/dev/pts" {
+            return Some(litebox::fs::devices::devpts_dir_status());
+        }
+        let id: u32 = path.strip_prefix("/dev/pts/")?.parse().ok()?;
+        // Existence comes from the same registry `pts_open` consults, so `stat` and `open` can
+        // never disagree about a given slave.
+        self.global
+            .pty_exists(id)
+            .then(|| litebox::fs::devices::devpts_slave_status(id))
+    }
+
+    /// Cross-process fallback for a `stat`/`access` miss on `path`: if this process's own
+    /// `SharedUnixAddrPresenceTable` (genuinely cross-process-visible, unlike the writable-layer
+    /// content itself) shows a listening AF_UNIX socket bound at `path` ANYWHERE in the fork
+    /// family, synthesize the same minimal status the OWNING process's own filesystem view
+    /// already gives it, instead of a real (but structurally-blind) `ENOENT`. See
+    /// `litebox::fs::devices::cross_process_bound_unix_socket_status`'s doc comment for the full
+    /// reasoning and the pass that root-caused this.
+    fn cross_process_bound_unix_socket_stat(&self, path: &str) -> Option<litebox::fs::FileStatus> {
+        let owner_pid = self
+            .global
+            .unix_addr_presence
+            .lookup(crate::syscalls::unix::UNIX_ADDR_KIND_PATH, path.as_bytes())?;
+        // `warn!`, not `debug!`: this fires at most a handful of times per real boot (once per
+        // distinct bound-but-locally-invisible path a caller actually stats/accesses), so its
+        // cost is negligible -- and firing at `warn` makes it visible in the project's own
+        // default `LITEBOX_LOG` filter (AGENTS.md: `warn,...fork_verify=error`) without needing
+        // the extremely hot, boot-slowing `syscalls::file=debug` target (every `sys_read` etc.
+        // logs at `debug` too -- confirmed live, twenty-fifth pass, 300+MB/14s of log at that
+        // level on this exact repro).
+        litebox_util_log::warn!(
+            path:% = path, owner_pid:% = owner_pid, self_pid:% = self.pid.get();
+            "DIAG cross_process_bound_unix_socket_stat: synthesizing stat for a sibling-bound AF_UNIX path"
+        );
+        Some(litebox::fs::devices::cross_process_bound_unix_socket_status(path))
+    }
+
+    /// Cross-process fallback for a real local `ENOENT` on `path`: if `SharedFilePublishTable`
+    /// holds a sibling's published content for it, copy that content, byte for byte, into a REAL
+    /// file at `path` in THIS process's own private filesystem view before returning. See
+    /// `syscalls::file::SharedFilePublishTable`'s own doc comment for why this is safe to do
+    /// (unlike `cross_process_bound_unix_socket_stat` above, which can only ever synthesize a
+    /// stat -- a bind path has no bytes to copy, but a short published byte string does). Once
+    /// materialized, every subsequent `stat`/`access`/`open`/`read` in this process sees an
+    /// entirely ordinary local file, with no further special-casing needed anywhere else. Returns
+    /// whether anything was actually materialized (so a caller can retry its real lookup only
+    /// when there is a genuine reason to).
+    fn materialize_shared_publish(&self, path: &str) -> bool {
+        let Some(content) = self.global.shared_file_publish.lookup(path.as_bytes()) else {
+            return false;
+        };
+        let Ok(fd) = self.sys_open(
+            path,
+            OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
+            Mode::RUSR
+                .union(Mode::WUSR)
+                .union(Mode::RGRP)
+                .union(Mode::ROTH),
+        ) else {
+            return false;
+        };
+        let Ok(fd) = i32::try_from(fd) else {
+            return false;
+        };
+        let _ = self.sys_write(fd, &content, None);
+        let _ = self.sys_close(fd);
+        litebox_util_log::warn!(
+            path:% = path, len:% = content.len(), self_pid:% = self.pid.get();
+            "DIAG materialize_shared_publish: copied a sibling's published file content into this \
+             process's own filesystem view"
+        );
+        true
+    }
+
+    /// The descriptor number when `path` is `/proc/self/fd/N`, `/proc/thread-self/fd/N` or this
+    /// process's own `/proc/<pid>/fd/N`. `stat` of such a magic link describes the open file itself
+    /// (a socket, pipe or anonymous file has no path the link could resolve to), which Chromium's
+    /// sandbox helpers rely on when they `fstatat` every entry of `/proc/self/fd`.
+    fn own_proc_fd_number(&self, path: &str) -> Option<usize> {
+        let rest = path.strip_prefix("/proc/")?;
+        let (owner, tail) = rest.split_once('/')?;
+        if owner != "self" && owner != "thread-self" && owner != self.pid.get().to_string() {
+            return None;
+        }
+        tail.strip_prefix("fd/")?.parse().ok()
+    }
+
+    fn do_stat<T: From<litebox::fs::FileStatus> + From<FileStat>>(
         &self,
         pathname: impl path::Arg,
         follow_symlink: bool,
     ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
-        let status = if follow_symlink {
-            let path = self.resolve_final_symlinks(normalized_path)?;
-            self.files.borrow().fs.file_status(path)?
+        if let Some(status) = self.devpts_stat(normalized_path.as_str()) {
+            return Ok(T::from(status));
+        }
+        self.refresh_proc_fd_snapshot(normalized_path.as_str());
+        if follow_symlink && let Some(n) = self.own_proc_fd_number(normalized_path.as_str()) {
+            return descriptor_stat(n, self).map_err(|e| {
+                let kind = self.files.borrow().run_on_raw_fd(
+                    n,
+                    |_| "fs",
+                    |_| "net",
+                    |_| "pipe",
+                    |_| "eventfd",
+                    |_| "epoll",
+                    |_| "unix",
+                    |_| "pty",
+                    |_| "signalfd",
+                    |_| "timerfd",
+                    |_| "netlink",
+                );
+                litebox_util_log::warn!(fd = n, errno:? = e, kind:? = kind; "stat of /proc/self/fd entry failed");
+                Errno::ENOENT
+            });
+        }
+        self.refresh_from_spill(normalized_path.as_str());
+        let lookup_path = if follow_symlink {
+            self.resolve_final_symlinks(normalized_path)?
         } else {
-            self.files.borrow().fs.symlink_metadata(normalized_path)?
+            normalized_path
         };
-        Ok(T::from(status))
+        let status = if follow_symlink {
+            self.files.borrow().fs.file_status(lookup_path.clone())
+        } else {
+            self.files.borrow().fs.symlink_metadata(lookup_path.clone())
+        };
+        match status {
+            Ok(status) => Ok(T::from(status)),
+            Err(litebox::fs::errors::FileStatusError::PathError(
+                litebox::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => {
+                if self.materialize_shared_publish(&lookup_path) {
+                    let retried = if follow_symlink {
+                        self.files.borrow().fs.file_status(lookup_path.clone())
+                    } else {
+                        self.files.borrow().fs.symlink_metadata(lookup_path.clone())
+                    };
+                    if let Ok(status) = retried {
+                        return Ok(T::from(status));
+                    }
+                }
+                self.cross_process_bound_unix_socket_stat(&lookup_path)
+                    .map(T::from)
+                    .ok_or(Errno::ENOENT)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Given an already-normalized absolute path, transparently follow the *final* path
@@ -2331,17 +5706,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Err(Errno::ELOOP)
     }
 
-    /// Handle syscall `stat`
+    /// `path` (absolute) with EVERY symlink expanded, intermediate components and the final one
+    /// alike -- `realpath` without the existence check. Components that do not exist are kept
+    /// as written (a socket about to be `bind`ed has no file yet).
+    pub(crate) fn canonical_path_all_symlinks(&self, path: String) -> Result<String, Errno> {
+        const MAX_SYMLINK_HOPS: u32 = 40;
+        let mut hops = 0;
+        let mut pending: alloc::vec::Vec<String> = path
+            .normalized()?
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .rev()
+            .collect();
+        let mut current = String::new();
+        while let Some(component) = pending.pop() {
+            let candidate = alloc::format!("{current}/{component}");
+            match self.do_readlink(candidate.as_str()) {
+                Ok(target) => {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(Errno::ELOOP);
+                    }
+                    if target.starts_with('/') {
+                        current.clear();
+                    }
+                    for c in target.split('/').filter(|c| !c.is_empty()).rev() {
+                        pending.push(String::from(c));
+                    }
+                }
+                Err(_) => match component.as_str() {
+                    "." => {}
+                    ".." => {
+                        current = current
+                            .rsplit_once('/')
+                            .map_or(String::new(), |(d, _)| String::from(d));
+                    }
+                    _ => current = candidate,
+                },
+            }
+        }
+        Ok(if current.is_empty() {
+            String::from("/")
+        } else {
+            current
+        })
+    }
+
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
-        litebox_util_log::debug!(tid:% = self.tid, path:? = pathname; "sys_stat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), path:? = pathname; "sys_stat: entry");
         let result: Result<FileStat, Errno> = self.do_stat(pathname, true);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_stat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_stat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_stat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error")
+            }
         }
         result
     }
@@ -2356,9 +5779,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_stat(pathname, false)
     }
 
-    /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
-        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd; "sys_fstat: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = fd; "sys_fstat: entry");
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -2366,9 +5788,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
-                litebox_util_log::debug!(tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
+                litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_fstat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error")
+            }
         }
         result
     }
@@ -2382,14 +5806,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         T: From<litebox::fs::FileStatus> + From<FileStat>,
     {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         match fs_path {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                Ok(T::from(self.files.borrow().fs.file_status(get_cwd())?))
+                Ok(T::from(self.files.borrow().fs.file_status(self.rooted_cwd())?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 descriptor_stat(fd as usize, self)
@@ -2403,7 +5826,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `newfstatat`
     pub(crate) fn sys_newfstatat(
         &self,
         dirfd: i32,
@@ -2417,22 +5839,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         litebox_util_log::debug!(
-            tid:% = self.tid, dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
+            tid:% = self.tid.get(), dirfd:% = dirfd, flags:? = flags; "sys_newfstatat: entry"
         );
         let result: Result<FileStat, Errno> = self.do_fstatat(dirfd, pathname, flags);
         match &result {
             Ok(st) => {
                 let (mode, rdev) = (st.st_mode, st.st_rdev);
                 litebox_util_log::debug!(
-                    tid:% = self.tid, mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
+                    tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_newfstatat: returning"
                 );
             }
-            Err(e) => litebox_util_log::debug!(tid:% = self.tid, errno:? = e; "sys_newfstatat: error"),
+            Err(e) => {
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error")
+            }
         }
         result
     }
 
-    /// Handle syscall `statx`
     pub(crate) fn sys_statx(
         &self,
         dirfd: i32,
@@ -2541,37 +5964,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some((a, m)) => self.resolve_utimes_pair(a, m)?,
         };
 
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fs_path = self.fs_path(dirfd, pathname)?;
         let path = match fs_path {
             FsPath::Absolute { path } => path,
-            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                get_cwd().as_str().to_c_str()?.into_owned()
-            }
-            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                self.resolve_dirfd_path(fd)?
-            }
-            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
+            // Unlike most `*at` syscalls, `utimensat` does NOT require `AT_EMPTY_PATH` for the
+            // empty/NULL-path form: `utimensat(fd, NULL, times, 0)` is defined to operate on
+            // `fd` itself, and is exactly what musl's `futimens(fd, times)` compiles down to
+            // (see this function's own doc comment). Gating it on `AT_EMPTY_PATH` made every
+            // such call return `ENOENT`. The flag is still accepted, it is just not required.
+            FsPath::Cwd => self.rooted_cwd().as_str().to_c_str()?.into_owned(),
+            FsPath::Fd(fd) => self.resolve_dirfd_path(fd)?,
             FsPath::FdRelative { fd, path } => {
                 let dir_path = self.resolve_dirfd_path(fd)?;
                 Self::join_dir_relative_path(&dir_path, &path)?
             }
         };
 
-        self.files
+        let result = self
+            .files
             .borrow()
             .fs
-            .set_times(path, atime, mtime)
-            .map_err(Errno::from)
+            .set_times(path.clone(), atime, mtime)
+            .map_err(Errno::from);
+        if result.is_ok() {
+            self.inotify_path(&path, super::inotify::IN_ATTRIB, false);
+        }
+        result
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
+        let arg_dbg = alloc::format!("{arg:?}");
+        let result = self.do_fcntl(fd, arg);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = fd,
+            arg:% = arg_dbg,
+            result:? = result;
+            "sys_fcntl"
+        );
+        result
+    }
+    fn do_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
 
         let files = self.files.borrow();
         match arg {
+            // memfd sealing. `MFD_ALLOW_SEALING` is already accepted on `memfd_create`, so
+            // rejecting the follow-up fcntl would be inconsistent -- and EINVAL would claim the
+            // caller's arguments are malformed rather than that sealing is unavailable. Clients
+            // that seal a buffer before sharing it (the wl_shm idiom) can treat that as a fatal
+            // protocol error. Seals are accepted and reported back, but NOT enforced: nothing
+            // here can write to a guest's memfd behind its back, so the protection a seal buys
+            // on real Linux (guarding against a malicious peer shrinking a shared buffer) has no
+            // corresponding threat in this single-address-space shim.
+            FcntlArg::ADD_SEALS(_) => Ok(0),
+            // Report no seals set. Claiming seals we do not enforce would be worse: a caller
+            // that checks before trusting a buffer would get a false assurance.
+            FcntlArg::GET_SEALS => Ok(0),
             FcntlArg::GETFD => Ok(get_file_descriptor_flags(desc, &self.global, &files)?.bits()),
             FcntlArg::SETFD(flags) => {
                 set_file_descriptor_flags(desc, &self.global, &files, flags).map(|()| 0)
@@ -2604,9 +6055,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(files
                     .run_on_raw_fd(
                         desc,
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+                        // A plain regular-file fd has no `StdioStatusFlags` metadata attached
+                        // (that's only ever set on a re-opened `/dev/stdin`/`/dev/stdout`/
+                        // `/dev/stderr` fd -- see `insert_raw_file_fd_with_path`), so
+                        // `getfl_from_metadata!` here always missed and silently reported
+                        // `O_RDONLY` (0) regardless of the fd's real access mode. Read the actual
+                        // open-time flags the layered fs itself already tracks per fd instead --
+                        // see `layered::FileSystem::open_flags`'s doc comment for the real bug
+                        // this fixes (confirmed live: `xkbcomp`'s `fdopen(fd, "w")` failing on an
+                        // `O_WRONLY`-opened fd because `F_GETFL` lied and reported `O_RDONLY`).
+                        |fd| {
+                            // Two sources, and BOTH are needed. The filesystem knows the flags the
+                            // fd was opened with -- crucially its access mode, which is what the
+                            // comment above is about. The per-description `StdioStatusFlags`
+                            // metadata knows what `F_SETFL` has changed SINCE then.
+                            //
+                            // Reading only the first was a real, silent bug: `F_SETFL` writes that
+                            // metadata and nothing else, so every flag a guest set after open --
+                            // `O_NONBLOCK` above all -- vanished from the very next `F_GETFL`. The
+                            // universal idiom is `flags = F_GETFL; F_SETFL(flags | O_NONBLOCK)`,
+                            // and a library that then re-checks `F_GETFL & O_NONBLOCK` to decide
+                            // whether to use non-blocking reads concluded the fd was still
+                            // blocking. `stdio::tests::test_stdio_flags_with_dup` asserts exactly
+                            // this round-trip and had been failing it invisibly -- the test binary
+                            // was crashing before the failure could be reported.
+                            let mut open_flags = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                            if let Ok(narrowed) = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |ReopenedAccess(a)| *a)
+                            {
+                                open_flags =
+                                    (open_flags & ACCESS_MODE_MASK.complement()) | narrowed;
+                            }
+                            let set = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |crate::StdioStatusFlags(f)| {
+                                    *f & SETFL_MUTABLE_FLAGS
+                                });
+                            Ok(match set {
+                                Ok(set) => (open_flags & SETFL_MUTABLE_FLAGS.complement()) | set,
+                                // No per-description state yet means nothing has called `F_SETFL`
+                                // on this fd, so the open-time flags ARE the current flags.
+                                Err(_) => open_flags,
+                            })
+                        },
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
+                        |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
@@ -2618,11 +6117,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .bits())
             }
             FcntlArg::SETFL(flags) => {
-                let setfl_mask = OFlags::APPEND
-                    | OFlags::NONBLOCK
-                    | OFlags::NDELAY
-                    | OFlags::DIRECT
-                    | OFlags::NOATIME;
+                let setfl_mask = SETFL_MUTABLE_FLAGS;
                 let flags = flags & setfl_mask;
                 macro_rules! toggle_flags {
                     ($fd:ident) => {{
@@ -2677,20 +6172,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // Linux, `fcntl(F_SETFL, ...)` on a regular file is accepted but has no
                         // effect on read/write blocking behavior, so treat a missing-metadata fd
                         // here as a successful no-op rather than an error.
-                        match self
+                        let apply = |f: &mut OFlags| {
+                            let diff = (*f & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            f.toggle(diff);
+                        };
+                        // Bound to a `let` rather than used directly as the `match` scrutinee,
+                        // and this is load-bearing: a temporary in a scrutinee lives for the
+                        // WHOLE `match`, so the `descriptor_table_mut()` write guard would still
+                        // be held inside the `NoSuchMetadata` arm below -- which takes it again.
+                        // `RawRwLock` is not reentrant, so that is an immediate self-deadlock with
+                        // the descriptor table held forever, and every other thread that touches
+                        // an fd piles up behind it. Observed exactly that: a live XFCE session
+                        // stopped dead at ~49s with 20 of 34 host threads parked in
+                        // `RawMutex::block` and nobody holding the lock in a runnable state.
+                        let existing = self
                             .global
                             .litebox
                             .descriptor_table_mut()
-                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
-                                let diff = (*f & setfl_mask) ^ flags;
-                                if diff
-                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
-                                {
-                                    log_unsupported!("unsupported flags");
-                                }
-                                f.toggle(diff);
-                            }) {
-                            Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| apply(f));
+                        match existing {
+                            Ok(()) => Ok(()),
+                            // No per-description status state on this fd yet. This used to be
+                            // reported as success and then DISCARD the write -- so `F_SETFL` was a
+                            // silent no-op on every fd that had not been opened through a
+                            // `/dev/stdin`-style re-open, which is what attaches this metadata (see
+                            // `insert_raw_file_fd_with_path`). Real Linux accepts `F_SETFL` on any
+                            // fd and a later `F_GETFL` reflects it, so create the state instead,
+                            // seeded from the flags the file was actually opened with so the bits
+                            // `F_SETFL` does not govern stay truthful.
+                            Err(MetadataError::NoSuchMetadata) => {
+                                let mut f = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
+                                apply(&mut f);
+                                // `set_entry_metadata`, not `set_fd_metadata`: status flags belong
+                                // to the open file DESCRIPTION, so every fd duplicated from this
+                                // one must see the change -- which is what
+                                // `stdio::tests::test_stdio_flags_with_dup` asserts when it reads
+                                // the flag back through the original fd after setting it on the
+                                // duplicate.
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .set_entry_metadata(fd, crate::StdioStatusFlags(f));
+                                Ok(())
+                            }
                             Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
                         }
                     },
@@ -2726,6 +6253,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                 )??;
                 Ok(0)
             }
@@ -2734,7 +6265,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_fd| {
+                        |fd| {
                             let mut flock =
                                 lock.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                             let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
@@ -2742,10 +6273,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             if let litebox_common_linux::FlockType::Unlock = lock_type {
                                 return Err(Errno::EINVAL);
                             }
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so return `Unlock` unconditionally.
-                            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+                            let key = self.record_lock_key(fd)?;
+                            let (start, end) = Self::record_lock_range(&flock)?;
+                            let me = self.pid.get();
+                            let want_write =
+                                lock_type == litebox_common_linux::FlockType::WriteLock;
+                            let conflict = self
+                                .global
+                                .record_locks()
+                                .lock()
+                                .iter()
+                                .find(|l| {
+                                    l.key == key
+                                        && l.pid != me
+                                        && l.overlaps(start, end)
+                                        && (want_write || l.write)
+                                })
+                                .cloned();
+                            match conflict {
+                                None => {
+                                    flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+                                }
+                                Some(l) => {
+                                    flock.type_ = if l.write {
+                                        litebox_common_linux::FlockType::WriteLock
+                                    } else {
+                                        litebox_common_linux::FlockType::ReadLock
+                                    } as i16;
+                                    flock.whence = 0;
+                                    flock.start = l.start as usize;
+                                    flock.len = if l.end == u64::MAX {
+                                        0
+                                    } else {
+                                        (l.end - l.start) as isize
+                                    };
+                                    flock.pid = l.pid;
+                                }
+                            }
                             lock.write_at_offset::<Platform>(0, flock)
                                 .ok_or(Errno::EFAULT)?;
                             Ok(0)
@@ -2761,21 +6325,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
+                let blocking = matches!(arg, FcntlArg::SETLKW(_));
                 self.files
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_fd| {
+                        |fd| {
                             let flock = lock.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
+                            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so we don't need to maintain anything.
+                            let key = self.record_lock_key(fd)?;
+                            let (start, end) = Self::record_lock_range(&flock)?;
+                            self.do_record_lock(key, lock_type, start, end, blocking)?;
                             Ok(0)
                         },
                         |_fd| Err(Errno::EINVAL),
@@ -2786,8 +6352,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
+            }
+            FcntlArg::SETOWN(_) | FcntlArg::GETOWN => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                Ok(0)
+            }
+            FcntlArg::PIPE_SZ => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                Ok(65536)
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
                 let new_file = self
@@ -2805,9 +6380,129 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         DupFdError::TooManyFiles => Errno::EMFILE,
                         DupFdError::TargetFdExceedsLimit => Errno::EINVAL,
                     })?;
+                // Carry the source fd's recorded path over, exactly as `sys_dup` does. Without
+                // this, an fd duplicated through `fcntl(F_DUPFD)` -- rather than `dup`/`dup2` --
+                // loses the one thing `record_fd_path` exists to provide, and that is precisely
+                // the shape a shell produces: `savefd()` moves its own script fd up out of the way
+                // with `F_DUPFD`, and the result then cannot serve as a `dirfd` for the
+                // `openat`-family syscalls, nor be reopened by a cross-process `fork()` child.
+                // Observed as `/init`'s `preinit` presenting `fd=10 subsystem=file` with no path,
+                // which kept every one of its forks off the cross-process path.
+                {
+                    let files = self.files.borrow();
+                    if let Some(path) = files.lookup_fd_path(desc) {
+                        files.record_fd_path(new_file, path);
+                    }
+                }
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
+        }
+    }
+
+    fn record_lock_key(&self, fd: &TypedFd<FS>) -> Result<(usize, usize), Errno> {
+        let node_info = self
+            .files
+            .borrow()
+            .fs
+            .fd_file_status(fd)
+            .map_err(Errno::from)?
+            .node_info;
+        Ok((node_info.dev, node_info.ino))
+    }
+
+    /// The `[start, end)` byte range an `fcntl` `struct flock` names (`SEEK_SET` semantics;
+    /// `len == 0` means "to end of file").
+    fn record_lock_range(flock: &litebox_common_linux::Flock) -> Result<(u64, u64), Errno> {
+        let start = flock.start as u64;
+        if flock.len == 0 {
+            Ok((start, u64::MAX))
+        } else if flock.len > 0 {
+            Ok((start, start.saturating_add(flock.len as u64)))
+        } else {
+            let len = flock.len.unsigned_abs() as u64;
+            start
+                .checked_sub(len)
+                .map(|s| (s, start))
+                .ok_or(Errno::EINVAL)
+        }
+    }
+
+    /// Applies (or, for `Unlock`, removes) this process's record lock over `start..end`.
+    fn do_record_lock(
+        &self,
+        key: (usize, usize),
+        lock_type: litebox_common_linux::FlockType,
+        start: u64,
+        end: u64,
+        blocking: bool,
+    ) -> Result<(), Errno> {
+        let me = self.pid.get();
+        let try_apply = || -> Result<(), litebox::event::polling::TryOpError<Errno>> {
+            let mut locks = self.global.record_locks().lock();
+            let write = lock_type == litebox_common_linux::FlockType::WriteLock;
+            let unlock = lock_type == litebox_common_linux::FlockType::Unlock;
+            if !unlock
+                && locks.iter().any(|l| {
+                    l.key == key && l.pid != me && l.overlaps(start, end) && (write || l.write)
+                })
+            {
+                return Err(litebox::event::polling::TryOpError::TryAgain);
+            }
+            let mut next = alloc::vec::Vec::with_capacity(locks.len() + 2);
+            for l in locks.iter() {
+                if l.key == key && l.pid == me && l.overlaps(start, end) {
+                    if l.start < start {
+                        next.push(RecordLock {
+                            end: start,
+                            ..l.clone()
+                        });
+                    }
+                    if l.end > end {
+                        next.push(RecordLock {
+                            start: end,
+                            ..l.clone()
+                        });
+                    }
+                } else {
+                    next.push(l.clone());
+                }
+            }
+            if !unlock {
+                next.push(RecordLock {
+                    key,
+                    pid: me,
+                    write,
+                    start,
+                    end,
+                });
+            }
+            *locks = next;
+            Ok(())
+        };
+        let r = self
+            .global
+            .record_lock_pollee()
+            .wait(&self.wait_cx(), !blocking, Events::IN, try_apply)
+            .map_err(|e| match e {
+                litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
+                other => Errno::from(other),
+            });
+        // Any change may unblock a waiter (unlock, downgrade, or a shrunken range).
+        self.global.record_lock_pollee().notify_observers(Events::IN);
+        r
+    }
+
+    /// Drops every record lock this process holds; called when it exits.
+    pub(crate) fn release_record_locks(&self) {
+        let me = self.pid.get();
+        let mut locks = self.global.record_locks().lock();
+        let before = locks.len();
+        locks.retain(|l| l.pid != me);
+        let changed = locks.len() != before;
+        drop(locks);
+        if changed {
+            self.global.record_lock_pollee().notify_observers(Events::IN);
         }
     }
 
@@ -2822,10 +6517,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// every other open file description of the same underlying file).
     ///
     /// This is implemented with two pieces of state:
-    ///   - [`FlockFile`]: one per underlying file (keyed by `(dev, ino)` in
-    ///     `GlobalState::flock_registry`), tracking who currently holds the lock and any waiters.
-    ///     This is the actual contention/mutual-exclusion point, shared across every open file
-    ///     description of that file, matching kernel semantics for independent `open()`s.
+    ///   - [`SharedFlockTable`] (a `GlobalState` field, so genuinely shared by every host process
+    ///     of the fork family): one slot per underlying file, keyed by `(dev, path)` -- the path,
+    ///     because `ino` is renumbered by a cross-process `fork()` child's filesystem rebuild, see
+    ///     [`SharedFlockSlot`]'s doc comment -- tracking who currently holds the lock.
+    ///     This is the actual contention/mutual-exclusion point across PROCESSES, matching kernel
+    ///     semantics for independent `open()`s in different processes -- including a cross-process
+    ///     `fork()` child, which is a different host process here.
+    ///     When that table cannot represent a lock (its fixed capacity is full), `flock()` degrades
+    ///     to [`FlockFile`] below, which excludes within this host process only -- never to a
+    ///     failure the guest could not have provoked on real Linux.
+    ///   - [`FlockFile`]: this host process's own per-file lock state, the pre-`SharedFlockTable`
+    ///     behavior, now only the fallback.
     ///   - A holder id stored in this open file description's `DescriptorEntry`-scoped metadata
     ///     (via `set_entry_metadata`/`with_metadata_mut`, which is exactly LiteBox's existing
     ///     "shared across `dup()`'d fds of the same open, independent across separate `open()`s"
@@ -2833,25 +6536,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///     offsets), identifying *which* open file description currently holds the lock so a
     ///     `LOCK_UN`/re-`LOCK_EX` from the same open file description is idempotent/self-consistent
     ///     rather than contending with itself.
+    ///
+    /// Known deviation from real `flock()`, unchanged by `SharedFlockTable`: a `fork()`ed child that
+    /// INHERITS an already-locked fd gets its own holder id rather than sharing the parent's open
+    /// file description's, so it contends with its parent where real Linux would see one holder.
+    /// Real `flock()` callers that mean to contend open the file themselves (what
+    /// `.wfgy/flockx1.sh`, chromium's profile lock and SQLite all do), which this gets right.
     pub(crate) fn sys_flock(&self, fd: i32, operation: i32) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
 
-        let nonblock = operation & LOCK_NB != 0;
-        let op = operation & !LOCK_NB;
-        if !matches!(op, LOCK_SH | LOCK_EX | LOCK_UN) {
+        let flags = FlockOp::from_bits_retain(operation);
+        let nonblock = flags.contains(FlockOp::NB);
+        let op = flags & !FlockOp::NB;
+        if !matches!(op, FlockOp::SH | FlockOp::EX | FlockOp::UN) {
             return Err(Errno::EINVAL);
         }
+
+        // The path this descriptor was opened with -- the one file identity that survives a
+        // cross-process `fork()`, where `ino` does not (see `SharedFlockSlot`'s own doc comment).
+        // Absent for a descriptor this process has no name for (a memfd, an unlinked file, or one
+        // inherited without its record): the shared table then cannot key it, and `flock()`
+        // degrades to the per-process `FlockFile` below instead of failing the guest.
+        let path = self.files.borrow().lookup_fd_path(desc);
 
         let files = self.files.borrow();
         files
             .run_on_raw_fd(
                 desc,
-                |fd| self.do_flock(fd, op, nonblock),
+                |fd| self.do_flock(fd, op, nonblock, path.as_deref()),
                 // `flock()` on a non-regular-file fd (socket/pipe/eventfd/epoll/unix socket) is
                 // rejected with `EINVAL`, matching Linux (only regular files, directories, and a
                 // handful of special files support `flock()`; none of LiteBox's other fd kinds do).
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -2864,7 +6582,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
-    fn do_flock(&self, fd: &TypedFd<FS>, op: i32, nonblock: bool) -> Result<u32, Errno> {
+    fn do_flock(
+        &self,
+        fd: &TypedFd<FS>,
+        op: FlockOp,
+        nonblock: bool,
+        path: Option<&core::ffi::CStr>,
+    ) -> Result<u32, Errno> {
         let node_info = self
             .files
             .borrow()
@@ -2872,15 +6596,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .fd_file_status(fd)
             .map_err(Errno::from)?
             .node_info;
-        let key = (node_info.dev, node_info.ino);
-
-        let flock_file = {
-            let mut registry = self.global.flock_registry.lock();
-            registry
-                .entry(key)
-                .or_insert_with(|| alloc::sync::Arc::new(FlockFile::new()))
-                .clone()
-        };
+        let dev = node_info.dev;
+        let ino = node_info.ino;
+        // `to_bytes_with_nul` minus its terminator: `core::ffi::CStr` has no `as_bytes` in this
+        // crate's `no_std` build, and the nul is not part of the key.
+        let path: &[u8] = path.map_or(&[], |p| {
+            let with_nul = p.to_bytes_with_nul();
+            &with_nul[..with_nul.len().saturating_sub(1)]
+        });
+        // Host pid + holder id identify this open file description in the shared table: ids come
+        // from `GlobalState::next_flock_holder_id`, which is itself in the shared arena, so two
+        // processes never hand out the same one.
+        let host = self.global.platform.current_host_pid();
 
         // The holder id identifies this open file description (not this fd number) to the
         // `FlockFile`. It is stored as entry-shared metadata so it is visible to (and shared by)
@@ -2897,7 +6624,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .next_flock_holder_id
                     .fetch_add(1, Ordering::Relaxed);
-                let h = FlockHolderInner::new(id, flock_file.clone());
+                let h = FlockHolderInner::new(
+                    id,
+                    host,
+                    dev,
+                    path,
+                    self.global.shared_flock.region_addr(),
+                );
                 dt.set_entry_metadata(fd, h.clone());
                 h
             }
@@ -2905,19 +6638,63 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(dt);
 
         match op {
-            LOCK_SH => flock_file.lock_shared(&self.wait_cx(), holder.id, nonblock),
-            LOCK_EX => flock_file.lock_exclusive(&self.wait_cx(), holder.id, nonblock),
-            LOCK_UN => {
-                flock_file.unlock(holder.id);
+            FlockOp::UN => {
+                holder.release();
                 Ok(0)
+            }
+            FlockOp::SH | FlockOp::EX => {
+                let exclusive = op == FlockOp::EX;
+                // Diagnostic A/B only: `LITEBOX_FLOCK_SHARED_OFF=1` skips the cross-process table,
+                // so one binary can be measured both with it and with the pre-`SharedFlockTable`
+                // per-process behaviour it replaced.
+                if !self.global.platform.env_flag("LITEBOX_FLOCK_SHARED_OFF") {
+                    let table = &self.global.shared_flock;
+                    if let Some(res) = table.lock(
+                        self.global.platform,
+                        dev,
+                        path,
+                        host,
+                        holder.id,
+                        exclusive,
+                        nonblock,
+                        // Signals (and an exiting task) interrupt a blocked `flock(2)`, as on real
+                        // Linux: checked once per wait chunk, so delivery latency is bounded by
+                        // `SHARED_FLOCK_WAIT_CHUNK`, not by the unlock.
+                        &|| self.check_for_interrupt(),
+                    ) {
+                        return res.map(|()| 0);
+                    }
+                }
+                // Fallback: this host process's own registry (per-process exclusion only, the
+                // pre-`SharedFlockTable` behavior). The `Arc<FlockFile>` is also stashed on the
+                // holder so its `Drop` -- which cannot reach this registry -- can release it.
+                let file = {
+                    let mut registry = self.global.flock_registry.lock();
+                    registry
+                        .entry((dev, ino))
+                        .or_insert_with(|| alloc::sync::Arc::new(FlockFile::new()))
+                        .clone()
+                };
+                *holder.local.lock() = Some(file.clone());
+                if exclusive {
+                    file.lock_exclusive(&self.wait_cx(), holder.id, nonblock)
+                } else {
+                    file.lock_shared(&self.wait_cx(), holder.id, nonblock)
+                }
             }
             _ => Err(Errno::EINVAL),
         }
     }
 
     /// Handle syscall `getcwd`
+    ///
+    /// The CWD is an absolute path in root-space already (see [`FsState::cwd`]), so this is it
+    /// verbatim: inside a chroot, the root directory reads as "/".
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let cwd = self.fs.borrow().cwd.read().clone();
+        let mut cwd = self.fs.borrow().cwd.read().clone();
+        if cwd.len() > 1 && cwd.ends_with('/') {
+            cwd.pop();
+        }
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);
@@ -2937,11 +6714,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         use litebox::fs::errors::{FileStatusError, PathError};
         use litebox::path::Arg as _;
 
-        // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
         let resolved = self.resolve_path(pathname)?;
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        // `chdir` follows a symlink in the final component (`chdir link-to-dir` is how
+        // `s6-supervise` enters each `/run/service/<name> -> servicedir`); `file_status` does not.
+        let abs_path = self.resolve_final_symlinks(abs_path)?;
 
-        // Verify the path exists and is a directory.
         match self.files.borrow().fs.file_status(abs_path.as_str()) {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
@@ -2959,13 +6737,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Ensure the CWD ends with '/'.
-        let mut new_cwd = abs_path;
+        // The fs backend sees the root prefix; the CWD is stored the way the GUEST spells it, so
+        // it is translated back here (inside a chroot, the root directory itself is "/"). A path
+        // that is not inside the root at all -- reachable only through a relative `chdir` from a
+        // CWD the `chroot` left outside it -- has no guest spelling, hence `ENOENT`.
+        let root = self.fs.borrow().root.read().clone();
+        let mut new_cwd = strip_root(&root, &abs_path)?;
         if !new_cwd.ends_with('/') {
             new_cwd.push('/');
         }
 
         *self.fs.borrow().cwd.write() = new_cwd;
+        Ok(())
+    }
+
+    /// Handle syscall `chroot`
+    ///
+    /// The root is kept on [`FsState`], which `CLONE_FS` shares by `Arc`, so a `clone(CLONE_FS)`
+    /// child's `chroot` changes the root of every task sharing that state -- parent included. That
+    /// is the whole point for Chromium, whose zygote drops filesystem access by `chroot`-ing inside
+    /// a `CLONE_FS | CLONE_VFORK` child and then carrying on, rooted, in the parent.
+    pub fn sys_chroot(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::path::Arg as _;
+
+        // `CAP_SYS_CHROOT` is capability 18. Root in the initial user namespace holds it; so does
+        // the owner of a user namespace, which holds every capability inside its own namespace.
+        const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
+        let creds = self.creds();
+        let permitted =
+            creds.cap_eff & CAP_SYS_CHROOT_BIT != 0 || (creds.uid_map.is_none() && creds.euid == 0);
+        if !permitted {
+            return Err(Errno::EPERM);
+        }
+
+        // Resolved against the CURRENT root, exactly as `chdir` is: the target of a `chroot` is
+        // looked up the way the caller can see the filesystem right now, not in the backend's own
+        // coordinates.
+        let resolved = self.resolve_path(pathname)?;
+        let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        let abs_path = self.resolve_final_symlinks(abs_path)?;
+
+        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+            Ok(status) => {
+                if status.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                return Err(Errno::ENOENT);
+            }
+            Err(FileStatusError::PathError(_)) => {
+                return Err(Errno::EACCES);
+            }
+            Err(_) => {
+                return Err(Errno::ENOENT);
+            }
+        }
+
+        // Ensure the root ends with '/', so `join_root` can concatenate onto it directly.
+        let mut new_root = abs_path;
+        if !new_root.ends_with('/') {
+            new_root.push('/');
+        }
+
+        *self.fs.borrow().root.write() = new_root;
         Ok(())
     }
 
@@ -3002,7 +6839,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        let mut new_cwd = abs_path;
+        // The fs backend sees the root prefix; the CWD is stored the way the GUEST spells it, so
+        // it is translated back here -- a directory reached through an fd opened before a `chroot`
+        // lies outside the root and has no guest spelling, hence `ENOENT`.
+        let root = self.fs.borrow().root.read().clone();
+        let mut new_cwd = strip_root(&root, &abs_path)?;
         if !new_cwd.ends_with('/') {
             new_cwd.push('/');
         }
@@ -3013,7 +6854,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let pipe = self.global.create_linux_pipe(flags)?;
 
@@ -3032,6 +6872,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.close_linux_pipe(&reader).unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            rd_fd:% = rd_raw_fd,
+            wr_fd:% = wr_raw_fd;
+            "sys_pipe2: created"
+        );
         Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
     }
 
@@ -3108,6 +6954,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         })
                     },
                     |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
                 )
                 .flatten()?;
             Ok(fd.try_into().unwrap())
@@ -3138,17 +6985,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = raw_fd,
+            initval:% = initval;
+            "sys_eventfd2: created"
+        );
         Ok(raw_fd.try_into().unwrap())
     }
 
     /// Handle syscall `timerfd_create`. See `syscalls::timerfd`'s module doc comment for the
     /// scope of what this shim's timerfd support actually covers.
-    pub fn sys_timerfd_create(&self, flags: TfdFlags) -> Result<u32, Errno> {
+    pub fn sys_timerfd_create(&self, clockid: i32, flags: TfdFlags) -> Result<u32, Errno> {
         if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
+        // Only CLOCK_REALTIME and CLOCK_MONOTONIC are meaningfully distinct here (see
+        // `TimerfdFile::new`'s `is_realtime` doc comment) -- every other real clockid
+        // (BOOTTIME, MONOTONIC_RAW, etc.) behaves like CLOCK_MONOTONIC for this shim's purposes
+        // (all backed by the same `Platform::Instant`), matching how `sys_clock_gettime` already
+        // narrows the same set of clockids elsewhere in this crate.
+        let is_realtime = clockid == i32::from(litebox_common_linux::ClockId::RealTime);
 
-        let timerfd = super::timerfd::TimerfdFile::new(self.global.platform, flags);
+        let timerfd = super::timerfd::TimerfdFile::new(self.global.platform, flags, is_realtime);
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::timerfd::TimerfdSubsystem<Platform>>(timerfd);
         if flags.contains(TfdFlags::CLOEXEC) {
@@ -3165,10 +7024,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = raw_fd;
+            "sys_timerfd_create: created"
+        );
         Ok(raw_fd.try_into().unwrap())
     }
 
-    /// Handle syscall `timerfd_settime`.
     pub fn sys_timerfd_settime(
         &self,
         fd: i32,
@@ -3176,13 +7039,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_value: UserPtr<ItimerSpec>,
         old_value: Option<UserPtrMut<ItimerSpec>>,
     ) -> Result<(), Errno> {
-        if flags.intersects((TfdSettimeFlags::TIMER_ABSTIME | TfdSettimeFlags::TIMER_CANCEL_ON_SET).complement())
-        {
+        if flags.intersects(
+            (TfdSettimeFlags::TIMER_ABSTIME | TfdSettimeFlags::TIMER_CANCEL_ON_SET).complement(),
+        ) {
             return Err(Errno::EINVAL);
         }
-        let new = new_value.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let new = new_value
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
         let interval = core::time::Duration::try_from(new.it_interval)?;
         let value = core::time::Duration::try_from(new.it_value)?;
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fd:% = fd,
+            flags:? = flags,
+            interval:? = interval,
+            value:? = value;
+            "sys_timerfd_settime: entry"
+        );
 
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -3210,13 +7084,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let now = self.global.platform.now();
                         let deadline = if value.is_zero() {
                             None
+                        } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME)
+                            && !file.is_realtime()
+                        {
+                            // `value` is an absolute deadline against this fd's own `CLOCK_MONOTONIC`
+                            // (or equivalent) domain -- i.e. a duration since the same monotonic
+                            // reference point `self.global.boot_time` anchors (see
+                            // `gettime_as_duration`'s identical `ClockId::Monotonic` handling).
+                            // Getting this branch wrong (previously: always treating `value` as a
+                            // realtime/wall-clock epoch timestamp regardless of the fd's real
+                            // clockid) meant a monotonic-relative deadline like "327s since boot"
+                            // compared as far in the past against a ~1.7-billion-second wall-clock
+                            // "now", firing the timer immediately instead of ~327s in the future --
+                            // see `TimerfdFile::is_realtime`'s doc comment for the confirmed-live
+                            // symptom this produced.
+                            self.global.boot_time.checked_add(value)
                         } else if flags.contains(TfdSettimeFlags::TIMER_ABSTIME) {
                             // `value` is an absolute deadline since the epoch (real
-                            // `timerfd_settime`'s `TFD_TIMER_ABSTIME`, measured against whichever
-                            // clockid the fd was created with -- this shim, like every other
-                            // narrow real-time-vs-monotonic distinction in this crate, only
-                            // tracks monotonic time). Convert by comparing against the current
-                            // wall-clock reading and applying the same offset to `now`.
+                            // `timerfd_settime`'s `TFD_TIMER_ABSTIME` against `CLOCK_REALTIME`).
+                            // Convert by comparing against the current wall-clock reading and
+                            // applying the same offset to `now`.
                             let wall_now = self.real_time_as_duration_since_epoch();
                             if value > wall_now {
                                 now.checked_add(value - wall_now)
@@ -3229,6 +7116,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Ok(file.set_time(deadline, interval))
                     })
                 },
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()?;
 
@@ -3245,7 +7133,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `timerfd_gettime`.
     pub fn sys_timerfd_gettime(
         &self,
         fd: i32,
@@ -3275,6 +7162,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     Ok(handle.with_entry(super::timerfd::TimerfdFile::get_time))
                 },
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()?;
         curr_value
@@ -3308,6 +7196,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// real Linux (nothing is mmapped until the client calls `ftruncate`); `sys_ftruncate`
     /// creates/resizes the real handle lazily on first (or later) growth.
     pub fn sys_memfd_create(&self, flags: MfdFlags) -> Result<u32, Errno> {
+        litebox_util_log::debug!(flags:? = flags; "sys_memfd_create: entry");
         if flags.intersects(
             (MfdFlags::CLOEXEC
                 | MfdFlags::ALLOW_SEALING
@@ -3316,6 +7205,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | MfdFlags::EXEC)
                 .complement(),
         ) {
+            litebox_util_log::debug!("sys_memfd_create: EINVAL, bad flags");
             return Err(Errno::EINVAL);
         }
         let id = self.global.next_memfd_id.fetch_add(1, Ordering::Relaxed);
@@ -3323,16 +7213,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rootfs -- the path is unlinked immediately below regardless, so where it briefly lives
         // is never guest-observable.
         let path = alloc::format!("/.memfd:{id}");
-        let file = self.do_open(
-            path.as_str(),
-            OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
-            Mode::from_bits_truncate(0o600),
-        )?;
+        // Creating and unlinking the backing name is the kernel's own bookkeeping, never subject
+        // to the caller's permissions on `/`: an unprivileged `memfd_create` must work.
+        let _root = litebox::fs::ident::root_guard();
+        let file = self
+            .do_open(
+                path.as_str(),
+                OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
+                Mode::from_bits_truncate(0o600),
+            )
+            .inspect_err(|e| {
+                litebox_util_log::debug!(err:? = e; "sys_memfd_create: do_open failed");
+            })?;
         // Unlink immediately -- the fd stays valid (see this method's own doc comment), but the
         // path is gone before any guest code could ever observe/race it.
         let files = self.files.borrow();
         files.fs.unlink(path.as_str()).map_err(|e| {
             let _ = files.fs.close(&file);
+            litebox_util_log::debug!(err:? = e; "sys_memfd_create: unlink failed");
             Errno::from(e)
         })?;
         drop(files);
@@ -3346,7 +7244,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         assert!(old.is_none());
         drop(dt);
 
-        self.insert_raw_file_fd_with_path(file, OFlags::empty(), None)
+        let result = self.insert_raw_file_fd_with_path(file, OFlags::empty(), None);
+        litebox_util_log::debug!(result:? = result; "sys_memfd_create: returning");
+        result
     }
 
     /// Handle a `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ` ioctl on a stdio fd.
@@ -3401,14 +7301,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            // Both are pty-specific: meaningless (and `ENOTTY` on real Linux) for a plain stdio
-            // fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
-            IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCSPTLCK(_) => Err(Errno::ENOTTY),
+            // All four are ptmx-master-specific: meaningless (and `ENOTTY` on real Linux) for a
+            // plain stdio fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
+            IoctlArg::TIOCGPTN(_)
+            | IoctlArg::TIOCSPTLCK(_)
+            | IoctlArg::TIOCGPTPEER(_)
+            | IoctlArg::TIOCPKT(_) => Err(Errno::ENOTTY),
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let dt = self.global.litebox.descriptor_table();
                 let pgid = dt
                     .with_metadata(fd, |p: &crate::ForegroundPgid| p.0)
-                    .unwrap_or(self.pid);
+                    .unwrap_or(self.pid.get());
                 pgrp_ptr
                     .write_at_offset::<Platform>(0, pgid)
                     .ok_or(Errno::EFAULT)?;
@@ -3446,14 +7349,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle a `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCSWINSZ`/`TIOCGPTN`/`TIOCSPTLCK`/
-    /// `TIOCGPGRP`/`TIOCSPGRP` ioctl on a pty fd (master or slave).
+    /// `TIOCGPTPEER`/`TIOCGPGRP`/`TIOCSPGRP` ioctl on a pty fd (master or slave).
     ///
-    /// `TIOCGPTN`/`TIOCSPTLCK` are master-only (matching real Linux, which returns `ENOTTY` for
-    /// them on the slave); every other command works on both sides, reading/writing the state
+    /// `TIOCGPTN`/`TIOCSPTLCK`/`TIOCGPTPEER` are master-only (matching real Linux, which returns
+    /// `ENOTTY` for them on the slave); every other command works on both sides, reading/writing the state
     /// shared on the pty's [`super::pty::PtyPair`] so master and slave observe the same tty
     /// state, exactly as real Linux's master/slave pair do.
     fn pty_ioctl(&self, end: &super::pty::PtyEnd<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
-        let pair = end.pair();
+        let pair = end.pty_state(&self.global.shared_pty);
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
                 termios_ptr
@@ -3484,7 +7387,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if !end.is_master() {
                     return Err(Errno::ENOTTY);
                 }
-                ptr.write_at_offset::<Platform>(0, pair.id)
+                ptr.write_at_offset::<Platform>(0, pair.id())
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
@@ -3496,9 +7399,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pair.set_locked(val != 0);
                 Ok(0)
             }
+            // Atomically open the peer (slave) and return its fd directly as this ioctl's
+            // result -- the fast path real glibc's `openpty()` actually takes (see the variant's
+            // doc comment in `litebox_common_linux`). Reuses `GlobalState::pts_open`, the exact
+            // function `open("/dev/pts/<id>")` itself calls, so the two paths agree on
+            // everything: the `EIO`-while-locked check, the shared underlying entry, all of it.
+            IoctlArg::TIOCGPTPEER(flags) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                let flags = OFlags::from_bits_truncate(*flags as u32);
+                let slave = self.global.pts_open(pair.id())?;
+                let path = alloc::ffi::CString::new(alloc::format!("/dev/pts/{}", pair.id()))
+                    .map_err(|_| Errno::EINVAL)?;
+                self.insert_raw_pty_fd(slave, flags, path)
+            }
+            IoctlArg::TIOCPKT(ptr) => {
+                if !end.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
+                let val = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                pair.set_packet_mode(val != 0);
+                Ok(0)
+            }
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let pgid = match pair.get_fg_pgid() {
-                    0 => self.pid,
+                    0 => self.pid.get(),
                     pgid => pgid,
                 };
                 pgrp_ptr
@@ -3566,6 +7492,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `fd` refers to an evdev input device node (`/dev/input/event0`, major 13 -- see
     /// `litebox::fs::devices::InputDevice`'s node-info constants), mirroring
     /// [`Self::is_dri_device`]'s identical major-number-check shape.
+    /// Classify a file descriptor's special-device identity in ONE `fd_file_status` call.
+    ///
+    /// `read()` previously asked [`Self::is_dri_device`] and then [`Self::is_input_device`]
+    /// separately, and each performs its own full `fd_file_status` stat -- so every read of every
+    /// fd paid TWO stats purely to discover it was an ordinary file. Live trace of one busybox
+    /// exec: 386 reads, and the checks fire on each. Both tests read the same two fields
+    /// (`rdev`'s major number and `file_type`), so one lookup answers both.
+    ///
+    /// Returns `(is_dri, is_input)`.
+    pub(crate) fn classify_device_fd(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+    ) -> Result<(bool, bool), Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let is_char = status.file_type == litebox::fs::FileType::CharacterDevice;
+                // Non-character-device fds -- the overwhelming majority, every regular file,
+                // pipe and socket -- can skip the major-number arithmetic entirely.
+                if !is_char {
+                    return Ok((false, false));
+                }
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                litebox_util_log::debug!(
+                    tid:% = self.tid.get(),
+                    rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
+                    file_type:? = status.file_type;
+                    "classify_device_fd: character device"
+                );
+                Ok((major == 226, major == 13))
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
     pub(crate) fn is_input_device(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
@@ -3573,7 +7535,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let is_input =
                     major == 13 && status.file_type == litebox::fs::FileType::CharacterDevice;
                 litebox_util_log::debug!(
-                    tid:% = self.tid,
+                    tid:% = self.tid.get(),
                     rdev:? = status.node_info.rdev.map(|v| (v.get() >> 8, v.get() & 0xff)),
                     file_type:? = status.file_type,
                     is_input:% = is_input;
@@ -3600,13 +7562,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
 
-        litebox_util_log::debug!(tid:% = self.tid, fd:% = fd, arg:? = arg; "sys_ioctl: entry");
+        litebox_util_log::debug!(tid:% = self.tid.get(), fd:% = fd, arg:? = arg; "sys_ioctl: entry");
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONBIO(arg) => {
@@ -3616,20 +7577,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         desc,
                         |file_fd| {
-                            // Mirrors `FcntlArg::SETFL`'s raw-fd branch: most fds dispatched here
-                            // are plain regular files carrying no `StdioStatusFlags` metadata at
-                            // all (real Linux accepts `ioctl(FIONBIO)` on a regular file as a
-                            // no-op too), so a missing-metadata result is success, not an error.
-                            // For stdio fds this is what makes `do_read`'s non-blocking-stdin
-                            // check observe the flag `FIONBIO` set, not just `fcntl(F_SETFL)`.
-                            match self
+                            // `ioctl(FIONBIO)` is the other way a guest sets `O_NONBLOCK`, and it
+                            // must leave the fd in the same state `fcntl(F_SETFL)` would -- the
+                            // two are interchangeable on real Linux, and `do_read`'s
+                            // non-blocking-stdin check reads whichever one of them ran last.
+                            //
+                            // Previously a missing-metadata result was reported as success and the
+                            // write discarded, which made `FIONBIO` a silent no-op on every fd not
+                            // opened through a `/dev/stdin`-style re-open. Create the state
+                            // instead, seeded from the flags the file was opened with, exactly as
+                            // `F_SETFL`'s raw-fd branch now does.
+                            //
+                            // Bound to a `let`, not used as the `match` scrutinee: a scrutinee
+                            // temporary lives for the whole `match`, and the arm below takes the
+                            // same non-reentrant write lock. See `F_SETFL`'s own comment for the
+                            // deadlock that shape produced.
+                            let existing = self
                                 .global
                                 .litebox
                                 .descriptor_table_mut()
                                 .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
                                     flags.set(OFlags::NONBLOCK, val != 0);
-                                }) {
-                                Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                                });
+                            match existing {
+                                Ok(()) => Ok(()),
+                                Err(MetadataError::NoSuchMetadata) => {
+                                    let mut flags =
+                                        files.fs.open_flags(file_fd).unwrap_or(OFlags::empty());
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                    self.global
+                                        .litebox
+                                        .descriptor_table_mut()
+                                        .set_entry_metadata(
+                                            file_fd,
+                                            crate::StdioStatusFlags(flags),
+                                        );
+                                    Ok(())
+                                }
                                 Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
                             }
                         },
@@ -3654,7 +7638,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                         |fd| {
                             self.global
-                                .pipes
+                                .pipes()
                                 .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                 .map_err(Errno::from)
                         },
@@ -3730,18 +7714,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             });
                             Ok(())
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
                     )
                     .flatten()?;
                 Ok(0)
             }
-            IoctlArg::FIOCLEX => files.run_on_raw_fd(
+            IoctlArg::FIONREAD(out) => {
+                // A pipe (inotify descriptors included) reports its queued bytes.
+                let pipe_bytes = files
+                    .run_on_raw_fd(
+                        desc,
+                        |_| None,
+                        |_| None,
+                        |pipe| self.global.pipes().readable_bytes(pipe).ok(),
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                        |_| None,
+                    )
+                    .ok()
+                    .flatten();
+                if let Some(n) = pipe_bytes {
+                    out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
+                        .ok_or(Errno::EFAULT)?;
+                    return Ok(0);
+                }
+                let n = files.with_socket(
+                    &self.global,
+                    u32::try_from(desc).map_err(|_| Errno::EBADF)?,
+                    |fd| {
+                        let proxy = self.global.get_proxy(fd)?;
+                        Ok(proxy.pending_rx_bytes())
+                    },
+                    |_unix| Err(Errno::EINVAL),
+                )?;
+                out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::FIOASYNC(_) => {
+                self.check_raw_fd_exists(i32::try_from(desc).map_err(|_| Errno::EBADF)?)?;
+                Ok(0)
+            }
+            IoctlArg::FIOCLEX | IoctlArg::FIONCLEX => {
+                // Descriptor-table-level flag, identical for every fd kind. `FIONCLEX` clears it;
+                // Python's `os.set_inheritable(fd, True)` (uvloop's subprocess stdio redirect)
+                // uses it and only falls back to `fcntl` on ENOTTY, so EINVAL here broke every
+                // uvloop/asyncio subprocess spawn.
+                let flags = if matches!(arg, IoctlArg::FIOCLEX) {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                };
+                files.run_on_raw_fd(
                 desc,
                 |fd| {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3754,7 +7800,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3762,7 +7808,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3770,7 +7816,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3778,7 +7824,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3786,7 +7832,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3794,7 +7840,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3802,7 +7848,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
                 |fd| {
@@ -3810,10 +7856,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .litebox
                         .descriptor_table_mut()
-                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        .set_fd_metadata(fd, flags);
                     Ok(0)
                 },
-            )?,
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, flags);
+                    Ok(0)
+                })?
+            }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
@@ -3823,6 +7877,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCSPTLCK(..)
             | IoctlArg::TIOCSCTTY(..)
+            | IoctlArg::TIOCGPTPEER(..)
+            | IoctlArg::TIOCPKT(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..) => files.run_on_raw_fd(
                 desc,
@@ -3869,6 +7925,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
             )?,
             IoctlArg::DrmModeGetResources(..)
             | IoctlArg::DrmModeGetCrtc(..)
@@ -3878,8 +7935,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmModeCreateDumb(..)
             | IoctlArg::DrmModeMapDumb(..)
             | IoctlArg::DrmModeDestroyDumb(..)
+            | IoctlArg::DrmModeAddFb(..)
             | IoctlArg::DrmModeAddFb2(..)
             | IoctlArg::DrmModePageFlip(..)
+            | IoctlArg::DrmModeDirtyFb(..)
             | IoctlArg::DrmModeGetPlaneResources(..)
             | IoctlArg::DrmModeGetPlane(..)
             | IoctlArg::DrmModeSetPlane(..)
@@ -3888,8 +7947,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | IoctlArg::DrmSetClientCap(..)
             | IoctlArg::DrmSetMaster
             | IoctlArg::DrmDropMaster
+            | IoctlArg::DrmGetMagic(..)
+            | IoctlArg::DrmAuthMagic(..)
             | IoctlArg::DrmModeObjGetProperties(..)
-            | IoctlArg::DrmModeGetProperty(..) => files.run_on_raw_fd(
+            | IoctlArg::DrmModeGetProperty(..)
+            | IoctlArg::DrmModeConnectorSetProperty(..)
+            | IoctlArg::DrmModeObjSetProperty(..)
+            | IoctlArg::DrmModeGetPropBlob(..)
+            | IoctlArg::DrmPrimeHandleToFd(..)
+            | IoctlArg::DrmPrimeFdToHandle(..)
+            | IoctlArg::DrmGemClose(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_dri_device(&files.fs, fd)? {
@@ -3906,9 +7973,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
             )?,
-            IoctlArg::VtGetState(..)
+            IoctlArg::VtOpenQry(..)
+            | IoctlArg::VtGetMode(..)
             | IoctlArg::VtSetMode(..)
+            | IoctlArg::VtGetState(..)
+            | IoctlArg::VtActivate(..)
+            | IoctlArg::VtWaitActive(..)
             | IoctlArg::KdSetMode(..)
             | IoctlArg::KdSkbMode(..) => files.run_on_raw_fd(
                 desc,
@@ -3919,6 +7991,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Err(Errno::ENOTTY)
                     }
                 },
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -3947,6 +8020,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
             )?,
             IoctlArg::EvdevGetVersion(ptr) => {
                 files.run_on_raw_fd(
@@ -3958,6 +8032,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Err(Errno::ENOTTY)
                         }
                     },
+                    |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
@@ -3989,6 +8064,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
                 )??;
                 let id = litebox_common_linux::InputId {
                     bustype: litebox_common_linux::BUS_VIRTUAL,
@@ -3996,7 +8072,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     product: 0,
                     version: 0,
                 };
-                ptr.write_at_offset::<Platform>(0, id).ok_or(Errno::EFAULT)?;
+                ptr.write_at_offset::<Platform>(0, id)
+                    .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::EvdevGetBits { ev, len, arg: ptr } => {
@@ -4009,6 +8086,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Err(Errno::ENOTTY)
                         }
                     },
+                    |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
@@ -4055,7 +8133,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let write_len = usize::try_from(len).unwrap_or(0).min(bits.len());
                 ptr.write_slice_at_offset::<Platform>(0, &bits[..write_len])
                     .ok_or(Errno::EFAULT)?;
-                Ok(0)
+                // Real `EVIOCGBIT` returns the number of bytes actually written, not a bare
+                // success code -- `libevdev_new_from_fd`'s capability sync reads this return
+                // value to know how many bytes of the bitmask are valid, so returning 0 here
+                // told libevdev every event type had zero capability bytes regardless of what
+                // was actually written to the buffer.
+                Ok(u32::try_from(write_len).unwrap_or(0))
             }
             IoctlArg::EvdevGetName { len, arg: ptr } => {
                 files.run_on_raw_fd(
@@ -4067,6 +8150,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Err(Errno::ENOTTY)
                         }
                     },
+                    |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
@@ -4106,6 +8190,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
                 )??;
                 // This synthetic device has no physical-location/unique-ID string, matching real
                 // uinput/virtual-device behavior -- `ENOENT` here is what `libevdev_new_from_fd()`
@@ -4130,6 +8215,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
                 )??;
                 // A plain keyboard+mouse device has no `INPUT_PROP_*` bits set (only
                 // touchpads/pointing-sticks/direct-input devices set any) -- an all-zero
@@ -4137,7 +8223,92 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
                 ptr.write_slice_at_offset::<Platform>(0, &bits)
                     .ok_or(Errno::EFAULT)?;
-                Ok(0)
+                // See `EvdevGetBits`'s matching fix: real `EVIOCGPROP` also returns the byte
+                // count written, not a bare success code.
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetKey { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // No keys are currently held down on this synthetic device -- an all-zero
+                // bitmap is the correct, real answer, matching real hardware at attach time.
+                // Real `EVIOCGKEY` returns the byte count written, same as `EVIOCGBIT`/
+                // `EVIOCGPROP`.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetLed { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // No LEDs are lit on this synthetic device -- an all-zero bitmap is the
+                // correct, real answer, matching real hardware at attach time.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
+            }
+            IoctlArg::EvdevGetSwitch { len, arg: ptr } => {
+                files.run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        if self.is_input_device(&files.fs, fd)? {
+                            Ok(())
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )??;
+                // No switches are active on this synthetic device -- an all-zero bitmap is
+                // the correct, real answer, matching real hardware at attach time.
+                let bits = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                ptr.write_slice_at_offset::<Platform>(0, &bits)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(u32::try_from(bits.len()).unwrap_or(0))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
@@ -4150,8 +8321,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// caller) to [`crate::syscalls::vt`].
     fn vt_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
         match arg {
-            IoctlArg::VtGetState(ptr) => crate::syscalls::vt::get_state::<Platform>(*ptr),
+            IoctlArg::VtOpenQry(ptr) => crate::syscalls::vt::open_qry::<Platform>(*ptr),
+            IoctlArg::VtGetMode(ptr) => crate::syscalls::vt::get_mode::<Platform>(*ptr),
             IoctlArg::VtSetMode(ptr) => crate::syscalls::vt::set_mode::<Platform>(*ptr),
+            IoctlArg::VtGetState(ptr) => crate::syscalls::vt::get_state::<Platform>(*ptr),
+            IoctlArg::VtActivate(vt) => crate::syscalls::vt::activate(*vt),
+            IoctlArg::VtWaitActive(vt) => crate::syscalls::vt::wait_active(*vt),
             IoctlArg::KdSetMode(mode) => crate::syscalls::vt::set_mode_kd(*mode),
             IoctlArg::KdSkbMode(mode) => crate::syscalls::vt::set_kbmode(*mode),
             _ => unreachable!("vt_ioctl only ever called for VT/KD ioctl variants"),
@@ -4161,10 +8336,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Dispatch a `DRM_IOCTL_MODE_*` request (already confirmed to target a real DRI device fd
     /// by the caller) to the shim-wide [`crate::syscalls::drm::DrmSubsystem`].
     fn drm_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+        // Every DRM ioctl funnels through here, so this one line makes the whole
+        // guest<->KMS conversation visible. Gated behind `LITEBOX_DRM_TRACE=1` so it
+        // costs nothing by default: an ungated per-ioctl log floods a real session
+        // (page flips arrive at vblank rate) and has previously throttled the
+        // emulator badly enough to change what is being measured.
+        if crate::syscalls::drm::drm_trace_enabled() {
+            litebox_util_log::debug!(pid:% = self.pid.get(), ioctl:? = arg; "diag-drm-ioctl");
+        }
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
-            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(*ptr),
+            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(self.global.platform, *ptr),
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
             IoctlArg::DrmModeCreateDumb(ptr) => {
@@ -4174,8 +8357,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeDestroyDumb(ptr) => {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
+            IoctlArg::DrmModeAddFb(ptr) => self.global.drm.add_fb(*ptr),
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
-            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(self.global.platform, *ptr),
+            IoctlArg::DrmModePageFlip(ptr) => {
+                self.global
+                    .drm
+                    .page_flip(self.global.platform, &self.global.boot_time, *ptr)
+            }
+            IoctlArg::DrmModeDirtyFb(ptr) => self.global.drm.dirty_fb(self.global.platform, *ptr),
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
@@ -4184,13 +8373,112 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmSetClientCap(ptr) => self.global.drm.set_client_cap(*ptr),
             IoctlArg::DrmSetMaster => self.global.drm.set_master(),
             IoctlArg::DrmDropMaster => self.global.drm.drop_master(),
+            IoctlArg::DrmGetMagic(ptr) => self.global.drm.get_magic(*ptr),
+            IoctlArg::DrmAuthMagic(ptr) => self.global.drm.auth_magic(*ptr),
             IoctlArg::DrmModeObjGetProperties(ptr) => self.global.drm.obj_get_properties(*ptr),
             IoctlArg::DrmModeGetProperty(ptr) => self.global.drm.get_property(*ptr),
+            IoctlArg::DrmModeConnectorSetProperty(ptr) => {
+                self.global.drm.connector_set_property(*ptr)
+            }
+            IoctlArg::DrmModeObjSetProperty(ptr) => self.global.drm.obj_set_property(*ptr),
+            IoctlArg::DrmModeGetPropBlob(ptr) => self.global.drm.get_prop_blob(*ptr),
+            IoctlArg::DrmPrimeHandleToFd(ptr) => self.drm_prime_handle_to_fd(*ptr),
+            IoctlArg::DrmPrimeFdToHandle(ptr) => self.drm_prime_fd_to_handle(*ptr),
+            IoctlArg::DrmGemClose(ptr) => {
+                let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                self.global.drm.gem_close(req.handle)
+            }
             _ => unreachable!("drm_ioctl called with a non-DRM IoctlArg"),
         }
     }
 
-    /// Handle syscall `epoll_create` and `epoll_create1`
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` -- see [`litebox_common_linux::DRM_IOCTL_PRIME_HANDLE_TO_FD`]'s
+    /// own doc comment for why this device hands back a second real fd onto the same dumb-buffer
+    /// storage instead of implementing a real dma-buf subsystem.
+    ///
+    /// Opens a fresh fd on `/dev/dri/card0` itself (real `DRM_IOCTL_GET_CAP`-style access, not a
+    /// synthetic type) -- reopening the real device node keeps every existing DRI-fd check
+    /// (`is_dri_device`'s major-number match, this same `drm_ioctl` dispatch on the new fd)
+    /// automatically correct for the returned fd with zero new fd-kind plumbing, matching how a
+    /// real client's own `open("/dev/dri/card0")` produces an ordinary DRI fd too. Tags the new
+    /// fd (not its underlying entry -- see [`DrmPrimeFdMarker`]'s own doc comment) with the
+    /// exported buffer's fake `MAP_DUMB` offset so `syscalls::mm::try_dri_dumb_buffer_mmap`
+    /// resolves the guest's later `mmap(new_fd, ..., 0)` back onto the identical shared-memory
+    /// handle the original `CREATE_DUMB`/`MAP_DUMB` path already established.
+    fn drm_prime_handle_to_fd(&self, ptr: UserPtrMut<DrmPrimeHandle>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let map_offset = self.global.drm.prime_export_offset(req.handle)?;
+        let file = self.do_open(
+            "/dev/dri/card0",
+            OFlags::RDWR,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let old = dt.set_fd_metadata(&file, DrmPrimeFdMarker { map_offset });
+        assert!(old.is_none());
+        drop(dt);
+        // `DRM_CLOEXEC` (bit 0, real kernel `drm.h`) is the one `flags` bit real clients actually
+        // set here (mirroring `O_CLOEXEC`'s own real-Linux meaning) -- honored the same way
+        // `sys_memfd_create`'s `MfdFlags::CLOEXEC` handling is, immediately above in this file.
+        let new_fd = self.insert_raw_file_fd_with_path(
+            file,
+            if req.flags & 1 != 0 {
+                OFlags::CLOEXEC
+            } else {
+                OFlags::empty()
+            },
+            None,
+        )?;
+        req.fd = i32::try_from(new_fd).map_err(|_| Errno::EMFILE)?;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` -- the reverse of [`Self::drm_prime_handle_to_fd`]. See
+    /// [`litebox_common_linux::DRM_IOCTL_PRIME_FD_TO_HANDLE`]'s own doc comment for why this is a
+    /// same-handle self-import round-trip on this single-client device rather than a real
+    /// cross-device dma-buf import.
+    fn drm_prime_fd_to_handle(&self, ptr: UserPtrMut<DrmPrimeHandle>) -> Result<u32, Errno> {
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let raw_fd = u32::try_from(req.fd)
+            .map(|v| v as usize)
+            .map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        let map_offset = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd, |m: &DrmPrimeFdMarker| m.map_offset)
+                        .ok()
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .map_err(|_| Errno::EBADF)?
+            .ok_or(Errno::EINVAL)?;
+        drop(files);
+        let handle = self
+            .global
+            .drm
+            .lookup_handle_by_map_offset(map_offset)
+            .ok_or(Errno::ENOENT)?;
+        req.handle = handle;
+        ptr.write_at_offset::<Platform>(0, req)
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
     pub fn sys_epoll_create(&self, flags: EpollCreateFlags) -> Result<u32, Errno> {
         litebox_util_log::debug!(flags:? = flags; "sys_epoll_create: entry");
         if flags.intersects(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
@@ -4220,7 +8508,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    /// Handle syscall `epoll_ctl`
     pub(crate) fn sys_epoll_ctl(
         &self,
         epfd: i32,
@@ -4252,16 +8539,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             Some(event.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            epfd:% = epfd,
+            op:? = op,
+            fd:% = fd;
+            "DIAG sys_epoll_ctl: entry"
+        );
         let handle = self
             .global
             .litebox
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
+        handle.with_entry(|entry| {
+            entry.epoll_ctl(
+                &self.global,
+                op,
+                fd,
+                &file_descriptor,
+                event,
+                self.pid.get(),
+            )
+        })
     }
 
-    /// Handle syscall `epoll_pwait`
     pub fn sys_epoll_pwait(
         &self,
         epfd: i32,
@@ -4313,12 +8615,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EBADF)?
             }
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            epfd:% = epfd,
+            maxevents:% = maxevents,
+            timeout:? = timeout;
+            "sys_epoll_pwait: entry"
+        );
         let do_wait = || {
             handle.with_entry(|epoll_file| {
+                epoll_file.rebind_inherited(&self.global, &self.files.borrow(), self.pid.get());
                 match epoll_file.wait(
                     &self.global,
                     &self.wait_cx().with_timeout(timeout),
                     maxevents,
+                    self.tid.get(),
+                    epfd,
                 ) {
                     Ok(epoll_events) => {
                         if !epoll_events.is_empty() {
@@ -4333,14 +8645,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             })
         };
-        if let Some(sigmask) = sigmask {
+        let result = if let Some(sigmask) = sigmask {
             self.with_temporary_signal_mask(sigmask, do_wait)
         } else {
             do_wait()
-        }
+        };
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            epfd:% = epfd,
+            result:? = result;
+            "sys_epoll_pwait: returning"
+        );
+        result
     }
 
-    /// Handle syscall `ppoll`.
     pub fn sys_ppoll(
         &self,
         fds: UserPtrMut<litebox_common_linux::Pollfd>,
@@ -4362,14 +8680,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
+        let mut diag_fds: alloc::vec::Vec<(i32, u32)> = alloc::vec::Vec::with_capacity(nfds);
         for i in 0..nfds_signed {
             let fd = fds.read_at_offset::<Platform>(i).ok_or(Errno::EFAULT)?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
             );
+            diag_fds.push((fd.fd, events.bits()));
             set.add_fd(fd.fd, events);
         }
+        // Diagnostic logging (sys_ppoll had zero logging before this, the same
+        // silently-unlogged-syscall pattern this investigation has found repeatedly for other
+        // calls -- see AGENTS.md sub-session 39). Kept landed: cheap (one line per ppoll call),
+        // and directly shows which fds/events a GLib/GTK main loop is watching and what came back.
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            fds:? = diag_fds,
+            timeout:? = timeout;
+            "sys_ppoll: entry"
+        );
 
         let mut do_wait = || {
             set.wait(
@@ -4383,6 +8713,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             do_wait()
         };
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            wait_result:? = wait_result;
+            "sys_ppoll: wait returned"
+        );
         match wait_result {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
@@ -4395,7 +8730,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Write just the revents back.
         let fds_base_addr = fds.as_usize();
         let mut ready_count = 0;
         for (i, revents) in set.revents().enumerate() {
@@ -4413,6 +8747,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ready_count += 1;
             }
         }
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            ready_count:% = ready_count,
+            revents:? = set
+                .revents_with_fds()
+                .map(|(fd, e)| {
+                    let kind = super::epoll::EpollDescriptor::try_from(
+                        &self.files.borrow(),
+                        fd.reinterpret_as_unsigned() as usize,
+                    )
+                    .map_or("none", |d| d.kind());
+                    (fd, kind, e.bits())
+                })
+                .collect::<alloc::vec::Vec<_>>();
+            "sys_ppoll: returning"
+        );
         Ok(ready_count)
     }
 
@@ -4489,7 +8839,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(ready_count)
     }
 
-    /// Handle syscall `pselect`.
     pub(crate) fn sys_pselect(
         &self,
         nfds: u32,
@@ -4506,12 +8855,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if sigsetpack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 return Err(Errno::EINVAL);
             }
-            Some(
-                sigsetpack
-                    .sigset
-                    .read_at_offset::<Platform>(0)
-                    .ok_or(Errno::EFAULT)?,
-            )
+            // glibc's `pselect` always passes the pack, with a NULL `sigset` when the caller gave
+            // no mask: the kernel treats that as "leave the mask alone".
+            if sigsetpack.sigset.as_usize() == 0 {
+                None
+            } else {
+                Some(
+                    sigsetpack
+                        .sigset
+                        .read_at_offset::<Platform>(0)
+                        .ok_or(Errno::EFAULT)?,
+                )
+            }
         } else {
             None
         };
@@ -4608,11 +8963,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
 
             let mut dt = task.global.litebox.descriptor_table_mut();
+            let narrowed = dt.with_metadata(fd, |ReopenedAccess(a)| *a).ok();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
-            if close_on_exec {
-                let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
+            // A read-only/write-only reopen stays that way through `dup` (Chromium duplicates
+            // the read-only fd and re-checks its access mode).
+            if let Some(a) = narrowed {
+                let _ = dt.set_fd_metadata(&fd, ReopenedAccess(a));
             }
+            // FD_CLOEXEC belongs to the descriptor, not the open file description: a duplicate
+            // starts with it clear unless the caller asked for it (dup3/F_DUPFD_CLOEXEC),
+            // whatever the source had.
+            let _ = dt.set_fd_metadata(
+                &fd,
+                if close_on_exec {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                },
+            );
             drop(dt);
 
             let new_fd = match target {
@@ -4659,6 +9027,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
             )
             .map_err(|_| DupFdError::BadFd)?
     }
@@ -4668,6 +9037,968 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// The dup() system call creates a copy of the file descriptor oldfd, using the lowest-numbered unused file descriptor for the new descriptor.
     /// The dup2() system call performs the same task as dup(), but instead of using the lowest-numbered unused file descriptor, it uses the file descriptor number specified in newfd.
     /// The dup3() system call is similar to dup2(), but it also takes an additional flags argument that can be used to set the close-on-exec flag for the new file descriptor.
+    /// Create a pipe and place its WRITE end at exactly `target_fd`, returning a
+    /// descriptor-independent handle on the READ end for a host pump thread.
+    ///
+    /// This is how a cross-process `fork()` child reconstructs a pipe fd it could not inherit:
+    /// litebox's pipes are in-memory objects with no OS handle behind them, so the child builds a
+    /// fresh local pipe at the same fd number and a host thread bridges it to the real Windows
+    /// handle the parent passed across.
+    ///
+    /// Goes through the ordinary descriptor paths rather than reaching into the table --
+    /// `create_linux_pipe` for the ends, `insert_raw_fd` to land the writer, then `sys_dup`'s
+    /// exact-fd form to move it, exactly as a guest's own `dup2` would.
+    pub(crate) fn install_pipe_write_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
+        let reader_handle = self.global.pipes().detach_end(&ends.reader).ok()?;
+        let temp_fd = {
+            let files = self.files.borrow();
+            let wr = files.insert_raw_fd(ends.writer).ok()?;
+            // The reader half is never inserted: the HOST owns it, via `reader_handle` above.
+            let _ = self.global.pipes().close(&ends.reader);
+            wr
+        };
+        let temp_fd = i32::try_from(temp_fd).ok()?;
+        if temp_fd != target_fd {
+            self.sys_dup(temp_fd, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(temp_fd);
+        }
+        Some(reader_handle)
+    }
+
+    /// Create a pipe and place its READ end at exactly `target_fd`, returning a
+    /// descriptor-independent handle on the WRITE end for a host pump thread.
+    ///
+    /// The mirror of [`Self::install_pipe_write_end_at_fd`], for the fd a cross-process `fork()`
+    /// child READS -- a shell pipeline's `cmd2` in `cmd1 | cmd2`. The host pump feeds this pipe
+    /// from the real Windows pipe the parent handed across, so the child's `read(0, ..)` sees the
+    /// same bytes the parent's own copy of the pipe holds.
+    pub(crate) fn install_pipe_read_end_at_fd(
+        &self,
+        target_fd: i32,
+    ) -> Option<litebox::pipes::DetachedPipeEnd<Platform>> {
+        let ends = self.global.create_linux_pipe(OFlags::empty()).ok()?;
+        let writer_handle = self.global.pipes().detach_end(&ends.writer).ok()?;
+        let temp_fd = {
+            let files = self.files.borrow();
+            let rd = files.insert_raw_fd(ends.reader).ok()?;
+            // The writer half is never inserted: the HOST owns it, via `writer_handle` above.
+            let _ = self.global.pipes().close(&ends.writer);
+            rd
+        };
+        let temp_fd = i32::try_from(temp_fd).ok()?;
+        if temp_fd != target_fd {
+            self.sys_dup(temp_fd, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(temp_fd);
+        }
+        Some(writer_handle)
+    }
+
+    /// Describe a regular-file fd well enough for a cross-process `fork()` child to reproduce it,
+    /// or `None` if it is not a file or cannot be reproduced.
+    ///
+    /// "Reproduce" means reopen the same path and seek to the same offset -- see
+    /// [`litebox::platform::ForkInheritedFile`] for what that does and does not preserve. Requires
+    /// a path (an fd opened through a path this shim never recorded, or one whose file has since
+    /// been unlinked, cannot be reopened) and a seekable offset, so a directory fd or an anonymous
+    /// file simply stays uncarriable and the fork falls back.
+    pub(crate) fn carriable_file_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, u32, u64)> {
+        let files = self.files.borrow();
+        let path = files.lookup_fd_path(raw_fd)?;
+        let path = path.to_str().ok()?;
+        // The path must still resolve: an unlinked file is perfectly usable through the parent's
+        // open fd and completely unreachable by name, which is exactly the case a reopen cannot
+        // serve.
+        files.fs.symlink_metadata(path).ok()?;
+        let path = alloc::string::String::from(path);
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let flags = files.fs.open_flags(fd)?;
+                    let is_directory = files
+                        .fs
+                        .fd_file_status(fd)
+                        .is_ok_and(|status| status.file_type == litebox::fs::FileType::Directory);
+                    if is_directory {
+                        return Some((path, (flags | OFlags::DIRECTORY).bits(), 0));
+                    }
+                    let offset = files
+                        .fs
+                        .seek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                        .ok()?;
+                    Some((path, flags.bits(), offset as u64))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Cross-process carry spec for a regular-file fd, or `None` if `raw_fd` is not one.
+    ///
+    /// `F|<flags>|<offset>|<path>` says "reopen this path", which is right for rootfs content --
+    /// both sides then hold the same stored bytes -- and wrong for a file that exists only in
+    /// this process's own writable layer: the writable layer is per host process, so the
+    /// receiver's `open` answers `ENOENT`. Chromium hit exactly that handing a
+    /// `--user-data-dir` fd back out of `/tmp/cu3` (`.wfgy/chr16.err`:
+    /// `spec=F|1|0|/tmp/cu3/Default/Local Storage/leveldb/LOG`). Those are carried as `T|`, a
+    /// byte-level [`Self::snapshot_nameless_file_for_carry`], so the receiver gets the real
+    /// bytes rather than a name it cannot resolve.
+    ///
+    /// The two are not interchangeable the other way: a rootfs file MUST stay `F|`, because two
+    /// processes that each hold a private snapshot of it would silently stop sharing writes.
+    ///
+    /// A file only in this layer that has no snapshot form -- a directory, or one over the
+    /// 64 MiB snapshot cap -- falls back to `F|`, which is the reopen that already fails there
+    /// today. Wrong, and unchanged, but it is an errno the receiver sees and reports; nothing
+    /// here panics, since the host process is the whole guest session.
+    ///
+    /// Known over-application: a cross-process fork child ADOPTS the parent's writable layer into
+    /// its own `in_mem` (`import_writable_layer`), so a file it merely inherited also answers
+    /// "mine alone" and goes out as `T|`. That is still the sender's bytes, which is closer to
+    /// real `SCM_RIGHTS` (one shared open file description) than a reopen landing on a copy that
+    /// has since diverged; what the receiver loses is the path, its fd being unlinked under
+    /// `/dev/shm`.
+    pub(crate) fn carriable_file_spec_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<alloc::string::String> {
+        let (path, flags, offset) = self.carriable_file_for_raw_fd(raw_fd)?;
+        if self.path_only_in_own_writable_layer(&path)
+            && let Some(spec) = self.snapshot_nameless_file_for_carry(raw_fd)
+        {
+            return Some(spec);
+        }
+        Some(alloc::format!("F|{flags}|{offset}|{path}"))
+    }
+
+    /// Whether `path` resolves only inside this process's own writable layer, so that another
+    /// host process reopening it would not find these bytes.
+    ///
+    /// Thin wrapper: the answer comes from the fs itself (`FileSystem::only_in_own_writable_layer`,
+    /// answered by the layered fs, the only thing that knows which layer holds the entry).
+    fn path_only_in_own_writable_layer(&self, path: &str) -> bool {
+        self.files.borrow().fs.only_in_own_writable_layer(path)
+    }
+
+    /// An eventfd's carryable state, if `raw_fd` names one.
+    ///
+    /// Counterpart to [`Self::carriable_file_for_raw_fd`] for the cheapest subsystem that was
+    /// keeping forks off the cross-process path: an eventfd has no OS object and no path, only a
+    /// counter and two behaviour bits. See `litebox::platform::ForkInheritedEventfd`.
+    pub(crate) fn carriable_eventfd_for_raw_fd(&self, raw_fd: usize) -> Option<(u64, u32)> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::eventfd::EventfdSubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    Some(
+                        handle.with_entry(|e: &super::eventfd::EventFile<Platform>| {
+                            let (count, flags) = e.fork_state();
+                            (count, flags.bits())
+                        }),
+                    )
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// The `/dev/pts/<id>` path and open flags of a pty SLAVE fd whose pty is published in
+    /// `SharedPtyTable`, or `None` for anything else (including a master, which has no path to
+    /// reopen that would not allocate a new pty).
+    ///
+    /// Lets a cross-process `fork()` child come up with the slave at the same fd -- the child of
+    /// `forkpty()`/`script`/a terminal emulator, and every command a shell inside a pty runs,
+    /// has its stdio on the slave. Reopening by path lands on `GlobalStateHandle::pts_open`'s
+    /// shared-slave fallback, which reaches the same byte rings and control state.
+    pub(crate) fn carriable_pty_slave_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(alloc::string::String, u32)> {
+        let files = self.files.borrow();
+        let id = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::pty::PtySubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    handle.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                        (!end.is_master()).then(|| end.pty_state(&self.global.shared_pty).id())
+                    })
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        self.global.shared_pty.exists(id).then(|| {
+            (
+                alloc::format!("/dev/pts/{id}"),
+                (OFlags::RDWR | OFlags::NOCTTY).bits(),
+            )
+        })
+    }
+
+    /// The pty id of `raw_fd` when it is a MASTER of a published (cross-process-visible) pty, else
+    /// `None`. Such a master carries nothing process-private -- it is just the id -- so a
+    /// cross-process fork child can re-attach it; see [`Self::install_pty_master_at_fd`].
+    pub(crate) fn carriable_pty_master_for_raw_fd(&self, raw_fd: usize) -> Option<u32> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |fd: &litebox::fd::TypedFd<super::pty::PtySubsystem<Platform>>| {
+                    let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                    handle.with_entry(|end: &super::pty::PtyEnd<Platform>| {
+                        (end.is_master() && end.shared_id().is_some())
+                            .then(|| end.shared_id())
+                            .flatten()
+                    })
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Child side of carrying a published pty's master across a cross-process `fork()`: re-attaches
+    /// master `id` at exactly `target_fd`. `spec` is `<cloexec 0|1>|<id>`.
+    ///
+    /// Without this the master is simply absent in the child, but GLib/VTE's child setup (every GTK
+    /// terminal) uses the INHERITED master before `exec` -- `ioctl(master, TIOCGPTPEER)` to get its
+    /// slave -- and failed with "Failed to open PTY peer: Bad file descriptor".
+    pub(crate) fn install_pty_master_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, id) = spec.split_once('|')?;
+        let id: u32 = id.parse().ok()?;
+        let master = self.global.pty_master_attach(id)?;
+        let flags = if cloexec == "1" { OFlags::CLOEXEC } else { OFlags::empty() };
+        let raw = i32::try_from(
+            self.insert_raw_pty_fd(master, flags, CString::new("/dev/ptmx").ok()?)
+                .ok()?,
+        )
+        .ok()?;
+        if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), (cloexec == "1").then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        Some(())
+    }
+
+    /// Recreate an eventfd at exactly `target_fd` with `count` and `flags`.
+    ///
+    /// How a cross-process `fork()` child restores an inherited eventfd, mirroring
+    /// [`Self::install_file_at_fd`].
+    pub(crate) fn install_eventfd_at_fd(
+        &self,
+        target_fd: i32,
+        count: u64,
+        flags: u32,
+    ) -> Option<()> {
+        let flags = litebox_common_linux::EfdFlags::from_bits_truncate(flags);
+        let eventfd = super::eventfd::EventFile::<Platform>::new(count, flags);
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<super::eventfd::EventfdSubsystem<Platform>>(eventfd);
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(typed)
+            .map_err(|typed| {
+                self.global
+                    .litebox
+                    .descriptor_table_mut()
+                    .remove(&typed)
+                    .unwrap();
+            })
+            .ok()?;
+        // `insert_raw_fd` picks the lowest free number; the child needs this exact one.
+        let raw_i32 = i32::try_from(raw).ok()?;
+        if raw_i32 == target_fd {
+            return Some(());
+        }
+        let moved = self.sys_dup(raw_i32, Some(target_fd), None).is_ok();
+        let _ = self.sys_close(raw_i32);
+        moved.then_some(())
+    }
+
+    /// Text spec another process can rebuild `raw_fd` from, for `SCM_RIGHTS` over a cross-process
+    /// connection: `F|<open flags>|<offset>|<path>` for a regular file, pty slave or plain stdio
+    /// device, `E|<count>|<efd flags>` for an eventfd, `S|<flags>|<size>|<name>` for a
+    /// memfd/shm named section, `T|<flags>|<size>|<name>` for a snapshot of a nameless file, and
+    /// `U|<unix spec>` for a unix socket -- the last is `UnixSocket::fork_carry`'s own spec
+    /// (`unix.rs`), so an `SCM_RIGHTS` carry and a cross-process fork carry are ONE code path. It
+    /// rebuilds a connected endpoint (the `C` kind: same shared slot, same side, same peer,
+    /// whatever was queued already moved into the slot's ring), an unbound stream/datagram
+    /// socket, and a listener (`L`); `fork_carry` refuses the states it genuinely cannot
+    /// describe -- a bound-but-unconnected socket, a connect in progress, and a bound or
+    /// connected DATAGRAM socket -- and this returns that reason as `Err` rather than a fd the
+    /// receiver would silently have to drop.
+    ///
+    /// `Ok(None)` is the ordinary "this kind has no cross-process rebuild" case (pipes, epoll,
+    /// inet sockets, pty masters ...); `Err(reason)` is a unix socket we COULD have carried had it
+    /// been in a reachable state, which is the one worth reading in a log.
+    ///
+    /// A regular file whose bytes live only in THIS process's writable layer is carried as `T|`,
+    /// not `F|` -- see [`Self::carriable_file_spec_for_raw_fd`].
+    pub(crate) fn scm_carry_spec(
+        &self,
+        raw_fd: usize,
+    ) -> Result<Option<alloc::string::String>, &'static str> {
+        let mut unix_refusal: Option<&'static str> = None;
+        if let Some(spec) = self.carriable_file_spec_for_raw_fd(raw_fd) {
+            return Ok(Some(spec));
+        }
+        if let Some((path, flags)) = self.carriable_pty_slave_for_raw_fd(raw_fd) {
+            return Ok(Some(alloc::format!("F|{flags}|0|{path}")));
+        }
+        if let Some((count, flags)) = self.carriable_eventfd_for_raw_fd(raw_fd) {
+            return Ok(Some(alloc::format!("E|{count}|{flags}")));
+        }
+        if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(raw_fd) {
+            return Ok(Some(alloc::format!("S|{flags}|{size}|{name}")));
+        }
+        if self.raw_fd_subsystem_name(raw_fd) == "unix-socket" {
+            match self.raw_fd_unix_carry(raw_fd, 0, false) {
+                Ok((spec, hold)) => {
+                    // A CONNECTED endpoint's carry counts an extra hold on the shared slot under
+                    // THIS host pid, and the receiver releases exactly that pid when it adopts the
+                    // fd (`from_fork_spec`'s `C` branch reads the spec's `me` field, which
+                    // `fork_carry` set to this pid because `for_spawn` is false here). Without it
+                    // the slot can be reclaimed between `sendmsg` and adoption, so a `Conn` hold is
+                    // the carry working -- abandoning it is what used to refuse every socketpair
+                    // end Chromium hands its children over Mojo. A `Presence` hold is the real
+                    // anomaly: it would advertise a listening address under a pid no process has
+                    // (`child_pid == 0`), and `connect()` would find a listener nobody can accept.
+                    match hold {
+                        Some(
+                            hold @ crate::syscalls::unix::UnixCarryHold::Presence { .. },
+                        ) => {
+                            crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
+                                &self.global,
+                                hold,
+                            );
+                            unix_refusal = Some("unix-socket(listener; carried presence entry)");
+                        }
+                        _ => return Ok(Some(alloc::format!("U|{spec}"))),
+                    }
+                }
+                Err(reason) => unix_refusal = Some(reason),
+            }
+        }
+        let spec = if raw_fd <= 2 && self.raw_fd_is_plain_stdio_device(raw_fd) {
+            let (path, flags) = match raw_fd {
+                0 => ("/dev/stdin", OFlags::RDONLY),
+                1 => ("/dev/stdout", OFlags::WRONLY),
+                _ => ("/dev/stderr", OFlags::WRONLY),
+            };
+            Some(alloc::format!("F|{}|0|{path}", flags.bits()))
+        } else {
+            self.snapshot_nameless_file_for_carry(raw_fd)
+        };
+        match spec {
+            Some(spec) => Ok(Some(spec)),
+            None => Err(unix_refusal.unwrap_or("fd kind has no cross-process rebuild")),
+        }
+    }
+
+    /// Receiving half of [`Self::scm_carry_spec`]: builds the descriptor in this process and
+    /// returns its raw fd number.
+    pub(crate) fn rebuild_carried_fd(&self, spec: &str, cloexec: bool) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
+        if let Some(carried) = spec.strip_prefix("U|") {
+            return self.rebuild_carried_unix(carried, cloexec);
+        }
+        let mut parts = spec.splitn(4, '|');
+        let kind = parts.next().ok_or(Errno::EINVAL)?;
+        let first: u64 = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or(Errno::EINVAL)?;
+        let raw = match kind {
+            "F" => {
+                let offset: u64 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let path = parts.next().ok_or(Errno::EINVAL)?;
+                let mut flags = OFlags::from_bits_truncate(u32::try_from(first).map_err(|_| Errno::EINVAL)?)
+                    & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+                if cloexec {
+                    flags |= OFlags::CLOEXEC;
+                }
+                let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty())?;
+                if offset != 0 {
+                    let offset = isize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+                    self.sys_lseek(
+                        i32::try_from(raw).map_err(|_| Errno::EINVAL)?,
+                        offset,
+                        litebox::fs::SeekWhence::RelativeToBeginning,
+                    )?;
+                }
+                raw
+            }
+            "S" => {
+                let size: usize = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let name = parts.next().ok_or(Errno::EINVAL)?;
+                self.install_shm_file(
+                    name,
+                    size,
+                    u32::try_from(first).map_err(|_| Errno::EINVAL)?,
+                    cloexec,
+                )
+                .and_then(|fd| u32::try_from(fd).map_err(|_| Errno::EINVAL))?
+            }
+            "T" => {
+                let size: usize = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let name = parts.next().ok_or(Errno::EINVAL)?;
+                let raw = self.rebuild_snapshot_file(
+                    u32::try_from(first).map_err(|_| Errno::EINVAL)?,
+                    size,
+                    name,
+                    cloexec,
+                )?;
+                return Ok(raw);
+            }
+            "E" => {
+                let flags: u32 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or(Errno::EINVAL)?;
+                let mut flags = litebox_common_linux::EfdFlags::from_bits_truncate(flags);
+                if cloexec {
+                    flags |= litebox_common_linux::EfdFlags::CLOEXEC;
+                }
+                self.sys_eventfd2(u32::try_from(first).map_err(|_| Errno::EINVAL)?, flags)?
+            }
+            _ => return Err(Errno::EINVAL),
+        };
+        usize::try_from(raw).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Receiving half of a unix socket passed by `SCM_RIGHTS` over a cross-process connection:
+    /// `carried` is `<cloexec 0|1>|<fork spec>` as produced by [`Self::raw_fd_unix_carry`].
+    fn rebuild_carried_unix(&self, carried: &str, cloexec: bool) -> Result<usize, Errno> {
+        let (sender_cloexec, spec) = carried.split_once('|').ok_or(Errno::EINVAL)?;
+        let socket = match crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec) {
+            Some(socket) => socket,
+            None => {
+                // A spec this process cannot rebuild still carries the sender's counted hold;
+                // without this the shared connection slot stays occupied (see
+                // `UnixSocket::release_unadopted_carry`).
+                crate::syscalls::unix::UnixSocket::release_unadopted_carry(&self.global, spec);
+                return Err(Errno::EINVAL);
+            }
+        };
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
+        let raw = {
+            let files = self.files.borrow();
+            files
+                .insert_raw_fd(typed)
+                .map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?
+        };
+        if cloexec || sender_cloexec == "1" && cloexec {
+            let files = self.files.borrow();
+            set_file_descriptor_flags(raw, &self.global, &files, FileDescriptorFlags::FD_CLOEXEC)?;
+        }
+        Ok(raw)
+    }
+
+    /// Reopen `path` at exactly `target_fd`, positioned at `offset`.
+    ///
+    /// How a cross-process `fork()` child restores an inherited regular-file fd. Creation flags
+    /// are stripped: the parent had this file open, so it exists, and honouring `O_CREAT`/`O_TRUNC`
+    /// here would let restoring a descriptor destroy the very data it is restoring access to.
+    pub(crate) fn install_file_at_fd(
+        &self,
+        target_fd: i32,
+        path: &str,
+        flags: u32,
+        offset: u64,
+    ) -> Option<()> {
+        const AT_FDCWD: i32 = -100;
+        let flags =
+            OFlags::from_bits_truncate(flags) & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+        let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty()).ok()?;
+        let raw = i32::try_from(raw).ok()?;
+        if raw != target_fd {
+            self.sys_dup(raw, Some(target_fd), None).ok()?;
+            let _ = self.sys_close(raw);
+        }
+        if offset != 0 {
+            let offset = isize::try_from(offset).ok()?;
+            self.sys_lseek(
+                target_fd,
+                offset,
+                litebox::fs::SeekWhence::RelativeToBeginning,
+            )
+            .ok()?;
+        }
+        Some(())
+    }
+
+    /// True when `raw_fd` (0, 1, or 2) is still the plain, untouched `/dev/stdin`/`/dev/stdout`/
+    /// `/dev/stderr` fd this process started with -- i.e. it still carries `StdioStream`
+    /// metadata (attached by `initialize_stdio_in_shared_descriptors_table` at process start, or
+    /// by `stdio_stream_for_path` on a later explicit reopen of one of those three paths).
+    ///
+    /// A cross-process `fork()` child gets fds 0/1/2 for free from `CreateProcessW`'s own stdio
+    /// handle inheritance, so a plain stdio fd needs no carrying -- that is the ONE case the old
+    /// `raw >= 3` cutoff got right. But a guest that redirected 0/1/2 onto a pipe or regular file
+    /// before forking (`cmd 2>&1 | sed`, `exec 3<>path; dup2(3,1)`, any shell pipeline) replaces
+    /// the descriptor-table entry entirely via `dup2`, and the replacement carries no
+    /// `StdioStream` tag -- so this correctly returns `false` for a redirected 0/1/2, marking it
+    /// as needing the same real carrying (pipe bridge / file reopen) any other fd gets. See
+    /// `try_cross_process_fork`'s own use of this for the full mechanism and the observability
+    /// bug this was silently causing (`docs/AGENTS_ARCHIVE_2026-09-22.md`, "Guest-diagnostic-
+    /// must-travel-by-pipe").
+    pub(crate) fn raw_fd_is_plain_stdio_device(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |_: &StdioStream| ())
+                        .is_ok()
+                },
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+            )
+            .unwrap_or(false)
+    }
+
+    /// Name the fd subsystem `raw_fd` belongs to, for diagnostics.
+    ///
+    /// The cross-process `fork()` gate can only carry pipes, and "some fd was in the way" is a
+    /// useless thing to read in a log when the question is which subsystem to teach next.
+    /// Is `raw_fd` marked close-on-exec?
+    ///
+    /// Reported alongside the subsystem when a cross-process `fork()` refuses an fd, because the
+    /// two facts together decide what carrying it would even mean: a `CLOEXEC` fd is one the guest
+    /// has already declared its exec'd children must NOT have, so for the fork+exec pair that is
+    /// almost every fork, carrying it faithfully and then closing it at exec are the same outcome.
+    pub(crate) fn raw_fd_is_cloexec(&self, raw_fd: usize) -> bool {
+        let files = self.files.borrow();
+        crate::syscalls::file::get_file_descriptor_flags(raw_fd, &self.global, &files)
+            .map(|f| f.contains(FileDescriptorFlags::FD_CLOEXEC))
+            .unwrap_or(false)
+    }
+
+    /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
+    pub(crate) fn raw_fd_unix_carry_check(&self, raw_fd: usize) -> Option<Result<(), &'static str>> {
+        self.files
+            .borrow()
+            .raw_fd_unix_carry_check(&self.global, raw_fd)
+    }
+
+    /// See `FilesState::raw_fd_unix_carry` (`net.rs`). The spec is prefixed with whether the fd
+    /// is close-on-exec, so the child can restore that too.
+    pub(crate) fn raw_fd_unix_carry(
+        &self,
+        raw_fd: usize,
+        child_pid: i32,
+        for_spawn: bool,
+    ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str>
+    {
+        let cloexec = self.raw_fd_is_cloexec(raw_fd);
+        let (spec, hold) = self
+            .files
+            .borrow()
+            .raw_fd_unix_carry(&self.global, raw_fd, self.peer_cred(), child_pid, for_spawn)?;
+        Ok((alloc::format!("{}|{spec}", u8::from(cloexec)), hold))
+    }
+
+    /// Rebuilds, at exactly `target_fd`, a unix socket a cross-process fork parent carried (see
+    /// `Task::raw_fd_unix_carry`).
+    pub(crate) fn install_unix_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, spec) = spec.split_once('|')?;
+        let socket = crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec)?;
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(typed)
+            .map_err(|typed| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+            })
+            .ok()?;
+        drop(files);
+        let raw = i32::try_from(raw).ok()?;
+        let flags = (cloexec == "1").then_some(OFlags::CLOEXEC);
+        if raw != target_fd {
+            let moved = self.sys_dup(raw, Some(target_fd), flags).is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        if flags.is_some() {
+            let files = self.files.borrow();
+            let desc = usize::try_from(target_fd).ok()?;
+            set_file_descriptor_flags(
+                desc,
+                &self.global,
+                &files,
+                FileDescriptorFlags::FD_CLOEXEC,
+            )
+            .ok()?;
+        }
+        Some(())
+    }
+
+    /// See `FilesState::raw_fd_inet_carry` (`net.rs`). `None` means this fd is an INET socket
+    /// whose state cannot be named across a process boundary; the caller then DROPS the fd in the
+    /// child instead of refusing the fork (see `try_cross_process_fork`).
+    pub(crate) fn raw_fd_inet_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
+        let cloexec = self.raw_fd_is_cloexec(raw_fd);
+        let spec = self.files.borrow().raw_fd_inet_carry(&self.global, raw_fd)?;
+        Some(alloc::format!("{}|{spec}", u8::from(cloexec)))
+    }
+
+    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried (see
+    /// `Task::raw_fd_inet_carry`). The child attaches to the SAME `Network` socket its parent
+    /// holds, located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
+    /// reference, so closing it here cannot tear down the parent's.
+    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        use litebox_common_linux::{SockFlags, SockType};
+        let mut parts = spec.split('|');
+        // Parsed in the order `FilesState::raw_fd_inet_carry` writes it (`<cloexec>|<v6>|<nonblock>|
+        // <net spec>`). Every rejection below is LOGGED rather than a bare `?`: the guest-visible
+        // symptom is only `EBADF` on one inherited fd, and a silent `None` here is what made the
+        // whole carry look like "the child never got an fd" with no evidence in the run's log.
+        let (cloexec, v6, nonblock, net_spec) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a == "1", b == "1", c == "1", d),
+                _ => {
+                    litebox_util_log::warn!(
+                        fd:% = target_fd, spec:% = spec;
+                        "fork child: malformed inet carry spec; this fd is left missing (EBADF)"
+                    );
+                    return None;
+                }
+            };
+        let sock_type = match net_spec.as_bytes().first() {
+            Some(b'T') | Some(b'L') => SockType::Stream,
+            Some(b'U') | Some(b'u') => SockType::Datagram,
+            _ => {
+                litebox_util_log::warn!(
+                    fd:% = target_fd, spec:% = spec;
+                    "fork child: inet carry spec names no known socket; this fd is left missing (EBADF)"
+                );
+                return None;
+            }
+        };
+        let mut flags = SockFlags::empty();
+        flags.set(SockFlags::NONBLOCK, nonblock);
+        flags.set(SockFlags::CLOEXEC, cloexec);
+
+        let Some(socket) = self.global.net_lock().fork_adopt(net_spec) else {
+            litebox_util_log::warn!(
+                fd:% = target_fd, spec:% = net_spec;
+                "fork child: a carried inet socket could not be re-adopted here; this fd is left missing (EBADF)"
+            );
+            return None;
+        };
+        let proxy = self.global.initialize_socket(&socket, sock_type, flags);
+        // A carried UDP socket that was `connect(2)`ed needs TWO things restored, not one.
+        // `fork_adopt` restores the network-side peer (`UdpSpecific::remote_endpoint`), but the
+        // shim sends through the `NetworkProxy::Datagram` channel `initialize_socket` just built
+        // fresh above -- and that channel carries its OWN peer bit:
+        // `DatagramSocketChannel::send_to` returns `DestinationAddressRequired` whenever
+        // `addr.is_none()` and the channel is not marked connected. A brand-new channel never is,
+        // so a `send()` on a carried CONNECTED datagram socket failed with EDESTADDRREQ while the
+        // socket underneath was correctly connected. `SocketState::Connected` is the public way to
+        // set that bit (`NetworkProxy::set_state`); the actual address still comes from
+        // `remote_endpoint` further down, so nothing is duplicated here.
+        //
+        // `set_local_port` is the same story from the other side: the channel's port is what
+        // `GlobalStateHandle::sendto` checks before it "auto-binds", and an auto-bind on a socket
+        // the PARENT owns would take a second ephemeral port for a socket that already has one.
+        if let litebox::net::socket_channel::NetworkProxy::Datagram(channel) = proxy.as_ref() {
+            let mut fields = net_spec.split(',');
+            let kind = fields.next();
+            let _lip = fields.next();
+            let lport = fields.next().and_then(|p| u16::from_str_radix(p, 16).ok());
+            let _rip = fields.next();
+            let rport = fields.next().and_then(|p| u16::from_str_radix(p, 16).ok());
+            if matches!(kind, Some("U")) {
+                if let Some(lport) = lport {
+                    let _ = channel.set_local_port(lport);
+                }
+                if rport.is_some_and(|p| p != 0) {
+                    proxy.set_state(litebox::net::socket_channel::SocketState::Connected);
+                }
+            }
+        }
+        if v6 {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let _ = dt.with_metadata_mut(&socket, |o: &mut super::net::SocketOptions| {
+                o.is_v6 = true;
+            });
+        }
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(socket)
+            .map_err(|typed| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+            })
+            .ok()?;
+        drop(files);
+        let raw = i32::try_from(raw).ok()?;
+        let dup_flags = cloexec.then_some(OFlags::CLOEXEC);
+        if raw != target_fd {
+            let moved = self.sys_dup(raw, Some(target_fd), dup_flags).is_ok();
+            let _ = self.sys_close(raw);
+            return moved.then_some(());
+        }
+        if dup_flags.is_some() {
+            let files = self.files.borrow();
+            let desc = usize::try_from(target_fd).ok()?;
+            set_file_descriptor_flags(
+                desc,
+                &self.global,
+                &files,
+                FileDescriptorFlags::FD_CLOEXEC,
+            )
+            .ok()?;
+        }
+        Some(())
+    }
+
+    /// See `EpollFile::fork_carry_spec` (`epoll.rs`). `None` when `raw_fd` is not an epoll fd.
+    ///
+    /// Unlike every other carry this one ships no shared object and no reopenable name: it ships
+    /// the interest list, which the child re-registers against its own rebuilt descriptors.
+    pub(crate) fn raw_fd_epoll_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
+        let files = self.files.borrow();
+        let epoll_fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(raw_fd)
+            .ok()?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)?;
+        let spec = handle.with_entry(|entry| entry.fork_carry_spec());
+        drop(files);
+        Some(alloc::format!("{}|{spec}", u8::from(self.raw_fd_is_cloexec(raw_fd))))
+    }
+
+    /// Rebuilds, at exactly `target_fd`, an epoll set a cross-process fork parent carried (see
+    /// `Task::raw_fd_epoll_carry`). `spec` is `<cloexec 0|1>|<interest>[,<interest>...]`, an
+    /// interest being `<target fd>:<events>:<data>`.
+    ///
+    /// The child gets a fresh `EpollFile` and re-registers each interest against its OWN
+    /// descriptor for the same fd number -- its carried listening socket, eventfd or pipe is a
+    /// different object here than the parent's, so the parent's `Arc`s cannot simply be copied.
+    /// An interest whose target did not survive the fork is dropped and counted, not fatal: the
+    /// alternative is the whole fd being absent, which is what a daemon's `epoll_wait` reads as
+    /// `EBADF`.
+    pub(crate) fn install_epoll_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
+        let (cloexec, interests) = spec.split_once('|')?;
+        let cloexec = cloexec == "1";
+        let flags = if cloexec {
+            litebox_common_linux::EpollCreateFlags::EPOLL_CLOEXEC
+        } else {
+            litebox_common_linux::EpollCreateFlags::empty()
+        };
+        let raw = i32::try_from(self.sys_epoll_create(flags).ok()?).ok()?;
+        let epfd = if raw != target_fd {
+            let moved = self
+                .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
+                .is_ok();
+            let _ = self.sys_close(raw);
+            if !moved {
+                return None;
+            }
+            target_fd
+        } else {
+            raw
+        };
+        let epfd_u32 = u32::try_from(epfd).ok()?;
+        let files = self.files.borrow();
+        let epoll_fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd as usize)
+            .ok()?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)?;
+        let mut restored = 0usize;
+        let mut lost = 0usize;
+        for item in interests.split(',').filter(|s| !s.is_empty()) {
+            let mut parts = item.split(':');
+            let parsed = parts
+                .next()
+                .and_then(|f| f.parse::<u32>().ok())
+                .zip(parts.next().and_then(|e| e.parse::<u32>().ok()))
+                .zip(parts.next().and_then(|d| d.parse::<u64>().ok()));
+            let Some(((fd, events), data)) = parsed else {
+                lost += 1;
+                continue;
+            };
+            // `epoll_ctl` refuses an epoll set registering itself; Linux answers EINVAL.
+            if fd == epfd_u32 {
+                lost += 1;
+                continue;
+            }
+            let Ok(target) = super::epoll::EpollDescriptor::try_from(&files, fd as usize) else {
+                lost += 1;
+                litebox_util_log::debug!(
+                    epfd:% = epfd, target_fd:% = fd;
+                    "fork child: a carried epoll interest names an fd that did not survive the fork; it is left unregistered"
+                );
+                continue;
+            };
+            let event = litebox_common_linux::EpollEvent { events, data };
+            match handle.with_entry(|entry| {
+                entry.add_interest(&self.global, fd, &target, event, self.pid.get())
+            }) {
+                Ok(()) => restored += 1,
+                Err(errno) => {
+                    lost += 1;
+                    litebox_util_log::debug!(
+                        epfd:% = epfd, target_fd:% = fd, errno:? = errno;
+                        "fork child: a carried epoll interest could not be re-registered here"
+                    );
+                }
+            }
+        }
+        litebox_util_log::debug!(
+            epfd:% = epfd, restored:% = restored, lost:% = lost;
+            "fork child: rebuilt a carried epoll set"
+        );
+        Some(())
+    }
+
+    pub(crate) fn raw_fd_subsystem_name(&self, raw_fd: usize) -> &'static str {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| "file",
+                |_| "socket",
+                |_| "pipe",
+                |_| "eventfd",
+                |_| "epoll",
+                |_| "unix-socket",
+                |_| "pty",
+                |_| "signalfd",
+                |_| "timerfd",
+                |_| "netlink",
+            )
+            .unwrap_or("unknown")
+    }
+
+    /// If `raw_fd` is a pipe, return a descriptor-independent handle on its end plus which end it
+    /// is; `None` otherwise.
+    ///
+    /// The parent needs this before a cross-process `fork()`: a `SenderHalf` means the child will
+    /// WRITE, so the child is given an OS pipe's write handle and the parent pumps that OS pipe's
+    /// read handle back into this in-memory pipe. The handle must be descriptor-independent
+    /// because the guest typically closes its own copy right after forking.
+    pub(crate) fn detached_pipe_end_for_raw_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<(
+        litebox::pipes::DetachedPipeEnd<Platform>,
+        litebox::pipes::HalfPipeType,
+    )> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |_| None,
+                |_| None,
+                |pipe_fd| {
+                    let half = self.global.pipes().half_pipe_type(pipe_fd).ok()?;
+                    let end = self.global.pipes().detach_end(pipe_fd).ok()?;
+                    Some((end, half))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
     pub fn sys_dup(
         &self,
         oldfd: i32,
@@ -4742,7 +10073,6 @@ const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,
         fd: i32,
@@ -4752,6 +10082,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+        let listed_directory = self
+            .files
+            .borrow()
+            .lookup_fd_path(fd)
+            .and_then(|path| path.into_string().ok());
+        if let Some(directory) = listed_directory {
+            self.refresh_proc_fd_snapshot(&directory);
+            self.refresh_spilled_directory(&directory);
+        }
         let files = self.files.borrow();
         files.run_on_raw_fd(
             fd,
@@ -4773,7 +10112,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
-                        // not enough space
                         if nbytes == 0 {
                             // not enough space for even a single entry
                             return Err(Errno::EINVAL);
@@ -4815,6 +10153,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
@@ -4981,41 +10320,57 @@ mod tests {
     #[test]
     fn fspath_new() {
         // Absolute paths should never invoke the get_cwd closure.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", || {
-            panic!("get_cwd should not be called for absolute paths")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "/usr/bin",
+            || {
+                panic!("get_cwd should not be called for absolute paths")
+            },
+            "/",
+        )
         .unwrap();
         assert!(matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/usr/bin"));
 
         // Relative path resolves against CWD.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", || {
-            String::from("/home/")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "foo/bar",
+            || String::from("/home/"),
+            "/",
+        )
         .unwrap();
         assert!(
             matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/home/foo/bar")
         );
 
         // Empty path at AT_FDCWD → Cwd variant.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
-            panic!("get_cwd should not be called for empty Cwd path")
-        })
+        let fp = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            "",
+            || {
+                panic!("get_cwd should not be called for empty Cwd path")
+            },
+            "/",
+        )
         .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
 
         // Positive fd + empty path → Fd variant.
-        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        let fp = FsPath::new(5, "", || panic!("should not be called"), "/").unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
         // Invalid dirfd → EBADF.
-        let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
+        let err = FsPath::new(-1, "file.txt", || panic!("should not be called"), "/").unwrap_err();
         assert_eq!(err, Errno::EBADF);
 
         // Path exceeding PATH_MAX → ENAMETOOLONG.
         let long_path = "a".repeat(PATH_MAX + 1);
-        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), || {
-            String::from("/")
-        })
+        let err = FsPath::new(
+            litebox_common_linux::AT_FDCWD,
+            long_path.as_str(),
+            || String::from("/"),
+            "/",
+        )
         .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);
     }
@@ -5449,10 +10804,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         let target = task
-            .sys_readlink(
-                "/sys/class/drm/card0/subsystem",
-                &mut [0u8; 64],
-            )
+            .sys_readlink("/sys/class/drm/card0/subsystem", &mut [0u8; 64])
             .is_ok();
         assert!(target, "test harness invariant: the symlink must exist");
 
@@ -5481,8 +10833,12 @@ mod tests {
     fn lstat_on_dangling_symlink_succeeds_but_stat_returns_enoent() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        task.sys_symlinkat("/does/not/exist", litebox_common_linux::AT_FDCWD, "/dangling")
-            .unwrap();
+        task.sys_symlinkat(
+            "/does/not/exist",
+            litebox_common_linux::AT_FDCWD,
+            "/dangling",
+        )
+        .unwrap();
 
         let lstat = task.sys_lstat("/dangling").unwrap();
         assert_eq!(
@@ -6033,6 +11389,81 @@ mod tests {
     }
 
     #[test]
+    fn close_range_closes_everything_in_range_and_spares_everything_outside() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (a, b) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (c, d) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (a, b, c, d) = (
+            i32::try_from(a).unwrap(),
+            i32::try_from(b).unwrap(),
+            i32::try_from(c).unwrap(),
+            i32::try_from(d).unwrap(),
+        );
+        // The four pipe ends are consecutive above stdio; close the middle two only, so the test
+        // distinguishes "closed the range" from "closed everything".
+        let (low, high) = (b.min(c), b.max(c));
+
+        task.sys_close_range(u32::try_from(low).unwrap(), u32::try_from(high).unwrap(), 0)
+            .expect("close_range over open fds must succeed");
+
+        for fd in [low, high] {
+            assert_eq!(
+                task.sys_fcntl(fd, FcntlArg::GETFD).unwrap_err(),
+                Errno::EBADF,
+                "fd {fd} was in the range and must be closed"
+            );
+        }
+        for fd in [a, d] {
+            if fd < low || fd > high {
+                task.sys_fcntl(fd, FcntlArg::GETFD)
+                    .unwrap_or_else(|e| panic!("fd {fd} was outside the range: {e:?}"));
+            }
+        }
+
+        // Re-closing an already-closed range is success, not `EBADF`: a descriptor in the range
+        // that is not open is explicitly not an error on Linux, and the whole point of the
+        // `0..=u32::MAX` idiom is that almost nothing in the range is open.
+        task.sys_close_range(u32::try_from(low).unwrap(), u32::try_from(high).unwrap(), 0)
+            .expect("a range with nothing open in it must still succeed");
+    }
+
+    #[test]
+    fn close_range_cloexec_marks_instead_of_closing() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (reader, writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let (reader, writer) = (
+            i32::try_from(reader).unwrap(),
+            i32::try_from(writer).unwrap(),
+        );
+        // `CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC`, which is the pairing libcs actually pass --
+        // `UNSHARE` must be accepted rather than rejected as an unknown flag.
+        task.sys_close_range(
+            u32::try_from(reader.min(writer)).unwrap(),
+            u32::try_from(reader.max(writer)).unwrap(),
+            (1 << 1) | (1 << 2),
+        )
+        .expect("CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC must be accepted");
+
+        let cloexec = litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC.bits();
+        for fd in [reader, writer] {
+            let flags = task
+                .sys_fcntl(fd, FcntlArg::GETFD)
+                .unwrap_or_else(|e| panic!("fd {fd} must still be OPEN, not closed: {e:?}"));
+            assert_eq!(flags & cloexec, cloexec, "fd {fd} must be close-on-exec");
+        }
+    }
+
+    #[test]
+    fn close_range_rejects_an_inverted_range_and_unknown_flags() {
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_close_range(9, 3, 0).unwrap_err(), Errno::EINVAL);
+        assert_eq!(
+            task.sys_close_range(3, 9, 1 << 7).unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
     fn pipe2_o_direct_returns_einval_instead_of_panicking() {
         // Regression test: pipe2(..., O_DIRECT) ("packet mode", not implemented by this shim's
         // pipes) used to unconditionally panic (todo!("O_DIRECT not supported")).
@@ -6066,18 +11497,20 @@ mod tests {
             v_state: 0,
         };
         let st_ptr = UserPtrMut::from_usize((&raw mut st).expose_provenance());
-        assert_eq!(
-            task.sys_ioctl(tty0_fd, IoctlArg::VtGetState(st_ptr)),
-            Ok(0)
+        assert_eq!(task.sys_ioctl(tty0_fd, IoctlArg::VtGetState(st_ptr)), Ok(0));
+        assert_ne!(
+            st.v_active, 0,
+            "VT_GETSTATE must report a real (non-zero) active VT"
         );
-        assert_ne!(st.v_active, 0, "VT_GETSTATE must report a real (non-zero) active VT");
         task.sys_close(tty0_fd).unwrap();
 
         // -- vt_open(cur_vt): open /dev/tty<cur_vt>, VT_SETMODE + KDSKBMODE + KDSETMODE --
         let vt_path = alloc::format!("/dev/tty{}", st.v_active);
         let vt_fd = task
             .sys_open(&vt_path, OFlags::RDWR, Mode::empty())
-            .unwrap_or_else(|_| panic!("{vt_path} (the VT_GETSTATE-reported active VT) must exist and be openable"));
+            .unwrap_or_else(|_| {
+                panic!("{vt_path} (the VT_GETSTATE-reported active VT) must exist and be openable")
+            });
         let vt_fd = i32::try_from(vt_fd).unwrap();
 
         let mode = VtMode {

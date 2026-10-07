@@ -4,40 +4,20 @@
 //! Real IP-packet networking for the Windows userland platform, via an in-process userspace NAT
 //! gateway -- **no Administrator privileges, no driver, no virtual adapter required**.
 //!
-//! LiteBox's own network stack (`litebox::net`, backed by `smoltcp` configured with
-//! `medium-ip`) sends and receives raw IP packets to/from the guest's virtual interface
-//! (`10.0.0.2/24`, gateway `10.0.0.1`) via [`litebox::platform::IPInterfaceProvider`]. On Linux,
-//! `litebox_platform_linux_userland` hands those packets to a real kernel TUN device
-//! (`/dev/net/tun`), and relies on the *host* having IP forwarding and NAT (`MASQUERADE`)
-//! configured to actually reach the Internet.
-//!
-//! On Windows, the equivalent of a TUN device (Wintun) requires Administrator privileges to
-//! create a virtual adapter -- acceptable for a one-time host setup step on Linux, but not for a
-//! per-invocation requirement of a standalone, unprivileged Windows executable. Raw sockets
-//! (`SOCK_RAW`) and WinDivert both have the same elevation requirement (creating a raw socket or
-//! loading a WFP callout driver are both privileged operations on Windows), so no "real network
-//! interface" style backend can satisfy "runs as a normal user."
-//!
-//! Instead, this module implements a **userspace NAT gateway**: a second, private `smoltcp`
-//! `Interface` plays the role of the gateway (`10.0.0.1`) that the guest's own `smoltcp` instance
-//! already targets. It is configured in IP-router mode (`Interface::set_any_ip(true)` plus a
-//! default route whose next-hop is itself), so it accepts packets addressed to *any* destination
-//! IP, not just its own -- exactly the behavior of a router/NAT gateway. For each new TCP
-//! connection or UDP flow the guest opens, this module opens a **real, unprivileged Winsock
-//! socket** (via `std`/`socket2`, using ordinary `connect()`/`send()`/`recv()` -- the same API any
-//! desktop application uses) to the real destination, and pumps bytes between the guest-facing
-//! smoltcp socket and the real OS socket. This is the same architectural approach used by QEMU's
-//! `-netdev user` (slirp), Docker Desktop's networking, and gVisor's netstack: a full IP stack is
-//! terminated in userspace and re-emitted as ordinary client socket calls, so from the host
-//! kernel's point of view, LiteBox looks like any other unprivileged process making outbound
-//! connections -- nothing about it requires elevation.
+//! The guest's `smoltcp` stack (`litebox::net`, `medium-ip`) exchanges raw IP packets with this
+//! module through [`LoopbackQueue`]. A private second `smoltcp` `Interface` plays the gateway
+//! (`10.0.0.1`) the guest already routes through and re-emits each flow as an ordinary
+//! unprivileged Winsock socket to the real destination. Wintun, `SOCK_RAW` and WinDivert all
+//! require elevation to install or attach on Windows, so no real-interface backend can satisfy
+//! "runs as a normal user".
 //!
 //! # Scope
 //!
-//! Only outbound (guest-initiated) TCP and UDP flows are proxied; the guest acting as a TCP/UDP
-//! *server* reachable from the real network is out of scope (this mirrors what a NAT gateway with
-//! no configured port-forwarding rules provides -- the common case for `apk`/`wget`/`curl`-style
-//! outbound-only workloads). ICMP (`ping`) is not proxied.
+//! Outbound (guest-initiated) TCP and UDP flows are proxied transparently. Inbound reachability
+//! is opt-in and TCP-only: each `LITEBOX_PUBLISH=host:guest` entry (the runner's `--publish`,
+//! mirroring `docker run -p`) binds a real `127.0.0.1:<host_port>` listener and forwards every
+//! accepted host connection to `GUEST_IP_ADDR:<guest_port>`. No mapping exists by default.
+//! Inbound UDP forwarding and ICMP are not implemented.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -65,42 +45,24 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// Maximum transmission unit, matching `litebox::net::phy::DEVICE_MTU`.
 const DEVICE_MTU: usize = 1600;
 
-/// TCP/UDP socket buffer sizes for the gateway-side sockets.
 const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 
-/// Common destination ports the gateway pre-listens on so a guest's first SYN to one of them
-/// doesn't need to wait for a listening-socket refill. Anything else still works via
-/// [`GatewayState::ensure_listening`], just with one extra poll round-trip on first use.
-const WELL_KNOWN_PORTS: &[u16] = &[53, 80, 443];
+/// Destination ports given a listening socket up front, so a guest's first SYN to one of them is
+/// accepted on the first poll rather than waiting for [`GatewayState::ensure_listening`].
+const PRE_LISTENED_PORTS: &[u16] = &[53, 80, 443];
 
 /// How long a UDP NAT flow (`GatewayState::udp_flows`) may sit with no traffic in either
-/// direction before `pump_udp` reaps it.
-///
-/// UDP is connectionless, so unlike TCP there is no FIN/close handshake that tells the gateway
-/// "the guest is done with this flow" -- the only removal trigger before this timeout existed was
-/// a hard error from the real socket's `recv_from` (e.g. `ECONNRESET`), which a normal, successful
-/// one-shot exchange (the overwhelmingly common case: a single DNS query/response on port 53)
-/// never produces. Every such exchange therefore left its `UdpFlow` (and the real, ephemeral-port
-/// `UdpSocket` bound in `pump_udp`'s `or_insert_with`) permanently resident in `udp_flows` for the
-/// rest of the process's lifetime -- confirmed in practice: after enough real DNS lookups within
-/// one `litebox_runner_linux_on_windows_userland.exe` invocation (e.g. partway through `apk add
-/// nodejs`'s per-package mirror lookups), fresh outbound connections started stalling
-/// indefinitely, and the same symptom was independently reproducible via repeated `wget` calls
-/// against unrelated hosts in the same process -- consistent with cumulative ephemeral-port/socket
-/// exhaustion rather than a per-request bug. A 30s idle timeout is generous for DNS (whose
-/// exchanges complete in milliseconds) while still bounding the leak.
+/// direction before `pump_udp` reaps it: UDP has no FIN, so a flow whose exchange completes
+/// normally is never removed any other way.
 const UDP_FLOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Max number of concurrently backlogged listening sockets per port (allows a handful of
 /// simultaneous new connections to the same port without dropping SYNs).
 const LISTEN_BACKLOG_PER_PORT: usize = 4;
 
-/// A minimal in-process, thread-safe packet queue used as the "wire" between the guest's
-/// `smoltcp` interface (driven by `litebox::net::Network`, calling
-/// [`send_ip_packet`]/[`receive_ip_packet`]) and this module's private gateway-side `smoltcp`
-/// interface. This replaces what would otherwise be a real NIC or TUN device: both directions are
-/// just raw IP packets handed off in memory, since both ends are `smoltcp` instances running in
-/// the same process.
+/// The "wire" between the guest's `smoltcp` interface and this module's gateway-side one: both
+/// ends are `smoltcp` instances in this process, so a real NIC or TUN device is just two
+/// in-memory raw-IP queues.
 #[derive(Default)]
 struct LoopbackQueue {
     /// Packets sent by the guest, waiting to be processed by the gateway.
@@ -109,8 +71,6 @@ struct LoopbackQueue {
     to_guest: std::collections::VecDeque<Vec<u8>>,
 }
 
-/// `smoltcp::phy::Device` implementation for the gateway-side interface, backed by
-/// [`LoopbackQueue`].
 struct GatewayDevice {
     queue: Arc<Mutex<LoopbackQueue>>,
 }
@@ -174,27 +134,24 @@ impl TxToken for GatewayTxToken {
     }
 }
 
-/// State for one proxied TCP flow: a gateway-side `smoltcp` socket (terminating the guest's TCP
-/// connection) bridged to a real, unprivileged OS `TcpStream` connected to the real destination.
+/// One proxied TCP flow: a gateway-side `smoltcp` socket terminating the guest's connection,
+/// bridged to a real, unprivileged OS `TcpStream` to the real destination.
 struct TcpFlow {
-    /// `Connecting` while a background thread is running `Socket::connect_timeout` (a real
-    /// blocking connect with a bounded wait, which correctly detects connection-refused/timeout
-    /// on Windows -- unlike hand-rolled nonblocking-connect + `getpeername()` polling, which
-    /// proved unreliable: `getpeername()` can report success before the TCP handshake actually
-    /// finishes, leading to premature writes that fail with `WSAENOTCONN`).
     state: TcpFlowState,
-    /// The real socket returned EOF or errored; only draining remaining smoltcp-side data.
-    real_closed: bool,
-    /// Bytes read from the guest but not yet fully written to `real` (a nonblocking write can
-    /// legitimately write fewer bytes than requested, or return `WouldBlock` entirely).
+    /// Set when the real socket hit EOF or an error; only the drain to the guest continues.
+    real_eof_or_error: bool,
     pending_to_real: Vec<u8>,
-    /// Bytes read from `real` but not yet fully enqueued into the guest-facing smoltcp socket
-    /// (`Socket::send_slice` can likewise enqueue fewer bytes than given when its TX buffer is
-    /// full).
     pending_to_guest: Vec<u8>,
+    /// Set once `real`'s write half has been shut down in response to the smoltcp-side peer
+    /// closing first, so that happens exactly once instead of on every `drive()` cycle.
+    graceful_fin_sent: bool,
 }
 
 enum TcpFlowState {
+    /// A background thread is running `Socket::connect_timeout`: a blocking connect with a
+    /// bounded wait, which detects refused/timeout correctly. Polling `getpeername()` on a
+    /// nonblocking connect does not -- it can report success before the handshake finishes, and
+    /// the first write then fails with `WSAENOTCONN`.
     Connecting(std::sync::mpsc::Receiver<std::io::Result<std::net::TcpStream>>),
     Connected(std::net::TcpStream),
 }
@@ -204,9 +161,7 @@ enum TcpFlowState {
 /// how a NAT UDP "connection" tracks the most recent 5-tuple).
 struct UdpFlow {
     real: std::net::UdpSocket,
-    /// Last time a datagram was sent or received on this flow. Used by `pump_udp` to reap flows
-    /// idle longer than [`UDP_FLOW_IDLE_TIMEOUT`] -- see that constant's doc comment for why this
-    /// is necessary (UDP has no close signal to remove a flow otherwise).
+    /// Last datagram sent or received; `pump_udp` reaps flows idle past [`UDP_FLOW_IDLE_TIMEOUT`].
     last_active: std::time::Instant,
 }
 
@@ -216,22 +171,38 @@ struct GatewayState {
     device: GatewayDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// Listening TCP sockets, keyed by (port, backlog slot). Refilled as connections are accepted.
+    /// Listening TCP sockets, keyed by (port, backlog slot), refilled as connections are accepted.
     tcp_listeners: HashMap<(u16, usize), SocketHandle>,
-    /// Active proxied TCP flows, keyed by the accepted socket's handle.
     tcp_flows: HashMap<SocketHandle, TcpFlow>,
-    /// UDP sockets bound wildcard-address (any destination IP) but *not* wildcard-port -- unlike
-    /// TCP, `smoltcp`'s UDP `accepts()` always requires an exact destination-port match (`port:
-    /// 0` is rejected by `bind` outright), so one socket per destination port is required. Keyed
-    /// by destination port; created on demand the first time the guest sends to a new port.
+    /// UDP sockets bound wildcard-address but *not* wildcard-port: `smoltcp`'s UDP `accepts()`
+    /// always requires an exact destination-port match (`port: 0` is rejected by `bind`
+    /// outright), so one socket per destination port is required. Keyed by destination port.
     udp_listeners: HashMap<u16, SocketHandle>,
-    /// Active UDP NAT flows, keyed by (destination port, guest source port).
     udp_flows: HashMap<(u16, u16), UdpFlow>,
     zero_time: std::time::Instant,
+    /// Host-accepted connections from published ports, waiting to be bridged into the guest.
+    /// `None` when no port is published, which is the common case.
+    inbound_rx: Option<std::sync::mpsc::Receiver<InboundConnection>>,
+    /// Next ephemeral source port for a gateway->guest connection. Collisions with a still-live
+    /// flow are retried on the next cycle, since a `connect` on an in-use port fails cleanly
+    /// rather than corrupting anything.
+    next_ephemeral_port: u16,
+    /// Gateway-side local ports owned by an INBOUND (published-port) flow's own connecting
+    /// socket. These must never get a wildcard listening socket: the guest's replies on such a
+    /// flow are addressed *to* this port, and a wildcard listener opened on it would compete
+    /// with the real connecting socket for those very packets, delivering them to a socket
+    /// nothing pumps.
+    ports_claimed_by_inbound_flows: std::collections::HashSet<u16>,
+    /// Which local port each inbound flow owns, so the claim above is released when that flow is
+    /// reaped -- otherwise a long-lived process leaks one port per connection served.
+    inbound_flow_ports: HashMap<SocketHandle, u16>,
 }
 
 impl GatewayState {
-    fn new(queue: Arc<Mutex<LoopbackQueue>>) -> Self {
+    fn new(
+        queue: Arc<Mutex<LoopbackQueue>>,
+        inbound_rx: Option<std::sync::mpsc::Receiver<InboundConnection>>,
+    ) -> Self {
         let mut device = GatewayDevice { queue };
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
@@ -242,10 +213,8 @@ impl GatewayState {
         });
         // Router mode: accept packets addressed to any destination, not just our own IP(s).
         iface.set_any_ip(true);
-        // A default route whose gateway is ourselves satisfies the route-lookup check that
-        // `any_ip` mode still performs (see `smoltcp`'s `iface/interface/ipv4.rs`): any
-        // destination resolves to a route whose next-hop is one of our own addresses, so the
-        // packet is accepted instead of silently dropped.
+        // `any_ip` mode still performs a route lookup, so a default route whose next-hop is one
+        // of our own addresses is what keeps every destination routable instead of dropped.
         iface
             .routes_mut()
             .add_default_ipv4_route(GATEWAY_IP_ADDR)
@@ -254,7 +223,7 @@ impl GatewayState {
         let mut sockets = SocketSet::new(vec![]);
 
         let mut tcp_listeners = HashMap::new();
-        for &port in WELL_KNOWN_PORTS {
+        for &port in PRE_LISTENED_PORTS {
             for slot in 0..LISTEN_BACKLOG_PER_PORT {
                 let handle = new_listening_tcp_socket(&mut sockets, port);
                 tcp_listeners.insert((port, slot), handle);
@@ -262,7 +231,7 @@ impl GatewayState {
         }
 
         let mut udp_listeners = HashMap::new();
-        for &port in WELL_KNOWN_PORTS {
+        for &port in PRE_LISTENED_PORTS {
             let handle = new_wildcard_udp_socket(&mut sockets, port);
             udp_listeners.insert(port, handle);
         }
@@ -276,6 +245,52 @@ impl GatewayState {
             udp_listeners,
             udp_flows: HashMap::new(),
             zero_time: std::time::Instant::now(),
+            inbound_rx,
+            next_ephemeral_port: 49152,
+            ports_claimed_by_inbound_flows: std::collections::HashSet::new(),
+            inbound_flow_ports: HashMap::new(),
+        }
+    }
+
+    /// Bridge every host connection accepted by a published-port listener into the guest, as an
+    /// ordinary [`TcpFlow`] in the same table the outbound path uses -- already `Connected`, since
+    /// the host peer's socket is accepted and there is nothing to connect *to* on the real side.
+    /// Inbound forwarding then reuses the outbound byte pump rather than duplicating it.
+    fn accept_inbound_flows(&mut self) {
+        let Some(rx) = &self.inbound_rx else {
+            return;
+        };
+        // Drain without blocking: this runs on the single gateway thread.
+        let pending: Vec<InboundConnection> = rx.try_iter().collect();
+        for conn in pending {
+            let local_port = self.next_ephemeral_port;
+            self.next_ephemeral_port = if self.next_ephemeral_port >= 65535 {
+                49152
+            } else {
+                self.next_ephemeral_port + 1
+            };
+            let Some(handle) = new_connecting_tcp_socket(
+                &mut self.sockets,
+                &mut self.iface,
+                conn.guest_port,
+                local_port,
+            ) else {
+                // Port collision or socket-set exhaustion: drop this connection rather than
+                // stalling the gateway. The host peer sees a closed connection and can retry.
+                continue;
+            };
+            self.ports_claimed_by_inbound_flows.insert(local_port);
+            self.inbound_flow_ports.insert(handle, local_port);
+            self.tcp_flows.insert(
+                handle,
+                TcpFlow {
+                    state: TcpFlowState::Connected(conn.real),
+                    real_eof_or_error: false,
+                    pending_to_real: Vec::new(),
+                    pending_to_guest: Vec::new(),
+                    graceful_fin_sent: false,
+                },
+            );
         }
     }
 
@@ -285,8 +300,6 @@ impl GatewayState {
         )
     }
 
-    /// Ensure there's a listening socket ready for `port`, creating one on demand for ports
-    /// outside [`WELL_KNOWN_PORTS`]. Cheap no-op if one already exists.
     fn ensure_listening(&mut self, port: u16) {
         if self.tcp_listeners.contains_key(&(port, 0)) {
             return;
@@ -295,10 +308,15 @@ impl GatewayState {
         self.tcp_listeners.insert((port, 0), handle);
     }
 
-    /// Inspect packets the guest has queued but not yet processed, and make sure a listening
-    /// socket exists for whatever destination TCP/UDP port they target -- a listening socket
-    /// must already exist *before* `Interface::poll` processes an inbound SYN or UDP datagram for
-    /// smoltcp to accept it, so this must run ahead of `poll()`.
+    /// Whether an inbound flow owns `port`, meaning no wildcard listener may be opened on it --
+    /// see `ports_claimed_by_inbound_flows`.
+    fn port_is_claimed_by_an_inbound_flow(&self, port: u16) -> bool {
+        self.ports_claimed_by_inbound_flows.contains(&port)
+    }
+
+    /// Make sure a listening socket exists for whatever destination TCP/UDP port the guest's
+    /// queued packets target: `smoltcp` only accepts a SYN or datagram if a listening socket was
+    /// already bound before `Interface::poll` processes it, so this runs ahead of `poll()`.
     fn ensure_listeners_for_queued_packets(&mut self) {
         let queued: Vec<Vec<u8>> = {
             let q = self.device.queue.lock().unwrap();
@@ -311,7 +329,9 @@ impl GatewayState {
             match ipv4.next_header() {
                 IpProtocol::Tcp => {
                     if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) {
-                        self.ensure_listening(tcp.dst_port());
+                        if !self.port_is_claimed_by_an_inbound_flow(tcp.dst_port()) {
+                            self.ensure_listening(tcp.dst_port());
+                        }
                     }
                 }
                 IpProtocol::Udp => {
@@ -324,16 +344,15 @@ impl GatewayState {
         }
     }
 
-    /// One round of: poll the gateway interface, accept newly-established TCP connections
-    /// (spawning their real-socket bridge), pump bytes for all active TCP/UDP flows, and refill
-    /// any listening sockets that got consumed by an accepted connection.
     fn drive(&mut self) {
         self.ensure_listeners_for_queued_packets();
+        // Bridge any newly-accepted host connections BEFORE polling, so their SYN toward the guest
+        // goes out on this same cycle rather than waiting a full 5ms tick.
+        self.accept_inbound_flows();
 
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
 
-        // Accept newly-established connections on any listening socket.
         let listener_handles: Vec<((u16, usize), SocketHandle)> =
             self.tcp_listeners.iter().map(|(&k, &v)| (k, v)).collect();
         for ((port, slot), handle) in listener_handles {
@@ -344,7 +363,6 @@ impl GatewayState {
             if established {
                 self.tcp_listeners.remove(&(port, slot));
                 self.accept_tcp_flow(handle, port);
-                // Refill so future connections to this port can still be accepted.
                 let new_handle = new_listening_tcp_socket(&mut self.sockets, port);
                 self.tcp_listeners.insert((port, slot), new_handle);
             }
@@ -358,18 +376,11 @@ impl GatewayState {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
 
-    /// Begin proxying a freshly-accepted TCP connection: look up its real destination (the
-    /// "local" endpoint from the gateway's perspective, since the guest dialed it as if the
-    /// gateway itself were the destination) and open a real, unprivileged outbound socket to it.
+    /// Begin proxying a freshly-accepted TCP connection: the socket's local endpoint is the real
+    /// destination, since the guest dialed it as if the gateway itself were the destination.
     ///
-    /// The actual `connect()` runs on a short-lived background thread using a real *blocking*
-    /// connect with a bounded timeout (`Socket::connect_timeout`), rather than a hand-rolled
-    /// nonblocking-connect-then-poll loop: on Windows, polling `getpeername()` to detect
-    /// completion is unreliable (it can report success before the handshake actually finishes,
-    /// causing the very first write to fail with `WSAENOTCONN`), whereas a blocking connect with
-    /// `select()`-based completion detection is both correct and well-tested. Running it off the
-    /// gateway's single driver thread keeps that thread from stalling on slow/unreachable
-    /// destinations.
+    /// The `connect()` runs on a short-lived background thread so the gateway's single driver
+    /// thread never stalls on a slow or unreachable destination.
     fn accept_tcp_flow(&mut self, handle: SocketHandle, listen_port: u16) {
         let dest = {
             let socket: &tcp::Socket = self.sockets.get(handle);
@@ -382,32 +393,38 @@ impl GatewayState {
         let dest_addr = SocketAddr::V4(SocketAddrV4::new(dest_ip, listen_port));
 
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> std::io::Result<std::net::TcpStream> {
-                let socket = socket2::Socket::new(
-                    socket2::Domain::IPV4,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )?;
-                socket.connect_timeout(&dest_addr.into(), Duration::from_secs(10))?;
-                socket.set_nonblocking(true)?;
-                Ok(socket.into())
-            })();
-            let _ = tx.send(result);
-        });
+        let spawn_result = std::thread::Builder::new()
+            .name("litebox-tcp-flow-connect".to_owned())
+            .spawn(move || {
+                let result = (|| -> std::io::Result<std::net::TcpStream> {
+                    let socket = socket2::Socket::new(
+                        socket2::Domain::IPV4,
+                        socket2::Type::STREAM,
+                        Some(socket2::Protocol::TCP),
+                    )?;
+                    socket.connect_timeout(&dest_addr.into(), Duration::from_secs(10))?;
+                    socket.set_nonblocking(true)?;
+                    Ok(socket.into())
+                })();
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawn_result {
+            eprintln!("[net] failed to spawn tcp-flow-connect thread: {e}");
+            return;
+        }
 
         self.tcp_flows.insert(
             handle,
             TcpFlow {
                 state: TcpFlowState::Connecting(rx),
-                real_closed: false,
+                real_eof_or_error: false,
+                graceful_fin_sent: false,
                 pending_to_real: Vec::new(),
                 pending_to_guest: Vec::new(),
             },
         );
     }
 
-    /// Pump bytes for every active TCP flow: guest -> real socket, and real socket -> guest.
     fn pump_tcp_flows(&mut self) {
         let mut to_remove = Vec::new();
         for (&handle, flow) in &mut self.tcp_flows {
@@ -415,7 +432,7 @@ impl GatewayState {
                 match rx.try_recv() {
                     Ok(Ok(stream)) => flow.state = TcpFlowState::Connected(stream),
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        flow.real_closed = true;
+                        flow.real_eof_or_error = true;
                         continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => continue,
@@ -427,19 +444,17 @@ impl GatewayState {
 
             let socket: &mut tcp::Socket = self.sockets.get_mut(handle);
 
-            if !flow.real_closed {
-                // guest -> real. `real` is a nonblocking socket, so a short/`WouldBlock` write
-                // must be retried later rather than treated via `write_all` (which errors out on
-                // `WouldBlock` instead of buffering/retrying) -- any unwritten remainder is kept
-                // in `pending_to_real` and retried on the next `drive()` cycle before reading any
-                // further guest data, to preserve TCP byte-stream ordering.
+            if !flow.real_eof_or_error {
+                // guest -> real. `real` is nonblocking, so a short or `WouldBlock` write leaves
+                // the remainder in `pending_to_real`, retried on the next `drive()` cycle before
+                // any further guest data is read, to preserve byte-stream ordering.
                 if !flow.pending_to_real.is_empty() {
                     match real.write(&flow.pending_to_real) {
                         Ok(n) => {
                             flow.pending_to_real.drain(..n);
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                        Err(_) => flow.real_closed = true,
+                        Err(_) => flow.real_eof_or_error = true,
                     }
                 }
                 while flow.pending_to_real.is_empty() && socket.can_recv() {
@@ -460,31 +475,27 @@ impl GatewayState {
                             flow.pending_to_real.extend_from_slice(&buf[..n]);
                         }
                         Err(_) => {
-                            flow.real_closed = true;
+                            flow.real_eof_or_error = true;
                             break;
                         }
                     }
                 }
-                // real -> guest. `flow.pending_to_guest` holds bytes read from `real` but not yet
-                // fully enqueued into the smoltcp socket's TX buffer: `Socket::send_slice` is a
-                // byte-stream partial-write, exactly like a real `write()`, and can enqueue fewer
-                // bytes than given when its buffer is full -- silently dropping the remainder
-                // (as `let _ = socket.send_slice(...)` previously did) corrupted the byte stream
-                // whenever the guest's receive window/backlog fell behind a fast real-socket
-                // reader, exactly the kind of truncation `apk`'s "I/O error" pointed at.
+                // real -> guest. `send_slice` is a byte-stream partial write too, so its remainder
+                // goes to `pending_to_guest` rather than being dropped, which would truncate the
+                // guest's byte stream whenever its receive window fell behind.
                 if !flow.pending_to_guest.is_empty() && socket.can_send() {
                     match socket.send_slice(&flow.pending_to_guest) {
                         Ok(n) => {
                             flow.pending_to_guest.drain(..n);
                         }
-                        Err(_) => flow.real_closed = true,
+                        Err(_) => flow.real_eof_or_error = true,
                     }
                 }
                 while flow.pending_to_guest.is_empty() && socket.can_send() {
                     let mut buf = [0u8; 4096];
                     match real.read(&mut buf) {
                         Ok(0) => {
-                            flow.real_closed = true;
+                            flow.real_eof_or_error = true;
                             break;
                         }
                         Ok(n) => match socket.send_slice(&buf[..n]) {
@@ -493,39 +504,61 @@ impl GatewayState {
                                 flow.pending_to_guest.extend_from_slice(&buf[sent..n]);
                             }
                             Err(_) => {
-                                flow.real_closed = true;
+                                flow.real_eof_or_error = true;
                                 break;
                             }
                         },
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => {
-                            flow.real_closed = true;
+                            flow.real_eof_or_error = true;
                             break;
                         }
                     }
                 }
             }
 
-            // Only close once every byte read from `real` has actually been handed to the guest:
-            // `pending_to_guest` non-empty means some already-read real-socket bytes are still
-            // waiting on smoltcp TX buffer space, and `send_queue() > 0` means smoltcp itself
-            // hasn't finished delivering them to the guest yet -- closing early in either case
-            // would truncate the response the guest sees.
-            if flow.real_closed && flow.pending_to_guest.is_empty() && socket.send_queue() == 0 {
+            // Close only once every byte read from `real` has reached the guest: a non-empty
+            // `pending_to_guest` is still waiting on smoltcp TX space and a non-zero
+            // `send_queue()` is still in flight, and closing early truncates the response.
+            if flow.real_eof_or_error
+                && flow.pending_to_guest.is_empty()
+                && socket.send_queue() == 0
+            {
                 socket.close();
             }
-            if !socket.is_open() {
+            // The smoltcp-side peer (the guest, for an inbound flow) closed first; shut down only
+            // `real`'s write half (see `shutdown_write_not_close_to_avoid_windows_rst` for why not
+            // a full close). Gated on the guest->real direction being drained for the same reason
+            // the close above is gated on the real->guest one: ending our ability to send while
+            // bytes the guest already wrote are still buffered throws the response away -- the
+            // ordinary shape of a published request, since a server writes its reply and closes
+            // in the same cycle.
+            if !socket.is_open()
+                && !flow.graceful_fin_sent
+                && flow.pending_to_real.is_empty()
+                && !socket.can_recv()
+            {
+                shutdown_write_not_close_to_avoid_windows_rst(real);
+                flow.graceful_fin_sent = true;
+            }
+            let guest_side_done = !socket.is_open() || flow.graceful_fin_sent;
+            if guest_side_done
+                && flow.real_eof_or_error
+                && flow.pending_to_guest.is_empty()
+                && socket.send_queue() == 0
+            {
                 to_remove.push(handle);
             }
         }
         for handle in to_remove {
             self.tcp_flows.remove(&handle);
+            if let Some(port) = self.inbound_flow_ports.remove(&handle) {
+                self.ports_claimed_by_inbound_flows.remove(&port);
+            }
             self.sockets.remove(handle);
         }
     }
 
-    /// Ensure there's a wildcard-address UDP socket listening for `dest_port`, creating one on
-    /// demand for ports outside [`WELL_KNOWN_PORTS`].
     fn ensure_udp_listening(&mut self, dest_port: u16) -> SocketHandle {
         *self
             .udp_listeners
@@ -533,13 +566,10 @@ impl GatewayState {
             .or_insert_with(|| new_wildcard_udp_socket(&mut self.sockets, dest_port))
     }
 
-    /// Pump datagrams for every UDP destination port the guest has talked to: each inbound
-    /// datagram from the guest is relayed via a real `UdpSocket` keyed by (destination port,
-    /// guest source port), and any reply read back from that real socket is relayed back to the
-    /// guest, addressed as if it came from the real destination.
+    /// Relay each of the guest's datagrams to the real destination through a real `UdpSocket`
+    /// keyed by (destination port, guest source port), and relay replies back to the guest
+    /// addressed as if they came from the real destination.
     fn pump_udp(&mut self) {
-        // First, drain any newly-created listeners' pending guest datagrams and open/refresh the
-        // matching real-socket flow.
         let dest_ports: Vec<u16> = self.udp_listeners.keys().copied().collect();
         for dest_port in dest_ports {
             let handle = self.udp_listeners[&dest_port];
@@ -571,7 +601,6 @@ impl GatewayState {
             }
         }
 
-        // Drain replies for every active UDP flow back to the guest.
         let mut dead_flows = Vec::new();
         for (&(dest_port, guest_port), flow) in &mut self.udp_flows {
             let Some(&handle) = self.udp_listeners.get(&dest_port) else {
@@ -616,6 +645,14 @@ impl GatewayState {
     }
 }
 
+/// Windows turns a `close()`/drop of a socket that still holds unread data in its own receive
+/// buffer into an abortive RST, so dropping a real socket mid-exchange makes the host peer see
+/// "forcibly closed by the remote host" instead of the bytes it was waiting for. Ending only our
+/// write half sends a graceful FIN and leaves the drain intact.
+fn shutdown_write_not_close_to_avoid_windows_rst(real: &std::net::TcpStream) {
+    let _ = real.shutdown(std::net::Shutdown::Write);
+}
+
 fn new_wildcard_udp_socket(sockets: &mut SocketSet<'static>, port: u16) -> SocketHandle {
     let mut socket = udp::Socket::new(
         smoltcp::storage::PacketBuffer::new(
@@ -627,12 +664,80 @@ fn new_wildcard_udp_socket(sockets: &mut SocketSet<'static>, port: u16) -> Socke
             vec![0u8; SOCKET_BUFFER_SIZE],
         ),
     );
-    // Wildcard *address* (accept datagrams sent to any destination IP), but the destination
-    // *port* must match exactly -- `smoltcp` has no wildcard-port bind for UDP.
+    // Wildcard *address* (any destination IP), but the destination *port* must match exactly:
+    // `smoltcp` has no wildcard-port bind for UDP.
     socket
         .bind(IpListenEndpoint { addr: None, port })
         .expect("bind on a freshly-created UDP socket cannot fail for a nonzero port");
     sockets.add(socket)
+}
+
+/// A host-side connection accepted by a published-port listener, waiting to be bridged into the
+/// guest. Produced by [`spawn_publish_listener`]'s thread, consumed by
+/// [`GatewayState::accept_inbound_flows`].
+struct InboundConnection {
+    /// The already-accepted, already-nonblocking real socket the host peer is talking to.
+    real: std::net::TcpStream,
+    /// The port *inside the guest* to bridge to (the right-hand side of `--publish host:guest`).
+    guest_port: u16,
+}
+
+/// Bind a real Windows listening socket on `127.0.0.1:host_port` and forward every accepted
+/// connection to `guest_port` inside the guest: the `docker run -p` / slirp `hostfwd` rule that
+/// lets a guest *server* be reached, which outbound NAT alone cannot express.
+///
+/// Loopback specifically, not `0.0.0.0`: publishing a guest service to the whole network by
+/// default would be a surprising exposure decision to make on a user's behalf, and every
+/// intended use here (a browser on this machine) is served by loopback.
+fn spawn_publish_listener(
+    host_port: u16,
+    guest_port: u16,
+    tx: std::sync::mpsc::Sender<InboundConnection>,
+) -> std::io::Result<()> {
+    let listener = std::net::TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        host_port,
+    )))?;
+    std::thread::Builder::new()
+        .name(format!("litebox-publish-{host_port}"))
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(real) = stream else { continue };
+                // Nonblocking from the outset: `pump_tcp_flows` polls these by hand on the single
+                // gateway thread and must never block on one peer.
+                if real.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                if tx.send(InboundConnection { real, guest_port }).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Create a `smoltcp` socket that *connects to* the guest (rather than listening for it), to
+/// bridge a host-accepted connection inward. Its local endpoint is the gateway's own IP with an
+/// ephemeral port, so the guest sees an ordinary connection arriving from `10.0.0.1`, exactly as
+/// it would from a router forwarding a port.
+fn new_connecting_tcp_socket(
+    sockets: &mut SocketSet<'static>,
+    iface: &mut Interface,
+    guest_port: u16,
+    local_port: u16,
+) -> Option<SocketHandle> {
+    let mut socket = tcp::Socket::new(
+        smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
+        smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
+    );
+    socket
+        .connect(
+            iface.context(),
+            (IpAddress::Ipv4(GUEST_IP_ADDR), guest_port),
+            local_port,
+        )
+        .ok()?;
+    Some(sockets.add(socket))
 }
 
 fn new_listening_tcp_socket(sockets: &mut SocketSet<'static>, port: u16) -> SocketHandle {
@@ -641,8 +746,8 @@ fn new_listening_tcp_socket(sockets: &mut SocketSet<'static>, port: u16) -> Sock
         smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
     );
     // `addr: None` is the wildcard: accept connections whose *destination* is any address, not
-    // just our own -- this is what makes the gateway transparently proxy to arbitrary real
-    // destinations rather than only accepting connections to `10.0.0.1` itself.
+    // just our own -- this is what makes the gateway proxy to arbitrary real destinations rather
+    // than only accepting connections to `10.0.0.1` itself.
     socket
         .listen(IpListenEndpoint { addr: None, port })
         .expect("listen on a freshly-created socket cannot fail");
@@ -653,10 +758,9 @@ fn new_listening_tcp_socket(sockets: &mut SocketSet<'static>, port: u16) -> Sock
 /// guest-facing `litebox::net::Network` (via [`send_ip_packet`]/[`receive_ip_packet`]).
 ///
 /// Owned by [`crate::WindowsUserland`] as a lazily-initialized field (`OnceLock<NatGateway>`)
-/// rather than a module-level `static`: this codebase actively ratchets down new global mutable
-/// state (see `dev_tests/src/ratchet.rs`'s `ratchet_globals`), so a genuinely process-scoped
-/// singleton like this belongs on the one process-lifetime `WindowsUserland` instance instead of
-/// introducing another bare `static`.
+/// rather than a module-level `static`: `dev_tests/src/ratchet.rs`'s `ratchet_globals` tracks
+/// this crate's bare-static count and is trying to reduce it, so a process-scoped singleton
+/// belongs on the one process-lifetime `WindowsUserland` instance instead.
 pub(crate) struct NatGateway {
     queue: Arc<Mutex<LoopbackQueue>>,
     /// Signaled whenever a new packet is pushed into `queue.to_guest`, so
@@ -671,18 +775,24 @@ impl NatGateway {
         let notify = Arc::new(std::sync::Condvar::new());
         let notify_lock = Arc::new(Mutex::new(()));
 
+        // Published ports (`LITEBOX_PUBLISH=8080:80,3000:3000`), read from the environment rather
+        // than plumbed through a CLI argument so every runner gets it without threading a new
+        // field through its own arg parsing -- matching how `LITEBOX_DUMP_FRAMES` and friends are
+        // already handled.
+        let inbound_rx = Self::spawn_published_listeners();
+
         let gateway_queue = queue.clone();
         let gateway_notify = notify.clone();
         std::thread::Builder::new()
             .name("litebox-nat-gateway".into())
             .spawn(move || {
-                let mut state = GatewayState::new(gateway_queue);
+                let mut state = GatewayState::new(gateway_queue, inbound_rx);
                 loop {
                     state.drive();
                     gateway_notify.notify_all();
-                    // Bound the idle sleep so real-socket readiness (which nothing here wakes us
-                    // for directly, since these are plain blocking-free `std` sockets polled by
-                    // hand rather than through an OS readiness API) is still noticed promptly.
+                    // These are plain `std` sockets polled by hand, with no OS readiness API to
+                    // wake us, so the idle sleep is what bounds how soon real-socket readiness is
+                    // noticed.
                     std::thread::sleep(Duration::from_millis(5));
                 }
             })
@@ -698,15 +808,87 @@ impl NatGateway {
             notify_lock,
         }
     }
+
+    /// Parse `LITEBOX_PUBLISH` and start a host listener per entry.
+    ///
+    /// Format: `host:guest` pairs, comma-separated (`LITEBOX_PUBLISH=3000:3000,8080:80`). A bare
+    /// `port` is shorthand for `port:port`. Returns `None` when unset or when nothing could be
+    /// bound, so the gateway skips inbound handling entirely in the common case.
+    ///
+    /// Every outcome is logged, success included: a published port that silently failed to bind
+    /// would present as "the guest's server is broken", sending the next person to debug the
+    /// wrong layer.
+    fn spawn_published_listeners() -> Option<std::sync::mpsc::Receiver<InboundConnection>> {
+        // Same empty-means-unset rule as `init_published_ports`; see its comment.
+        let spec = std::env::var("LITEBOX_PUBLISH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut bound_any = false;
+        for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (host_str, guest_str) = entry.split_once(':').unwrap_or((entry, entry));
+            let (Ok(host_port), Ok(guest_port)) = (
+                host_str.trim().parse::<u16>(),
+                guest_str.trim().parse::<u16>(),
+            ) else {
+                litebox_util_log::warn!(
+                    "LITEBOX_PUBLISH: ignoring malformed entry {entry:?} (expected `host:guest`, e.g. `3000:3000`)"
+                );
+                continue;
+            };
+            match spawn_publish_listener(host_port, guest_port, tx.clone()) {
+                Ok(()) => {
+                    bound_any = true;
+                    litebox_util_log::info!(
+                        "published 127.0.0.1:{host_port} -> guest {GUEST_IP_ADDR}:{guest_port}"
+                    );
+                }
+                Err(e) => litebox_util_log::warn!(
+                    "LITEBOX_PUBLISH: failed to bind 127.0.0.1:{host_port}: {e}"
+                ),
+            }
+        }
+        bound_any.then_some(rx)
+    }
 }
 
 /// Get (initializing on first use) the [`NatGateway`] behind `slot`.
 ///
 /// Lazy so that non-networked invocations (e.g. `/bin/true`) never pay the cost of spinning up
-/// the gateway thread. `slot` is a field on [`crate::WindowsUserland`], not a module-level
-/// `static`; see [`NatGateway`]'s doc comment for why.
+/// the gateway thread.
 fn gateway(slot: &OnceLock<NatGateway>) -> &NatGateway {
     slot.get_or_init(NatGateway::new)
+}
+
+/// Start the gateway NOW if any port is published, instead of waiting for the guest to send its
+/// first packet.
+///
+/// [`gateway`] is deliberately lazy, and every *outbound* path forces initialization because the
+/// guest sending a packet is what calls it. A **published port has no such trigger**: a guest that
+/// only `listen()`s -- an X/VNC bridge, a web UI, exactly the server workloads publishing exists
+/// for -- never sends anything, so the gateway would never start, the host listener would never
+/// bind, and a browser connecting to `127.0.0.1:<port>` would get connection-refused with nothing
+/// in the log to explain it.
+///
+/// Call once during platform construction. No-op when `LITEBOX_PUBLISH` is unset, preserving the
+/// laziness for everyone not publishing a port.
+pub(crate) fn init_published_ports(slot: &OnceLock<NatGateway>) {
+    // An EMPTY value counts as unset: `process_fork::spawn_process_fork_child` hands a
+    // cross-process fork child `LITEBOX_PUBLISH=""` to cancel the parent's inherited value, and
+    // omitting the name from the child's environment block means inherit, not remove -- so empty
+    // is how the cancellation arrives.
+    if std::env::var("LITEBOX_PUBLISH").is_ok_and(|v| !v.trim().is_empty()) {
+        let _ = gateway(slot);
+    }
+}
+
+/// Whether this host process carries the guest's packets (owns the NAT gateway and its published
+/// ports). Cross-process fork children do not: their `Network` is the root's shared one, and the
+/// gateway's queue exists only in the root process (see
+/// [`litebox::platform::IPInterfaceProvider::owns_ip_interface`]).
+pub(crate) fn owns_ip_interface() -> bool {
+    static OWNS: OnceLock<bool> = OnceLock::new();
+    *OWNS.get_or_init(|| std::env::var_os(crate::process_fork::FORK_CHILD_GPRS_ENV_VAR).is_none())
 }
 
 /// Send a raw IP packet from the guest into the NAT gateway.
@@ -723,18 +905,12 @@ pub(crate) fn send_ip_packet(
     packet: &[u8],
 ) -> Result<(), litebox::platform::SendError> {
     let gw = gateway(slot);
-    // A packet addressed to `127.0.0.0/8` (or back to the guest's own
-    // interface address) must never reach the NAT gateway thread: the
-    // gateway only knows how to proxy to REAL external destinations via
-    // REAL Windows sockets, and nothing is ever listening on a real Windows
-    // `127.0.0.1` socket on the guest's behalf -- the guest's own listening
-    // socket lives entirely inside this same process's smoltcp stack.
-    // Loop it straight back into the guest's own receive queue instead,
-    // exactly as a real kernel's loopback device would.
-    let is_loopback = Ipv4Packet::new_checked(packet)
-        .is_ok_and(|p| p.dst_addr().is_loopback() || p.dst_addr() == GUEST_IP_ADDR);
+    let targets_guest_loopback = packet_targets_guest_loopback(packet);
     let mut queue = gw.queue.lock().unwrap();
-    if is_loopback {
+    if targets_guest_loopback {
+        // Nothing is listening on a real Windows `127.0.0.1` socket on the guest's behalf -- the
+        // guest's own listener lives in this process's smoltcp stack -- so loop the packet
+        // straight back, exactly as a real kernel's loopback device would.
         queue.to_guest.push_back(packet.to_vec());
         drop(queue);
         gw.notify.notify_all();
@@ -742,6 +918,12 @@ pub(crate) fn send_ip_packet(
         queue.to_gateway.push_back(packet.to_vec());
     }
     Ok(())
+}
+
+/// Whether `packet` is addressed to `127.0.0.0/8` or back to the guest's own interface address.
+fn packet_targets_guest_loopback(packet: &[u8]) -> bool {
+    Ipv4Packet::new_checked(packet)
+        .is_ok_and(|p| p.dst_addr().is_loopback() || p.dst_addr() == GUEST_IP_ADDR)
 }
 
 /// Attempt to receive a raw IP packet (originating from the NAT gateway, e.g. a proxied TCP/UDP
@@ -763,6 +945,12 @@ pub(crate) fn receive_ip_packet(
 /// Block the calling thread until either a packet is available to read from the gateway, or
 /// `timeout` elapses. Mirrors `LinuxUserland::wait_on_tun`'s role for the network-worker thread.
 pub(crate) fn wait_on_tun(slot: &OnceLock<NatGateway>, timeout: Option<core::time::Duration>) {
+    if !owns_ip_interface() {
+        // No gateway in this process to wait on, and none may be started: a second one would
+        // fight the owner for the published ports.
+        std::thread::sleep(timeout.unwrap_or(Duration::from_millis(50)));
+        return;
+    }
     let gw = gateway(slot);
     let has_packet = || !gw.queue.lock().unwrap().to_guest.is_empty();
     if has_packet() {

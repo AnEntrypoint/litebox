@@ -119,6 +119,12 @@ pub enum SignalDisposition {
     Continue,
 }
 
+// Not converted to `bitvec` (or another general bitset crate): this is `#[repr(transparent)]` over
+// a single `u64` with `FromBytes`/`IntoBytes` for direct zerocopy transmutation onto the real Linux
+// `sigset_t` wire layout, its methods are all `const fn` (used in signal-delivery hot paths), and
+// `as_u64`/`from_u64` are a deliberate raw-bits escape hatch for wire encoding. `bitvec` targets
+// growable/runtime-sized bit-vectors, not a fixed 64-bit ABI-transparent const-fn type, so it does
+// not fit better than the current hand-rolled bit ops here.
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(transparent)]
 pub struct SigSet(u64);
@@ -366,9 +372,44 @@ pub struct SiginfoData {
 }
 
 impl SiginfoData {
+    /// The `SIGCHLD` arm of `_sifields`: `si_pid`, `si_uid`, `si_status` (the raw exit code for
+    /// `CLD_EXITED`, the signal number for `CLD_KILLED`).
+    pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {
+        let mut pad = [0u32; 28];
+        pad[0] = pid.cast_unsigned();
+        pad[1] = uid;
+        pad[2] = status.cast_unsigned();
+        Self { pad }
+    }
+
+    /// `si_pid` and `si_uid`, which every non-fault siginfo layout places first.
+    pub fn sender(&self) -> (i32, u32) {
+        let pad = self.pad;
+        (pad[0].cast_signed(), pad[1])
+    }
+
+    /// `si_status` of the `SIGCHLD` layout.
+    pub fn child_status(&self) -> i32 {
+        let pad = self.pad;
+        pad[2].cast_signed()
+    }
+
     pub fn new_addr(addr: usize) -> Self {
         let mut pad = [0u32; 28];
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
+        Self { pad }
+    }
+
+    /// The `SIGSYS` arm of `_sifields`: `si_call_addr`, `si_syscall`, `si_arch` -- the three fields
+    /// a seccomp `SECCOMP_RET_TRAP` handler reads (`SYS_SECCOMP`).
+    pub fn new_sigsys(call_addr: usize, syscall: i32, arch: u32) -> Self {
+        let mut pad = [0u32; 28];
+        let bytes = pad.as_mut_bytes();
+        bytes[..core::mem::size_of::<usize>()].copy_from_slice(&call_addr.to_ne_bytes());
+        let mut off = core::mem::size_of::<usize>();
+        bytes[off..off + 4].copy_from_slice(&syscall.to_ne_bytes());
+        off += 4;
+        bytes[off..off + 4].copy_from_slice(&arch.to_ne_bytes());
         Self { pad }
     }
 }

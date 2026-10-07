@@ -18,6 +18,24 @@ use crate::{
 /// For now, we assume that synchronization support (and the ability to exit) is a hard requirement
 /// in every LiteBox based system. In the future, this may be relaxed. Other requirements from the
 /// platform are dependent on the particular subsystems.
+///
+/// **2026-09-17 create-vs-attach note**: `x` stays a plain `Arc` here, deliberately NOT threaded
+/// through `litebox::platform::SharedKernelStateProvider` the way
+/// `litebox_shim_linux::GlobalState` now is. This crate is the shared, platform-generic base for
+/// EVERY runner (Linux native, macOS, optee, snp, lvbs, and the Windows userland cross-process
+/// fork target), and adding that bound to `LiteBox<Platform>` itself forces `Platform:
+/// SharedKernelStateProvider` onto every generic `Platform: RawSyncPrimitivesProvider` bound
+/// throughout this crate that touches `LiteBox` (confirmed live: over 200 downstream
+/// `cargo check` errors across `fs/`, `mm/`, `net/`, `pipes.rs`, ...) -- a correctness-neutral
+/// (every real platform already implements the trivial default) but very wide mechanical
+/// propagation, out of scope for this pass. `LiteBoxX::descriptors` (the shim-wide open-file-
+/// description table) therefore stays a per-process-fresh `Arc` even for a
+/// `LITEBOX_PROCESS_FORK=1` cross-process fork child; `litebox_shim_linux::GlobalState` (its own,
+/// far more contained crate) is where the real create-vs-attach wiring landed instead -- see that
+/// crate's `GlobalStateHandle`/`LinuxShimBuilder::build` for the live mechanism and
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md` for the full scoping rationale. The
+/// `SharedKernelStateProvider`/`SharedKernelStateSlot::LiteBoxX` trait/slot already exist in
+/// `crate::platform` for a follow-up pass that wants to take on this wider propagation.
 pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }
@@ -78,13 +96,28 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
+    /// Clones the handle (a cheap `Arc::clone`, same underlying `LiteBoxX`) -- deliberately not
+    /// the ordinary `Clone` trait, to keep this call site-visible/greppable rather than an
+    /// implicit `.clone()` a reader could mistake for a real duplication. `pub`, not
+    /// `pub(crate)`: `litebox_shim_linux::GlobalStateHandle` legitimately needs its OWN clone of
+    /// THIS process's `LiteBox` handle alongside the (possibly cross-process-shared)
+    /// `GlobalState` it wraps -- see that struct's doc comment and this struct's own
+    /// "2026-09-17 create-vs-attach note" above for why `LiteBox` itself must stay a plain,
+    /// per-process `Arc`, never routed through `SharedKernelStateProvider`. Still deliberately
+    /// not a blanket `#[derive(Clone)]`: external users outside this trust boundary should keep
+    /// constructing a `LiteBox` only via [`Self::new`].
+    pub fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
         }
+    }
+
+    /// Returns the platform this instance was created with -- e.g. so a caller holding only a
+    /// [`LiteBox`] (not a `Platform` reference directly, as `litebox_shim_linux::GlobalStateHandle`
+    /// callers into `syscalls::unix`'s `SharedUnixConnTable` are) can still reach
+    /// platform-specific instance methods such as `SystemInfoProvider::is_process_alive`.
+    pub fn platform(&self) -> &'static Platform {
+        self.x.platform
     }
 
     /// Access to the file descriptor table.
@@ -105,6 +138,31 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
+    }
+
+    /// Like [`Self::descriptor_table`], but yields `None` instead of waiting when another thread
+    /// already holds the table for writing.
+    ///
+    /// Same reason as [`Self::try_descriptor_table_mut`]: a caller that is itself holding a lock
+    /// other threads need cannot park here without risking a cycle.
+    pub fn try_descriptor_table(
+        &self,
+    ) -> Option<impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform>> {
+        self.x.descriptors.try_read()
+    }
+
+    /// Like [`Self::descriptor_table_mut`], but yields `None` instead of waiting when another
+    /// thread already holds the table.
+    ///
+    /// For a caller that cannot afford to park because it is itself holding a lock other threads
+    /// need -- [`crate::net::Network::attempt_to_close_queued`] runs with the cross-process
+    /// `net_lock` held, so blocking here would freeze every process in the fork family behind a
+    /// guest thread that holds the table and then asks for `net_lock`. Skipping the pass and
+    /// retrying on the next tick is always safe: this is maintenance work, not a request.
+    pub fn try_descriptor_table_mut(
+        &self,
+    ) -> Option<impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform>> {
+        self.x.descriptors.try_write()
     }
 }
 

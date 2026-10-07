@@ -110,3 +110,66 @@ fn test_bidirectional_tcp_communication_automatic() {
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
 }
+
+/// Simulates the exact torn state a dead lock holder can leave behind (see
+/// `Network::reset_after_poisoning`'s own doc comment): a live, bound listening socket occupying
+/// both a `socket_set` slot AND a `local_port_allocator` entry, as if the process that created it
+/// died mid-`net_lock` critical section right after. `reset_after_poisoning` must leave the
+/// `Network` fully usable afterward -- zero live sockets, the port free again, and no panic --
+/// exactly the guarantee `GlobalStateHandle::net_lock` relies on before handing a lock recovered
+/// from a dead holder to its next caller.
+#[test]
+fn test_reset_after_poisoning_clears_torn_state_and_frees_ports() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let listener_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+    network
+        .bind(&listener_fd, &listen_addr)
+        .expect("Failed to bind TCP socket");
+    network
+        .listen(&listener_fd, 1)
+        .expect("Failed to listen on TCP socket");
+
+    // Simulate a dead-holder recovery landing right here, mid-way through whatever the (now dead)
+    // holder was doing with this socket -- `reset_after_poisoning` must not need `listener_fd`
+    // (or any other previously-issued fd/port) to be dropped cleanly first; it wholesale resets
+    // regardless of what state the caller was in, exactly as `net_lock` calls it before the next
+    // caller ever touches the guard.
+    network.reset_after_poisoning();
+
+    assert_eq!(
+        network.socket_set.iter().count(),
+        0,
+        "reset_after_poisoning must leave socket_set fully empty"
+    );
+
+    // Port 8080 must be free again -- if `local_port_allocator` were NOT reset, this bind would
+    // fail with `AlreadyInUse` even though the socket that held it is long gone.
+    let new_listener_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket after reset");
+    network
+        .bind(&new_listener_fd, &listen_addr)
+        .expect("port 8080 must be free again after reset_after_poisoning");
+    network
+        .listen(&new_listener_fd, 1)
+        .expect("Failed to listen on TCP socket after reset");
+
+    // A full connect/accept/send/receive cycle must work normally on the fresh state -- proves
+    // `reset_after_poisoning` didn't just clear counters while leaving `socket_set`/`interface` in
+    // some inconsistent in-between shape.
+    let client_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+    let err = network
+        .connect(&client_fd, &listen_addr, false)
+        .unwrap_err();
+    assert!(
+        matches!(err, ConnectError::InProgress),
+        "Expected InProgress error, got {err:?}",
+    );
+}

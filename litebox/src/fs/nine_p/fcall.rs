@@ -9,6 +9,7 @@
 use super::transport;
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
+use zerocopy::{FromBytes as _, IntoBytes as _};
 
 /// File identifier type
 pub(super) type Fid = u32;
@@ -1202,7 +1203,10 @@ impl<'a> TaggedFcall<'a> {
 
 /// Trait for encoding/decoding types in little-endian wire format.
 ///
-/// The 9P protocol uses little-endian byte order for all integer fields.
+/// Primitive conversion must route through `zerocopy::byteorder`'s `little_endian` wrappers, never
+/// hand-rolled `to_le_bytes`/`from_le_bytes`. `FcallDecoder`'s streaming byte-slice cursor must
+/// stay: 9P's length-prefixed strings/vectors need it, and a fixed-layout `#[derive(FromBytes)]`
+/// struct cannot express them. See gm mutable fs-ninep-lewire-zerocopy-not-handrolled.
 trait LeWire: Sized + Copy {
     const SIZE: usize;
     fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError>;
@@ -1210,24 +1214,42 @@ trait LeWire: Sized + Copy {
 }
 
 macro_rules! impl_le_wire {
-    ($($ty:ty),* $(,)?) => {
+    ($(($ty:ty, $zc:ty)),* $(,)?) => {
         $(
             impl LeWire for $ty {
                 const SIZE: usize = core::mem::size_of::<$ty>();
 
                 fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError> {
-                    w.write_all(&self.to_le_bytes())
+                    w.write_all(<$zc>::new(self).as_bytes())
                 }
 
                 fn read_le(buf: &[u8]) -> Option<Self> {
-                    Some(<$ty>::from_le_bytes(buf.try_into().ok()?))
+                    Some(<$zc>::read_from_bytes(buf).ok()?.get())
                 }
             }
         )*
     };
 }
 
-impl_le_wire!(u8, u16, u32, u64);
+// u8 has no endianness to speak of; `zerocopy::byteorder` has no U8 type for exactly that
+// reason, so it keeps its own direct (and already byte-order-correct-by-construction) impl.
+impl LeWire for u8 {
+    const SIZE: usize = 1;
+
+    fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError> {
+        w.write_all(&[self])
+    }
+
+    fn read_le(buf: &[u8]) -> Option<Self> {
+        buf.first().copied()
+    }
+}
+
+impl_le_wire!(
+    (u16, zerocopy::byteorder::little_endian::U16),
+    (u32, zerocopy::byteorder::little_endian::U32),
+    (u64, zerocopy::byteorder::little_endian::U64),
+);
 
 // ============================================================================
 // Encoding functions

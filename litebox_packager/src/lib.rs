@@ -319,10 +319,22 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
         .into_par_iter()
         .map(|(_key_path, entry)| {
+            // A symlink carries no payload: emit the link itself and never read, rewrite, or
+            // copy its target. Reading it here is exactly what flattened every layer, turning
+            // /bin/ls -> /bin/busybox into a second 804 KB copy of busybox.
+            if let Some(target) = entry.symlink_target {
+                return Ok(TarEntry {
+                    tar_path: entry.tar_path,
+                    data: Vec::new(),
+                    mode: entry.mode,
+                    symlink_target: Some(target),
+                });
+            }
+
             let data = std::fs::read(&entry.read_path)
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
-            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
+            let rewritten = if is_elf(&data) && !no_rewrite.contains(&entry.read_path) {
                 rewrite_elf(&data, &entry.read_path, verbose)
             } else {
                 data
@@ -332,6 +344,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: entry.tar_path,
                 data: rewritten,
                 mode: entry.mode,
+                symlink_target: None,
             })
         })
         .collect();
@@ -360,6 +373,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: CONFIG_JSON_TAR_PATH.to_string(),
                 data: extracted.config_json,
                 mode: 0o644,
+                symlink_target: None,
             });
         } else {
             eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
@@ -377,6 +391,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
                 data: script.into_bytes(),
                 mode: 0o755,
+                symlink_target: None,
             });
         } else {
             eprintln!(
@@ -576,6 +591,12 @@ fn discover_all_dependencies(
 /// ELF magic bytes: `\x7fELF`.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
+pub use litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
+
+pub(crate) fn is_elf(data: &[u8]) -> bool {
+    data.starts_with(&ELF_MAGIC)
+}
+
 /// ELF e_machine value for x86_64.
 const EM_X86_64: u16 = 62;
 /// ELF e_machine value for AArch64.
@@ -613,7 +634,12 @@ fn target_elf_machine() -> u16 {
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
+///
+/// `pub` (rather than crate-private) so the runtime OCI-loading path
+/// (`litebox_runner_linux_on_windows_userland`'s `--oci-image` option) can rewrite each layer's
+/// executable ELFs the same way this crate's own ahead-of-time packaging path already does,
+/// without duplicating the ELF-magic/architecture-check/rewriter-error-handling logic.
+pub fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
@@ -665,6 +691,12 @@ struct TarEntry {
     tar_path: String,
     data: Vec<u8>,
     mode: u32,
+    /// When `Some`, this entry is a SYMLINK to the given target rather than a regular file,
+    /// and `data` is empty. Real container images are largely defined by their symlink
+    /// structure (`/bin/ls -> /bin/busybox`, `/lib64 -> /lib`), so materializing each link as
+    /// a full file copy produces a rootfs that is no longer the image it came from -- and
+    /// duplicates enormously (295 copies of one 804 KB busybox, 226 MB, in a single layer).
+    symlink_target: Option<String>,
 }
 
 fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
@@ -672,7 +704,55 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create output file {}", output.display()))?;
     let mut builder = Builder::new(file);
 
+    // Copy-on-write mapping alignment. `MapViewOfFile3` (the Win32 primitive behind
+    // `try_allocate_cow_pages`) requires a view's FILE OFFSET to be 64KiB-aligned -- unlike
+    // Linux `mmap`, which needs only 4KiB. Tar's 512-byte block layout means a natural archive
+    // lands almost nothing on that boundary: a real Alpine layer measured 1 of 88 files (1.1%)
+    // aligned, so the CoW fast path fell back to a 4KB-per-syscall memcpy for essentially every
+    // exec (386 sys_read calls to launch one busybox).
+    //
+    // Pad before any entry whose DATA is large enough to be worth mapping so its data starts on
+    // a 64KiB boundary. Only files >= 64KiB are padded: a smaller file cannot fill a view and
+    // aligning it would cost space for no benefit. On that same layer only 11 of 88 files
+    // qualify -- but they are exactly the ones every exec maps (busybox, ld-musl, libcrypto,
+    // libssl) -- so the whole change costs 0.41 MB on 8.43 MB, 4.8%.
+    const COW_VIEW_ALIGN: u64 = 65536;
+    const TAR_BLOCK: u64 = 512;
+    // Tracks the byte offset the next entry's HEADER will be written at, mirroring what the
+    // builder itself emits: one header block, then the data rounded up to a block boundary.
+    let mut offset: u64 = 0;
+
     for entry in entries {
+        // Emit alignment padding BEFORE this entry's header when its data would otherwise
+        // straddle a 64KiB boundary. The padding is a real tar entry (a regular file under
+        // litebox/, ignored by the guest) rather than raw bytes, because a tar reader must be
+        // able to walk past it -- raw filler would desynchronize every subsequent header.
+        if entry.symlink_target.is_none() && entry.data.len() as u64 >= COW_VIEW_ALIGN {
+            let data_start = offset + TAR_BLOCK;
+            let misalign = data_start % COW_VIEW_ALIGN;
+            if misalign != 0 {
+                // Space to fill, minus the padding entry's own header block.
+                let mut gap = COW_VIEW_ALIGN - misalign;
+                while gap < TAR_BLOCK * 2 {
+                    gap += COW_VIEW_ALIGN;
+                }
+                let pad_len = gap - TAR_BLOCK;
+                let pad = vec![0u8; usize::try_from(pad_len).expect("pad fits usize")];
+                let mut pad_header = Header::new_ustar();
+                pad_header.set_size(pad_len);
+                pad_header.set_mode(0o644);
+                pad_header.set_uid(1000);
+                pad_header.set_gid(1000);
+                pad_header.set_entry_type(tar::EntryType::Regular);
+                pad_header.set_cksum();
+                let pad_name = format!("litebox/.align/{offset}");
+                builder
+                    .append_data(&mut pad_header, &pad_name, pad.as_slice())
+                    .with_context(|| format!("failed to add alignment padding {pad_name}"))?;
+                offset += TAR_BLOCK + pad_len.div_ceil(TAR_BLOCK) * TAR_BLOCK;
+            }
+        }
+        let entry_data_len = entry.data.len() as u64;
         // Note: we use the ustar format because the runtime tar filesystem
         // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
         // supports ustar. This limits path lengths to 256 bytes (with the
@@ -685,13 +765,92 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         header.set_mode(entry.mode & 0o777);
         header.set_uid(1000);
         header.set_gid(1000);
+        // A symlink entry carries its target in the header's linkname and no payload.
+        if let Some(target) = &entry.symlink_target {
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, &entry.tar_path, target)
+                .with_context(|| {
+                    format!(
+                        "failed to add symlink {} -> {target} to tar",
+                        entry.tar_path
+                    )
+                })?;
+            // A symlink entry is header-only, no data blocks.
+            offset += TAR_BLOCK;
+            continue;
+        }
         header.set_entry_type(tar::EntryType::Regular);
         header.set_cksum();
         builder
             .append_data(&mut header, &entry.tar_path, entry.data.as_slice())
             .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
+        offset += TAR_BLOCK + entry_data_len.div_ceil(TAR_BLOCK) * TAR_BLOCK;
     }
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod symlink_emit_tests {
+    use super::*;
+
+    /// A `TarEntry` carrying a `symlink_target` must be written as a real symlink header, not a
+    /// file. Every layer built before this contained ZERO symlinks -- 295 copies of one 804 KB
+    /// busybox in a single layer -- because the packager resolved links away, on the since-stale
+    /// premise that the runtime tar filesystem could not read them.
+    #[test]
+    fn build_tar_emits_symlink_entries() {
+        let dir = std::env::temp_dir().join("litebox_symlink_emit_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.tar");
+
+        let entries = vec![
+            TarEntry {
+                tar_path: "bin/busybox".to_string(),
+                data: b"ELF-ish payload".to_vec(),
+                mode: 0o755,
+                symlink_target: None,
+            },
+            TarEntry {
+                tar_path: "bin/ls".to_string(),
+                data: Vec::new(),
+                mode: 0o777,
+                symlink_target: Some("busybox".to_string()),
+            },
+        ];
+        build_tar(&entries, &out).unwrap();
+
+        let mut archive = tar::Archive::new(std::fs::File::open(&out).unwrap());
+        let mut saw_symlink = false;
+        let mut saw_regular = false;
+        for e in archive.entries().unwrap() {
+            let e = e.unwrap();
+            let path = e.path().unwrap().to_string_lossy().to_string();
+            match e.header().entry_type() {
+                tar::EntryType::Symlink => {
+                    assert_eq!(path, "bin/ls");
+                    let target = e.link_name().unwrap().unwrap();
+                    assert_eq!(target.to_string_lossy(), "busybox");
+                    // A symlink must carry no payload -- otherwise it is still a copy.
+                    assert_eq!(e.header().size().unwrap(), 0);
+                    saw_symlink = true;
+                }
+                tar::EntryType::Regular => {
+                    assert_eq!(path, "bin/busybox");
+                    // The exec bit must survive: a shell refuses to run a 0644 binary (rc=126)
+                    // even though litebox itself ignores the mode.
+                    assert_eq!(e.header().mode().unwrap() & 0o777, 0o755);
+                    saw_regular = true;
+                }
+                other => panic!("unexpected entry type {other:?} for {path}"),
+            }
+        }
+        assert!(saw_symlink, "no symlink entry was written");
+        assert!(saw_regular, "no regular entry was written");
+        let _ = std::fs::remove_file(&out);
+    }
 }

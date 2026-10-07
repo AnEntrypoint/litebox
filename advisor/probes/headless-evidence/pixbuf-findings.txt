@@ -1,0 +1,101 @@
+gdk-pixbuf PNG decode: binary-level facts (2026-09-04, advisor)
+
+libgdk_pixbuf-2.0.so.0, extracted from layer_timeline3.tar:
+
+  DT_NEEDED includes libglycin-2.so.0   -- glycin is a DIRECT dependency
+  376 exported FUNC symbols
+  ZERO exported glycin symbols          -- readelf --dyn-syms | grep -c glycin == 0
+  strings show gdk_pixbuf__glycin_image_begin_load / _load_increment / _stop_load
+  strings show ../gdk-pixbuf/io-glycin-utils.c
+
+=> The glycin loader is a BUILT-IN, compiled into libgdk_pixbuf and linked
+   against libglycin directly. It is not a dlopen'd module, so it needs no
+   loaders.cache entry. The "missing loaders.cache" theory is therefore wrong,
+   and so is any fix that writes one -- gdk-pixbuf-query-loaders scans the
+   loaders DIRECTORY and structurally cannot enumerate a built-in, which is why
+   it reports zero image/png entries even on a successful (rc=0) run.
+
+Runtime, with a live session bus, RUST_LOG=trace and G_MESSAGES_DEBUG=all
+(advisor/probes/pixbuf_decode_probe.sh):
+
+  failed to load "cursor.png": Couldn't recognize the image file format
+  process tree: NO glycin subprocess
+  glycin log lines: NONE
+
+=> gdk-pixbuf rejects the file BEFORE any decoder runs. glycin never executes,
+   so nothing about the sandbox, bwrap, namespaces or seccomp is reached on
+   this path. The EPERM fix (37753913) is correct and still needed for bwrap's
+   own errno, but it is NOT what gates PNG decoding.
+
+The remaining question is why gdk-pixbuf's format sniffing rejects a valid PNG
+when its only PNG-capable loader is a built-in it should always have.
+
+UPDATE (same session): IT IS NOT ABOUT PNG, AND NOT ABOUT loaders.cache.
+
+Control comparison, PNG vs XPM. XPM is the one format this layer ships a real
+loader .so for (libpixbufloader-xpm.so, physically present in the loaders dir):
+
+  gdk-pixbuf-csource PNG  -> rc=1 "Couldn't recognize the image file format"
+  gdk-pixbuf-csource XPM  -> rc=1 "Couldn't recognize the image file format"
+
+BOTH fail. So no loader of any kind is being found -- this is the whole loader
+mechanism, not a PNG/glycin gap.
+
+And it is not a missing cache. Generating one and installing it changes nothing:
+
+  loaders.cache before          absent
+  gdk-pixbuf-query-loaders      rc=0, 350 bytes, correctly lists
+                                libpixbufloader-xpm.so with magic "/* XPM */"
+  cache copied into place       yes
+  retry XPM                     rc=1, same error
+  retry PNG                     rc=1, same error
+
+So a VALID cache, naming a loader .so that EXISTS, still yields "unrecognized"
+for that loader's own format. The defect is in loading/registering the module
+at runtime, downstream of both the cache and the file's format sniffing.
+
+This retires three theories at once: "missing loaders.cache" (generated, no
+change), "missing PNG loader plugin" (XPM has its plugin and fails identically),
+and the entire glycin/bwrap/namespace/sandbox path (never reached; no decoder
+of any kind runs).
+
+Next question, and it is now a litebox question rather than a packaging one:
+does dlopen of libpixbufloader-xpm.so actually succeed under litebox? gdk-pixbuf
+loads modules via gmodule/dlopen, and a silent dlopen failure would produce
+exactly this symptom for every format at once.
+
+UPDATE 2: syscall-level trace -- the cache is READ IN FULL, then no module is
+ever opened. Not a dlopen failure either.
+
+Ruled out first: broken dependencies. `ldd` on libpixbufloader-xpm.so inside the
+guest resolves EVERY DT_NEEDED (libgdk_pixbuf, libgobject, libglib, libgmodule,
+libgio, libglycin, libffi, libpcre2, libz, libmount, liblcms2, libfontconfig,
+libseccomp, libgcc_s, libblkid, libfreetype, libexpat, musl) with ZERO
+"not found". So the module is loadable.
+
+Also ruled out: a cache-location mismatch. Setting GDK_PIXBUF_MODULE_FILE
+explicitly at a freshly generated cache fails identically.
+
+The trace (LITEBOX_LOG=debug), for the gdk-pixbuf-csource that fails:
+
+  2.964030  sys_openat  /tmp/lc  fd=4          <- our generated cache
+  2.964207  sys_read    fd=4  result=Ok(350)   <- reads all 350 bytes
+  2.964249  sys_read    fd=4  result=Ok(0)     <- clean EOF
+  2.964333  sys_mmap    4096
+  2.972180  sys_openat  /usr/lib/charset.alias  fd=None
+  2.972395  sys_write   fd=2  "failed to load ... Couldn't recognize the image
+                              file format"
+  2.972538  sys_exit_group status=Exit(1)
+
+Between reading the cache and reporting failure there is NO openat of
+libpixbufloader-xpm.so, and no openat of any loaders/ path at all. gdk-pixbuf
+consumes the cache and then declines to load the module it names.
+
+So the sequence is: cache present and valid -> read completely -> module never
+opened -> every format reported unrecognized. The failure is in gdk-pixbuf's
+handling of the parsed cache, before any dlopen is attempted.
+
+Only one unsupported syscall appears anywhere in these runs: membarrier (2x).
+glib uses memory barriers for its thread-safe one-time-init (g_once), which
+guards exactly this kind of module registration, so that is worth eliminating
+before looking further -- it is the one known litebox gap on this path.

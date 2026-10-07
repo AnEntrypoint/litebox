@@ -28,15 +28,10 @@ pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
-    /// Explicitly crate-internal: Create a new empty descriptor table.
-    ///
-    /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
-    /// be invoked anywhere else in the codebase.
     pub(crate) fn new_from_litebox_creation() -> Self {
         Self { entries: vec![] }
     }
 
-    /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     #[expect(
         clippy::missing_panics_doc,
         reason = "panics impossible due to type invariants"
@@ -114,7 +109,13 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
-            unreachable!();
+            // Same shape as `close_and_duplicate_if_shared`: the number outlived its entry, so
+            // there is no entry to hand back. `close(2)`-reachable, so EBADF, never a panic.
+            litebox_util_log::warn!(
+                fd:% = fd.x.as_usize().unwrap_or(usize::MAX);
+                "diag-fd-remove: descriptor slot is already empty, nothing to remove"
+            );
+            return None;
         };
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
@@ -136,12 +137,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
-        let idx = fd.x.as_usize()?;
+        let idx = match fd.x.as_usize() {
+            Some(idx) => idx,
+            None => return None,
+        };
         let Some(old) = self.entries[idx].take() else {
-            unreachable!();
+            // Guest-reachable, and a real run reached it (chrD91: `unreachable` at this line
+            // killed a cross-process fork child's guest-execution thread). An owned, unclosed
+            // `TypedFd` whose slot is empty means the number outlived its entry -- a second
+            // close racing the first, or an fd rebuilt in a fork child without its entry. Linux
+            // answers EBADF for a close of a number nothing owns, so report it and let the caller
+            // turn that into EBADF; taking the entry out twice must never kill the session.
+            litebox_util_log::warn!(
+                fd:% = idx;
+                "diag-fd-close: descriptor slot is already empty, close() answers EBADF"
+            );
+            return None;
         };
         if Arc::strong_count(&old.x) == 1 {
-            // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
@@ -150,14 +163,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     .unwrap();
                 Some(CloseResult::Closed(entry))
             } else {
-                // Put it back
                 let old = self.entries[idx].replace(old);
                 assert!(old.is_none());
                 Some(CloseResult::Deferred)
             }
         } else {
             fd.x.mark_as_closed();
-            // Shared, so we need to duplicate it.
             let old = self.entries[idx].replace(old);
             assert!(old.is_none());
             Some(CloseResult::Duplicated(TypedFd {
@@ -182,53 +193,154 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have at least one other duplicate floating around and still accessing an entry somewhere
     /// outside of `fds`; if an entry is returned, then all possible FDs to it have been removed
     /// removed from `fds` (and no other operation was concurrently accessing an entry).
+    /// Takes `fds` as a slice of `Option` slots, rather than a `Vec`, specifically so a caller
+    /// whose OWN backing storage for `fds` is a fixed-size, pointer-free array placed in a
+    /// cross-process-shared struct (e.g. `litebox::net::Network::queued_for_closure`) never needs
+    /// a private-heap `Vec` of its own just to call this function -- see that field's own doc
+    /// comment for the cross-process-dangling-pointer defect class this signature exists to let
+    /// callers avoid entirely, live-caught as a real `TypedFd::as_usize().unwrap()` panic on a
+    /// `None` read through exactly such a foreign `Vec` pointer.
+    ///
+    /// **A further, DIFFERENT cross-process gap, also live-caught (twenty-eighth pass), once the
+    /// above was fixed**: `self` (`Descriptors`) is deliberately PER-PROCESS-PRIVATE (see
+    /// `GlobalStateHandle::litebox`'s own doc comment), but `fds` -- when it is
+    /// `Network::queued_for_closure` -- is genuinely CROSS-PROCESS-SHARED, and every process runs
+    /// its own periodic tick that calls this function against that SAME shared queue. A `TypedFd`
+    /// one process pushed encodes an index into THAT process's own private `entries`, meaningless
+    /// (out of bounds, or resolving to an unrelated live entry) in a DIFFERENT process's table --
+    /// confirmed live: `index out of bounds: the len is 16 but the index is 31`. Every lookup
+    /// below is therefore a best-effort, `None`-tolerant lookup: an index this process's own
+    /// table cannot resolve is left untouched in `fds` (never cleared, never force-removed) so
+    /// whichever process's OWN tick the index actually belongs to can still resolve and close it
+    /// correctly later -- the accepted, disclosed cost is that an entry belonging to a process
+    /// that exits before its own next tick can leak (stay queued forever, never closed), the same
+    /// class of bounded trade-off already accepted elsewhere in this codebase (e.g.
+    /// `Network::reset_after_poisoning`'s own doc comment) rather than a crash on a guest-
+    /// reachable path.
+    ///
+    /// **A THIRD variant of the same gap, also live-caught immediately after the above two**: an
+    /// in-bounds index can resolve to a REAL, live entry that belongs to a completely different
+    /// `FdEnabledSubsystem` (a pipe, a pty, a plain file -- `Descriptors::entries` numbers every
+    /// fd kind in one shared index space per process). `DescriptorEntry::into_subsystem_entry`'s
+    /// own `downcast().unwrap()` then panics with `called Result::unwrap() on an Err value`
+    /// instead of the type mismatch it should just refuse. Guarded the same way: check
+    /// `matches_subsystem::<Subsystem>()` before trusting the index at all.
     pub(crate) fn drain_entries_full_covered_by<Subsystem: FdEnabledSubsystem>(
         &mut self,
-        fds: &mut Vec<TypedFd<Subsystem>>,
+        fds: &mut [Option<TypedFd<Subsystem>>],
     ) -> Vec<Subsystem::Entry> {
-        // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
-        // we have the same number of FDs as matching to the strong-count of a descriptor entry,
-        // then it must be the case that we have everything needed to close the entries out.
+        // A queued count equal to the entry's strong count means every reference to it is in
+        // `fds`, so nothing outside `fds` can still reach it.
         let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
-            for fd in fds.iter() {
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
-                // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
-                // need to expand it out, we'd simply have a `continue` here.
-                let entry = entry.as_ref().unwrap();
-                strong_count_and_count
+            let mut strong_and_queued_counts = HashMap::<*const _, (usize, usize)>::new();
+            for fd in fds.iter().flatten() {
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
+                if !entry.read().matches_subsystem::<Subsystem>() {
+                    continue;
+                }
+                strong_and_queued_counts
                     .entry(Arc::as_ptr(&entry.x))
                     .or_insert((Arc::strong_count(&entry.x), 0))
                     .1 += 1;
             }
-            strong_count_and_count
+            strong_and_queued_counts
                 .into_iter()
-                .filter(|(_ptr, (sc, c))| sc == c)
+                .filter(|(_ptr, (strong_count, queued_count))| strong_count == queued_count)
                 .map(|(ptr, _)| ptr)
                 .collect()
         };
-        // Now we can actually go and remove every single such FD.
         let entries: Vec<Subsystem::Entry> = {
             let mut entries = vec![];
-            fds.retain(|fd: &TypedFd<Subsystem>| {
-                let entry = &self.entries[fd.x.as_usize().unwrap()];
-                let entry = entry.as_ref().unwrap();
+            for slot in fds.iter_mut() {
+                let Some(fd) = slot else { continue };
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
+                if !entry.read().matches_subsystem::<Subsystem>() {
+                    continue;
+                }
                 let entry_ptr = Arc::as_ptr(&entry.x);
                 if !removable_entries.contains(&entry_ptr) {
-                    return true;
+                    continue;
                 }
-                // This FD is removable
                 let entry = self.remove(fd);
                 if let Some(entry) = entry {
-                    // This is the last of the individual entries that were holding a ref to this.
                     entries.push(entry);
                 }
-                false
-            });
+                *slot = None;
+            }
             entries
         };
         debug_assert_eq!(entries.len(), removable_entries.len());
+        entries
+    }
+
+    /// Like [`Self::drain_entries_full_covered_by`], but skips (leaves queued) any entry whose
+    /// per-entry lock cannot be taken without waiting, instead of blocking on it.
+    ///
+    /// For a caller that is already holding a lock other threads need -- a shared worker such as
+    /// [`crate::net::Network::attempt_to_close_queued`], which runs while the cross-process
+    /// `net_lock` is held. Blocking there closes a cycle: a guest thread holding one descriptor's
+    /// entry lock (see [`Self::iter_mut`]) and then asking for `net_lock` waits for the worker,
+    /// while the worker waits for that entry -- and because `net_lock` lives in the shared arena,
+    /// every process in the fork family queues behind it (live: 16 host processes parked on one
+    /// arena mutex, chrD5). The skipped entry is simply visited on the next pass, the same
+    /// accepted trade-off [`Self::iter_mut_nowait`] already documents.
+    pub(crate) fn drain_entries_full_covered_by_nowait<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fds: &mut [Option<TypedFd<Subsystem>>],
+    ) -> Vec<Subsystem::Entry> {
+        let removable_entries: Vec<*const RwLock<_, _>> = {
+            let mut strong_and_queued_counts = HashMap::<*const _, (usize, usize)>::new();
+            for fd in fds.iter().flatten() {
+                let Some(idx) = fd.x.as_usize() else { continue };
+                let Some(Some(entry)) = self.entries.get(idx) else {
+                    continue;
+                };
+                let Some(guard) = entry.try_read() else { continue };
+                if !guard.matches_subsystem::<Subsystem>() {
+                    continue;
+                }
+                strong_and_queued_counts
+                    .entry(Arc::as_ptr(&entry.x))
+                    .or_insert((Arc::strong_count(&entry.x), 0))
+                    .1 += 1;
+            }
+            strong_and_queued_counts
+                .into_iter()
+                .filter(|(_ptr, (strong_count, queued_count))| strong_count == queued_count)
+                .map(|(ptr, _)| ptr)
+                .collect()
+        };
+        let mut entries = vec![];
+        for slot in fds.iter_mut() {
+            let Some(fd) = slot else { continue };
+            let Some(idx) = fd.x.as_usize() else { continue };
+            let Some(Some(entry)) = self.entries.get(idx) else {
+                continue;
+            };
+            let Some(guard) = entry.try_read() else { continue };
+            if !guard.matches_subsystem::<Subsystem>() {
+                continue;
+            }
+            let entry_ptr = Arc::as_ptr(&entry.x);
+            // Released before `self.remove`: the guard borrows `self.entries` through `entry`, and
+            // `remove` needs `&mut self`. (The blocking variant never had to say this because its
+            // guard was a temporary, dropped at the end of its own `if` condition.)
+            drop(guard);
+            if !removable_entries.contains(&entry_ptr) {
+                continue;
+            }
+            let entry = self.remove(fd);
+            if let Some(entry) = entry {
+                entries.push(entry);
+            }
+            *slot = None;
+        }
         entries
     }
 
@@ -242,6 +354,28 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
                 let entry = e.read();
+                if entry.matches_subsystem::<Subsystem>() {
+                    Some((
+                        InternalFd {
+                            raw: i.try_into().unwrap(),
+                        },
+                        crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Like [`Self::iter`], but skips any entry that cannot be read-locked without waiting (see
+    /// [`Self::iter_mut_nowait`]).
+    pub(crate) fn iter_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                let entry = e.try_read()?;
                 if entry.matches_subsystem::<Subsystem>() {
                     Some((
                         InternalFd {
@@ -274,7 +408,42 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                     return None;
                 }
                 let entry = e.write();
-                assert!(entry.matches_subsystem::<Subsystem>());
+                if !entry.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockWriteGuard::map(entry, |e| {
+                        e.as_subsystem_mut::<Subsystem>()
+                    }),
+                ))
+            })
+        })
+    }
+
+    /// Like [`Self::iter_mut`], but skips any entry whose lock cannot be taken without waiting.
+    ///
+    /// For a single shared worker that must never stall behind a guest thread that holds one
+    /// descriptor across a blocking call: the skipped entry is simply visited on the next pass.
+    pub(crate) fn iter_mut_nowait<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            InternalFd,
+            impl core::ops::DerefMut<Target = Subsystem::Entry>,
+        ),
+    > {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                if !e.try_read()?.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
+                let entry = e.try_write()?;
+                if !entry.matches_subsystem::<Subsystem>() {
+                    return None;
+                }
                 Some((
                     InternalFd {
                         raw: i.try_into().unwrap(),
@@ -289,53 +458,68 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
     /// Use the entry at `fd` as read-only.
     ///
-    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`. Also returns
+    /// `None` -- rather than panicking -- if `fd`'s index does not resolve in THIS table at all.
+    ///
+    /// That second case is not merely defensive: a `TypedFd` can end up read back against a
+    /// `Descriptors` table other than the one that created it whenever one process's fd index
+    /// travels into a cross-process-shared structure and a DIFFERENT process (most commonly a
+    /// freshly cross-process-forked child, whose own table starts out far smaller than the
+    /// parent's) later resolves it -- see `Self::drain_entries_full_covered_by`'s own doc comment
+    /// for the fully-diagnosed sibling instances of this exact defect class
+    /// (`Network::queued_for_closure`). Live-caught here too, unfixed until now: `index out of
+    /// bounds: the len is 1 but the index is 13` inside a cross-process-forked child barely past
+    /// `CreateProcessW`, `litebox/src/fd/mod.rs:422` (`docs/AGENTS_ARCHIVE_2026-09-22.md`, 54th
+    /// pass) -- a foreign index a `None`-tolerant `.get()` now simply treats as "not open here"
+    /// instead of taking down the entire guest process it happened to land in.
+    ///
+    /// The `matches_subsystem` gate below is that same defect class one step further in: an index
+    /// that DOES resolve, but to an entry of a different subsystem, used to `unwrap()` a failed
+    /// downcast and panic the entire guest process -- selkies died exactly this way
+    /// (`litebox/src/fd/mod.rs:1095`, exit 101) the moment a browser client made it spawn
+    /// `xfconf-query`. A mistyped fd is EBADF, never a panic.
     pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
     {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().read();
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.read();
+        if !entry.matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(f(entry.as_subsystem::<Subsystem>()))
     }
 
     /// Use the entry at `fd` as mutably.
     ///
-    /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
+    /// If the `fd` has been closed, then skips applying `f` and returns `None`. See
+    /// [`Self::with_entry`]'s doc comment for why an out-of-bounds/foreign index is `None`, not a
+    /// panic, here too.
     pub fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
+        let mut entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?.write();
+        if !entry.matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
     /// Obtain a handle to the underlying entry for the `fd`.
     ///
-    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the table.
+    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the
+    /// table. See that method's doc comment for why an out-of-bounds/foreign index is `None`, not
+    /// a panic, here too.
     pub fn entry_handle<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<EntryHandle<Platform, Subsystem>> {
-        // Since the typed FD should not have been created unless we had the correct subsystem in
-        // the first place, none of this should panic---if it does, someone has done a bad cast
-        // somewhere.
-        let entry = self.entries[fd.x.as_usize()?].as_ref()?;
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
@@ -356,10 +540,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
-        let mut entry = self.entries[usize::try_from(internal_fd.raw).unwrap()]
-            .as_ref()
-            .unwrap()
-            .write();
+        let idx = usize::try_from(internal_fd.raw).ok()?;
+        let mut entry = self.entries.get(idx)?.as_ref()?.write();
         if entry.matches_subsystem::<Subsystem>() {
             Some(f(entry.as_subsystem_mut::<Subsystem>()))
         } else {
@@ -371,30 +553,41 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
     /// deadlocks. Prefer using [`Self::with_entry`] when possible, to make life easier.
+    ///
+    /// Returns `None` (never panics) if `fd`'s index does not resolve in this table -- see
+    /// [`Self::with_entry`]'s doc comment.
     pub(crate) fn get_entry<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
-        Some(crate::sync::RwLockReadGuard::map(
-            self.entries[fd.x.as_usize()?].as_ref().unwrap().read(),
-            |e| e.as_subsystem::<Subsystem>(),
-        ))
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
+        Some(crate::sync::RwLockReadGuard::map(entry.read(), |e| {
+            e.as_subsystem::<Subsystem>()
+        }))
     }
 
     /// Get the entry at `fd`, mutably.
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
     /// deadlocks. Prefer using [`Self::with_entry_mut`] when possible, to make life easier.
+    /// Returns `None` (never panics) if `fd`'s index does not resolve in this table -- see
+    /// [`Self::with_entry`]'s doc comment.
     pub(crate) fn get_entry_mut<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem>>
     {
-        Some(crate::sync::RwLockWriteGuard::map(
-            self.entries[fd.x.as_usize()?].as_ref().unwrap().write(),
-            |e| e.as_subsystem_mut::<Subsystem>(),
-        ))
+        let entry = self.entries.get(fd.x.as_usize()?)?.as_ref()?;
+        if !entry.read().matches_subsystem::<Subsystem>() {
+            return None;
+        }
+        Some(crate::sync::RwLockWriteGuard::map(entry.write(), |e| {
+            e.as_subsystem_mut::<Subsystem>()
+        }))
     }
 
     /// Apply `f` on metadata at an fd, if it exists.
@@ -403,10 +596,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// both [`Self::set_fd_metadata`] and [`Self::set_entry_metadata`]) are run on the same
     /// fd, this will only return the value from the fd one, which will shadow the file one. If no
     /// fd-specific one is set, this returns the entry-specific one.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn with_metadata<Subsystem, T, R>(
         &self,
         fd: &TypedFd<Subsystem>,
@@ -416,9 +605,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
-            .as_ref()
-            .unwrap();
+        let idx = fd.x.as_usize().ok_or(MetadataError::ClosedFd)?;
+        let ind_entry = self
+            .entries
+            .get(idx)
+            .and_then(Option::as_ref)
+            .ok_or(MetadataError::ClosedFd)?;
         match ind_entry.metadata.get::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -430,11 +622,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         }
     }
 
-    /// Similar to [`Self::with_metadata`] but mutable.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn with_metadata_mut<Subsystem, T, R>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -444,9 +631,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        let ind_entry = self.entries[fd.x.as_usize().ok_or(MetadataError::ClosedFd)?]
-            .as_mut()
-            .unwrap();
+        let idx = fd.x.as_usize().ok_or(MetadataError::ClosedFd)?;
+        let ind_entry = self
+            .entries
+            .get_mut(idx)
+            .and_then(Option::as_mut)
+            .ok_or(MetadataError::ClosedFd)?;
         match ind_entry.metadata.get_mut::<T>() {
             Some(m) => Ok(f(m)),
             None => ind_entry
@@ -466,10 +656,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Returns the old metadata if any such metadata exists.
     ///
     /// Silently drops the store if the FD has been closed out.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn set_entry_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -479,9 +665,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        self.entries[fd.x.as_usize()?]
-            .as_ref()
-            .unwrap()
+        self.entries
+            .get(fd.x.as_usize()?)?
+            .as_ref()?
             .x
             .write()
             .metadata
@@ -495,10 +681,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// opened for the same entry.
     ///
     /// Silently drops the store if the FD has been closed out.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "the invariants guarantee that the unwrap panics cannot occur"
-    )]
     pub fn set_fd_metadata<Subsystem, T>(
         &mut self,
         fd: &TypedFd<Subsystem>,
@@ -508,9 +690,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         T: core::any::Any + Clone + Send + Sync,
     {
-        self.entries[fd.x.as_usize()?]
-            .as_mut()
-            .unwrap()
+        self.entries
+            .get_mut(fd.x.as_usize()?)?
+            .as_mut()?
             .metadata
             .insert(metadata)
     }
@@ -574,7 +756,6 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 /// naive derived `Clone` (which would `Arc::clone` every stored ownership token) is unsound for
 /// `fork()`'s per-process fd-table duplication.
 pub struct RawDescriptorStorage {
-    /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<StoredFd>>,
 }
 
@@ -597,7 +778,6 @@ impl StoredFd {
 
 impl RawDescriptorStorage {
     #[expect(clippy::new_without_default)]
-    /// Create a new raw descriptor store.
     pub fn new() -> Self {
         Self { stored_fds: vec![] }
     }
@@ -722,17 +902,11 @@ impl RawDescriptorStorage {
         fd: TypedFd<Subsystem>,
         raw_fd: usize,
     ) -> bool {
-        // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
-        // be too expensive if someone tries to store into a large raw FD?
-        //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 256,
-            "explicit upper bound restriction for now; see implementation details"
-        );
+        // A dense table is fine for realistic workloads; callers enforce RLIMIT_NOFILE before
+        // reaching here (e.g. `fcntl(F_DUPFD, 1000)` or a spawner parking fds high), so growing to
+        // the requested slot is bounded by that limit rather than by an arbitrary constant that
+        // turned a legal request into a panic.
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
-            // There's already something at this slot.
             return false;
         }
         if raw_fd >= self.stored_fds.len() {
@@ -780,7 +954,6 @@ impl RawDescriptorStorage {
         self.stored_fds.get(fd).is_some_and(Option::is_some)
     }
 
-    /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
     pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
         self.stored_fds
             .iter()
@@ -794,7 +967,6 @@ macro_rules! multi_subsystem_generic {
         /// Invoke the corresponding function that matches the subsystem.
         ///
         /// Equivalent versions of this function exist at differing number of subsystems.
-        // One callback per subsystem, generated per arity by this macro.
         #[allow(clippy::too_many_arguments)]
         fn $ident_f<R, $($subsystem),+>(
             &self,
@@ -910,14 +1082,12 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
     }
 }
 
-/// A crate-internal entry for a descriptor.
 pub(crate) struct DescriptorEntry {
     entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
     metadata: AnyMap,
 }
 
 impl DescriptorEntry {
-    /// Check if this entry matches the specified subsystem
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
         core::any::TypeId::of::<Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
@@ -966,7 +1136,6 @@ pub struct TypedFd<Subsystem: FdEnabledSubsystem> {
 }
 
 impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
-    /// Get the "internal FD"
     pub(crate) fn as_internal_fd(&self) -> InternalFd {
         assert!(!self.x.is_closed());
         InternalFd { raw: self.x.raw }
@@ -1001,12 +1170,10 @@ impl OwnedFd {
         }
     }
 
-    /// Check if it is closed
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(core::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Mark it as closed
     pub(crate) fn mark_as_closed(&self) {
         let was_closed = self
             .closed

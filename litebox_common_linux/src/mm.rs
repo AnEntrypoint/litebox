@@ -7,7 +7,7 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::page_mgmt::DeallocationError,
+    platform::page_mgmt::{DeallocationError, MemoryRegionPermissions},
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
@@ -59,31 +59,60 @@ pub fn do_mmap<
         None => None,
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            // TODO: create inaccessible pages for now. Creating mapping
-            // for both executable and writable might be needed for JIT.
-            #[cfg(not(debug_assertions))]
-            unsafe {
-                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-            }
-        }
+    let is_fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
+    // Every combination of the three protection bits, not the four this used to name. An
+    // unmatched combination previously created the pages INACCESSIBLE (and, in a debug build,
+    // hit a `todo!`), so `mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` -- what every GTK program asks
+    // for to hold its closure trampolines -- returned a successful mapping the guest then took
+    // SIGSEGV on at the first byte it wrote. See
+    // `PageManager::create_pages_with_permissions`'s own doc comment.
+    let mut permissions = MemoryRegionPermissions::empty();
+    permissions.set(
+        MemoryRegionPermissions::READ,
+        prot.contains(ProtFlags::PROT_READ),
+    );
+    permissions.set(
+        MemoryRegionPermissions::WRITE,
+        prot.contains(ProtFlags::PROT_WRITE),
+    );
+    permissions.set(
+        MemoryRegionPermissions::EXEC,
+        prot.contains(ProtFlags::PROT_EXEC),
+    );
+    let result =
+        unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) };
+    // AGENTS.md pass 212: a `MAP_FIXED`/`MAP_FIXED_NOREPLACE` request must place the mapping at
+    // EXACTLY the requested address or fail -- that is real Linux `mmap(2)`'s contract, and
+    // every caller (the ELF loader chief among them) computes all subsequent addresses from the
+    // REQUESTED address, never from whatever a mapping call actually returns. A platform-layer
+    // page allocator can have its own internal reasons to relocate a fixed-address request
+    // instead of honoring it (e.g. this crate's Windows backend silently falls back to an
+    // OS-picked address when it detects the requested range is claimed by another live process,
+    // to avoid corrupting that process's real memory -- see `allocate_pages`'s own doc comment
+    // in `litebox_platform_windows_userland`). Root-caused (pass 212) to a real, deterministic,
+    // reproducible crash: silently returning a mapping at the WRONG address for a fixed request
+    // left the ELF loader's BSS zero-fill writing to memory that was never actually mapped.
+    // Catch any such mismatch here, in the one shared choke point every `mmap()` caller already
+    // goes through, and fail the call the way real Linux would (`EEXIST`/`ENOMEM`), rather than
+    // letting every individual platform backend need to remember to check this itself.
+    // DIAG (AGENTS.md pass 226): unconditional print of every fixed-addr call's own result
+    // shape, to determine empirically whether this check's own `if` condition is EVER true for
+    // the still-unexplained EEXIST regression (passes 213-225 exhausted every other candidate).
+    if is_fixed_addr {
+        litebox_util_log::debug!(
+            requested:? = suggested_addr.map(|a| a.as_usize()),
+            actual:? = result.as_ref().ok().map(litebox::platform::RawConstPointer::as_usize),
+            is_err:% = result.is_err();
+            "DIAG do_mmap: fixed-addr call result"
+        );
     }
-    .map(UserPtrMut::from_platform_ptr::<Platform>)
+    if let (Ok(ptr), Some(requested)) = (&result, suggested_addr)
+        && is_fixed_addr
+        && litebox::platform::RawConstPointer::as_usize(ptr) != requested.as_usize()
+    {
+        return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse.into());
+    }
+    result.map(UserPtrMut::from_platform_ptr::<Platform>)
 }
 
 /// Handle syscall `munmap`
@@ -138,22 +167,49 @@ pub fn sys_mprotect<
     if len == 0 {
         return Ok(());
     }
+    // Linux rounds the length up to a whole page: libmagic maps a 10353312-byte file and then
+    // `mprotect`s exactly that length, which used to fail with ENOMEM (`PageRange` rejects an
+    // unaligned end) and made `file` unusable.
+    let len = len
+        .checked_next_multiple_of(litebox::mm::linux::PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
 
     let addr = addr.to_platform_ptr::<Platform>();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
-        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
-        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
-        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
-        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            #[cfg(not(debug_assertions))]
-            return Err(Errno::EINVAL);
+    // Real Linux `mprotect(2)` accepts ANY combination of PROT_READ/PROT_WRITE/PROT_EXEC (8
+    // combinations total, since PROT_NONE=0 and the three bits are independent) -- there is
+    // nothing special about the 5 combinations previously matched here. The remaining 3
+    // (PROT_WRITE alone, PROT_EXEC alone, PROT_WRITE|PROT_EXEC) are real, legal, and used in
+    // practice: e.g. musl/glibc's dynamic linker widens a RELRO/relocated segment to PROT_WRITE
+    // alone (no PROT_READ bit set explicitly -- real hardware/Windows still allows reading a
+    // writable page, so this is a legitimate narrowing request, not a mistake) while patching
+    // relocations, then restores the segment's real final protection afterward. Previously,
+    // any of these 3 unhandled combinations fell to a `todo!()` panic (debug builds, aborting
+    // the whole runner on an ordinary guest syscall) or silently returned `EINVAL` (release
+    // builds) -- silently leaving the segment at its OLD protection while the guest's dynamic
+    // linker believed the mprotect had succeeded and proceeded to write relocations into
+    // memory that was never actually made writable, producing a guest-visible SIGSEGV
+    // (confirmed live: weston's own ld.so relocation sequence, `mprotect(PROT_WRITE)` on a
+    // freshly-loaded shared library's data segment, silently EINVAL'd, followed by a real write
+    // fault at the exact start of that same range).
+    let permissions = {
+        let mut permissions = MemoryRegionPermissions::empty();
+        if prot.contains(ProtFlags::PROT_READ) {
+            permissions |= MemoryRegionPermissions::READ;
         }
-    }
-    .map_err(Errno::from)
+        if prot.contains(ProtFlags::PROT_WRITE) {
+            permissions |= MemoryRegionPermissions::WRITE;
+        }
+        if prot.contains(ProtFlags::PROT_EXEC) {
+            permissions |= MemoryRegionPermissions::EXEC;
+        }
+        permissions
+    };
+    // Linux rounds the length up to a whole page (Chromium protects a `0x101a`-byte region).
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }
+        .map_err(Errno::from)
 }
 
 /// Handle syscall `mremap`

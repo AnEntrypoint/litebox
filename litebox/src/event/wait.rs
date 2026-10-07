@@ -132,6 +132,8 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        // Same aarch64 store->load hazard as `start_wait`: `f` reads pending interrupts next.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let ready_to_run_guest = f();
         if !ready_to_run_guest {
             self.waker
@@ -161,6 +163,12 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
+        // Dekker-style handshake with `WaitContext::wait_until`: the waiter stores WAITING (SeqCst)
+        // then reads its wait condition; the waker stores the condition and then reads the state
+        // here. Each side needs a full store->load barrier. x86's locked RMW gives that for free;
+        // on aarch64 the state load below could otherwise be satisfied before the caller's
+        // condition store is visible, losing the wakeup.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.condvar;
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
@@ -204,6 +212,13 @@ pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform> {
+    /// Wakes the thread only if it is blocked in a wait, so it re-evaluates its wait condition.
+    /// Unlike [`Self::interrupt`], a thread running guest code is left alone (no forced exit
+    /// from the guest), which makes this cheap enough to call on every cross-process data event.
+    pub fn wake_if_waiting(&self) {
+        self.waker.wake();
+    }
+
     /// Interrupts the thread, whether it is waiting or running guest code.
     ///
     /// If it is waiting in [`WaitContext::wait_until`] or
@@ -211,6 +226,9 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
+        // Same store->load handshake as `WaitStateInner::wake`, against `prepare_to_run_guest`
+        // (stores RUNNING_IN_GUEST then reads pending interrupts) and `wait_until`.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
@@ -378,6 +396,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        // A SeqCst store does not order a later plain load before it on aarch64 (stlr/ldr);
+        // the wait/interrupt conditions read next must not be satisfied ahead of this store.
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.

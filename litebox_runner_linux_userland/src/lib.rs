@@ -33,6 +33,18 @@ pub struct CliArgs {
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Guest user id (default 1000). Use `--uid 0 --gid 0` for an OCI-style root guest: it also
+    /// sets up the root-owned filesystem scaffolding (`/tmp`, `/dev/shm`, `/run`, `/var/*`,
+    /// `/etc/resolv.conf`) an OCI image's own init expects.
+    #[arg(long = "uid", default_value_t = DEFAULT_GUEST_UID)]
+    pub uid: u16,
+    /// Present the initial guest process as pid 1, the way a container's init sees itself
+    /// (`s6-overlay`'s `/init` refuses to run otherwise). Later processes get sequential ids.
+    #[arg(long = "pid1")]
+    pub pid1: bool,
+    /// Guest group id (default 1000); see `--uid`.
+    #[arg(long = "gid", default_value_t = DEFAULT_GUEST_GID)]
+    pub gid: u16,
     /// Forward the existing environment variables
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
@@ -127,16 +139,235 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-pub fn run(cli_args: CliArgs) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::uptime())
-        .with_level(true)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_env_var("LITEBOX_LOG")
-                .from_env_lossy(),
+/// Set up the root-owned identity and FHS scaffolding every fresh in-mem upper layer needs before
+/// it can back a real guest process's filesystem -- shared by `run()`'s own bootstrap (copied from
+/// `litebox_runner_linux_on_windows_userland`, which owns the reasoning behind each entry) (see `layered.rs:243`'s
+/// `unimplemented!` and this function's own inline comments for why each step here matters).
+fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvider>(
+    in_mem: &mut litebox::fs::in_mem::FileSystem<Platform>,
+) {
+    // The guest's persistent identity is root, matching `Platform::init_task`'s credentials (for
+    // `run()`) or `task_params`'s credentials (for the process-fork child's adopted `Task`) and
+    // matching how a real container's initial process runs (a fresh OCI rootfs's `/`, `/etc`,
+    // `/lib`, etc. are root-owned at mode 0755, not world-writable). Without this, `getuid()`
+    // would report root while the file system's own permission checks still enforced a
+    // mismatched non-root identity, breaking any program (e.g. `apk`) that needs to write into
+    // the rootfs's root-owned directories -- for the process-fork child specifically, this
+    // mismatch is what previously hit `unimplemented!("{e} when setting up ancestor dirs")` at
+    // `litebox/src/fs/layered.rs:243` (a `MkdirError::NoWritePerms` this in-mem layer's own
+    // `mkdir` returns once `apk`'s file-migration-from-the-read-only-tar-layer path reaches a
+    // root-owned ancestor directory).
+    in_mem.set_default_user(0, 0);
+    in_mem.with_root_privileges(|fs| {
+        use litebox::fs::FileSystem as _;
+        fs.mkdir(
+            "/tmp",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
         )
-        .init();
+        .unwrap();
+
+        // `/dev/shm` on real Linux is its own tmpfs mount, not part of devtmpfs (the fixed,
+        // read-only-shaped `{stdin,stdout,null,urandom,...}` set `litebox::fs::devices::Devices`
+        // provides at `/dev` -- see that module's own doc comment): a plain writable directory
+        // whose files are always real shared memory, which is exactly what a `/tmp`-shaped
+        // in-mem directory already gives every OTHER file created under it except for the
+        // `MAP_SHARED|PROT_WRITE` real-backing part (see `syscalls::file::MemfdMarker` and
+        // `syscalls::mm::try_memfd_mmap`'s own doc comments for why an ordinary in-mem file can't
+        // support that directly). Mode 1777 (world-writable + sticky bit) matches real Linux's
+        // `/dev/shm` exactly -- multiple unrelated users/processes must be able to create files
+        // here, but only the owner of a given file (or root) may unlink someone else's. Without
+        // this directory existing at all, glibc's `shm_open("/name", ...)` (which opens
+        // `/dev/shm/name` under the hood -- there is no real `shm_open` syscall) fails at the
+        // very first `open()` with `ENOENT`, before ever reaching the `MAP_SHARED` gap: confirmed
+        // via `advisor/probes/shm_probe.c`, which reproduced exactly this `ENOENT` against the
+        // canonical XFCE layer (no `/dev/shm` tar entry, no synthesized directory here either) --
+        // this is the blocker AGENTS.md documents as labwc's shm-keymap-allocation crash under
+        // the stock `linuxserver/webtop:alpine-mate` image's real Wayland/DRM (labwc) path.
+        //
+        // `/dev` itself must exist as a real ancestor directory IN THIS SAME in-mem layer before
+        // `/dev/shm` can be created under it -- the `/dev` a guest normally sees is synthesized
+        // entirely by the separate `Devices` composer mount in `default_fs` below (this
+        // function's own in-mem layer knows nothing about that), so without this the `mkdir`
+        // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
+        // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
+        // root-owned matches real Linux's own `/dev`.
+        fs.mkdir(
+            "/dev",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
+        )
+            .unwrap();
+        fs.mkdir(
+            "/dev/shm",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RWXG
+                | litebox::fs::Mode::RWXO
+                | litebox::fs::Mode::SVTX,
+        )
+        .unwrap();
+
+        // Standard FHS directories that tools like `apk` expect to already exist
+        // (e.g. `apk` opens a log file under `/var/log`) but which don't survive
+        // as empty-directory entries when an OCI image's rootfs is scanned into a
+        // file-based tar (an empty directory has no file contents, so it produces
+        // no tar entry, and `TarRo`'s directory tree is inferred purely from file
+        // paths -- see litebox/src/fs/tar_ro.rs).
+        // `/var/lib` and `/var/lib/xkb` are added to this same list for the identical reason:
+        // `/var/lib/xkb` exists in the read-only tar layer (it ships a `README.compiled`), but a
+        // NEW file inside a directory that exists ONLY in the read-only layer has nowhere to
+        // land -- `TarRo::open_file_at` (litebox/src/fs/tar_ro.rs) refuses a writable open of a
+        // tar-layer directory, so `xkbcomp` (spawned by `Xorg` to compile the keyboard keymap)
+        // fails to create `/var/lib/xkb/server-0.xkm`, which `Xorg` treats as fatal ("Failed to
+        // activate virtual core keyboard"). Confirmed live: this was the concrete blocker after
+        // the DRM_CAP_CURSOR_WIDTH/HEIGHT and legacy ADDFB fixes let `Xorg` boot against
+        // `linuxserver/webtop:debian-xfce`. `/var/lib` must precede `/var/lib/xkb` in this list
+        // (same ancestor-ordering requirement as `/dev` before `/dev/shm` above) or `mkdir`
+        // panics with `PathError::MissingComponent`.
+        for dir in [
+            "/run",
+            "/var",
+            "/var/log",
+            "/var/cache",
+            "/var/tmp",
+            "/var/lib",
+            "/var/lib/xkb",
+        ] {
+            fs.mkdir(
+                dir,
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
+        }
+
+        // A container's `/etc/resolv.conf` normally comes from the *host* runtime at
+        // container-start (e.g. Docker bind-mounts the host's own resolver config in), not
+        // from the image itself -- a plain OCI rootfs like this one has no such file. Without
+        // it, DNS-using tools (`apk`, `wget`, ...) have no configured nameserver at all and
+        // fail immediately rather than reaching the network. Point at a public resolver
+        // reachable through the platform's NAT gateway, mirroring what a real container
+        // runtime would inject.
+        //
+        // `/etc` itself isn't created here (it comes from the tar layer composed in later),
+        // so create it in this in-mem layer too, matching the `/tmp`, `/run`, etc. pattern
+        // above.
+        fs.mkdir(
+            "/etc",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
+        )
+        .unwrap();
+        let resolv_conf = fs
+            .open(
+                "/etc/resolv.conf",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &resolv_conf,
+            b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&resolv_conf).unwrap();
+        // Likewise `/etc/hosts`: a container runtime injects it, an image does not carry one, and
+        // without a `localhost` entry every `getaddrinfo("localhost")` falls through to DNS.
+        let hosts = fs
+            .open(
+                "/etc/hosts",
+                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                litebox::fs::Mode::RUSR
+                    | litebox::fs::Mode::WUSR
+                    | litebox::fs::Mode::RGRP
+                    | litebox::fs::Mode::ROTH,
+            )
+            .unwrap();
+        fs.write(
+            &hosts,
+            b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\tlitebox\n",
+            None,
+        )
+        .unwrap();
+        fs.close(&hosts).unwrap();
+    });
+}
+
+/// Prints the return addresses on the panicking thread's frame-pointer chain after the normal
+/// panic message. Unlike `RUST_BACKTRACE`, this works on guest-running threads (whose unwind info
+/// stops at the guest entry) and needs no file access, which the seccomp filter forbids. Only
+/// useful for binaries built with `-C force-frame-pointers=yes`; resolve with `addr2line` after
+/// subtracting the `litebox-exe-base` line printed at startup.
+#[cfg(target_arch = "x86_64")]
+fn install_frame_pointer_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(std::boxed::Box::new(move |info| {
+        previous(info);
+        let mut rbp: usize;
+        // SAFETY: reads the frame-pointer register only.
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+        let mut out = std::string::String::from("litebox-panic-frames:");
+        for _ in 0..48 {
+            if rbp < 0x1000 || rbp % 8 != 0 {
+                break;
+            }
+            // SAFETY: best-effort walk; the chain is validated only by alignment, which is
+            // acceptable for a crash diagnostic that already runs on a panicking thread.
+            let (next, ret) = unsafe { (*(rbp as *const usize), *((rbp + 8) as *const usize)) };
+            out.push_str(&std::format!(" {ret:#x}"));
+            if next <= rbp {
+                break;
+            }
+            rbp = next;
+        }
+        eprintln!("{out}");
+    }));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_frame_pointer_panic_hook() {}
+
+/// A panic on any runner thread means this guest process's kernel state is no longer trustworthy:
+/// unwinding out of a thread that entered from guest code leaves the signal stack and TLS
+/// half-restored, which used to turn into millions of faults on the spot while the process (and
+/// any lock it held) lingered. Terminate the process instead, like a fatal signal would.
+fn install_terminate_on_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(std::boxed::Box::new(move |info| {
+        // A panic raised inside an allocator critical section still holds the shared-heap lock,
+        // and reporting it allocates.
+        litebox_platform_linux_userland::shared_heap::release_lock_if_held_by_current_thread();
+        previous(info);
+        // SAFETY: `_exit` never returns and touches no runtime state.
+        unsafe { libc::_exit(134) };
+    }));
+}
+
+pub fn run(cli_args: CliArgs) -> Result<()> {
+    if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some() {
+        install_frame_pointer_panic_hook();
+    }
+    install_terminate_on_panic_hook();
+    if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some()
+        && let Ok(maps) = std::fs::read_to_string("/proc/self/maps")
+        && let Some(line) = maps.lines().next()
+    {
+        // The seccomp filter forbids the file reads backtrace symbolization needs, so a panic
+        // backtrace shows raw addresses; subtract this base and feed them to `addr2line -e`.
+        eprintln!("litebox-exe-base: {}", line.split('-').next().unwrap_or(""));
+    }
+    litebox_util_log::set_private_alloc_hook(
+        litebox_platform_linux_userland::shared_heap::private_scope,
+    );
+    litebox_util_log::init_env_filtered_subscriber("LITEBOX_LOG");
 
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
@@ -226,15 +457,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
     let ppid = unsafe { libc::getppid() };
     let task_params = litebox_common_linux::TaskParams {
-        pid: tid,
-        ppid,
-        uid: u32::from(DEFAULT_GUEST_UID),
-        euid: u32::from(DEFAULT_GUEST_UID),
-        gid: u32::from(DEFAULT_GUEST_GID),
-        egid: u32::from(DEFAULT_GUEST_GID),
+        pid: if cli_args.pid1 { 1 } else { tid },
+        ppid: if cli_args.pid1 { 0 } else { ppid },
+        uid: u32::from(cli_args.uid),
+        euid: u32::from(cli_args.uid),
+        gid: u32::from(cli_args.gid),
+        egid: u32::from(cli_args.gid),
     };
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        if cli_args.uid == 0 {
+            initialize_root_in_mem_layer(&mut in_mem);
+        }
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -246,8 +480,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                                          path: &Path| {
                 fs.chown(
                     path.to_str().unwrap(),
-                    Some(DEFAULT_GUEST_UID),
-                    Some(DEFAULT_GUEST_GID),
+                    Some(cli_args.uid),
+                    Some(cli_args.gid),
                 )
                 .unwrap();
             };
@@ -387,7 +621,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
         if let Ok(sender) = sender_rx.recv() {
-            shim.set_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
+            shim.add_drm_flip_callback(move |bytes, width, height, pitch, _pixel_format| {
                 sender.send(litebox_platform_linux_userland::presentation::Frame {
                     width,
                     height,
@@ -422,9 +656,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // but that would require more invasive changes.
                 platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
             }
-            // Final flush
-            // TODO: keep running until all sockets are closed?
-            while shim.perform_network_interaction().call_again_immediately() {}
+            // Final flush: give in-flight data (a server that wrote its response and exited)
+            // up to two seconds to drain and be acknowledged, like a real kernel that keeps
+            // sending after the owning process is gone.
+            for _ in 0..200 {
+                while shim.perform_network_interaction().call_again_immediately() {}
+                platform.wait_on_tun(Some(core::time::Duration::from_millis(10)));
+            }
         });
         Some(child)
     } else {

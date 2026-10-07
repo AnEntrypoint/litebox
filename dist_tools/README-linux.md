@@ -33,6 +33,25 @@ unchanged.
 Interactive shells and subprocesses (`/bin/sh`, `sh -c "cmd1; cmd2"`, etc.)
 work normally.
 
+## Stock Alpine XFCE / Graphical Desktop Environment inside LiteBox
+
+LiteBox supports running Wayland/DRM compositors (such as `labwc` with XFCE components `xfsettingsd`, `xfce4-panel`, and `xfdesktop`) directly on top of LiteBox's Linux syscall shim.
+
+### GUI & Display Mapping (DRM to wgpu)
+- **Virtual DRM Device (`/dev/dri/card0`)**: LiteBox implements a software DRM/KMS dumb-buffer device in `litebox_shim_linux/src/syscalls/drm.rs`.
+- **Dumb Buffer Allocation & Page Flipping**:
+  - `DRM_IOCTL_MODE_CREATE_DUMB`: Allocates shared memory backing buffers.
+  - `DRM_IOCTL_MODE_MAP_DUMB`: Exposes page-aligned mmap offsets into the guest address space.
+  - `DRM_IOCTL_MODE_ADDFB2` & `DRM_IOCTL_MODE_PAGE_FLIP`: Attach scanout framebuffers and trigger vblank/page-flip events (`DrmEventVblank`).
+- **wgpu Host Presentation**: Flipped pixel buffers are transferred via the registered flip callback directly to a host `wgpu` rendering surface (e.g., `litebox_platform_windows_userland::presentation::Presenter`).
+
+### Running XFCE / Wayland Compositor in Stock Alpine
+To launch the XFCE desktop session inside stock Alpine rootfs under LiteBox:
+```sh
+# Ensure udev daemon is started and launch labwc with XFCE session components:
+udevd --daemon && labwc -s "xfsettingsd & xfce4-panel & xfdesktop &"
+```
+
 ## Language runtimes
 
 `node`, `npm`, `python3`, and `pip3` are preinstalled and ready to run agent

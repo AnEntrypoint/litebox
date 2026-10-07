@@ -1,0 +1,21 @@
+// usage: node shot.mjs URL out.png [waitSeconds]
+import fs from 'node:fs';
+const [url, out, wait='20'] = process.argv.slice(2);
+const base = 'http://127.0.0.1:9333';
+const targets = await (await fetch(base + '/json/list')).json();
+const page = targets.find(t => t.type === 'page');
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+await new Promise(r => ws.addEventListener('open', r));
+let id = 0; const pending = new Map(); const events = [];
+ws.addEventListener('message', m => { const d = JSON.parse(m.data); if (d.id && pending.has(d.id)) { pending.get(d.id)(d); pending.delete(d.id);} else events.push(d); });
+const send = (method, params={}) => new Promise(r => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({id:i, method, params})); });
+await send('Page.enable'); await send('Runtime.enable'); await send('Log.enable'); await send('Network.enable');
+await send('Emulation.setDeviceMetricsOverride', {width:1280, height:800, deviceScaleFactor:1, mobile:false});
+await send('Page.navigate', {url});
+await new Promise(r => setTimeout(r, Number(wait)*1000));
+const shot = await send('Page.captureScreenshot', {format:'png'});
+fs.writeFileSync(out, Buffer.from(shot.result.data, 'base64'));
+const ev = await send('Runtime.evaluate', {expression:'document.title + " | " + document.body.innerText.slice(0,300)', returnByValue:true});
+console.log(JSON.stringify(ev.result.result.value));
+for (const e of events.filter(e=>e.method.startsWith('Network.webSocket')||e.method==='Runtime.exceptionThrown'||e.method==='Log.entryAdded'||e.method==='Runtime.consoleAPICalled').slice(0,60)) console.log(e.method, JSON.stringify(e.params).slice(0,300));
+ws.close(); process.exit(0);

@@ -12,7 +12,7 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -24,7 +24,7 @@ trait DropGuard: Send + Sync {
 
 /// Concrete, generic implementation of [`DropGuard`].
 struct SocketDropGuard<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
+    global: GlobalStateHandle<Platform, FS>,
     sockfd: SocketFd<Platform>,
 }
 
@@ -32,8 +32,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<Platform,
     fn close(&mut self) {
         let _ = self
             .global
-            .net
-            .lock()
+            .net_lock()
             .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
     }
 }
@@ -63,13 +62,12 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
-        global: Arc<GlobalState<Platform, FS>>,
+        global: GlobalStateHandle<Platform, FS>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
         let sockfd = global
-            .net
-            .lock()
+            .net_lock()
             .socket(litebox::net::Protocol::Tcp)
             .map_err(Errno::from)?;
 
@@ -77,9 +75,21 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
         let proxy = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
 
         // 3. Initiate the TCP connection.
+        //
+        // The `net_lock` guard is bound and dropped INSIDE the block: `match
+        // global.net_lock().connect(..)` keeps the temporary guard alive to the end
+        // of the whole `match`, so the `spin_loop()` in the `InProgress` arm would
+        // run with the cross-process `net_lock` HELD -- a connect that never
+        // completes would then spin forever while every other host process in the
+        // fork family queues behind that lock (the same whole-guest freeze shape as
+        // `16f3e76`, on the guest side instead of the worker's).
         let mut check_progress = false;
         loop {
-            match global.net.lock().connect(&sockfd, &addr, check_progress) {
+            let result = {
+                let mut net = global.net_lock();
+                net.connect(&sockfd, &addr, check_progress)
+            };
+            match result {
                 Ok(()) => break,
                 Err(litebox::net::errors::ConnectError::InProgress) => {
                     core::hint::spin_loop();

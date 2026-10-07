@@ -7,12 +7,13 @@
 //! extracts its filesystem layers into a temporary rootfs directory, then
 //! walks the rootfs to discover all ELF files for syscall rewriting.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -66,6 +67,53 @@ pub struct RootfsEntry {
     pub is_executable: bool,
     /// Unix permission mode (lower 12 bits).
     pub mode: u32,
+    /// When `Some`, this entry is a SYMLINK whose target is this string, and it should be
+    /// emitted as a real symlink tar entry rather than a copy of `read_path`'s contents.
+    ///
+    /// A container image is largely DEFINED by its symlink structure
+    /// (`/bin/ls -> /bin/busybox`, `/lib64 -> /lib`); resolving links away yields a rootfs
+    /// that is no longer the image, and duplicates hugely -- one real layer held 295 copies
+    /// of the same 804 KB busybox, 226 MB. The runtime tar filesystem has supported symlinks
+    /// for some time (`litebox/src/fs/tar_ro.rs`: `IndexedChild::Symlink`, `read_link`), so
+    /// the flattening is no longer necessary.
+    pub symlink_target: Option<String>,
+}
+
+/// Same result as `image_ref.parse::<Reference>()`, without the Unicode regular expression that
+/// parser compiles on first use: its NFA costs about 30MB of heap that the process never returns.
+fn parse_reference(image_ref: &str) -> anyhow::Result<Reference> {
+    anyhow::ensure!(!image_ref.is_empty(), "empty image reference");
+    let (name_and_tag, digest) = match image_ref.split_once('@') {
+        Some((head, digest)) => (head, Some(digest.to_owned())),
+        None => (image_ref, None),
+    };
+    let last_segment_start = name_and_tag.rfind('/').map_or(0, |at| at + 1);
+    let (name, tag) = match name_and_tag[last_segment_start..].rfind(':') {
+        Some(at) => (
+            &name_and_tag[..last_segment_start + at],
+            Some(name_and_tag[last_segment_start + at + 1..].to_owned()),
+        ),
+        None => (name_and_tag, None),
+    };
+    anyhow::ensure!(!name.is_empty(), "empty repository name");
+    let (mut registry, mut repository) = match name.split_once('/') {
+        Some((left, right)) if left.contains('.') || left.contains(':') || left == "localhost" => {
+            (left.to_owned(), right.to_owned())
+        }
+        _ => ("docker.io".to_owned(), name.to_owned()),
+    };
+    if registry == "index.docker.io" {
+        registry = "docker.io".to_owned();
+    }
+    if registry == "docker.io" && !repository.contains('/') {
+        repository = format!("library/{repository}");
+    }
+    Ok(match (tag, digest) {
+        (Some(tag), Some(digest)) => Reference::with_tag_and_digest(registry, repository, tag, digest),
+        (Some(tag), None) => Reference::with_tag(registry, repository, tag),
+        (None, Some(digest)) => Reference::with_digest(registry, repository, digest),
+        (None, None) => Reference::with_tag(registry, repository, "latest".to_owned()),
+    })
 }
 
 /// Pull an OCI image from a registry and extract its layers into a temp directory.
@@ -85,8 +133,7 @@ pub struct RootfsEntry {
 /// authorization error from the registry.
 pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
     // Parse the image reference
-    let reference: Reference = image_ref
-        .parse()
+    let reference = parse_reference(image_ref)
         .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
 
     if verbose {
@@ -112,8 +159,16 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         }
     }
 
-    let image_data = rt.block_on(async {
-        let config = ClientConfig {
+    // Create temp directory for extraction
+    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
+    let rootfs_path = tempdir.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
+
+    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
+    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
+
+    let config_data = rt.block_on(async {
+        let client_config = ClientConfig {
             protocol: ClientProtocol::Https,
             // Pull the Linux image whose architecture matches the host. LiteBox
             // runs guest instructions natively rather than emulating them, so a
@@ -132,7 +187,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
             })),
             ..Default::default()
         };
-        let client = Client::new(config);
+        let client = Client::new(client_config);
 
         // Authenticate (anonymous for public images)
         let auth = RegistryAuth::Anonymous;
@@ -141,53 +196,73 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
             eprintln!("  Fetching manifest...");
         }
 
-        // Pull the full image (manifest + all layers)
-        let image_data: ImageData = client
-            .pull(
-                &reference,
-                &auth,
-                vec![
-                    oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
-                    oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
-                    oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
-                ],
-            )
+        // Fetch only the manifest up front; layers are pulled and extracted
+        // one at a time below so at most one (de)compressed layer's bytes
+        // are held in memory at once. Pulling every layer into memory
+        // simultaneously (the crate's own `Client::pull`) is what a real
+        // multi-GB Arch-based image (`linuxserver/webtop:arch-xfce`) was
+        // observed to OOM the host on -- see the packaging notes for this fix.
+        let (manifest, _digest) = client
+            .pull_image_manifest(&reference, &auth)
             .await
-            .with_context(|| format!("failed to pull image {reference}"))?;
+            .with_context(|| format!("failed to pull manifest for {reference}"))?;
+
+        let mut config_bytes: Vec<u8> = Vec::new();
+        client
+            .pull_blob(&reference, &manifest.config, &mut config_bytes)
+            .await
+            .with_context(|| format!("failed to pull image config for {reference}"))?;
+        let config = oci_client::client::Config::new(
+            config_bytes,
+            manifest.config.media_type.clone(),
+            manifest.annotations.clone(),
+        );
 
         if verbose {
-            eprintln!("  Pulled {} layer(s)", image_data.layers.len());
+            eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
         }
 
-        Ok::<_, anyhow::Error>(image_data)
+        let accepted_media_types = [
+            oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+        ];
+        let num_layers = manifest.layers.len();
+        for (i, layer_desc) in manifest.layers.iter().enumerate() {
+            if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
+                anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
+            }
+
+            if verbose {
+                eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
+            }
+
+            let mut layer_data: Vec<u8> = Vec::new();
+            client
+                .pull_blob(&reference, layer_desc, &mut layer_data)
+                .await
+                .with_context(|| format!("failed to pull layer {}", i + 1))?;
+
+            if verbose {
+                eprintln!(
+                    "  Extracting layer {}/{} ({} bytes)...",
+                    i + 1,
+                    num_layers,
+                    layer_data.len()
+                );
+            }
+            extract_layer(
+                &layer_data,
+                &layer_desc.media_type,
+                &rootfs_path,
+                &mut symlinks,
+                &mut permissions,
+            )
+            .with_context(|| format!("failed to extract layer {}", i + 1))?;
+        }
+
+        Ok::<_, anyhow::Error>(config)
     })?;
-
-    // Create temp directory for extraction
-    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
-    let rootfs_path = tempdir.path().join("rootfs");
-    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
-
-    // Extract layers in order (bottom layer first)
-    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
-    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
-    for (i, layer) in image_data.layers.iter().enumerate() {
-        if verbose {
-            eprintln!(
-                "  Extracting layer {}/{} ({} bytes)...",
-                i + 1,
-                image_data.layers.len(),
-                layer.data.len()
-            );
-        }
-        extract_layer(
-            &layer.data,
-            &layer.media_type,
-            &rootfs_path,
-            &mut symlinks,
-            &mut permissions,
-        )
-        .with_context(|| format!("failed to extract layer {}", i + 1))?;
-    }
 
     // Build the symlink map once for O(1) lookup during resolution.
     let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
@@ -207,10 +282,10 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     }
 
     // Save the raw config JSON before parsing (try_from consumes it).
-    let config_json = image_data.config.data.to_vec();
+    let config_json = config_data.data.to_vec();
 
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
-    let config = match ConfigFile::try_from(image_data.config) {
+    let config = match ConfigFile::try_from(config_data) {
         Ok(cf) => {
             let exec_config = cf.config.as_ref();
             let ic = ImageConfig {
@@ -246,6 +321,1014 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         symlink_map,
         permissions,
     })
+}
+
+/// Result of pulling an OCI image's layers directly into memory, with NO filesystem writes at
+/// all -- not even a temp directory. Each entry in `layers` is one OCI layer's tar bytes,
+/// decompressed if needed, in bottom-to-top order exactly as the manifest lists them, ready to
+/// hand straight to `litebox::fs::tar_ro::TarRo::from_layers` for whiteout-aware in-memory
+/// merging at guest-boot time. This is the runtime-loading counterpart to
+/// [`pull_and_extract`]: same registry pull, same one-layer-at-a-time streaming (never buffering
+/// every layer simultaneously), but stopping at "bytes in memory" instead of extracting onto a
+/// real host rootfs directory.
+pub struct PulledLayers {
+    /// One entry per OCI layer, rewritten tar bytes, bottom-to-top order. EVERY layer here is
+    /// `Cow::Borrowed` over a leaked memory-map (mirrors
+    /// `litebox_runner_linux_on_windows_userland`'s `mmapped_file` for `--initial-files`, so every
+    /// concurrent process reading the same cached layer shares its physical pages via the OS page
+    /// cache) -- both a cache-HIT layer (served directly from the on-disk cache, see [`cache`])
+    /// and a cache-MISS layer (rewritten this run, written to the cache, then immediately
+    /// re-opened as an mmap via `cache::write_and_map_cached_layer` so it becomes just as
+    /// page-cache-evictable as a hit, instead of staying a resident heap `Vec` for the guest's
+    /// whole lifetime). Only on the rare failure to write/mmap the cache file does a layer fall
+    /// back to `Cow::Owned` (heap-resident) as a correctness-preserving degradation.
+    pub layers: Vec<Cow<'static, [u8]>>,
+}
+
+/// On-disk cache of rewritten OCI layers, keyed by `(layer_digest, rewriter_version)`.
+///
+/// # Why cache the REWRITTEN bytes, not the raw pulled layer
+///
+/// The expensive, repeatable-per-boot costs are the network pull, gzip decompression, AND the
+/// ELF rewrite -- caching only the raw pulled bytes would still pay the rewrite cost (the
+/// dominant compute cost, though not the dominant wall-clock cost against a slow network) on
+/// every boot. Caching the rewritten output skips all three.
+///
+/// # Why the cache key is `(layer_digest, rewriter_version)`, not `layer_digest` alone
+///
+/// `layer_digest` (a `sha256:...` string from the manifest) is a real, content-addressed digest
+/// of the layer's RAW content -- a correct and natural key for "is this the same input". But the
+/// cached ARTIFACT is `litebox_syscall_rewriter`'s output for that input, which also depends on
+/// the exact rewriting logic in effect when the cache entry was written. If that logic ever
+/// changes (a bug fix, a newly handled instruction pattern, a trampoline layout change), an old
+/// cache entry keyed on `layer_digest` alone would be silently stale and WRONG: the guest would
+/// run old, incorrect rewritten code while every other part of the system believes the cache is
+/// authoritative. Folding `litebox_syscall_rewriter::REWRITER_CACHE_VERSION` into the key makes a
+/// rewriter-logic change (bumping that constant) invalidate every existing cache entry at once,
+/// with no silent-staleness window -- see that constant's own doc comment for the bump discipline.
+///
+/// # Why a project-relative `.litebox-cache/` directory
+///
+/// This project has no existing durable-but-not-source-controlled artifact directory convention
+/// beyond the harness's own `.gm/` (unrelated tooling state, not a place for build artifacts) --
+/// no `dirs`/`directories` crate dependency exists anywhere in the workspace to reach a
+/// platform user-cache directory, and introducing one purely for this cache would be a bigger
+/// footprint than the problem needs. A project-relative, gitignored directory (matching this
+/// repo's existing precedent of gitignored local artifact directories like `target-myfork/`) is
+/// simple, requires no new dependency, and is trivially discoverable/clearable by a developer
+/// (`rm -rf .litebox-cache`).
+pub mod cache {
+    use std::borrow::Cow;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::Context;
+
+    /// Directory holding cached rewritten OCI layers, relative to the current working directory.
+    /// Gitignored (see `.gitignore`'s "Local tooling state" section).
+    pub(crate) const CACHE_DIR: &str = ".litebox-cache";
+
+    /// Delete orphaned `.tmp-{pull,decompress,rewrite}-<pid>-<nanos>` scratch files left behind
+    /// by a run that was killed (e.g. by an external low-memory watchdog) before it could clean
+    /// up its own temp files -- a `SIGKILL`/`TerminateProcess` never runs a destructor, so these
+    /// accumulate across repeated killed attempts (observed live: ~4GB of orphans from five
+    /// killed runs, silently making the very memory/disk pressure that killed them worse for the
+    /// next attempt). A conservative age threshold (rather than a per-platform live-PID check,
+    /// which would need a new dependency for a Windows API call) avoids ever deleting a file a
+    /// genuinely-still-running sibling process is actively writing: a single layer's pull+
+    /// decompress+rewrite is observed to take at most a few minutes even for a very large layer,
+    /// so anything older than that is safe to treat as abandoned.
+    pub fn sweep_orphaned_temp_files(verbose: bool) {
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let dir = Path::new(CACHE_DIR);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(".tmp-") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < STALE_AFTER {
+                continue;
+            }
+            if verbose {
+                eprintln!(
+                    "  Removing orphaned temp file from a killed run ({} bytes, {}min old): {name}",
+                    metadata.len(),
+                    age.as_secs() / 60
+                );
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    /// Where the resolved layer list for an image reference is recorded (see
+    /// [`store_resolved_layers`]).
+    fn resolved_layers_path(image_ref: &str) -> PathBuf {
+        let safe: String = image_ref
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .collect();
+        Path::new(CACHE_DIR).join(format!("ref_{safe}.layers.json"))
+    }
+
+    /// Records the layer list `image_ref` resolved to, so a later run can start without the
+    /// registry. Best effort: a failure to write costs only the offline fallback.
+    pub fn store_resolved_layers(image_ref: &str, resolved_layers_json: &str) {
+        let path = resolved_layers_path(image_ref);
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::create_dir_all(CACHE_DIR).is_ok()
+            && std::fs::write(&tmp, resolved_layers_json).is_ok()
+        {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The layer list recorded by the last successful pull of `image_ref`, if any.
+    pub fn load_resolved_layers(image_ref: &str) -> Option<String> {
+        std::fs::read_to_string(resolved_layers_path(image_ref))
+            .ok()
+            .filter(|json| !json.trim().is_empty())
+    }
+
+    /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
+    /// version. The digest's `:` is replaced with `_` since `:` is a reserved character in
+    /// Windows paths (valid only as the drive-letter separator) -- same constraint already
+    /// documented on this module's sibling `is_excluded_path` for pacman's local-install-db
+    /// paths.
+    fn cache_path(layer_digest: &str, rewriter_version: u32) -> PathBuf {
+        let safe_digest = layer_digest.replace(':', "_");
+        Path::new(CACHE_DIR).join(format!("{safe_digest}_v{rewriter_version}.tar"))
+    }
+
+    /// Look up a cached rewritten layer for `(layer_digest, rewriter_version)`.
+    ///
+    /// Returns `Ok(None)` on ANY doubt about validity -- missing file, zero-byte file (a crashed
+    /// writer's leftover, since a real writer never finalizes an empty file this way), or any I/O
+    /// error reading it -- rather than risk serving stale/corrupt content. A cache implementation
+    /// that silently serves wrong data would be worse than no cache at all (see this module's own
+    /// top-level doc comment).
+    ///
+    /// The returned bytes are memory-mapped, not heap-copied (mirrors
+    /// `litebox_runner_linux_on_windows_userland`'s `mmapped_file` helper for `--initial-files`),
+    /// so every concurrent runner process reading the same cached layer shares its physical pages
+    /// via the OS page cache instead of each holding a private copy. The mapping is intentionally
+    /// leaked (`Box::leak`) to obtain the `'static` lifetime `PulledLayers::layers` requires --
+    /// this matches the process-lifetime leak `mmapped_file` already performs for the
+    /// `--initial-files` tar, and is bounded (once per distinct layer actually read this process
+    /// run), not unbounded.
+    pub fn read_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        verbose: bool,
+    ) -> Option<Cow<'static, [u8]>> {
+        let path = cache_path(layer_digest, rewriter_version);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if verbose {
+                    eprintln!("  [cache] MISS {layer_digest} (v{rewriter_version}): not cached");
+                }
+                return None;
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to open cache file {}: {e}",
+                        path.display()
+                    );
+                }
+                return None;
+            }
+        };
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to stat cache file: {e}"
+                    );
+                }
+                return None;
+            }
+        };
+        if meta.len() == 0 {
+            // A zero-byte file can only be a crashed/killed writer's leftover (see
+            // `write_cached_layer`'s atomic-rename discipline below -- a properly finished write
+            // is never empty for a real tar). Treat as a miss, and best-effort clean it up so a
+            // future run isn't confused by it either.
+            if verbose {
+                eprintln!(
+                    "  [cache] MISS {layer_digest} (v{rewriter_version}): cache file is empty (stale partial write?)"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        // SAFETY: mirrors `litebox_runner_linux_on_windows_userland::mmapped_file` -- we assume
+        // the cache file is not mutated externally while mapped. Cache files are written via the
+        // atomic write-temp-then-rename pattern in `write_cached_layer`, so any process that has
+        // this file open for reading always sees either a complete prior version (if the file was
+        // replaced, rename atomically retargets the directory entry, leaving this mapping's own
+        // inode's contents untouched) or nothing (if this is the first read after a fresh write).
+        let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] MISS {layer_digest} (v{rewriter_version}): failed to mmap cache file: {e}"
+                    );
+                }
+                return None;
+            }
+        };
+        if verbose {
+            eprintln!(
+                "  [cache] HIT {layer_digest} (v{rewriter_version}): {} bytes from {}",
+                mmap.len(),
+                path.display()
+            );
+        }
+        // Leak to get the 'static lifetime PulledLayers::layers requires -- see this function's
+        // doc comment.
+        let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+        Some(Cow::Borrowed(&leaked[..]))
+    }
+
+    /// Write a freshly rewritten layer to the cache for `(layer_digest, rewriter_version)`,
+    /// atomically: write to a temp file in the SAME directory, then rename into place. Rename is
+    /// atomic on the same filesystem, so a concurrent reader (a second runner process pulling the
+    /// same image at the same time -- plausible in this project's actual usage) can never observe
+    /// a partially-written cache file: it either doesn't exist yet, or is fully present.
+    ///
+    /// Best-effort: any failure here (e.g. read-only filesystem, disk full) is logged
+    /// (verbose-gated) and swallowed rather than propagated -- failing to populate the cache must
+    /// never fail the boot that produced the data, since the freshly rewritten bytes are already
+    /// available to the caller regardless of whether they get persisted.
+    pub fn write_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        data: &[u8],
+        verbose: bool,
+    ) {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        if let Err(e) = write_cached_layer_inner(&final_path, data) {
+            if verbose {
+                eprintln!(
+                    "  [cache] failed to write cache entry for {layer_digest} (v{rewriter_version}): {e:#}"
+                );
+            }
+            return;
+        }
+        if verbose {
+            eprintln!(
+                "  [cache] wrote {} bytes to {}",
+                data.len(),
+                final_path.display()
+            );
+        }
+    }
+
+    /// Write a freshly rewritten layer to the cache, then immediately re-open and mmap the
+    /// JUST-WRITTEN file, returning that mmap'd `Cow::Borrowed` slice instead of leaving the
+    /// caller holding the original in-memory `Vec<u8>`.
+    ///
+    /// This exists so a CACHE-MISS run is exactly as memory-cheap as a cache-hit run, immediately,
+    /// in the very same process run that produced the rewritten bytes -- not just on a later run.
+    /// Without this, `PulledLayers::layers` would hold every cache-miss layer's rewritten bytes as
+    /// a real heap `Vec` for the guest's entire lifetime, which is what caused the OOM-kill
+    /// observed pulling `linuxserver/webtop:debian-xfce` (17 layers, ~2.6GB decompressed): every
+    /// layer's rewritten bytes stayed resident simultaneously, summed across the whole image,
+    /// instead of being page-cache-evictable like a cache-hit layer already is.
+    ///
+    /// On any failure to write or mmap (read-only filesystem, disk full, etc.) this falls back to
+    /// `Cow::Owned(data)` -- the caller still gets correct bytes, just not the memory-cheap path
+    /// for this one layer. That failure is exactly what `write_cached_layer` already tolerates
+    /// (best-effort, never fails the boot), so this must tolerate it too.
+    pub fn write_and_map_cached_layer(
+        layer_digest: &str,
+        rewriter_version: u32,
+        data: Vec<u8>,
+        verbose: bool,
+    ) -> Cow<'static, [u8]> {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        if let Err(e) = write_cached_layer_inner(&final_path, &data) {
+            if verbose {
+                eprintln!(
+                    "  [cache] failed to write cache entry for {layer_digest} (v{rewriter_version}): {e:#}; keeping in-memory copy"
+                );
+            }
+            return Cow::Owned(data);
+        }
+        if verbose {
+            eprintln!(
+                "  [cache] wrote {} bytes to {}",
+                data.len(),
+                final_path.display()
+            );
+        }
+        // The in-memory Vec is no longer needed once the write succeeded -- drop it before
+        // (re-)opening the file so the two copies (heap Vec + mmap) never coexist longer than
+        // this brief window.
+        let expected_len = data.len();
+        drop(data);
+
+        match read_cached_layer(layer_digest, rewriter_version, verbose) {
+            Some(mmapped) => mmapped,
+            None => {
+                // Extremely unlikely (we just wrote this file successfully) but not impossible
+                // (e.g. concurrent external deletion). Re-reading from disk to recover the bytes
+                // would defeat the purpose of avoiding a second heap copy, and we've already
+                // dropped the original -- so this is a hard failure for this layer.
+                panic!(
+                    "  [cache] wrote {expected_len} bytes for {layer_digest} (v{rewriter_version}) but immediately failed to re-read/mmap them"
+                );
+            }
+        }
+    }
+
+    /// Build a fresh, process-and-call-unique temp file path inside the cache directory
+    /// (creating the directory if needed), for a caller that wants to write the rewritten bytes
+    /// itself (streaming) rather than handing this module an already-built `Vec<u8>`. Pair with
+    /// [`finalize_temp_into_cache`] to atomically publish it as the real cache entry.
+    pub fn temp_path_in_cache_dir() -> anyhow::Result<PathBuf> {
+        let dir = Path::new(CACHE_DIR);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+        let pid = std::process::id();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        Ok(dir.join(format!(".tmp-rewrite-{pid}-{unique}")))
+    }
+
+    /// Atomically publish a caller-written temp file (see [`temp_path_in_cache_dir`]) as the real
+    /// cache entry for `(layer_digest, rewriter_version)`, then immediately re-open and mmap it --
+    /// the streaming-output counterpart to [`write_and_map_cached_layer`]. Since the caller
+    /// already wrote the rewritten bytes directly to `tmp_path` (rather than building a `Vec<u8>`
+    /// and handing it to this module), this is JUST the atomic rename-into-place plus mmap, with
+    /// no second copy of the bytes ever created -- the file the rewrite produced BECOMES the
+    /// cache file.
+    ///
+    /// On any failure (rename, reopen, or mmap), removes the leftover temp file best-effort and
+    /// returns `Err` so the caller can fall back to an in-memory `Cow::Owned` rewrite, exactly as
+    /// `write_and_map_cached_layer` does for its own failure path.
+    pub fn finalize_temp_into_cache(
+        tmp_path: &Path,
+        layer_digest: &str,
+        rewriter_version: u32,
+        verbose: bool,
+    ) -> anyhow::Result<Cow<'static, [u8]>> {
+        let final_path = cache_path(layer_digest, rewriter_version);
+        let result = (|| -> anyhow::Result<Cow<'static, [u8]>> {
+            std::fs::rename(tmp_path, &final_path).with_context(|| {
+                format!(
+                    "failed to atomically rename {} -> {}",
+                    tmp_path.display(),
+                    final_path.display()
+                )
+            })?;
+            let file = std::fs::File::open(&final_path)
+                .with_context(|| format!("failed to reopen cache file {}", final_path.display()))?;
+            // SAFETY: mirrors `read_cached_layer` -- this file was just renamed into place from a
+            // process-and-call-unique temp path, so no other writer can be mutating it.
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .with_context(|| format!("failed to mmap cache file {}", final_path.display()))?;
+            let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+            Ok(Cow::Borrowed(&leaked[..]))
+        })();
+
+        match &result {
+            Ok(mmapped) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] wrote {} bytes to {} (streamed directly, no in-memory copy)",
+                        mmapped.len(),
+                        final_path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!(
+                        "  [cache] failed to finalize streamed cache entry for {layer_digest} (v{rewriter_version}): {e:#}"
+                    );
+                }
+                let _ = std::fs::remove_file(tmp_path);
+            }
+        }
+        result
+    }
+
+    fn write_cached_layer_inner(final_path: &Path, data: &[u8]) -> anyhow::Result<()> {
+        let dir = final_path
+            .parent()
+            .context("cache file path has no parent directory")?;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+
+        // Unique temp file name per (process, call) so two concurrent writers for the SAME layer
+        // never collide on the temp path itself -- only the final atomic rename needs to be race-
+        // safe, which `std::fs::rename` already guarantees on the same filesystem.
+        let pid = std::process::id();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp_path = dir.join(format!(".tmp-{pid}-{unique}"));
+
+        std::fs::write(&tmp_path, data)
+            .with_context(|| format!("failed to write temp cache file {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, final_path).with_context(|| {
+            format!(
+                "failed to atomically rename {} -> {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// Pull an OCI image's manifest and every layer's bytes into memory, decompressing gzip layers
+/// as they arrive and rewriting each layer's executable ELFs immediately afterward, before
+/// moving to the next layer -- the runtime-loading counterpart to [`pull_and_extract`]. Only ONE
+/// layer's decompressed bytes and its rewritten counterpart are ever alive at once; layers are
+/// never buffered as a batch across the whole image (a real multi-GB image, e.g.
+/// `linuxserver/webtop:debian-xfce`, was observed to fail a single ~5GB allocation when the
+/// pull step returned every decompressed layer at once and a separate rewrite step then held
+/// both the raw and rewritten copies of every layer simultaneously -- fusing pull+decompress+
+/// rewrite into one per-layer step, as done here, is the fix).
+pub fn pull_layers_in_memory(image_ref: &str, verbose: bool) -> anyhow::Result<PulledLayers> {
+    pull_layers_in_memory_impl(image_ref, None, verbose).map(|(pulled, _)| pulled)
+}
+
+/// Like [`pull_layers_in_memory`], but ALSO returns the resolved manifest layer list
+/// (media type + digest + size), JSON-serialized, so a caller that is about to become a
+/// cross-process fork PARENT can hand it to every child it spawns via
+/// [`pull_layers_with_known_digests`] -- skipping that child's own, otherwise-unconditional
+/// manifest fetch. See that function's own doc comment for why this matters and how much it
+/// saves.
+#[must_use = "the returned layer-digest JSON is the whole point of calling this over `pull_layers_in_memory`"]
+pub fn pull_layers_in_memory_with_resolved_digests(
+    image_ref: &str,
+    verbose: bool,
+) -> anyhow::Result<(PulledLayers, String)> {
+    // Pin mode: use the layer list recorded by the last successful pull and never contact the
+    // registry. A tag can be re-pointed upstream at any time, which silently turns a fully cached
+    // image into a multi-gigabyte download; on a slow or unreachable link that is the difference
+    // between a working run and none. The recorded list is never overwritten in this mode.
+    if std::env::var_os("LITEBOX_OCI_USE_LAST_RESOLVED").is_some_and(|v| v != "0") {
+        let resolved_json = cache::load_resolved_layers(image_ref).with_context(|| {
+            format!("LITEBOX_OCI_USE_LAST_RESOLVED is set but no resolved layer list is recorded for {image_ref}")
+        })?;
+        let known_layers = serde_json::from_str(&resolved_json)
+            .context("failed to parse the recorded OCI layer list")?;
+        eprintln!("  LITEBOX_OCI_USE_LAST_RESOLVED: using the recorded layer list for {image_ref}, not contacting the registry");
+        return pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
+            .map(|(pulled, _)| (pulled, resolved_json));
+    }
+    match pull_layers_in_memory_impl(image_ref, None, verbose) {
+        Ok((pulled, resolved_json)) => {
+            cache::store_resolved_layers(image_ref, &resolved_json);
+            Ok((pulled, resolved_json))
+        }
+        Err(err) => {
+            // The registry answered badly or not at all (rate limiting and transient network
+            // failures are routine for anonymous pulls), but a previous successful run recorded
+            // which layers this reference resolved to and those layers are cached on disk: use
+            // them rather than failing a run whose every byte is already local.
+            let Some(resolved_json) = cache::load_resolved_layers(image_ref) else {
+                return Err(err);
+            };
+            let Ok(known_layers) = serde_json::from_str(&resolved_json) else {
+                return Err(err);
+            };
+            eprintln!(
+                "warning: could not resolve {image_ref} from the registry ({err:#}); using the \
+                 layer list from the last successful pull"
+            );
+            pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
+                .map(|(pulled, _)| (pulled, resolved_json))
+                .map_err(|offline_err| err.context(format!("offline fallback also failed: {offline_err:#}")))
+        }
+    }
+}
+
+/// Like [`pull_layers_in_memory`], but skips the manifest fetch entirely -- a real, unconditional
+/// network round-trip (2-3s against a real public registry from this project's own dev host,
+/// measured via `LITEBOX_DIAG_FORK_TIMING=1`; see `docs/track-b-fork-fix-progress.md`'s matching
+/// entry) that a cross-process fork child otherwise pays on EVERY SINGLE FORK for a manifest
+/// whose content is byte-identical to the one the parent already resolved moments earlier within
+/// the same run. `layers_json` is the JSON list `pull_layers_in_memory_with_resolved_digests`
+/// returned from that earlier, real fetch.
+///
+/// Falls back to a genuine network pull (same as the manifest-driven path) for any INDIVIDUAL
+/// layer that isn't found in the on-disk cache -- this only skips discovering WHICH digests to
+/// look for, never the ability to actually fetch one if the cache came up empty. The parent and
+/// every fork child share one on-disk cache and run within the same process lifetime, so a cache
+/// miss here is expected to be as rare as it already is on the manifest-driven path, not a new
+/// failure mode this path introduces.
+pub fn pull_layers_with_known_digests(
+    image_ref: &str,
+    layers_json: &str,
+    verbose: bool,
+) -> anyhow::Result<PulledLayers> {
+    let known_layers: Vec<oci_client::manifest::OciDescriptor> = serde_json::from_str(layers_json)
+        .context("failed to parse pre-resolved OCI layer digest list")?;
+    let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
+    let mut cached_layers: Vec<Cow<'static, [u8]>> = Vec::with_capacity(known_layers.len());
+    for layer_desc in &known_layers {
+        match cache::read_cached_layer(&layer_desc.digest, rewriter_version, verbose) {
+            Some(cached) => cached_layers.push(cached),
+            None => break,
+        }
+    }
+    if cached_layers.len() == known_layers.len() {
+        return Ok(PulledLayers { layers: cached_layers });
+    }
+    drop(cached_layers);
+    pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose).map(|(pulled, _)| pulled)
+}
+
+fn pull_layers_in_memory_impl(
+    image_ref: &str,
+    known_layers: Option<Vec<oci_client::manifest::OciDescriptor>>,
+    verbose: bool,
+) -> anyhow::Result<(PulledLayers, String)> {
+    let reference = parse_reference(image_ref)
+        .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
+
+    if verbose {
+        eprintln!("Pulling image (runtime, in-memory): {reference}");
+    }
+
+    cache::sweep_orphaned_temp_files(verbose);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
+
+    #[allow(
+        clippy::items_after_statements,
+        reason = "kept next to its only caller below"
+    )]
+    fn host_image_arch() -> oci_spec::image::Arch {
+        if cfg!(target_arch = "aarch64") {
+            oci_spec::image::Arch::ARM64
+        } else {
+            oci_spec::image::Arch::Amd64
+        }
+    }
+
+    let (layers, resolved_layers_json) = rt.block_on(async {
+        let client_config = ClientConfig {
+            protocol: ClientProtocol::Https,
+            platform_resolver: Some(Box::new(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.platform.as_ref().is_some_and(|p| {
+                            p.os == oci_spec::image::Os::Linux
+                                && p.architecture == host_image_arch()
+                        })
+                    })
+                    .map(|e| e.digest.clone())
+            })),
+            // Without these an unreachable registry address (a black-holed IPv6 or CDN address is
+            // enough) hangs the whole run for minutes with no output.
+            connect_timeout: Some(std::time::Duration::from_secs(10)),
+            read_timeout: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let client = Client::new(client_config);
+        let auth = RegistryAuth::Anonymous;
+
+        // Investigative timing only (LITEBOX_DIAG_FORK_TIMING=1): isolates the manifest fetch's
+        // own cost from the per-layer cache-check loop below -- see
+        // docs/track-b-fork-fix-progress.md's per-fork overhead entries.
+        let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+
+        let resolved_layers: Vec<oci_client::manifest::OciDescriptor> = if let Some(known) =
+            known_layers
+        {
+            if verbose {
+                eprintln!(
+                    "  Using pre-resolved layer digests ({} layer(s), no manifest fetch)",
+                    known.len()
+                );
+            }
+            known
+        } else {
+            if verbose {
+                eprintln!("  Fetching manifest...");
+            }
+            let manifest_t0 = std::time::Instant::now();
+            let mut last_err = None;
+            let mut fetched = None;
+            for attempt in 1..=3u32 {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    client.pull_image_manifest(&reference, &auth),
+                )
+                .await;
+                match result {
+                    Ok(Ok(found)) => {
+                        fetched = Some(found);
+                        break;
+                    }
+                    Ok(Err(e)) => last_err = Some(anyhow::Error::new(e)),
+                    Err(_) => {
+                        last_err = Some(anyhow::anyhow!("timed out after 45s"));
+                    }
+                }
+                if verbose {
+                    eprintln!("  Manifest fetch attempt {attempt}/3 failed, retrying");
+                }
+            }
+            let (manifest, _digest) = fetched.ok_or_else(|| {
+                last_err
+                    .unwrap_or_else(|| anyhow::anyhow!("no attempt made"))
+                    .context(format!("failed to pull manifest for {reference}"))
+            })?;
+            if diag_timing {
+                eprintln!(
+                    "[diag-fork-timing] pull_image_manifest returned at {:?}",
+                    manifest_t0.elapsed()
+                );
+            }
+
+            // No image-config blob pull here, unlike `pull_and_extract`: `PulledLayers` has no
+            // `config`/`config_json` field and neither runtime caller
+            // (`litebox_runner_linux_on_windows_userland`) ever reads one -- the program to run
+            // is always given explicitly on this runner's own command line, never derived from
+            // the image's ENTRYPOINT/CMD. Fetching and parsing it was pure wasted work: one
+            // whole extra network round-trip (blob GET + the manifest GET above, with no HTTP
+            // keep-alive across them since every cross-process fork child re-execs with a
+            // brand-new `Client`) on every single `--oci-image` boot AND every cross-process fork
+            // of one, for a value nothing downstream ever looked at.
+
+            if verbose {
+                eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());
+            }
+            manifest.layers
+        };
+        let resolved_layers_json = serde_json::to_string(&resolved_layers)
+            .context("failed to serialize resolved OCI layer digest list")?;
+
+        let accepted_media_types = [
+            oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+        ];
+        let num_layers = resolved_layers.len();
+        let mut layers: Vec<Cow<'static, [u8]>> = Vec::with_capacity(num_layers);
+        let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
+        let layer_loop_t0 = std::time::Instant::now();
+        for (i, layer_desc) in resolved_layers.iter().enumerate() {
+            if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
+                anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
+            }
+
+            // Cache read path: a hit here skips network pull, gzip decompression, AND ELF
+            // rewriting entirely for this layer -- see `cache`'s own doc comment for the key
+            // scheme and validity discipline.
+            if let Some(cached) =
+                cache::read_cached_layer(&layer_desc.digest, rewriter_version, verbose)
+            {
+                if verbose {
+                    eprintln!(
+                        "  Layer {}/{} served from cache ({} bytes)",
+                        i + 1,
+                        num_layers,
+                        cached.len()
+                    );
+                }
+                layers.push(cached);
+                continue;
+            }
+
+            if verbose {
+                eprintln!("  Pulling layer {}/{}...", i + 1, num_layers);
+            }
+
+            // Pull the compressed blob DIRECTLY to a temp file rather than into a `Vec<u8>` --
+            // for a real large layer (e.g. `linuxserver/webtop`'s ~500MB-900MB compressed
+            // layers), the pulled bytes themselves are a genuine, avoidable in-memory buffer:
+            // this codebase already learned (see the decompression step below) that even a
+            // "correctly sized" `Vec` is still ordinary, non-page-cache-evictable heap memory
+            // for its whole lifetime. Streaming the pull straight to disk means the compressed
+            // bytes never exist as a heap allocation at all -- `oci_client::Client::pull_blob`
+            // is generic over any `tokio::io::AsyncWrite` target, so a `tokio::fs::File` works
+            // exactly like the `Vec<u8>` it replaces, with zero change to the pull call itself.
+            let tmp_dir = Path::new(cache::CACHE_DIR);
+            std::fs::create_dir_all(tmp_dir)
+                .with_context(|| format!("failed to create cache directory {}", tmp_dir.display()))?;
+            let pid = std::process::id();
+            let pull_unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let compressed_tmp_path = tmp_dir.join(format!(".tmp-pull-{pid}-{pull_unique}"));
+            {
+                let compressed_tmp_file = tokio::fs::File::create(&compressed_tmp_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to create temp pull file {}",
+                            compressed_tmp_path.display()
+                        )
+                    })?;
+                drop(compressed_tmp_file);
+                pull_layer_resumable(&client, &reference, layer_desc, &compressed_tmp_path, verbose)
+                    .await
+                    .with_context(|| format!("failed to pull layer {}", i + 1))?;
+            }
+
+            // Sniff gzip-ness from the first few bytes on disk rather than needing the whole
+            // blob in memory just to check a magic number.
+            let is_gzip = layer_desc.media_type.contains("gzip") || {
+                let mut magic = [0u8; 2];
+                std::fs::File::open(&compressed_tmp_path)
+                    .ok()
+                    .and_then(|mut f| {
+                        use std::io::Read as _;
+                        f.read_exact(&mut magic).ok()
+                    });
+                magic == [0x1f, 0x8b]
+            };
+
+            // Decompress to a temp file and mmap it, rather than holding the full decompressed
+            // layer (~2.5GB for a real large layer, e.g. `linuxserver/webtop:debian-xfce`) as a
+            // second simultaneous ordinary heap `Vec` alongside `rewrite_layer_elfs`'s own
+            // internal output buffer (also ~2.5GB). Before this, BOTH buffers were alive at once
+            // for the whole `rewrite_layer_elfs` call -- a genuine ~5GB simultaneous peak of
+            // non-evictable heap memory, confirmed live to push the host over its low-memory
+            // watchdog threshold even after every other buffer in this pipeline had already been
+            // pre-sized or made cache-mmap-backed. An mmap'd temp file is backed by the OS page
+            // cache, so the host can evict its pages under memory pressure instead of the
+            // allocation being unconditionally resident -- see `cache::write_and_map_cached_layer`
+            // and `litebox_runner_linux_on_windows_userland::mmapped_file` for the identical
+            // established pattern this reuses.
+            enum DecompressedSource {
+                Mmapped { mmap: memmap2::Mmap, tmp_path: PathBuf },
+                #[allow(dead_code, reason = "both branches now mmap; kept for fallback shape")]
+                InMemory(Vec<u8>),
+            }
+
+            let source = if is_gzip {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default();
+                let tmp_path = tmp_dir.join(format!(".tmp-decompress-{pid}-{unique}"));
+
+                {
+                    let compressed_file = std::fs::File::open(&compressed_tmp_path)
+                        .with_context(|| {
+                            format!(
+                                "failed to reopen pulled layer {}",
+                                compressed_tmp_path.display()
+                            )
+                        })?;
+                    let mut decoder =
+                        flate2::read::GzDecoder::new(std::io::BufReader::new(compressed_file));
+                    let tmp_file = std::fs::File::create(&tmp_path).with_context(|| {
+                        format!(
+                            "failed to create temp decompression file {}",
+                            tmp_path.display()
+                        )
+                    })?;
+                    let mut writer = std::io::BufWriter::new(tmp_file);
+                    std::io::copy(&mut decoder, &mut writer)
+                        .with_context(|| format!("failed to decompress layer {}", i + 1))?;
+                    writer
+                        .flush()
+                        .with_context(|| format!("failed to flush decompressed layer {}", i + 1))?;
+                }
+                // The compressed temp file is no longer needed once decompression has finished.
+                let _ = std::fs::remove_file(&compressed_tmp_path);
+
+                let tmp_file = std::fs::File::open(&tmp_path).with_context(|| {
+                    format!("failed to reopen decompressed temp file {}", tmp_path.display())
+                })?;
+                // SAFETY: mirrors `cache::read_cached_layer` / `mmapped_file` -- this temp file is
+                // exclusive to this process and this call (unique pid+timestamp name), never
+                // mutated externally while mapped.
+                let mmap = unsafe { memmap2::Mmap::map(&tmp_file) }.with_context(|| {
+                    format!("failed to mmap decompressed temp file {}", tmp_path.display())
+                })?;
+                DecompressedSource::Mmapped { mmap, tmp_path }
+            } else {
+                // Not gzip -- the pulled bytes on disk already ARE the tar to rewrite, so mmap
+                // that file directly rather than reading it into memory at all.
+                let tmp_file = std::fs::File::open(&compressed_tmp_path).with_context(|| {
+                    format!(
+                        "failed to reopen pulled (uncompressed) layer {}",
+                        compressed_tmp_path.display()
+                    )
+                })?;
+                // SAFETY: same discipline as the gzip branch above -- unique pid+timestamp name,
+                // exclusive to this process and call.
+                let mmap = unsafe { memmap2::Mmap::map(&tmp_file) }.with_context(|| {
+                    format!(
+                        "failed to mmap pulled layer {}",
+                        compressed_tmp_path.display()
+                    )
+                })?;
+                DecompressedSource::Mmapped {
+                    mmap,
+                    tmp_path: compressed_tmp_path,
+                }
+            };
+
+            let decompressed_slice: &[u8] = match &source {
+                DecompressedSource::Mmapped { mmap, .. } => &mmap[..],
+                DecompressedSource::InMemory(v) => &v[..],
+            };
+
+            if verbose {
+                eprintln!(
+                    "  Layer {}/{} decompressed ({} bytes), rewriting ELFs...",
+                    i + 1,
+                    num_layers,
+                    decompressed_slice.len()
+                );
+            }
+
+            // Stream the rewritten OUTPUT tar directly to a temp file on disk instead of building
+            // it as an in-memory `Vec<u8>` -- for a large layer (~2.6GB decompressed, e.g.
+            // `linuxserver/webtop:debian-xfce`'s largest layer) that Vec would be potentially the
+            // largest single allocation in the process, sitting in ordinary non-evictable heap
+            // memory for the whole rewrite. The temp file IS the eventual cache file: on success,
+            // `finalize_temp_into_cache` just renames it into place (atomic, same as
+            // `write_cached_layer`'s own discipline) and mmaps it -- no second copy of the bytes
+            // is ever created. Only if opening the temp file fails do we fall back to the
+            // original in-memory `Vec<u8>` path, preserving correctness on any real host where the
+            // streaming path can't be used (read-only cache dir, disk full, etc.).
+            let mapped = match cache::temp_path_in_cache_dir().and_then(|tmp_path| {
+                let tmp_file = std::fs::File::create(&tmp_path)
+                    .with_context(|| format!("failed to create temp rewrite file {}", tmp_path.display()))?;
+                let mut writer = std::io::BufWriter::new(tmp_file);
+                rewrite_layer_elfs(decompressed_slice, &mut writer, verbose)
+                    .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+                writer
+                    .flush()
+                    .with_context(|| format!("failed to flush rewritten layer {}", i + 1))?;
+                drop(writer);
+                Ok(tmp_path)
+            }) {
+                Ok(tmp_path) => {
+                    if verbose {
+                        eprintln!(
+                            "  Layer {}/{} rewritten directly to disk, publishing to cache...",
+                            i + 1,
+                            num_layers
+                        );
+                    }
+                    match cache::finalize_temp_into_cache(
+                        &tmp_path,
+                        &layer_desc.digest,
+                        rewriter_version,
+                        verbose,
+                    ) {
+                        Ok(mmapped) => mmapped,
+                        Err(_) => {
+                            // The streamed file couldn't be published as the cache entry (rename,
+                            // reopen, or mmap failed). Fall back to an in-memory rewrite so
+                            // correctness is preserved regardless -- this re-runs the (pure,
+                            // in-memory) rewrite once more, which is the same cost the old
+                            // always-in-memory path always paid, not a regression.
+                            let mut out = Vec::new();
+                            rewrite_layer_elfs(decompressed_slice, &mut out, verbose).with_context(|| {
+                                format!("failed to rewrite ELFs in layer {} (fallback)", i + 1)
+                            })?;
+                            cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
+                        }
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!(
+                            "  [cache] failed to open temp rewrite file for layer {}: {e:#}; rewriting in memory instead",
+                            i + 1
+                        );
+                    }
+                    let mut out = Vec::new();
+                    rewrite_layer_elfs(decompressed_slice, &mut out, verbose)
+                        .with_context(|| format!("failed to rewrite ELFs in layer {}", i + 1))?;
+                    cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
+                }
+            };
+
+            if let DecompressedSource::Mmapped { mmap, tmp_path } = source {
+                drop(mmap);
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+
+            if verbose {
+                eprintln!(
+                    "  Layer {}/{} ready ({} bytes after rewrite)",
+                    i + 1,
+                    num_layers,
+                    mapped.len()
+                );
+            }
+
+            layers.push(mapped);
+        }
+
+        if diag_timing {
+            eprintln!(
+                "[diag-fork-timing] all {num_layers} layer(s) ready (cache-check loop done) at {:?}",
+                layer_loop_t0.elapsed()
+            );
+        }
+
+        Ok::<_, anyhow::Error>((layers, resolved_layers_json))
+    })?;
+
+    Ok((PulledLayers { layers }, resolved_layers_json))
+}
+
+/// Rewrite every executable ELF entry inside one decompressed OCI layer tar's bytes, eagerly,
+/// before guest boot -- streaming a fresh tar with rewritten ELF payloads spliced in place of the
+/// originals directly into `out` (a rewrite can change a file's size, so entries are rebuilt with
+/// a `tar::Builder` rather than patched in place).
+///
+/// Eager (at image-load time, host-side, before boot) was chosen over lazy (deferred to each
+/// binary's first `exec()`) or cached (content-hash-keyed, reused across boots): the rewriter
+/// itself (`litebox_syscall_rewriter::hook_syscalls_in_elf`) is a pure, `no_std`-capable,
+/// in-memory `&[u8] -> Vec<u8>` transform with no host-only dependency forcing it out of the
+/// guest-boot path, so there is no correctness reason to defer it -- only a latency/laziness
+/// trade-off. Lazy rewriting would require plumbing a rewrite-on-first-exec cache through every
+/// runner's `exec()` path (each of which currently assumes its rootfs backend already serves
+/// pre-rewritten bytes), a materially larger change for a benefit (skipping unused binaries) that
+/// does not apply to the base-image case this pass targets, where nearly every ELF a small image
+/// ships is a real dependency reachable from its entrypoint. Content-hash caching across boots
+/// (persisting rewritten bytes keyed by a hash of the original ELF, reused whenever the same
+/// image is booted again) is a legitimate, purely additive follow-up once real usage shows
+/// eager-every-boot rewriting is a measured latency problem -- deliberately deferred rather than
+/// built speculatively against no evidence of that cost.
+///
+/// Generic over the output sink (`W: Write`) rather than fixed to `Vec<u8>`: the caller
+/// (`pull_layers_in_memory`) streams the OUTPUT tar directly to a file (`BufWriter<File>`) so the
+/// rewritten layer -- potentially the largest single allocation in the process for a big layer
+/// (~2.6GB observed for `linuxserver/webtop:debian-xfce`'s largest layer) -- is never held as one
+/// giant ordinary heap `Vec` at all. On any failure to open that file, the caller falls back to
+/// passing a `Vec<u8>` as `out` instead, so correctness is preserved regardless of which sink is
+/// used; this function itself has no opinion on which sink backs a real file vs. memory.
+pub fn rewrite_layer_elfs<W: Write>(
+    layer_tar: &[u8],
+    out: &mut W,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(layer_tar);
+    let mut builder = tar::Builder::new(out);
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result.context("failed to read tar entry while rewriting")?;
+        let mut header = entry.header().clone();
+        let entry_type = header.entry_type();
+        let path = entry.path()?.into_owned();
+
+        if entry_type != tar::EntryType::Regular {
+            // Symlinks, directories, whiteout markers, etc. pass through unchanged --
+            // only regular-file payloads can be an ELF worth rewriting.
+            builder.append(&header, std::io::empty())?;
+            continue;
+        }
+
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+
+        // Shared libraries are normally mode 0644: gating on the executable bit left them
+        // unpatched, so every process re-scanned and rewrote their whole text at mmap time.
+        let out_data = if crate::is_elf(&data) {
+            crate::rewrite_elf(&data, &path, verbose)
+        } else {
+            data
+        };
+
+        header.set_size(out_data.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, &path, out_data.as_slice())?;
+    }
+    builder.finish()?;
+    Ok(())
 }
 
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
@@ -413,6 +1496,10 @@ fn extract_tar<R: Read>(
         let path = normalize_path(&entry.path()?);
         let path_str = path.to_string_lossy();
 
+        if is_excluded_path(&path_str) {
+            continue;
+        }
+
         // Handle OCI whiteout files
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name == ".wh..wh..opq" {
@@ -490,7 +1577,29 @@ fn extract_tar<R: Read>(
                     .context("hard link entry has no link name")?,
             );
             let link_source = rootfs.join(&link_name);
-            if link_source.exists() {
+            // On Windows' case-insensitive NTFS, two case-distinct Linux paths (e.g.
+            // usr/share/terminfo/L/LFT-PC850 vs usr/share/terminfo/l/lft-pc850, a real
+            // collision found packaging linuxserver/webtop:arch-xfce) can resolve to the
+            // SAME physical file on disk. Copying a file onto itself is a no-op we should
+            // skip rather than attempt -- Windows sometimes tolerates a self-copy silently
+            // and sometimes fails with "the process cannot access the file" (os error 32)
+            // depending on handle/timing state, which is why this reproduced identically
+            // on a retry rather than looking like ordinary transient contention.
+            // `target` doesn't exist on disk yet at this point (it's the file we're about
+            // to create), so `canonicalize()` can't be used to detect the collision -- it
+            // requires the path to already exist. Compare the would-be OS path strings
+            // case-insensitively instead, which is exactly the comparison NTFS itself uses.
+            let is_self_collision = link_source
+                .to_str()
+                .zip(target.to_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+            if is_self_collision {
+                eprintln!(
+                    "  Skipping self-copy (case-collision on this filesystem): {} -> {}",
+                    link_source.display(),
+                    target.display()
+                );
+            } else if link_source.exists() {
                 std::fs::copy(&link_source, &target).with_context(|| {
                     format!(
                         "failed to copy hard link target {} -> {}",
@@ -664,6 +1773,21 @@ fn resolve_symlink_in_rootfs(
     }
 }
 
+/// Paths excluded from extraction entirely -- package-manager bookkeeping
+/// metadata that real guest programs never read at runtime, so it's safe to
+/// drop rather than needing to represent it faithfully on the host
+/// filesystem. Currently just pacman's (Arch Linux) local install database:
+/// `var/lib/pacman/local/<name>-<epoch>:<version>-<release>/` directory names
+/// contain a literal `:`, a reserved character in Windows paths (valid only
+/// as the drive-letter separator) -- `std::fs::create_dir_all` fails with
+/// "The directory name is invalid" (os error 267) on any such entry. Found
+/// packaging `linuxserver/webtop:arch-xfce`, an Arch-based image; Alpine-based
+/// images (using `apk`, no colon-bearing package-db paths) don't hit this.
+fn is_excluded_path(path_str: &str) -> bool {
+    path_str.starts_with("var/lib/pacman/local/")
+        || path_str.starts_with("var\\lib\\pacman\\local\\")
+}
+
 /// Check if a path starts with `/` (Unix-style absolute).
 ///
 /// On Windows, `Path::is_absolute()` requires a drive letter, so Unix-style
@@ -800,6 +1924,28 @@ fn lookup_mode(rel_path: &Path, permissions: &HashMap<PathBuf, u32>) -> u32 {
 /// `permissions` provides Unix permission modes captured from tar headers
 /// during extraction, so permission bits are accurate on non-Unix hosts.
 #[allow(clippy::implicit_hasher)]
+/// The link target to record for a symlink at `host_path`, as a Unix-style string.
+///
+/// Prefers `symlink_map`, which carries the target verbatim from the OCI layer's own tar
+/// headers -- the only faithful source on a non-Unix host, where extraction cannot create real
+/// symlinks and the on-disk entry is a placeholder. Falls back to the OS link (Linux hosts).
+///
+/// Returning `None` means "emit this as a file copy after all", so a target that cannot be
+/// recovered degrades to the previous behaviour rather than producing a dangling link.
+fn link_target_for(
+    host_path: &Path,
+    rootfs: &Path,
+    symlink_map: &HashMap<PathBuf, PathBuf>,
+) -> Option<String> {
+    let rel = host_path.strip_prefix(rootfs).unwrap_or(host_path);
+    if let Some(target) = symlink_map.get(rel) {
+        return Some(target.to_string_lossy().replace('\\', "/"));
+    }
+    std::fs::read_link(host_path)
+        .ok()
+        .map(|t| t.to_string_lossy().replace('\\', "/"))
+}
+
 pub fn scan_rootfs(
     rootfs: &Path,
     symlink_map: &HashMap<PathBuf, PathBuf>,
@@ -847,6 +1993,33 @@ pub fn scan_rootfs(
         let tar_path = tar_path.replace('\\', "/");
 
         if entry.file_type().is_file() {
+            // A symlink extracted on a non-Unix host is MATERIALIZED as a regular file copy
+            // (see `materialize_symlinks`), because Windows cannot create one without
+            // elevation -- so `is_symlink()` below is never true here and the on-disk entry
+            // has lost its identity. `symlink_map` still holds the target verbatim from the
+            // layer's own tar header, so consult it FIRST and re-emit a real link.
+            //
+            // Without this the packager silently reproduces the flattening it is meant to fix:
+            // a repackaged alpine:latest came out with 417 entries, ZERO symlinks and 305
+            // copies of the same 804,648-byte busybox.
+            if let Some(target) = symlink_map.get(rel_path) {
+                let target = target.to_string_lossy().replace('\\', "/");
+                if verbose {
+                    eprintln!("  [symlink] {tar_path} -> {target}");
+                }
+                files.insert(
+                    entry.path().to_path_buf(),
+                    RootfsEntry {
+                        tar_path,
+                        read_path: entry.path().to_path_buf(),
+                        is_executable: false,
+                        mode: lookup_mode(rel_path, permissions),
+                        symlink_target: Some(target),
+                    },
+                );
+                continue;
+            }
+
             let mode = lookup_mode(rel_path, permissions);
             let is_executable = mode & 0o111 != 0;
 
@@ -861,6 +2034,7 @@ pub fn scan_rootfs(
                     read_path: entry.path().to_path_buf(),
                     is_executable,
                     mode,
+                    symlink_target: None,
                 },
             );
         } else if entry.file_type().is_symlink() {
@@ -878,6 +2052,7 @@ pub fn scan_rootfs(
                             read_path: resolved.clone(),
                             is_executable,
                             mode,
+                            symlink_target: link_target_for(entry.path(), rootfs, symlink_map),
                         },
                     );
                 } else if resolved.is_dir() {
@@ -964,6 +2139,10 @@ pub fn scan_rootfs(
                     read_path,
                     is_executable,
                     mode,
+                    // Directory-symlink EXPANSION: these are synthesized paths under the
+                    // symlink's prefix (e.g. lib64/x from usr/lib64/x), not links themselves,
+                    // so they stay real file copies.
+                    symlink_target: None,
                 },
             );
         }
@@ -1085,4 +2264,134 @@ mod tests {
         let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
         assert_eq!(r, Some(rootfs.join("hello.txt")));
     }
+}
+
+/// Downloads one layer blob to `path`, surviving a stalled or dropped connection.
+///
+/// A single `pull_blob` call has no notion of progress: on a slow or flaky link it can trickle
+/// bytes forever (or hang with no output), and the runner just sat there. This instead reads the
+/// body in chunks with a per-chunk stall timeout, reports progress, and on any stall or network
+/// error re-requests the remainder with an HTTP `Range` header (`pull_blob_stream_partial`),
+/// appending to the same file. Because a partial response cannot be digest-checked by the client
+/// library, the finished file is hashed and compared to the layer's digest here.
+async fn pull_layer_resumable(
+    client: &Client,
+    reference: &Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    path: &Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+    use sha2::Digest as _;
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_ATTEMPTS: u32 = 60;
+
+    let total = u64::try_from(layer.size).unwrap_or(0);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut offset: u64 = 0;
+    let started = std::time::Instant::now();
+    let mut last_report = std::time::Instant::now();
+    let mut complete = false;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let requested = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            client.pull_blob_stream_partial(reference, layer, offset, None),
+        )
+        .await;
+        let response = match requested {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} failed at {offset} bytes: {e}; retrying");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS}: no response in {CONNECT_TIMEOUT:?} at {offset} bytes; retrying");
+                continue;
+            }
+        };
+        let mut stream = match response {
+            oci_client::client::BlobResponse::Partial(stream) => stream,
+            oci_client::client::BlobResponse::Full(stream) => {
+                if offset != 0 {
+                    file.set_len(0).await?;
+                    file.seek(std::io::SeekFrom::Start(0)).await?;
+                    offset = 0;
+                }
+                stream
+            }
+        };
+        loop {
+            match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    file.write_all(&chunk).await?;
+                    offset += chunk.len() as u64;
+                    if verbose && last_report.elapsed() >= std::time::Duration::from_secs(10) {
+                        last_report = std::time::Instant::now();
+                        let secs = started.elapsed().as_secs_f64().max(0.001);
+                        eprintln!(
+                            "  layer download: {} / {} MB ({:.0} KB/s avg)",
+                            offset >> 20,
+                            total >> 20,
+                            offset as f64 / 1024.0 / secs
+                        );
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} interrupted at {offset} bytes: {e}; resuming");
+                    break;
+                }
+                Ok(None) => {
+                    if total == 0 || offset >= total {
+                        complete = true;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} stalled {STALL_TIMEOUT:?} at {offset} bytes; resuming");
+                    break;
+                }
+            }
+        }
+        if complete || (total != 0 && offset >= total) {
+            complete = true;
+            break;
+        }
+    }
+    file.flush().await?;
+    drop(file);
+    anyhow::ensure!(
+        complete,
+        "layer download did not complete after {MAX_ATTEMPTS} attempts ({offset} of {total} bytes)"
+    );
+    if total != 0 {
+        anyhow::ensure!(offset == total, "layer download size mismatch: got {offset} bytes, expected {total}");
+    }
+    if let Some(expected) = layer.digest.strip_prefix("sha256:") {
+        let mut hasher = sha2::Sha256::new();
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        anyhow::ensure!(
+            actual == expected,
+            "layer digest mismatch after download: expected sha256:{expected}, got sha256:{actual}"
+        );
+    }
+    Ok(())
 }

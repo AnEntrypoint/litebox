@@ -1,0 +1,65 @@
+Layer 64KiB-alignment audit (2026-09-04)
+
+Alignment of file data inside each layer tar. Files >=64KiB are the ones that
+matter -- smaller ones cannot fill a 64KiB view. Measured statically, no runs.
+
+layer                              MB   >=64K  algn    %   syms
+alpine-pinned2.tar                243     319     2    1      0
+layer_pngfix.tar                 2445    1440    12    1      0
+layer31_direct.tar                679     581     6    1    521
+xfce-layer31-nopanel.tar          679     581     6    1    521
+layer_with_xorg.tar              2454    1458    17    1      0
+layer31_direct_fixed.tar         2447    1444    17    1      0   <- canonical
+layer31_glycin_disabled.tar      2447    1444    17    1      0
+layer31_mimefix.tar              2445    1441    17    1      0
+layer31_direct_fixed_probe.tar   2445    1440    17    1      0
+alpine_symlinks_preserved.tar       8      11     1    9    329
+layer31_realigned.tar             700     574   518   90   2149
+
+Every layer except the last is ~1% aligned and therefore pays the full
+26.6 ms/exec host-side cost measured in dfb9c166 (realigned: ~0 ms/exec on
+identical content).
+
+Two observations worth keeping:
+
+- `layer31_direct.tar` and `xfce-layer31-nopanel.tar` already carry 521
+  symlinks yet remain 1% aligned. They are on-disk proof of the dedup-only
+  control: deduplication alone buys nothing here, alignment is the lever.
+
+- `alpine_symlinks_preserved.tar` reads 9% but was packed BY the fixed
+  packager. It has only 11 files >=64KiB, so one miss swings the percentage
+  hugely; a real image packed the same way (webtop, 3055 files >=64KiB)
+  measured 3055/3055 = 100%. Small-sample artefact, not a packager bug.
+
+Recommendation: realign only what is actually used. Most entries above are
+historical variants (_probe, _mimefix, _pngfix, glycin_disabled). At ~700 MB
+and ~90s each, realigning all nine would burn ~6 GB for layers nobody boots.
+
+
+## Alignment does NOT affect CoW (2026-09-04, deterministic)
+
+One busybox exec, same bench script, three layers differing only in alignment:
+
+    1% aligned    reads=386  cow_attempts=9  cow_successes=0
+    90% aligned   reads=386  cow_attempts=9  cow_successes=0
+    100% aligned  reads=386  cow_attempts=9  cow_successes=0
+
+Byte-identical. Syscall counts are deterministic and immune to the host timing
+noise that wrecked the wall-clock comparisons, so this is a real answer.
+
+CoW's blocker is the FIXED-ADDRESS requirement, not file alignment:
+try_cow_mmap_file's Replace/NoReplace path needs the returned pointer to equal
+suggested_start exactly, which is independent of where the file sits in the tar.
+Alignment cannot help it at any percentage. Closing that avenue.
+
+Two measurement traps hit while producing this, both worth remembering:
+
+- A first attempt showed reads=0 for the realigned layers, which looked like a
+  spectacular CoW win. It was `Error: Expected a .tar file` --
+  MSYS2_ARG_CONV_EXCL did not reach a loop variable, so the path was mangled
+  and the runner never opened the layer. A ZERO in a syscall count means
+  "verify the run happened" before it means anything else; check a guest-side
+  completion marker first.
+
+- The "700 MB vs 734 MB" discrepancy between two sessions was units, not a
+  race: 734,300,160 bytes = 700 MiB = 734 MB. Same file.

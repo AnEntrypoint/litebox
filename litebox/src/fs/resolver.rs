@@ -69,10 +69,10 @@ impl Context {
     pub fn new() -> Context {
         Self {
             cwd: vec![],
-            user_info: UserInfo {
+            user_info: super::effective_identity().unwrap_or(UserInfo {
                 user: 1000,
                 group: 1000,
-            },
+            }),
         }
     }
 
@@ -101,10 +101,21 @@ impl Context {
         Ok(ResolvedPath { components })
     }
 
+    /// The identity to check against: the shim's per-process one when set.
+    fn acting_user(&self) -> UserInfo {
+        super::ident::get().unwrap_or(self.user_info)
+    }
+
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return permissions
+                .mode
+                .intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::XGRP)
         } else {
             permissions.mode.contains(Mode::XOTH)
@@ -112,9 +123,13 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::RGRP)
         } else {
             permissions.mode.contains(Mode::ROTH)
@@ -122,9 +137,13 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
+        let user_info = self.acting_user();
+        if user_info.user == 0 {
+            return true;
+        }
+        if user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
+        } else if user_info.group == permissions.owner.group {
             permissions.mode.contains(Mode::WGRP)
         } else {
             permissions.mode.contains(Mode::WOTH)
@@ -138,9 +157,22 @@ impl Default for Context {
     }
 }
 
-/// Maximum number of intermediate-symlink hops a single walk will follow before giving up with
-/// `PathError::TooManySymlinkHops` (`ELOOP`). Matches
-/// [`super::in_mem::FileSystem`]'s own `MAX_SYMLINK_HOPS` for its (upper/writable) layer.
+/// Whether a path walk must resolve a symlink sitting in its FINAL position.
+///
+/// `open`/`lstat` decide for themselves (`O_NOFOLLOW`, `lstat`'s whole purpose); a walk to a
+/// containing directory has no choice, since its own last component is an intermediate component
+/// of the path the caller named: see gm mutable `resolver-followfinal-enum-rationale`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowFinal {
+    /// Resolve a final-position symlink and keep walking (a walk to a directory).
+    Yes,
+    /// Stop at the final component and let the caller decide (a walk to a leaf).
+    No,
+}
+
+/// Hop bound for intermediate AND final symlink components, reported as
+/// `PathError::TooManySymlinkHops` (`ELOOP`); stricter than `in_mem`'s intermediate bound of 40.
+/// See gm mutable `resolver-max-symlink-hops-bound`.
 const MAX_SYMLINK_HOPS: u32 = 8;
 
 /// Absolute normalized path, must only be created from [`Context::resolve`].
@@ -168,9 +200,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         path: &'a ResolvedPath,
     ) -> Result<Option<(WalkingDirHandle<'_>, &'a str)>, WalkError> {
-        // Return the walking handle rather than an owned directory handle so backends can keep any
-        // locks acquired during path resolution held across the final operation. This lets e.g.
-        // "walk parent + mutate child" stay atomic.
+        // A walking handle, not an owned one, so "walk parent + mutate child" stays atomic: see gm
+        // mutable `resolver-parentdirandname-returns-walking-handle`.
         let Some((parent_components, name)) = path.parent_and_name() else {
             return Ok(None);
         };
@@ -214,6 +245,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             components,
             #[cfg(debug_assertions)]
             absolute_components,
+            // Unfollowed, a final-position symlink made `lstat` fail with `ENOTDIR` on any usrmerge
+            // `/lib -> usr/lib` layout: see gm mutable `resolver-walktodirectory-usrmerge-enotdir`.
+            FollowFinal::Yes,
         )?;
 
         match outcome.stop_reason {
@@ -246,40 +280,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             components,
             #[cfg(debug_assertions)]
             absolute_components,
+            FollowFinal::No,
         )
     }
 
-    /// Walk `components` from `from`, transparently following a symlink encountered in an
+    /// Walk `components` from the backend root, transparently following a symlink in an
     /// *intermediate* (non-final) position -- e.g. Alpine's usrmerge `/lib -> usr/lib` -- up to
-    /// [`MAX_SYMLINK_HOPS`] times, matching the same hop-limit idiom
-    /// [`super::in_mem::FileSystem::resolve_final_symlinks`] uses for the writable upper layer.
+    /// [`MAX_SYMLINK_HOPS`] times. A symlink at the requested *final* component is followed only
+    /// when `follow_final_component` is [`FollowFinal::Yes`].
     ///
-    /// A symlink encountered at the requested *final* component is deliberately left unresolved
-    /// here: callers that need the final component followed too (e.g. `open()` without
-    /// `O_NOFOLLOW`) do so themselves once they have the resolved parent + leaf name, exactly as
-    /// before this change. Only intermediate components -- which can never legitimately be
-    /// anything but "a directory, or a symlink to one" -- are resolved inline, since a walk cannot
-    /// otherwise continue through them.
-    ///
-    /// Returns the same shape `walk_directories` would: the final [`WalkOutcome`] plus how many of
-    /// the *originally requested* `components` were consumed (which, after following any
-    /// intermediate symlinks, no longer 1:1 corresponds to `outcome.components.len()`, hence
-    /// returned separately).
+    /// Returns the final [`WalkOutcome`] plus how many of the *originally requested* `components`
+    /// were consumed, which after a symlink hop no longer corresponds to `outcome.components`.
+    /// See gm mutable `resolver-walkpathfollowingsymlinks-doc-false-paragraph`.
     fn walk_path_following_symlinks<'a>(
         &'a self,
         context: &Context,
-        // Every hop restarts the walk from the backend root (all current call sites already pass
-        // `self.backend.root()` here, and a symlink target can point anywhere in the tree), since
-        // `WalkingDirHandle` cannot cheaply be "rewound" to an intermediate point once a backend
-        // has walked past it. The parameter is retained (rather than dropped in favor of an
-        // internal `self.backend.root()` call) so this function's signature keeps documenting that
-        // the walk is root-relative, matching `walk_to_directory`/`walk_path`'s existing contract.
+        // Unused: every hop restarts from `self.backend.root()`, a `WalkingDirHandle` not being
+        // rewindable. Retained so the signature still documents the walk as root-relative.
         _from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
+        follow_final_component: FollowFinal,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
-        // Owned, mutable working copy of the remaining path, so a symlink target can be spliced
-        // in.
         let mut remaining: Vec<String> = components.iter().map(|c| (*c).to_string()).collect();
         let original_len = components.len();
 
@@ -298,25 +320,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             let walked = outcome.components.len();
             let is_final_component_stop = outcome.stop_reason
                 == WalkStopReason::StoppedAtNonDirectory
-                && walked + 1 == current.len();
+                && walked + 1 == current.len()
+                && follow_final_component == FollowFinal::No;
             if outcome.stop_reason == WalkStopReason::CompleteDirectory || is_final_component_stop {
-                // Either fully walked, or stopped exactly at the requested final component (which
-                // is allowed to be a non-directory, e.g. a file or a symlink the caller will
-                // resolve itself) -- nothing left for us to do. The returned count must be
-                // expressed as an index/length into the *original* `components` the caller passed
-                // in (callers like `open`'s `components[walked]` index the original array with
-                // it), not into `current`: a symlink hop only ever rewrites a *non-final* prefix of
-                // the path (the final component, per this function's contract, is deliberately
-                // left unresolved here), so the final element of `current` is always identical to
-                // the final element of the original `components` regardless of how many hops
-                // happened, and the count is simply `original_len` (fully walked) or
-                // `original_len - 1` (stopped exactly at the original final component). This is
-                // NOT derived from `current`'s length -- `current` is a rewritten working copy
-                // whose total length is not monotonic across hops (a symlink target can expand to
-                // more or fewer components than the single component it replaced), so comparing
-                // `current.len()` against `original_len` could both underflow (a previous bug here)
-                // and, even saturating, return a value that does not correspond to a valid index
-                // into the caller's original array.
+                // `consumed` must index the caller's ORIGINAL `components`: `open` indexes that
+                // array with it.
+                // Under `FollowFinal::No` a symlink hop rewrites only a non-final prefix.
+                // Never derive it from `current.len()`: non-monotonic across hops, it underflowed.
+                // Under `FollowFinal::Yes` a success is always a complete walk, as
+                // `walk_to_directory` asserts.
+                // See gm mutable `resolver-consumed-count-four-constraints`.
                 let consumed = if is_final_component_stop {
                     original_len - 1
                 } else {
@@ -325,11 +338,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 return Ok((outcome, consumed));
             }
 
-            // Stopped at a genuinely intermediate (non-final) component. If it names a symlink,
-            // follow it transparently and retry; otherwise this is a real `ComponentNotADirectory`,
-            // reported the same way `walk_to_directory`/`walk_path` always have. (`read_link_at`
-            // consumes `outcome.last`, so we must have already decided we no longer need
-            // `outcome` itself before calling it.)
+            // `read_link_at` consumes `outcome.last`, so `outcome` must be finished with first:
+            // see gm mutable `resolver-readlinkat-consumes-walkinghandle`.
             let symlink_component = current[walked];
             let Some(target) = self
                 .backend
@@ -347,8 +357,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     .map(String::from)
                     .collect()
             } else {
-                // Relative target: resolve against the directory containing the symlink, i.e. the
-                // already-walked prefix (`current[..walked]`).
                 let mut v: Vec<String> =
                     current[..walked].iter().map(|c| (*c).to_string()).collect();
                 for component in target.split('/') {
@@ -362,7 +370,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 }
                 v
             };
-            // Append whatever of the original request came after the symlink component itself.
             new_remaining.extend(current[walked + 1..].iter().map(|c| (*c).to_string()));
             remaining = new_remaining;
         }
@@ -401,8 +408,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-/// This exists purely as a migration feature, until we have completely separated contexts. See
-/// comment on `Resolver`.
+/// Migration shim: one shared default context, until per-process [`Context`]s are separated out.
 fn default_context_pre_context_management_changes() -> Context {
     Context::new()
 }
@@ -423,10 +429,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .union(OFlags::LARGEFILE)
             .union(OFlags::NOFOLLOW)
             .union(OFlags::APPEND)
-            .union(OFlags::PATH);
+            .union(OFlags::PATH)
+            // Pure hint; its absence killed a live XFCE session with `not implemented:
+            // OFlags(NOATIME)`: see gm mutable `resolver-open-unlisted-oflag-einval-not-panic`.
+            .union(OFlags::NOATIME)
+            // I/O-behaviour hints: they say HOW to do the I/O, not WHAT to open.
+            .union(OFlags::DSYNC)
+            .union(OFlags::SYNC)
+            .union(OFlags::DIRECT)
+            .union(OFlags::ASYNC)
+            .union(OFlags::CLOEXEC);
 
+        // An unlisted flag is REPORTED (`EINVAL`), never fatal: the old `unimplemented!` panicked
+        // the HOST, taking down every guest in the runner, not just the one that opened the file.
+        // See gm mutable `resolver-open-unlisted-oflag-einval-not-panic`.
         if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
-            unimplemented!("{flags:?}")
+            litebox_util_log::warn!(flags:? = flags; "open: unsupported open flag(s)");
+            return Err(OpenError::PathError(PathError::InvalidPathname));
         }
         let path_only = flags.contains(OFlags::PATH);
 
@@ -459,79 +478,146 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             ));
         }
 
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        let walk = self.walk_path(
-            &context,
-            self.backend.root(),
-            &components,
-            #[cfg(debug_assertions)]
-            &components,
-        );
-        match walk {
-            Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
+        // Real `open()` without `O_NOFOLLOW` opens a symlink's TARGET: a container rootfs fanning
+        // `/bin/sh -> /bin/busybox` could not launch its shell (`ENOTDIR`). See gm mutable
+        // `resolver-open-follows-final-symlink-busybox`.
+        let follow_final_symlink = !flags.contains(OFlags::NOFOLLOW);
+        let mut components: Vec<String> = path.components.into_iter().collect();
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let component_refs: Vec<&str> = components.iter().map(String::as_str).collect();
+            let walk = self.walk_path(
+                &context,
+                self.backend.root(),
+                &component_refs,
+                #[cfg(debug_assertions)]
+                &component_refs,
+            );
+            match walk {
+                Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
+                    if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
+                        return Err(OpenError::AlreadyExists);
+                    }
+                    return Ok(insert(
+                        OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                        SeekBehavior::NonSeekable,
+                    ));
                 }
-                Ok(insert(
-                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
-                    SeekBehavior::NonSeekable,
-                ))
-            }
-            Ok((outcome, walked))
-                if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
-            {
-                let name = components[walked];
-                // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
-                // side effects like truncation cannot happen before AlreadyExists is returned.
-                let file = self.backend.open_file_at(outcome.last, name, flags)?;
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
-                }
-                if !path_only
-                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
-                    && ((read_allowed && !context.can_read(permissions))
-                        || (write_allowed && !context.can_write(permissions)))
+                Ok((outcome, walked))
+                    if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
                 {
-                    return Err(OpenError::AccessNotAllowed);
+                    let name = component_refs[walked];
+                    // `read_link_at` consumes `outcome.last`; the non-symlink path re-walks for a
+                    // fresh handle. See gm mutable `resolver-readlinkat-consumes-walkinghandle`.
+                    let link_target = if follow_final_symlink {
+                        self.backend.read_link_at(outcome.last, name).ok().flatten()
+                    } else {
+                        drop(outcome);
+                        None
+                    };
+                    if let Some(target) = link_target {
+                        let mut new_components: Vec<String> =
+                            if let Some(target) = target.strip_prefix('/') {
+                                target
+                                    .split('/')
+                                    .filter(|c| !c.is_empty() && *c != ".")
+                                    .map(String::from)
+                                    .collect()
+                            } else {
+                                let mut v: Vec<String> = component_refs[..walked]
+                                    .iter()
+                                    .map(|c| (*c).to_string())
+                                    .collect();
+                                for component in target.split('/') {
+                                    match component {
+                                        "" | "." => {}
+                                        ".." => {
+                                            v.pop();
+                                        }
+                                        c => v.push(c.to_string()),
+                                    }
+                                }
+                                v
+                            };
+                        new_components.extend(
+                            component_refs[walked + 1..]
+                                .iter()
+                                .map(|c| (*c).to_string()),
+                        );
+                        components = new_components;
+                        continue;
+                    }
+                    let (outcome, _) = self
+                        .walk_path(
+                            &context,
+                            self.backend.root(),
+                            &component_refs,
+                            #[cfg(debug_assertions)]
+                            &component_refs,
+                        )
+                        .map_err(|error| match error {
+                            WalkError::Io => OpenError::Io,
+                            WalkError::PathError(error) => error.into(),
+                        })?;
+                    // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
+                    // side effects like truncation cannot happen before AlreadyExists is returned.
+                    let file = self.backend.open_file_at(outcome.last, name, flags)?;
+                    if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
+                        return Err(OpenError::AlreadyExists);
+                    }
+                    if !path_only
+                        && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                        && ((read_allowed && !context.can_read(permissions))
+                            || (write_allowed && !context.can_write(permissions)))
+                    {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                    let seek_behavior = self.backend.seek_behavior(&file.item);
+                    return Ok(insert(OwnedHandle::File(file.item), seek_behavior));
                 }
-                let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
-            }
-            Ok(_) => {
-                // `walk_path` validates stop reasons before returning.
-                unreachable!()
-            }
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-                if flags.contains(OFlags::CREAT) =>
-            {
-                let Some((parent_components, name)) = path.parent_and_name() else {
-                    unreachable!("root path was handled above")
-                };
-                let parent = self
-                    .walk_to_directory(
-                        &context,
-                        self.backend.root(),
-                        &parent_components,
-                        #[cfg(debug_assertions)]
-                        &parent_components,
-                    )
-                    .map_err(|error| match error {
+                Ok(_) => {
+                    // `walk_path` validates stop reasons before returning.
+                    unreachable!()
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+                    if flags.contains(OFlags::CREAT) =>
+                {
+                    let Some((name_idx, name)) = component_refs
+                        .len()
+                        .checked_sub(1)
+                        .map(|i| (i, component_refs[i]))
+                    else {
+                        unreachable!("root path was handled above")
+                    };
+                    let parent_components = &component_refs[..name_idx];
+                    let parent = self
+                        .walk_to_directory(
+                            &context,
+                            self.backend.root(),
+                            parent_components,
+                            #[cfg(debug_assertions)]
+                            parent_components,
+                        )
+                        .map_err(|error| match error {
+                            WalkError::Io => OpenError::Io,
+                            WalkError::PathError(error) => error.into(),
+                        })?;
+                    let parent = self.owned_parent_dir(parent).map_err(|error| match error {
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-                    WalkError::Io => OpenError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?;
-                let file = self.backend.create_file_at(parent, name, mode)?;
-                let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(OwnedHandle::File(file), seek_behavior))
+                    let file = self.backend.create_file_at(parent, name, mode)?;
+                    let seek_behavior = self.backend.seek_behavior(&file);
+                    return Ok(insert(OwnedHandle::File(file), seek_behavior));
+                }
+                Err(error) => {
+                    return match error {
+                        WalkError::Io => Err(OpenError::Io),
+                        WalkError::PathError(error) => Err(error.into()),
+                    };
+                }
             }
-            Err(error) => match error {
-                WalkError::Io => Err(OpenError::Io),
-                WalkError::PathError(error) => Err(error.into()),
-            },
         }
+        Err(OpenError::PathError(PathError::TooManySymlinkHops))
     }
 
     fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
@@ -699,6 +785,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
+    fn services_own_writes(&self, path: &str) -> bool {
+        self.backend.services_own_writes(path)
+    }
+
+    fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChmodError::Io)?;
+        let entry = entry.get_entry_mut();
+        let file = match &entry.entry.handle {
+            OwnedHandle::File(file) => file,
+            // `Backend::chmod` is scoped to `FileHandle`; the only real `fchmod` caller (wlroots'
+            // shm-file dance) never targets a directory fd, so this stays a hard error. See gm
+            // mutable `resolver-chmodfd-filehandle-only-wlroots`.
+            OwnedHandle::Dir(_) => return Err(ChmodError::Io),
+        };
+        self.backend.chmod(file, mode)
+    }
+
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
@@ -789,41 +896,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn rename(&self, from: impl Arg, to: impl Arg) -> Result<(), RenameError> {
-        // `Backend` (the `Composer`-based mount abstraction this `Resolver` sits on) has no
-        // `rename_at` operation: every current use of `Resolver<Composer>` in this codebase
-        // mounts either genuinely read-only backends (`tar_ro`, the OCI image's read-only rootfs
-        // layer) or device backends (`devices`, `/dev`) -- neither can meaningfully support
-        // rename, so reporting `ReadOnlyFileSystem` here is accurate rather than a stub. The
-        // writable rename path that matters (e.g. `apk` atomically replacing a downloaded temp
-        // file) goes through `in_mem::FileSystem::rename` instead, since the writable "upper"
-        // layer in this codebase's `layered::FileSystem` setup is always a plain `in_mem`
-        // filesystem, never a `Resolver<Composer>`.
+        // No `Backend::rename_at`: every `Resolver<Composer>` mount is read-only (`tar_ro`) or a
+        // device backend; `apk`'s atomic temp-file rename goes via `in_mem`. See gm mutable
+        // `resolver-composer-mounts-are-readonly`.
         let _ = (from, to);
         Err(RenameError::ReadOnlyFileSystem)
     }
 
     fn link(&self, oldpath: impl Arg, newpath: impl Arg) -> Result<(), LinkError> {
-        // Same rationale as `rename` above: every current use of `Resolver<Composer>` mounts
-        // either a genuinely read-only backend (`tar_ro`) or a device backend (`devices`, `/dev`),
-        // neither of which can meaningfully support creating a new hard link.
+        // Same rationale as `rename` above.
         let _ = (oldpath, newpath);
         Err(LinkError::ReadOnlyFileSystem)
     }
 
     fn symlink(&self, target: impl Arg, linkpath: impl Arg) -> Result<(), SymlinkError> {
-        // Same rationale as `rename` above: every current use of `Resolver<Composer>` mounts
-        // either a genuinely read-only backend (`tar_ro`) or a device backend (`devices`, `/dev`),
-        // neither of which can meaningfully support creating a new symlink.
+        // Same rationale as `rename` above.
         let _ = (target, linkpath);
         Err(SymlinkError::ReadOnlyFileSystem)
     }
 
     fn read_link(&self, path: impl Arg) -> Result<String, ReadLinkError> {
-        // Backends can carry real symlinks now (see `Backend::read_link_at`, needed so
-        // intermediate-component symlinks like Alpine's usrmerge `/lib -> usr/lib` can be followed
-        // during a walk) even though `symlink()`/`rename()` above remain unsupported for
-        // *creating* new entries -- every current mount through this resolver is still read-only
-        // (`tar_ro`) or a device backend (`devices`) with nothing to write.
+        // Backends carry real symlinks (`Backend::read_link_at`, for intermediate-component
+        // usrmerge `/lib -> usr/lib`) even though *creating* one above is unsupported. See gm
+        // mutable `resolver-composer-mounts-are-readonly`.
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
@@ -938,30 +1033,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn symlink_metadata(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
-        // `open()` (and therefore `file_status` above) always transparently follows a
-        // final-component symlink -- backends never see one reach their own `open_file_at`, by
-        // design (see `Backend::read_link_at`'s doc comment). So check the final component
-        // directly via the same `read_link_at` primitive `Self::read_link` uses, *before* ever
-        // calling `open()`/`file_status`: a dangling symlink's target need not exist for this to
-        // succeed, whereas routing through `file_status` would incorrectly surface `ENOENT`.
+        // `read_link_at` must run BEFORE any `open()`/`file_status`, which always follow a
+        // final-component symlink and so report `ENOENT` for a dangling one. See gm mutable
+        // `resolver-symlinkmetadata-readlink-before-open`.
         let context = default_context_pre_context_management_changes();
         let resolved = context.resolve(path)?;
-        let Some((parent, name)) = self.parent_dir_and_name(&context, &resolved).map_err(
-            |error| match error {
-                WalkError::Io => FileStatusError::Io,
-                WalkError::PathError(error) => error.into(),
-            },
-        )?
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &resolved)
+                .map_err(|error| match error {
+                    WalkError::Io => FileStatusError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
         else {
             // The root itself was requested; it is always a directory, never a symlink.
             return self.file_status("/");
         };
         match self.backend.read_link_at(parent, name) {
             Ok(Some(target)) => {
-                // Reuse the containing directory's own status for the fields a symlink has no
-                // independent, meaningful value for (owner/timestamps/block size) -- matching
-                // this crate's existing precedent of approximating metadata a backend doesn't
-                // track natively rather than inventing an unrelated placeholder.
+                // A symlink has no independent owner/timestamps/block size, so the containing
+                // directory's status stands in: see gm mutable
+                // `resolver-symlinkmetadata-readlink-before-open`.
                 let Some((parent_components, _)) = resolved.parent_and_name() else {
                     unreachable!("a symlink can never be the root");
                 };

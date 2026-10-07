@@ -273,6 +273,7 @@ impl Composer {
             .map(|dir| dir.node_info.clone())
             .expect("virtual directory is precomputed");
         FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             // rwxr-xr-x for virtual dirs
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
@@ -631,20 +632,30 @@ impl Backend for Composer {
         match dir.inner {
             // A virtual directory is a pure mount-point placeholder with no real backend entries
             // of its own; nothing there can be a symlink.
-            ComposerWalkingDirHandleInner::Virtual { .. } => Ok(None),
+            ComposerWalkingDirHandleInner::Virtual { path } => {
+                // Only the mount points themselves exist under a virtual directory; any other
+                // name is absent (`ENOENT`), which a layered caller must be able to tell apart
+                // from "exists but is not a symlink" (`EINVAL`) so it can consult the next layer.
+                if self
+                    .immediate_mount_children(&path)
+                    .iter()
+                    .any(|child| child == name)
+                {
+                    Ok(None)
+                } else {
+                    Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+                }
+            }
             ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
                 let child_path = append_components(path, &[name]);
-                // A read-only lookup, unlike the mutating operations `checked_child_path` guards
-                // (create/unlink/mkdir/...): a name that is itself a nested mount point (e.g.
-                // `read_link_at("/dev", "dri")` when `/dev/dri` is its own mount) is a real,
-                // existing child directory, just never a symlink -- reject only the case where
-                // it's an ancestor of a *deeper* mount (no backend entry could resolve there),
-                // and let an exact mount point fall through to the "not a symlink" answer instead
-                // of being misreported as ENOENT.
+                // A read-only lookup must NOT use `checked_child_path`, which also rejects an
+                // exact mount point: `read_link_at("/dev", "dri")` with `/dev/dri` mounted names a
+                // real directory and must answer "not a symlink", never ENOENT. See gm mutable
+                // `composer-readlinkat-exact-mount-not-enoent`.
                 if self.mount_relation(&child_path) == MountRelation::AncestorOfMount {
                     return Ok(None);
                 }
@@ -694,6 +705,26 @@ impl Backend for Composer {
         self.mounts[h.mount_index]
             .backend
             .truncate(&h.handle, length)
+    }
+
+    /// Answered by whichever mount owns `path`: the deepest mount whose path is a prefix of it,
+    /// which is the same mount [`Self::write`] would reach for an open handle on that path.
+    fn services_own_writes(&self, path: &str) -> bool {
+        let components: Vec<String> = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        self.mounts
+            .iter()
+            .filter(|mount| components.starts_with(&mount.path[..]))
+            .max_by_key(|mount| mount.path.len())
+            .is_some_and(|mount| mount.backend.services_own_writes(path))
+    }
+
+    fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.chmod(&h.handle, mode)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {

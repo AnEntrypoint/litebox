@@ -36,12 +36,9 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for SignalfdSubsystem<Platform> 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for SignalfdFile<Platform> {}
 
 /// The real kernel ABI struct returned by reading a signalfd (`include/uapi/linux/signalfd.h`),
-/// always exactly 128 bytes regardless of architecture. Only the fields litebox's `Siginfo` can
-/// actually populate (`ssi_signo`/`ssi_errno`/`ssi_code`, and `ssi_addr` for the fault-address
-/// signals `SiginfoData::new_addr` encodes -- see that function's callers) are ever non-zero; the
-/// rest (`ssi_pid`, `ssi_uid`, `ssi_status`, ...) are zeroed, matching the same level of siginfo
-/// fidelity every other consumer of litebox's `Siginfo`/`SiginfoData` already has (there is no
-/// per-signal-code-specific field tracking anywhere in this codebase to draw richer values from).
+/// always exactly 128 bytes regardless of architecture. Populated from litebox's `Siginfo`:
+/// `ssi_signo`/`ssi_errno`/`ssi_code`, `ssi_addr` for a fault signal, `ssi_pid`/`ssi_uid` for
+/// every other one, and `ssi_status` for `SIGCHLD`; the remaining fields are zero.
 #[repr(C)]
 #[derive(Clone, Copy, IntoBytes, Immutable)]
 struct SignalfdSiginfo {
@@ -81,20 +78,45 @@ impl SignalfdSiginfo {
         let pad = info.data.pad;
         let mut addr_bytes = [0u8; size_of::<usize>()];
         addr_bytes.copy_from_slice(&pad.as_bytes()[..size_of::<usize>()]);
-        let ssi_addr = usize::from_ne_bytes(addr_bytes) as u64;
+        // The same bytes are `si_addr` for a fault signal and `si_pid`/`si_uid` (then, for
+        // `SIGCHLD`, `si_status`) for every other one.
+        let is_fault = matches!(
+            litebox_common_linux::signal::Signal::try_from(info.signo),
+            Ok(litebox_common_linux::signal::Signal::SIGSEGV
+                | litebox_common_linux::signal::Signal::SIGBUS
+                | litebox_common_linux::signal::Signal::SIGILL
+                | litebox_common_linux::signal::Signal::SIGFPE
+                | litebox_common_linux::signal::Signal::SIGTRAP)
+        );
+        let ssi_addr = if is_fault {
+            usize::from_ne_bytes(addr_bytes) as u64
+        } else {
+            0
+        };
+        let (ssi_pid, ssi_uid) = if is_fault {
+            (0, 0)
+        } else {
+            let (pid, uid) = info.data.sender();
+            (pid.cast_unsigned(), uid)
+        };
+        let ssi_status = if info.signo == litebox_common_linux::signal::Signal::SIGCHLD.as_i32() {
+            info.data.child_status()
+        } else {
+            0
+        };
 
         Self {
             ssi_signo: info.signo as u32,
             ssi_errno: info.errno,
             ssi_code: info.code,
-            ssi_pid: 0,
-            ssi_uid: 0,
+            ssi_pid,
+            ssi_uid,
             ssi_fd: 0,
             ssi_tid: 0,
             ssi_band: 0,
             ssi_overrun: 0,
             ssi_trapno: 0,
-            ssi_status: 0,
+            ssi_status,
             ssi_int: 0,
             ssi_ptr: 0,
             ssi_utime: 0,
@@ -167,7 +189,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SignalfdFile<Platform> 
     /// real-world usage: glib/D-Bus/most event loops always create a signalfd with `SFD_NONBLOCK`
     /// and integrate it into their own poll loop, checked via `check_io_events` above, which IS
     /// fully accurate) is unaffected by this gap.
-    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, Errno> {
+    pub(crate) fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, Errno> {
         if buf.len() < core::mem::size_of::<SignalfdSiginfo>() {
             return Err(Errno::EINVAL);
         }

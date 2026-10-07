@@ -1,3 +1,76 @@
+## Phase 10: the actual `Compositor::commit`/`push_to_drm_dumb_buffer` path -- live-verified
+## end-to-end, closing `gui-wayland-compositor-on-drm-future`'s own last-named gap
+
+Phase 9 (below) proved the full `wayland-client` <-> compositor `wl_shm` protocol round-trip
+byte-correct, but its own `combined.rs` **deliberately omitted** the DRM dumb-buffer push (see
+that file's own doc comment) to keep the protocol repro minimal -- so the PRD row's actual
+closing question ("does `Compositor::commit`/`push_to_drm_dumb_buffer` really copy a real
+client's pixels into litebox's DRM device") was still open. `src/combined_drm.rs` (new, this
+phase) is `combined.rs`'s exact client+compositor-on-two-threads shape with `main.rs`'s real
+`drm: DrmDevice` field and `push_to_drm_dumb_buffer` call reinstated in the commit handler.
+
+**First live run hit a real, previously-unexercised litebox gap, root-caused and fixed**:
+`DrmDevice::new(fd, true)` (`disable_connectors=true`, used by every phase of this probe since
+phase 1) panicked with `Access(AccessError { errmsg: "Failed to set property of connector",
+source: Os { code: 22 (EINVAL) } })` -- a failure mode this exact call had never actually hit
+before, because no prior phase's run path drove smithay's `LegacyDrmDevice::reset_state()` far
+enough to reach the one connector-property WRITE in its own start-up sequence (every earlier
+phase either used `create_dumb_buffer`-only static enumeration, or never got past protocol setup
+before this probe's own 20/30s timeout). Root cause, confirmed by reading `drm-ffi`'s own
+`mode::set_property` (used by `drm-rs`'s generic `Device::set_property`, which is what
+`LegacyDrmDevice::reset_state`'s `set_connector_state` helper actually calls -- not the legacy
+connector-only setter litebox already implemented): it unconditionally issues
+`DRM_IOCTL_MODE_OBJ_SETPROPERTY` (ioctl nr `0xba`, `struct drm_mode_obj_set_property`), a
+DIFFERENT, object-type-carrying ioctl from `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY` (nr `0xab`) --
+litebox had only ever implemented the legacy one. With `0xba` entirely unhandled, it fell through
+to the ioctl dispatch's generic `EINVAL` default arm -- the exact symptom observed, and the exact
+class of gap `DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY`'s own doc comment already described for a
+DIFFERENT real caller (wlroots/labwc) that uses the legacy ioctl instead.
+
+**Fixed at the root** (`litebox_common_linux::DRM_IOCTL_MODE_OBJ_SETPROPERTY`/
+`DrmModeObjSetProperty`, `litebox_shim_linux::syscalls::drm::DrmSubsystem::obj_set_property`):
+implemented the real `DRM_IOCTL_MODE_OBJ_SETPROPERTY` ioctl with the same accept-as-a-no-op
+semantics `connector_set_property` already established (no real DPMS hardware state exists for
+this single-address-space shim to change), narrowed to exactly the one settable (object,
+property) pair this device advertises: the virtual connector's `DPMS` property; any other
+object/property combination gets a real `ENOENT`. Wired into the ioctl decode table and
+`drm_ioctl`'s dispatch exactly like every sibling DRM ioctl.
+
+**Second issue found and fixed, this time in the PROBE's own code, not litebox**: with the
+ioctl gap fixed, the client->compositor protocol round-trip and `with_buffer_contents` pixel
+copy both succeeded (`COMMIT_SHM_OK ... first4=[11, 22, 33, 44]`, matching the client's real
+write exactly) but `push_to_drm_dumb_buffer`'s own `drm.add_framebuffer(&dumb, 32, 32)` call
+failed with `ADDFB_FAILED`. Root cause: `add_framebuffer`'s real signature is `(buffer, depth,
+bpp)`, and `32, 32` passes `depth=32` -- but real `XRGB8888` has color depth 24 (the top byte is
+padding, not alpha) even though each pixel occupies 32 bits, and litebox's own `add_fb` ioctl
+handler correctly enforces this real-kernel distinction (`req.bpp == 32 && req.depth == 24`),
+rejecting `depth=32` as a format this single-format device does not support. This exact bug was
+present in `main.rs`, `desktop.rs`, AND the new `combined_drm.rs` (all copy the same call site) --
+never caught before because no prior phase's code path ever reached a real `add_framebuffer`
+call with a real committed client buffer. Fixed in all three call sites (`depth=24, bpp=32`).
+
+**Live-verified end-to-end, independently re-run twice with byte-identical results** (real guest
+process, `litebox_runner_linux_on_windows_userland.exe --gui-hidden`, one process at a time on
+this RAM-limited host): `wayland-combined-drm` now prints the complete real chain --
+`CONNECTED` -> `CLIENT_ACCEPTED` -> three real globals bound -> `COMMITTED`/`COMMIT_SHM_OK
+first4=[11, 22, 33, 44]` (the client's actual written bytes) -> `DUMB_COPY_OK bytes_copied=64` ->
+`SETCRTC_OK fb_id=framebuffer::Handle(1)` -> `RESULT_OK ... drm_pushed=true` ->
+`COMBINED_DRM_DONE`. This is the exact thing the PRD row asked for: a real, unmodified
+`wayland-client` connecting to a real compositor built on litebox's DRM emulation, with
+`Compositor::commit` pulling the client's actual pixel bytes and `push_to_drm_dumb_buffer`
+genuinely driving them through `CREATE_DUMB` -> `MAP_DUMB` -> memcpy -> `ADDFB` -> `SETCRTC`
+against litebox's virtual DRM device -- witnessed live, not assumed from a clean compile.
+
+`main.rs`'s own display-source callback was also missing the same `flush_clients()` call
+`combined.rs`'s phase-8 investigation found and fixed (see below) -- harmless there only because
+no real client had ever reached a second round-trip against it; carried the fix forward to keep
+the two files from silently diverging on a gap one of them already paid to find.
+
+**Reproducing this phase**: `cargo zigbuild --target x86_64-unknown-linux-musl --release --bin
+wayland-combined-drm` (same recipe as every other phase below), rewrite, append into a rootfs
+tar, run as a real guest process. No fork/execve needed (single-process, two-thread shape, same
+as `combined.rs`).
+
 # Wayland/Smithay DRM backend probe
 
 Deliberately **not** a workspace member (has its own `[workspace]` table in

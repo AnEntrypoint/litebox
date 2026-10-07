@@ -31,9 +31,29 @@ use crate::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
-/// Support for unidirectional communication channels
+/// Support for unidirectional communication channels.
+///
+/// # Why `Pipes` holds no `LiteBox`
+///
+/// `Pipes` is a `GlobalState` field (`litebox_shim_linux`), so in a cross-process-fork guest its
+/// bytes are placed inline in the fixed-base shared kernel arena and are visible to every process
+/// of the fork family. A `LiteBox<Platform>` handle is effectively an `Arc` pointer into ONE
+/// process's private heap: any copy stored here is a foreign, meaningless (or dangling) pointer in
+/// every other process. An earlier design kept one in a `Mutex` and had each process "rebind" it
+/// to its own before use, which is racy by construction -- another process can rebind between
+/// this process's rebind and its use, and even cloning the foreign handle dereferences another
+/// process's memory. That produced host `STATUS_ACCESS_VIOLATION`s inside
+/// `Descriptors::get_entry` (epoll on pipes, selkies) and inside a descriptor table's `Drop`.
+/// So every operation takes the CALLING process's own `LiteBox` explicitly, and `Pipes` itself
+/// carries no process-relative state at all.
 pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    litebox: LiteBox<Platform>,
+    _platform: core::marker::PhantomData<fn() -> Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for Pipes<Platform> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
@@ -41,9 +61,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Pipes` handle is expected to be shared across all usage over the system.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            litebox: litebox.clone(),
+            _platform: core::marker::PhantomData,
         }
     }
 
@@ -62,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// writes and might be interleaved with other writes.
     pub fn create_pipe(
         &self,
+        litebox: &LiteBox<Platform>,
         capacity: usize,
         flags: Flags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
@@ -70,7 +92,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
         let sender = PipeEnd::Sender(sender);
         let receiver = PipeEnd::Receiver(receiver);
-        let mut dt = self.litebox.descriptor_table_mut();
+        let mut dt = litebox.descriptor_table_mut();
         let sender = dt.insert(sender);
         let receiver = dt.insert(receiver);
         (sender, receiver)
@@ -79,8 +101,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Close the pipe at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    pub fn close(&self, litebox: &LiteBox<Platform>, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
+        let removed = litebox.descriptor_table_mut().remove(fd);
+        // `unique` is the invariant that decides whether the guest on the other end gets EOF:
+        // only a unique entry is actually dropped here, and only that drop runs `WriteEnd::drop`.
+        // A `false` on what should be the last close means some other descriptor-table duplicate
+        // is still pinning this end open -- which presents to the guest as a `read()` that blocks
+        // forever, with nothing else to see. Worth a line.
+        litebox_util_log::debug!(unique:% = removed.is_some(); "pipes: closed a pipe end");
         // Shutdowns are taken care of automatically by the drop implementations
         Ok(())
     }
@@ -93,11 +121,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// change in the future to an explicit "peer has shut down" error.
     pub fn read(
         &self,
+        litebox: &LiteBox<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: &PipeFd<Platform>,
         buf: &mut [u8],
     ) -> Result<usize, errors::ReadError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
@@ -111,11 +140,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
     pub fn write(
         &self,
+        litebox: &LiteBox<Platform>,
         cx: &WaitContext<'_, Platform>,
         fd: &PipeFd<Platform>,
         buf: &[u8],
     ) -> Result<usize, errors::WriteError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
             PipeEnd::Sender(p) => Arc::clone(p),
             PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
@@ -124,12 +154,57 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         p.write(cx, buf).map_err(From::from)
     }
 
+    /// Take a handle on the end at `fd` that is independent of the descriptor table.
+    ///
+    /// Every other read/write path here is keyed by a live [`PipeFd`], which is exactly right for
+    /// guest syscalls: pipe lifetime follows descriptors. It cannot serve a HOST-side bridge that
+    /// must outlive the guest's descriptor, though, and the cross-process `fork()` path needs
+    /// precisely that. A shell performing command substitution closes its own copy of the write
+    /// end immediately after forking -- that close is what eventually gives the reader EOF -- so
+    /// by the time the forked child is running there is no descriptor left in the parent to pump
+    /// the child's output through.
+    ///
+    /// This clones the same `Arc` the fd-keyed paths already clone before doing I/O (see
+    /// [`Self::read`]/[`Self::write`]), so it introduces no new sharing rule -- only a second way
+    /// to name an end. Lifetime semantics are unchanged and still correct: dropping the returned
+    /// handle drops its `Arc`, and `WriteEnd`'s own `Drop` shuts the end down and notifies the
+    /// peer with `HUP`. A host pump therefore signals EOF by dropping the handle when its child
+    /// exits, exactly as a guest signals it by closing the last descriptor.
+    pub fn detach_end(
+        &self,
+        litebox: &LiteBox<Platform>,
+        fd: &PipeFd<Platform>,
+    ) -> Result<DetachedPipeEnd<Platform>, errors::ClosedError> {
+        let dt = litebox.descriptor_table();
+        let end = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => PipeEnd::Receiver(Arc::clone(p)),
+            PipeEnd::Sender(p) => PipeEnd::Sender(Arc::clone(p)),
+        };
+        Ok(DetachedPipeEnd { end })
+    }
+
+    /// The number of bytes waiting to be read from the receiver end at `fd` (`FIONREAD`).
+    ///
+    /// A sender end reports `0`.
+    pub fn readable_bytes(
+        &self,
+        litebox: &LiteBox<Platform>,
+        fd: &PipeFd<Platform>,
+    ) -> Result<usize, errors::ClosedError> {
+        let dt = litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
+            PipeEnd::Sender(_) => Ok(0),
+        }
+    }
+
     /// Whether the provided FD points to a reader or a writer end.
     pub fn half_pipe_type(
         &self,
+        litebox: &LiteBox<Platform>,
         fd: &PipeFd<Platform>,
     ) -> Result<HalfPipeType, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = litebox.descriptor_table();
         match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
             PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
@@ -137,8 +212,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     }
 
     /// Get the flags set on the pipe at `fd`.
-    pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+    pub fn get_flags(&self, litebox: &LiteBox<Platform>, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
+        let dt = litebox.descriptor_table();
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
             PipeEnd::Sender(p) => p.get_status(),
@@ -151,11 +226,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Specifically, sets the bits in the `mask` to `on`, leaving the others unchanged.
     pub fn update_flags(
         &self,
+        litebox: &LiteBox<Platform>,
         fd: &PipeFd<Platform>,
         mask: Flags,
         on: bool,
     ) -> Result<(), errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = litebox.descriptor_table();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
             PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
@@ -166,13 +242,108 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
     pub fn with_iopollable<R>(
         &self,
+        litebox: &LiteBox<Platform>,
         fd: &PipeFd<Platform>,
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
+        let dt = litebox.descriptor_table();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),
+        }
+    }
+}
+
+/// One end of a pipe, held independently of any descriptor table entry.
+///
+/// Obtained from [`Pipes::detach_end`]; see that method for why this exists and why its lifetime
+/// semantics match the descriptor path exactly.
+pub struct DetachedPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    end: PipeEnd<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platform> {
+    /// How many references to this pipe end are alive, this handle included.
+    ///
+    /// Diagnostic only. A host pump uses it to tell "I am the last owner, so dropping me will
+    /// shut the end down and give the peer EOF" from "a descriptor somewhere still holds this
+    /// end open", which are indistinguishable from the outside and produce very different
+    /// behaviour for the guest on the other side.
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => Arc::strong_count(p),
+            PipeEnd::Sender(p) => Arc::strong_count(p),
+        }
+    }
+
+    /// Stable identity of the underlying pipe end, shared by every handle to it.
+    #[must_use]
+    pub fn identity(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => Arc::as_ptr(p).cast::<()>() as usize,
+            PipeEnd::Sender(p) => Arc::as_ptr(p).cast::<()>() as usize,
+        }
+    }
+
+    /// Whether a read on this end can only ever return end-of-file: it is a receiver half with
+    /// every writer gone and nothing left buffered. Delivering that EOF to a second reader steals
+    /// no bytes, which is what lets a bridge release a child's copy of the end without waiting for
+    /// its sibling bridges.
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.is_peer_shutdown() && p.endpoint.rb.lock().is_empty(),
+            PipeEnd::Sender(_) => false,
+        }
+    }
+
+    /// How many bytes are waiting to be read from a receiver half (`FIONREAD`); `0` on a sender
+    /// half.
+    ///
+    /// Sampled twice, this is the only evidence available about whether the holder of a second
+    /// reference to this end is actually reading: a count that never moves means nobody is
+    /// draining it, whatever `strong_count` says about who still holds one.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.endpoint.rb.lock().occupied_len(),
+            PipeEnd::Sender(_) => 0,
+        }
+    }
+
+    /// Whether this is the sender half or the receiver half.
+    #[must_use]
+    pub fn half_pipe_type(&self) -> HalfPipeType {
+        match &self.end {
+            PipeEnd::Sender(_) => HalfPipeType::SenderHalf,
+            PipeEnd::Receiver(_) => HalfPipeType::ReceiverHalf,
+        }
+    }
+
+    /// Read from this end. Fails with `NotForReading` on a sender half, matching
+    /// [`Pipes::read`].
+    pub fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, errors::ReadError> {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.read(cx, buf).map_err(From::from),
+            PipeEnd::Sender(_) => Err(errors::ReadError::NotForReading),
+        }
+    }
+
+    /// Write into this end. Fails with `NotForWriting` on a receiver half, matching
+    /// [`Pipes::write`].
+    pub fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+    ) -> Result<usize, errors::WriteError> {
+        match &self.end {
+            PipeEnd::Sender(p) => p.write(cx, buf).map_err(From::from),
+            PipeEnd::Receiver(_) => Err(errors::WriteError::NotForWriting),
         }
     }
 }
@@ -642,9 +813,9 @@ mod tests {
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = &crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(litebox);
+        let pipes = &super::Pipes::new();
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
+        let (prod, cons) = pipes.create_pipe(litebox, 2, super::Flags::empty(), None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -652,11 +823,11 @@ mod tests {
                 let mut i = 0;
                 while i < data.len() {
                     let ret = pipes
-                        .write(&WaitState::new(platform).context(), &prod, &data[i..])
+                        .write(litebox, &WaitState::new(platform).context(), &prod, &data[i..])
                         .unwrap();
                     i += ret;
                 }
-                pipes.close(&prod).unwrap();
+                pipes.close(litebox, &prod).unwrap();
                 assert_eq!(i, data.len());
             });
 
@@ -664,10 +835,10 @@ mod tests {
             let mut i = 0;
             loop {
                 let ret = pipes
-                    .read(&WaitState::new(platform).context(), &cons, &mut buf[i..])
+                    .read(litebox, &WaitState::new(platform).context(), &cons, &mut buf[i..])
                     .unwrap();
                 if ret == 0 {
-                    pipes.close(&cons).unwrap();
+                    pipes.close(litebox, &cons).unwrap();
                     break;
                 }
                 i += ret;
@@ -680,16 +851,16 @@ mod tests {
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = &crate::LiteBox::new(platform);
-        let pipes = &super::Pipes::new(litebox);
+        let pipes = &super::Pipes::new();
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
+        let (prod, cons) = pipes.create_pipe(litebox, 2, super::Flags::NON_BLOCKING, None);
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
                 let mut i = 0;
                 while i < data.len() {
-                    match pipes.write(&WaitState::new(platform).context(), &prod, &data[i..]) {
+                    match pipes.write(litebox, &WaitState::new(platform).context(), &prod, &data[i..]) {
                         Ok(n) => {
                             i += n;
                         }
@@ -702,14 +873,14 @@ mod tests {
                         }
                     }
                 }
-                pipes.close(&prod).unwrap();
+                pipes.close(litebox, &prod).unwrap();
                 assert_eq!(i, data.len());
             });
 
             let mut buf = [0; 10];
             let mut i = 0;
             loop {
-                match pipes.read(&WaitState::new(platform).context(), &cons, &mut buf[i..]) {
+                match pipes.read(litebox, &WaitState::new(platform).context(), &cons, &mut buf[i..]) {
                     Ok(n) => {
                         if n == 0 {
                             break;
@@ -725,7 +896,7 @@ mod tests {
                     }
                 }
             }
-            pipes.close(&cons).unwrap();
+            pipes.close(litebox, &cons).unwrap();
             assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
     }

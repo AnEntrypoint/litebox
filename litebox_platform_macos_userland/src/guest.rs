@@ -42,6 +42,12 @@ use litebox_common_linux::PtRegs;
 
 /// Runs a guest thread with the given shim and initial context.
 ///
+/// Reached two ways: [`crate::run_thread`] for a guest program's initial
+/// (`execve`-time) thread, and this platform's
+/// [`litebox::platform::ThreadProvider::spawn_thread`] for every later
+/// `clone()`-created one. Both have already registered a
+/// `crate::ThreadHandle` for the calling thread by this point.
+///
 /// See the module documentation for what remains before this can transfer
 /// control to the guest.
 pub(crate) fn run_thread(
@@ -50,7 +56,7 @@ pub(crate) fn run_thread(
 ) {
     litebox_util_log::error!(
         "guest entry is not yet implemented for macOS on aarch64; the thread will exit without \
-         running guest code. See the litebox_platform_macos_userland::guest module docs."
+         running guest code. See docs/macos.md's \"Remaining work\" section."
     );
 }
 

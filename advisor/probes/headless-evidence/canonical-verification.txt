@@ -1,0 +1,30 @@
+STAGE_DBUS
+STAGE_SEATD
+STAGE_WESTON
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+STAGE_XWAYLAND
+STAGE_XFCONFD
+STAGE_XCHECK
+(process:37): GLib-GIO-WARNING **: 08:29:45.905: Failed to create file monitor for /root/.config/glib-2.0/settings/keyfile: Unable to find default local file monitor

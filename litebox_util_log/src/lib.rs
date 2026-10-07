@@ -97,6 +97,9 @@ pub use backend_log::SpanGuard;
 #[cfg(feature = "backend_tracing")]
 pub use backend_tracing::SpanGuard;
 
+#[cfg(feature = "tracing_subscriber_init")]
+pub use backend_tracing::init_env_filtered_subscriber;
+
 /// Converts a [`log::Record`] into the compact host-console format.
 ///
 /// Formats the record as `[LEVEL] message key=value ...\n` into `writer`.
@@ -142,4 +145,54 @@ pub mod __private {
     pub use tracing;
     #[cfg(feature = "backend_tracing")]
     pub use tracing::Level;
+}
+
+/// Registers the function used to enter (`true`) / leave (`false`) a scope in which the calling
+/// thread must allocate from private (non-shared) memory. The runner sets this when its global
+/// allocator can place heap data in memory shared between forked guest processes; unset (the
+/// default) it does nothing. See [`PrivateAllocGuard`].
+pub fn set_private_alloc_hook(hook: fn(bool)) {
+    PRIVATE_ALLOC_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+static PRIVATE_ALLOC_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// While alive, the calling thread's heap allocations come from private memory.
+///
+/// Wrap any code that grows a `static` (or `thread_local!`) collection: with kernel state shared
+/// across a native `fork()`, such a collection's nodes would otherwise be reachable from BOTH the
+/// parent's and the child's copy of the static, and each process would then mutate the other's
+/// nodes.
+pub struct PrivateAllocGuard(());
+
+impl PrivateAllocGuard {
+    /// Enters a private-allocation scope.
+    #[must_use]
+    pub fn new() -> Self {
+        let f = PRIVATE_ALLOC_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if f != 0 {
+            // SAFETY: only `set_private_alloc_hook` stores here, always a valid `fn(bool)`.
+            let hook: fn(bool) = unsafe { core::mem::transmute::<usize, fn(bool)>(f) };
+            hook(true);
+        }
+        Self(())
+    }
+}
+
+impl Default for PrivateAllocGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PrivateAllocGuard {
+    fn drop(&mut self) {
+        let f = PRIVATE_ALLOC_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if f != 0 {
+            // SAFETY: as in `new`.
+            let hook: fn(bool) = unsafe { core::mem::transmute::<usize, fn(bool)>(f) };
+            hook(false);
+        }
+    }
 }

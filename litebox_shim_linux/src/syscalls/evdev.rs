@@ -32,10 +32,30 @@
 
 use alloc::collections::VecDeque;
 
+use litebox::event::Events;
+use litebox::event::polling::Pollee;
 use litebox_common_linux::{EV_SYN, InputEvent, SYN_REPORT};
 use zerocopy::IntoBytes;
 
 use crate::ShimPlatform;
+
+/// Whether per-`SYN_REPORT` input tracing is enabled (set from `LITEBOX_INPUT_TRACE=1` by
+/// the runner, since this `no_std` crate cannot read the environment itself).
+///
+/// Off by default, same reasoning as `drm::drm_trace_enabled`: mouse motion arrives at
+/// pointer-sample rate, so an ungated log floods a real session. Turn it on to answer "how many
+/// `SYN_REPORT`s does one physical mouse move actually produce" -- the question
+/// `evdev-emits-two-syn-reports-per-mouse-move` needed a live, counted answer to.
+pub(crate) fn input_trace_enabled() -> bool {
+    INPUT_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set once by the runner to turn evdev `SYN_REPORT` tracing on.
+pub fn set_input_trace(enabled: bool) {
+    INPUT_TRACE.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+static INPUT_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Bound on how many not-yet-`read()` events this device holds before the oldest is dropped --
 /// a real evdev device's kernel-side ring buffer is similarly bounded (`EVDEV_BUFFER_SIZE`,
@@ -48,13 +68,32 @@ const MAX_QUEUED_EVENTS: usize = 256;
 /// is and is not implemented in this pass.
 pub(crate) struct EvdevSubsystem<Platform: ShimPlatform> {
     pending_events: litebox::sync::Mutex<Platform, VecDeque<InputEvent>>,
+    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the evdev
+    /// fd waiting for input -- see `DrmSubsystem::flip_pollee`'s doc comment for the identical
+    /// bug shape this fixes: `EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch previously
+    /// computed on-demand readiness via `has_pending()` but never registered an observer here,
+    /// so a client that registers this fd once via `epoll_ctl` and blocks in `epoll_wait` across
+    /// many iterations (rather than re-polling synchronously after every event) would never wake
+    /// for the second and later queued input events.
+    pollee: Pollee<Platform>,
 }
 
 impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             pending_events: litebox::sync::Mutex::new(VecDeque::new()),
+            pollee: Pollee::new(),
         }
+    }
+
+    /// Register an observer for evdev fd readiness -- see [`Self::pollee`]'s doc comment. Called
+    /// from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch, exactly
+    /// where every other pollable fd kind (e.g. eventfd) registers its own observer.
+    pub(crate) fn register_observer(
+        &self,
+        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
+    ) {
+        self.pollee.register_observer(observer, Events::IN);
     }
 
     /// Push one real event into the queue, followed by a `SYN_REPORT` (real evdev clients expect
@@ -64,11 +103,37 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     /// [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer's overflow behavior (newest
     /// events win, not silently refused).
     fn push(&self, event: InputEvent) {
-        let mut events = self.pending_events.lock();
-        if events.len() >= MAX_QUEUED_EVENTS {
-            events.pop_front();
+        self.push_batch(&[event]);
+    }
+
+    /// Queue N real events terminated by a SINGLE `SYN_REPORT`.
+    ///
+    /// `SYN_REPORT` is the marker an evdev client uses to decide "this input batch is complete,
+    /// act on it now". Real hardware groups everything belonging to one physical action into one
+    /// report -- a diagonal mouse movement is `REL_X, REL_Y, SYN_REPORT`, not two separate
+    /// reports. Emitting a sync after every individual event makes a compositor run its whole
+    /// pointer-motion path twice per movement, and briefly act on an X-only intermediate position
+    /// the user never pointed at.
+    ///
+    /// Drops oldest-first at [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer (newest
+    /// events win rather than being refused).
+    fn push_batch(&self, batch: &[InputEvent]) {
+        if batch.is_empty() {
+            return;
         }
-        events.push_back(event);
+        if input_trace_enabled() {
+            litebox_util_log::debug!(
+                batch_len:% = batch.len();
+                "evdev-input-trace: push_batch emitting one SYN_REPORT"
+            );
+        }
+        let mut events = self.pending_events.lock();
+        for event in batch {
+            if events.len() >= MAX_QUEUED_EVENTS {
+                events.pop_front();
+            }
+            events.push_back(*event);
+        }
         if events.len() >= MAX_QUEUED_EVENTS {
             events.pop_front();
         }
@@ -79,6 +144,8 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
             code: SYN_REPORT,
             value: 0,
         });
+        drop(events);
+        self.pollee.notify_observers(Events::IN);
     }
 
     /// Queue an `EV_KEY` event -- a keyboard key or mouse button transition. `value` is `1`
@@ -105,6 +172,36 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
             code,
             value,
         });
+    }
+
+    /// Queue one 2D relative motion as a SINGLE evdev report: `REL_X`, `REL_Y`, `SYN_REPORT`.
+    ///
+    /// This is what real mouse hardware emits for one physical movement. Sending the axes as two
+    /// separately-synced reports (which [`Self::push_rel`] called twice would do) makes a client
+    /// process the motion twice and briefly act on an X-only position that was never pointed at.
+    ///
+    /// A zero delta on an axis is omitted, matching real hardware, which does not report an axis
+    /// that did not move. If BOTH are zero nothing is queued at all -- no event, no sync.
+    pub(crate) fn push_rel_motion(&self, dx: i32, dy: i32) {
+        let mut batch: [InputEvent; 2] = [InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            r#type: litebox_common_linux::EV_REL,
+            code: 0,
+            value: 0,
+        }; 2];
+        let mut n = 0;
+        if dx != 0 {
+            batch[n].code = litebox_common_linux::REL_X;
+            batch[n].value = dx;
+            n += 1;
+        }
+        if dy != 0 {
+            batch[n].code = litebox_common_linux::REL_Y;
+            batch[n].value = dy;
+            n += 1;
+        }
+        self.push_batch(&batch[..n]);
     }
 
     /// Pop the oldest pending event, if any, encoded as the exact bytes a real `read()` on an

@@ -1,0 +1,16 @@
+     28 feature=setsockopt(level = 1, optname = 59)
+     28 feature=setsockopt(level = 1, optname = 31)
+     12 feature=unsupported syscall inotify_init1
+      8 feature=ioctl with arg Raw { cmd: 3222823994, arg: UserPtrMut(539816512) }
+      6 feature=unsupported syscall inotify_init
+      6 feature=unsupported syscall getresuid
+      4 feature=prctl(GetDumpable)
+      3 feature=unsupported syscall shmget
+      3 feature=unsupported syscall pidfd_open
+      2 feature=unsupported syscall close_range
+      2 feature=setsockopt(level = 1, optname = 26)
+      2 feature=setsockopt(level = 1, optname = 16)
+      1 feature=unsupported syscall setpriority
+      1 feature=unsupported syscall getpriority
+      1 feature=unsupported syscall get_mempolicy
+      1 feature=ioctl with arg Raw { cmd: 1074021792, arg: UserPtrMut(539815996) }

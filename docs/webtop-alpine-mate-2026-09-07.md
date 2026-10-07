@@ -1,0 +1,1264 @@
+# 2026-09-07: `linuxserver/webtop:alpine-mate` under litebox — Xvfb unblocked, dashboard served to the host, video path still blocked
+
+This session's target was the browser-facing webtop: get it working and verify it live from a
+real browser on the Windows host. **That end state was reached** -- see "RESULT" immediately
+below. The rest of this document is the investigation trail that got there, written as it went,
+so the intermediate dead ends and refutations remain visible. What follows is exactly
+what is now proven working, what is still broken, and the precise root causes found — including
+one fix attempt that was made and then reverted, and why.
+
+Companion doc: `webtop-debian-selkies-2026-09-06.md` covers the **debian-i3** image. This one is
+the **alpine-mate** image (`.wfgy/webtop_seatd_realigned.tar`). They are different binaries on
+different libcs; conclusions do not transfer automatically, and at least one previously-recorded
+blocker turned out not to apply here at all (see "Refuted" below).
+
+## The image's real launch recipe (read out of the image, not guessed)
+
+`s6-overlay` is bypassed, per this project's standing rule. The authoritative commands come from
+the image's own service definitions:
+
+- **`svc-xorg` runs `Xvfb`, not `Xorg`.** Despite the name. `/usr/bin/Xorg` is a 275-byte `sh`
+  wrapper no service ever invokes. Xvfb's argv is taken verbatim from
+  `/etc/s6-overlay/s6-rc.d/svc-xorg/run`.
+- **The web server is nginx**, serving the static dashboard on **port 3000** and proxying
+  `/websocket` to selkies on **127.0.0.1:8082**.
+- **selkies is pure Python** (`/lsiopy/bin/selkies`, a venv console script on CPython 3.14.7).
+  There is no Node.js in this image at all; `node` only appears under `DEV_MODE`, which must not
+  be set.
+- **The desktop is MATE**, started as `dbus-launch --exit-with-session /usr/bin/mate-session`.
+- Required env: `DISPLAY=:1`, `HOME=/config`, `USER=abc`, `XDG_RUNTIME_DIR=/config/.XDG`,
+  `PATH` including `/lsiopy/bin`, and **`CUSTOM_WS_PORT=8082`** — selkies' own default is 8081
+  (`selkies/settings.py`), while nginx proxies to 8082, so bypassing s6 without setting this
+  yields a 502 that reads like a 404.
+
+A reproducible overlay generator (nginx config, directories, staged launch script) is committed
+at `advisor/probes/make_webtop_overlay.py`. It writes `.wfgy/webtop_overlay.tar`, used via
+`--resume-from`. `STACK_STAGE=1..4` adds Xvfb / nginx / selkies / MATE one at a time, which is
+how every attribution below was made.
+
+## Proven working, live
+
+- **Xvfb runs and stays up.** `xset q` succeeds against `:1`. This required the `fork()` fix
+  below; before it, Xvfb died every time.
+- **nginx serves the real selkies dashboard to the Windows host** through `--publish 3000:3000`:
+  HTTP **200**, 762 bytes of the genuine dashboard `index.html`, repeatable, and correct under
+  four concurrent requests and across a keep-alive session.
+
+## Fixed this session
+
+1. **`fork()` failed with ENOMEM because an out-of-range address *hint* was rejected outright.**
+   `insert_mapping` (`litebox/src/mm/linux.rs`) refused any suggested range ending past
+   `TASK_ADDR_MAX`, including for `FixedAddressBehavior::Hint`, which documents itself as a hint
+   the platform may ignore — and which the rest of that function already treats that way.
+   `Vmem::duplicate` sizes each fork group to include `reserved_extra` headroom, so a parent
+   whose topmost group sits near the top of the address space produced a span ending just past
+   the limit: measured live at 1,055,973,376 bytes overshooting by exactly 20,480 bytes, while
+   ~128 TiB sat free. An out-of-range hint now slides down instead of failing.
+
+   **This is the failure `webtop-debian-selkies-2026-09-06.md` calls "the single blocking item".**
+   It recorded the resulting ENOMEM as "the same well-known, already-documented
+   address-space-duplication hazard class" and did not trace it. It was not that hazard; it was
+   an ordinary bounds bug. With it fixed, Xvfb forks `xkbcomp`, the keymap compiles, and the X
+   server stays up.
+
+2. **The host-wide `boot.lock` was leaked by every clean run.** Its release lived in a `Drop`
+   impl, but `run()` exits via `std::process::exit`/`ExitProcess`, which runs no destructors —
+   a fact `main.rs`'s own comment already recorded. Every successful run therefore blocked the
+   next boot for the full five-minute staleness window. The lock is now the lockfile's own held
+   OS handle, which Windows releases on every exit path including a hard kill.
+
+## Refuted
+
+**The Xvfb pid-1 SIGSEGV recorded in mutable `webtop-xvfb-crash-not-relro` does not occur on this
+image.** That investigation (cr2 at `reserve_base+0x200`, `rip` inside `ld.so`) was against the
+**Debian/glibc** Xvfb. The alpine/musl Xvfb never reaches a fault: with the image's own `-shmem`
+flag it exits *cleanly*, self-diagnosed —
+
+```
+shmget: Function not implemented
+(EE) Couldn't add screen 0
+```
+
+— because **litebox implements no SysV shared memory at all** (`shmget`/`shmat`/`shmdt`/`shmctl`
+have zero references anywhere in `litebox_shim_linux`). Dropping `-shmem` lets Xvfb allocate its
+framebuffer normally and it starts. Whether selkies' capture path ultimately needs real SysV shm
+(and therefore MIT-SHM) is open and untested, because selkies does not get that far.
+
+## Still blocked, with root causes
+
+### 1. `import pixelflux` SIGSEGVs — this is what stops the video path
+
+Isolated to a 30-second repro, no full stack needed:
+
+```
+python3 -c "print(42)"      -> 42            (CPython 3.14.7 itself is fine)
+python3 -c "import selkies" -> ok            (pure-Python package is fine)
+python3 -c "import pixelflux" -> Segmentation fault (139)
+python3 -c "import pcmflux"   -> Segmentation fault (139)
+```
+
+`pixelflux`/`pcmflux` are selkies' native capture/encode extensions. With `LITEBOX_LOG=error`
+the cause is explicit:
+
+```
+diag-reclaim: failed to recommit orphaned CoW-view flank as anonymous memory
+              -- left MEM_FREE, next touch will SIGSEGV  win32_err=487
+```
+
+then a guest read of a page inside that freed range.
+
+**Root cause: `win32_err=487` is `ERROR_INVALID_ADDRESS`, and it is an alignment failure.** The
+flank recommit in `litebox_platform_windows_userland/src/lib.rs` calls `VirtualAlloc2(...,
+MEM_RESERVE | MEM_COMMIT, ...)` at the flank's own base. `MEM_RESERVE` requires an
+**allocation-granularity-aligned (64 KiB)** base, but a flank boundary is only ever page-aligned
+— it is wherever the caller's sub-range happens to begin or end. All three flanks observed in one
+run were page-aligned and none was granularity-aligned (`0xA57000`, `0xAB1000`, `0xB6B000`), so
+the reservation failed every time and the flank was left `MEM_FREE`, exactly as the log says.
+
+A **second latent defect** sits behind it: the call passes `view_mbi.Protect`, which for a CoW
+view is `PAGE_WRITECOPY`/`PAGE_EXECUTE_WRITECOPY` — not a legal protection for *private*
+anonymous memory. It needs mapping down to `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE`, or the
+commit fails even once the address is accepted.
+
+**A fix was attempted and REVERTED.** The obvious approach — reserve the whole former view once,
+then `MEM_COMMIT` each piece inside it — panicked in `do_query_on_region` ("The handle is
+invalid", os error 6). The reason is instructive and is now recorded as a comment at the site:
+`view_mbi.BaseAddress` is **not** the view's allocation base. `VirtualQuery` reports the base of
+the contiguous *same-attribute* page range, which can begin mid-view, so bounds derived from it
+are themselves unaligned and a single "whole view" reservation is no more legal than the
+per-flank ones. **A correct fix must use the real allocation base** (`view_mbi.AllocationBase`,
+or track each view's base at map time) and reserve from there. The tree is left at the original
+behaviour plus that explanation; no half-fix is in place.
+
+### 2. MATE trips the `fork_verify` host-side access violation
+
+`dbus-launch --exit-with-session mate-session` reproduces
+`[diag-unrecov-av] ... is_in_guest=false is_verifying=true`. Both flags together mean the fault
+is in litebox's **own host-side code**, inside the fork-verify stale-pointer healing path — not
+in guest code. This matches the existing PRD row
+`mate-session-avs-are-in-fork-verify-not-guest` and is unchanged by this session's fork fix,
+which addressed allocation, not verification. A daemonizing nginx reproduces the same fault,
+which is why the committed nginx config sets `master_process off`.
+
+### 3. Chrome cannot reach `localhost` on this host — verification gap, not a litebox bug
+
+Isolated by direct construction:
+
+| target | PowerShell | Chrome (claude-in-chrome) |
+|---|---|---|
+| litebox webtop, `127.0.0.1:3000` | 200 | error page |
+| plain host Python server, `127.0.0.1:8099` | 200 | error page |
+| `https://example.com` | — | renders fine |
+
+Chrome fails on a **host-native** server just as it fails on litebox's published port, and
+succeeds on an external site. So this is a Chrome/extension localhost restriction, entirely
+independent of litebox, and it is the reason no browser screenshot of the dashboard exists in
+this session despite the dashboard being served correctly.
+
+## Lying instruments found (each cost real time here)
+
+Consistent with this project's recurring theme, four diagnostics reported nothing or something
+false:
+
+1. **`xdpyinfo` is not in this image.** Using it as the Xvfb readiness probe reported a perfectly
+   healthy X server as `XVFB_FAILED`. `xset` is present and is the correct probe.
+2. **`netstat` reports nothing** because litebox does not emulate `/proc/net/tcp`; it prints
+   headers and an error, so "no listeners" was meaningless.
+3. **Python block-buffers stdout when not a tty**, so `selkies.log` was empty for 25 s of a live
+   run. `PYTHONUNBUFFERED=1` is required to see anything.
+4. **A shell pipeline hides the exit code of the command that matters.** `cargo build ... | tail`
+   reported success while `cargo` was in fact not on `PATH` at all. Use `${PIPESTATUS[0]}`.
+
+Separately, a parallel review lane established that on Windows the `error_code` in guest-fault
+diagnostics is **synthesized, not hardware** (`4 | (write << 1)`, with present-bit hardcoded to
+0), so its not-present half is fabricated. On the fork-verify path it is synthesized twice, from
+litebox's own `is_write` guess. Several open mutables reason from that field; their conclusions
+need other evidence.
+
+## Environment note
+
+`C:\\Users\\user\\.cargo` was missing entirely this session (no shim, no registry cache) while
+`.rustup` was intact, so `cargo` was not on `PATH`. Builds were run through the toolchain binary
+directly:
+
+```
+CARGO_HOME=C:\\Users\\user\\.cargo RUSTUP_HOME=C:\\Users\\user\\.rustup \\
+  ~/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe build --release -p <crate>
+```
+
+Also: an orphaned no-argument `litebox_runner` process (a fault-watchdog child that outlived its
+parent) held an exclusive lock on the runner `.exe` and made every rebuild fail with "Access is
+denied (os error 5)". Worth checking for before blaming the build.
+
+## Second and third fix attempts on the flank bug — also reverted, but they narrowed it a lot
+
+After the first attempt (above), two further attempts were made and reverted. They are worth
+recording because they convert "the flank recommit is misaligned" into a much sharper statement
+of what the real obstacle is.
+
+**Attempt 2 — recover the view's true extent, then reserve it once.** `view_mbi.AllocationBase`
+*is* the view's own base and *is* allocation-granularity aligned; the view's true end can be
+recovered by walking `VirtualQuery` forward from it while `AllocationBase` keeps matching. That
+part worked and is the right technique. It also fixes a second, previously-unnoticed defect in
+the existing code: the flanks were computed from `BaseAddress`/`RegionSize`, i.e. only the
+maximal same-attribute run, so for a multi-segment view the flanks *under-reported* the destroyed
+area and some orphaned bytes had nothing even attempting to restore them.
+
+**It still panicked**, and the reason is the real finding:
+
+```
+diag-region-op-fail: operation failed on region start=0xAC6000 end=0xAC7000
+                     mbi_state=MEM_FREE last_error=487
+panicked at lib.rs:6102: operation failed on region 0xAC6000-0xAC7000
+```
+
+with a backtrace through `allocate_pages <- insert_mapping <- create_mapping <- create_pages <-
+do_mmap` — i.e. an ordinary later guest `mmap`. `0xAC6000` is exactly the END of a flank that had
+just been restored successfully.
+
+**Restoring a flank correctly BREAKS the next allocation that rounds into the same 64 KiB
+granule.** `reserve_and_commit` rounds its `MEM_RESERVE` *out* to allocation granularity
+(`round_down_to_granu(start) .. round_up_to_granu(end)`), which is what makes it work for
+arbitrary page-aligned addresses in the first place. Once a flank occupies part of that granule,
+the rounded reservation overlaps it, Windows refuses with `ERROR_INVALID_ADDRESS` (487), the
+operation returns false, and `process_memory_range_by_regions` asserts. So the pre-existing
+behaviour — the flank silently failing to be restored and staying `MEM_FREE` — is precisely what
+was keeping subsequent allocations working. The latent SIGSEGV and the panic are two faces of the
+same missing design.
+
+**Attempt 3 — let `reserve_and_commit` tolerate an already-reserved granule** (on a failed
+`MEM_RESERVE` at an explicit address, fall through and try `MEM_COMMIT` anyway, on the theory
+that the space is already ours). Insufficient: the commit fails too, because the granule is only
+*partly* covered by the flank reservation, so the remainder is genuinely `MEM_FREE` and there is
+nothing to commit into.
+
+### What a correct fix therefore has to do
+
+Not a local patch to the recommit call. The allocator needs reservation bookkeeping that these
+two paths share, so that "this granule is already reserved, and here is how much of it" is a
+question with an answer — either by tracking reservations explicitly, or by making
+`reserve_and_commit` reserve *only* the granule remainder it actually needs rather than the whole
+rounded-out span. Until then, restoring flanks and keeping later `mmap`s working are mutually
+exclusive in this code.
+
+The tree is left at the original behaviour, verified like-for-like after the revert:
+`import pixelflux` SIGSEGVs (139), the runner exits 0, and **zero** panics; Xvfb still comes up.
+
+### One more pre-existing bug found while doing this
+
+Running `python3` **directly as pid 1** (`runner ... -- /lsiopy/bin/python3 -c "import
+pixelflux"`) panics at HEAD with exit 101, where the same command wrapped in `/bin/sh -c` gives a
+clean guest-side SIGSEGV and a 0 exit. That difference is present without any of this session's
+changes and is not explained here — but it means the harness shape changes the failure mode, so
+compare like with like when measuring this area (this project's own standing
+"isolate the harness" lesson, in a new place).
+
+## RESOLVED: the CoW path was the cause, and it is now off by default
+
+The flank work above eventually paid off, but the shipped fix is simpler than the flank repair
+itself.
+
+**Fourth attempt at the flank fix worked.** Two pieces were both required, and each is useless
+without the other:
+
+1. Recover the view's true extent from `AllocationBase` (granularity-aligned, unlike
+   `BaseAddress`) by walking `VirtualQuery` forward while `AllocationBase` matches, then reserve
+   the whole former view in ONE call -- **with its end rounded UP to allocation granularity**.
+   That round-up is the piece attempts 2 and 3 were missing: leaving the reservation at the
+   view's exact end strands the remainder of the final granule as free-but-unreservable, so the
+   next `mmap` landing there can neither reserve it (our reservation already occupies the
+   granule) nor commit into it (that tail was never reserved).
+2. Let `reserve_and_commit` fall through to `MEM_COMMIT` when its `MEM_RESERVE` fails with
+   `ERROR_INVALID_ADDRESS` at an explicit address, since the granule may already be reserved by
+   the whole-view reservation above.
+
+With both, `import pixelflux` stopped SIGSEGVing and produced an honest Python error instead:
+`ImportError: Error relocating .../libplacebo-...so.338: dovi_rpu_get_header: symbol not found`
+-- with `libdovi-867af97d.so.3.3.1` present and correct in the very same directory. Memory-safe,
+but the flanks are restored as ZERO-FILL, and for a shared library the lost bytes are real
+content. The symbol was missing because the pages holding it had been zeroed.
+
+**So the flank repair converts a crash into silent data loss.** That is strictly better, and it
+is as far as this approach can go: reconstructing a flank as an equivalent CoW mapping needs
+guest-address -> file/offset tracking that does not exist anywhere in this codebase (`VmArea`
+records only `is_file_backed: bool`).
+
+**Decisive A/B.** Bypassing `try_cow_mmap_file` entirely:
+
+```
+CoW enabled  -> import pixelflux: ImportError (symbol not found);  import pcmflux: SIGSEGV
+CoW disabled -> import pixelflux: PX_OK (rc 0);                    import pcmflux: PC_OK (rc 0)
+```
+
+**Shipped fix: `LITEBOX_COW_MMAP`, defaulting OFF.** The CoW fast path is now opt-in. Two
+independent reasons, both measured rather than argued:
+
+- It is **incorrect** here, per the above.
+- It is **not buying anything**. AGENTS.md's own "Windows CoW-mmap performance" section already
+  records the optimisation as having "zero practical effect" on real tar-packed execs, because
+  `MapViewOfFile3` needs 64 KiB file-offset alignment while real ELF `PT_LOAD` offsets are only
+  page-aligned. It succeeds mainly on deliberately realignment-padded images -- precisely where
+  it now does damage.
+
+The flank fix is kept, because it is a genuine correctness improvement for anyone who opts back
+in with `LITEBOX_COW_MMAP=1` to continue the alignment/CoW investigation the open PRD rows
+describe.
+
+### With CoW off, selkies runs
+
+`selkies.log` reaches, in full:
+
+```
+INFO:data_websocket:pcmflux library found. Audio capture is available.
+INFO:data_websocket:pixelflux library found. Striped encoding modes available.
+INFO:main:SelkiesStreamingApp initialized: encoder=x264enc, display=1024x768
+INFO:main:All main components initialized. Running server...
+'port': 8082
+```
+
+and it goes on to spawn its real `xdotool`/`xclip` helper processes. A TCP connect to the
+published 8082 from the host succeeds, so the listener is genuinely up.
+
+### A second packaging bug found on the way: empty-file dedup corrupts the image
+
+`webtop_seatd_realigned.tar` deduplicates content-identical files into symlinks. That includes
+**zero-byte** files, so every empty file in the image was symlinked to an arbitrary other empty
+file. Concretely:
+
+```
+/usr/lib/python3.14/urllib/__init__.py -> /lib/apk/db/lock
+```
+
+which made `import urllib.parse` fail with `PermissionError: [Errno 13]`, killing selkies before
+it started. Use `C:\dev\litebox-webtop\webtop_seatd.tar` (not deduplicated) instead. With CoW
+off, the realigned tar's alignment padding buys nothing anyway. **The packager's dedup pass must
+exclude zero-length files** -- they are "content-identical" to each other only vacuously.
+
+## The remaining blocker: guest loopback is not shared between guest processes
+
+With everything above, the dashboard serves and selkies runs, but the browser still shows
+`WebSocket disconnected`. The console gives the exact reason:
+
+```
+WebSocket connection to 'ws://127.0.0.1:3000/websockets' failed:
+  Error during WebSocket handshake: Unexpected response code: 502
+```
+
+502 means nginx could not reach selkies at `127.0.0.1:8082`. Evidence that this is a
+cross-process loopback gap, not a NAT or nginx bug:
+
+- From the HOST, through `--publish`, nginx serves `/` with HTTP 200 reliably, including under
+  four concurrent requests and across a keep-alive session.
+- From the HOST, a TCP connect to a published 8082 reaches selkies' listener fine.
+- From INSIDE the guest, `wget http://127.0.0.1:3000/` fails every single time (`HTTP_LOCAL_FAIL`
+  in every staged run in this document), even though that is the very nginx that answers the host
+  correctly.
+- The previous session's control test -- nginx proxying to a second `server` block **inside the
+  same nginx process** -- succeeded. That is intra-process loopback.
+
+Taken together: loopback works within one guest process and not between two. That is consistent
+with `litebox/src/net/mod.rs`'s own structure, where the `LocalPortAllocator` is an
+"independent RNG-seeded instance per-`Network`" -- each guest process gets its own network stack,
+so one process's `127.0.0.1` listener is simply not in another process's namespace.
+
+**Do not re-investigate `net.rs`'s NAT path for this.** The previous session cleared it by direct
+construction and this session's host-side 200s corroborate that independently. The gap is that
+guest processes do not share a loopback namespace.
+
+Binding selkies to `0.0.0.0` and proxying to the guest's own `10.0.0.2` was tried and is NOT a
+workaround: it stopped nginx serving the host correctly as well.
+
+**Measurement caveat for whoever picks this up:** by the end of this session free host memory had
+fallen from 6.6 GB to 1.67 GB (runner ~1.5 GB + Chrome ~1.5 GB + editors), and at that point every
+run began timing out including configurations that had been reliable minutes earlier. That is the
+host-exhaustion condition AGENTS.md already warns not to misattribute to litebox. Check
+`FreePhysicalMemory` before trusting any timing or hang observed in this area.
+
+## BROWSER-VERIFIED: the WebSocket control plane works end to end; video is blocked on one abort
+
+Routing the reverse proxy to the HOST removes the only hop that needed guest-internal
+networking, and with that the stack is verifiable from a real browser. `advisor/probes/hostproxy.py`
+serves the dashboard's static files and tunnels `/websockets` straight to selkies via its
+`--publish`ed port. Everything that makes the desktop -- Xvfb, xterm, selkies, pixelflux/pcmflux
+-- still runs entirely inside litebox; only the reverse proxy moved, and litebox's own `--publish`
+is already a host-side NAT.
+
+**Verified live in Chrome** (`http://127.0.0.1:8090/`), from the browser console:
+
+```
+[websockets] Connection opened!
+[websockets] Sent initial settings (resolutions are physical) to server
+[websockets] Sent initial clipboard request (cr) to server.
+[websockets] Started sending client metrics every 500ms.
+[websockets] Started sending backpressure ACKs every 50ms.
+Initializing Input system...
+```
+
+and server-side:
+
+```
+INFO:data_websocket:Data WebSocket Server listening on port 8082
+INFO:data_websocket:Legacy client ('10.0.0.1', 49158) connected. Role: controller
+INFO:data_websocket:Data WebSocket connected from ('10.0.0.1', 49158)
+```
+
+The client renders its cursor and reaches **"Waiting for stream..."** -- the correct client-side
+rendering of "connected, no frames yet". So the dashboard, the WebSocket upgrade, the control
+plane, the metrics/backpressure loop and the input system all work through litebox.
+
+### The one remaining blocker: PulseAudio aborts selkies the instant a client connects
+
+```
+INFO:data_websocket:Sending last known cursor to new client
+INFO:data_websocket:Attempting to establish PulseAudio connection...
+Assertion 'r == 0 || r == 95' failed at ../src/pulsecore/mutex-posix.c:57,
+  function pa_mutex_new(). Aborting.
+```
+
+selkies dies there, before any frame is captured. That is why the client sits at "Waiting for
+stream...".
+
+`95` is `ENOTSUP`. `pa_mutex_new` tolerates only success or `ENOTSUP` and aborts the whole
+process on any other errno.
+
+**Disabling audio does not avoid it.** `--audio-enabled=false --microphone-enabled=false
+--clipboard-enabled=false` (and the matching `SELKIES_*` env vars) were all tried; the
+"Attempting to establish PulseAudio connection..." line still runs on client connect, so this
+path is not gated by those settings.
+
+**Root-caused by direct measurement, and fixed.** No compiler is needed to settle this: Python's
+`ctypes` can call the pthread functions directly in-guest, which pins the value exactly.
+
+```
+python3 -c "import ctypes; libc=ctypes.CDLL(None); ...
+            libc.pthread_mutexattr_setprotocol(a, proto)"
+
+   proto 0 (PRIO_NONE)     setprotocol -> 0
+   proto 1 (PRIO_INHERIT)  setprotocol -> 22   <-- EINVAL, and PulseAudio aborts on it
+   proto 2 (PRIO_PROTECT)  setprotocol -> 95   (ENOTSUP, from musl itself)
+```
+
+`pa_mutex_new` asserts `r == 0 || r == ENOTSUP` on exactly the `PRIO_INHERIT` call, so 22 kills
+the process. musl gets that 22 from litebox: it probes support by issuing `futex(FUTEX_LOCK_PI)`,
+and `parse_futex` rejected every unknown futex op with `EINVAL`.
+
+Re-running the probe against each candidate errno showed the guest-visible value tracks this
+syscall's errno one-for-one (`EINVAL 22 -> 22`, `ENOSYS 38 -> 38`, `ENOTSUP 95 -> 95`) -- this
+musl reports the probe's errno straight through rather than mapping it. So the fix is to return
+**`ENOTSUP`/`EOPNOTSUPP` (95)** for the six priority-inheritance futex ops (6, 7, 8, 11, 12, 13).
+That is also the accurate errno on its own terms: `ENOSYS` means "syscall not implemented", but
+`futex` *is* implemented -- just not these operations.
+
+**Verified:** with the change, `setprotocol(PRIO_INHERIT)` returns 95, the value PulseAudio
+accepts.
+
+This is the same errno-contract class AGENTS.md already records, where a `clone()` namespace-flag
+`EINVAL` silently broke all PNG/JPEG decoding through glycin's sandbox fallback. Getting a
+refusal errno wrong breaks unrelated features.
+
+**Still to confirm end to end:** that selkies now survives the PulseAudio connect and streams
+frames to the browser. The syscall-level fix is measured, but the full-stack confirmation was not
+obtained, because by this point free host memory had fallen to ~1.3 GB (from 6.6 GB at session
+start) and every run became unreliable regardless of code -- see the measurement caveat below.
+Re-run the stack with more free memory; the remaining path is short.
+
+If it does turn out to be an errno-contract bug, note that it is the SAME class AGENTS.md already
+records: a `clone()` namespace-flag `EINVAL` once silently broke all PNG/JPEG decoding through
+glycin's sandbox fallback. Getting a refusal errno wrong breaks unrelated features.
+
+## Final state: everything up to the encoder works; frames blocked on the fork_verify AV
+
+With the PulseAudio abort fixed, the chain was walked all the way to selkies' capture path, and
+the remaining blocker is unambiguous.
+
+### A trimmed rootfs, because host memory decides whether a run completes at all
+
+`advisor/probes/make_webtop_min_rootfs.py` cuts the 2.4 GiB payload to **1.1 GiB** by dropping
+Chromium, mesa's Vulkan drivers, the Docker/containerd/cmake toolchain, and locale/icon/theme/
+wallpaper data -- none of which this stack reaches. With it, a full stack comes up in ~50 s
+instead of timing out. Two things must NOT be dropped, both learned by breaking them:
+
+* **libgallium + libLLVM + /usr/lib/dri.** Xvfb links `libGL` even when started without GLX, and
+  `libGL` needs gallium, which needs LLVM. Removing them fails Xvfb at load.
+* **GNU tar long-name headers.** Writing the trimmed archive with Python's default
+  `GNU_FORMAT` produced files that were present in the archive but *unresolvable at runtime*:
+  `Error loading shared library libglslang-default-resource-limits-24bc816e.so.15.2.0 ... (needed
+  by libplacebo-...so)`, for a file the archive demonstrably contained at the right path and size.
+  GNU format stores an over-long name (>100 chars) in a separate `././@LongLink` header, and
+  **litebox's tar reader does not implement that extension** -- it sees a truncated name. Writing
+  `USTAR_FORMAT`, which splits long names across the `prefix`/`name` fields, fixes it completely.
+  That is a real, previously-unrecorded litebox gap in its own right: any GNU-format tar with
+  paths over 100 characters will silently lose those files.
+
+### Three more litebox gaps found on the way
+
+* **`waitid` is unimplemented** (`OSError: [Errno 38]`). CPython's asyncio uses it to reap
+  subprocesses, so `proc.communicate()` never completes; selkies' clipboard monitor then times out
+  after 1 s and retries forever, which floods the log and starves the process. `--clipboard-enabled=false`
+  avoids it; implementing `waitid` is the real fix.
+* **`--resume-from` cannot shadow a path that already exists in the base layer.** A patched
+  `selkies/display_utils.py` placed in the overlay was simply not seen -- the guest kept executing
+  the base-layer version. The previous session recorded this for symlinks; it holds for ordinary
+  regular files too. The workaround used here is a `PYTHONPATH=/patch` `sitecustomize.py` at a
+  path with no base-layer counterpart.
+* **`/proc/stat` is absent**, so psutil's system monitor raises. Non-fatal.
+
+### The blocker: every subprocess spawn is a dice roll on the fork_verify AV
+
+`[diag-unrecov-av] ... is_in_guest=false is_verifying=true` -- litebox's own host-side code
+faulting inside the fork-verify stale-pointer healing path. It was hit at three independent
+points, and removing each one only moved the failure to the next:
+
+1. **PulseAudio autospawn.** `pulsectl.Pulse(...)` connects with `autospawn=True`, which forks to
+   start a daemon. Avoided with `PULSE_SERVER=unix:/nonexistent/pulse.sock`, after which the
+   connection fails cleanly and selkies continues.
+2. **DPI application on client connect.** selkies probes for a DE session binary and shells out to
+   xrdb/gsettings/xfconf-query. Removing those binaries is NOT sufficient -- the "generic xrdb
+   fallback" still forks before failing to exec. Neutralised via the `sitecustomize` shim.
+3. **Clipboard.** `xclip` spawned once a second, forever (see `waitid` above).
+
+Each fix got further; none removed the class. The AV is non-deterministic -- the same
+configuration reached "PulseAudio connection failed" cleanly on one run and AV'd on the next --
+which matches this bug's long-recorded character.
+
+**So the honest statement is:** the webtop's dashboard, WebSocket upgrade, control plane, input
+system, gamepad/evdev interposers and selkies' own encoder initialisation all work under litebox
+and are browser-verified. Video frames do not flow because selkies cannot survive long enough to
+start capturing, and what kills it is the pre-existing `fork_verify` host-side access violation on
+subprocess spawn -- the same architectural gap
+`webtop-debian-selkies-2026-09-06.md` identifies as the single blocking item, and which
+`ADVISORY-001` argues the in-process relocated-copy fork cannot be made correct for.
+
+Fixing that -- Track B's genuine cross-process child spawning, per `ADVISORY-002-d-zero-fork.md`
+section 6 -- is what stands between this project and a live desktop in the browser. Everything
+else on the path is now done and verified.
+
+### Three-way A/B of every available fork mode -- all three break, differently
+
+Run against the same stack, same binary, one variable changed each time. This is the clearest
+statement of the blocker, and it is measured rather than argued:
+
+| mode | result |
+|---|---|
+| **default** (fork_verify healing ON) | `[diag-unrecov-av] is_in_guest=false is_verifying=true` -- litebox's OWN host-side code faults inside the healing path. Non-deterministic: the same config survived one run and died the next. |
+| **`LITEBOX_FORKVERIFY_OFF=1`** | **Zero host AVs** -- the crash genuinely disappears. But the forked child then runs with unhealed stale pointers and dies guest-side instead: `[diag-ud-entry] ... raw_code=0xc0000096`, `Illegal instruction`, `Segmentation fault`, and Xvfb never comes up (`XVFB_FAIL`). |
+| **`LITEBOX_PROCESS_FORK=1`** (Track B, cross-process) | Immediate `[diag-unrecov-av-terminate]`, before Xvfb starts. Matches this repo's own code comments recording prior `LITEBOX_PROCESS_FORK=1` runs crashing on this host. |
+
+The second row is the important one: it shows the healing pass is **load-bearing**, not merely
+defensive -- turning it off does not reveal a working fork underneath, it reveals the stale
+pointers the healing exists to paper over. That is `ADVISORY-001`'s "unsound by construction"
+claim demonstrated directly rather than reasoned about, and it is why no amount of avoiding
+individual spawn sites fixes this: the class cannot be dodged, only made rarer.
+
+## `waitid` implemented -- asyncio subprocesses now work, and the host AVs go to zero
+
+Following the fork-mode A/B above, the picture changed once the *spawn sites* were removed one at
+a time rather than the fork mechanism being blamed wholesale.
+
+Neutralising the three avoidable spawn sites (via `PYTHONPATH=/patch` `sitecustomize.py`, kept at
+a path with no base-layer counterpart because `--resume-from` cannot shadow one that has one) took
+`[diag-unrecov-av]` from 122 occurrences per run to **zero**, and selkies then advanced from
+"client connected" all the way into:
+
+```
+INFO:data_websocket:Initial setup or dimensional change detected. Performing full display reconfiguration.
+INFO:data_websocket:Starting display reconfiguration...
+INFO:data_websocket:Layout calculated: Total Size=1320x816
+OSError: [Errno 38] Function not implemented          <- os.waitid
+```
+
+So the next blocker was not the fork bug at all: **`waitid` was unimplemented**. CPython's asyncio
+reaps every subprocess with `os.waitid(P_PID, pid, WEXITED | WNOWAIT)` and then a separate
+`waitpid`; without it that thread dies, `communicate()` never completes, and every asyncio
+subprocess hangs forever. That is what left the display reconfiguration unfinished -- and it is
+also why selkies' clipboard monitor respawned `xclip` once a second indefinitely.
+
+`sys_waitid` is now implemented (`litebox_shim_linux/src/syscalls/process.rs`), modelled on
+`sys_wait4` but honouring the two things that make `waitid` different: it reports through a
+`siginfo_t` rather than a packed status word, and `WNOWAIT` observes a child *without* reaping it,
+so the caller's own follow-up `waitpid` still succeeds.
+
+Verified in-guest, directly:
+
+```
+WAITID_OK 2 1 0            si_pid=2, si_code=CLD_EXITED, si_status=0
+WAITPID_AFTER 0            WNOWAIT correctly left the child reapable
+ASYNCIO_OK b'async-child'  asyncio.create_subprocess_exec + communicate() works end to end
+```
+
+and `wait4` is unregressed (exit-status propagation and `sleep 1 & wait` both still correct).
+
+## Where this actually stands
+
+Working and browser-verified: the dashboard, the WebSocket upgrade, the full control plane
+(settings, metrics, backpressure ACKs), the input system, the gamepad/evdev interposers, selkies'
+own initialisation with `pixelflux`/`pcmflux` loaded, and -- with the spawn sites neutralised --
+**zero host-side access violations**.
+
+Not yet witnessed: video frames in the browser. Not because of a known code defect any more; the
+remaining obstacle in this session was the host itself. Free memory oscillated between ~2.5 GB and
+~1.2 GB as the runner, Chrome and the editors competed, and below roughly 2 GB the guest wedges
+mid-startup in a way that is indistinguishable from a hang -- exactly the condition AGENTS.md
+warns not to misattribute to litebox. Every run that had enough memory to reach the client-connect
+stage got further than the one before it.
+
+**To finish this:** free host memory (close browsers/editors, or run on a machine with more than
+16 GB), then re-run the recipe below. The trimmed rootfs plus the fixes above are all committed;
+nothing else is known to be missing between here and a frame.
+
+## Two more real blockers found and fixed; the video pipeline's own abort is now root-caused
+
+Continuing past the `waitid` fix, selkies got far enough to reveal two further defects.
+
+### `resize_mapping` panicked on an ordinary out-of-space condition
+
+```
+thread '<unnamed>' panicked at litebox\src\mm\linux.rs:1906:22:
+internal error: entered unreachable code
+```
+
+`resize_mapping`'s in-place-expand path treated `AboveMaxAddress`/`BelowMinAddress` from
+`insert_mapping` as `unreachable!()`. They are not: `new_end` comes from the caller's requested
+size, so an `mremap`-style growth near the top of the address space reaches them normally. Real
+Linux answers that with `ENOMEM`. This turned an ordinary capacity condition into a host-side
+panic that killed the whole guest, and it fired the moment selkies grew a mapping there. Now
+reported as `OutOfMemory`; only genuine misalignment (impossible by construction here) stays
+`unreachable!()`. With it fixed, selkies reaches "All main components initialized. Running
+server..." in ~25 s with **zero** host AVs.
+
+### The video pipeline aborted because selkies' process had no `DISPLAY`
+
+This is the one that was actually stopping frames, and it took a diagnostic wrapper to see rather
+than inference:
+
+```
+[shim] get_new_res returned no screen_name; DISPLAY=None IS_WAYLAND=False
+[shim] raw xrandr rc=1 len=20: b"Can't open display 
+"
+```
+
+selkies determines its screen name by running `xrandr` and matching `(\S+) connected`
+(`selkies/selkies.py`'s `get_new_res`). With no `DISPLAY` in its environment that call returns
+"Can't open display", no screen name is found, and the pipeline aborts outright:
+
+```
+WARNING:gst_app_resize:Could not determine connected screen from xrandr.
+ERROR:data_websocket:CRITICAL: Could not determine screen name from xrandr. Aborting.
+ERROR:data_websocket:FATAL: Initial reconfiguration completed, but video pipeline did not start.
+```
+
+Everything else in the stack sees `:1` correctly -- `xterm` renders, `xset q` succeeds, and a
+standalone asyncio `xrandr` from the same guest returns the full 129-byte output including
+`screen connected 1024x768+0+0`. So this is specific to selkies' own environment handling, not a
+litebox gap. `advisor/probes/webtop_sitecustomize.py` restores it (overridable with
+`SELKIES_DISPLAY`).
+
+**Two of my own mistakes are recorded here because they cost real time and would cost it again:**
+first, an earlier revision of that shim also neutered `resize_display`/`generate_xrandr_gtf_modeline`,
+which looks harmless and silently removes the very call the video pipeline depends on; second, I
+dropped `+extension RANDR` from the Xvfb argv while simplifying, which produces the *identical*
+"Could not determine connected screen" symptom for a completely different reason. Both are easy
+to reintroduce.
+
+### The reproducible recipe
+
+```
+python advisor/probes/make_webtop_min_rootfs.py     # 2.4 GiB -> ~983 MiB
+python advisor/probes/make_webtop_overlay.py        # nginx conf + dirs + launch script
+#   ... then append advisor/probes/webtop_sitecustomize.py into the overlay as patch/sitecustomize.py
+
+litebox_runner_linux_on_windows_userland.exe --unstable   --initial-files .wfgy/webtop_min.tar --resume-from .wfgy/webtop_overlay.tar   --publish 8081:8081   --env PYTHONPATH=/patch --env DISPLAY=:1 --env HOME=/config   --env PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   -- /bin/sh -c 'Xvfb :1 -screen 0 1024x768x24 -dpi 96        +extension COMPOSITE +extension DAMAGE +extension RANDR +extension RENDER        +extension XFIXES +extension XTEST -nolisten tcp -ac -noreset & sleep 12;      xterm -geometry 100x30+30+30 -bg black -fg green -e sh -c "while true; do date; sleep 1; done" &      sleep 6; selkies --addr=localhost --mode=websockets        --audio-enabled=false --microphone-enabled=false --clipboard-enabled=false'
+
+SELKIES_PORT=8081 python advisor/probes/hostproxy.py   # then open http://127.0.0.1:8090/
+```
+
+**Watch the port.** selkies binds its own default 8081 here; `CUSTOM_WS_PORT` did not take effect
+in this configuration, so the proxy must target whatever
+`data_websocket:... listening on port N` actually reports.
+
+### Honest status
+
+Not confirmed: frames rendering in the browser. Every code-level blocker found has been fixed and
+each fix verified on its own, and the last one (`DISPLAY`) was identified from its own diagnostic
+rather than guessed -- but no run after that fix stayed healthy long enough to reach the client's
+first frame.
+
+The obstacle is the host, not a known defect. Free memory oscillated between ~2.9 GB and ~0.4 GB
+across these runs as the runner (~1.4 GB), Chrome and the editors competed; below roughly 2 GB the
+guest stalls mid-startup -- consistently at gamepad initialisation in the last attempts -- in a
+way indistinguishable from a hang. Runs that had the memory reached "Running server" in 25 s;
+runs that did not never got there at all. Re-run the recipe above with more free memory to
+confirm.
+
+## RESULT: live video from litebox rendered in Chrome on the host
+
+Confirmed by three consecutive browser screenshots of `http://127.0.0.1:8090/`, each a different
+colour -- **cyan, then green, then magenta** -- matching the palette cycled once per second by
+`/paint_root.py` inside the guest. Changing frames, not one stale image: a live stream.
+
+Server side, in the same run:
+
+```
+[x11] Configuring Output: 1314x816 @ 60.00 FPS (Encode Node: -1)
+INFO:data_websocket:SUCCESS: Capture started for 'primary'.
+INFO:data_websocket:Broadcasting primary stream resolution to all clients: 1314x816
+INFO:data_websocket:Display reconfiguration finished successfully.
+```
+
+The whole path runs inside litebox: Xvfb, the X client painting the root window, selkies with its
+`pixelflux` x264 encoder, capture through X11 MIT-SHM. Only the reverse proxy sits on the host,
+because guest processes do not share a loopback namespace -- and litebox's own `--publish` is
+already a host-side NAT, so that hop was always going to be host-side.
+
+### What it took: seven litebox defects, each found by measurement
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | `insert_mapping` rejected an out-of-range address **hint** | `fork()` failed with ENOMEM while ~128 TiB was free; Xvfb could not fork `xkbcomp`, so the X server never started |
+| 2 | `boot.lock` released via a `Drop` that `ExitProcess` never runs | every clean run blocked the next boot for 5 minutes |
+| 3 | CoW file-mapping zero-filled destroyed views' flanks | shared libraries silently corrupted; `import pixelflux` failed on a symbol that was present on disk |
+| 4 | `futex(FUTEX_LOCK_PI)` returned `EINVAL`, not `ENOTSUP` | PulseAudio's `pa_mutex_new` assertion aborted selkies the instant a browser connected |
+| 5 | `waitid` unimplemented | CPython asyncio never reaped subprocesses; display reconfiguration hung forever |
+| 6 | `resize_mapping` treated an out-of-space expand as `unreachable!()` | host-side panic killed the guest once selkies grew a mapping near the top of the address space |
+| 7 | **System V shared memory entirely unimplemented** | `[x11] capture error: shmget failed` -- the actual reason no frames ever flowed |
+
+Two further problems were mine, not litebox's, and are recorded because they are easy to repeat:
+dropping `+extension RANDR` from the Xvfb argv, and over-neutering `resize_display` in the shim --
+both produce the identical "Could not determine connected screen from xrandr" symptom for
+completely different reasons. And one belongs to selkies: its process ends up with no `DISPLAY`,
+so its `xrandr` probe returns "Can't open display" and it aborts the pipeline; the shim restores
+it.
+
+### Reproducing
+
+```
+python advisor/probes/make_webtop_min_rootfs.py     # 2.4 GiB -> ~983 MiB
+python advisor/probes/make_webtop_overlay.py        # nginx conf, dirs, launch script
+#   append advisor/probes/webtop_sitecustomize.py into the overlay as patch/sitecustomize.py
+#   append a root-painter (or any X client) as /paint_root.py
+
+litebox_runner_linux_on_windows_userland.exe --unstable   --initial-files .wfgy/webtop_min.tar --resume-from .wfgy/webtop_overlay.tar   --publish 8081:8081   --env PYTHONPATH=/patch --env DISPLAY=:1 --env HOME=/config   --env PATH=/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   -- /bin/sh -c 'Xvfb :1 -screen 0 1280x800x24 -dpi 96        +extension COMPOSITE +extension DAMAGE +extension RANDR +extension RENDER        +extension MIT-SHM +extension XFIXES +extension XTEST        -nolisten tcp -ac -noreset & sleep 12;      python3 /paint_root.py & sleep 5;      selkies --addr=localhost --mode=websockets        --audio-enabled=false --microphone-enabled=false        --clipboard-enabled=false --gamepad-enabled=false'
+
+SELKIES_PORT=8081 python advisor/probes/hostproxy.py    # open http://127.0.0.1:8090/
+```
+
+Three things to keep right, each of which cost a debugging cycle:
+
+* **`+extension RANDR` and `+extension MIT-SHM` are load-bearing.** Without RANDR selkies cannot
+  find a screen name; without MIT-SHM there is no shared-memory capture path to use.
+* **Watch the websocket port.** selkies binds its own default (8081 here); `CUSTOM_WS_PORT` did
+  not take effect in this configuration, so point the proxy at whatever
+  `data_websocket: ... listening on port N` actually reports.
+* **Give the host RAM.** The runner needs ~1.4 GB and below roughly 2 GB free the guest stalls
+  mid-startup in a way indistinguishable from a hang -- the condition AGENTS.md warns not to
+  misattribute to litebox. Runs with headroom reach "Running server" in ~25 s.
+
+### Still imperfect
+
+Audio, clipboard and gamepad are disabled in the verified configuration -- each is a fork site
+that still risks the `fork_verify` host-side AV, which remains the real architectural gap
+(`ADVISORY-001`, Track B). MATE itself is not running; the verified desktop content is a painted
+root window. Both are worth picking up next, and neither is on the critical path to "frames reach
+the browser", which is now closed.
+
+## Next steps, in dependency order
+
+1. Fix the flank recommit properly, using the view's real allocation base and mapping
+   copy-on-write protections down to their private-memory equivalents. Repro is
+   `python3 -c "import pixelflux"`, ~30 s. This unblocks selkies, and selkies is the whole video
+   path.
+2. Then bring up MATE, which needs the `fork_verify` host-side AV addressed
+   (`mate-session-avs-are-in-fork-verify-not-guest`). A lighter WM already present in the image
+   (`openbox`, `labwc`) may be worth trying first purely to get window content on `:1`.
+3. Browser verification needs Chrome to be allowed to reach `localhost` on this host.
+
+---
+
+# 2026-09-08 continuation: default-configured MATE desktop, live in the browser
+
+## Result
+
+The stock `linuxserver/webtop:alpine-mate` desktop now comes up with its **own default
+configuration** and streams to a host browser: top panel with `Applications`/`Places`/`System`
+menus and a live clock, desktop icons (Computer, Home, Trash), MATE wallpaper, bottom panel with
+window list and workspace switcher. The Applications menu opens and renders its full category
+tree. Input round-trips (clicks land where sent).
+
+Everything runs inside litebox: Xvfb, dbus-daemon, marco, mate-settings-daemon, caja, mate-panel,
+and selkies with its pixelflux/pcmflux x264 encoders. Only the reverse proxy is host-side, and
+only because guest processes do not share a loopback namespace (pre-existing, documented above).
+
+## Defects found and fixed this pass
+
+Each was found from a live failure, not from reading code.
+
+1. **`ThreadHandle::interrupt` deadlocked the whole guest** (`d89bebd`). It called
+   `std::env::var_os` between its `SuspendThread` and its `ResumeThread`; on Windows that
+   allocates and takes ntdll's process-wide environment critical section, so suspending a thread
+   that happened to hold that lock deadlocked the suspender forever. `cdb -pv` showed one thread
+   at `Suspend: 2` inside `RtlQueryEnvironmentVariable` with six more queued behind it. The shim
+   made it near-certain by calling `env_flag` twice per syscall.
+
+2. **`getsockopt`/`setsockopt` returned `EINVAL` for unknown options** (`694bb93`), where Linux
+   returns `ENOPROTOOPT`. zbus probes `SO_PEERPIDFD`; `EINVAL` turned an optional probe into a
+   fatal transport error, so GdkPixbuf -> glycin -> D-Bus image decoding failed for EVERY image.
+   `mate-panel` aborted outright and `marco` crash-looped on its icon theme.
+
+3. **`O_NOATIME` panicked the host** (`133d3d4`) via an `unimplemented!()` in two filesystems'
+   flag whitelists.
+
+4. **`fork_verify` could write into litebox's own code** (`6860300`) -- a heal target derived
+   from decoded guest operands was only checked for "committed and writable", which litebox's own
+   `MEM_IMAGE` pages satisfy once the widen step flips them.
+
+5. **`allocate_pages` panicked the host on OOM** (`62e3c79`) instead of returning
+   `AllocationError::OutOfMemory`, so one oversized `mmap` killed every process in the guest.
+
+6. **Writable `MAP_SHARED` file mappings were rejected with `ENODEV`** (`d22a916`). dconf's
+   `dconf_shm_flag` asserts on `MAP_FAILED`, so `dconf-service` aborted mid-call and every
+   GSettings write failed.
+
+7. **Read-only `MAP_SHARED` mappings did not share that object** (`5a13f2c`), which defeated the
+   point: dconf's writer maps the flag byte `PROT_WRITE` and its readers map it `PROT_READ`.
+   `mate-panel` appends each panel with a read-modify-write of `toplevel-id-list`, so the second
+   append read a stale list and dropped the first entry:
+
+       before -> toplevel-id-list=['bottom']
+       after  -> toplevel-id-list=['top', 'bottom']
+
+   The missing `top` toplevel is exactly why there was no Applications menu: `menu-bar`, `clock`
+   and `notification-area` all reference `toplevel-id='top'`, and a panel that does not exist
+   cannot host them. The applet IIDs were correct the whole time.
+
+## Not fixed: s6-overlay `/init` cannot run (fixed-address ET_EXEC collision)
+
+Running the image through its own `/init` still fails within the first few syscalls, on both the
+alpine and ubuntu images, reproduced here in about a minute:
+
+    s6-overlay-suexec: fatal: child failed with exit code 139
+
+`preinit` (a static ET_EXEC linked at 0x400000) forks, and the child's `execve` of `s6-mkdir`
+(another ET_EXEC at 0x400000) collides, because every guest process shares ONE host address space
+and the parent's ELF still occupies that range. litebox detects the relocation and fails the load
+after execve's point of no return, which is the honest response but is fatal. This is the
+already-documented `vfork-parent-wakes-during-nested-child-execve` row and needs genuine
+per-process address-space isolation (or exec-into-a-fresh-host-process) to fix; `LITEBOX_PROCESS_FORK=1`
+does not help. Because of it, the DE is started from the image's own `/defaults/startwm.sh`
+components rather than under s6 supervision.
+
+## XFCE: not available on Alpine
+
+`linuxserver/webtop` has no `alpine-xfce` tag; XFCE ships only on the debian/ubuntu/fedora/arch
+bases. `ubuntu-xfce` was pulled and packed via `litebox_packager --oci-image` (119,692 entries,
+13.7 GB, at `C:\dev\litebox-webtop\xfce\webtop_xfce.tar`) and boots far enough to run a shell and
+locate `xfce4-session`/`xfce4-panel`/`xfdesktop`/`xfwm4`, and its `startwm.sh` copies real default
+config from `/defaults/xfce/` (plain XML, no dconf). It then hits a NEW, separate gap: Ubuntu
+ships **rust-coreutils**, and those binaries abort in rustix's auxv handling
+(`rustix/src/backend/linux_raw/param/auxv.rs:269: called Result::unwrap() on an Err value: ()`),
+taking out `sleep`, `tail` and the DE launch. `/bin/sleep 1` on its own succeeds, so the failure
+is situational and not yet root-caused. litebox builds an auxv on the initial stack but provides
+no `/proc/self/auxv`, which is the first thing to check.
+
+## Forking work: the s6 collision, measured rather than argued
+
+New this pass, on top of the `debian-i3` session's writeup. The failure reproduces on the LOCAL
+alpine image in about a minute (`-- /init`), so it no longer needs an 8GB Debian pull to study:
+
+    s6-overlay-suexec: fatal: child failed with exit code 139
+
+**1. The colliding owner is the grandparent, not the parent.** The untruncated foreign-claim line
+says `self_owner=GuestPid(3) foreign_owner=Some(GuestPid(1)) foreign_range=Some((4194304, 4255744))`.
+GuestPid(1) is `s6-overlay-suexec` itself, still live and still holding 0x400000, while its
+grandchild `s6-mkdir` tries to load there. The chain is pid 1 --vfork--> pid 2 (`preinit`,
+`CLONE_VM|CLONE_VFORK`) --fork--> pid 3 (`s6-mkdir`, flags 0). All three are static ET_EXEC linked
+at 0x400000, and litebox has one host address space for all of them.
+
+**2. What actually blocks the cross-process path is a PIPE.** `LITEBOX_PROCESS_FORK=1` alone
+changes nothing, and the reason is now logged explicitly rather than inferred:
+
+    clone: cross-process (D==0) fork() NOT eligible -- guest holds fd(s) at or above 3
+
+`s6-overlay-suexec` creates its synchronisation pipe (`sys_pipe2: created rd_fd=4 wr_fd=3`)
+immediately before forking, so `beyond_stdio` is nonzero at both clones and the gate refuses.
+None of the shim's seven fd subsystems are backed by an inheritable Windows HANDLE.
+
+**3. Forcing the gate proves the address space is the right lever -- and that the mechanism is
+not ready.** `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` (added this pass; measurement only, off by
+default, documented as accepting that the child loses its fds) takes the cross-process path:
+
+    clone: cross-process fork() forced by LITEBOX_PROCESS_FORK_IGNORE_FDS
+    clone: spawned cross-process fork() child parent_tid=1 child_tid=2
+
+and the 0x400000 collision DISAPPEARS -- no `AddressInUse`, no "load_program failed after point
+of no return", no SIGSEGV. So giving the child its own real address space is the correct fix.
+
+It then hangs instead, and the child's own diagnostics say why:
+
+    vmem-adopt-probe (child): adopting 0 pre-populated region(s), brk=0x0
+    vmem-adopt-probe (child): adopted=0 ... tracked=0, expected=0, brk=0x0
+    task-resume-probe (child): ... calling run_thread with rip=0x40c83d rsp=0x7fefffeee128
+
+The child adopts ZERO regions and is then resumed at an address inside the parent's ELF that does
+not exist in it. Cross-process fork currently spawns a real Windows process, verifies its VMA
+layout round-trips, and resumes it -- but never transfers the parent's memory. It is diagnostic
+scaffolding, not a working fork.
+
+**So the remaining work is now specific**, rather than "needs address-space isolation": (a) make
+`spawn_cross_process_fork_child` actually transfer the parent's regions instead of adopting an
+empty layout, and (b) back guest pipes (and the other fd subsystems) with inheritable Windows
+HANDLEs so the eligibility gate can pass honestly. Neither was attempted here; forcing a third
+unverified fix at this depth is what this project's own discipline warns against, and the
+measurement flag is deliberately not a workaround.
+
+### Update: vfork must never take the cross-process path, and what is left after that
+
+Two corrections to the section above, both measured.
+
+**The empty VMA layout was not a missing feature -- it was the cross-process path being applied to
+a vfork.** `do_clone` already handles `CLONE_VFORK` correctly and deliberately: the child SHARES
+the parent's `Arc<PageManager>` and is handed an intentionally EMPTY `AddressRelocations`, because
+nothing was duplicated and nothing is supposed to be (`ElfLoader::load`'s vfork-detach step then
+gives the child a brand-new `PageManager` at `execve` time). Feeding that empty map to
+`spawn_cross_process_fork_child` spawns a real Windows process and tells it to adopt zero regions,
+so the child comes up with no address space and is resumed at an `rip` belonging to a parent it
+does not share memory with -- exactly the `adopting 0 pre-populated region(s), brk=0x0` hang.
+The cross-process path is for REAL forks, and now refuses vfork children explicitly.
+
+**With that fixed, the collision this whole line of work targets is gone.** On the s6 chain the
+vfork (pid 1 -> pid 2) correctly stays on the sharing path, the real fork (pid 2 -> pid 3) goes
+cross-process, and the count of `sys_execve: load_program failed after point of no return` drops
+to ZERO -- `s6-mkdir` no longer collides with GuestPid(1) at 0x400000. That confirms the diagnosis
+end to end: a real per-process address space is both necessary and sufficient for this collision
+class.
+
+**What still fails is the transfer itself.** The parent now AVs while copying its own memory into
+the child:
+
+    [process_fork_diag] fork(): probing 0 reservation group(s)   <- the vfork, correctly empty
+    [process_fork_diag] fork(): probing 2 reservation group(s)   <- the real fork
+    [diag-unrecov-av-terminate] rip=0x7ff7cfb6af48 addr=0xaab000
+
+`read_source_bytes` (`ptr.to_owned_slice(range.len())` over each relocation group) faults reading
+a source range, so the child is never resumed and the run dies. The next step is to make that read
+fault-tolerant per page rather than assuming every byte of a group is mapped -- `fork_verify`'s own
+`read_usize_fault_tolerant` is the existing pattern for that -- and only then to revisit fd
+inheritance, which remains the other half of honest eligibility.
+
+### Root cause found: the abandoned duplicate's teardown, not the transfer
+
+The cross-process fork path was never functional -- not "incomplete for s6", broken for ANY fork.
+Minimal repro, ten seconds, no s6 and no webtop needed:
+
+    litebox_runner ... --initial-files webtop_mate.tar -- \
+      /bin/sh -c 'echo PARENT_START; (echo IN_CHILD); echo PARENT_END'
+
+    LITEBOX_PROCESS_FORK unset -> PARENT_START / IN_CHILD / PARENT_END, 0 AVs, exit 0
+    LITEBOX_PROCESS_FORK=1     -> PARENT_START only, 67 AVs, SIGSEGV (exit 139)
+
+The real fault was masked. What `[diag-unrecov-av]` reported first was a crash inside
+`ntdll!RtlpUnwindPrologue+0x11a` (`mov rcx,[r8]` with `r8=0xa`), reached from
+`ntdll!RtlpxVirtualUnwind` with `std::io::Write::write_all<Stderr>` on the stack -- i.e. the
+DIAGNOSTIC path dying while trying to report. Resolved via the PDB with `cdb`'s `ln`. With
+`RUST_BACKTRACE=1` the underlying fault appears instead:
+
+    rip=0x7ff000c09000 addr=0x7ff000c09000       <- instruction fetch
+    pagestate: State=MEM_COMMIT Protect=PAGE_READWRITE Type=MEM_PRIVATE
+
+an instruction fetch on a guest page that is committed and readable/writable but NOT executable.
+Guest code had lost its execute permission.
+
+**The cause is the in-process duplicate being torn down, not the cross-process transfer.**
+`do_clone` always builds `dest_pm` via `pm.duplicate()` and moves it into a child `ThreadState`;
+the cross-process branch then returns early and drops that `ThreadState`, freeing the duplicated
+address space. Proven by simply leaking it instead:
+
+    mem::forget(thread)  ->  67 AVs and SIGSEGV become ZERO AVs, no SIGSEGV
+
+Leaking is not a fix (it strands a whole duplicated address space per fork), but it isolates the
+teardown as the culprit. The mechanism is an identity mismatch: `duplicate()` runs wrapped in
+`with_fork_duplicate_claim_owner(child_tid, ..)`, so every range it reserves is registered to the
+CHILD, while the early return drops it on the PARENT's thread where `current_claim_owner()` is the
+parent -- and `claim_range`'s same-owner coalescing then merges and releases ranges that are
+really the parent's own live memory. Dropping it under the child's owner instead takes the repro
+from 67 AVs + SIGSEGV to 1 AV and exit 0.
+
+**Still not finished.** One AV remains (a guest page around `0x10106000`), the child produces no
+output and the parent does not continue, so `LITEBOX_PROCESS_FORK=1` remains non-functional. The
+structurally correct fix is to not build the duplicate at all when the cross-process path will be
+taken -- decide eligibility BEFORE `pm.duplicate()` and derive the child's identity relocations
+from the parent's own `tracked_regions()`, since a cross-process child runs at SOURCE coordinates
+and has no use for a duplicate. That removes the teardown entirely rather than making it less
+destructive, and removes a wasted full address-space copy per fork.
+
+### Five more defects in the cross-process fork path
+
+All found with the ten-second repro, all confined to the `LITEBOX_PROCESS_FORK=1` opt-in path,
+default path re-verified clean (3/3 `A B C`, 0 AVs) after each.
+
+1. **The in-process duplicate was built and then thrown away.** `do_clone` always ran
+   `pm.duplicate()` and moved the result into a child `ThreadState`, which the cross-process branch
+   then dropped on early return. A cross-process child runs at SOURCE coordinates in its own
+   address space and has no use for a duplicate at all. The decision now happens BEFORE
+   duplication (`try_cross_process_fork`), which removes the destructive teardown outright rather
+   than trying to make it less destructive -- and saves a full eager address-space copy per fork.
+   Everything the path needs is available pre-duplication: the register snapshot is the parent's
+   own `ctx`, the FS base is the parent's own, the layout is the parent's own `tracked_regions()`,
+   and the relocation map is the identity.
+
+2. **`std::env::set_var` storm around the spawn.** Six `set_var` calls before `CreateProcessW` and
+   six `remove_var` after, to pass data to the child via `lpEnvironment: null` inheritance.
+   Mutating the environment is undefined behaviour in a multi-threaded process, and litebox runs
+   ~20 host threads several of which read environment variables through the same ntdll critical
+   section. This is the WRITE-side twin of the read-side deadlock already fixed in
+   `ThreadHandle::interrupt`. The child now gets an explicit `CREATE_UNICODE_ENVIRONMENT` block
+   built from `vars_os()` plus the extras; the parent's own environment is never touched.
+
+3. **The child inherited no stdio at all.** `spawn_suspended` was called with
+   `bInheritHandles = FALSE` and no `STARTF_USESTDHANDLES`, so the child had no stdout, stderr or
+   stdin. Everything it printed -- the guest's own `echo B` AND every child-side
+   `[process_fork_diag]` line -- went nowhere. That is why the child appeared never to start.
+
+4. **Copy groups were not allocation-granularity aligned.** `copy_one_group` pins each group in
+   the child with `MEM_ADDRESS_REQUIREMENTS`, and Windows rejects a reservation whose base is not
+   64 KiB aligned:
+
+       group copy FAILED group=0x10046000..0x100df000 GetLastError=87   (ERROR_INVALID_PARAMETER)
+
+   `PageManager::duplicate`'s own reservation groups were granule-aligned by construction;
+   `tracked_regions()` reports page-aligned VMA bounds. Groups are now widened to their enclosing
+   granule and merged.
+
+5. **The source read assumed a group was fully mapped.** A granule-aligned group can span padding,
+   a guard gap, or a range the guest `munmap`ed. `read_source_bytes` now reads page at a time and
+   zero-fills holes instead of faulting in the parent mid-fork.
+
+**Still not working.** `LITEBOX_PROCESS_FORK=1` does not complete a fork: the guest's `(echo B)`
+never appears and the parent does not reach `echo C`. The failure has moved (it now happens before
+`do_clone` logs anything) and remains non-deterministic across identical runs. `/init` does not
+boot. The path is opt-in and off by default, so none of this reaches ordinary use.
+
+### Why the cross-process copy cannot work as written: it races litebox's own demand-commit
+
+Traced to the exact operation, by instrumenting `copy_one_group` page by page on the ten-second
+repro against a deliberately tiny rootfs (`docker.io/library/alpine:latest`, 8.8 MB, so the copy
+plan is 84 MB rather than 1.5 GB and the walk is quick):
+
+    [process_fork] spawn_process_fork_child: CreateProcessW returned ok=true
+    [process_fork] copying group 0x10040000..0x10110000
+    [process_fork_trace] reserve done ptr=0x10040000
+    ... 397 successful page read/write traces ...
+    [process_fork_trace] page 0x10106000 read q=48 State=0x2000 Protect=0x0 Type=0x20000
+                                              Size=0xa000        <- MEM_RESERVE, not MEM_COMMIT
+
+`0x10106000` is the address that had appeared in every unexplained crash all session. It is
+RESERVED but NOT COMMITTED, because litebox commits guest memory ON DEMAND -- that is what all the
+`[diag-commit] VirtualAlloc2(MEM_COMMIT) over reserved range` lines in any debug log are.
+
+That is the real defect, and it is structural rather than a missing null check. `fork()` must
+snapshot the parent's address space ATOMICALLY. The cross-process path instead walks that address
+space page by page from the forking thread while **the parent's other guest threads keep running
+and keep demand-committing pages underneath it**. The copy is racing the VEH that materialises
+those pages. It explains everything that made this so hard to pin down: the faulting address was
+always `0x10106000`, but the crash site, the AV count, and the exit code differed on every
+otherwise-identical run -- the hallmark of a race, not of a wrong constant.
+
+So the remaining work is not another bug fix in the copy loop. Either the guest must be frozen for
+the duration of the snapshot (litebox already has the machinery -- `ThreadHandle::interrupt` and
+`ctxwatch_arm_other_threads` suspend every other guest thread, with the hard-won constraint that
+NOTHING inside that window may allocate or take a lock the suspended threads could hold, see
+`diag_interrupt_enabled`), or the child must fault its own pages in from the parent on demand
+rather than being handed an eager copy. Both are real designs; neither is a small change, and
+picking one should be a deliberate decision rather than the next thing tried.
+
+#### Correction to the section above
+
+The "races demand-commit from other guest threads" explanation is **wrong**, and is retracted
+here rather than left standing. The repro is `sh -c 'echo A; (echo B); echo C'` and `sh` is
+single-threaded: at the moment of the copy the only guest thread is the one executing `do_clone`,
+so there is no concurrent guest thread committing pages underneath it. What the page-by-page trace
+actually establishes is narrower, and still useful:
+
+* the copy reaches `0x10106000` -- the address behind every unexplained crash this session -- and
+  that page is genuinely `State=MEM_RESERVE`, not committed;
+* `read_source_bytes` consults `fork_verify::is_readable`, which correctly rejects a non-committed
+  page, so the read is skipped and no fault should occur there;
+* yet the process dies between that page's trace line and the next one.
+
+So the failure is somewhere in that window and is NOT explained by the reserved page alone. The
+final AV record captured is `rip=0x0 addr=0x0 rax=0xc0000005 is_in_guest=false` -- a jump to null
+with the access-violation status still in `rax`, i.e. a nested failure inside exception dispatch
+rather than a clean first fault. Instrumentation perturbs it (the failure mode, AV count and exit
+code all move between identical runs), which is what defeated eight successive attempts.
+
+What remains true and load-bearing from that section: the ten-second repro, the tiny-rootfs trick
+(`alpine:latest`, 8.8 MB, 84 MB copy plan instead of 1.5 GB) that makes per-page instrumentation
+practical, and the fact that every crash converges on the same address. What is NOT established is
+why. Anyone picking this up should start from the nested-dispatch failure, not from the reserved
+page, and should not trust the retracted race explanation.
+
+### RESOLVED: cross-process fork works
+
+`LITEBOX_PROCESS_FORK=1` now completes a real fork. On the ten-second repro,
+`sh -c 'echo A; (echo B); echo C'`, 4/4 runs print `A B C` with exit 0 and ZERO unrecoverable
+AVs, and the child's own diagnostics confirm it is doing the real thing rather than falling back:
+
+    vmem-adopt-probe (child): adopted=18 (VM_SHARED=0), tracked=18, expected=18,
+                              brk=0x11108000 (expected 0x11108000)
+    vmem-adopt-probe (child): VMA layout adoption VERIFIED -- every region's boundaries,
+                              flags and file-backing round-trip exactly
+    task-resume-probe (child): built Task, set fs_base, ... run_thread returned
+
+The `B` comes from a genuinely separate Windows process. The default (thread-based) fork path is
+unchanged.
+
+**The last defect was mine, in the patch two sections above.** `litebox_platform_windows_userland`
+contains TWO closures named `read_source_bytes` with byte-identical bodies -- one in
+`diagnostic_process_fork_probe`, one in the production `spawn_cross_process_fork_child`. The
+page-tolerance fix was applied with a single-occurrence string replace, so it landed on the
+DIAGNOSTIC one and the production path kept the original whole-range
+`ptr.to_owned_slice(range.len())`. That read faults on a `MEM_RESERVE`-but-not-committed page, and
+a copy group -- widened to 64 KiB allocation granularity, over an address space litebox commits on
+demand -- always contains some. Hence the copy dying at `0x10106000` every single time while the
+crash site, AV count and exit code moved around: the fault was deterministic, its consequences
+were not.
+
+Two lessons worth keeping. First, an anchored single-occurrence replace is unsafe in a file with
+duplicated helper closures -- verify WHICH function the edit landed in. Second, the bisection that
+found it (`if true { return None; }` at the top of the read) appeared to prove "the copy is not at
+fault" because it was editing the same wrong copy; the bisection and the fix were consistent with
+each other and both wrong.
+
+### `/init`: the ET_EXEC collision is gone; fd inheritance is the only thing left
+
+With a working cross-process fork, `s6-overlay-suexec: fatal: child failed with exit code 139` --
+the SIGSEGV from `s6-mkdir` colliding with GuestPid(1) at 0x400000, and the wall this whole line of
+work existed to break -- **no longer happens**. Booting `/init` with
+`LITEBOX_PROCESS_FORK_IGNORE_FDS=1` now gets past it and fails on exactly what that flag warns it
+will:
+
+    preinit: line 73: dup2(3,1): Bad file descriptor
+
+`s6-overlay-suexec` creates a synchronisation pipe before forking, and a cross-process child cannot
+inherit it because none of this shim's fd subsystems is backed by a real Windows HANDLE. That is
+now the single remaining blocker for booting a stock s6-overlay image, it is precisely stated, and
+it is a bounded piece of work rather than an open question.
+
+### The last blocker, scoped: inheriting guest pipe fds across a cross-process fork
+
+`/init` now fails on exactly one thing. With `LITEBOX_PROCESS_FORK_IGNORE_FDS=1` the ET_EXEC
+collision is gone and the boot reaches:
+
+    preinit: line 73: dup2(3,1): Bad file descriptor
+
+`/package/admin/s6-overlay-3.2.1.0/libexec/preinit` is a SHELL SCRIPT, and line 73 is
+
+    eval `s6-overlay-stat /run`
+
+i.e. command substitution: the shell creates a pipe, forks, the child `dup2`s the write end onto
+its stdout and execs, and the parent reads the child's output back. The pipe carries real data, so
+it cannot be dropped -- which is precisely what `LITEBOX_PROCESS_FORK_IGNORE_FDS` warns it does.
+
+**Why this is not a small fix.** litebox's pipes are pure in-memory objects
+(`litebox/src/pipes.rs`: a `ringbuf` `HeapRb` split into `ReadEnd`/`WriteEnd`), with no OS handle
+behind them, so nothing about a pipe survives a process boundary. Confirmed by reading the code
+rather than assumed:
+
+* Direction IS available -- `HalfPipeType::{SenderHalf, ReceiverHalf}` (`pipes.rs:182`), reachable
+  through the pipes arm of `FileDescriptors::run_on_raw_fd`. Enumerating "which of my fds are
+  pipes, and which end" is therefore easy.
+* There is NO host-side read/write API for a guest pipe. The runner's existing stdio forwarders
+  bridge host stdio to the guest via `shim.pty_master_read(pty_id, ..)` -- a PTY-specific call.
+  There is no `pipe_read`/`pipe_write` equivalent.
+* There is NO API to install a descriptor at a chosen guest fd number. Guest fds 0/1/2 are created
+  by `open("/dev/stdin")`/`open("/dev/stdout")` against `litebox::fs::devices::Devices`; nothing
+  places an arbitrary object at fd N.
+* Adding a new fd subsystem is expensive: `run_on_raw_fd` dispatches over the seven existing
+  subsystems by taking one closure EACH (ten arguments today), so an eighth means touching every
+  call site in the shim.
+
+**Implementation plan** (the design that fits the existing architecture -- pump threads bridging
+in-memory pipes to real handles, which is exactly what the stdio forwarders already do):
+
+1. Host-side pipe bridge on `LinuxShim`: `pipe_read(fd, buf)` / `pipe_write(fd, buf)`, mirroring
+   the existing `pty_master_read`/`pty_master_write` pair. No new fd subsystem needed -- these
+   operate on an existing pipe fd.
+2. An fd-installation path for the child. The cheapest honest option is to reuse the existing
+   syscall dispatch rather than add API surface: the child synthesizes `pipe2` + `dup2` + `close`
+   through `LinuxShimEntrypoints::syscall` before resuming the guest, landing a real pipe at the
+   required fd number.
+3. Parent side, in `try_cross_process_fork`: enumerate fds >= 3; for each pipe, `CreatePipe`, mark
+   the child's end inheritable, and spawn a pump thread bridging the OS end to the guest pipe via
+   (1). A `SenderHalf` in the child means child-writes -> parent pumps OS-read -> guest pipe; a
+   `ReceiverHalf` is the mirror image.
+4. Protocol: extend the existing child env block with `fd:handle:direction` triples, alongside
+   `LITEBOX_INTERNAL_FORK_CHILD_GPRS` and `..._VMA_LAYOUT`.
+
+Only the `SenderHalf` direction is needed for command substitution, so (3) can land write-ends
+first and be verified against `/init` before the read-end mirror is added.
+
+#### Attempted, and the constraints the attempt found
+
+The plan above was implemented far enough to hit the encapsulation boundaries, then reverted. Three
+constraints it discovered, none of which are visible from the design sketch and all of which change
+the shape of the work:
+
+1. **`PipeFd` is move-only on purpose.** It is not `Copy` and not `Clone` -- `syscalls/pipe.rs`
+   states it "does not release the pipe on `Drop`; ends must either be inserted or closed", so the
+   type enforces single ownership. A pump thread therefore cannot simply hold a copy taken out of
+   the fd table (`error[E0507]: cannot move out of *pipe_fd which is behind a shared reference`).
+
+2. **The pipe ends' `Arc`s are private.** `PipeEnd { Receiver(Arc<ReadEnd>), Sender(Arc<WriteEnd>) }`
+   is a private enum in `litebox/src/pipes.rs`, and the only accessor that reaches inside it,
+   `with_iopollable`, yields `&dyn IOPollable` -- pollable, not writable. Every read/write path
+   (`Pipes::read`/`Pipes::write`) is keyed by a live `PipeFd`.
+
+3. **Which is fatal for the case that matters**, because a shell doing command substitution CLOSES
+   its own copy of the write end immediately after forking -- that is what lets the reader see EOF.
+   So by the time the child is running, no descriptor for that write end exists in the parent at
+   all, and a descriptor-keyed pump has nothing to write through. Keeping the parent's fd open
+   instead is not a fix: the reader would then never see EOF and the shell would hang forever.
+
+So the plan needs a fifth piece, in the core crate rather than the shim: a detached pipe-end handle
+-- something like `Pipes::detach_end(&PipeFd) -> DetachedPipeEnd` holding the `Arc<WriteEnd>` /
+`Arc<ReadEnd>` with `read`/`write`/`close` on it -- so a host pump can outlive the descriptor and
+can drop the end explicitly to signal EOF when the child exits. That is a deliberate widening of a
+core API's contract (pipe lifetime currently follows descriptors, exclusively), which is a design
+decision about `litebox::pipes` and not a mechanical addition to the fork path.
+
+Everything else in the plan survives intact and was confirmed to exist:
+`WaitState::new(&'static Platform)` is public so a pump thread can build its own `WaitContext`;
+`GlobalState::{read,write}_linux_pipe` are the pumping primitives; `create_linux_pipe` +
+`insert_raw_fd` + `sys_dup`'s exact-fd form place a fresh pipe at a chosen fd in the child;
+`half_pipe_type` classifies direction; and `LinuxShim` is `Arc`-backed and `Clone` so pump threads
+can hold it, while `LinuxShimEntrypoints` is deliberately `!Send` so the child-side install must
+run on the child's own guest thread.
+
+# 2026-09-10: exact s6-rc.d dependency order and tar-pair equivalence, read directly from both rootfs tars
+
+Read both `.wfgy/webtop_seatd.tar` and `.wfgy/webtop_seatd_realigned.tar` via Python `tarfile` (no
+extraction) to settle two open questions left by "The image's real launch recipe" above.
+
+**The two tars are file-set-identical (54,273 entries each).** `_realigned` only adds 2,384
+`litebox/.align/<offset>` padding entries and converts 4,913 duplicate-content regular files into
+symlinks (content dedup) -- neither is more complete; use whichever is convenient.
+
+**Full ordered `s6-rc.d` dependency chain** (reference for what a manual bypass-s6 launch script
+must still replicate by hand): `init-migrations -> init-adduser -> init-device-perms/init-envfile
+-> init-os-end -> init-selkies -> init-nginx -> init-selkies-config -> init-video ->
+init-selkies-end -> init-config -> init-crontab-config -> init-config-end -> init-mods ->
+init-mods-package-install -> init-mods-end -> init-custom-files -> init-services -> {svc-xorg,
+svc-nginx, svc-pulseaudio, svc-cron, svc-docker, svc-watchdog}`; `svc-xsettingsd`, `svc-selkies`
+and `svc-de` additionally depend on `svc-xorg`+`svc-nginx`. **Pixel-bearing subset is exactly four
+services**: `svc-xorg` (Xvfb), `svc-de` (`/defaults/startwm.sh` -> MATE), `svc-nginx`,
+`svc-selkies` -- everything else (cron, docker, watchdog, xsettingsd [self-disables once
+`xfce4-session` exists], mods, crontab, device-perms, adduser, migrations) contributes zero pixels
+and can stay skipped in a bypass launch. **There is no `svc-dbus` anywhere in this alpine tree** --
+the only D-Bus is the `dbus-launch --exit-with-session /usr/bin/mate-session` already named above.
+
+**Ports, for completeness** (3000/8082 already confirmed live above): HTTPS on **3001**
+(`CUSTOM_HTTPS_PORT`, same `init-nginx` sed as 3000); selkies `control_port` defaults to **8083**;
+`/devmode`->5173 and `/pelorus`->5100 exist only under `DEV_MODE`/`PELORUS`, which must stay unset.
+One more `svc-selkies` env not previously recorded here: `XCURSOR_THEME=Breeze_Light`.
+
+No new blockers found -- this only fills in the bypass-launch reference map. Full raw finding:
+gm mutable `webtop-alpine-mate-s6-bypass-launch-recipe` (filed here, resolved).

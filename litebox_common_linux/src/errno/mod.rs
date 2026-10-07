@@ -234,6 +234,18 @@ impl From<litebox::fs::errors::ChmodError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::ChownError> for Errno {
+    fn from(value: litebox::fs::errors::ChownError) -> Self {
+        match value {
+            litebox::fs::errors::ChownError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::ChownError::Io => Errno::EIO,
+            litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::SetTimesError> for Errno {
     fn from(value: litebox::fs::errors::SetTimesError) -> Self {
         match value {
@@ -395,6 +407,7 @@ impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
             litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
             litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
             litebox::platform::page_mgmt::PermissionUpdateError::Denied => Errno::EACCES,
+            litebox::platform::page_mgmt::PermissionUpdateError::OutOfMemory => Errno::ENOMEM,
             _ => unimplemented!(),
         }
     }
@@ -434,7 +447,12 @@ impl From<litebox::net::errors::SocketError> for Errno {
     fn from(value: litebox::net::errors::SocketError) -> Self {
         match value {
             litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
-            _ => unimplemented!(),
+            // `socket(2)` reports a socket table with no room left as "out of file descriptors",
+            // never as a crash: the caller is the one that has to cope, and a panic here takes
+            // down every process of the session at once (three guest processes died here in
+            // chrD97, each taking its listening ports with it).
+            litebox::net::errors::SocketError::TooManySockets => Errno::EMFILE,
+            _ => Errno::EMFILE,
         }
     }
 }
@@ -515,6 +533,19 @@ impl From<litebox::net::errors::RemoteAddrError> for Errno {
         match value {
             litebox::net::errors::RemoteAddrError::InvalidFd => Errno::EBADF,
             litebox::net::errors::RemoteAddrError::NotConnected => Errno::ENOTCONN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ShutdownError> for Errno {
+    fn from(value: litebox::net::errors::ShutdownError) -> Self {
+        match value {
+            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            // Real Linux `shutdown(2)` reports ENOTCONN for a socket that is not connected --
+            // the errno a caller can actually act on, unlike a blanket EOPNOTSUPP.
+            litebox::net::errors::ShutdownError::NotConnected => Errno::ENOTCONN,
+
             _ => unimplemented!(),
         }
     }

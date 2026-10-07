@@ -4,17 +4,28 @@
 //! Syscalls Handlers
 
 pub(crate) mod drm;
+/// Re-exported so the runner (which can read the environment, unlike this
+/// `no_std` crate) can turn DRM ioctl tracing on without widening the module.
+pub use drm::{set_dirty_fb_enabled, set_drm_trace};
 pub(crate) mod epoll;
-pub(crate) mod eventfd;
 pub(crate) mod evdev;
+pub(crate) mod eventfd;
+pub(crate) mod inotify;
+/// Re-exported so the runner (which can read the environment, unlike this
+/// `no_std` crate) can turn evdev `SYN_REPORT` tracing on without widening the module.
+pub use evdev::set_input_trace;
 pub mod file;
+pub(crate) mod file_spill;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod netlink;
 pub(crate) mod pipe;
+pub(crate) mod pidns;
 pub mod process;
 pub(crate) mod pty;
+mod pty_ldisc;
+pub(crate) mod seccomp;
 pub(crate) mod signalfd;
 pub(crate) mod timerfd;
 pub(crate) mod unix;

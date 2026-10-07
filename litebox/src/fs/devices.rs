@@ -30,6 +30,12 @@ const STDIO_BLOCK_SIZE: usize = 1024;
 const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/zero
+const ZERO_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/random
+const RANDOM_BLOCK_SIZE: usize = 0x1000;
+/// Block size for /dev/full
+const FULL_BLOCK_SIZE: usize = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -58,9 +64,9 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
-/// Node info for `/dev/tty0` (major=4, minor=0 -- the real Linux "current VT" console device;
-/// see `Documentation/admin-guide/devices.txt`). `seatd`'s `seat_update_vt` opens exactly this
-/// path and calls `VT_GETSTATE` on it to learn which numbered VT (`/dev/tty<N>`) is active.
+/// Node info for `/dev/tty0` (major=4, minor=0 -- the real Linux "current VT" console device).
+/// `seatd`'s `seat_update_vt` opens exactly this path and `VT_GETSTATE`s it to learn the active
+/// VT. See gm mutable mut-1789043589437.
 const TTY0_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 21,
@@ -68,14 +74,180 @@ const TTY0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x0400),
 };
 /// Node info for `/dev/tty1` (major=4, minor=1 -- the first real numbered VT). This virtual
-/// device always reports VT 1 as active (see [`super::super::syscalls::vt`]'s doc comment, or
-/// this module's own [`Device::Tty0`]/[`Device::Tty1`] pairing), so `/dev/tty1` is the one
-/// `seatd`'s `vt_open`/`vt_close` subsequently open once `VT_GETSTATE` on `/dev/tty0` names it.
+/// device always reports VT 1 as active, so `/dev/tty1` is the node `seatd`'s `vt_open`/`vt_close`
+/// open once `VT_GETSTATE` on `/dev/tty0` names it. See gm mutable mut-1789043589437.
 const TTY1_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 22,
     // major=4, minor=1
     rdev: core::num::NonZeroUsize::new(0x0401),
+};
+/// Node info for `/dev/zero` (major=1, minor=5 -- real Linux convention). Reads deliver endless
+/// NUL bytes, writes are discarded; GTK/GLib/Xorg mmap it as an anonymous-memory substitute.
+/// See gm mutable mut-1789043610245.
+const ZERO_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 23,
+    // major=1, minor=5
+    rdev: core::num::NonZeroUsize::new(0x105),
+};
+/// Node info for `/dev/random` (major=1, minor=8 -- real Linux convention). libgcrypt/GnuTLS
+/// (dbus, at-spi, gvfs) open this directly; treated identically to [`Device::URandom`], litebox
+/// having no entropy-starvation model. See gm mutable mut-1789043610245.
+const RANDOM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 24,
+    // major=1, minor=8
+    rdev: core::num::NonZeroUsize::new(0x108),
+};
+/// Node info for `/dev/full` (major=1, minor=7 -- real Linux convention). Reads behave like
+/// `/dev/zero`; every write must fail, which some programs' error-handling paths depend on.
+/// See gm mutable mut-1789043610245.
+const FULL_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 25,
+    // major=1, minor=7
+    rdev: core::num::NonZeroUsize::new(0x107),
+};
+/// Node info for `/dev/console` (major=5, minor=1 -- matching the major:minor observed in the
+/// real webtop image's own tar device-node entry for this path). Session/init-shaped guest code
+/// opens it directly. See gm mutable mut-1789043589437.
+const CONSOLE_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 26,
+    // major=5, minor=1
+    rdev: core::num::NonZeroUsize::new(0x501),
+};
+/// Node info for `/dev/tty` (major=5, minor=0 -- real Linux convention). The
+/// controlling-terminal alias, distinct from the numbered VT devices (`tty0`/`tty1`).
+/// See gm mutable mut-1789043589437.
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 27,
+    // major=5, minor=0
+    rdev: core::num::NonZeroUsize::new(0x500),
+};
+
+/// What `stat` reports for the `/dev/pts` devpts mount point.
+///
+/// Lives here although nothing in this crate mounts `/dev/pts`: `FileStatus` is
+/// `#[non_exhaustive]`, so only this crate can build one. The shim decides which ptys exist.
+#[must_use]
+pub fn devpts_dir_status() -> FileStatus {
+    FileStatus {
+        nlink: 1,
+        file_type: FileType::Directory,
+        mode: Mode::RWXU
+            .union(Mode::RGRP)
+            .union(Mode::XGRP)
+            .union(Mode::ROTH)
+            .union(Mode::XOTH),
+        size: super::DEFAULT_DIRECTORY_SIZE,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 5,
+            ino: 1,
+            rdev: None,
+        },
+        blksize: super::DEFAULT_DIRECTORY_SIZE,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
+/// What `stat` reports for the pty slave `/dev/pts/<id>`.
+///
+/// The caller must already have established that this pty is allocated -- see
+/// [`devpts_dir_status`].
+#[must_use]
+pub fn devpts_slave_status(id: u32) -> FileStatus {
+    FileStatus {
+        nlink: 1,
+        file_type: FileType::CharacterDevice,
+        // `rw-rw-rw-`. A slave is opened by whoever holds its id, and this crate models no tty
+        // group ownership to restrict it with.
+        mode: Mode::RUSR
+            .union(Mode::WUSR)
+            .union(Mode::RGRP)
+            .union(Mode::WGRP)
+            .union(Mode::ROTH)
+            .union(Mode::WOTH),
+        size: 0,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 5,
+            // Distinct per slave, so two ptys never look like the same file to a caller that
+            // compares `(dev, ino)`.
+            ino: 0x1000 + id as usize,
+            // Real Linux devpts slaves are character devices 136:<id>.
+            rdev: core::num::NonZeroUsize::new(0x8800 + id as usize),
+        },
+        blksize: 0x1000,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
+/// What `stat`/`access` report for a real AF_UNIX `bind()` path that some sibling process in this
+/// fork family has registered (`litebox_shim_linux::syscalls::unix::SharedUnixAddrPresenceTable`,
+/// a genuinely shared, cross-process-visible side table) but that does not exist in THIS
+/// process's own private, per-process writable filesystem layer.
+///
+/// **Why this exists.** Litebox's writable-layer content only crosses process boundaries at a
+/// cross-process `fork()`'s spawn/exit instants (see `docs/track-b-fork-fix-progress.md` and
+/// `litebox_platform_windows_userland::process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc
+/// comment for the honest limit: "nothing propagates to an already-running long-lived process
+/// between ITS OWN spawns"). A long-running, never-exiting cross-process-forked daemon (Xvfb,
+/// dbus-daemon) that `bind()`s a listening AF_UNIX socket therefore never republishes that
+/// filesystem write to any sibling for as long as it keeps running -- confirmed live as the exact
+/// cause of `webtop_stack.sh`'s `$XSOCK` wait loop never observing Xvfb's own socket path
+/// (twenty-fourth/twenty-fifth pass).
+///
+/// **Why this is the right fix, not the general writable-layer sync.** A bound AF_UNIX path is
+/// purely a NAME/existence marker -- litebox has no `FileType::Socket` variant at all, so
+/// `UnixSocketAddr::bind`'s own server-side path creation already represents it as an ordinary
+/// `RegularFile` in the OWNING process's filesystem view (`litebox_shim_linux/src/syscalls/
+/// unix.rs`). This function returns that SAME representation for a sibling's `stat`/`access`,
+/// rather than widening the general writable-layer sync to a periodic/continuous mechanism (a
+/// much larger, racier undertaking for content this table doesn't even carry).
+#[must_use]
+pub fn cross_process_bound_unix_socket_status(path: &str) -> FileStatus {
+    // FNV-1a over the path, so two different bound paths never collide on `(dev, ino)` -- no
+    // hashing crate needed for this `no_std` module.
+    let mut ino: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        ino ^= u64::from(*b);
+        ino = ino.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    FileStatus {
+        nlink: 1,
+        file_type: FileType::RegularFile,
+        // Matches `UnixSocketAddr::bind`'s own server-side creation mode exactly
+        // (`Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH`).
+        mode: Mode::RWXU
+            .union(Mode::RGRP)
+            .union(Mode::XGRP)
+            .union(Mode::ROTH)
+            .union(Mode::XOTH),
+        size: 0,
+        owner: UserInfo::ROOT,
+        node_info: NodeInfo {
+            dev: 0,
+            ino: ino as usize,
+            rdev: None,
+        },
+        blksize: 4096,
+        atime: Timestamp::default(),
+        mtime: Timestamp::default(),
+    }
+}
+
+/// `/dev/ptmx`, the pty multiplexer. Real Linux character device 5:2.
+const PTMX_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 28,
+    // major=5, minor=2
+    rdev: core::num::NonZeroUsize::new(0x502),
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +262,27 @@ enum Device {
     /// `/dev/tty1` -- the one numbered VT this virtual device ever reports as active (see
     /// [`TTY1_NODE_INFO`]).
     Tty1,
+    /// `/dev/zero` -- endless NUL-byte stream on read, discards writes.
+    Zero,
+    /// `/dev/random` -- treated identically to [`Device::URandom`]; this backend has no
+    /// entropy-starvation model to distinguish the two. See gm mutable mut-1789043610245.
+    Random,
+    /// `/dev/full` -- reads behave like [`Device::Zero`]; every write fails with `ENOSPC`.
+    Full,
+    /// `/dev/ptmx` -- the pty multiplexer. `open` never reaches this backend: the shim's
+    /// `do_open_resolved` intercepts it and returns a live master from its own registry.
+    /// Must stay in `Device::ALL` regardless, or `stat`/`access`/`readdir` return `ENOENT`, glibc's
+    /// `openpty`/`grantpt` fail, and `xfce4-terminal` reports "error creating pty".
+    /// See gm mutable mut-1789043570653.
+    Ptmx,
+    /// `/dev/console` -- opens and stats successfully; byte-stream I/O is rejected rather than
+    /// faked. See gm mutable mut-1789043589437.
+    Console,
+    /// `/dev/tty` -- the controlling-terminal alias, deliberately a FIXED node and NOT a real
+    /// per-session ctty redirect: `open_file_at` carries no caller identity, so this backend
+    /// cannot reach the shim's session state. Serves `isatty`/`ctermid`/stat probing only.
+    /// See gm mutable mut-1789043589437.
+    Tty,
 }
 
 impl Device {
@@ -101,6 +294,12 @@ impl Device {
         ("urandom", Device::URandom),
         ("tty0", Device::Tty0),
         ("tty1", Device::Tty1),
+        ("zero", Device::Zero),
+        ("random", Device::Random),
+        ("full", Device::Full),
+        ("console", Device::Console),
+        ("tty", Device::Tty),
+        ("ptmx", Device::Ptmx),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -110,6 +309,7 @@ impl Device {
     fn file_status(self) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
@@ -120,6 +320,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Null => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -130,6 +331,7 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::URandom => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
                 size: 0,
@@ -140,10 +342,10 @@ impl Device {
                 mtime: Timestamp::default(),
             },
             Device::Tty0 | Device::Tty1 => FileStatus {
+                nlink: 1,
                 file_type: FileType::CharacterDevice,
-                // Real VT device nodes are `crw--w----`, group `tty` -- litebox's guest
-                // identity always runs as root (see `DriDevice::file_status`'s identical
-                // rationale), so group-writable is sufficient for every guest process.
+                // Real VT nodes are `crw--w----` group `tty`; litebox's guest identity is
+                // always root, so group-writable suffices. See gm mutable mut-1789043627523.
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
                 size: 0,
                 owner: UserInfo::ROOT,
@@ -156,8 +358,109 @@ impl Device {
                 atime: Timestamp::default(),
                 mtime: Timestamp::default(),
             },
+            Device::Zero | Device::Full => FileStatus {
+                nlink: 1,
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: if self == Device::Zero {
+                    ZERO_NODE_INFO
+                } else {
+                    FULL_NODE_INFO
+                },
+                blksize: if self == Device::Zero {
+                    ZERO_BLOCK_SIZE
+                } else {
+                    FULL_BLOCK_SIZE
+                },
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Random => FileStatus {
+                nlink: 1,
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: RANDOM_NODE_INFO,
+                blksize: RANDOM_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Console => FileStatus {
+                nlink: 1,
+                file_type: FileType::CharacterDevice,
+                // Real /dev/console is `crw-------` (mode 0600), owner root -- matches the
+                // real webtop image's own tar entry for this path (major:minor 5:1).
+                mode: Mode::RUSR | Mode::WUSR,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: CONSOLE_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            // `rw-rw-rw-`, matching real Linux: any user may open the multiplexer.
+            Device::Ptmx => FileStatus {
+                nlink: 1,
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR
+                    .union(Mode::WUSR)
+                    .union(Mode::RGRP)
+                    .union(Mode::WGRP)
+                    .union(Mode::ROTH)
+                    .union(Mode::WOTH),
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: PTMX_NODE_INFO,
+                blksize: 0x1000,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
+            Device::Tty => FileStatus {
+                nlink: 1,
+                file_type: FileType::CharacterDevice,
+                // Real /dev/tty is `crw-rw-rw-` (mode 0666) -- world-writable/readable since
+                // any process's own controlling terminal is meant to always be reachable via
+                // this path regardless of the tty's own group-restricted permissions.
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+            },
         }
     }
+}
+
+/// LOUD diagnostic for an `open("/dev/<name>")` this backend does not register: without it the
+/// guest sees only a generic `ENOENT` and names no missing device.
+/// Must stay `format!`-free -- a fixed stack buffer straight to
+/// [`crate::platform::StdioProvider::write_to`] -- so it is safe where the heap may not be.
+/// See gm mutable mut-1789043615583.
+fn diag_raw_print_dev_open_miss<Platform: crate::platform::StdioProvider>(
+    platform: &Platform,
+    name: &str,
+) {
+    const PREFIX: &[u8] = b"[diag-dev-open-miss] unregistered /dev/ path opened: /dev/";
+    let mut line = [0u8; 192];
+    let mut pos = 0usize;
+    let n = PREFIX.len().min(line.len());
+    line[..n].copy_from_slice(&PREFIX[..n]);
+    pos += n;
+    let name_bytes = name.as_bytes();
+    let avail = line.len().saturating_sub(pos).saturating_sub(1);
+    let take = name_bytes.len().min(avail);
+    line[pos..pos + take].copy_from_slice(&name_bytes[..take]);
+    pos += take;
+    if pos < line.len() {
+        line[pos] = b'\n';
+        pos += 1;
+    }
+    let _ = platform.write_to(crate::platform::StdioOutStream::Stderr, &line[..pos]);
 }
 
 /// A [`super::backend::Backend`] that supports Unix-y devices.
@@ -281,28 +584,21 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
-        let device = Device::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let device = match Device::from_name(name) {
+            Some(device) => device,
+            None => {
+                diag_raw_print_dev_open_miss(self.litebox.x.platform, name);
+                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+        };
 
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        // `O_NONBLOCK` is accepted here without changing this backend's own `read`/`write`
-        // (mirroring the `O_TRUNC` handling below, which is likewise accepted but not literally
-        // honored by this backend). `Stdout`/`Stderr`/`Null`/`URandom` never block in the first
-        // place, so there is nothing to honor for them. `Stdin` is the one device that can
-        // genuinely block (`StdioProvider::read_from_stdin`) -- callers that need `O_NONBLOCK`
-        // to actually take effect on a stdin read (e.g. `open("/dev/stdin", O_NONBLOCK)`, the
-        // real-world case is libuv/Node putting a reopened stdin fd into non-blocking mode) get
-        // it from the shim layer instead: `litebox_shim_linux::syscalls::file::do_read` consults
-        // `StdioStatusFlags` metadata and the platform's `stdin_ready` probe to return `EAGAIN`
-        // rather than blocking, for any fd tagged `StdioStream::Stdin` -- see
-        // `insert_raw_file_fd_with_path`, which tags a freshly-(re)opened `/dev/stdin` with both
-        // `StdioStream` and `StdioStatusFlags` metadata derived from these same `flags`. This
-        // backend has no such per-fd status-flag storage of its own (`DeviceFileHandle` is a
-        // stateless `Copy` type), so previously this `unimplemented!()`'d unconditionally instead
-        // of ever reaching that shim-layer handling -- crashing the whole process on any
-        // `open("/dev/stdin"|"/dev/stdout"|"/dev/stderr"|"/dev/urandom", O_NONBLOCK)`.
+        // `O_NONBLOCK` must be accepted and ignored here, never rejected: libuv/Node reopens
+        // `/dev/stdin` non-blocking, and `EAGAIN` is delivered by the shim's `do_read` from
+        // `StdioStatusFlags` metadata, not by this stateless backend.
+        // See gm mutable mut-1789043596575.
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
@@ -350,18 +646,23 @@ where
                 // /dev/null read returns EOF
                 Ok(0)
             }
-            Device::URandom => {
+            Device::URandom | Device::Random => {
+                // `/dev/random` is treated identically to `/dev/urandom`: no entropy-starvation
+                // model. See gm mutable mut-1789043610245.
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 Ok(buf.len())
             }
-            // Real Linux VT devices support read()/write() (raw keyboard/console I/O); no
-            // caller on this codebase's actual VT usage path (`seatd`'s open + VT_GETSTATE/
-            // VT_SETMODE/KDSETMODE/KDSKBMODE ioctls, see `litebox_shim_linux`'s VT subsystem)
-            // ever reads or writes these nodes, so this deliberately rejects rather than
-            // silently returning zero bytes -- matching `DriDevices::read`'s identical
-            // "fail loud, not silently wrong" rationale for a device-node shape this backend
-            // does not implement the full byte-stream protocol for.
-            Device::Tty0 | Device::Tty1 => Err(ReadError::NotForReading),
+            Device::Zero | Device::Full => {
+                // /dev/zero and /dev/full both deliver an endless NUL-byte stream on read.
+                buf.fill(0);
+                Ok(buf.len())
+            }
+            // Reject, never return 0 bytes: `seatd` only ever ioctls these nodes, so a silent
+            // empty read would hide a real caller this backend cannot serve.
+            // See gm mutable mut-1789043589437.
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
+                Err(ReadError::NotForReading)
+            }
         }
     }
 
@@ -371,19 +672,26 @@ where
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
-            Device::Null | Device::URandom => {
-                // /dev/null discards data: report as if written fully
-                //
-                // Writing to /dev/random or /dev/urandom will update the entropy
-                // pool with the data written, but this will not result in a higher
-                // entropy count. This means that it will impact the contents read
-                // from both files, but it will not make reads from /dev/random
-                // faster. For simplicity, we just discard the data written to
-                // /dev/urandom here.
+            Device::Null | Device::URandom | Device::Random => {
+                // Discarded, not stirred in: a real `/dev/[u]random` write perturbs the entropy
+                // pool (without raising the entropy count), which litebox does not model.
+                // See gm mutable mut-1789043610245.
                 return Ok(buf.len());
             }
-            // See `Device::Tty0 | Device::Tty1`'s identical rationale in `read` above.
-            Device::Tty0 | Device::Tty1 => return Err(WriteError::NotForWriting),
+            Device::Zero => {
+                // /dev/zero discards writes, same as /dev/null.
+                return Ok(buf.len());
+            }
+            Device::Full => {
+                // Real `/dev/full` gives `ENOSPC`; `WriteError` has no no-space variant, so `Io`
+                // is the deliberate stand-in -- never `Ok`, which callers' error paths test for.
+                // See gm mutable mut-1789043610245.
+                return Err(WriteError::Io);
+            }
+            // Reject, never silently succeed -- see gm mutable mut-1789043589437.
+            Device::Tty0 | Device::Tty1 | Device::Console | Device::Tty | Device::Ptmx => {
+                return Err(WriteError::NotForWriting);
+            }
         };
         self.litebox
             .x
@@ -398,13 +706,24 @@ where
         Err(TruncateError::IsTerminalDevice)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty0 | Device::Tty1 => {
-                SeekBehavior::NonSeekable
+            Device::Stdin
+            | Device::Stdout
+            | Device::Stderr
+            | Device::Tty0
+            | Device::Tty1
+            | Device::Console
+            | Device::Tty
+            | Device::Ptmx => SeekBehavior::NonSeekable,
+            Device::Null | Device::URandom | Device::Zero | Device::Random | Device::Full => {
+                SeekBehavior::ZeroPosition
             }
-            Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
     }
 
@@ -415,6 +734,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -488,11 +808,9 @@ const DRI_RENDERD128_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0xE280),
 };
 
-/// A DRM device node -- `card0` (the control/modeset node) or `renderD128` (the
-/// render-only node). Real DRM devices always ship at least the control node; a render
-/// node is only meaningful once real GPU-accelerated rendering (as opposed to the
-/// dumb-buffer path) is implemented, but is included now since userspace libraries
-/// (`libdrm`) commonly probe for it and quietly skip it if absent.
+/// A DRM device node -- `card0` (the control/modeset node) or `renderD128` (the render-only
+/// node). `renderD128` is exposed even though only the dumb-buffer path is implemented, because
+/// `libdrm` commonly probes for a render node and quietly skips it if absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriDevice {
     Card0,
@@ -500,8 +818,10 @@ pub enum DriDevice {
 }
 
 impl DriDevice {
-    const ALL: &'static [(&'static str, DriDevice)] =
-        &[("card0", DriDevice::Card0), ("renderD128", DriDevice::RenderD128)];
+    const ALL: &'static [(&'static str, DriDevice)] = &[
+        ("card0", DriDevice::Card0),
+        ("renderD128", DriDevice::RenderD128),
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
@@ -513,12 +833,10 @@ impl DriDevice {
             DriDevice::RenderD128 => DRI_RENDERD128_NODE_INFO,
         };
         FileStatus {
+            nlink: 1,
             file_type: FileType::CharacterDevice,
-            // Real DRM nodes are `crw-rw----`, group `video` -- litebox's own guest
-            // identity always runs as root (see `initialize_root_in_mem_layer`'s doc
-            // comment elsewhere in this codebase), so group-readable is sufficient for
-            // every guest process to open this node without needing a real group-membership
-            // model.
+            // Real DRM nodes are `crw-rw----` group `video`; litebox's guest identity is
+            // always root, so group-readable suffices. See gm mutable mut-1789043627523.
             mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
             size: 0,
             owner: UserInfo::ROOT,
@@ -530,19 +848,10 @@ impl DriDevice {
     }
 }
 
-/// A [`super::backend::Backend`] exposing `/dev/dri/{card0,renderD128}` -- the DRM
-/// device nodes a "dumb buffer" software display client opens to enumerate a virtual
-/// display, allocate a pixel buffer, and page-flip it. Mounted as its own nested backend
-/// at `/dev/dri` (see the composer's nested-mount support), separate from [`Devices`]
-/// at `/dev`, since [`Devices`]' own `walk_directories` is a flat, single-level
-/// namespace with no subdirectory support.
-///
-/// This backend only handles the filesystem-visible SHAPE of the device nodes (open,
-/// stat, permissions, directory listing) -- the actual DRM ioctl protocol (buffer
-/// allocation, mode-setting, page-flip) is handled by `litebox_shim_linux`'s
-/// `DrmSubsystem`, reached once a guest has successfully `open()`ed one of these nodes,
-/// mirroring how `Devices`' own stdio entries are thin filesystem shells around state
-/// that actually lives in the shim layer.
+/// A [`super::backend::Backend`] exposing `/dev/dri/{card0,renderD128}` -- the device-node SHAPE
+/// only (open/stat/permissions/listing); the DRM ioctl protocol lives in `litebox_shim_linux`'s
+/// `DrmSubsystem`. Must be a nested mount at `/dev/dri`: [`Devices`]' own `walk_directories` is a
+/// flat single-level namespace with no subdirectory support.
 pub struct DriDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -670,13 +979,9 @@ where
     }
 
     fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // Real Linux DRM device nodes DO support read() -- it delivers queued
-        // DRM_EVENT_FLIP_COMPLETE/DRM_EVENT_VBLANK events (struct drm_event), not raw pixel
-        // bytes. That event-delivery path isn't implemented yet (page-flip completion is a
-        // stub in this pass -- see DrmSubsystem's own doc comment), so reads are rejected
-        // outright for now rather than silently returning zero bytes as if no event were
-        // ever pending, which would be a worse lie: a real client polling for flip
-        // completion would spin forever instead of failing loudly.
+        // Real DRM `read()` delivers queued `drm_event` records, not pixel bytes, and that path
+        // is still a stub: reject rather than return 0, or a client polling for flip completion
+        // spins forever. See gm mutable mut-1789043637459.
         Err(ReadError::NotForReading)
     }
 
@@ -686,6 +991,10 @@ where
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
@@ -699,6 +1008,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -766,11 +1076,9 @@ const INPUT_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x0D40),
 };
 
-/// An evdev input device node -- only `event0` (one virtual keyboard+mouse device) is
-/// exposed in this pass; a real system typically has one event node per physical input
-/// device, but a single combined node is a real, valid evdev shape (e.g. a USB
-/// keyboard-with-trackpad reports both `EV_KEY` and `EV_REL` on one node) and is
-/// sufficient for a single virtual display with one virtual input source.
+/// An evdev input device node. Only `event0` is exposed: one combined keyboard+mouse node is a
+/// real, valid evdev shape (a USB keyboard-with-trackpad reports both `EV_KEY` and `EV_REL` on one
+/// node) and is sufficient for one virtual display with one virtual input source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDevice {
     Event0,
@@ -786,10 +1094,10 @@ impl InputDevice {
     fn file_status(self) -> FileStatus {
         let InputDevice::Event0 = self;
         FileStatus {
+            nlink: 1,
             file_type: FileType::CharacterDevice,
-            // Real evdev nodes are `crw-r-----`, group `input` -- same rationale as
-            // `DriDevice::file_status`: litebox's guest identity is always root, so
-            // group-readable is enough for every guest process to open this node.
+            // Real evdev nodes are `crw-r-----` group `input`; litebox's guest identity is
+            // always root, so group-readable suffices. See gm mutable mut-1789043627523.
             mode: Mode::RUSR | Mode::WUSR | Mode::RGRP,
             size: 0,
             owner: UserInfo::ROOT,
@@ -801,17 +1109,232 @@ impl InputDevice {
     }
 }
 
-/// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the evdev node a guest
-/// keyboard/mouse-driven GUI toolkit reads raw `struct input_event` records from.
-/// Mounted as its own nested backend at `/dev/input`, mirroring [`DriDevices`] at
-/// `/dev/dri` (see that type's own doc comment for why a nested mount is needed instead
-/// of adding directly to the flat, single-level [`Devices`] namespace).
-///
-/// This backend only handles the filesystem-visible SHAPE of the device node (open,
-/// stat, permissions, directory listing) -- the actual evdev protocol (capability-query
-/// ioctls, and the real `input_event` byte stream) is handled by `litebox_shim_linux`'s
-/// `EvdevSubsystem`, reached once a guest has successfully `open()`ed this node,
-/// mirroring how [`DriDevices`] hands off to `litebox_shim_linux`'s `DrmSubsystem`.
+/// The set of currently-allocated pty ids, shared with `litebox_shim_linux`'s `GlobalState`.
+/// A deliberate mirror of the shim's own `pty_registry`, whose typed-fd values cannot cross the
+/// crate boundary; `ptmx_open`/`ptmx_closed`/`attach_pty_stdio` are the only sites that mutate
+/// either, so the two cannot drift.
+pub type PtsRegistry = alloc::collections::BTreeSet<u32>;
+
+/// A [`super::backend::Backend`] exposing `/dev/pts/<id>` for every live pty. It exists so that
+/// `/dev/pts` ITSELF is `open(O_DIRECTORY)`-able and listable: glibc's `ttyname_r` opens and scans
+/// that directory to cross-check its `/proc/self/fd` readlink, and fails every `openpty()` without
+/// it. Nested mount at `/dev/pts`, under the same constraint as [`DriDevices`].
+pub struct PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    registry: alloc::sync::Arc<crate::sync::RwLock<Platform, PtsRegistry>>,
+}
+
+impl<Platform> PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    /// Construct a new `PtsDevices` backend sharing the given `registry` -- the shim keeps its own
+    /// clone of the same `Arc` and updates it as ptys are allocated and freed.
+    #[must_use]
+    pub fn new(
+        _litebox: &LiteBox<Platform>,
+        _allocator: InodeAllocator,
+        registry: alloc::sync::Arc<crate::sync::RwLock<Platform, PtsRegistry>>,
+    ) -> Self {
+        Self { registry }
+    }
+}
+
+/// Owned file handle; identifies which pty slave (by id) backs this fd. Never carries real I/O --
+/// the shim intercepts every `open("/dev/pts/<id>")` first; this is the correctly-shaped fallback
+/// for a stat/access that interception misses, so such a caller gets an answer and not a panic.
+#[derive(Debug, Clone, Copy)]
+pub struct PtsDeviceFileHandle {
+    id: u32,
+}
+
+/// Directory handle, reused for both walking and owned dir handles (no borrows needed).
+#[derive(Debug, Clone, Copy)]
+pub struct PtsDeviceDirHandle;
+
+impl<Platform> super::backend::private::Sealed for PtsDevices<Platform> where
+    Platform: RawSyncPrimitivesProvider + 'static
+{
+}
+
+impl<Platform> BackendHandles for PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    type WalkingDirHandle<'a> = PtsDeviceDirHandle;
+    type FileHandle = PtsDeviceFileHandle;
+    type DirHandle = PtsDeviceDirHandle;
+}
+
+impl<Platform> Backend for PtsDevices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(PtsDeviceDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        if let Some(&component) = components.first() {
+            let exists = component
+                .parse::<u32>()
+                .is_ok_and(|id| self.registry.read().contains(&id));
+            if exists {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let id = name
+            .parse::<u32>()
+            .ok()
+            .filter(|id| self.registry.read().contains(id))
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(PtsDeviceFileHandle { id }),
+            permissions: PermissionCheck::ByBackend,
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(self
+            .registry
+            .read()
+            .iter()
+            .map(|id| DirEntry {
+                name: format!("{id}"),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(devpts_slave_status(*id).node_info),
+            })
+            .collect())
+    }
+
+    fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        // Real pty I/O never reaches this backend -- see gm mutable mut-1789043570653.
+        Err(ReadError::NotForReading)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
+        SeekBehavior::NonSeekable
+    }
+
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(devpts_slave_status(h.get_typed::<Self>().id))
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        // Must be the SAME shape the shim's own `stat("/dev/pts")` answers with, not a separate
+        // `root_inode`: glibc's `ttyname_r` compares the two. See gm mutable mut-1789043570653.
+        Ok(devpts_dir_status())
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+}
+
+/// A [`super::backend::Backend`] exposing `/dev/input/event0` -- the device-node SHAPE only
+/// (open/stat/permissions/listing); the evdev capability ioctls and `input_event` byte stream live
+/// in `litebox_shim_linux`'s `EvdevSubsystem`. Nested mount at `/dev/input`, under the same
+/// constraint as [`DriDevices`].
 pub struct InputDevices<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -941,13 +1464,9 @@ where
     }
 
     fn read(&self, _h: &FileHandle, _buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
-        // Real evdev reads deliver queued `struct input_event` records, handled by
-        // `litebox_shim_linux`'s `EvdevSubsystem` (reached once the guest has opened this
-        // node) rather than this filesystem-shape-only backend -- see this type's own doc
-        // comment. Rejecting outright here (rather than silently returning zero bytes) is
-        // deliberate: `EvdevSubsystem` intercepts `read()` on this fd before this method is
-        // ever reached in practice (mirroring `DriDevices::read`'s identical rationale), so
-        // reaching this specific code path means something bypassed that interception.
+        // `EvdevSubsystem` intercepts `read()` on this fd before this method is ever reached, so
+        // reaching it means something bypassed that interception: reject rather than return 0.
+        // See gm mutable mut-1789043637459.
         Err(ReadError::NotForReading)
     }
 
@@ -957,6 +1476,10 @@ where
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
@@ -970,6 +1493,7 @@ where
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         let _h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -1027,15 +1551,9 @@ where
     }
 }
 
-
-/// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- the minimal set a real
-/// `libudev`/`libdrm` device-enumeration walk actually reads:
-/// `udev_enumerate_scan_devices()` opens `uevent` (to populate `udev_device` properties)
-/// and reads the `dev`/`subsystem` attributes via `sysattr` lookups that fall back to
-/// reading these same files directly when no udev database is present (as is always the
-/// case here, since litebox has no `udevd`/`/run/udev` database at all). This matches the
-/// real, stable shape every Linux kernel has shipped under `/sys/class/drm/cardN/` since
-/// DRM's sysfs class was added -- not a guess.
+/// A leaf file inside `/sys/class/drm/{card0,renderD128}/` -- exactly the set a real
+/// `libudev`/`libdrm` enumeration walk falls back to reading when no `udevd` database exists,
+/// which in litebox is always.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysDrmFile {
     /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines, the same content the
@@ -1047,6 +1565,11 @@ pub enum SysDrmFile {
     /// Symlink to the (synthetic) `drm` subsystem directory -- `libudev` reads this
     /// link's target basename to populate `udev_device_get_subsystem()`.
     Subsystem,
+    /// `<name>/device/uevent` -- the *device's own* uevent file, one level below
+    /// [`SysDrmFile::Uevent`]; libdrm's `drmGetDevice2()` fails without it. Deliberately absent
+    /// from [`SysDrmFile::ALL`], which covers only the real `<name>/` directory, and therefore
+    /// reachable solely via [`SysDrmDirHandle::DeviceOf`].
+    DeviceUevent,
 }
 
 impl SysDrmFile {
@@ -1076,6 +1599,31 @@ const SYS_DRM_RENDERD128_DIR_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
+/// Node info for the synthetic `/sys/class/drm/card0/device` directory.
+const SYS_DRM_CARD0_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 28,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/renderD128/device` directory.
+const SYS_DRM_RENDERD128_DEVICE_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 29,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/card0/device/drm` directory.
+const SYS_DRM_CARD0_DEVICE_DRM_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 30,
+    rdev: None,
+};
+/// Node info for the synthetic `/sys/class/drm/renderD128/device/drm` directory.
+const SYS_DRM_RENDERD128_DEVICE_DRM_DIR_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 31,
+    rdev: None,
+};
+
 impl DriDevice {
     /// The `MAJOR`/`MINOR`/`DEVNAME` values this device reports under
     /// `/sys/class/drm/<name>/`, reusing the exact same major/minor numbers already
@@ -1093,18 +1641,28 @@ impl DriDevice {
             DriDevice::RenderD128 => SYS_DRM_RENDERD128_DIR_NODE_INFO,
         }
     }
+
+    /// Node info for this device's synthetic `<name>/device` directory.
+    fn sys_device_dir_node_info(self) -> NodeInfo {
+        match self {
+            DriDevice::Card0 => SYS_DRM_CARD0_DEVICE_DIR_NODE_INFO,
+            DriDevice::RenderD128 => SYS_DRM_RENDERD128_DEVICE_DIR_NODE_INFO,
+        }
+    }
+
+    /// Node info for this device's synthetic `<name>/device/drm` directory.
+    fn sys_device_drm_dir_node_info(self) -> NodeInfo {
+        match self {
+            DriDevice::Card0 => SYS_DRM_CARD0_DEVICE_DRM_DIR_NODE_INFO,
+            DriDevice::RenderD128 => SYS_DRM_RENDERD128_DEVICE_DRM_DIR_NODE_INFO,
+        }
+    }
 }
 
-/// A [`super::backend::Backend`] exposing the minimal `/sys/class/drm/{card0,renderD128}/`
-/// subtree a real `libudev`-based DRM client (e.g. `weston`'s `drm-backend.so`) needs to
-/// enumerate litebox's one emulated DRM device. This is deliberately NOT a general
-/// procfs/sysfs emulation -- only the exact files real `udev_enumerate_scan_devices()` +
-/// `udev_device_new_from_syspath()` calls read (`uevent`, `dev`, `subsystem`) are served,
-/// for exactly the two DRM nodes [`DriDevices`] already exposes at `/dev/dri`. Mounted at
-/// `/sys/class/drm`; the composer's virtual-directory auto-synthesis (see
-/// `super::composer::ComposerBuilder::build`) creates the `/sys` and `/sys/class` ancestor
-/// directories automatically, so this backend only needs to handle its own two-level
-/// subtree (`card0`/`renderD128`, each containing `uevent`/`dev`/`subsystem`).
+/// A [`super::backend::Backend`] serving the minimal `/sys/class/drm/{card0,renderD128}/` subtree
+/// a `libudev` DRM client enumerates (`uevent`/`dev`/`subsystem`), plus a synthetic
+/// `<name>/device/drm/<name>` looping back to `/sys/class/drm/<name>`: libdrm's
+/// `drmGetDeviceNameFromFd2()` (wlroots/labwc) `stat`s it or fails "Failed to create DRM backend".
 pub struct SysClassDrm<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1130,12 +1688,18 @@ where
     }
 }
 
-/// Directory handle: either the backend's mount root (`/sys/class/drm` itself) or inside
-/// one specific device's subdirectory (`/sys/class/drm/<name>`).
+/// Directory handle: the backend's mount root (`/sys/class/drm` itself), one specific device's
+/// subdirectory (`/sys/class/drm/<name>`), that device's synthetic `device` subdirectory, or that
+/// subdirectory's own `drm` subdirectory.
 #[derive(Debug, Clone, Copy)]
 pub enum SysDrmDirHandle {
     Root,
     Device(DriDevice),
+    /// `/sys/class/drm/<name>/device` -- the `DriDevice` is the device this synthetic
+    /// directory hangs off of (i.e. whose `device` component was walked), not a target.
+    DeviceOf(DriDevice),
+    /// `/sys/class/drm/<name>/device/drm` -- same `DriDevice` semantics as `DeviceOf`.
+    DeviceDrmOf(DriDevice),
 }
 
 /// Owned file handle; identifies which device's which sysfs attribute file backs this fd.
@@ -1185,34 +1749,46 @@ where
                 let Some(device) = DriDevice::from_name(component) else {
                     return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                 };
-                // Walked one real directory level (`card0`/`renderD128`) -- the resolver
-                // uses `components.len()` both to check per-level permissions and, via
-                // `walk_path_following_symlinks`, to know how many of the caller's path
-                // components were consumed as directories, so this MUST be populated
-                // (unlike the flat `DriDevices`/`Devices` backends, which never walk past
-                // their mount root and so correctly leave this empty).
+                // MUST be populated: the resolver reads `components.len()` both for per-level
+                // permissions and to know how many path components were consumed as directories.
+                // See gm mutable mut-1789043705517.
                 let walked = vec![WalkedComponent {
                     permissions: PermissionCheck::ByBackend,
                 }];
                 if components.len() == 1 {
                     return Ok(WalkOutcome {
                         components: walked,
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 }
-                // Second component: must name one of this device's leaf files: stop here
-                // (a leaf file is never a directory), leaving the resolver/caller to
-                // resolve the final component itself (matching `TarRo`'s own convention).
+                // Second component: a leaf file stops the walk -- the caller resolves the final
+                // component itself, as `TarRo` does -- while `device` continues it.
+                // See gm mutable mut-1789043705517.
                 if components.len() == 2 && SysDrmFile::from_name(components[1]).is_some() {
                     return Ok(WalkOutcome {
                         components: walked,
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                if components[1] == "device" {
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
+                        &components[2..],
+                    )?;
+                    // Prepend BOTH components consumed here: `card0`/`renderD128` AND `device`
+                    // itself, which the delegated call never counts. Undercounting trips the
+                    // composer's own walk-length assertion. See gm mutable mut-1789043705517.
+                    let mut components_out = walked;
+                    components_out.push(WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
                     });
                 }
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
@@ -1225,22 +1801,128 @@ where
                 let Some(&component) = components.first() else {
                     return Ok(WalkOutcome {
                         components: vec![],
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
-                            device,
-                        )),
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
                         stop_reason: WalkStopReason::CompleteDirectory,
                     });
                 };
                 if SysDrmFile::from_name(component).is_some() {
                     return Ok(WalkOutcome {
                         components: vec![],
-                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(device)),
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
+                }
+                if component == "device" {
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(device)),
+                        &components[1..],
+                    )?;
+                    // Count the `device` component itself -- see gm mutable mut-1789043705517.
+                    let mut components_out = vec![WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    }];
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
+                    });
+                }
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysDrmDirHandle::DeviceOf(device) => {
+                // Inside the synthetic `<name>/device` directory: only `drm` exists here, and
+                // walking into it continues one more synthetic level.
+                // See gm mutable mut-1789043688678.
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                if component == "drm" {
+                    let walked = vec![WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    }];
+                    if components.len() == 1 {
+                        return Ok(WalkOutcome {
+                            components: walked,
+                            last: WalkingDirHandle::from_typed::<Self>(
+                                SysDrmDirHandle::DeviceDrmOf(device),
+                            ),
+                            stop_reason: WalkStopReason::CompleteDirectory,
+                        });
+                    }
+                    let mut outcome = self.walk_directories(
+                        WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(device)),
+                        &components[1..],
+                    )?;
+                    // Prepend the `drm` component this arm consumed -- same walk-length
+                    // invariant; see gm mutable mut-1789043705517.
+                    let mut components_out = walked;
+                    components_out.append(&mut outcome.components);
+                    return Ok(WalkOutcome {
+                        components: components_out,
+                        last: outcome.last,
+                        stop_reason: outcome.stop_reason,
+                    });
+                }
+                // Leaf stops, not walkable directories: libdrm's `drmGetDevice2()` fails if
+                // either is unhandled. See gm mutable mut-1789043688678.
+                if component == "subsystem" || component == "uevent" {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceOf(
                             device,
                         )),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
                     });
                 }
                 Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+            }
+            SysDrmDirHandle::DeviceDrmOf(device) => {
+                // Inside the synthetic `<name>/device/drm` directory: `card0`/`renderD128` each
+                // resolve back to the real `/sys/class/drm/<name>` -- the self-referencing loop
+                // real PCI topology produces. See gm mutable mut-1789043688678.
+                let Some(&component) = components.first() else {
+                    return Ok(WalkOutcome {
+                        components: vec![],
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::DeviceDrmOf(
+                            device,
+                        )),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                };
+                let Some(target) = DriDevice::from_name(component) else {
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                };
+                let walked = vec![WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                }];
+                if components.len() == 1 {
+                    return Ok(WalkOutcome {
+                        components: walked,
+                        last: WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(target)),
+                        stop_reason: WalkStopReason::CompleteDirectory,
+                    });
+                }
+                // Beyond here (e.g. `.../drm/card0/uevent`) delegate into the real
+                // `Device(target)` walk -- looping back is the point -- prepending the component
+                // this arm consumed. See gm mutable mut-1789043705517.
+                let mut outcome = self.walk_directories(
+                    WalkingDirHandle::from_typed::<Self>(SysDrmDirHandle::Device(target)),
+                    &components[1..],
+                )?;
+                let mut components_out = walked;
+                components_out.append(&mut outcome.components);
+                Ok(WalkOutcome {
+                    components: components_out,
+                    last: outcome.last,
+                    stop_reason: outcome.stop_reason,
+                })
             }
         }
     }
@@ -1266,11 +1948,20 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let SysDrmDirHandle::Device(device) = dir else {
-            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+        // `device/drm` has no leaf files of its own, so a plain-file open inside it is always
+        // `ENOENT`; `device` has exactly one (`uevent`), its `subsystem` being a symlink served
+        // by `read_link_at`. See gm mutable mut-1789043688678.
+        let (device, file) = match dir {
+            SysDrmDirHandle::Device(device) => {
+                let file = SysDrmFile::from_name(name)
+                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                (device, file)
+            }
+            SysDrmDirHandle::DeviceOf(device) if name == "uevent" => {
+                (device, SysDrmFile::DeviceUevent)
+            }
+            _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
-        let file = SysDrmFile::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
 
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -1305,6 +1996,31 @@ where
                     ino_info: None,
                 })
                 .collect()),
+            SysDrmDirHandle::DeviceOf(device) => Ok(vec![
+                DirEntry {
+                    name: String::from("drm"),
+                    file_type: FileType::Directory,
+                    ino_info: Some(device.sys_device_drm_dir_node_info()),
+                },
+                DirEntry {
+                    name: String::from("subsystem"),
+                    file_type: FileType::Symlink,
+                    ino_info: None,
+                },
+                DirEntry {
+                    name: String::from("uevent"),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                },
+            ]),
+            SysDrmDirHandle::DeviceDrmOf(_) => Ok(DriDevice::ALL
+                .iter()
+                .map(|(n, d)| DirEntry {
+                    name: String::from(*n),
+                    file_type: FileType::Directory,
+                    ino_info: Some(d.sys_dir_node_info()),
+                })
+                .collect()),
         }
     }
 
@@ -1314,20 +2030,28 @@ where
         name: &str,
     ) -> Result<Option<String>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let SysDrmDirHandle::Device(_) = dir else {
-            return Ok(None);
-        };
-        let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
-            return Ok(None);
-        };
-        // Real sysfs `subsystem` links are relative, e.g. `../../../../class/drm`,
-        // resolving back up to the `drm` class directory -- `libudev` only reads the
-        // link target's basename (`drm`) to populate `udev_device_get_subsystem()`, so
-        // the exact number of `../` hops does not matter as long as the final basename
-        // is right (litebox's `/sys/class/drm` mount is itself a virtual directory with
-        // no real sibling classes, so this link is illustrative rather than
-        // independently walkable -- matching real udev's own basename-only usage).
-        Ok(Some(String::from("../../../class/drm")))
+        match dir {
+            SysDrmDirHandle::Device(_) => {
+                let Some(SysDrmFile::Subsystem) = SysDrmFile::from_name(name) else {
+                    return Ok(None);
+                };
+                // Only the basename is load-bearing: `libudev` reads it for
+                // `udev_device_get_subsystem()` and never walks the `../` hops.
+                // See gm mutable mut-1789043689557.
+                Ok(Some(String::from("../../../class/drm")))
+            }
+            SysDrmDirHandle::DeviceOf(_) => {
+                if name != "subsystem" {
+                    return Ok(None);
+                }
+                // Must be `platform`, never `pci`: it is what the kernel itself reports for a
+                // bus-less DRM device (`simpledrm`/`vkms`) and the one value libdrm's
+                // `drm_device_get_subsystem_type()` accepts without erroring.
+                // See gm mutable mut-1789043688678.
+                Ok(Some(String::from("../../../bus/platform")))
+            }
+            SysDrmDirHandle::Root | SysDrmDirHandle::DeviceDrmOf(_) => Ok(None),
+        }
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -1339,6 +2063,10 @@ where
             }
             SysDrmFile::Dev => format!("{major}:{minor}\n"),
             SysDrmFile::Subsystem => return Err(ReadError::NotForReading),
+            // `drm_device_get_bustype()` only needs this file to exist and be readable -- no
+            // specific key -- bus classification having already happened via the `subsystem`
+            // symlink read just before. See gm mutable mut-1789043688678.
+            SysDrmFile::DeviceUevent => String::from("DRIVER=litebox\n"),
         };
         let bytes = content.as_bytes();
         let start = offset.min(bytes.len());
@@ -1356,6 +2084,10 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
@@ -1369,8 +2101,10 @@ where
             }
             SysDrmFile::Dev => format!("{major}:{minor}\n").len(),
             SysDrmFile::Subsystem => 0,
+            SysDrmFile::DeviceUevent => "DRIVER=litebox\n".len(),
         };
         Ok(FileStatus {
+            nlink: 1,
             // Real sysfs attribute files report as regular files (`lstat` on the
             // `subsystem` symlink itself is handled by the resolver via `read_link_at`,
             // never reaching here for a plain, symlink-following `open()`/`stat()`).
@@ -1387,6 +2121,8 @@ where
                     (DriDevice::RenderD128, SysDrmFile::Uevent) => 18,
                     (DriDevice::RenderD128, SysDrmFile::Dev) => 19,
                     (DriDevice::RenderD128, SysDrmFile::Subsystem) => 20,
+                    (DriDevice::Card0, SysDrmFile::DeviceUevent) => 33,
+                    (DriDevice::RenderD128, SysDrmFile::DeviceUevent) => 34,
                 },
                 rdev: None,
             },
@@ -1401,8 +2137,11 @@ where
         let node_info = match h {
             SysDrmDirHandle::Root => self.root_inode.clone(),
             SysDrmDirHandle::Device(device) => device.sys_dir_node_info(),
+            SysDrmDirHandle::DeviceOf(device) => device.sys_device_dir_node_info(),
+            SysDrmDirHandle::DeviceDrmOf(device) => device.sys_device_drm_dir_node_info(),
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -1467,39 +2206,16 @@ const UDEV_DB_EVENT0_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// Real eudev per-device-database `E:` property lines this backend serves for
-/// `/run/udev/data/c13:64` -- each parsed by `udev_device_read_db()`
-/// (`src/libudev/libudev-device.c`) into a real udev property via
-/// `udev_device_add_property_from_string()`. libinput's `evdev_configure_device()`
-/// (`src/evdev.c`) reads these SPECIFIC property names (`ID_INPUT`/`ID_INPUT_MOUSE`/
-/// `ID_INPUT_KEYBOARD`, matched against `evdev_udev_tag_matches[]`) to decide whether a
-/// device is tagged as supported input at all -- a device with NO `ID_INPUT` property
-/// hits `evdev_configure_device`'s very first check (`(udev_tags &
-/// EVDEV_UDEV_TAG_INPUT) == 0`) and is rejected with "not tagged as supported input
-/// device", logged by the caller as "not using input device". This is NOT read from any
-/// ioctl or sysfs attribute -- real udev normally derives these properties at boot via
-/// `hwdb`/`udev` rules matching the device's real evdev capabilities, which litebox has no
-/// equivalent of; serving them directly here is the correct, faithful substitute for
-/// litebox's one static, known-shape virtual device (a keyboard+mouse-capable device,
-/// matching [`EvdevSubsystem`]'s real `push_key`/`push_rel` capability range).
+/// The exact `E:` property lines `/run/udev/data/c13:64` must carry. libinput's
+/// `evdev_configure_device()` rejects any device without `ID_INPUT` ("not tagged as supported
+/// input device"); real udev derives these from `hwdb` rules at boot, which litebox has none of.
+/// See gm mutable mut-1789043722510.
 const UDEV_DB_EVENT0_CONTENT: &[u8] = b"E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_INPUT_KEYBOARD=1\n";
 
-/// A [`super::backend::Backend`] exposing `/run/udev/data/c13:64` -- real eudev's
-/// per-device database file (`udev_device_read_db()`, `src/libudev/libudev-device.c`):
-/// merely being ABLE TO OPEN this file (any content, even empty) is what real eudev
-/// treats as "this device has a database entry" -> `udev_device->is_initialized = true`.
-/// `libinput_udev_create_context()`'s own device-enumeration walk
-/// (`udev_input_add_devices()`, `src/udev-seat.c`) explicitly skips any device where
-/// `udev_device_get_is_initialized()` is false ("skip unconfigured input device") --
-/// litebox has no real `udevd` ever running to create this file, so without it, the one
-/// virtual input device [`SysClassInput`]/[`InputDevices`] otherwise correctly exposes is
-/// silently rejected by libinput's own enumeration filter. Beyond mere openability, the
-/// file's CONTENT also matters -- see [`UDEV_DB_EVENT0_CONTENT`]'s own doc comment. This is
-/// deliberately NOT a general `/run/udev/data` emulation -- exactly one, fixed file is
-/// served, matching litebox's one static virtual input device; a real system's device
-/// database has one entry per real device and is written by `udevd` at boot, which
-/// litebox has no equivalent of (correctly -- see [`EvdevSubsystem`]'s doc comment on why
-/// litebox's device set is intentionally static per-run).
+/// A [`super::backend::Backend`] serving exactly one file, `/run/udev/data/c13:64` -- eudev's
+/// per-device database entry. Its mere openability sets `udev_device->is_initialized`, without
+/// which `libinput_udev_create_context()` silently skips the one virtual input device
+/// [`InputDevices`] exposes; its contents matter too, see [`UDEV_DB_EVENT0_CONTENT`].
 pub struct UdevDb<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1621,9 +2337,8 @@ where
     }
 
     fn read(&self, _h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
-        // See `UDEV_DB_EVENT0_CONTENT`'s own doc comment: these `E:` property lines are
-        // what makes libinput's `evdev_configure_device()` tag this device as supported
-        // input at all, not just "openable".
+        // These `E:` lines are what make libinput's `evdev_configure_device()` tag this device
+        // as supported input at all, not merely "openable". See gm mutable mut-1789043722510.
         let content = UDEV_DB_EVENT0_CONTENT;
         if offset >= content.len() {
             return Ok(0);
@@ -1642,12 +2357,17 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
 
     fn file_status(&self, _h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: UDEV_DB_EVENT0_CONTENT.len(),
@@ -1661,6 +2381,7 @@ where
 
     fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -1718,12 +2439,9 @@ where
     }
 }
 
-/// A leaf file inside `/sys/class/input/event0/` -- the minimal set a real
-/// `libudev`-based input client (`libinput_udev_create_context()`'s
-/// `udev_enumerate_scan_devices()` walk) needs: `uevent` (populates `udev_device`
-/// properties without a running `udevd`) and `subsystem` (a symlink whose basename
-/// `udev_device_get_subsystem()` reads). Mirrors [`SysDrmFile`]'s exact shape, scoped to
-/// litebox's one virtual input device (`/dev/input/event0`, see [`InputDevice::Event0`]).
+/// A leaf file inside `/sys/class/input/event0/` -- the same minimal set as [`SysDrmFile`], which
+/// is what a real `libudev` input client's `udev_enumerate_scan_devices()` walk reads, scoped to
+/// litebox's one virtual input device ([`InputDevice::Event0`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysInputFile {
     /// `MAJOR=`/`MINOR=`/`DEVNAME=`/`SUBSYSTEM=` key=value lines.
@@ -1755,16 +2473,10 @@ const SYS_INPUT_EVENT0_DIR_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// A [`super::backend::Backend`] exposing the minimal `/sys/class/input/event0/` subtree
-/// a real `libudev`-based input client needs to enumerate litebox's one emulated evdev
-/// device. Deliberately NOT a general procfs/sysfs emulation -- only the exact files real
-/// `udev_enumerate_scan_devices()` + `udev_device_new_from_syspath()` calls read
-/// (`uevent`, `dev`, `subsystem`) are served, for the one node [`InputDevices`] already
-/// exposes at `/dev/input/event0`. Mounted at `/sys/class/input`; the composer's virtual-
-/// directory auto-synthesis creates the `/sys` and `/sys/class` ancestor directories
-/// automatically, so this backend only needs to handle its own one-level subtree
-/// (`event0`, containing `uevent`/`dev`/`subsystem`). Only one device exists, so unlike
-/// [`SysClassDrm`] this backend has no device-selector enum to match on.
+/// A [`super::backend::Backend`] serving the minimal `/sys/class/input/event0/` subtree a
+/// `libudev` input client enumerates for the one node [`InputDevices`] exposes --
+/// `uevent`/`dev`/`subsystem`, never general sysfs. One device only, so unlike [`SysClassDrm`]
+/// there is no device-selector enum.
 pub struct SysClassInput<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -1984,6 +2696,10 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
@@ -1998,6 +2714,7 @@ where
             SysInputFile::Subsystem => 0,
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size,
@@ -2024,6 +2741,7 @@ where
             SysInputDirHandle::Device => SYS_INPUT_EVENT0_DIR_NODE_INFO,
         };
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
@@ -2087,18 +2805,35 @@ where
 enum SysDevCharEntry {
     /// `13:64` -- the virtual input device, target `../../class/input/event0`.
     Input,
+    /// `226:0` -- the virtual DRM primary node, target `../../class/drm/card0`. Required by
+    /// wlroots' `drmGetDeviceNameFromFd2()` (labwc/sway), which weston never calls -- so a
+    /// weston-only check passes with this entry missing while labwc aborts backend creation.
+    /// See gm mutable mut-1789043688678.
+    Drm,
+    /// `226:128` -- the virtual DRM render node, target `../../class/drm/renderD128`. The same
+    /// reverse lookup as [`SysDevCharEntry::Drm`], needed by a later wlroots path: the GBM/EGL
+    /// render-node open, which reports `drmGetDevice2 failed` without it.
+    /// See gm mutable mut-1789043688678.
+    DrmRender,
 }
 
 impl SysDevCharEntry {
-    const ALL: &'static [(&'static str, SysDevCharEntry)] = &[("13:64", SysDevCharEntry::Input)];
+    const ALL: &'static [(&'static str, SysDevCharEntry)] = &[
+        ("13:64", SysDevCharEntry::Input),
+        ("226:0", SysDevCharEntry::Drm),
+        ("226:128", SysDevCharEntry::DrmRender),
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
     }
 
     fn target(self) -> &'static str {
-        let SysDevCharEntry::Input = self;
-        "../../class/input/event0"
+        match self {
+            SysDevCharEntry::Input => "../../class/input/event0",
+            SysDevCharEntry::Drm => "../../class/drm/card0",
+            SysDevCharEntry::DrmRender => "../../class/drm/renderD128",
+        }
     }
 }
 
@@ -2109,19 +2844,24 @@ const SYS_DEV_CHAR_INPUT_NODE_INFO: NodeInfo = NodeInfo {
     rdev: None,
 };
 
-/// A [`super::backend::Backend`] exposing `/sys/dev/char/<major>:<minor>` -- the standard
-/// sysfs reverse-lookup symlink from a character device's `(major, minor)` pair back to
-/// its `/sys/class/*` directory. Real `libudev`'s `udev_device_new_from_devnum()` (used by
-/// `seatd`'s own `seat_open_device()` to canonicalize/re-validate a device path via
-/// `realpath()` + a `stat()`-then-devnum-lookup) reads exactly this symlink; without it,
-/// seatd's device-open sequence silently fails and immediately closes the just-opened fd
-/// (confirmed live: `sys_stat` on `/sys/dev/char/13:64` returns `ENOENT` immediately before
-/// seatd's own `"Closing device"` log line, with zero error in between). Deliberately NOT a
-/// general sysfs `dev/char` emulation -- only the one entry litebox's one static virtual
-/// input device (see [`SysClassInput`]) needs; a real DRM device would need its own entry
-/// too, but DRM's own device-open path does not appear to depend on this lookup succeeding
-/// (its own `/sys/dev/char/<major>:<minor>/device/...` sub-path lookups already fail today,
-/// tolerated by mesa's loader) so it is out of scope here.
+/// Node info for the `226:0` entry.
+const SYS_DEV_CHAR_DRM_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 27,
+    rdev: None,
+};
+
+/// Node info for the `226:128` entry.
+const SYS_DEV_CHAR_DRM_RENDER_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 32,
+    rdev: None,
+};
+
+/// A [`super::backend::Backend`] serving `/sys/dev/char/<major>:<minor>` -- the sysfs reverse
+/// lookup from a char device's `(major, minor)` back to its `/sys/class/*` directory. `libudev`'s
+/// `udev_device_new_from_devnum()` reads it; without it seatd silently closes the fd it just
+/// opened, and wlroots' `drmGetDeviceNameFromFd2()` fails.
 pub struct SysDevChar<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,
@@ -2272,6 +3012,10 @@ where
         Err(TruncateError::NotForWriting)
     }
 
+    fn chmod(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn seek_behavior(&self, _h: &FileHandle) -> SeekBehavior {
         SeekBehavior::PositionBased
     }
@@ -2279,12 +3023,15 @@ where
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let h = h.get_typed::<Self>();
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::RegularFile,
             mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
             size: 0,
             owner: UserInfo::ROOT,
             node_info: match h.entry {
                 SysDevCharEntry::Input => SYS_DEV_CHAR_INPUT_NODE_INFO,
+                SysDevCharEntry::Drm => SYS_DEV_CHAR_DRM_NODE_INFO,
+                SysDevCharEntry::DrmRender => SYS_DEV_CHAR_DRM_RENDER_NODE_INFO,
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
@@ -2294,6 +3041,7 @@ where
 
     fn dir_status(&self, _h: &DirHandle) -> Result<FileStatus, FileStatusError> {
         Ok(FileStatus {
+            nlink: 1,
             file_type: FileType::Directory,
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,

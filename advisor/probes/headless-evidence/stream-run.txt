@@ -1,0 +1,92 @@
+STAGE_DBUS
+STAGE_SEATD
+STAGE_WESTON
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+STAGE_XWAYLAND
+STAGE_XFCONFD
+STAGE_XCHECK
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  30.432217300s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=48 tid=48 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 
+STAGE_XFWM4
+  32.004693200s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=67 tid=67 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 
+  32.467873700s ERROR litebox_shim_linux: diag-guest-exception: pre-signal snapshot exception=Exception(6) kernel_mode=false rip=0x7feffff7fb8a rsp=0x16f6efd8 cr2=0x0 error_co
+  32.467902100s ERROR litebox_shim_linux: diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped) cr2=0x0
+  32.467910900s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(4) pid=13 tid=13 comm=[115, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+STAGE_XFSETTINGSD
+GUESTOUT[xfsettingsd] 
+  41.569693800s ERROR litebox_shim_linux: diag-guest-exception: pre-signal snapshot exception=Exception(14) kernel_mode=false rip=0x18aad270 rsp=0x1a32f010 cr2=0x352e30 error_
+  41.569715600s ERROR litebox_shim_linux: diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped) cr2=0x352e30
+  41.569725000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(11) pid=15 tid=15 comm=[115, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+STAGE_XFDESKTOP
+  47.146731000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=122 tid=122 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+  47.593177600s ERROR litebox_shim_linux: diag-guest-exception: pre-signal snapshot exception=Exception(6) kernel_mode=false rip=0x7feffff7fb8a rsp=0x1d6eefd8 cr2=0x0 error_co
+  47.593205900s ERROR litebox_shim_linux: diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped) cr2=0x0
+  47.593215200s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(4) pid=17 tid=17 comm=[115, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+STAGE_PANEL
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+  72.681279400s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(13) pid=14 tid=14 comm=[116, 97, 105, 108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+GUESTOUT[panel] 
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+  73.172065200s ERROR litebox_shim_linux: diag-guest-exception: pre-signal snapshot exception=Exception(14) kernel_mode=false rip=0x1e04d270 rsp=0x1f8cf010 cr2=0x352e30 error_
+  73.172112200s ERROR litebox_shim_linux: diag-guest-exception: NO mapping overlaps cr2 (genuinely unmapped) cr2=0x352e30
+  73.172296000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(11) pid=18 tid=18 comm=[115, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=39999 distinct_colors_capped64=64
+  75.714170200s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(13) pid=16 tid=16 comm=[116, 97, 105, 108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=39999 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=39999 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=39999 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=40009 distinct_colors_capped64=64
+  86.184406000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(6) pid=161 tid=161 comm=[120, 102, 99, 101, 52, 45, 112, 97, 110, 101,
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=40009 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=99323 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=99323 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=102106 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+  99.487921400s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=125 tid=125 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92661 distinct_colors_capped64=64

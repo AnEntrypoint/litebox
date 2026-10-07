@@ -45,19 +45,170 @@
 use core::ffi::c_void;
 use std::ops::Range;
 
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_EXTENDED_PARAMETER_0,
-    MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MemExtendedParameterAddressRequirements,
-    PAGE_READWRITE, VirtualFreeEx,
+    MEM_EXTENDED_PARAMETER_1, MEM_RELEASE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, UnmapViewOfFile2, VirtualFreeEx,
+    VirtualProtectEx,
 };
+// The placeholder family: reserve address space as a PLACEHOLDER, split it, then replace each
+// piece either with a real section view (`MEM_REPLACE_PLACEHOLDER`) or with ordinary committed
+// memory. This is the ONLY way a shared mapping can be given to another process at a fixed
+// address -- `MapViewOfFile3` cannot be made to overlay memory the child already holds, in any
+// state (`ERROR_INVALID_ADDRESS`, 487, measured for committed, decommitted and merely-reserved
+// alike), so the address must still be FREE-but-reserved at the moment the view is placed.
+// Spelled out here rather than imported so this file does not depend on the exact names
+// `windows-sys` exports for them.
+const PLACEHOLDER_RESERVE: u32 = 0x0004_0000; // MEM_RESERVE_PLACEHOLDER
+const PLACEHOLDER_REPLACE: u32 = 0x0000_4000; // MEM_REPLACE_PLACEHOLDER
+const PLACEHOLDER_PRESERVE: u32 = 0x0000_0002; // MEM_PRESERVE_PLACEHOLDER
+
+use crate::{
+    FORK_CHILD_SHARED_REGIONS_ENV_VAR, encode_fork_shared_regions, shm_section_handle,
+    take_fork_shared_regions,
+};
+use litebox::platform::page_mgmt::{MemoryRegionPermissions, SharedRegionCarry};
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetExitCodeThread, GetProcessId,
+    GetProcessIdOfThread, GetProcessTimes, GetThreadTimes, INFINITE,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
+
+/// Converts a `FILETIME` (100ns ticks since 1601-01-01) to a raw `u64`, matching how the two
+/// halves are meant to be combined (`dwLowDateTime`/`dwHighDateTime` per MSDN, not a native
+/// 64-bit read -- the struct is not guaranteed 8-byte aligned).
+fn filetime_to_u64(ft: FILETIME) -> u64 {
+    (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+}
+
+/// 53rd-pass diagnostic (`docs/AGENTS_ARCHIVE_2026-09-22.md`'s own pickup): real, independent
+/// Windows-level evidence for whether a cross-process-forked child's process HANDLE is being
+/// reported exited/signaled prematurely, ahead of `WaitForSingleObject`'s own return value --
+/// `dbus-daemon`'s activation babysitter was observed reporting "Process X exited, reason
+/// unknown" under 1ms after `fork()`, while the real target binary's `execve` did not appear
+/// until thousands of log lines (and materially later wall-clock time) afterward. Reads the
+/// process's OWN `GetProcessTimes` creation timestamp (set by the kernel at `CreateProcessW`
+/// time, independent of anything litebox's own code believes) and diffs it against
+/// `GetSystemTimeAsFileTime`'s "now" to report a real, kernel-sourced elapsed-ms-since-creation
+/// figure alongside the wait outcome -- this is NOT `Instant::now()` bookkeeping that could itself
+/// be wrong, it is what Windows itself says about this exact process. `eprintln!` (not
+/// `litebox_util_log`) deliberately: this module's other diagnostics use the same convention, and
+/// it must be visible with zero log-filter configuration required (see this pass's exact
+/// AGENTS.md-recorded default `EnvFilter`, which silences most `debug!` call sites by default).
+fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
+    unsafe {
+        let pid = GetProcessId(handle);
+        let mut creation = core::mem::zeroed::<FILETIME>();
+        let mut exit = core::mem::zeroed::<FILETIME>();
+        let mut kernel = core::mem::zeroed::<FILETIME>();
+        let mut user = core::mem::zeroed::<FILETIME>();
+        let got_times = GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        ) != 0;
+        let mut now = core::mem::zeroed::<FILETIME>();
+        GetSystemTimeAsFileTime(&raw mut now);
+        let now_ticks = filetime_to_u64(now);
+        let creation_ticks = filetime_to_u64(creation);
+        let elapsed_ms_since_creation = if got_times && now_ticks >= creation_ticks {
+            (now_ticks - creation_ticks) / 10_000
+        } else {
+            u64::MAX
+        };
+        let mut exit_code: u32 = 0;
+        let got_exit_code = GetExitCodeProcess(handle, &raw mut exit_code) != 0;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
+        let wait_str = match wait_result {
+            WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
+            WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
+            WAIT_FAILED_V => "WAIT_FAILED",
+            _ => "WAIT_OTHER",
+        };
+        eprintln!(
+            "[wait4_diag] {tag} pid={pid} handle={handle:p} wait_result={wait_result:#x}({wait_str}) \
+             GetLastError={get_last_error} got_process_times={got_times} \
+             elapsed_ms_since_CreateProcessW={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
+             exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
+            if exit_code == STILL_ACTIVE {
+                "STILL_ACTIVE"
+            } else {
+                "real_exit_code"
+            },
+            exit_code == STILL_ACTIVE
+        );
+    }
+}
+
+/// Thread-handle counterpart to [`diag_log_wait_evidence`] (pass 59) -- same evidence shape, but
+/// through the THREAD-scoped Win32 APIs (`GetProcessIdOfThread`/`GetThreadTimes`/
+/// `GetExitCodeThread`) instead of their process-scoped namesakes, which either fail outright or
+/// answer a different question entirely when given a thread handle (`GetProcessId` on a thread
+/// handle does not return the owning process's pid; `GetExitCodeProcess` on a thread handle is a
+/// straight `HANDLE`-kind mismatch). Used by [`wait_for_thread_exit`]/[`try_wait_for_thread_exit`]
+/// only -- the process-handle-based callers keep using [`diag_log_wait_evidence`] unchanged.
+fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
+    unsafe {
+        let pid = GetProcessIdOfThread(handle);
+        let mut creation = core::mem::zeroed::<FILETIME>();
+        let mut exit = core::mem::zeroed::<FILETIME>();
+        let mut kernel = core::mem::zeroed::<FILETIME>();
+        let mut user = core::mem::zeroed::<FILETIME>();
+        let got_times = GetThreadTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        ) != 0;
+        let mut now = core::mem::zeroed::<FILETIME>();
+        GetSystemTimeAsFileTime(&raw mut now);
+        let now_ticks = filetime_to_u64(now);
+        let creation_ticks = filetime_to_u64(creation);
+        let elapsed_ms_since_creation = if got_times && now_ticks >= creation_ticks {
+            (now_ticks - creation_ticks) / 10_000
+        } else {
+            u64::MAX
+        };
+        let mut exit_code: u32 = 0;
+        let got_exit_code = GetExitCodeThread(handle, &raw mut exit_code) != 0;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
+        let wait_str = match wait_result {
+            WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
+            WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
+            WAIT_FAILED_V => "WAIT_FAILED",
+            _ => "WAIT_OTHER",
+        };
+        eprintln!(
+            "[wait4_diag] {tag} owning_pid={pid} thread_handle={handle:p} wait_result={wait_result:#x}({wait_str}) \
+             GetLastError={get_last_error} got_thread_times={got_times} \
+             elapsed_ms_since_thread_start={elapsed_ms_since_creation} got_exit_code={got_exit_code} \
+             exit_code={exit_code}({}) exit_code_is_STILL_ACTIVE={}",
+            if exit_code == STILL_ACTIVE {
+                "STILL_ACTIVE"
+            } else {
+                "real_exit_code"
+            },
+            exit_code == STILL_ACTIVE
+        );
+    }
+}
 
 /// Windows' `STILL_ACTIVE` sentinel (`GetExitCodeProcess` returns this as the "exit code" for a
 /// process that has not yet terminated) -- not re-exported by `windows_sys` at this crate's
@@ -125,9 +276,7 @@ pub const RESUME_CHILD_READY_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_READY";
 pub const RESUME_CHILD_FD_MARKER: &str = "LITEBOX_DIAG_RESUME_CHILD_FD_OK";
 
 /// Whether the CURRENT process is a `CreateProcess`-spawned diagnostic resume child (pass 114),
-/// checked by the runner's `main()` before clap-parsing argv. `std::env::var` (not `var_os`) is
-/// deliberate: the marker's value is meaningless, only presence matters, and this mirrors
-/// [`diag_process_fork_spawn_enabled`]'s own presence-check style.
+/// checked by the runner's `main()` before clap-parsing argv.
 #[must_use]
 pub fn is_diagnostic_resume_child() -> bool {
     std::env::var_os(REEXEC_CHILD_ENV_VAR).is_some()
@@ -179,7 +328,11 @@ pub fn run_diagnostic_resume_child() -> Result<(), std::convert::Infallible> {
                                  with {} range(s), arming fork_verify",
                                 relocations.ranges().len()
                             );
-                            crate::fork_verify::begin(alloc::sync::Arc::new(relocations));
+                            // Diagnostic-only probe: no real sigreturn trampoline address is
+                            // transmitted over this channel, so `0` (the documented "none
+                            // established" sentinel `is_sigreturn_trampoline` always rejects) is
+                            // the honest value -- never a real trampoline page to protect here.
+                            crate::fork_verify::begin(alloc::sync::Arc::new(relocations), 0);
                         }
                         None => {
                             eprintln!(
@@ -771,6 +924,627 @@ pub fn diag_process_fork_task_resume_enabled() -> bool {
 /// guest-visible.
 pub const FORK_CHILD_GPRS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GPRS";
 
+/// Carries the PARENT's own already-established `Task::ensure_sigreturn_trampoline` address (hex,
+/// `0` if never established) across the `CreateProcessW`-spawned child boundary -- see
+/// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s own doc comment on
+/// its `sigreturn_trampoline` parameter for the full bug this closes (found live investigating the
+/// `LITEBOX_LAZY_FORK_COMMIT=1` subshell crash: a fork-without-`execve()` child's own freshly-built
+/// `SignalState` starts this at `0`, even though the real trampoline PAGE CONTENT at that address
+/// is already correctly present via the ordinary group-copy mechanism -- the host's own
+/// sigreturn-recognition logic needs the ADDRESS, not just the bytes, so a signal return the child
+/// needs to service crashes as a genuine, unhandled `SIGSEGV` instead of being recognized and
+/// serviced). Never guest-visible.
+pub const FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR: &str =
+    "LITEBOX_INTERNAL_FORK_CHILD_SIGRETURN_TRAMPOLINE";
+
+/// Carries the PARENT's own current `Task::comm` bytes (hex-encoded, so an embedded NUL byte
+/// survives the env-var boundary intact) across the `CreateProcessW`-spawned child boundary -- see
+/// `litebox::platform::PlatformExtensions::spawn_cross_process_fork_child`'s own doc comment on its
+/// `comm` parameter for the full bug this closes (found investigating the same lazy-fork-commit
+/// SIGABRT crash `FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR` was: `LinuxShim::adopt_forked_process`
+/// unconditionally builds the child's own freshly-built `Task` with an EMPTY `comm`, unlike the
+/// thread-based `clone()` path's correct `comm: self.comm.clone()`, so every cross-process fork
+/// child showed a blank `comm` in `DIAG_TIMELINE`/`LITEBOX_DIAG_SYSCALL_TIMELINE` until its own
+/// `execve` -- masquerading as "comm is never inherited at fork" in general before this env var
+/// closed the gap for this one path). Never guest-visible.
+pub const FORK_CHILD_COMM_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_COMM";
+
+/// Path of the descriptor file a fork child re-arms its demand-paged file mappings from.
+pub const FORK_CHILD_LAZY_FILE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_LAZY_FILE";
+
+/// Carries the child's guest identity as `pid:ppid:pgid:pidns:nspid:nstid` (decimal): the pid the
+/// parent's `fork()` returned, so the child's `getpid()` agrees with the parent's `$!`/`wait4()`/
+/// `kill()` view of it instead of being the child's unrelated Windows process id, plus the PID
+/// namespace the child was born into and the pid/tid it holds there (a `clone(CLONE_NEWPID)` child
+/// is pid 1 even though its parent knows it by a different number). The last three are absent from
+/// an older parent's line, which parses as the initial namespace. Never guest-visible.
+pub const FORK_CHILD_GUEST_IDENTITY_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_GUEST_IDENTITY";
+
+/// Carries shim-level fds (unix sockets) a cross-process fork child must rebuild, as
+/// `fd:hexspec` pairs separated by commas; each spec is opaque to the platform (see
+/// `litebox::platform::ForkInheritedShimFd`). Never guest-visible.
+pub const FORK_CHILD_SHIM_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_SHIM_FDS";
+
+/// Parses [`FORK_CHILD_GUEST_IDENTITY_ENV_VAR`] from this process's environment.
+pub fn fork_child_guest_identity() -> Option<litebox::platform::ForkChildIdentity> {
+    let raw = std::env::var(FORK_CHILD_GUEST_IDENTITY_ENV_VAR).ok()?;
+    let mut parts = raw.split(':').map(str::parse::<i32>);
+    let pid = parts.next()?.ok()?;
+    let ppid = parts.next()?.ok()?;
+    let pgid = parts.next()?.ok()?;
+    let pid_ns = parts.next().and_then(Result::ok).unwrap_or(0);
+    let ns_pid = parts.next().and_then(Result::ok).unwrap_or(pid);
+    let ns_tid = parts.next().and_then(Result::ok).unwrap_or(ns_pid);
+    (pid > 0).then_some(litebox::platform::ForkChildIdentity {
+        pid,
+        ppid,
+        pgid,
+        pid_ns,
+        ns_pid,
+        ns_tid,
+    })
+}
+
+/// Carries the guest pipe fds a cross-process `fork()` child must come up holding, as
+/// `fd:handle:direction` triples separated by commas (e.g. `3:1a4:w,0:1b0:r`), where `handle` is
+/// the hex value of an inheritable Windows pipe handle already present in the child by virtue of
+/// `CreateProcessW`'s `bInheritHandles`, and `direction` is [`ChildPipeEnd::tag`] -- `w` if the
+/// child writes that fd, `r` if it reads it.
+///
+/// A handle value passed through the environment looks alarming and is not: handle values are
+/// per-process, and inheritance is what actually makes this one valid in the child -- the number
+/// only says WHICH of the handles it already owns belongs at which fd. It travels the same way
+/// [`FORK_CHILD_GPRS_ENV_VAR`] does, in the child's own environment block, never by mutating this
+/// process's environment. Never guest-visible.
+pub const FORK_CHILD_PIPE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PIPE_FDS";
+
+/// Carries the path of a tar holding the PARENT's writable filesystem layer at the instant of a
+/// cross-process `fork()`, for the child to import over its own freshly-built rootfs.
+///
+/// A cross-process child re-execs this binary and rebuilds its filesystem from the original
+/// `--initial-files` tar plus an empty in-memory upper layer, so without this it starts from a
+/// pristine rootfs and cannot see a single write the parent (or an earlier sibling, via the
+/// child-to-parent export this mirrors) has made. Real `fork()` gives the child the parent's exact
+/// filesystem view, and this is what restores that. Observed the gap directly: `/init`'s `preinit`
+/// creates `/run/s6` in one forked child, that child's export lands back in the parent, and then
+/// `s6-linux-init-maker` in the NEXT child died with `unable to mkdir /run/s6/basedir: No such
+/// file or directory`, because its rootfs had never heard of `/run/s6`.
+///
+/// The importing child must NOT delete this path after reading it: since
+/// [`export_parent_writable_layer_for_child`] started routing every export through
+/// [`publish_as_container_fs_snapshot`], the path this variable carries is almost always the ONE
+/// canonical, well-known [`CONTAINER_FS_SNAPSHOT_ENV_VAR`] file shared by the entire boot tree, not
+/// a fresh single-consumer temp file -- several children spawned in the same narrow window are
+/// routinely hex-identical on this path, and a deleting importer race-deletes the file out from
+/// under every sibling/cousin that has not yet gotten around to opening it, producing `The system
+/// cannot find the file specified. (os error 2)`. Confirmed live 2026-09-17 (seventh pass): the
+/// importer used to `remove_file` it on the mistaken assumption ("Single-use, and this child is
+/// its only reader") that predates the shared-canonical-path mechanism. The file is safe to leave
+/// on disk indefinitely -- every future exporter atomically replaces it in place (`rename` or
+/// `copy` over the same path), exactly like `--resume-from` at the top-level `run()`, which never
+/// deleted it either. Never guest-visible.
+pub const FORK_CHILD_PARENT_LAYER_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_PARENT_LAYER";
+
+/// Carries the regular-file fds a cross-process `fork()` child must come up holding, as
+/// `fd:offset:flags:path` entries separated by commas, all four fields hex (the path is the hex of
+/// its UTF-8 bytes).
+///
+/// The path is hex-encoded rather than quoted because a filesystem path may contain any byte at
+/// all, `:` and `,` included, and an escaping scheme that has to be got right in two places is a
+/// bug waiting to happen for no benefit -- these entries are written and read by the same binary
+/// and never seen by anything else.
+///
+/// Unlike a pipe there is no handle to inherit: the child's filesystem is already the parent's
+/// (see [`FORK_CHILD_PARENT_LAYER_ENV_VAR`]), so it reopens the path and seeks. See
+/// `litebox::platform::ForkInheritedFile` for what that preserves. Never guest-visible.
+pub const FORK_CHILD_FILE_FDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_FILE_FDS";
+
+/// Eventfds the child must recreate, as `fd:count:flags` hex triples joined by `,`.
+///
+/// Same channel and shape as [`FORK_CHILD_FILE_FDS_ENV_VAR`], because an eventfd needs even less
+/// than a file does: no reopen, no bridge, just the counter and its two behaviour bits. See
+/// `litebox::platform::ForkInheritedEventfd`.
+pub const FORK_CHILD_EVENTFDS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_EVENTFDS";
+
+/// Set (to any non-empty value) on a child spawned by
+/// [`litebox::platform::ForkChildVerificationProvider::spawn_exec_collision_child`], read by the
+/// runner's own `run()` to skip `acquire_boot_lock()` for this one, specific case.
+///
+/// The boot lock's own purpose is real and unrelated to this: it exists to make two
+/// INDEPENDENT, accidental concurrent boots of this host's own litebox instances structurally
+/// impossible, because they would silently starve each other for host memory/CPU. A collision
+/// child is not that -- it is one deliberate, synchronous continuation of the SAME logical boot,
+/// and the spawning thread is BLOCKED waiting for it (`Command::status()`), contending for
+/// nothing while the child runs. Without this, the child's own `run()` would hit the SAME
+/// host-wide lock the still-live parent already holds and exit immediately with the lock's own
+/// "another boot is already in progress" error -- confirmed live: exactly this, `raw_status=1`,
+/// before `s6-mkdir` ever ran.
+pub const EXEC_COLLISION_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_EXEC_COLLISION_CHILD";
+
+/// One fixed, well-known tar path, shared by EVERY real OS process this boot ever spawns
+/// (the top-level process sets it once; `Command`'s default env inheritance carries it to
+/// every descendant automatically, fork or exec-collision alike) -- the container's ONE
+/// filesystem, approximated.
+///
+/// **Why this exists, stated precisely.** A real Linux container's processes all share ONE
+/// mount namespace: any process's write is immediately visible to every other, no matter how
+/// the process tree branches. Litebox's cross-process fork and exec-collision hand-offs instead
+/// give each new real OS process a POINT-IN-TIME snapshot (`--resume-from` at spawn,
+/// `--export-writable-layer` at exit) -- correct for a short-lived, run-to-completion child with
+/// no live siblings (`s6-mkdir`, a command-substitution subshell), but wrong the moment two
+/// branches diverge and BOTH stay alive: each keeps writing to its own frozen fork of the
+/// filesystem, invisible to the other, forever. Confirmed live as a real defect, not a
+/// hypothetical one: `s6-svscan`'s long-lived supervision children never saw a servicedir `pid 1`
+/// created well after they were spawned, and kept failing "No such file or directory" on every
+/// retry, each retry re-importing the SAME stale snapshot rather than `pid 1`'s current state.
+///
+/// **The fix, and its honest limit.** Route EVERY hand-off's export and import through this ONE
+/// path instead of a fresh per-call file, and -- critically -- export the SPAWNING process's own
+/// current state to it immediately before every spawn, not only at a child's own exit. This
+/// makes every `--resume-from` as fresh as the most recent spawn or exit ANYWHERE in the tree,
+/// which is exactly right for the sequential, one-event-at-a-time shape almost all of a container
+/// boot actually has. It is NOT a general solution to live, concurrent, continuous filesystem
+/// sharing across real OS processes: two branches that are BOTH independently writing at
+/// overlapping instants can still race (last exporter wins), and nothing propagates to an
+/// already-running long-lived process between ITS OWN spawns -- only a true shared-memory or
+/// IPC-backed filesystem (a real, separate, much larger undertaking) closes that gap completely.
+/// This is the right-sized fix for what the boot actually does, not a claim of full POSIX shared-
+/// filesystem semantics.
+pub const CONTAINER_FS_SNAPSHOT_ENV_VAR: &str = "LITEBOX_INTERNAL_CONTAINER_FS_SNAPSHOT";
+
+/// Whether THIS process's own writable-layer view is known to be a faithful continuation of the
+/// shared boot-tree snapshot it was supposed to adopt (`true`, the default) or a degraded
+/// fallback because that adoption genuinely failed (`false`, set by
+/// [`mark_writable_layer_import_degraded`]).
+///
+/// Exists so [`publish_as_container_fs_snapshot`]'s own regression guard can tell "this export is
+/// smaller because it is a legitimately different, independent branch of the boot tree" (common,
+/// harmless, must publish) apart from "this export is smaller because THIS process itself never
+/// got the real prior state and is about to clobber it with a near-empty view" (rare, the one
+/// case the guard exists for). A raw byte-size comparison alone cannot distinguish these -- see
+/// `publish_as_container_fs_snapshot`'s own fix history for the real, live-observed defect this
+/// caused: a completely healthy sibling's smaller-but-fresher export (e.g. one that legitimately
+/// has fewer bytes than an unrelated branch's own larger one) was silently discarded in favor of a
+/// stale snapshot, live-observed dropping a just-created `/tmp/empty` for several forks in a row
+/// on a real `de_only.sh` boot (66th-67th pass).
+static WRITABLE_LAYER_IMPORT_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Record that this process's own adoption of a shared writable-layer snapshot it was actually
+/// handed (a real, previously-published archive, not merely "none existed yet") failed to parse
+/// or apply -- so this process is now running from a base rootfs it should NOT trust as complete,
+/// and [`publish_as_container_fs_snapshot`] must not let this process's own future exports
+/// silently outrank a real prior snapshot on size alone; the OLD, cruder size-based guard becomes
+/// this flag's fallback behavior specifically for THIS process's own publishes from here on.
+///
+/// Never call this for the ordinary, expected "nothing to import yet" case (the very first spawn
+/// in a fresh boot, or a `--resume-from` path that legitimately does not exist) -- that process's
+/// view is NOT degraded, it simply has nothing to have missed.
+pub fn mark_writable_layer_import_degraded() {
+    WRITABLE_LAYER_IMPORT_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Publishes a freshly-written export as this boot tree's new canonical "latest" filesystem
+/// snapshot (see [`CONTAINER_FS_SNAPSHOT_ENV_VAR`]'s own doc comment), and returns the path a
+/// caller should actually hand to whatever reads it back -- the shared path on success, or
+/// `written_to` itself unchanged if there is no shared path to publish to (the env var was never
+/// set -- should not happen in practice, since `run()` always sets it, but a caller with no
+/// shared destination is no worse off than before this mechanism existed).
+///
+/// `rename`, not copy: atomic on the same volume (both paths are under `std::env::temp_dir()`),
+/// so a concurrent reader of the shared path never observes a half-written file -- at worst,
+/// under genuinely concurrent exports, the LAST rename to land wins, this mechanism's disclosed,
+/// bounded limitation, not silent corruption.
+///
+/// `pub`, not `pub(crate)`: the runner crate's own exiting-child export path (`task-resume-probe`)
+/// used to publish via a raw `std::fs::copy(export_path, shared)` directly onto this same
+/// canonical path instead of going through here -- `copy` is NOT atomic (it overwrites the
+/// destination's bytes in place over real wall-clock time), so a sibling concurrently importing
+/// `shared` could open it mid-copy and read a torn file: part old content, part new, which
+/// `import_writable_layer`'s tar reader then reports as `failed to read tar entry: numeric field
+/// was not a number` rather than a clean success or a clean "file missing". Confirmed live
+/// 2026-09-17 (seventh pass), one occurrence in ~180 adopts across a repro run, immediately
+/// following an exiting child's copy-based publish. Callers outside this crate must route their
+/// publish through this function (copying to a fresh scratch path first, `written_to`, then
+/// calling this) rather than writing to [`CONTAINER_FS_SNAPSHOT_ENV_VAR`]'s path directly, so
+/// every writer shares the one atomic-rename discipline.
+pub fn publish_as_container_fs_snapshot(written_to: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(shared) = std::env::var_os(CONTAINER_FS_SNAPSHOT_ENV_VAR) else {
+        return written_to;
+    };
+    let shared = std::path::PathBuf::from(shared);
+
+    // Non-regression guard, not a real merge (see this module's own doc comment's honest limit on
+    // CONTAINER_FS_SNAPSHOT_ENV_VAR: this is not live, concurrent, continuous sharing).
+    //
+    // Originally a bare byte-size comparison (kept ANY existing snapshot larger than the fresh
+    // export, unconditionally) -- REAL, LIVE-OBSERVED DEFECT, 66th-67th pass: on a real
+    // `de_only.sh` boot, this fired 17 times discarding a perfectly healthy process's own
+    // genuinely fresher, smaller export (its own real writable-layer view, including a
+    // just-created `/tmp/empty`) purely because an UNRELATED sibling branch's own larger export
+    // happened to be the current "shared" value -- a smaller-but-different branch is not a
+    // "regression" at all, and raw size cannot tell the two cases apart. Gating the guard on
+    // [`WRITABLE_LAYER_IMPORT_OK`] instead: the guard's entire justification (s6-supervise
+    // instances re-publishing a near-empty view after losing the shared-file-briefly-missing
+    // import race, oscillating a real snapshot 55808 -> 7680 -> 55808 bytes) is specifically a
+    // process whose OWN import of the shared state it needed just failed. Restrict the size veto
+    // to exactly that self-reported condition; every process whose own import succeeded (or never
+    // needed one -- the boot's very first spawn) always gets to publish its own real, current
+    // view, matching this module's own already-accepted "last exporter wins" semantics for the
+    // common case instead of overriding it with a proxy that was wrong most of the time it fired.
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some();
+    let this_process_degraded =
+        !WRITABLE_LAYER_IMPORT_OK.load(core::sync::atomic::Ordering::Relaxed);
+    if this_process_degraded
+        && let Ok(existing) = std::fs::metadata(&shared)
+        && let Ok(new) = std::fs::metadata(&written_to)
+        && existing.len() > new.len()
+    {
+        if diag {
+            eprintln!(
+                "[diag-fork-snapshot] REGRESSION GUARD FIRED pid={} existing_len={} new_len={} \
+                 -- discarding {} (fresh export), keeping stale {} (shared)",
+                std::process::id(),
+                existing.len(),
+                new.len(),
+                written_to.display(),
+                shared.display()
+            );
+        }
+        let _ = std::fs::remove_file(&written_to);
+        return shared;
+    }
+    if diag {
+        eprintln!(
+            "[diag-fork-snapshot] publishing pid={} {} -> {} (new_len={:?}, prev_len={:?})",
+            std::process::id(),
+            written_to.display(),
+            shared.display(),
+            std::fs::metadata(&written_to).map(|m| m.len()).ok(),
+            std::fs::metadata(&shared).map(|m| m.len()).ok(),
+        );
+    }
+
+    match std::fs::rename(&written_to, &shared) {
+        Ok(()) => shared,
+        Err(e) => {
+            eprintln!(
+                "[process_fork] could not publish {} as the container's shared filesystem \
+                 snapshot {} ({e}); handing over the unpublished export instead",
+                written_to.display(),
+                shared.display()
+            );
+            written_to
+        }
+    }
+}
+
+/// The `--oci-image` reference this run booted from, so a cross-process child can rebuild the same
+/// rootfs.
+///
+/// [`FORK_CHILD_TAR_PATH_ENV_VAR`] carries the `--initial-files` path, and a child re-execs with
+/// NO command line of its own -- it reconstructs everything from its environment. So on the
+/// `--oci-image` path a child arrived with no rootfs source at all and could not `execve` anything;
+/// every cross-process fork of an OCI-booted guest failed, which is why enabling
+/// `LITEBOX_PROCESS_FORK` broke a webtop boot outright (`XVFB_FAILED`, `DBUS_FAILED`).
+///
+/// The reference, not a materialised rootfs: the child re-derives its layers from the
+/// digest-keyed on-disk layer cache the parent has already warmed. No image is modified, nothing
+/// extra is written, and the two processes agree by construction because they run the same code
+/// over the same digests -- see [`FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`] for why the child skips
+/// re-DISCOVERING those digests via its own manifest fetch, using this reference only as a
+/// fallback identifier (error messages, and the rare case a referenced layer is missing from the
+/// cache and must be pulled fresh).
+pub const FORK_CHILD_OCI_IMAGE_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_OCI_IMAGE";
+
+/// The parent's already-resolved OCI manifest layer list (media type + digest + size, JSON via
+/// `litebox_packager::oci::pull_layers_in_memory_with_resolved_digests`'s return value), so a
+/// cross-process fork child can skip its own manifest fetch entirely
+/// (`litebox_packager::oci::pull_layers_with_known_digests`).
+///
+/// # Why this exists
+///
+/// Measured live (`LITEBOX_DIAG_FORK_TIMING=1`, see `docs/track-b-fork-fix-progress.md`'s
+/// matching entry): `pull_image_manifest` -- a real, unconditional HTTPS round-trip to the
+/// registry, with NO connection reuse across forks since each one is a fresh process with its own
+/// fresh `Client` -- took 2.2-3.1 SECONDS per call against a real public registry from this
+/// project's own dev host, while the entire per-layer cache-check loop that follows it (all 17
+/// layers already `[cache] HIT`) took 3-15 MILLISECONDS. The manifest fetch was, by a factor of
+/// roughly 200-700x, the dominant cost of every single cross-process fork of an `--oci-image`
+/// boot -- for a value (WHICH layer digests exist) the parent had already resolved, correctly,
+/// moments earlier in the exact same run. Handing it over removes that cost from every fork after
+/// the first resolution, exactly as [`FORK_CHILD_OCI_IMAGE_ENV_VAR`] already removes the need to
+/// re-specify which image to boot.
+pub const FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR: &str = "LITEBOX_INTERNAL_FORK_CHILD_OCI_DIGESTS";
+
+/// Encode `bytes` as lowercase hex, for [`FORK_CHILD_FILE_FDS_ENV_VAR`].
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decode what [`hex_encode`] produced. `None` on anything malformed.
+#[must_use]
+pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let s = core::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(s, 16).ok()?);
+    }
+    Some(out)
+}
+
+/// Serializes the parent's current writable layer to `path`, or explains why it could not.
+type ParentWritableLayerExporter =
+    Box<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync + 'static>;
+
+static PARENT_WRITABLE_LAYER_EXPORTER: std::sync::OnceLock<ParentWritableLayerExporter> =
+    std::sync::OnceLock::new();
+
+/// Teach this crate how to serialize the parent's writable filesystem layer for a cross-process
+/// `fork()` child (see [`FORK_CHILD_PARENT_LAYER_ENV_VAR`]).
+///
+/// A registration seam rather than a direct call because the filesystem lives in the runner crate,
+/// which depends on this one -- and because the archive format is the runner's `tar` writer, the
+/// exact counterpart of the `import_writable_layer` the child will use to read it back. Called
+/// once from the runner's bootstrap; a second call is ignored.
+pub fn register_parent_writable_layer_exporter(exporter: ParentWritableLayerExporter) {
+    let _ = PARENT_WRITABLE_LAYER_EXPORTER.set(exporter);
+}
+
+/// Export the parent's writable layer for a child about to be spawned, returning the file's path.
+///
+/// Best-effort, and deliberately so: a failure here means the child sees only the base rootfs,
+/// which is exactly the behaviour before this existed -- strictly worse than a correct fork, but
+/// never worse than failing the fork outright.
+pub(crate) fn export_parent_writable_layer_for_child() -> Option<std::path::PathBuf> {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let exporter = PARENT_WRITABLE_LAYER_EXPORTER.get()?;
+    // Named by this process's pid plus a sequence number: several forks can be in flight from
+    // different guest threads, and a fixed name would let one overwrite another's archive mid-
+    // write (the write itself, not the canonical "latest" pointer below, which tolerates it).
+    let path = std::env::temp_dir().join(format!(
+        "litebox-forkparent-{}-{}.tar",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let diag_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let export_t0 = std::time::Instant::now();
+    let export_result = exporter(&path);
+    if diag_timing {
+        eprintln!(
+            "[diag-fork-timing] (parent) export_parent_writable_layer_for_child: exporter() returned ok={} at {:?}",
+            export_result.is_ok(),
+            export_t0.elapsed()
+        );
+    }
+    match export_result {
+        Ok(()) => {
+            let publish_t0 = std::time::Instant::now();
+            let published = publish_as_container_fs_snapshot(path);
+            if diag_timing {
+                eprintln!(
+                    "[diag-fork-timing] (parent) publish_as_container_fs_snapshot returned at {:?}",
+                    publish_t0.elapsed()
+                );
+            }
+            Some(published)
+        }
+        Err(e) => {
+            eprintln!(
+                "[process_fork] could not export the parent's writable layer for the fork child                  ({e}); it will start from the base rootfs only"
+            );
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// Write `buf` in full to an inherited Windows handle named by its raw value, returning whether
+/// every byte landed.
+///
+/// Exists so the cross-process fork child's pipe pump (in the runner crate, which deliberately
+/// does not depend on `windows-sys`) can drive the inherited handle without reaching for the Win32
+/// API itself. Short writes are ordinary on a pipe, so this loops; `false` means the parent's end
+/// is gone and nothing further is deliverable.
+///
+/// The handle is taken as `usize` because a Windows `HANDLE` is a raw pointer and therefore
+/// `!Send`, while the value itself is process-wide and thread-agnostic.
+#[must_use]
+pub fn write_all_to_inherited_handle(handle: usize, buf: &[u8]) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    let handle = handle as HANDLE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let mut written: u32 = 0;
+        // Safety: `handle` is a live inherited pipe write handle and `buf` outlives the call.
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                buf[off..].as_ptr().cast(),
+                u32::try_from(buf.len() - off).unwrap_or(u32::MAX),
+                &raw mut written,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || written == 0 {
+            return false;
+        }
+        off += written as usize;
+    }
+    true
+}
+
+/// Close an inherited Windows handle named by its raw value. See
+/// [`write_all_to_inherited_handle`] for why the value travels as a `usize`.
+///
+/// For a cross-process fork child's pipe this is what actually delivers EOF: it drops the last
+/// writer, so the parent's pump sees a zero-byte `ReadFile` and releases its own end.
+///
+/// # Safety
+/// The caller must own `handle` and must not close it again.
+pub unsafe fn close_inherited_handle(handle: usize) {
+    unsafe { CloseHandle(handle as HANDLE) };
+}
+
+/// Which end of a bridging OS pipe the cross-process `fork()` child inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildPipeEnd {
+    /// The child inherits the WRITE end and writes; the parent keeps the read end.
+    ChildWrites,
+    /// The child inherits the READ end and reads; the parent keeps the write end.
+    ChildReads,
+    /// [`Self::ChildWrites`] for a guest fd that is close-on-exec: the child's rebuilt fd must
+    /// carry `FD_CLOEXEC`, or a `posix_spawn`-style error pipe stays open through `exec` and the
+    /// parent blocks reading it until the exec'd program exits.
+    ChildWritesCloexec,
+    /// [`Self::ChildReads`] for a close-on-exec guest fd.
+    ChildReadsCloexec,
+}
+
+impl ChildPipeEnd {
+    /// The one-character tag this direction travels under in
+    /// [`FORK_CHILD_PIPE_FDS_ENV_VAR`].
+    #[must_use]
+    pub fn tag(self) -> char {
+        match self {
+            Self::ChildWrites => 'w',
+            Self::ChildReads => 'r',
+            Self::ChildWritesCloexec => 'W',
+            Self::ChildReadsCloexec => 'R',
+        }
+    }
+
+    #[must_use]
+    pub fn child_writes(self) -> bool {
+        matches!(self, Self::ChildWrites | Self::ChildWritesCloexec)
+    }
+
+    #[must_use]
+    pub fn cloexec(self) -> bool {
+        matches!(self, Self::ChildWritesCloexec | Self::ChildReadsCloexec)
+    }
+
+    #[must_use]
+    pub fn with_cloexec(self, cloexec: bool) -> Self {
+        match (self.child_writes(), cloexec) {
+            (true, false) => Self::ChildWrites,
+            (true, true) => Self::ChildWritesCloexec,
+            (false, false) => Self::ChildReads,
+            (false, true) => Self::ChildReadsCloexec,
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "w" => Some(Self::ChildWrites),
+            "r" => Some(Self::ChildReads),
+            "W" => Some(Self::ChildWritesCloexec),
+            "R" => Some(Self::ChildReadsCloexec),
+            _ => None,
+        }
+    }
+}
+
+/// Create an anonymous pipe with exactly one end inheritable by a `CreateProcessW` child, the
+/// other staying private to this process.
+///
+/// Returns `(local, child)`. Both must be closed by the caller: `child` right after the spawn (the
+/// child has its own copy by then, and every extra copy of a pipe end counts as a live
+/// writer/reader, which turns EOF into a hang), `local` when its pump thread finishes.
+///
+/// `bInheritHandle` on the `SECURITY_ATTRIBUTES` marks BOTH ends inheritable, so the local end is
+/// explicitly un-marked afterwards -- a pipe end live in the wrong process is a subtle hang rather
+/// than a visible error.
+pub fn create_inheritable_child_pipe(which: ChildPipeEnd) -> Result<(HANDLE, HANDLE), String> {
+    use windows_sys::Win32::Foundation::SetHandleInformation;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(core::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+        lpSecurityDescriptor: core::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let mut read_handle: HANDLE = core::ptr::null_mut();
+    let mut write_handle: HANDLE = core::ptr::null_mut();
+    // Safety: both out-params are valid local `HANDLE` slots and `sa` outlives the call.
+    let ok = unsafe { CreatePipe(&raw mut read_handle, &raw mut write_handle, &raw mut sa, 0) };
+    if ok == 0 {
+        return Err(format!(
+            "CreatePipe for an inherited fork-child pipe failed, GetLastError={}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let (local, child) = if which.child_writes() {
+        (read_handle, write_handle)
+    } else {
+        (write_handle, read_handle)
+    };
+    // Safety: `local` was just returned by `CreatePipe`.
+    if unsafe { SetHandleInformation(local, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe {
+            CloseHandle(read_handle);
+            CloseHandle(write_handle);
+        }
+        return Err(format!(
+            "SetHandleInformation(parent-side end, INHERIT=0) failed, GetLastError={err}"
+        ));
+    }
+    Ok((local, child))
+}
+
+/// Read up to `buf.len()` bytes from an inherited Windows handle named by its raw value.
+///
+/// `Some(0)` is end-of-file (or `ERROR_BROKEN_PIPE`, which means the same thing for a pipe). The
+/// counterpart of [`write_all_to_inherited_handle`]; see that function for why the handle travels
+/// as a `usize`.
+#[must_use]
+pub fn read_from_inherited_handle(handle: usize, buf: &mut [u8]) -> usize {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+    let mut read: u32 = 0;
+    // Safety: `handle` is a live pipe read handle and `buf` outlives the call.
+    let ok = unsafe {
+        ReadFile(
+            handle as HANDLE,
+            buf.as_mut_ptr().cast(),
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            &raw mut read,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 { 0 } else { read as usize }
+}
+
+/// Whether a process handle refers to a process that has already exited.
+///
+/// Used by the parent-side pump for a pipe end the child READS: that pump has to wait for the
+/// guest parent to close its own copy of the descriptor before it may drain anything, and if the
+/// parent never does, the child exiting is what tells the pump to give up instead of waiting for
+/// ever.
+#[must_use]
+pub fn process_has_exited(process: usize) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    // Safety: `process` is a live process handle owned by the caller.
+    unsafe { WaitForSingleObject(process as HANDLE, 0) == WAIT_OBJECT_0 }
+}
+
 /// Serializes a [`litebox::platform::ForkFullGprSnapshot`] as one comma-separated line of
 /// hex fields, in a fixed field order matching [`deserialize_full_gprs`] exactly. Mirrors
 /// `AddressRelocations::serialize_for_diagnostic`'s own "both ends are always the same binary"
@@ -808,6 +1582,19 @@ pub fn serialize_full_gprs(g: &litebox::platform::ForkFullGprSnapshot) -> String
 /// mismatch or a non-hex field) rather than panicking -- data crossing a process boundary must
 /// degrade gracefully, matching every other `deserialize_for_diagnostic`-style helper in this
 /// investigation.
+///
+/// `fs_base` is additionally validated here (`is_valid_user_fs_base` + `TASK_ADDR_MAX`), the same
+/// two checks `WindowsUserland::set_arch_specific_register`'s `FsBase` arm applies to
+/// `arch_prctl`/`clone` -- defense in depth for the fork-resume path: today's only production
+/// caller (`spawn_process_fork_child` -> the re-exec'd child's `diag_process_fork_task_resume_
+/// probe` -> `set_arch_specific_register`) already re-validates this value before it is ever
+/// applied to the child's real FS base, but that downstream re-validation is indirect (a
+/// consequence of routing through the same function, not a guarantee of THIS deserializer's
+/// contract), so this deserializer rejects a corrupted value at the earliest point it enters this
+/// crate rather than relying solely on a later caller happening to revalidate it. A rejection here
+/// is logged via `diag_raw_print` (never `eprintln!`, which is known to re-fault on the corrupted
+/// thread state this exact bug produces -- see `lib.rs`'s `vectored_exception_handler_entry` doc
+/// comment) so a corrupted cross-process line is never silently swallowed.
 #[must_use]
 pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGprSnapshot> {
     let mut it = line.split(',');
@@ -837,6 +1624,18 @@ pub fn deserialize_full_gprs(line: &str) -> Option<litebox::platform::ForkFullGp
         fs_base: next()?,
     };
     if it.next().is_some() {
+        return None;
+    }
+    let task_addr_max = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        { litebox::mm::linux::PAGE_SIZE },
+    >>::TASK_ADDR_MAX;
+    if !litebox_common_linux::arch::is_valid_user_fs_base(g.fs_base) || g.fs_base >= task_addr_max {
+        crate::diag_raw_print(
+            b"[fsbase-reject] deserialize_full_gprs: fs_base=0x",
+            g.fs_base,
+            b" task_addr_max=0x",
+            task_addr_max,
+        );
         return None;
     }
     Some(g)
@@ -982,7 +1781,7 @@ pub fn diagnostic_spawn_and_copy(
     // whether or not `LITEBOX_DIAG_PROCESS_FORK_FDS` is also set (the two are otherwise unrelated
     // gates -- see each one's own doc comment).
     let want_stdin_pipe = want_fds || want_relocations;
-    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_stdin_pipe);
+    let spawn_result = spawn_suspended(&mut exe_wide, want_resume, want_stdin_pipe, false, &[]);
     unsafe {
         std::env::remove_var(REEXEC_CHILD_ENV_VAR);
         std::env::remove_var(REAL_RESUME_CHILD_ENV_VAR);
@@ -1004,6 +1803,7 @@ pub fn diagnostic_spawn_and_copy(
             source_group,
             *dest_base,
             &mut read_source_bytes,
+            &[],
         ));
     }
 
@@ -1051,8 +1851,6 @@ pub fn diagnostic_spawn_and_copy(
         }
     }
 
-    // `guard` drops here: TerminateProcess + CloseHandle, unconditionally, whether or not it was
-    // ever resumed -- see the guard's own doc comment.
     Ok(results)
 }
 
@@ -1083,7 +1881,15 @@ pub fn spawn_process_fork_child(
     mut read_source_bytes: impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     full_gprs: litebox::platform::ForkFullGprSnapshot,
     relocations_line: String,
-) -> Result<Option<(u32, HANDLE)>, String> {
+    child_pipe_handles: &[(i32, HANDLE, ChildPipeEnd)],
+    inherited_files: &[litebox::platform::ForkInheritedFile],
+    inherited_eventfds: &[litebox::platform::ForkInheritedEventfd],
+    inherited_shim_fds: &[litebox::platform::ForkInheritedShimFd],
+    comm: [u8; 16],
+    sigreturn_trampoline: usize,
+    identity: litebox::platform::ForkChildIdentity,
+    lazy_file_map_path: Option<&str>,
+) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
         .as_os_str()
@@ -1099,24 +1905,400 @@ pub fn spawn_process_fork_child(
     // probe`, wired in the runner crate's `main()`) by setting the SAME three gate env vars those
     // passes introduced as opt-in flags -- this production path always wants that exact chain, so
     // it sets all three unconditionally rather than exposing them as separately-toggleable knobs.
-    unsafe {
-        std::env::set_var(REEXEC_CHILD_ENV_VAR, "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1");
-        std::env::set_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1");
-        std::env::set_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR, &relocations_line);
-        std::env::set_var(FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs));
+    // Handed to the child through its OWN environment block -- never by mutating this process's
+    // environment. See `build_child_environment_block` for why that distinction is load-bearing.
+    let mut child_env: Vec<(&str, String)> = vec![
+        (REEXEC_CHILD_ENV_VAR, "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE", "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT", "1".to_string()),
+        ("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME", "1".to_string()),
+        (FORK_CHILD_VMA_LAYOUT_ENV_VAR, relocations_line.clone()),
+        (FORK_CHILD_GPRS_ENV_VAR, serialize_full_gprs(&full_gprs)),
+        (
+            FORK_CHILD_SIGRETURN_TRAMPOLINE_ENV_VAR,
+            format!("{sigreturn_trampoline:x}"),
+        ),
+        (FORK_CHILD_COMM_ENV_VAR, hex_encode(&comm)),
+        (
+            FORK_CHILD_GUEST_IDENTITY_ENV_VAR,
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                identity.pid,
+                identity.ppid,
+                identity.pgid,
+                identity.pid_ns,
+                identity.ns_pid,
+                identity.ns_tid
+            ),
+        ),
+        (
+            FORK_CHILD_SHIM_FDS_ENV_VAR,
+            inherited_shim_fds
+                .iter()
+                .map(|f| format!("{:x}:{}", f.fd, hex_encode(f.spec.as_bytes())))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        // A fork child must never publish host ports.
+        //
+        // `LITEBOX_PUBLISH` would otherwise be inherited (the block below copies this process's
+        // environment), and every cross-process child then raced to bind the same
+        // `127.0.0.1:<port>` the parent already holds -- observed as a burst of
+        // `failed to bind 127.0.0.1:3000: Only one usage of each socket address ...` on every
+        // fork. Losing that race is the harmless outcome; WINNING it would be worse, because the
+        // child would then be answering connections meant for the guest's real listener.
+        //
+        // Publishing is a property of the top-level run, exactly as it is of a `docker run`, not of
+        // every process the guest happens to fork. Overridden to empty rather than merely omitted,
+        // because omission means inherit here.
+        ("LITEBOX_PUBLISH", String::new()),
+    ];
+    if let Some(path) = lazy_file_map_path {
+        child_env.push((FORK_CHILD_LAZY_FILE_ENV_VAR, path.to_string()));
     }
-    let spawn_result = spawn_suspended(&mut exe_wide, false, false);
-    unsafe {
-        std::env::remove_var(REEXEC_CHILD_ENV_VAR);
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_GLOBALSTATE");
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_VMEM_ADOPT");
-        std::env::remove_var("LITEBOX_DIAG_PROCESS_FORK_TASK_RESUME");
-        std::env::remove_var(FORK_CHILD_VMA_LAYOUT_ENV_VAR);
-        std::env::remove_var(FORK_CHILD_GPRS_ENV_VAR);
+    // Lazy (reserve-then-commit-on-first-fault) group classification -- see
+    // `crate::lazy_fork_commit`'s own module doc comment for the full design and correctness
+    // argument. `lazy_eligible[i]` tells the group-copy loop below whether
+    // `group_relocations[i]` should be RESERVED ONLY here (population deferred to the child's own
+    // VEH, on first real access) instead of eagerly `copy_one_group`-copied. Always all-`false`
+    // unless `LITEBOX_LAZY_FORK_COMMIT=1` is set -- see `lazy_fork_commit_enabled`'s doc comment
+    // for why that makes this whole mechanism provably inert by default.
+    // 114th pass: every currently-live thread's own stack pointer, not just this fork-calling
+    // thread's -- see `ALL_THREAD_STACK_RSPS`'s own doc comment (`lib.rs`) for the live-`cdb`-
+    // confirmed bug this closes. `full_gprs.rsp` is included explicitly too, defensively, in case
+    // this exact thread's own registration (via `run_thread_inner`, which runs before any guest
+    // code including this syscall) is ever missing for some reason not yet anticipated -- a
+    // harmless, idempotent duplicate when it is already present, per `classify_lazy_eligible_
+    // groups`'s own `.any(...)` check.
+    let active_rsps: Vec<usize> = {
+        let mut v = crate::ALL_THREAD_STACK_RSPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        v.push(full_gprs.rsp);
+        v
+    };
+    if std::env::var_os("LITEBOX_DIAG_LAZY_FORK_COMMIT").is_some() {
+        eprintln!("[lazy_fork_commit] 114th-pass DIAG: active_rsps at fork = {active_rsps:x?}");
     }
+    // Taken HERE, not at the `child_env.push` below, because it also decides which groups may stay
+    // lazy -- see the `lazy_eligible` filter right after this call.
+    let carried_shared: Vec<SharedRegionCarry> = take_fork_shared_regions();
+    let mut lazy_eligible = crate::lazy_fork_commit::classify_lazy_eligible_groups(
+        group_relocations,
+        vma_layout,
+        &active_rsps,
+        sigreturn_trampoline,
+    );
+    // A group that carries a shared region may NOT stay lazy. The child's lazy installer reserves
+    // the group's whole span and faults its pages in on first access, which for a shared range
+    // means faulting in a PRIVATE copy of the object's bytes -- and reserving over the view the
+    // parent mapped there would clobber it outright. Sharing wins over laziness: such a group is
+    // built eagerly (the placeholder route commits its non-shared part instead of deferring it).
+    for (i, eligible) in lazy_eligible.iter_mut().enumerate() {
+        if !*eligible {
+            continue;
+        }
+        let group = &group_relocations[i].0;
+        if carried_shared
+            .iter()
+            .any(|c| c.range.start < group.end && group.start < c.range.end)
+        {
+            *eligible = false;
+        }
+    }
+    let mut lazy_group_ranges: Vec<Range<usize>> = group_relocations
+        .iter()
+        .zip(lazy_eligible.iter())
+        .filter(|(_, eligible)| **eligible)
+        .map(|((group, _dest_base), _)| group.clone())
+        .collect();
+    // Guard-cow (88th pass single-generation; 89th pass generalized to any number of concurrent
+    // generations per parent -- see `lazy_fork_commit`'s own module doc comment, "89th pass"
+    // section, for the derivation). `try_claim_guard_cow_table` no longer gates on a single
+    // outstanding-child slot; it only ever declines for the degenerate zero-page case (never
+    // reachable here, since `lazy_group_ranges` is checked non-empty just above). Kept as an
+    // `Option`/`match` for interface stability and as a defensive hook for a future resource cap.
+    let mut guard_cow_claim: Option<crate::lazy_fork_commit::GuardCowClaim> = None;
+    if crate::lazy_fork_commit::guard_cow_enabled() && !lazy_group_ranges.is_empty() {
+        let total_pages: usize = lazy_group_ranges
+            .iter()
+            .map(|r| r.len().div_ceil(4096))
+            .sum();
+        match crate::lazy_fork_commit::try_claim_guard_cow_table(total_pages) {
+            Some(claim) => {
+                child_env.push((
+                    crate::lazy_fork_commit::FORK_CHILD_GUARD_COW_TABLE_ENV_VAR,
+                    crate::lazy_fork_commit::guard_cow_claim_table_base(&claim).to_string(),
+                ));
+                guard_cow_claim = Some(claim);
+            }
+            None => {
+                // Another live child from this same parent still holds the slot -- fall this
+                // whole fork back to fully eager (every group), not partially lazy.
+                lazy_eligible = vec![false; lazy_eligible.len()];
+                lazy_group_ranges.clear();
+            }
+        }
+    }
+    if !lazy_group_ranges.is_empty() {
+        child_env.push((
+            crate::lazy_fork_commit::FORK_CHILD_LAZY_RANGES_ENV_VAR,
+            crate::lazy_fork_commit::serialize_lazy_ranges(&lazy_group_ranges),
+        ));
+        child_env.push((
+            crate::lazy_fork_commit::FORK_CHILD_PARENT_PID_ENV_VAR,
+            std::process::id().to_string(),
+        ));
+    }
+    // Exported BEFORE the spawn: the path has to be in the child's environment block, and the
+    // contents have to reflect the parent as of this `fork()`, not as of whenever the child gets
+    // around to reading it.
+    let parent_layer = export_parent_writable_layer_for_child();
+    // `build_child_environment_block` copies this process's own environment and skips whatever is
+    // being overridden -- so an entry that is merely omitted here is inherited instead. A
+    // cross-process child is itself a fork parent for its own children, and it already carries
+    // this variable from its own spawn, so omitting it let a grandchild inherit its GRANDparent's
+    // path: an archive that had already been consumed and deleted. Observed exactly that, five
+    // children in a row reporting `could not adopt the parent's writable layer from
+    // ...forkparent-8760-8.tar: failed to open`, every one of them naming the same stale file.
+    child_env.push((
+        FORK_CHILD_PARENT_LAYER_ENV_VAR,
+        parent_layer
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    ));
+    if !inherited_files.is_empty() {
+        let spec = inherited_files
+            .iter()
+            .map(|f| {
+                format!(
+                    "{:x}:{:x}:{:x}:{}",
+                    f.fd,
+                    f.offset,
+                    f.flags,
+                    hex_encode(f.path.as_bytes())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_FILE_FDS_ENV_VAR, spec));
+    }
+    // Bug found live 2026-09-17 (Track B step 4 investigation): `spawn_cross_process_fork_child`
+    // has received `inherited_eventfds` since pass 116 and the runner-side child already knows how
+    // to consume `FORK_CHILD_EVENTFDS_ENV_VAR` (`litebox_runner_linux_on_windows_userland::main`,
+    // `install_eventfd_at_fd`) -- but nothing on the PARENT side ever set the env var, so every
+    // fork the gate accepted as eligible because it carried only eventfds beyond stdio still
+    // resumed the child with that fd simply missing. A guest process whose GLib main loop wakes
+    // itself via an eventfd (the common case for every desktop daemon in the XFCE/D-Bus path) then
+    // hit `EBADF` on first use. Same encode-as-hex-triples shape as `inherited_files` above.
+    if !inherited_eventfds.is_empty() {
+        let spec = inherited_eventfds
+            .iter()
+            .map(|e| format!("{:x}:{:x}:{:x}", e.fd, e.count, e.flags))
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_EVENTFDS_ENV_VAR, spec));
+    }
+    if !child_pipe_handles.is_empty() {
+        let spec = child_pipe_handles
+            .iter()
+            .map(|(fd, h, dir)| format!("{fd}:{:x}:{}", *h as usize, dir.tag()))
+            .collect::<Vec<_>>()
+            .join(",");
+        child_env.push((FORK_CHILD_PIPE_FDS_ENV_VAR, spec));
+    }
+    // An omitted entry is INHERITED, and a cross-process child is itself a fork parent, so
+    // omitting it would let a grandchild adopt its grandparent's shared regions -- addresses this
+    // child never mapped and objects it may not even hold.
+    //
+    // This is the whole point of the mechanism: `carried_shared` names the shared objects behind
+    // this process's `VM_SHARED` mappings, and the child re-opens them BY NAME to get its own
+    // handle to the very same bytes. Only the ranges the parent actually manages to map (below,
+    // while the child is suspended) turn into real sharing; the child verifies each one itself
+    // rather than taking the name on faith (see `Vmem::adopt_carried_shared`).
+    child_env.push((
+        FORK_CHILD_SHARED_REGIONS_ENV_VAR,
+        encode_fork_shared_regions(&carried_shared),
+    ));
+    // Track B step 4 (ADVISORY-002 3.3): hand the child a real, live handle to the SAME shared
+    // kernel heap section this process itself maps, instead of letting it reserve its own,
+    // content-independent 8 GiB mapping (the deliberate, previously-incomplete step-3 shape --
+    // see `SHARED_KERNEL_HEAP_BASE`'s own doc comment in `lib.rs`). No `DuplicateHandle`/
+    // pid-discovery round-trip needed here (unlike the presenter's scanout handshake in
+    // `control_server.rs`): this parent already calls `CreateProcessW` for the child directly, and
+    // ordinary Windows handle INHERITANCE (`spawn_suspended`'s `force_inherit_handles` below)
+    // preserves the exact numeric handle value into the child's own handle table, so the decimal
+    // value read back from this env var in the child is already correct with no further IPC.
+    //
+    // STILL GATED behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT=1`, deliberately NOT the unconditional
+    // production default, despite Track B step 5 (ADVISORY-002 3.3) closing the bug this gate was
+    // ORIGINALLY added for: the bump-allocation cursor (`shared_heap_cursor` in `lib.rs`) now
+    // lives INSIDE the shared section itself and is advanced with a single cross-process-visible
+    // atomic CAS, and that fix IS live-verified correct under real concurrent allocation pressure
+    // from both parent and child simultaneously (71 real cross-process forks, zero corruption, zero
+    // crash, zero colliding offsets -- see AGENTS.md's "Real cross-process content sharing"
+    // section). But making it the default and then live-booting the actual target workload
+    // (`.wfgy/webtop_stack.sh`, `docker.io/linuxserver/webtop:debian-xfce`, 17 layers, one alone
+    // 736 MiB) surfaced a SEPARATE, real regression this fix does not touch: every plain external
+    // command this script execs (`sed`, `ln`, `mkdir`, ...) reconstructs its own full in-memory
+    // merged rootfs from the OCI layer cache (`globalstate-probe (child): rebuilding rootfs from
+    // OCI image ...`), a single ~173 MiB-plus host allocation THROUGH THIS SAME shared heap. With
+    // sharing OFF, each such process's entire 8 GiB reservation (rootfs buffer included) is a
+    // PRIVATE section Windows reclaims the instant that short-lived process exits -- effectively
+    // unlimited cumulative capacity across a long boot. With sharing ON, all of them draw from the
+    // SAME ONE 8 GiB pool for as long as the eldest ancestor (this whole boot's PID 1) stays alive,
+    // and this bump allocator never frees/decommits a claimed range on ANY process's exit (see
+    // `WindowsUserland::free`'s own "dead in practice" doc comment) -- so roughly 45-90 plain execs
+    // into a real `debian-xfce` webtop boot, the shared pool is permanently exhausted and every
+    // subsequent forked command aborts with a genuine host-side Rust allocation failure (live
+    // log: `memory allocation of 181493744 bytes failed`, repeating, well before Xvfb/dbus even
+    // start) -- WORSE than the sharing-off default, which reaches `NGINX_STARTED`/
+    // `NGINX_SELFTEST_FAILED` and beyond without ever hitting this class. Real per-process content
+    // sharing therefore still needs either a reclaim mechanism (decommit/return a process's claimed
+    // ranges back to the shared pool on its exit) or routing the one-shot rootfs-rebuild buffer
+    // through a private, non-shared allocation instead of this shared heap, before it is safe as
+    // the default for a real multi-exec workload -- neither exists yet. Full evidence, exact repro,
+    // and the precise byte accounting: `docs/AGENTS_ARCHIVE_2026-09-17.md`.
+    // Unconditional (no longer gated behind `LITEBOX_DIAG_SHARED_HEAP_INHERIT`, unlike this
+    // export's original Track B step 4/5 purpose): that gate existed solely because routing
+    // EVERY ordinary host-heap allocation through this shared section regressed real multi-exec
+    // boots into commit-limit exhaustion (see `SLAB_ALLOC`'s doc comment) -- a regression that no
+    // longer applies, since that routing was fully reverted and ordinary `GlobalAlloc` traffic
+    // no longer touches `init_shared_kernel_heap` at all. The ONLY remaining consumer of this
+    // export is the small, bounded `shared_kernel_arena_alloc`/`SharedArc<T>` mechanism backing
+    // `litebox::platform::SharedKernelStateProvider`'s real create-vs-attach protocol for
+    // `LiteBoxX`/`GlobalState` (2026-09-17 pass) -- every cross-process-fork child needs this
+    // section mapped at the SAME address as its ancestor for that protocol's `attach` calls to
+    // have anything to attach to, so exporting it is now simply part of spawning such a child at
+    // all, not an opt-in diagnostic.
+    let shared_heap_export = crate::shared_kernel_heap_export_for_fork_child();
+    if let Some((section_handle, base)) = shared_heap_export {
+        child_env.push((
+            crate::FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR,
+            section_handle.to_string(),
+        ));
+        child_env.push((crate::FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR, base.to_string()));
+        // Diagnostic-only (`LITEBOX_DIAG_SHARED_HEAP_PROBE=1`), a no-op otherwise: writes a known
+        // sentinel the child reads back once it maps the same section, the most direct live proof
+        // that this mechanism genuinely shares content and not just address layout.
+        crate::shared_kernel_heap_probe_parent_write(base);
+        // Live cross-process `SharedArc<T>` proof (`LITEBOX_DIAG_SHARED_ARC_PROBE=1`), riding on
+        // this same shared-heap-inherit export: creates (once per parent process) an isolated
+        // `SharedArc<SharedArcProbeData>` test allocation and hands the child its arena offset, so
+        // the child can attach, read the parent's write through the wrapper, and exercise
+        // clone/drop -- see `shared_arc_probe_parent_prepare`'s doc comment.
+        if std::env::var_os("LITEBOX_DIAG_SHARED_ARC_PROBE").is_some() {
+            let arc_offset = crate::shared_arc_probe_parent_prepare();
+            child_env.push((
+                crate::FORK_CHILD_SHARED_ARC_PROBE_OFFSET_ENV_VAR,
+                arc_offset.to_string(),
+            ));
+        }
+        // Real (non-diagnostic) `SharedKernelStateProvider` create-vs-attach export: hand the
+        // child THIS process's own `SharedArc` offset for every slot this process has actually
+        // CREATED (never one it only attached to -- an attaching child re-exports the SAME
+        // offset it itself attached with, transitively propagating the root's allocation down
+        // an arbitrarily deep fork tree, exactly like `SHARED_KERNEL_HEAP_SECTION_HANDLE`'s own
+        // "content-sharing composes transitively across nested forks" property above).
+        for slot in [
+            litebox::platform::SharedKernelStateSlot::LiteBoxX,
+            litebox::platform::SharedKernelStateSlot::ShimGlobalState,
+        ] {
+            if let Some(offset) = crate::shared_kernel_state_offset(slot) {
+                child_env.push((
+                    crate::shared_kernel_state_slot_env_var(slot),
+                    offset.to_string(),
+                ));
+            }
+        }
+    }
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] pre-spawn exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
+    }
+    // Explicit allow-list for THIS child's `CreateProcessW` call: its own bridge-pipe ends plus
+    // (when exported) the shared-kernel-heap section handle -- never rely on ambient
+    // `bInheritHandles=TRUE` picking up whatever else happens to be marked inheritable
+    // process-wide at this moment (see `spawn_suspended_impl`'s doc comment: that ambient
+    // over-broad inheritance is the confirmed root cause of the nginx-self-test pipe-EOF hang).
+    let mut extra_inheritable_handles: std::vec::Vec<HANDLE> =
+        child_pipe_handles.iter().map(|(_, h, _)| *h).collect();
+    if let Some((section_handle, _base)) = shared_heap_export {
+        extra_inheritable_handles.push(section_handle as HANDLE);
+    }
+    // Only forced when the shared-heap gate above actually exported a handle -- an unconditional
+    // `bInheritHandles=TRUE` would inherit every OTHER currently-inheritable handle in this
+    // process into the child too, a behavior change to the DEFAULT path this pass has no reason
+    // to make when there is nothing new for the child to inherit.
+    let spawn_result = if shared_heap_export.is_some() {
+        spawn_suspended_forcing_handle_inheritance(
+            &mut exe_wide,
+            &child_env,
+            &extra_inheritable_handles,
+        )
+    } else {
+        spawn_suspended_with_extra_handles(
+            &mut exe_wide,
+            false,
+            false,
+            true,
+            &child_env,
+            &extra_inheritable_handles,
+        )
+    };
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] post-spawn exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
+    }
+    // Nothing to undo: this process's own environment was never touched.
+    //
+    // Close this process's copies of the child-side pipe write handles as soon as the spawn is
+    // decided, on BOTH the success and failure paths. The child has its own inherited copies by
+    // now (or does not exist at all), and every copy left open here counts as a live writer on
+    // that pipe -- so keeping one would mean the parent's pump thread never sees `ReadFile`
+    // return zero and the guest's reader never sees EOF, which presents as a hang rather than as
+    // an error.
+    let close_child_side = || {
+        for (_, h, _) in child_pipe_handles {
+            if !h.is_null() {
+                // Safety: each handle came from `create_inheritable_child_write_pipe` and is
+                // closed exactly once, here.
+                unsafe { CloseHandle(*h) };
+            }
+        }
+    };
+    // The CHILD deletes the parent-layer archive once it has imported it, so it is removed here
+    // only when there will be no child to do so.
+    let spawn_result = spawn_result.inspect_err(|_| {
+        close_child_side();
+        if let Some(path) = &parent_layer {
+            let _ = std::fs::remove_file(path);
+        }
+        // The spawn itself never happened -- no group was ever guarded under this claim (if one
+        // was made pre-spawn for the table's env-var address). Abort it now rather than leaking
+        // this process's single guard-cow slot forever.
+        if let Some(claim) = guard_cow_claim.take() {
+            crate::lazy_fork_commit::abort_guard_cow_claim(claim);
+        }
+    });
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
+    close_child_side();
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] spawned child pid={} process={:p} thread={:p}",
+            pid, process, thread
+        );
+    }
 
     // From here on, any early-return path must explicitly tear the child down itself -- there is
     // no `Drop` guard doing it implicitly, by design (see this function's doc comment).
@@ -1127,21 +2309,114 @@ pub fn spawn_process_fork_child(
                 CloseHandle(thread);
                 CloseHandle(process);
             }
+            // The child is being torn down before it ever ran, so it will never import (and
+            // therefore never delete) the parent-layer archive. Do it here instead.
+            if let Some(path) = &parent_layer {
+                let _ = std::fs::remove_file(path);
+            }
             eprintln!($($arg)*);
             return Ok(None);
         }};
     }
 
-    for (source_group, dest_base) in group_relocations {
-        let result = copy_one_group(process, source_group, *dest_base, &mut read_source_bytes);
+    let diag_copy_timing = std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some();
+    let copy_all_t0 = std::time::Instant::now();
+    // Running page-count cursor into the guard-cow table, matching the CHILD's own identical
+    // computation in `install_if_configured` -- both walk `group_relocations`/`lazy_eligible` (or
+    // `FORK_CHILD_LAZY_RANGES_ENV_VAR`, which was serialized from the SAME filtered sequence) in
+    // the same order, advancing only across LAZY groups.
+    let mut next_guard_slot: usize = 0;
+    for ((source_group, dest_base), lazy) in group_relocations.iter().zip(lazy_eligible.iter()) {
+        let process = core::hint::black_box(process);
+        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+            let process_addr = &process as *const _ as usize;
+            let dummy = 0u8;
+            let stack_addr = &dummy as *const _ as usize;
+            eprintln!(
+                "[diag_alloc_vec] pre-call process={:p} process_slot_addr={:#x} current_stack_addr={:#x} group={:#x}..{:#x} lazy={lazy}",
+                process, process_addr, stack_addr, source_group.start, source_group.end
+            );
+        }
+        let group_t0 = std::time::Instant::now();
+        let has_shared = carried_shared
+            .iter()
+            .any(|c| c.range.start < source_group.end && source_group.start < c.range.end);
+        let result = if *lazy && !has_shared {
+            if let Some(claim) = guard_cow_claim.as_mut() {
+                let group_slot_base = next_guard_slot;
+                next_guard_slot += source_group.len().div_ceil(4096);
+                crate::lazy_fork_commit::guard_cow_reserve_group(
+                    claim,
+                    pid,
+                    process,
+                    source_group,
+                    group_slot_base,
+                )
+            } else {
+                crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
+            }
+        } else {
+            copy_one_group(
+                process,
+                source_group,
+                *dest_base,
+                &mut read_source_bytes,
+                &carried_shared,
+            )
+        };
+        if diag_copy_timing {
+            eprintln!(
+                "[diag-fork-timing] (parent) {}group={:#x}..{:#x} len={:#x} succeeded={} took {:?}",
+                if *lazy {
+                    "reserve_group_lazy "
+                } else {
+                    "copy_one_group "
+                },
+                source_group.start,
+                source_group.end,
+                source_group.len(),
+                result.succeeded,
+                group_t0.elapsed()
+            );
+        }
         if !result.succeeded {
+            if let Some(claim) = guard_cow_claim.take() {
+                crate::lazy_fork_commit::abort_guard_cow_claim(claim);
+            }
             fail_teardown!(
-                "[process_fork] spawn_process_fork_child: group copy FAILED group={:#x}..{:#x} GetLastError={}",
+                "[process_fork] spawn_process_fork_child: group {} FAILED group={:#x}..{:#x} GetLastError={}",
+                if *lazy { "reserve" } else { "copy" },
                 result.source_group.start,
                 result.source_group.end,
                 result.last_error
             );
         }
+    }
+    // Every group succeeded -- commit the guard-cow claim (if any) under the real child pid now
+    // that it is known. From this point on, `guard_cow_write_fault_veh` actively services this
+    // parent's own future writes to whatever was actually guarded above.
+    if let Some(claim) = guard_cow_claim.take() {
+        crate::lazy_fork_commit::finalize_guard_cow_table(claim, pid);
+    }
+    if diag_copy_timing {
+        eprintln!(
+            "[diag-fork-timing] (parent) ALL group copies done, {} group(s), took {:?} total",
+            group_relocations.len(),
+            copy_all_t0.elapsed()
+        );
+    }
+    // DIAGNOSTIC ONLY, this pass's own investigation (never leave enabled by default): artificial
+    // delay to test whether the lazy-commit crash (a 100%-reproducible "Killed" on a bash subshell
+    // fork, in an address range OUTSIDE every lazy-reserved group, only when
+    // LITEBOX_LAZY_FORK_COMMIT=1) is a genuine logic bug in the lazy mechanism itself, or a
+    // PRE-EXISTING race elsewhere in child startup that the eager path's own ~100ms of
+    // WriteProcessMemory calls happened to mask simply by taking that long. If reintroducing this
+    // delay (which does no useful work) makes the crash disappear, that is strong evidence for the
+    // latter.
+    if let Ok(ms) = std::env::var("LITEBOX_DIAG_LAZY_FORK_ARTIFICIAL_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 
     // PASS 144: `copy_one_group` above commits every reservation-group span as blanket
@@ -1239,7 +2514,6 @@ pub fn spawn_process_fork_child(
             );
         }
     }
-
     // PASS 144 (external-observer diagnostic, kept alongside the fix above): pass 143 found the cross-process child crashing with a genuine
     // `STATUS_ACCESS_VIOLATION` (raw=0xc0000005) AFTER `fork_verify` correctly arms and the FS base
     // is correctly propagated, yet with ZERO corresponding VEH trace output -- not even under
@@ -1253,8 +2527,48 @@ pub fn spawn_process_fork_child(
     // `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER=1` (opt-in, diagnostic-only): the debug loop below
     // blocks this call until the child either hits a fault or exits, so it must never run in the
     // default/production path.
+    //
+    // 113th pass: on a real desktop boot there are dozens of cross-process forks before the one
+    // under investigation, and this diagnostic's own blocking wait multiplies real per-fork
+    // latency badly enough to change boot timing -- `LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_
+    // SKIP=<n>` (diagnostic-only, defaults to 0 = unchanged prior behavior) lets the first `n`
+    // cross-process forks proceed with no debugger attached at all, so only the fork actually
+    // under investigation pays this cost.
+    //
+    // 113th pass, real cost finding (corrected from an earlier, WRONG draft of this same comment
+    // that claimed `ContinueDebugEvent`'s status here bypasses this process's own VEH -- it does
+    // not: `observe_real_resume_fault`'s own loop below already uses `DBG_EXCEPTION_NOT_HANDLED`
+    // for every real exception, precisely so the guest's own VEH gets the normal second-chance
+    // dispatch, exactly as its own existing comment there already documented; only the ONE
+    // synthetic `DbgBreakPoint` attach breakpoint gets `DBG_CONTINUE`). The REAL cost is simpler:
+    // each observed exception pays a real `WaitForDebugEvent` round trip plus `OpenThread`/
+    // `GetThreadContext`/a multi-field `eprintln!`/`CloseHandle` before `ContinueDebugEvent` lets
+    // VEH proceed -- for a lazy-fork-commit/guard-cow child, which can legitimately take MANY
+    // deliberate page faults during ordinary startup, this per-fault overhead compounds into a
+    // real, measured slowdown (live-confirmed: enabling this diagnostic on a lazy-mode boot made
+    // the RAM crater arrive faster than the same boot with no diagnostic attached,
+    // `.wfgy/pass113_extdebug{2,3}.poll.log` vs `pass113_lazy_final.poll.log`'s clean 200s run) --
+    // a slower-running observed child holds its own memory longer while more concurrent siblings
+    // pile up. Use the `_SKIP` env var above to keep this cost off every fork except the one under
+    // investigation; for a lazy-fork-commit bug specifically, prefer unperturbed logging over this
+    // diagnostic where possible, since even a correctly-passed-through exception still costs real
+    // wall-clock time this mechanism's own timing-sensitive bugs may be exposed by.
+    static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    let external_debugger_skip: u32 =
+        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+    let external_debugger_fork_index =
+        EXTERNAL_DEBUGGER_FORK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let external_debugger_requested =
-        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER").is_some();
+        std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER").is_some()
+            && external_debugger_fork_index >= external_debugger_skip;
+    if external_debugger_requested {
+        eprintln!(
+            "[process_fork_diag] real-resume: external debugger attaching for fork_index={external_debugger_fork_index} (skip={external_debugger_skip})"
+        );
+    }
     let debug_attached = external_debugger_requested
         && unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcess(pid) } != 0;
     if external_debugger_requested && !debug_attached {
@@ -1289,12 +2603,30 @@ pub fn spawn_process_fork_child(
     // Success: the child is now running real, ongoing guest execution (pass 139's `Task`-resume
     // path, taken because `FORK_CHILD_GPRS_ENV_VAR`/`FORK_CHILD_VMA_LAYOUT_ENV_VAR` and the three
     // gate env vars above are set -- see `run_diagnostic_resume_child`'s and `main()`'s dispatch).
-    // Close the thread handle (no longer needed -- the process handle alone is enough to
-    // wait/kill by pid) and hand the caller the process handle and pid, alive, un-terminated.
-    unsafe {
-        CloseHandle(thread);
+    //
+    // Pass 59: `thread` is NO LONGER closed here -- it used to be, on the theory that "the
+    // process handle alone is enough to wait/kill by pid". That theory is exactly what broke
+    // `xfce4-session`'s `wait4()` on a real desktop boot: this child's OWN Windows process can
+    // outlive its ONE original guest task (`exit_group()` on that task's thread is not the same
+    // event as the whole Windows process exiting, the moment the child spawns any further OS
+    // thread of its own that outlives that task -- e.g. `ssh-agent`'s self-daemonizing `fork()`
+    // falling back to the thread-based path because it holds a bound `AF_UNIX` listening socket,
+    // an uncarriable fd). The caller now hands `thread` to
+    // `litebox::platform::CrossProcessChildHandle` instead of `process`, so
+    // `wait_for_thread_exit`/`try_wait_for_thread_exit` (task-scoped) are what `wait4()` actually
+    // blocks on -- see those functions' own doc comments for the full mechanism. `process` is
+    // still handed back too: `spawn_fork_child_pipe_pump` and
+    // `take_cross_process_writable_layer_export` (`GetProcessIdOfThread` aside, the writable-layer
+    // export path is keyed by the real Windows pid, not by either handle) still need it.
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] pre-return exe_wide len={} cap={} ptr={:p}",
+            exe_wide.len(),
+            exe_wide.capacity(),
+            exe_wide.as_ptr()
+        );
     }
-    Ok(Some((pid, process)))
+    Ok(Some((pid, process, thread)))
 }
 
 /// Pass 115's fd-inheritance probe: `DuplicateHandle`s the CURRENT (parent) process's real
@@ -2067,7 +3399,7 @@ fn observe_real_resume_fault(child_pid: u32) {
             }
             // Keep watching: a VEH-handled exception may be followed by a SECOND, unhandled one
             // (e.g. the guest instruction retried and faulted again, or a different guest
-            // instruction faults next) -- bounded by the same 3s deadline as the outer loop.
+            // instruction faults next).
             continue;
         }
         unsafe {
@@ -2722,11 +4054,160 @@ impl EncodeWideExt for std::ffi::OsStr {
 /// `(process, thread, pid, stdout_read_end, stdin_write_end)`.
 type SpawnSuspendedResult = (HANDLE, HANDLE, u32, Option<HANDLE>, Option<HANDLE>);
 
+/// Builds a `CREATE_UNICODE_ENVIRONMENT` block: this process's current environment plus `extra`,
+/// as UTF-16 `NAME=VALUE\0` records terminated by an extra `\0`.
+///
+/// This exists so a child can be handed extra variables WITHOUT the parent calling
+/// `std::env::set_var`. The previous approach set six variables, spawned, and removed them again,
+/// relying on `lpEnvironment: null` inheritance. Mutating the environment is undefined behaviour
+/// in a multi-threaded process (which is why `set_var` is `unsafe` in current Rust), and litebox
+/// is emphatically multi-threaded: ~20 host threads, several of which read environment variables.
+/// Windows implements those reads and writes against one process-wide structure guarded by
+/// ntdll's environment critical section, so the write storm raced every concurrent reader.
+///
+/// This is the write-side twin of a bug already fixed on the read side: `ThreadHandle::interrupt`
+/// used to call `std::env::var_os` between its `SuspendThread` and `ResumeThread`, and could
+/// deadlock against a thread suspended while holding that same lock. Reading the environment
+/// (`vars_os` below) is safe and is all this needs.
+fn build_child_environment_block(extra: &[(&str, String)]) -> Vec<u16> {
+    let mut block: Vec<u16> = Vec::new();
+    let mut push_entry = |name: &std::ffi::OsStr, value: &std::ffi::OsStr| {
+        // Skip anything we are about to override, so the child never sees a stale duplicate --
+        // Windows resolves duplicates by first occurrence, so a leftover would win.
+        let name_lossy = name.to_string_lossy();
+        if extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(&name_lossy))
+        {
+            return;
+        }
+        block.extend(name.encode_wide_for_windows());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide_for_windows());
+        block.push(0);
+    };
+    for (name, value) in std::env::vars_os() {
+        push_entry(&name, &value);
+    }
+    for (name, value) in extra {
+        block.extend(std::ffi::OsStr::new(name).encode_wide_for_windows());
+        block.push(u16::from(b'='));
+        block.extend(std::ffi::OsStr::new(value.as_str()).encode_wide_for_windows());
+        block.push(0);
+    }
+    // An empty environment still needs its own terminating NUL before the block terminator.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 fn spawn_suspended(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
     want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
 ) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_with_extra_handles(
+        exe_wide,
+        want_stdout_pipe,
+        want_stdin_pipe,
+        inherit_stdio,
+        extra_env,
+        &[],
+    )
+}
+
+/// Same as [`spawn_suspended`], plus an explicit list of extra handles this ONE child should
+/// inherit -- see [`spawn_suspended_impl`]'s doc comment on `extra_inheritable_handles` for why
+/// this matters even outside the `force_inherit_handles` (shared-heap) path: any cross-process
+/// fork spawn that carries pipe fds into its child needs its bridge-pipe `child` ends listed here
+/// too, or they fall back to ambient (over-broad) `bInheritHandles=TRUE` inheritance.
+fn spawn_suspended_with_extra_handles(
+    exe_wide: &mut [u16],
+    want_stdout_pipe: bool,
+    want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
+    extra_inheritable_handles: &[HANDLE],
+) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_impl(
+        exe_wide,
+        want_stdout_pipe,
+        want_stdin_pipe,
+        inherit_stdio,
+        extra_env,
+        false,
+        extra_inheritable_handles,
+    )
+}
+
+/// Production counterpart of [`spawn_suspended`] that additionally forces `bInheritHandles=TRUE`
+/// on the `CreateProcessW` call regardless of what `inherit_stdio`'s own stdio-handle wiring
+/// happened to decide -- needed because [`spawn_process_fork_child`] marks the shared-kernel-heap
+/// section handle inheritable and relies on THIS process's handle inheritance (not any
+/// `DuplicateHandle` step) to carry it into the child at the same numeric value (see that
+/// function's own doc comment on `FORK_CHILD_SHARED_HEAP_SECTION_ENV_VAR`). Without this, a run
+/// whose real stdio handles all happened to be invalid/non-inheritable (e.g. fully redirected to
+/// `NUL`) would silently leave `inherit_handles` at `0` and drop the shared-heap handle on the
+/// floor even though `spawn_process_fork_child` had already set it up.
+///
+/// `extra_inheritable_handles` are handles this ONE child is specifically meant to inherit
+/// (the shared-kernel-heap section handle, this child's own bridge-pipe ends) -- see
+/// [`spawn_suspended_impl`]'s doc comment for why they are threaded all the way through instead
+/// of just relying on ambient `bInheritHandles=TRUE` process-wide inheritance.
+fn spawn_suspended_forcing_handle_inheritance(
+    exe_wide: &mut [u16],
+    extra_env: &[(&str, String)],
+    extra_inheritable_handles: &[HANDLE],
+) -> Result<SpawnSuspendedResult, String> {
+    spawn_suspended_impl(
+        exe_wide,
+        false,
+        false,
+        true,
+        extra_env,
+        true,
+        extra_inheritable_handles,
+    )
+}
+
+/// `extra_inheritable_handles`: handles this call additionally wants ONE new child to inherit
+/// (e.g. `spawn_process_fork_child`'s per-fd bridge-pipe "child" ends, or the shared-kernel-heap
+/// section handle), each of which the CALLER has already marked `HANDLE_FLAG_INHERIT` on.
+///
+/// FIX (pipe-handle-leak investigation, 2026-09-17): plain `bInheritHandles=TRUE` inherits EVERY
+/// currently-inheritable handle open anywhere in THIS process into the new child -- not just the
+/// ones this call intends. That is over-broad by construction: any OTHER handle this process
+/// happens to have marked inheritable at the moment of this `CreateProcessW` call (most
+/// concretely, another concurrently-in-flight `spawn_process_fork_child` call's own per-fd bridge
+/// pipe `child` end, marked inheritable earlier in `create_inheritable_child_pipe` and not yet
+/// closed by that OTHER call's own `close_child_side`) gets silently duplicated into THIS child
+/// too, purely because Windows handle inheritance is scoped to the whole process, never to one
+/// `CreateProcessW` call. A sibling cross-process-fork child holding a stray inherited duplicate
+/// of another child's pipe write end keeps that pipe's underlying kernel object alive after its
+/// real, intended writer exits -- the reader never sees EOF, presenting as a permanent hang
+/// (root-caused live against the `webtop_stack.sh` nginx self-test hang; see
+/// `docs/AGENTS_ARCHIVE_2026-09-17.md`). `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` scopes inheritance
+/// to an explicit allow-list for exactly this ONE `CreateProcessW` call, immune to whatever else
+/// is concurrently marked inheritable elsewhere in the process -- the same mechanism Microsoft's
+/// own docs recommend over broad `bInheritHandles=TRUE` for this reason (MSDN "Constrained
+/// process handle inheritance"), and the only way to match real `fork()`+`exec()` semantics
+/// (child gets exactly the fds it should, nothing else) rather than the "inherit everything"
+/// Windows default.
+fn spawn_suspended_impl(
+    exe_wide: &mut [u16],
+    want_stdout_pipe: bool,
+    want_stdin_pipe: bool,
+    inherit_stdio: bool,
+    extra_env: &[(&str, String)],
+    force_inherit_handles: bool,
+    extra_inheritable_handles: &[HANDLE],
+) -> Result<SpawnSuspendedResult, String> {
+    // Built up-front so the pointer handed to `CreateProcessW` stays valid for the whole call.
+    let mut env_block = build_child_environment_block(extra_env);
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
     startup_info.cb =
         u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
@@ -2791,8 +4272,210 @@ fn spawn_suspended(
             }
             startup_info.hStdInput = stdin_read;
         }
+    } else if inherit_stdio {
+        // FIX (track-b investigation, confirmed live): this function's own doc comment used to
+        // claim "the child inherits the parent's real console session's stdio the ordinary way a
+        // genuine `fork()` child would" via `bInheritHandles=0` and no `STARTF_USESTDHANDLES` --
+        // but that reasoning is backwards. `bInheritHandles=0` means NONE of the parent's open
+        // handles (including its stdio) are inherited; omitting `STARTF_USESTDHANDLES` then just
+        // leaves the child's stdio unset, which `CreateProcessW` only fills in with a fresh
+        // console/NUL default, never the parent's real stream. A real POSIX `fork()` child always
+        // keeps the exact same fd table (including stdio) as its parent -- this was silently
+        // dropping every cross-process fork child's stdout/stderr, live-confirmed against the
+        // `tcache_fork_repro.sh`-equivalent `bash -c` repro under `LITEBOX_PROCESS_FORK=1`: the
+        // child's own `echo`-produced `TCACHE_REPRO_*` marker lines, and every `eprintln!` in this
+        // module's own child-side diagnostic chain, never appeared anywhere -- not lost output
+        // from a hang, genuinely never delivered anywhere observable. Explicitly duplicate the
+        // CURRENT process's real `STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE`/`STD_INPUT_HANDLE` into
+        // the child via `STARTF_USESTDHANDLES` with `bInheritHandles=1`, matching real `fork()`
+        // semantics, so the child's own stdout writes (and any guest `write(1, ..)`/`write(2, ..)`
+        // this platform routes through the real Windows stdio handles) become visible the same way
+        // a normal, non-fork guest program's output already is.
+        //
+        // BUG FIXED HERE (found this session): this branch used to run unconditionally whenever
+        // `!want_stdout_pipe`, ignoring `inherit_stdio` entirely -- so even the memory-copy-only
+        // diagnostic probe (`inherit_stdio=false`, pass 111/112) got the parent's stdio wired in
+        // against its own explicit request. Worse, a SECOND, later block in this function
+        // (removed here) re-ran the identical `GetStdHandle` lookups and then unconditionally
+        // wrote `startup_info.hStdInput/hStdOutput/hStdError = h` and forced
+        // `dwFlags |= STARTF_USESTDHANDLES` / `inherit_handles = 1` with NO null/
+        // `INVALID_HANDLE_VALUE` guard at all -- unlike this block, which only assigns a stream
+        // when the handle is actually valid. Whenever the parent's own `STD_INPUT_HANDLE` (or
+        // stdout/stderr) was null or `INVALID_HANDLE_VALUE` -- a real condition for a
+        // non-interactively-launched/redirected runner process, live-confirmed via `GetStdHandle`
+        // in this exact spawn path -- that second block clobbered this block's correct "leave it
+        // unset" decision and hand the child a `STARTUPINFOW` naming a genuinely invalid HANDLE as
+        // one of its standard streams, which is then what the child's own fd 0/1/2 plumbing (and
+        // in turn the guest's dynamically-linked glibc probing those fds at startup) inherits.
+        // Fixed by keeping exactly one such block, gated on `inherit_stdio` (so the diagnostic
+        // probe's explicit `inherit_stdio=false` is respected again), and preserving this block's
+        // per-handle validity guard as the only place `STARTF_USESTDHANDLES`/`hStd*` get set.
+        unsafe {
+            let stdout_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            );
+            let stderr_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+            );
+            let stdin_h = windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            );
+            // `GetStdHandle` returns THIS process's own stdio handles, which may not themselves be
+            // marked inheritable (e.g. when a pipe was created upstream, by a shell or another
+            // launcher, without `bInheritHandle` set) -- `CreateProcessW`'s `bInheritHandles=1`
+            // below only propagates handles that are ALREADY marked inheritable, silently skipping
+            // any that are not, so mark each one explicitly (`HANDLE_FLAG_INHERIT = 1`) before
+            // relying on it; a failed `SetHandleInformation` just leaves that handle exactly as
+            // inheritable as it already was, no worse than the pre-fix behavior. Each stream is
+            // ONLY wired into `startup_info` -- and only then counts toward `STARTF_USESTDHANDLES`
+            // -- when it is neither null nor `INVALID_HANDLE_VALUE`; an invalid stream is left at
+            // its zeroed default rather than ever being copied into the child's `STARTUPINFOW`.
+            const HANDLE_FLAG_INHERIT: u32 = 1;
+            if !stdout_h.is_null()
+                && stdout_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stdout_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdOutput = stdout_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+            if !stderr_h.is_null()
+                && stderr_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stderr_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdError = stderr_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+            if !stdin_h.is_null() && stdin_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    stdin_h,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                );
+                startup_info.hStdInput = stdin_h;
+                startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            }
+        }
+        if startup_info.dwFlags & STARTF_USESTDHANDLES != 0 {
+            inherit_handles = 1;
+        }
+    }
+    // else (`!want_stdout_pipe && !inherit_stdio`): the diagnostic memory-copy-only probe's own
+    // explicit request -- leave the child's stdio completely unset (fresh console/NUL default),
+    // matching its documented intent instead of silently overriding it.
+
+    if force_inherit_handles {
+        // See `spawn_suspended_forcing_handle_inheritance`'s doc comment: the shared-kernel-heap
+        // section handle must be inherited even on a run whose own stdio handles happened not to
+        // be inheritable.
+        inherit_handles = 1;
     }
 
+    // `CREATE_NO_WINDOW`: every caller of this function redirects the child's stdio itself
+    // (`want_stdout_pipe`/`want_stdin_pipe`'s pipes, or `inherit_stdio`'s inherited handles) --
+    // there is never a case where this child needs its OWN visible console. Without this flag,
+    // Windows allocates a fresh console window for each spawn regardless of stdio redirection
+    // (redirecting the streams and suppressing the window are independent knobs), which is
+    // exactly what made every `LITEBOX_PROCESS_FORK=1` child (nginx, curl, mkdir, sed, ... --
+    // every one of this session's dozens of test runs) flash a new terminal window on screen.
+    // Mirrors the fault-watchdog spawn's own `CREATE_NO_WINDOW` use elsewhere in this file.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // Build the explicit inheritance allow-list this call intends: its own wired stdio handles
+    // plus whatever `extra_inheritable_handles` the caller asked for (bridge-pipe child ends,
+    // the shared-heap section handle). See `spawn_suspended_impl`'s own doc comment for why this
+    // exists instead of trusting plain `bInheritHandles=TRUE`.
+    let mut allow_list: std::vec::Vec<HANDLE> = std::vec::Vec::new();
+    for h in [
+        startup_info.hStdOutput,
+        startup_info.hStdError,
+        startup_info.hStdInput,
+    ] {
+        if !h.is_null() && !allow_list.contains(&h) {
+            allow_list.push(h);
+        }
+    }
+    for h in extra_inheritable_handles {
+        if !h.is_null() && !allow_list.contains(h) {
+            allow_list.push(*h);
+        }
+    }
+
+    // `attr_list_buf` must outlive the `CreateProcessW` call below; `DeleteProcThreadAttributeList`
+    // is called on every exit path (the `ok` branch below and both early-return failure branches),
+    // matching the paired-cleanup shape every other resource in this function already follows.
+    let mut attr_list_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+    let mut startup_info_ex: STARTUPINFOEXW = unsafe { core::mem::zeroed() };
+    let mut creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+    let mut attr_list_initialized = false;
+    let use_explicit_list = inherit_handles == 1 && !allow_list.is_empty();
+    if use_explicit_list {
+        let mut size: usize = 0;
+        // Safety: first call with a null list is documented to fail with
+        // `ERROR_INSUFFICIENT_BUFFER` while still writing the required size into `size`.
+        unsafe {
+            InitializeProcThreadAttributeList(core::ptr::null_mut(), 1, 0, &raw mut size);
+        }
+        if size > 0 {
+            attr_list_buf.resize(size, 0);
+            let list_ptr = attr_list_buf.as_mut_ptr().cast::<c_void>();
+            // Safety: `attr_list_buf` is sized exactly `size` bytes per the query above and
+            // outlives every use of `list_ptr` below.
+            let init_ok =
+                unsafe { InitializeProcThreadAttributeList(list_ptr, 1, 0, &raw mut size) };
+            if init_ok != 0 {
+                attr_list_initialized = true;
+                // Safety: `allow_list` outlives the `UpdateProcThreadAttribute`/`CreateProcessW`
+                // pair below; `list_ptr` was just initialized above.
+                let update_ok = unsafe {
+                    UpdateProcThreadAttribute(
+                        list_ptr,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                        allow_list.as_ptr().cast::<c_void>(),
+                        allow_list.len() * core::mem::size_of::<HANDLE>(),
+                        core::ptr::null_mut(),
+                        core::ptr::null(),
+                    )
+                };
+                if update_ok != 0 {
+                    startup_info_ex.StartupInfo = startup_info;
+                    startup_info_ex.StartupInfo.cb =
+                        u32::try_from(core::mem::size_of::<STARTUPINFOEXW>())
+                            .expect("STARTUPINFOEXW fits in u32");
+                    startup_info_ex.lpAttributeList = list_ptr;
+                    creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+                } else {
+                    // Setup failed -- fall back to the old ambient-inheritance behavior rather
+                    // than hard-failing the whole spawn; still strictly no worse than before this
+                    // fix. `attr_list_initialized` stays true so cleanup still runs.
+                    eprintln!(
+                        "spawn_suspended_impl: UpdateProcThreadAttribute(HANDLE_LIST) failed, GetLastError={} -- falling back to bInheritHandles=TRUE with no explicit list",
+                        unsafe { GetLastError() }
+                    );
+                }
+            } else {
+                eprintln!(
+                    "spawn_suspended_impl: InitializeProcThreadAttributeList failed, GetLastError={} -- falling back to bInheritHandles=TRUE with no explicit list",
+                    unsafe { GetLastError() }
+                );
+            }
+        }
+    }
+    let startup_info_ptr: *const STARTUPINFOW =
+        if creation_flags & EXTENDED_STARTUPINFO_PRESENT != 0 {
+            (&raw const startup_info_ex).cast::<STARTUPINFOW>()
+        } else {
+            &raw const startup_info
+        };
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -2800,13 +4483,20 @@ fn spawn_suspended(
             core::ptr::null(),
             core::ptr::null(),
             inherit_handles,
-            CREATE_SUSPENDED,
+            creation_flags,
+            env_block.as_mut_ptr().cast(),
             core::ptr::null(),
-            core::ptr::null(),
-            &raw const startup_info,
+            startup_info_ptr,
             &raw mut process_info,
         )
     };
+    if attr_list_initialized {
+        // Safety: `list_ptr` (== `attr_list_buf.as_mut_ptr()`) was successfully initialized above
+        // and `CreateProcessW` has already returned, so the list is no longer needed.
+        unsafe {
+            DeleteProcThreadAttributeList(attr_list_buf.as_mut_ptr().cast::<c_void>());
+        }
+    }
     // The child's own inherited copy of the write/read handles keeps them open in the child; the
     // parent must close ITS copies regardless of CreateProcessW's outcome so each pipe only stays
     // open via the child's handle (needed for ERROR_BROKEN_PIPE to fire correctly once the child
@@ -2854,15 +4544,406 @@ fn spawn_suspended(
     ))
 }
 
+/// Rebuilds `source_group` in the child with its `VM_SHARED` sub-ranges as REAL views of the real
+/// shared objects, and everything else as ordinary copied bytes.
+///
+/// # Why a placeholder, and why only the parent can do the mapping
+///
+/// `MapViewOfFile3` cannot be made to overlay address space the child already holds -- measured:
+/// committed, decommitted and merely-reserved targets all answer `ERROR_INVALID_ADDRESS` (487). A
+/// view can only *replace a placeholder*. So the group is reserved as ONE placeholder, split into
+/// per-segment placeholders with `VirtualFreeEx(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`, each
+/// shared segment replaced by `MapViewOfFile3(..., MEM_REPLACE_PLACEHOLDER, ...)`, and each
+/// remaining segment replaced by `MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER` plus the
+/// parent's bytes. The layout is unchanged -- the group still covers exactly `source_group`, at
+/// exactly that address -- only the shared sub-ranges are backed differently.
+///
+/// Only the parent can do it: by the time the child runs, its address space already exists, and a
+/// `SharedMemoryHandle` is a `HANDLE` value that means nothing in another process. The child's own
+/// route to the same bytes is the NAME, which it re-opens in `Vmem::adopt_carried_shared`.
+///
+/// Returns `Err(win32_err)` when this group cannot be carried. The caller then rebuilds the group
+/// as copied bytes -- loudly, never silently: the parent logs the region it failed to share, and
+/// the child refuses to book it as shared (`memory_is_shared_view` sees PRIVATE pages), so a
+/// degraded group is never mistaken for real sharing.
+///
+/// A refusal must leave the child's address space exactly as the caller's byte-copy fallback
+/// expects it -- FREE at this span. Every check that can refuse runs before the placeholder is
+/// reserved, and every failure after it runs `cleanup`; a hole left here is what broke chrD62,
+/// where the fallback's re-reserve hit `ERROR_INVALID_ADDRESS` (487) and the whole cross-process
+/// spawn was abandoned.
+fn copy_one_group_with_shared(
+    child: HANDLE,
+    source_group: &Range<usize>,
+    shared: &[SharedRegionCarry],
+    read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
+) -> Result<(), u32> {
+    const GRAN: usize = 64 * 1024;
+    // `ERROR_INVALID_HANDLE`: this process holds no live handle to the object it is trying to hand
+    // the child, so there is nothing to map.
+    const NO_SECTION_HANDLE: u32 = 6;
+    let len = source_group.len();
+    if source_group.start % GRAN != 0 || len % GRAN != 0 {
+        // A placeholder must be granularity-aligned and granularity-sized. Reservation groups are
+        // by construction (pass 110), so reaching this means the group bookkeeping changed, not
+        // that this region is uncarriable.
+        return Err(0);
+    }
+
+    // Step 1: cut the group into segments along the shared ranges. Pure bookkeeping, done BEFORE
+    // anything exists in the child, so every refusal up to here leaves the child's address space
+    // byte-for-byte untouched and the caller's byte-copy fallback re-reserves a FREE span.
+    // That ordering is what chrD62 broke: the check used to run AFTER the reserve, so a refused
+    // group left a live placeholder over the very span the fallback then re-reserved --
+    // `ERROR_INVALID_ADDRESS` (487), `spawn/resume failed`, and every child pushed onto the
+    // same-process thread-based fork where it faults before its first instruction.
+    let mut segments: std::vec::Vec<(Range<usize>, Option<&SharedRegionCarry>)> =
+        std::vec::Vec::new();
+    let mut cursor = source_group.start;
+    for carry in shared {
+        let start = carry.range.start.max(source_group.start);
+        let end = carry.range.end.min(source_group.end);
+        if start >= end {
+            continue;
+        }
+        if start > cursor {
+            segments.push((cursor..start, None));
+        }
+        segments.push((start..end, Some(carry)));
+        cursor = end;
+    }
+    if cursor < source_group.end {
+        segments.push((cursor..source_group.end, None));
+    }
+    // Only PAGE alignment is required: a placeholder splits at any page boundary and a view starts
+    // at any page boundary. Allocation-granularity alignment is NOT -- measured,
+    // `.wfgy/xproc_sparse.py`, which reproduces chrD62's sparse group exactly (28672 shared at
+    // +0x0, a 36864 private gap, 4096 shared at +0x10000): the split at the UNALIGNED +0x7000
+    // boundary and both non-granularity-sized views succeed. Requiring 64KB alignment there is
+    // what made every real group holding an odd-sized shared region uncarriable, which is the
+    // whole regression -- a shared range is always page-aligned because it is an mmap.
+    const PAGE_SIZE: usize = 4096;
+    if segments
+        .iter()
+        .any(|(segment, _)| segment.start % PAGE_SIZE != 0)
+    {
+        return Err(0);
+    }
+
+    // Step 2: the whole group as ONE placeholder -- reserved, nothing committed, so still
+    // replaceable.
+    let mut addr_req = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: source_group.start as *mut c_void,
+        HighestEndingAddress: (source_group.end - 1) as *mut c_void,
+        Alignment: 0,
+    };
+    let mut ext_param = MEM_EXTENDED_PARAMETER {
+        Anonymous1: MEM_EXTENDED_PARAMETER_0 {
+            _bitfield: MemExtendedParameterAddressRequirements as u64,
+        },
+        Anonymous2: MEM_EXTENDED_PARAMETER_1 {
+            Pointer: (&raw mut addr_req).cast::<c_void>(),
+        },
+    };
+    let reserved = unsafe {
+        windows_sys::Win32::System::Memory::VirtualAlloc2(
+            child,
+            core::ptr::null_mut(),
+            len,
+            MEM_RESERVE | PLACEHOLDER_RESERVE,
+            PAGE_NOACCESS,
+            &raw mut ext_param,
+            1,
+        )
+    };
+    if reserved.is_null() {
+        return Err(unsafe { GetLastError() });
+    }
+    if reserved as usize != source_group.start {
+        unsafe {
+            VirtualFreeEx(child, reserved, 0, MEM_RELEASE);
+        }
+        return Err(0);
+    }
+
+    // Step 3: split the placeholder to match the segments. One `VirtualFreeEx(...,
+    // MEM_PRESERVE_PLACEHOLDER)` per segment, in address order, carves each segment out of whatever
+    // placeholder currently covers it.
+    // Best-effort undo, run before every failure return below that has already placed something.
+    // Freeing each segment's base with `MEM_RELEASE` (size 0) releases the whole allocation that
+    // contains it -- after a split every segment is its own allocation, and an unsplit remainder's
+    // allocation base is the first segment inside it, so covering every segment base covers the
+    // whole group. It has to be undone because the caller's byte-copy fallback re-reserves the
+    // group at this SAME address, and reserving over live memory answers 487 (measured,
+    // `.wfgy/xproc_placeholder2.py` case D/G).
+    let cleanup = || {
+        for (segment, _) in &segments {
+            unsafe {
+                // A section view answers `VirtualFreeEx(..., MEM_RELEASE)` with 87 and has to be
+                // unmapped with `UnmapViewOfFile2` instead; a placeholder or a committed private
+                // range ignores that and is released by the `VirtualFreeEx` after it. Both are
+                // best-effort, and together they cover every state a segment can be left in when
+                // a later step fails. Measured: `.wfgy/xproc_placeholder5.py`.
+                let _ = UnmapViewOfFile2(
+                    child,
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: segment.start as *mut c_void,
+                    },
+                    0,
+                );
+                let _ = VirtualFreeEx(child, segment.start as *mut c_void, 0, MEM_RELEASE);
+            }
+        }
+    };
+    let diag = std::env::var_os("LITEBOX_DIAG_FORK_SHARED").is_some();
+    // A split has to leave a remainder. `VirtualFreeEx(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`
+    // over a range that is ALREADY the whole placeholder covering it is rejected with
+    // `ERROR_INVALID_ADDRESS` (487) -- measured, `.wfgy/xproc_placeholder3.py` case J: splitting
+    // an entire 12-granule placeholder returns 487, splitting only its first granule returns 0.
+    // Once segment `i` has been split off, the leftover placeholder begins exactly at segment
+    // `i + 1` and ends at the group end, so the LAST segment is already exactly one placeholder
+    // and must not be split again. This was the whole 487 in run shmf2: group=12 granules with
+    // the shared range as its first granule, so the loop's second split covered the entire
+    // remaining 11-granule placeholder and failed.
+    for (index, (segment, _)) in segments.iter().enumerate() {
+        if index + 1 == segments.len() {
+            break;
+        }
+        let ok = unsafe {
+            VirtualFreeEx(
+                child,
+                segment.start as *mut c_void,
+                segment.len(),
+                MEM_RELEASE | PLACEHOLDER_PRESERVE,
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if diag {
+                eprintln!(
+                    "[diag-fork-shared] SPLIT FAILED group={:#x}..{:#x} segment={:#x}..{:#x} err={}",
+                    source_group.start, source_group.end, segment.start, segment.end, err
+                );
+            }
+            cleanup();
+            return Err(err);
+        }
+    }
+
+    // Step 3: replace each placeholder segment with what actually belongs there.
+    for (segment, carry) in &segments {
+        match carry {
+            Some(carry) => {
+                let Some(section) = shm_section_handle(carry.name.as_str()) else {
+                    cleanup();
+                    return Err(NO_SECTION_HANDLE);
+                };
+                // Widest first: a view can never exceed the section's protection ceiling, so the
+                // narrow retries are what a file-backed section whose ceiling fell back to
+                // `PAGE_READWRITE` needs. The widest protection is NOT what the guest asked for,
+                // so the view is narrowed back to `carry.perms` right after it is placed --
+                // `adopt_carried_shared` on the child side only does bookkeeping, and the child
+                // runs no instruction of its own before it is resumed, so this is the only place
+                // the child's initial protection can be made to equal the parent's.
+                //
+                // A `COPY_ON_WRITE` carry -- a guest `MAP_PRIVATE` file mapping, which one section
+                // serves for every process that maps that file -- must be mapped COPY-ON-WRITE, or
+                // the child's writes land in the shared object and every other mapper (including
+                // the parent) sees them: a "private" mapping that is not private. The child's own
+                // `mprotect(PROT_WRITE)` succeeds either way, so nothing but the bytes tells the
+                // two apart -- hence `cb70.sh`.
+                let protections: &[u32] = if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
+                    &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
+                } else {
+                    &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
+                };
+                let mut view = 0usize;
+                let mut granted = 0u32;
+                for protection in protections {
+                    let mapped = unsafe {
+                        MapViewOfFile3(
+                            section as *mut c_void,
+                            child,
+                            segment.start as *mut c_void,
+                            0,
+                            segment.len(),
+                            PLACEHOLDER_REPLACE,
+                            *protection,
+                            core::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                    if !mapped.Value.is_null() {
+                        view = mapped.Value as usize;
+                        granted = *protection;
+                        break;
+                    }
+                }
+                if view == 0 {
+                    let err = unsafe { GetLastError() };
+                    if diag {
+                        eprintln!(
+                            "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
+                            source_group.start,
+                            source_group.end,
+                            segment.start,
+                            segment.end,
+                            carry.name.as_str(),
+                            err
+                        );
+                    }
+                    cleanup();
+                    return Err(err);
+                }
+                if view != segment.start {
+                    // Should be unreachable: `MEM_REPLACE_PLACEHOLDER` with an explicit base
+                    // either replaces exactly that placeholder or fails.
+                    cleanup();
+                    return Err(0);
+                }
+                // Handing the child a wider view than its own mapping is not harmless: a guest
+                // `PROT_READ` `MAP_SHARED` region mapped `PAGE_EXECUTE_READWRITE` lets the child
+                // write into the object every other mapper -- including the parent -- sees, and
+                // leaves a guest write there unfaulted. `PROT_READ|PROT_EXEC` likewise must not
+                // arrive writable. Narrowing can legitimately fail (the same section ceiling that
+                // forced the wide map), and a too-wide view stays correct in the direction that
+                // matters -- nothing is taken away that the mapping needs -- so the failure is
+                // reported, not fatal.
+                let narrowed = crate::prot_flags(carry.perms);
+                if narrowed != granted {
+                    let mut previous = 0u32;
+                    let ok = unsafe {
+                        VirtualProtectEx(
+                            child,
+                            view as *mut c_void,
+                            segment.len(),
+                            narrowed,
+                            &mut previous,
+                        )
+                    };
+                    if ok == 0 && diag {
+                        eprintln!(
+                            "[diag-fork-shared] NARROW FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} granted={:#x} wanted={:#x} err={}",
+                            source_group.start,
+                            source_group.end,
+                            segment.start,
+                            segment.end,
+                            carry.name.as_str(),
+                            granted,
+                            narrowed,
+                            unsafe { GetLastError() }
+                        );
+                    }
+                }
+            }
+            None => {
+                let placed = unsafe {
+                    windows_sys::Win32::System::Memory::VirtualAlloc2(
+                        child,
+                        segment.start as *mut c_void,
+                        segment.len(),
+                        MEM_RESERVE | MEM_COMMIT | PLACEHOLDER_REPLACE,
+                        PAGE_READWRITE,
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if placed.is_null() {
+                    let err = unsafe { GetLastError() };
+                    cleanup();
+                    return Err(err);
+                }
+                // The parent's real bytes for the non-shared part of the group: the same
+                // page-by-page copy `copy_one_group` does, restricted to this segment so an
+                // unreadable padding page stays zero-filled instead of failing the whole group.
+                if let Some(err) = copy_pages_into(child, segment, read_source_bytes) {
+                    cleanup();
+                    return Err(err);
+                }
+            }
+        }
+    }
+    // Measurement only: `LITEBOX_DIAG_FORK_SHARED_FORCE_FAIL=1` fails every carry AFTER the group
+    // is fully placed in the child, so the degradation can be proven to rebuild the child exactly
+    // as the byte-copy path does -- a forced failure must reproduce the no-carry baseline result
+    // for every probe. Without it the degradation is exercised only by whichever real group happens to
+    // fail, which is how chrD62 shipped a hole in the child's address space untested.
+    if std::env::var_os("LITEBOX_DIAG_FORK_SHARED_FORCE_FAIL").is_some() {
+        cleanup();
+        return Err(0);
+    }
+    if std::env::var_os("LITEBOX_DIAG_FORK_SHARED").is_some() {
+        for (segment, carry) in &segments {
+            eprintln!(
+                "[diag-fork-shared] group={:#x}..{:#x} segment={:#x}..{:#x} {}",
+                source_group.start,
+                source_group.end,
+                segment.start,
+                segment.end,
+                match carry {
+                    Some(c) => alloc::format!("SHARED view of {}", c.name.as_str()),
+                    None => "private copy".to_string(),
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `WriteProcessMemory`s the parent's live bytes for every page of `range` into `child` at the same
+/// addresses. Unreadable pages (real guest padding inside a granularity-rounded group) are left
+/// zero-filled, and all-zero pages are skipped because `MEM_COMMIT` already zero-fills them.
+/// Returns `Some(win32_err)` on the first write failure.
+fn copy_pages_into(
+    child: HANDLE,
+    range: &Range<usize>,
+    read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
+) -> Option<u32> {
+    const PAGE_SIZE: usize = 4096;
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let page_end = (cursor + PAGE_SIZE).min(range.end);
+        if let Some(bytes) = read_source_bytes(cursor..page_end) {
+            if !bytes.iter().all(|b| *b == 0) {
+                let mut written = 0usize;
+                let ok = unsafe {
+                    WriteProcessMemory(
+                        child,
+                        cursor as *mut c_void,
+                        bytes.as_ptr().cast::<c_void>(),
+                        bytes.len(),
+                        &raw mut written,
+                    )
+                };
+                if ok == 0 || written != bytes.len() {
+                    return Some(unsafe { GetLastError() });
+                }
+            }
+        }
+        cursor = page_end;
+    }
+    None
+}
+
 /// Attempts steps 1-2 of [`diagnostic_spawn_and_copy`]'s doc comment for a single reservation
 /// group. Never panics on failure -- a failed group is reported in the returned
 /// [`GroupCopyResult`], not propagated as an error, so the caller sees every group's outcome.
+///
+/// `carried_shared` are the parent's `VM_SHARED` mappings; any that fall inside this group are
+/// mapped as real views by [`copy_one_group_with_shared`] instead of being copied as bytes.
 fn copy_one_group(
     child: HANDLE,
     source_group: &Range<usize>,
     _dest_base: usize,
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
+    carried_shared: &[SharedRegionCarry],
 ) -> GroupCopyResult {
+    if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+        eprintln!(
+            "[diag_alloc_vec] copy_one_group ENTRY child={:p} group={:#x}..{:#x}",
+            child, source_group.start, source_group.end
+        );
+    }
     const PAGE_SIZE: usize = 4096;
     let len = source_group.len();
     let fail = |err: u32| GroupCopyResult {
@@ -2870,6 +4951,46 @@ fn copy_one_group(
         succeeded: false,
         last_error: err,
     };
+
+    // A `VM_SHARED` mapping inside this group is NOT bytes to copy. Copying the parent's bytes
+    // gives the child its own private pages that merely start out equal, and then every write the
+    // child makes lands where the parent cannot see it -- which is the bug. The shared sub-ranges
+    // get a real view of the real object instead; everything else in the group is copied as bytes
+    // exactly as before.
+    let mut shared: std::vec::Vec<SharedRegionCarry> = carried_shared
+        .iter()
+        .filter(|c| c.range.start < source_group.end && source_group.start < c.range.end)
+        .cloned()
+        .collect();
+    shared.sort_by_key(|c| c.range.start);
+    if !shared.is_empty() {
+        match copy_one_group_with_shared(child, source_group, &shared, read_source_bytes) {
+            Ok(()) => {
+                return GroupCopyResult {
+                    source_group: source_group.clone(),
+                    succeeded: true,
+                    last_error: 0,
+                };
+            }
+            Err(err) => {
+                // NAMED, never silent: this is a region the child will NOT genuinely share, and
+                // the child says so too when it refuses to book it (`Vmem::adopt_carried_shared`).
+                litebox_util_log::error!(
+                    group:? = source_group, regions:? = shared.iter().map(|c| (c.range.start, c.range.end, c.name.as_str())).collect::<std::vec::Vec<_>>(), win32_err:% = err;
+                    "fork: a shared region could not be mapped into the child, so this fork loses \
+                     real sharing for it -- parent and child will NOT observe each other's writes"
+                );
+                // NOT fatal to the fork. Losing sharing for one region is the pre-existing bug
+                // this carry exists to fix; a fork that abandons the cross-process spawn is
+                // strictly worse -- it lands on the same-process thread-based fallback, where
+                // every child faults before its first instruction, which also makes the carry
+                // impossible to test. So: fall through and rebuild this group as copied bytes,
+                // exactly as it was before the carry existed. The child still refuses to book
+                // the range as shared (`memory_is_shared_view` sees PRIVATE pages), so the
+                // degradation is loud on both sides and never mistaken for real sharing.
+            }
+        }
+    }
 
     // Step 1: force-reserve+commit the group's exact span, at its exact SOURCE address, in the
     // child. `MEM_ADDRESS_REQUIREMENTS` makes this a hard requirement -- per pass 109, either it
@@ -2909,7 +5030,14 @@ fn copy_one_group(
         )
     };
     if reserved.is_null() {
-        return fail(unsafe { GetLastError() });
+        let err = unsafe { GetLastError() };
+        if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+            eprintln!(
+                "[diag_alloc_vec] copy_one_group VirtualAlloc2 FAILED child={:p} group={:#x}..{:#x} len={:#x} err={}",
+                child, source_group.start, source_group.end, len, err
+            );
+        }
+        return fail(err);
     }
     if reserved as usize != source_group.start {
         // Should be unreachable given `MEM_ADDRESS_REQUIREMENTS` is a hard requirement (pass 109
@@ -2944,6 +5072,19 @@ fn copy_one_group(
     // ever reached the resume/injection step). The full per-address log is reconstructible from
     // (start_addr, run_length) at analysis time by grep'ing the printed range.
     let mut zero_runs: Vec<(usize, usize)> = Vec::new();
+
+    // Batching consecutive pages into one larger `WriteProcessMemory` call was tried here and
+    // MEASURED LIVE to make things WORSE, not better (see `docs/track-b-fork-fix-progress.md`'s
+    // matching entry): ~24s became ~46s for the same real 173MB group. The per-page cost this
+    // function pays is not dominated by `WriteProcessMemory`'s own call overhead -- it is
+    // dominated by `read_source_bytes`'s own per-page `VirtualQuery` call (see
+    // `fork_verify::is_readable`'s doc comment: cost scales with the process's total committed
+    // memory), which batching the WRITE side does nothing to reduce while adding a real extra
+    // buffer-copy cost on top. The actual fix belongs on the READ side, not here -- see
+    // `read_source_bytes`'s own construction site in this crate's `lib.rs`
+    // (`spawn_cross_process_fork_child`) for where that is addressed instead. Left as simple,
+    // unbatched per-page writes here deliberately, now that batching is a confirmed non-fix.
+    let (mut n_unreadable, mut n_zero, mut n_written) = (0usize, 0usize, 0usize);
     let mut cursor = source_group.start;
     while cursor < source_group.end {
         let page_end = (cursor + PAGE_SIZE).min(source_group.end);
@@ -2951,6 +5092,13 @@ fn copy_one_group(
         let Some(bytes) = read_source_bytes(page_range.clone()) else {
             // Unreadable page: leave it as the child's already-zero-filled MEM_COMMIT content
             // (real guest padding pages are unmapped too, so this matches production behavior).
+            if std::env::var_os("LITEBOX_DIAG_FORK_SKIPPED_PAGE").is_some() {
+                eprintln!(
+                    "[diag-fork-skip] page treated as unreadable/padding, left zero-filled in child: addr={:#x}..{:#x} group={:#x}..{:#x}",
+                    page_range.start, page_range.end, source_group.start, source_group.end
+                );
+            }
+            n_unreadable += 1;
             cursor = page_end;
             continue;
         };
@@ -2972,22 +5120,46 @@ fn copy_one_group(
                 }
             }
         }
+        if bytes.iter().all(|b| *b == 0) {
+            n_zero += 1;
+            cursor = page_end;
+            continue;
+        }
+        n_written += 1;
         let mut written = 0usize;
+        let dest = (reserved as usize + (cursor - source_group.start)) as *mut c_void;
         let ok = unsafe {
             WriteProcessMemory(
                 child,
-                (reserved as usize + (cursor - source_group.start)) as *mut c_void,
+                dest,
                 bytes.as_ptr().cast::<c_void>(),
                 bytes.len(),
                 &raw mut written,
             )
         };
         if ok == 0 || written != bytes.len() {
-            return fail(unsafe { GetLastError() });
+            let err = unsafe { GetLastError() };
+            if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
+                eprintln!(
+                    "[diag_alloc_vec] copy_one_group WriteProcessMemory FAILED child={:p} addr={:#x} len={:#x} written={} err={}",
+                    child,
+                    reserved as usize + (cursor - source_group.start),
+                    bytes.len(),
+                    written,
+                    err
+                );
+            }
+            return fail(err);
         }
         cursor = page_end;
     }
 
+    if std::env::var_os("LITEBOX_DIAG_FORK_TIMING").is_some() && len >= (16 << 20) {
+        eprintln!(
+            "[diag-fork-timing] (parent) group {:#x} pages: unreadable_or_skipped={n_unreadable} zero={n_zero} written={n_written}",
+            source_group.start
+        );
+    }
     if log_zeroes {
         for (run_start, run_words) in &zero_runs {
             let run_end = run_start + run_words * 8;
@@ -3021,7 +5193,20 @@ fn copy_one_group(
 /// cross-process spawn primitive produces) that the caller has not already closed.
 pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
     unsafe {
-        WaitForSingleObject(handle, INFINITE);
+        // 53rd-pass diagnostic: capture real Windows-level evidence (kernel process-creation
+        // timestamp, actual WaitForSingleObject return value) BEFORE this call's own
+        // GetExitCodeProcess, to settle whether this blocking wait is genuinely returning early
+        // (a litebox-side bug) or genuinely correctly reporting a real, fast exit (pointing the
+        // bug elsewhere, e.g. inside the spawned child itself). See `diag_log_wait_evidence`'s doc
+        // comment for the full rationale and AGENTS_ARCHIVE_2026-09-22.md's 53rd-pass pickup.
+        let wait_result = WaitForSingleObject(handle, INFINITE);
+        let last_error = GetLastError();
+        diag_log_wait_evidence(
+            "wait_for_process_exit(blocking/INFINITE)",
+            handle,
+            wait_result,
+            last_error,
+        );
         let mut exit_code: u32 = 0;
         if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             eprintln!(
@@ -3048,7 +5233,22 @@ pub unsafe fn wait_for_process_exit(handle: HANDLE) -> u32 {
 pub unsafe fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
     unsafe {
         const WAIT_OBJECT_0: u32 = 0;
-        if WaitForSingleObject(handle, 0) != WAIT_OBJECT_0 {
+        let wait_result = WaitForSingleObject(handle, 0);
+        // 53rd-pass diagnostic: this poll is called from tight repoll loops (see
+        // `sys_wait4`'s callers in `litebox_shim_linux/src/syscalls/process.rs`) -- logging every
+        // WAIT_TIMEOUT would flood the log and perturb timing, so only the transition that
+        // matters for the premature-exit hypothesis (this poll concluding WAIT_OBJECT_0, i.e.
+        // "I think this process is gone") is logged. See `diag_log_wait_evidence`'s doc comment.
+        if wait_result == WAIT_OBJECT_0 {
+            let last_error = GetLastError();
+            diag_log_wait_evidence(
+                "try_wait_for_process_exit(WNOHANG poll)->WAIT_OBJECT_0",
+                handle,
+                wait_result,
+                last_error,
+            );
+        }
+        if wait_result != WAIT_OBJECT_0 {
             return None;
         }
         let mut exit_code: u32 = 0;
@@ -3059,6 +5259,103 @@ pub unsafe fn try_wait_for_process_exit(handle: HANDLE) -> Option<u32> {
             );
             return Some(0);
         }
+        if exit_code == STILL_ACTIVE {
+            return None;
+        }
+        Some(exit_code)
+    }
+}
+
+/// Blocks until the specific OS thread behind `handle` terminates, then returns its raw exit
+/// code -- the TASK-scoped counterpart to [`wait_for_process_exit`]'s PROCESS-scoped wait.
+///
+/// # Why this exists (pass 59)
+///
+/// [`wait_for_process_exit`] answers "has the whole Windows process exited", which a genuine
+/// cross-process fork child normally satisfies at the exact moment its one guest task calls
+/// `exit_group()` -- because that task's OS thread (see `run_thread`'s doc comment: "this will
+/// run until the thread terminates") is normally that process's ONLY thread, so the thread
+/// terminating and the process terminating are the same event. That equivalence breaks the
+/// moment the cross-process child spawns ANY additional OS thread of its own that outlives the
+/// original task -- concretely, a same-process (thread-based) fork-fallback child of ITS OWN
+/// (e.g. `ssh-agent`'s self-daemonizing `fork()`, ineligible for cross-process treatment because
+/// it holds a bound `AF_UNIX` listening socket, an uncarriable fd class -- see
+/// `ThreadProvider::spawn_thread`/AGENTS.md's cross-process-fork eligibility scan). That
+/// fallback's daemon thread runs forever inside the SAME Windows process, so the process itself
+/// never exits even though the ORIGINAL task -- the one a parent's `wait4()` actually asked
+/// about -- finished long ago. Waiting on that task's own initiating thread handle instead
+/// (confirmed 1:1 with the task's lifetime: `spawn_thread`/`thread_start`'s OS thread runs
+/// exactly one `run_thread_arch` call then the `std::thread::Builder` closure returns, ending
+/// that thread, for both the root-process case and every `spawn_thread`-spawned case) answers
+/// the question at the right granularity regardless of what sibling threads a misbehaving-by-
+/// design child spawns afterward.
+///
+/// Deliberately a NEW, separate function rather than a `wait_for_process_exit` modification:
+/// [`diagnostic_cross_process_wait4_probe`]'s own self-test registers a genuine
+/// `std::process::Child`'s PROCESS handle (via `AsRawHandle`) to round-trip
+/// `CROSS_PROCESS_EXIT_MARKER` through a real `ExitProcess` call -- `GetExitCodeThread` on that
+/// handle would be a `HANDLE`-kind mismatch. Only the production
+/// [`litebox::platform::PlatformProvider::wait_for_cross_process_exit`]/
+/// `try_wait_for_cross_process_exit` call sites (`lib.rs`'s `WindowsUserland` impl) switch to
+/// this pair; the diagnostic probe keeps using the process-handle functions above, unchanged.
+///
+/// # Safety
+///
+/// `handle` must be a valid, open Windows THREAD `HANDLE` (the child task's initiating thread,
+/// as returned by [`spawn_process_fork_child`]) that the caller has not already closed.
+pub unsafe fn wait_for_thread_exit(handle: HANDLE) -> u32 {
+    unsafe {
+        let wait_result = WaitForSingleObject(handle, INFINITE);
+        let last_error = GetLastError();
+        diag_log_thread_wait_evidence(
+            "wait_for_thread_exit(blocking/INFINITE)",
+            handle,
+            wait_result,
+            last_error,
+        );
+        let mut exit_code: u32 = 0;
+        if GetExitCodeThread(handle, &raw mut exit_code) == 0 {
+            eprintln!(
+                "[process_fork] wait_for_thread_exit: GetExitCodeThread failed, GetLastError={}",
+                GetLastError()
+            );
+        }
+        exit_code
+    }
+}
+
+/// Non-blocking poll variant of [`wait_for_thread_exit`] for `wait4(WNOHANG)` -- same relationship
+/// to it as [`try_wait_for_process_exit`] has to [`wait_for_process_exit`].
+///
+/// # Safety
+///
+/// Same contract as [`wait_for_thread_exit`].
+pub unsafe fn try_wait_for_thread_exit(handle: HANDLE) -> Option<u32> {
+    unsafe {
+        const WAIT_OBJECT_0: u32 = 0;
+        let wait_result = WaitForSingleObject(handle, 0);
+        if wait_result == WAIT_OBJECT_0 {
+            let last_error = GetLastError();
+            diag_log_thread_wait_evidence(
+                "try_wait_for_thread_exit(WNOHANG poll)->WAIT_OBJECT_0",
+                handle,
+                wait_result,
+                last_error,
+            );
+        }
+        if wait_result != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut exit_code: u32 = 0;
+        if GetExitCodeThread(handle, &raw mut exit_code) == 0 {
+            eprintln!(
+                "[process_fork] try_wait_for_thread_exit: GetExitCodeThread failed, GetLastError={}",
+                GetLastError()
+            );
+            return Some(0);
+        }
+        // `GetExitCodeThread` uses the SAME `STILL_ACTIVE` sentinel convention as
+        // `GetExitCodeProcess` for "not finished yet" -- see `try_wait_for_process_exit`.
         if exit_code == STILL_ACTIVE {
             return None;
         }
@@ -3080,7 +5377,6 @@ pub const WAIT4_PROBE_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_WAIT4_PROBE_CHILD"
 /// [`WAIT4_PROBE_CHILD_ENV_VAR`] child should exit with.
 pub const WAIT4_PROBE_EXIT_CODE_ENV_VAR: &str = "LITEBOX_INTERNAL_WAIT4_PROBE_EXIT_CODE";
 
-/// Whether the CURRENT process is a [`WAIT4_PROBE_CHILD_ENV_VAR`]-marked child.
 #[must_use]
 pub fn is_wait4_probe_child() -> bool {
     std::env::var_os(WAIT4_PROBE_CHILD_ENV_VAR).is_some()
@@ -3176,4 +5472,372 @@ pub fn diagnostic_cross_process_wait4_probe(
     );
 
     let _ = child.wait();
+}
+
+/// Internal-only marker env var: set (never guest-visible), alongside [`WATCHDOG_TARGET_PID_ENV_VAR`],
+/// on a `CreateProcess`-spawned child of THIS SAME binary that exists purely to watch its parent's
+/// PID and force-terminate it externally if it ever wedges into the whole-process kernel-level
+/// freeze this Track-B investigation session root-caused (see this module's own doc comment and
+/// `run_external_fault_watchdog_child`'s for the full evidence trail). Named distinctly from
+/// [`REEXEC_CHILD_ENV_VAR`] (an ordinary fork-child re-exec) since this process is never a guest
+/// process at all -- it never touches `LinuxShim`, never loads a guest binary, and exits the
+/// instant its parent does (successfully or otherwise).
+const FAULT_WATCHDOG_CHILD_ENV_VAR: &str = "LITEBOX_INTERNAL_FAULT_WATCHDOG_CHILD";
+
+/// Companion to [`FAULT_WATCHDOG_CHILD_ENV_VAR`]: the parent's own PID, passed as a plain decimal
+/// string since environment variables are the only data channel available before this child's own
+/// `main()` has parsed any argv (this child is spawned with none, exactly like the diagnostic-
+/// resume children elsewhere in this module).
+const WATCHDOG_TARGET_PID_ENV_VAR: &str = "LITEBOX_INTERNAL_FAULT_WATCHDOG_TARGET_PID";
+
+/// Whether the CURRENT process is an external fault-terminate watchdog child -- see
+/// [`FAULT_WATCHDOG_CHILD_ENV_VAR`]'s doc comment. Checked by the runner's own `main()` before
+/// `CliArgs::parse()`, exactly like [`is_diagnostic_resume_child`]/[`is_wait4_probe_child`].
+#[must_use]
+pub fn is_fault_watchdog_child() -> bool {
+    std::env::var_os(FAULT_WATCHDOG_CHILD_ENV_VAR).is_some()
+}
+
+/// Raw handle of this process's own "guest has started running" event (0 = none), created by
+/// [`spawn_external_fault_watchdog`] and signalled by [`mark_guest_started`].
+static GUEST_STARTED_EVENT: core::sync::atomic::AtomicIsize =
+    core::sync::atomic::AtomicIsize::new(0);
+
+fn guest_started_event_name(target_pid: u32) -> Vec<u16> {
+    let mut name: Vec<u16> = format!(r"Local\litebox-guest-started-{target_pid}")
+        .encode_utf16()
+        .collect();
+    name.push(0);
+    name
+}
+
+static FAULT_ARMED_EVENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+
+fn fault_armed_event_name(target_pid: u32) -> Vec<u16> {
+    let mut name: Vec<u16> = format!(r"Local\litebox-fault-armed-{target_pid}")
+        .encode_utf16()
+        .collect();
+    name.push(0);
+    name
+}
+
+pub fn mark_fault_terminate_armed() {
+    let handle = FAULT_ARMED_EVENT.load(core::sync::atomic::Ordering::Acquire);
+    if handle != 0 {
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as HANDLE) };
+    }
+}
+
+/// Tells this process's external fault watchdog that guest code is now running. Until then the
+/// watchdog does not count idle time as a wedge: everything before the guest starts (the OCI
+/// manifest fetch and layer download, decompression, rootfs indexing) is legitimately idle on the
+/// network or disk, and treating that as a freeze got the whole runner `TerminateProcess`'d with
+/// exit code 1 and no message after ~15s of a slow layer download. The freeze this watchdog exists
+/// for happens only during guest execution (a fault inside the VEH's recovered-AV resume).
+pub fn mark_guest_started() {
+    let handle = GUEST_STARTED_EVENT.load(core::sync::atomic::Ordering::Acquire);
+    if handle != 0 {
+        // SAFETY: `handle` is the event this process created in `spawn_external_fault_watchdog`
+        // and never closes.
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as HANDLE) };
+    }
+}
+
+/// Spawns the external fault-terminate watchdog child described by
+/// [`FAULT_WATCHDOG_CHILD_ENV_VAR`]'s doc comment. Called once, early in the real runner's own
+/// `main()` (before any guest work begins), from the SAME process the child will go on to watch.
+/// Best-effort: if spawning fails for any reason (a locked-down host, a broken `CreateProcessW`),
+/// this returns without panicking -- an unwatched process is exactly today's pre-fix behavior, not
+/// a regression, so failing to add supervision must never itself break an otherwise-working run.
+/// Skippable via `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` for an investigation that specifically
+/// wants to observe the whole-process freeze without any external supervision collecting it.
+pub fn spawn_external_fault_watchdog() {
+    if std::env::var_os("LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG").is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut exe_wide: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide_for_windows()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let parent_pid = std::process::id();
+    let started_name = guest_started_event_name(parent_pid);
+    // Manual-reset, initially non-signalled. Deliberately never closed: it must outlive the spawn.
+    // SAFETY: `started_name` is a valid NUL-terminated UTF-16 string.
+    let started_event = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            core::ptr::null(),
+            1,
+            0,
+            started_name.as_ptr(),
+        )
+    };
+    if !started_event.is_null() {
+        GUEST_STARTED_EVENT.store(
+            started_event as isize,
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+    let armed_name = fault_armed_event_name(parent_pid);
+    let armed_event = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            core::ptr::null(),
+            1,
+            0,
+            armed_name.as_ptr(),
+        )
+    };
+    if !armed_event.is_null() {
+        FAULT_ARMED_EVENT.store(armed_event as isize, core::sync::atomic::Ordering::Release);
+    }
+    unsafe {
+        std::env::set_var(FAULT_WATCHDOG_CHILD_ENV_VAR, "1");
+        std::env::set_var(WATCHDOG_TARGET_PID_ENV_VAR, parent_pid.to_string());
+    }
+    let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
+    startup_info.cb =
+        u32::try_from(core::mem::size_of::<STARTUPINFOW>()).expect("STARTUPINFOW fits in u32");
+    let mut process_info: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+    // No `CREATE_SUSPENDED`: this child must start running its own watch loop immediately, and
+    // unlike every other spawn in this module it is never a guest process, so none of the guest-
+    // memory-copy/relocation machinery `spawn_process_fork_child` needs a suspended window for
+    // applies here. `CREATE_NO_WINDOW` (`0x0800_0000`) keeps this invisible on a real console --
+    // it has no user-facing output of its own (`diag_raw_print` only, gated on an env var).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ok = unsafe {
+        CreateProcessW(
+            core::ptr::null(),
+            exe_wide.as_mut_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            core::ptr::null(),
+            core::ptr::null(),
+            &raw const startup_info,
+            &raw mut process_info,
+        )
+    };
+    unsafe {
+        std::env::remove_var(FAULT_WATCHDOG_CHILD_ENV_VAR);
+        std::env::remove_var(WATCHDOG_TARGET_PID_ENV_VAR);
+    }
+    if ok == 0 {
+        return;
+    }
+    // Neither handle is needed past spawn: this watchdog child is deliberately unsupervised
+    // (never waited on, never terminated by the parent) so it can keep running and watching even
+    // if the parent later wedges in exactly the way it exists to detect.
+    unsafe {
+        CloseHandle(process_info.hProcess);
+        CloseHandle(process_info.hThread);
+    }
+}
+
+/// Entry point the runner's `main()` calls instead of the normal `CliArgs::parse()` + `run()` path
+/// when [`is_fault_watchdog_child`] is true. Never returns under normal operation -- exits only
+/// when the watched parent exits (cleanly or otherwise), matching its own lifetime to the
+/// process it supervises.
+///
+/// # Why this process exists at all (Track-B investigation, this session)
+///
+/// Live evidence, this session: `LITEBOX_PROCESS_FORK=1` repros deterministically hit a fault
+/// during the in-process `vectored_exception_handler`'s recovered-AV resume (`context.Rip =
+/// recover`, an `NtContinue`-driven synthetic control transfer with no matching `call`
+/// instruction). On this host/Windows build, that fault sometimes freezes -- not just the
+/// faulting thread, but EVERY thread in the process, confirmed directly: a same-process watchdog
+/// thread (`fault_terminate_watchdog_thread_body`, `litebox_platform_windows_userland::lib`),
+/// spawned specifically to force-terminate the process if its own in-VEH self-termination attempt
+/// (`TerminateProcess`/`RaiseFailFastException`, both independently confirmed live to sometimes
+/// not complete when called from the faulting thread itself) does not complete, was ALSO observed
+/// to stop ticking entirely once this freeze occurs -- its own `std::thread::sleep`-driven poll
+/// loop simply stops advancing, with no panic, no log line, nothing. This rules out a same-process
+/// fix as sufficient: whatever freezes this process freezes the WHOLE process, watchdog thread
+/// included. An EXTERNAL process (a real `Stop-Process -Force`/`TerminateProcess` call issued from
+/// a DIFFERENT process against the frozen PID) was independently confirmed, every time this
+/// session it was tried, to succeed immediately with no error -- this function is that same
+/// working mechanism, automated and always-standing-by rather than manual.
+pub fn run_external_fault_watchdog_child() -> ! {
+    let target_pid: u32 = std::env::var(WATCHDOG_TARGET_PID_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if target_pid == 0 {
+        std::process::exit(0);
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle =
+        unsafe { windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid) };
+    if handle.is_null() {
+        // The target has already exited (or never existed) by the time this watchdog got
+        // scheduled -- nothing to watch. Not an error: a normal, fast-exiting run races this
+        // child's own startup routinely.
+        std::process::exit(0);
+    }
+
+    fn process_cpu_time_100ns(handle: HANDLE) -> Option<u64> {
+        let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
+        let mut user = windows_sys::Win32::Foundation::FILETIME::default();
+        let ok = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let as_u64 = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
+            (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+        };
+        Some(as_u64(kernel) + as_u64(user))
+    }
+
+    // Same poll cadence and CPU-progress safety gate as the in-process watchdog
+    // (`fault_terminate_watchdog_thread_body`) -- see that function's own doc comment for the
+    // full reasoning (a process spending real CPU time is legitimately busy/slow, per this
+    // investigation's own separately-documented `copy_one_group`-under-memory-pressure findings,
+    // not wedged). This watchdog's OWN threshold is intentionally longer than the in-process
+    // one's -- it exists as the backstop for exactly the case where the in-process one could not
+    // run at all, so it must tolerate that entire window plus the in-process watchdog's own grace
+    // period elapsing first, without racing it.
+    const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(500);
+    const EXTERNAL_GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(15);
+    let grace_ticks = u32::try_from(EXTERNAL_GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis())
+        .expect("grace period fits in a u32 tick count");
+    let mut stalled_ticks: u32 = 0;
+    let mut cpu_time_at_stall_start: Option<u64> = None;
+    let diag_enabled = std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some();
+    let started_name = guest_started_event_name(target_pid);
+    let started_event = unsafe {
+        windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, started_name.as_ptr())
+    };
+    // An idle guest process is ORDINARY: a server waiting for a client sits at ~0% CPU, which is
+    // exactly what the stall counter below measures. The arm is the ONLY thing separating that from
+    // "wedged after an unrecoverable fault", so when the arm cannot be observed this watchdog must
+    // not terminate anything. The in-process watchdog gates on its own internal flag rather than on
+    // this event, so a genuine fault is still collected there.
+    //
+    // `LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM=1` forces this path so the degradation is
+    // measured rather than assumed.
+    let unobservable_arm = std::env::var_os("LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM").is_some();
+    let armed_name = fault_armed_event_name(target_pid);
+    let armed_event = if unobservable_arm {
+        core::ptr::null_mut()
+    } else {
+        // `SYNCHRONIZE` access.
+        unsafe {
+            windows_sys::Win32::System::Threading::OpenEventW(0x0010_0000, 0, armed_name.as_ptr())
+        }
+    };
+    if armed_event.is_null() {
+        eprintln!(
+            "[diag-external-watchdog-disarmed] target_pid={target_pid} arm={} -- not supervising",
+            if unobservable_arm {
+                "unobservable(simulated)"
+            } else {
+                "unobservable(open_failed)"
+            }
+        );
+        unsafe { CloseHandle(handle) };
+        std::process::exit(0);
+    }
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        let arm_signalled = unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0)
+        } == 0;
+        if !arm_signalled {
+            let mut code: u32 = STILL_ACTIVE;
+            if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {
+                unsafe { CloseHandle(handle) };
+                std::process::exit(0);
+            }
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = None;
+            continue;
+        }
+        if !started_event.is_null()
+            && unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(started_event, 0)
+            } != 0
+        {
+            // Guest has not started: the parent is still preparing its rootfs. Only bail out if
+            // the parent itself is gone.
+            let mut code: u32 = STILL_ACTIVE;
+            if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {
+                unsafe { CloseHandle(handle) };
+                std::process::exit(0);
+            }
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = None;
+            continue;
+        }
+        let mut exit_code: u32 = STILL_ACTIVE;
+        let alive = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } != 0
+            && exit_code == STILL_ACTIVE;
+        if !alive {
+            // The target exited on its own (cleanly or via its own in-process termination path
+            // succeeding after all) -- this watchdog's job is done.
+            unsafe { CloseHandle(handle) };
+            std::process::exit(0);
+        }
+        let cpu_now = process_cpu_time_100ns(handle);
+        if stalled_ticks == 0 {
+            cpu_time_at_stall_start = cpu_now;
+        }
+        // Threshold, not a bare `>` -- see the sibling in-process watchdog
+        // (`fault_terminate_watchdog_thread_body`, `litebox_platform_windows_userland::lib`)'s
+        // own comment for the live-confirmed false-positive this guards against (that watchdog's
+        // OWN poll-loop overhead was enough to make a bare comparison always read "progress",
+        // even against a target independently confirmed wedged at 0% CPU). This external
+        // watchdog measures a DIFFERENT process's CPU time via `OpenProcess`, so it is not
+        // self-contaminating the same way, but the same threshold is applied for consistency and
+        // as a margin against ordinary scheduler/measurement noise.
+        const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
+        let made_progress = match (cpu_time_at_stall_start, cpu_now) {
+            (Some(before), Some(after)) => {
+                after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS
+            }
+            _ => false,
+        };
+        if made_progress {
+            stalled_ticks = 0;
+            cpu_time_at_stall_start = cpu_now;
+            continue;
+        }
+        stalled_ticks += 1;
+        if diag_enabled {
+            eprintln!(
+                "[diag-external-watchdog-tick] target_pid={target_pid} stalled_ticks={stalled_ticks}"
+            );
+        }
+        if stalled_ticks < grace_ticks {
+            continue;
+        }
+        // Zero CPU progress for the whole external grace period, and the in-process watchdog
+        // (which gets a much shorter grace period and would have already acted if it were able
+        // to) has not resolved this either: force it now, from this genuinely separate process,
+        // exactly like the manual `Stop-Process -Force` this investigation confirmed always works
+        // immediately against the same frozen PID.
+        eprintln!(
+            "[diag-external-watchdog-terminate] target_pid={target_pid} stalled_ticks={stalled_ticks}"
+        );
+        unsafe {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+        std::process::exit(0);
+    }
 }

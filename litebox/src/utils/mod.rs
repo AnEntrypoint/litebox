@@ -115,6 +115,13 @@ impl_reinterpret! { u16, i16 }
 impl_reinterpret! { u8, i8 }
 
 /// An object that will run a closure when it goes out of scope.
+///
+/// Not replaced with the `scopeguard` crate: `litebox_platform_windows_userland/src/lib.rs` (owned
+/// by other concurrent work at the time of this audit pass) still depends on this exact
+/// `defer`/`Defer` API, so removing it here would leave that call site broken while only partially
+/// resolving the finding -- converting the other call sites to `scopeguard` while this one stays on
+/// the hand-rolled version would leave two competing defer mechanisms in the codebase, which is
+/// worse than the current single (if reinvented) one.
 pub struct Defer<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> Drop for Defer<F> {

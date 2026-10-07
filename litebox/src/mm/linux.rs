@@ -18,7 +18,10 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::DeallocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::RemapError;
 use crate::platform::page_mgmt::SharedMemoryError;
+use crate::platform::page_mgmt::SharedObjectKind;
+use crate::platform::page_mgmt::SharedRegionCarry;
 
 /// Page size in bytes.
 ///
@@ -38,6 +41,24 @@ pub const PAGE_SIZE: usize = 4096;
 /// Page size in bytes. See the 4 KiB definition for details.
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 pub const PAGE_SIZE: usize = 16384;
+
+/// Runtime kill-switch for `Vmem::MAPPING_GUARD_GAP` -- see that constant's doc comment for what
+/// the gap is for and what it does and does not guarantee.
+///
+/// This crate is `#![no_std]` and cannot read an environment variable itself, so the switch lives
+/// here and is set once at startup by the runner (from `LITEBOX_NO_MAPPING_GUARD_GAP`) through
+/// [`set_mapping_guard_gap_disabled`]. It exists so one binary can A/B the guard gap without a
+/// rebuild, matching `LITEBOX_NO_PLACEMENT_FLOOR`'s rationale on the platform side: comparing two
+/// separately-built binaries confounds the measurement with every other difference between them.
+static MAPPING_GUARD_GAP_DISABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Disable (or re-enable) the inter-mapping guard gap. See [`MAPPING_GUARD_GAP_DISABLED`].
+///
+/// Intended to be called once, at startup, before any guest mapping is placed.
+pub fn set_mapping_guard_gap_disabled(disabled: bool) {
+    MAPPING_GUARD_GAP_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Windows' `dwAllocationGranularity` (the platform's own
 /// `WindowsUserland::round_up_to_granu`/`round_down_to_granu` in
@@ -84,7 +105,7 @@ bitflags::bitflags! {
         /// Bytes covered by a `VM_OWN_FORK_PADDING` range but NOT overwritten by any subsequent
         /// `Replace` (inter-region alignment/coherent-group padding within the group's span) stay
         /// tracked under this flag for the lifetime of the process. Without a distinct tag, such
-        /// a range is indistinguishable, by `VmFlags` alone, from [`Vmem::new_excluding`]'s own
+        /// a range is indistinguishable, by `VmFlags` alone, from [`Vmem::new`]'s own
         /// placeholders -- which represent OTHER, foreign host-reserved memory this process must
         /// never touch. Confusing the two here was the confirmed root cause of the long-standing
         /// fork()+execve() mallocng `.meta=0` crash: `release_memory`'s `!vm.is_empty()`
@@ -93,6 +114,49 @@ bitflags::bitflags! {
         /// as real, still-committed memory a later, unrelated allocation's neighbor believed was
         /// untouched -- see `release_memory`'s own callers for the fix built on this flag.
         const VM_OWN_FORK_PADDING = 1 << 9;
+
+        /// Marks a placeholder range as belonging to ANOTHER, still-live process sharing this
+        /// same real host address space -- memory this `Vmem` must never place anything over,
+        /// under ANY [`FixedAddressBehavior`], not even [`FixedAddressBehavior::Replace`]'s
+        /// otherwise-legitimate "a `MAP_FIXED` request unconditionally overwrites whatever is
+        /// there" semantics (see `insert_mapping`'s own doc comment on why an ordinary
+        /// empty-flags [`Vmem::new`] placeholder is deliberately allowed to be replaced, and why
+        /// that is wrong for this case specifically).
+        ///
+        /// The one and only source of this flag today is
+        /// [`Vmem::new_for_vfork_execve_detach`]: a `CLONE_VFORK` child's fresh `Vmem`, seeded
+        /// with the ranges the shared `PageManager` it is detaching from was tracking at that
+        /// moment (i.e. the PARENT's own live memory) -- a genuinely different case from every
+        /// other placeholder kind here, because there is no host-level mechanism (unlike a real
+        /// `fork()` child's `duplicate()`, which asks the platform's own allocator for fresh room)
+        /// that keeps this child's own address choices away from a foreign, concurrently-live
+        /// owner's memory. An `insert_mapping` caller that reaches this flag on ANY overlap --
+        /// partial or, unlike the empty-flags case, even a full one -- must fail loudly
+        /// (`AddressPartiallyInUse`) rather than silently decommit-then-recommit real memory a
+        /// different, merely-blocked process is going to resume using.
+        const VM_FOREIGN_LIVE_NEVER_REPLACE = 1 << 10;
+
+        /// Marks a `shared_handle` VMA that stands in for a guest `MAP_PRIVATE` file mapping --
+        /// the only kind [`Vmem::map_existing_shared_pages_file_private_cow`] creates. The view
+        /// of the object is COPY-ON-WRITE, so the guest gets real `MAP_PRIVATE` semantics over
+        /// an object every mapper of that file shares: pages are shared until written, and a
+        /// write is this process's own.
+        ///
+        /// Why a dedicated bit rather than reading `is_file_backed && shared_handle.is_some()`:
+        /// a genuine `MAP_SHARED` attachment -- a SysV `shmat`, whose object is
+        /// [`SharedObjectKind::FileBacked`] and therefore also `is_file_backed` with a live
+        /// `shared_handle` -- must KEEP shared-write semantics, and `mprotect` on it must never
+        /// silently hand the guest a private view. The two are indistinguishable by every other
+        /// field (both carry `VM_SHARED` and both are file-backed), so the distinction has to be
+        /// stated explicitly.
+        ///
+        /// It lives in this flag word, not in a separate `VmArea` field, precisely because the
+        /// word is what crosses a `fork()`: it is copied verbatim by [`Vmem::duplicate`] and
+        /// transmitted as [`DuplicatedRangeInfo`]'s raw `flag_bits` into
+        /// [`Vmem::new_adopting_existing_memory`], so a child's inherited mapping is mapped
+        /// copy-on-write too -- the child shares the parent's pages until it writes, exactly as
+        /// Linux's `fork()` + `MAP_PRIVATE` file mapping does.
+        const VM_PRIVATE_FILE_COW = 1 << 11;
 
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
@@ -121,6 +185,24 @@ impl VmFlags {
             Self::empty()
         };
         may | shared_flag
+    }
+
+    /// The [`MemoryRegionPermissions`] qualifier every platform call that touches this VMA's
+    /// memory must carry alongside the access bits.
+    ///
+    /// Non-empty only for [`Self::VM_PRIVATE_FILE_COW`]: the platform has to be told the view is
+    /// copy-on-write on BOTH the call that creates it and every later
+    /// [`PageManagementProvider::update_permissions`], because on Windows the difference is the
+    /// view's page protection itself (`PAGE_WRITECOPY` instead of `PAGE_READWRITE`), not
+    /// something the platform can infer from an address range -- and a call that forgets it
+    /// either fails (`ERROR_INVALID_PARAMETER` on a copy-on-write view) or, worse, succeeds by
+    /// handing the guest a writable view of the shared object.
+    pub(super) fn write_qualifier(self) -> MemoryRegionPermissions {
+        if self.contains(VmFlags::VM_PRIVATE_FILE_COW) {
+            MemoryRegionPermissions::COPY_ON_WRITE
+        } else {
+            MemoryRegionPermissions::empty()
+        }
     }
 }
 
@@ -324,6 +406,53 @@ pub(super) struct VmArea<Platform: PageManagementProvider<ALIGN>, const ALIGN: u
     /// created (see `create_pages`), so no `VmArea` on such a platform ever reaches this struct
     /// with `VM_SHARED` set and this field `None` -- that combination cannot occur.
     shared_handle: Option<Platform::SharedMemoryHandle>,
+    /// Extra address space RESERVED immediately after this VMA's end but deliberately left with
+    /// no `VmArea` of its own: [`CreatePagesFlags::ENSURE_SPACE_AFTER`]'s growth headroom, of
+    /// [`DEFAULT_RESERVED_SPACE_SIZE`] bytes. `0` when this mapping has no such headroom.
+    ///
+    /// Recorded by [`Vmem::create_mapping`], which claims `length + reserved_extra` of address
+    /// space via `get_unmmaped_area` but inserts a VMA covering only `length`. That asymmetry is
+    /// intentional (the headroom must stay unbacked so a later `brk`/`mremap` can grow into it),
+    /// but it makes the reservation invisible to every consumer that reasons from VMA extents.
+    ///
+    /// [`Vmem::duplicate`] is the consumer that must not be fooled. It builds a fork's coherent
+    /// groups from VMA extents, so without this field a group's span ends at its last VMA's end
+    /// while the PARENT actually holds a further `reserved_extra` bytes. The child's reservation
+    /// is then short by exactly that much, and `insert_mapping(FixedAddressBehavior::Hint)` is
+    /// free to place a LATER group inside what was an EARLIER group's headroom -- so relative
+    /// offsets that were valid in the parent do not survive the fork, which is precisely the
+    /// invariant coherent-group relocation exists to preserve.
+    ///
+    /// This is a real defect, fixed here on its own merits and correct by construction. It is NOT
+    /// the cause of the `webtop:debian-xfce` fork faults it was originally written to address --
+    /// see advisory section 3M. Measured directly: a 30-concurrent-`/bin/true` capture before and
+    /// after this change produced a byte-identical fault set (25 distinct `cr2`, 30 deaths, zero
+    /// addresses eliminated or moved), because the 16 MiB hole those faults land in is INTERIOR
+    /// to a group whose span was already correct, not past a group's end. Do not read this field
+    /// as having fixed that bug.
+    ///
+    /// # Propagation rule -- deliberately NOT the same as `view_base`/`view_len`
+    ///
+    /// The sibling fields below must be propagated UNCHANGED through every clone, split and
+    /// reconstruction. This field must NOT. The headroom sits immediately AFTER the original
+    /// mapping's end, so when a VMA is split (see `protect_mapping`'s split logic) only the slice
+    /// that still ends exactly where the ORIGINAL pre-split mapping ended still owns it. A
+    /// leading or middle slice inheriting a nonzero `reserved_extra` would claim reserved space
+    /// that no longer follows it, extending a fork group past address space it does not own --
+    /// a fresh instance of the very bug this field exists to fix, not a fix for it. Every other
+    /// slice therefore gets `0`. Do not "simplify" this to match its neighbours.
+    reserved_extra: usize,
+    /// For a `shared_handle` mapping only: the REAL Windows/platform view's own base address and
+    /// length, exactly as returned by the `map_shared_memory` call that created it -- NOT the
+    /// VMA's current tracked range in `self.vmas` (a `rangemap::RangeMap`), which can SHRINK
+    /// (via `.remove()` splitting/trimming an entry on a partial `munmap`) independently of the
+    /// real view underneath, which never moves or resizes once mapped. These two fields must be
+    /// propagated UNCHANGED (never recomputed from a current, possibly-shrunken tracked range)
+    /// through every clone/split/reconstruction of a `VmArea` that still refers to the SAME real
+    /// view -- see `remove_mapping`'s full-coverage check, the only reader. `(0, 0)` for a
+    /// private (non-shared) mapping, where the fields are meaningless.
+    view_base: usize,
+    view_len: usize,
 }
 
 // Manual impls since `#[derive(Clone, Copy)]` would incorrectly require `Platform: Clone`/`Copy`
@@ -342,9 +471,39 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> PartialEq
     for VmArea<Platform, ALIGN>
 {
     fn eq(&self, other: &Self) -> bool {
+        // `self.vmas` is a `rangemap::RangeMap`, which automatically COALESCES adjacent/
+        // overlapping entries whose values compare equal (this is documented `rangemap`
+        // behavior, not a bug in that crate). For a genuinely shared mapping, `view_base`
+        // uniquely identifies the real underlying view, so two `VmArea`s that share it really
+        // are fragments of the SAME logical mapping and merging them back together is correct
+        // (this is in fact required for `remove_mapping`'s own "does any other fragment still
+        // survive" check to work at all).
+        //
+        // For a PRIVATE (non-shared) mapping, `shared_handle` is always `None` and `view_base`/
+        // `view_len` are always `(0, 0)` -- see `VmArea::new`'s doc comment -- so EVERY private
+        // `VmArea` with the same `flags`/`is_file_backed` compares equal to every OTHER private
+        // `VmArea` with the same flags, regardless of which real allocation either one actually
+        // describes. Two entirely unrelated, adjacent guest mappings (e.g. two different shared
+        // libraries loaded back-to-back by a dynamic linker) with matching protection flags
+        // then silently coalesce into ONE tracked `RangeMap` entry the moment `rangemap` notices
+        // they're adjacent -- confirmed live: a tracked VMA's extent was observed growing from
+        // 0.93 MB to 5.44 MB across a real run with no corresponding guest operation, and a
+        // later `mprotect`/`munmap` walk that should only have touched one of the coalesced
+        // fragments instead applied across the whole merged span, reaching into memory the
+        // guest never asked about. Since a private `VmArea` carries no field that uniquely
+        // identifies which real allocation it is, the only correct fix here is to never let two
+        // private `VmArea`s compare equal to each other at all -- forcing `rangemap` to keep
+        // every private mapping as its own distinct tracked entry, exactly matching real Linux
+        // VMA semantics (adjacent VMAs with identical protection are NOT silently merged by the
+        // kernel either, unless an explicit `mremap`/`mmap` operation asks for it).
+        if self.shared_handle.is_none() && other.shared_handle.is_none() {
+            return false;
+        }
         self.flags == other.flags
             && self.is_file_backed == other.is_file_backed
             && self.shared_handle == other.shared_handle
+            && self.view_base == other.view_base
+            && self.view_len == other.view_len
     }
 }
 impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> Eq for VmArea<Platform, ALIGN> {}
@@ -369,11 +528,19 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             flags,
             is_file_backed,
             shared_handle: None,
+            view_base: 0,
+            view_len: 0,
+            reserved_extra: 0,
         }
     }
 
     /// Create a new [`VmArea`] backed by a real platform shared-memory object -- see
     /// [`Self::shared_handle`]'s field doc comment.
+    ///
+    /// `view_base`/`view_len` are not known yet at this point (the real view hasn't been mapped
+    /// -- that only happens once this `VmArea` reaches `insert_mapping`), so they start at `0`
+    /// and get filled in by `insert_mapping` itself once the real `map_shared_memory` call
+    /// returns the view's actual base address.
     #[inline]
     pub(super) fn new_shared(
         flags: VmFlags,
@@ -384,6 +551,22 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
             flags,
             is_file_backed,
             shared_handle: Some(shared_handle),
+            view_base: 0,
+            view_len: 0,
+            reserved_extra: 0,
+        }
+    }
+
+    /// Return `(view_base, view_len)` -- the REAL view's original full extent -- if this is a
+    /// shared mapping with the fields already populated (i.e. it has been through
+    /// `insert_mapping` at least once). `None` for a private mapping, or a shared `VmArea` that
+    /// hasn't reached `insert_mapping` yet.
+    #[inline]
+    pub(super) fn view_extent(self) -> Option<Range<usize>> {
+        if self.shared_handle.is_some() && self.view_len != 0 {
+            Some(self.view_base..(self.view_base + self.view_len))
+        } else {
+            None
         }
     }
 }
@@ -408,24 +591,11 @@ impl<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize> VmArea<Platfor
 ///   within a bounded window above `rsp` -- by the shim's separate stack fixup pass, for reasons
 ///   that pass documents at length.
 ///
-/// - **not the `brk` heap**: like the stack, the heap is dominated by live allocator-managed
-///   payload data (strings, buffers, arbitrary program structures) that a scanning consumer cannot
-///   distinguish from the allocator's own bookkeeping pointers by inspecting the range alone.
-///   Originally the heap WAS included here on the theory that mallocng's own bookkeeping
-///   "genuinely holds pointers that must be relocated" and "never transient stack-style buffers" --
-///   disproven live: a real fork()-then-execve() repro (`apk add nodejs` followed by
-///   `node --version` in an interactive shell) showed the fork-time fixup pass that consumes this
-///   range corrupting the NUL terminator of a live heap-allocated argv string (`"--version\0"`)
-///   because its terminator byte shared an 8-byte-aligned scan word with an adjacent, unrelated,
-///   genuinely-stale pointer value elsewhere in the same allocation's slack/neighboring bytes --
-///   the pass "fixed" the pointer-shaped word and silently destroyed the live string byte(s) that
-///   word also happened to cover. This is exactly the same false-positive hazard the stack pass was
-///   narrowed to avoid (see [`Vmem`]'s stack-scan-window doc comment in
-///   `litebox_shim_linux::syscalls::process::fixup_stale_stack_pointers`), just manifesting in the
-///   heap instead of the stack. No real repro has ever required heap coverage specifically (the
-///   only repro that motivated adding [`super::AddressRelocations::private_data_ranges`] at all --
-///   busybox `ash`'s `.bss` file-stack sentinel -- lives in an ELF's `PF_W` `PT_LOAD` segment, not
-///   the heap), so excluding it here closes the argv-corruption bug with no known regression.
+/// The `brk` heap is NOT excluded: it satisfies every clause above (private, writable,
+/// non-executable, not `VM_GROWSDOWN`) and is deliberately included -- see
+/// [`is_private_data_range`]'s own doc comment for the live 20/20-vs-0/20 crash evidence behind
+/// that, and for why the argv-corruption repro once blamed on heap inclusion was actually caused
+/// by a since-removed byte-pattern heuristic rather than by scanning the heap as such.
 ///
 /// See [`super::AddressRelocations::private_data_ranges`].
 /// `(source range, destination base address, was executable in source, is a private data region,
@@ -569,27 +739,78 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
-    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
-    pub(super) fn new(platform: &'static Platform) -> Self {
-        Self::new_excluding(platform, core::iter::empty())
+    /// Minimum separation kept between two independently-placed guest mappings.
+    ///
+    /// Without this, `get_unmmaped_area` is free to place a fresh mapping so its end touches the
+    /// next mapping's start exactly, and nothing downstream objects -- the VMA bookkeeping is
+    /// perfectly consistent, the two mappings simply have no space between them. That is fine for
+    /// a mapping of fixed size, and wrong for one the guest intends to GROW.
+    ///
+    /// glibc's `sysmalloc` is exactly such a caller: extending the top chunk writes a chunk header
+    /// just past the current end of the heap. Two separate faults tonight are that write landing in
+    /// the neighbour, in the same glibc function, differing only in what happened to be next door:
+    ///
+    /// - `libc+0xa0b98` (`mov %r9,0x8(%rcx)`), forked Xorg: neighbour was a library's R+X text, so
+    ///   the write hit a present-but-non-writable page -- `error_code=0x7`, SIGSEGV.
+    /// - `libc+0xa0966` (`mov %rax,0x8(%rsi)`), Xorg as pid 1: neighbour was ordinary R+W data, so
+    ///   the write succeeded, corrupted it, and glibc's own consistency check aborted -- SIGABRT.
+    ///
+    /// The pid-1 case is the clearer proof, because the placement decision is visible in the log:
+    /// the mapping that was overrun spans `0x11421000..0x1142d000` (289542144..289591296), and the
+    /// allocation immediately before the crash recorded `chosen=289591296` -- the search picked
+    /// literally the next byte after that mapping's end.
+    ///
+    /// A stack already gets [`Self::STACK_GUARD_GAP`] for the same reason, in the same function.
+    /// This is the non-stack equivalent, deliberately much smaller: a stack grows without bound and
+    /// needs real headroom, whereas this only has to ensure two mappings never touch, so a
+    /// heap-extension write past the end lands in a hole and faults instead of silently corrupting
+    /// a neighbour.
+    ///
+    /// WHAT THIS DOES AND DOES NOT GUARANTEE. It guarantees two independently-placed mappings are
+    /// never adjacent, which converts the OBSERVED fault class -- a chunk-header write a few bytes
+    /// past the end (`+0x8`, `+0x18`) -- from silent corruption of a neighbour into a clean fault
+    /// on an unmapped hole. It does NOT guarantee that no allocation can ever reach a neighbour:
+    /// `sysmalloc` can extend the heap by much more than a page in one call, and a large enough
+    /// single extension can still jump a one-page hole. Enlarging the constant would only move that
+    /// theoretical hole outward, not close it -- the real protection is that the search should not
+    /// be placing growable mappings flush against their neighbours in the first place, and this
+    /// constant enforces exactly that minimum.
+    ///
+    /// Set `LITEBOX_NO_MAPPING_GUARD_GAP=1` to disable at runtime, so one binary can A/B this
+    /// (matching `LITEBOX_NO_PLACEMENT_FLOOR`'s own rationale).
+    pub(super) const MAPPING_GUARD_GAP: usize = 1 << 12;
+
+    /// Whether [`Self::MAPPING_GUARD_GAP`] is in force. See that constant's doc comment.
+    ///
+    /// `litebox` is `#![no_std]` and has no environment access of its own, so the switch is a
+    /// static set once at startup by whoever DOES have an environment (the runner, from
+    /// `LITEBOX_NO_MAPPING_GUARD_GAP`) via [`set_mapping_guard_gap_disabled`]. An earlier revision
+    /// of this read `std::env` inside a `cfg(feature = "std")` block, which -- there being no such
+    /// feature on this crate -- compiled to nothing and left the A/B gate silently inert. That is
+    /// exactly the class of lying instrument this investigation kept tripping over, so it is
+    /// recorded here rather than quietly corrected.
+    fn mapping_guard_gap() -> usize {
+        if MAPPING_GUARD_GAP_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            0
+        } else {
+            Self::MAPPING_GUARD_GAP
+        }
     }
 
-    /// Create a new [`Vmem`] instance, treating any of the platform's reported
-    /// [`PageManagementProvider::reserved_pages`] that overlap a range in `excluded` as NOT
-    /// reserved.
+    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider),
+    /// with every range the platform reports as [`PageManagementProvider::reserved_pages`]
+    /// recorded as already taken.
     ///
-    /// This exists for `fork()` (see [`Self::duplicate`]): since the platform backend reports
-    /// `reserved_pages()` as a snapshot of the whole host process's committed/reserved memory
-    /// (there being only one host process backing every guest "process" in this architecture),
-    /// a plain [`Self::new`] for a to-be-forked-into child `Vmem` would incorrectly treat the
-    /// PARENT's own already-committed guest memory as pre-reserved host state -- even though the
-    /// child is meant to claim those exact same addresses as its own independent copy. Passing
-    /// the parent's currently-tracked guest ranges as `excluded` here lets the child `Vmem`
-    /// legitimately allocate over them.
-    pub(super) fn new_excluding(
-        platform: &'static Platform,
-        excluded: impl Iterator<Item = Range<usize>> + Clone,
-    ) -> Self {
+    /// A `fork()` child's `Vmem` used to be built with the PARENT's own live ranges subtracted
+    /// back out of that set (via a since-removed `new_excluding`), on the reasoning that the
+    /// child was going to claim those exact addresses as its own copy. It does not, and cannot:
+    /// every guest process shares one host address space, so the copy is placed wherever the
+    /// platform finds room (see [`Self::duplicate`]'s group placement). What the subtraction did
+    /// instead was leave the child believing the parent's live memory was free, so after the
+    /// child's own `execve` its new image could be loaded straight on top of it. Confirmed live:
+    /// `dbus-daemon`, forked from a shell that then `exec`'d its last command, took SIGSEGV on an
+    /// address inside the shell's released heap -- memory `dbus-daemon` had loaded ITSELF into.
+    pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk: 0,
@@ -600,44 +821,99 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 each.start % ALIGN == 0 && each.end % ALIGN == 0,
                 "Vmem: reserved range is not aligned to {ALIGN} bytes"
             );
-            // Subtract every excluded range from `each`, inserting whatever (possibly
-            // discontiguous) pieces remain as still-reserved.
-            let mut pieces = alloc::vec![each.clone()];
-            for excl in excluded.clone() {
-                pieces = pieces
-                    .into_iter()
-                    .flat_map(|p| {
-                        let mut out = Vec::new();
-                        let overlap_start = p.start.max(excl.start);
-                        let overlap_end = p.end.min(excl.end);
-                        if overlap_start >= overlap_end {
-                            // No overlap with this exclusion.
-                            out.push(p);
-                        } else {
-                            if p.start < overlap_start {
-                                out.push(p.start..overlap_start);
-                            }
-                            if overlap_end < p.end {
-                                out.push(overlap_end..p.end);
-                            }
-                        }
-                        out
-                    })
-                    .collect();
+            if each.start >= each.end {
+                continue;
             }
-            for piece in pieces {
-                if piece.start >= piece.end {
-                    continue;
-                }
-                vmem.vmas.insert(
-                    piece,
-                    VmArea {
-                        flags: VmFlags::empty(),
-                        is_file_backed: false,
-                        shared_handle: None,
-                    },
-                );
+            vmem.vmas.insert(
+                each.clone(),
+                VmArea {
+                    flags: VmFlags::empty(),
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
+        }
+        vmem
+    }
+
+    /// Like [`Self::new`], but ALSO records `parent_occupied` as foreign, do-not-touch address
+    /// space -- exactly the same empty-flags "reserved by someone else" placeholder
+    /// [`Self::new`]'s own loop inserts for [`PageManagementProvider::reserved_pages`], just for
+    /// ranges a CALLER supplies directly instead of ranges the platform tracks itself.
+    ///
+    /// # Why this exists: `CLONE_VFORK`'s shared-then-detach execve, not [`Self::duplicate`]'s fork
+    ///
+    /// [`Self::new`]'s own doc comment above already explains why a plain thread-based `fork()`
+    /// child does NOT need this: [`Self::duplicate`] places the child's copy at genuinely fresh
+    /// host addresses (asking the platform's real allocator for room, which inherently cannot
+    /// double-book already-committed memory), so by the time that child later `execve()`s, its own
+    /// memory occupies addresses nothing else uses -- freeing and reusing them is safe.
+    ///
+    /// A `CLONE_VFORK` child is different in exactly the way that reasoning depends on: it is
+    /// never placed anywhere, because it never gets a copy at all -- `do_clone` hands it the
+    /// SAME [`PageManager`] `Arc` the parent is still using (see that function's own doc comment
+    /// on why this is safe up to this exact point: the parent is unconditionally blocked in
+    /// `wait_for_vfork_done` for the whole window). When that child calls `execve()`,
+    /// `detach_pm_for_vfork_execve` swaps in a brand-new `PageManager` for it -- correct per
+    /// real Linux's own `execve()` semantics (always a fresh address space) -- but a brand-new
+    /// `Vmem::new` only knows about [`PageManagementProvider::reserved_pages`], which on Windows is
+    /// a snapshot frozen at process-startup time (`refresh_reserved_pages` is a documented no-op
+    /// there) and so has NO knowledge whatsoever of anything the parent allocated since starting
+    /// up -- which, for a real process like `xfce4-session`, is effectively its entire heap, stack
+    /// growth, and every library `mmap`ed after its own startup. Unlike `duplicate()`'s child, this
+    /// child's execve is NOT placing memory at fresh host addresses discovered by asking the
+    /// platform for room -- it is running in the exact same real Windows process, address space
+    /// and (per the platform's own `reserved_pages` snapshot) largely UNTRACKED memory as the
+    /// still-live, merely-blocked parent. A "blind" fresh `Vmem` can then have its ELF loader's own
+    /// hint-based placement (PIE base, stack, mmap'd libraries -- the overwhelming common case)
+    /// select an address `insert_mapping`'s free-space search believes is empty but which is real,
+    /// currently-committed memory belonging to the PARENT -- and `insert_mapping`'s own
+    /// `FixedAddressBehavior::Replace` fallback (see its doc comment above) will silently
+    /// decommit-then-recommit fresh content directly over it, destroying the parent's live memory
+    /// out from under it. The parent does not notice until it resumes (unblocked the moment this
+    /// child reaches its own `execve`/`_exit`, not when it eventually exits) and later touches the
+    /// now-corrupted region -- a DELAYED fault, often tens of milliseconds to several seconds
+    /// after the actual corruption, which is exactly the observed shape of `xfce4-session`'s own
+    /// real `STATUS_ACCESS_VIOLATION` crash shortly after forking a `CLONE_VFORK` child that this
+    /// constructor was added to fix (2026-09-23 investigation).
+    ///
+    /// `parent_occupied` should be every range the OLD, about-to-be-detached `PageManager` (the one
+    /// this child was sharing with its still-live parent) currently tracks -- see
+    /// [`super::PageManager::tracked_regions`]. Recorded with the SAME empty-flags placeholder
+    /// [`Self::new`] itself uses for foreign, platform-reserved memory: real ranges (a PIE base
+    /// search, a `brk`-extension, an ordinary `mmap` hint search) correctly skip them, exactly as
+    /// they already skip [`Self::new`]'s own `reserved_pages` placeholders -- with no change needed
+    /// to `insert_mapping`'s existing overlap logic. Malformed/unaligned input is skipped, never
+    /// panics, matching this module's established "degrade, never crash the process being
+    /// diagnosed" contract for data describing another process's memory.
+    pub(super) fn new_for_vfork_execve_detach(
+        platform: &'static Platform,
+        parent_occupied: impl Iterator<Item = Range<usize>>,
+    ) -> Self {
+        let mut vmem = Self::new(platform);
+        for each in parent_occupied {
+            if each.start >= each.end || each.start % ALIGN != 0 || each.end % ALIGN != 0 {
+                continue;
             }
+            // `VM_FOREIGN_LIVE_NEVER_REPLACE`, not an ordinary empty-flags placeholder -- see that
+            // flag's own doc comment for why an empty-flags entry (silently stealable under
+            // `FixedAddressBehavior::Replace`, by design, for the foreign-but-genuinely-free
+            // `reserved_pages()` case `Vmem::new` itself seeds) is NOT strong enough here: this
+            // range is the PARENT's own live, in-use memory, not merely foreign-and-free space.
+            vmem.vmas.insert(
+                each,
+                VmArea {
+                    flags: VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE,
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
         }
         vmem
     }
@@ -646,11 +922,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// the given addresses, in this process's address space -- performing no allocation, no
     /// reservation, no commit, and no copying of any kind.
     ///
-    /// # Why this exists (and why it is NOT [`Self::new`] or [`Self::new_excluding`])
+    /// # Why this exists (and why it is NOT [`Self::new`])
     ///
     /// The normal startup path builds an EMPTY `Vmem` ([`Self::new`]) and grows it as the ELF
     /// loader's `PT_LOAD` segments, then the guest's own `mmap`/`brk` calls, allocate real pages
-    /// through it. [`Self::new_excluding`] is the `fork()`-into-the-same-host-process variant,
+    /// through it. [`Self::new`] is also the `fork()`-into-the-same-host-process variant,
     /// which still allocates every destination page itself (see [`Self::duplicate`]).
     ///
     /// A genuine process-based `fork()` child (this repo's `FINDINGS.txt` passes 107-137) needs
@@ -673,7 +949,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// whole host process's committed memory, which in an adopting child ALREADY INCLUDES the
     /// pre-populated guest regions this function is being asked to describe. Folding it in would
     /// overwrite each adopted region's real flags with `VmFlags::empty()` (the placeholder
-    /// [`Self::new_excluding`] inserts for host-reserved space) and so silently destroy exactly
+    /// [`Self::new`] inserts for host-reserved space) and so silently destroy exactly
     /// the information this constructor exists to preserve.
     ///
     /// `brk` is the parent's program break at fork() time, or `0` if it had no heap yet -- the
@@ -681,24 +957,178 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// Shared (`VM_SHARED`) regions cannot be adopted: a `VmArea`'s
     /// [`VmArea::shared_handle`] is a live platform handle in the PARENT's handle table with no
-    /// meaning in another process. Such regions are adopted with their flags intact but no handle,
-    /// and are reported by the returned count so a caller can surface the discrepancy rather than
-    /// silently mis-describing them.
+    /// meaning in another process, and a Windows cross-process fork's own reservation-group copy
+    /// (`copy_one_group`/`group_relocations`) deliberately never recreates real backing for a
+    /// `VM_SHARED` source region either (see `GroupRelocation`'s own doc comment: "`VM_SHARED`
+    /// regions are relocated independently" -- no such independent path actually exists for the
+    /// Windows cross-process-fork child today). Such regions are therefore skipped entirely here
+    /// (not inserted into `vmas`) rather than adopted with a dangling `shared_handle: None` --
+    /// root-caused live (45th pass, 2026-09-22): a previous revision DID insert them with an
+    /// ordinary-looking `VmArea` (`shared_handle: None`, `view_len: 0`), which made
+    /// `Vmem::remove_mapping`'s `shared_overlaps` check (keyed on `VmArea::view_extent()`, which
+    /// returns `None` whenever `shared_handle` is `None`) treat the region as ordinary PRIVATE
+    /// memory -- routing a later guest `munmap`/`mprotect` on it straight into
+    /// `WindowsUserland::deallocate_pages`/`update_permissions`'s real `VirtualFree`/
+    /// `VirtualProtect` calls, against an address this child process never actually committed any
+    /// real memory at (Windows correctly reports `MEM_FREE`), panicking
+    /// `litebox_platform_windows_userland::process_memory_range_by_regions`'s own
+    /// `assert!(success, ...)` (confirmed live via two independent boots hitting the bit-identical
+    /// region `0x7fef60030000-0x7fef64000000` and error signature). Skipping adoption instead
+    /// means a later guest access to that address faults honestly (a real, attributable page
+    /// fault at the actual point of use) rather than silently believing a phantom mapping exists
+    /// until an unrelated later cleanup operation panics the whole host process. Real
+    /// cross-process content sharing for `VM_SHARED` regions (duplicating the underlying platform
+    /// handle into the child, the same way pipes/files are already carried) remains unimplemented
+    /// -- this only stops the crash, it does not restore correct shared-memory semantics across a
+    /// cross-process fork.
     ///
-    /// Returns the `Vmem` plus the number of regions adopted and the number of those that carried
-    /// `VM_SHARED` (i.e. adopted without a usable handle, as above).
+    /// Returns the `Vmem` plus the number of regions adopted and the number of `VM_SHARED`
+    /// (+ `PROT_NONE` whose address range could not be reserved here, see below) regions seen and
+    /// deliberately skipped (never inserted into `vmas`).
+    ///
+    /// # `PROT_NONE` regions get the SAME treatment as `VM_SHARED` -- 46th pass, 2026-09-22
+    ///
+    /// `litebox_shim_linux::syscalls::process::do_clone`'s own real copy-plan computation (the
+    /// group-building loop feeding `copy_one_group`, NOT this crate's own `Vmem::duplicate` --
+    /// that function's grouping is used only by a diagnostic/verification path, never by the real
+    /// production cross-process fork) explicitly filters its `groups` to regions with at least one
+    /// of `VM_READ`/`VM_WRITE`/`VM_EXEC` set, with the documented rationale "a `PROT_NONE` region
+    /// ... has no bytes anyone can legitimately read, so it has nothing to copy -- and litebox
+    /// never commits one". That is correct and deliberate, but it means a `PROT_NONE` region gets
+    /// EXACTLY the same "tracked in `vmas` but never actually backed by real Windows memory in
+    /// THIS child process" treatment a `VM_SHARED` region does -- and adopting it anyway hits the
+    /// bit-identical failure mode this function's own doc comment above documents for `VM_SHARED`:
+    /// a later guest `munmap`/`mprotect` (most commonly at ordinary process-exit teardown, which
+    /// walks and releases every tracked VMA) routes straight into a REAL `VirtualFree`/
+    /// `VirtualProtect` call against an address Windows correctly reports `MEM_FREE` for,
+    /// panicking `litebox_platform_windows_userland::process_memory_range_by_regions`'s
+    /// `assert!(success, ...)`. Confirmed live, 46th pass: two independent boots, both still
+    /// hitting the bit-identical `0x7fef60030000-0x7fef64000000` region AFTER the 45th pass's
+    /// `VM_SHARED`-only fix landed, with a live diagnostic (`LITEBOX_DIAG_PROCESS_FORK_EXEC_FIXUP`)
+    /// showing the crashing span is a glibc-arena-shaped pair -- a small `flags=0x73` (RW) head
+    /// immediately followed by a large `flags=0x70` (`PROT_NONE`, no `VM_READ`/`VM_WRITE`/`VM_EXEC`
+    /// bit set, only the `VM_MAY*` bits) tail -- and `do_clone`'s own group filter (confirmed by
+    /// reading, quoted above) never gives that tail span a group, so `copy_one_group` never
+    /// reserves or commits real memory there in the child. Skipping adoption here closes the gap
+    /// the same way the `VM_SHARED` fix does: a later guest touch faults honestly (no VMA found,
+    /// same outcome `do_clone`'s own comment already says is "exactly as it should" happen for an
+    /// inaccessible region), and teardown finds nothing tracked to route into a real Windows call.
+    ///
+    /// # `PROT_NONE` regions are reserved here now -- Chromium pass (2026-10-02)
+    ///
+    /// That 46th-pass reasoning was right about the CRASH but wrong about the consequence: a
+    /// `PROT_NONE` region that is merely untracked is a region whose reservation the child has
+    /// lost, and guest software uses those reservations by `mprotect`-ing pages into them. Live
+    /// evidence (`.wfgy/mres1.sh`, a 1 GiB / 8 MiB / 64 KiB `PROT_NONE` `mmap` followed by a
+    /// cross-process `fork()`): the parent's `mprotect` succeeds and the child's returns `ENOMEM`
+    /// at every size, because `protect_mapping` finds no VMA covering the range. In Chromium that
+    /// `ENOMEM` is a failed `CHECK` (`int3`) ~0.09s into every renderer's life. Reserving the range
+    /// (no commit, `PAGE_NOACCESS`) restores the reservation instead of the phantom: the region is
+    /// tracked, access still faults, `mprotect` commits into it, and a later `munmap` has real
+    /// memory to release. A range Windows will not reserve (it can be reserved already by a
+    /// fork-copy group, which is fine, or genuinely unmappable) still falls back to the 46th-pass
+    /// skip, so this only ever adds coverage.
     pub(super) fn new_adopting_existing_memory(
         platform: &'static Platform,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
         brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, false)
+    }
+
+    /// Like [`Self::new_adopting_existing_memory`], but for a child that INHERITED the parent's
+    /// address space natively (a Linux `fork()`): `PROT_NONE` reservations and shared mappings
+    /// exist for real in such a child, so they are tracked too. Dropping them (right for a
+    /// Windows child, which has nothing behind them) made `mprotect` on an allocator's reserved
+    /// range fail with `ENOMEM` and left shared mappings un-`munmap`-able.
+    pub(super) fn new_adopting_inherited_memory(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        Self::adopt(platform, regions, brk, group_spans, true)
+    }
+
+    fn adopt(
+        platform: &'static Platform,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+        keep_all: bool,
     ) -> (Self, usize, usize) {
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk,
             platform,
         };
+        // Cross-process-fork guest-mmap-into-rounding-padding bug (subshell-crash investigation,
+        // `lazy_fork_commit.rs`'s own doc comment has the full repro/evidence): the REAL,
+        // production group-relocation spans this child's own `copy_one_group`/
+        // `reserve_group_lazy` (`litebox_platform_windows_userland::process_fork`) actually
+        // reserved+committed on the Windows side (`litebox_shim_linux::syscalls::process::do_clone`'s
+        // own 64KiB-`GRANULE`-widened `groups` computation, NOT `Vmem::duplicate`'s -- that one
+        // feeds only a diagnostic/verification path) can extend up to 65535 bytes past this
+        // group's own real, page-granular guest VMAs on either side (`GRANULE` alignment padding
+        // for `VirtualAlloc2`'s `MEM_ADDRESS_REQUIREMENTS`, which needs 64KiB-aligned bounds).
+        // `regions` below (== `AddressRelocations::vma_layout()`) has NO entry for that padding --
+        // it is real, per-VMA guest layout, at page granularity, with no notion of the coarser
+        // group rounding at all. Without recording the padding here too, this child's own
+        // `allocate_pages`/guest-`mmap()` bookkeeping believes that padding is ordinary free
+        // address space and can hand it out for a fresh mapping -- corrupting host memory that, on
+        // real (4KiB-granular) Linux, would simply have been part of the SAME, single, adjacent
+        // VMA. Confirmed live: a forked child's own guest `mmap()` was handed exactly such a
+        // padding range immediately following a real executable VMA, `mprotect`'d it `PROT_READ`,
+        // and a later genuine control-flow transfer into that same address (needing the real code
+        // that belongs there) code-fetch-faulted on a now-non-executable page.
+        //
+        // Insert a `VM_OWN_FORK_PADDING` placeholder for each group's FULL span FIRST, before the
+        // real per-region adoption loop below -- `RangeMap::insert` overwrites/narrows whatever was
+        // there for the inserted sub-range, so every real VMA's own `insert` below correctly
+        // replaces this placeholder across its own extent, leaving the placeholder in place only
+        // for the genuine gaps (rounding padding, and any other group-internal hole `do_clone`'s
+        // own widen-and-merge already tolerates -- see that function's own doc comment on why
+        // `read_source_bytes` reads a group page at a time rather than assuming the whole span is
+        // readable). Malformed/unaligned input is skipped, never panics, matching this function's
+        // own existing "degrade, never crash the process being diagnosed" contract for `regions`.
+        for group in group_spans {
+            if group.start >= group.end || group.start % ALIGN != 0 || group.end % ALIGN != 0 {
+                continue;
+            }
+            vmem.vmas.insert(
+                group,
+                VmArea {
+                    // No access bit is set (this range is untouched padding, not guest data), but
+                    // every `VM_MAY*` one is: this is the child's OWN anonymous-ish memory, so
+                    // `mprotect` over it must behave as it does over ordinary anonymous memory.
+                    // Without the `VM_MAY*` bits, `protect_mapping` refuses every request to turn
+                    // an access bit on -- confirmed live as a guest `mprotect` returning EACCES on
+                    // a VMA whose only flag was `VM_OWN_FORK_PADDING`, which killed crashpad's
+                    // intermediate process (a reservation it had just made could not be made
+                    // writable). `VM_MAY*` is the "what may EVER be turned on" record, so granting
+                    // all three here is a statement about the memory, not about its current state.
+                    flags: VmFlags::VM_OWN_FORK_PADDING | VmFlags::VM_MAY_ACCESS_FLAGS,
+                    is_file_backed: false,
+                    shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
+                },
+            );
+        }
         let mut adopted = 0usize;
         let mut shared = 0usize;
+        // A child that INHERITED the parent's address space natively (`keep_all`, a real Linux
+        // `fork()`) already has every shared view mapped for real, so there is nothing to carry
+        // and nothing to re-open -- asking here would re-open the same object a second time for
+        // no reason. Only the adopt-from-scratch case (a Windows cross-process fork child, whose
+        // own address space starts empty) needs the carry.
+        let carried_shared: Vec<SharedRegionCarry> = if keep_all {
+            Vec::new()
+        } else {
+            platform.carried_fork_shared_regions()
+        };
         for (range, flag_bits, is_file_backed) in regions {
             if range.start >= range.end || range.start % ALIGN != 0 || range.end % ALIGN != 0 {
                 // Malformed/unaligned input (this data crossed a process boundary): skip rather
@@ -707,8 +1137,65 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             let flags = VmFlags::from_bits_truncate(flag_bits);
-            if flags.contains(VmFlags::VM_SHARED) {
-                shared += 1;
+            let is_shared = flags.contains(VmFlags::VM_SHARED);
+            let is_padding = flags.contains(VmFlags::VM_OWN_FORK_PADDING);
+            let is_inaccessible = flags.intersection(VmFlags::VM_ACCESS_FLAGS).is_empty();
+            // A padding range is owned, already-committed memory (that flag's own doc comment),
+            // and `do_clone`'s copy groups now carry it, so the bytes are here already -- turning
+            // it into a bare reserve-only reservation here is what silently dropped them: the
+            // child ended up with address space claimed but no host page behind it, so a read the
+            // PARENT served from committed memory faulted as a genuine AV in the child.
+            if !keep_all && !is_padding && (is_shared || is_inaccessible) {
+                if is_shared {
+                    // A `VM_SHARED` region can be adopted for real after all. The parent mapped
+                    // the SAME object into this process at this address before spawning it and
+                    // named it in the carry, so re-opening that name here yields a handle to the
+                    // same bytes; what was missing was the bookkeeping, and recording a real
+                    // `shared_handle` is what turns this address from "some private pages that
+                    // happen to hold a copy of the parent's data at fork time" into an attachment
+                    // to the one shared store. See [`Self::adopt_carried_shared`].
+                    match carried_shared.iter().find(|c| c.range == range) {
+                        Some(carry)
+                            if vmem.adopt_carried_shared(
+                                range.clone(),
+                                flags,
+                                is_file_backed,
+                                carry,
+                            ) =>
+                        {
+                            adopted += 1;
+                            continue;
+                        }
+                        _ => {
+                            shared += 1;
+                            continue;
+                        }
+                    }
+                }
+                // A `PROT_NONE` region CAN be given real backing in this process after all:
+                // reserving its address range without committing anything
+                // (`PageManagementProvider::reserve_pages_without_commit`) reproduces exactly the
+                // state it has on the source side -- address space owned, no memory behind it, any
+                // access still faulting -- and leaves a later guest `mprotect` over it free to
+                // commit pages into it. That is not a workaround: without it, a `fork()` child of
+                // a process whose allocator reserved a big `PROT_NONE` range (Chromium's
+                // renderers, V8, PartitionAlloc) got `ENOMEM` from the very `mprotect` that makes
+                // the reservation usable, and died. Repro: `.wfgy/mres1.sh` (every size, parent
+                // succeeds / child fails ENOMEM).
+                //
+                // `VM_SHARED` no longer needs this escape hatch -- see the branch above.
+                let reserved_here = !is_shared
+                    && is_inaccessible
+                    && platform.reserve_pages_without_commit(range.clone());
+                if !reserved_here {
+                    // See this function's own doc comment (both the `VM_SHARED` paragraph and the
+                    // `PROT_NONE` one added in the 46th pass): deliberately NOT inserted into
+                    // `vmas` -- there is no real backing for either kind in this (adopting)
+                    // process, and pretending otherwise is what produced a live, reproducible
+                    // host-process panic.
+                    shared += 1;
+                    continue;
+                }
             }
             vmem.vmas.insert(
                 range,
@@ -716,11 +1203,146 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     flags,
                     is_file_backed,
                     shared_handle: None,
+                    view_base: 0,
+                    view_len: 0,
+                    reserved_extra: 0,
                 },
             );
             adopted += 1;
         }
         (vmem, adopted, shared)
+    }
+
+    /// Every `VM_SHARED` mapping this address space holds, described as a [`SharedRegionCarry`]
+    /// -- i.e. by the host-wide NAME of its backing object rather than by its
+    /// [`VmArea::shared_handle`], which is a per-process handle with no meaning anywhere else.
+    ///
+    /// This is the parent half of carrying a real shared mapping into a cross-process `fork()`
+    /// child. A mapping whose object has no name on this platform is simply absent here: it
+    /// cannot be reconstructed elsewhere, and the child reports it as unrestorable rather than
+    /// quietly substituting a private copy (see [`Self::adopt`]).
+    pub(super) fn shared_region_carry(&self) -> Vec<SharedRegionCarry> {
+        let mut out = Vec::new();
+        for (range, vma) in self.vmas.iter() {
+            let Some(handle) = vma.shared_handle else {
+                continue;
+            };
+            let Some((name, kind)) = self.platform.shared_memory_object_name(handle) else {
+                continue;
+            };
+            // The object's REAL size, not the VMA's possibly-shrunken tracked extent: a partial
+            // `munmap` narrows `range` while the underlying view (`view_len`) never changes, and
+            // a re-open asked for the shorter length would hand the child a different, smaller
+            // object on a platform that fixes size at creation.
+            let size = if vma.view_len != 0 {
+                vma.view_len
+            } else {
+                range.end - range.start
+            };
+            out.push(SharedRegionCarry {
+                range: range.clone(),
+                name,
+                kind,
+                size,
+                // Same bit positions by construction: `VmFlags::VM_READ/WRITE/EXEC` are `1<<0/1/2`
+                // and so are `MemoryRegionPermissions::READ/WRITE/EXEC` (see `impl From<
+                // MemoryRegionPermissions> for VmFlags`). Only the access bits are wanted here --
+                // `VM_MAY*` sits at `1<<4..` and would land on unrelated permission bits.
+                //
+                // PLUS the copy-on-write qualifier, which is the whole ballgame for a
+                // `VM_PRIVATE_FILE_COW` region: the child's view of this one section is created by
+                // the PARENT (`process_fork`'s `MapViewOfFile3` into the suspended child), and if
+                // it is created as an ordinary writable view the child's writes land in the object
+                // every other mapper of that file sees -- a `MAP_PRIVATE` mapping that is not
+                // private. Measured: `.wfgy/cb70.sh` `P_SEES_FILE_NOT_CHILD_WRITE=False`.
+                perms: MemoryRegionPermissions::from_bits_truncate(
+                    vma.flags.intersection(VmFlags::VM_ACCESS_FLAGS).bits() as u8,
+                ) | vma.flags.write_qualifier(),
+                flags: vma.flags.bits(),
+            });
+        }
+        out
+    }
+
+    /// Re-open `carry`'s named object in THIS process and record it as the backing of `range`,
+    /// so a fork child's `VM_SHARED` region is THE SAME BYTES the parent sees, not a copy of
+    /// them.
+    ///
+    /// Returns `false` (having closed anything it opened) when the object cannot be re-opened by
+    /// name. Never falls back to a private/COW mapping: a silent copy is the bug this exists to
+    /// fix, so an unrestorable region stays unrestorable and is counted as such.
+    ///
+    /// It does NOT map anything. The parent already did, into this process, before this process
+    /// ran a single instruction -- a section view cannot be created over memory a process already
+    /// holds (`MapViewOfFile3` over committed, decommitted or merely reserved address space all
+    /// fail; `.wfgy/winshmprobe.py`), so the mapping has to be made by whoever holds the child's
+    /// process handle while it is still suspended. What is left to do here is the bookkeeping
+    /// that turns those pages into an attachment.
+    fn adopt_carried_shared(
+        &mut self,
+        range: Range<usize>,
+        flags: VmFlags,
+        is_file_backed: bool,
+        carry: &SharedRegionCarry,
+    ) -> bool {
+        let name = carry.name.as_str();
+        if name.is_empty() {
+            return false;
+        }
+        let opened = match carry.kind {
+            SharedObjectKind::FileBacked => self
+                .platform
+                .create_file_backed_named_shared_memory(name, carry.size),
+            SharedObjectKind::Named => self
+                .platform
+                .create_named_shared_memory(name, carry.size),
+        };
+        let Ok(handle) = opened else {
+            litebox_util_log::warn!(
+                target:? = range, name:% = name;
+                "fork child: the carried shared object could not be re-opened by name"
+            );
+            return false;
+        };
+        let Some(page_range) = PageRange::<ALIGN>::new(range.start, range.end) else {
+            let _ = self.platform.close_shared_memory(handle);
+            return false;
+        };
+        // Ask the OS, not the parent's word for it, whether this address is genuinely a view. The
+        // parent maps each carried region while this process is still suspended, and a parent-side
+        // failure there is not otherwise visible from here -- re-opening the name SUCCEEDS either
+        // way, because the object exists regardless of whether this process holds a view of it.
+        // Booking a `shared_handle` over pages that are actually a private copy is exactly the
+        // silent "looks shared, is not" failure, so refuse instead: the caller then treats this
+        // range as an ordinary inherited private mapping, which is honest.
+        if !self.platform.memory_is_shared_view(range.clone()) {
+            litebox_util_log::error!(
+                target:? = range, name:% = name;
+                "fork child: the parent could not map the carried shared object into this process, \
+                 so this region is NOT shared -- parent and child will NOT observe each other's writes"
+            );
+            let _ = self.platform.close_shared_memory(handle);
+            return false;
+        }
+        // The view is ALREADY here: the parent mapped this very object into this process at this
+        // very address before spawning it (see `PageManagementProvider::export_fork_shared_
+        // regions`, and `map_shared_memory`'s own placement rule -- a section view cannot be
+        // created over memory this process already has, so only the parent, holding the child's
+        // process handle while it was still suspended, could have put it there). Calling
+        // `insert_mapping` here would therefore fail, and would be the wrong call anyway.
+        //
+        // What is missing is the BOOKKEEPING: without a `VmArea` whose `shared_handle` is this
+        // process's own handle to the SAME object, this address is only whatever placeholder the
+        // group spans left behind -- a read of it does not reach the object and a write through it
+        // lands in memory nobody else can see, which is precisely the "the inherited mapping is a
+        // private copy" failure. Recording it is what makes reads and writes go to the one store.
+        let mut vma = VmArea::new_shared(flags, is_file_backed, handle);
+        // `insert_mapping` would fill these in from the platform's answer; there is no answer
+        // here, so state them: the view is exactly `range`, mapped by the parent.
+        vma.view_base = range.start;
+        vma.view_len = range.end - range.start;
+        self.register_existing_mapping_overwrite(page_range, vma);
+        true
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
@@ -764,21 +1386,120 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
     ) -> Result<(), VmemUnmapError> {
         let range: Range<usize> = range.into();
-        let is_shared = self
+        // A shared-handle view can only be PHYSICALLY unmapped (`UnmapViewOfFileEx` on Windows)
+        // as a whole -- there is no OS primitive for unmapping a subrange of a view, unlike
+        // Linux's `munmap`, which allows any page-granularity subrange (real, common guest
+        // patterns: ld.so unmapping the gaps between a `.so`'s `PT_LOAD` segments, a `wl_shm`
+        // client trimming or splitting a pool). Confirmed live: `xfwm4` panics with
+        // `UnmapError(Unaligned)` hitting exactly this on a real weston/XFCE launch (AGENTS.md
+        // pass 255-256's own diagnostic capture: `ERROR_INVALID_ADDRESS`/`0x1e7` from
+        // `UnmapViewOfFileEx` on a range that was a genuine page-aligned SUBRANGE of a still-live
+        // view, not a misaligned address). For each shared VMA this removal overlaps, only issue
+        // the real platform unmap when `range` covers that VMA's own FULL current extent (i.e.
+        // this genuinely removes the whole view); for a partial overlap, treat it as a logical
+        // unmap instead -- revoke access via `update_permissions` (Windows freely allows
+        // re-protecting a SUBRANGE of an already-mapped view, unlike unmapping one) and leave the
+        // real view mapped underneath. The remaining, still-live subrange(s) of that view keep
+        // working normally; `self.vmas.remove(range)` below still correctly narrows/removes the
+        // logical bookkeeping either way, matching every other (non-shared) mapping's own
+        // partial-unmap handling.
+        // A single `munmap()` call only ever removes a SUBRANGE of `self.vmas`' current tracked
+        // bookkeeping for a view, which itself may already be a shrunken remnant of the view's
+        // real, original extent (a PRIOR partial `munmap` narrows the `RangeMap` entry via
+        // `.remove()` below without touching the real, still-fully-mapped Windows view
+        // underneath). So "does this call fully remove the whole real view" is a TWO-part
+        // question, not a single-range comparison against either extent alone:
+        //   1. does `range` cover this call's own overlapping VMA's CURRENT tracked range (i.e.
+        //      does this call empty that `RangeMap` entry) -- exactly the original per-call
+        //      check, still correct for its own purpose;
+        //   2. if so, does the real view (`view_base..view_base+view_len`, recorded once by
+        //      `insert_mapping` and NEVER recomputed from a shrunken tracked range -- see
+        //      `VmArea::view_base`'s doc comment) have any OTHER surviving tracked fragment
+        //      elsewhere in `self.vmas` -- i.e. is this genuinely the LAST piece.
+        // Only when both hold has the whole real view been removed; only then is it correct to
+        // call `unmap_shared_memory`, and always at `view_base` (the real original base
+        // `MapViewOfFile`/`map_shared_memory` returned), NEVER the current tracked range's own
+        // (possibly shrunken) start -- Windows' `UnmapViewOfFileEx` requires the exact original
+        // base and rejects anything else outright. This also fixes the mirror-image leak: a
+        // back-to-front unmap sequence now still recognizes "whole view removed" on its final
+        // fragment, since part 2 checks the fixed, never-shrinking `view_extent`, not removal
+        // order.
+        let shared_overlaps: alloc::vec::Vec<(Range<usize>, Range<usize>)> = self
             .vmas
             .overlapping(range.clone())
-            .any(|(_, vma)| vma.shared_handle.is_some());
+            .filter_map(|(r, vma)| vma.view_extent().map(|ve| (r.clone(), ve)))
+            .collect();
         unsafe {
-            if is_shared {
-                self.platform
-                    .unmap_shared_memory(range.clone())
-                    .map_err(|_| VmemUnmapError::UnmapError(DeallocationError::Unaligned))?;
-            } else {
+            for (vma_range, view_range) in &shared_overlaps {
+                let call_empties_this_fragment =
+                    range.start <= vma_range.start && range.end >= vma_range.end;
+                // Whether any OTHER tracked fragment of the SAME real view survives elsewhere in
+                // `self.vmas`, after this call's removal is applied. Any tracked entry whose
+                // `view_extent()` equals this one's, other than `vma_range` itself (which this
+                // call is about to fully remove, per `call_empties_this_fragment`), is such a
+                // survivor.
+                let other_fragment_survives = call_empties_this_fragment
+                    && self.vmas.iter().any(|(r, vma)| {
+                        r != vma_range && vma.view_extent().as_ref() == Some(view_range)
+                    });
+                if call_empties_this_fragment && !other_fragment_survives {
+                    // This call empties the last surviving tracked fragment of the whole real
+                    // view: a genuine whole-view removal. Always unmap at `view_range.start`
+                    // (== `view_base`), the real original base address.
+                    self.platform
+                        .unmap_shared_memory(view_range.clone())
+                        .map_err(|err| {
+                            // Preserve the real underlying error class instead of collapsing
+                            // every failure into a generic `Unaligned` -- a future diagnostic
+                            // sees which platform-level failure this actually was.
+                            VmemUnmapError::UnmapError(match err {
+                                SharedMemoryError::Unaligned => DeallocationError::Unaligned,
+                                SharedMemoryError::UnsupportedByPlatform
+                                | SharedMemoryError::OutOfMemory
+                                | SharedMemoryError::AddressInUse => {
+                                    DeallocationError::AlreadyUnallocated
+                                }
+                            })
+                        })?;
+                } else {
+                    // A genuine partial unmap of a still-live view: revoke access to just the
+                    // removed subrange instead of attempting (and failing) a real unmap. Errors
+                    // here are deliberately swallowed (best-effort revocation) rather than
+                    // surfaced as `VmemUnmapError`: Linux's own `munmap` on a subrange cannot
+                    // fail this way at all, so there is no correct errno to synthesize, and
+                    // failing the whole `remove_mapping` call over a permission-update glitch
+                    // would be a strictly worse outcome than leaving the (still logically
+                    // unmapped, per `self.vmas.remove` below) subrange READABLE a little longer.
+                    // Clamp to `vma_range` (this call's own overlapping tracked fragment), NOT
+                    // `view_range` (the whole real view, which can span far beyond this one
+                    // fragment once the view has been split into multiple tracked pieces by
+                    // earlier partial unmaps): revoking access across the WHOLE view would strip
+                    // a live guest's access to bytes belonging to a DIFFERENT, still-surviving
+                    // fragment of the same real view -- exactly the bug that produced a real,
+                    // reproducible SIGSEGV (weston writing into memory that this call incorrectly
+                    // NOACCESS'd, even though that memory belonged to a fragment this specific
+                    // `munmap()` call never asked to touch).
+                    let overlap_start = range.start.max(vma_range.start);
+                    let overlap_end = range.end.min(vma_range.end);
+                    let _ = self.platform.update_permissions(
+                        overlap_start..overlap_end,
+                        MemoryRegionPermissions::empty(),
+                    );
+                }
+            }
+            if shared_overlaps.is_empty() {
                 self.platform
                     .deallocate_pages(range.clone())
                     .map_err(VmemUnmapError::UnmapError)?;
             }
         }
+        // Unconditional, and deliberately NOT hung off `deallocate_pages` above: this is the one
+        // point every guest unmap converges on, including the shared-overlap branch that skips
+        // the platform deallocation entirely because a shared view can only be unmapped whole.
+        // Any platform bookkeeping keyed by guest address has to be dropped on ALL of those
+        // paths -- see `release_mapping_claim`. Placed before `self.vmas.remove` only so the
+        // range is still owned here; the order is otherwise immaterial.
+        self.platform.release_mapping_claim(range.clone());
         self.vmas.remove(range);
         Ok(())
     }
@@ -792,9 +1513,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
     ///
-    /// # Panics
-    ///
-    /// File-backed mapping is not supported yet.
+    /// A file-backed region is left untouched: `MADV_DONTNEED` leaves the range's contents
+    /// unspecified rather than requiring them to change, and there is no way to drop a
+    /// file-backed (or copy-on-write shared-handle) region's pages without losing a mapping
+    /// this process may share with its fork children.
     ///
     /// # Safety
     ///
@@ -818,7 +1540,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
                 }
-                unimplemented!("resetting file-backed mappings is not supported yet");
+                // `madvise(MADV_DONTNEED)` on a file-backed mapping is legal on Linux and can be
+                // asked for by any guest (a `MADV_FREE` caller hits the arm above instead, which
+                // is the one Linux restricts to anonymous memory). Discarding the pages is not
+                // implemented, and a `panic` here is not an option: guest-reachable code answers
+                // with an errno or with success, never by killing the host process -- which is
+                // the whole session. Preserving the bytes is a legal outcome of `MADV_DONTNEED`
+                // (the range's contents are unspecified afterwards, not required to change), so
+                // leave the mapping exactly as it is.
+                litebox_util_log::debug!(
+                    start:% = r.start, end:% = r.end, shared:% = vma.shared_handle.is_some();
+                    "diag-reset-pages: MADV_DONTNEED on a file-backed mapping is a no-op, contents preserved"
+                );
+                continue;
             }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
@@ -850,15 +1584,76 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn insert_mapping(
         &mut self,
         suggested_range: PageRange<ALIGN>,
-        vma: VmArea<Platform, ALIGN>,
+        mut vma: VmArea<Platform, ALIGN>,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        // A `Hint` means exactly what `FixedAddressBehavior::Hint` documents: "the platform may
+        // choose a different address if the hint is not available". The rest of this function
+        // already assumes precisely that -- it records wherever the allocation ACTUALLY landed
+        // (`new_start = ret.as_usize()` below) rather than assuming the suggestion was honored.
+        // So a hint whose end falls past `TASK_ADDR_MAX` describes an unusable SUGGESTION, not an
+        // impossible REQUEST: only the LENGTH has to fit in the address space. Slide such a hint
+        // down to the top of the usable range and let the platform place it, instead of failing
+        // the caller outright.
+        //
+        // This is not hypothetical tidying. `Vmem::duplicate` reserves each fork group as one
+        // contiguous span sized to the parent's own extent INCLUDING each `VmArea`'s
+        // `reserved_extra` headroom, so a parent whose topmost group sits near the top of the
+        // address space hands down a span ending just past `TASK_ADDR_MAX`. Rejecting it failed
+        // the ENTIRE `fork()` with `ENOMEM` while ~128 TiB of address space sat free. Observed
+        // live: a 1,055,973,376-byte group span overshooting the limit by exactly 20,480 bytes,
+        // which is what stopped `Xvfb` from forking `xkbcomp` (keymap compilation then fails and
+        // the X server aborts with "Failed to activate virtual core keyboard"). That ENOMEM had
+        // previously been read as the general "fork-without-exec is architecturally unsound"
+        // hazard rather than this specific, ordinary, fixable bounds bug -- the two are not the
+        // same thing, and this one costs nothing to get right.
+        let suggested_range = if suggested_range.end > Platform::TASK_ADDR_MAX
+            && fixed_address_behavior == FixedAddressBehavior::Hint
+        {
+            let len = suggested_range.len();
+            let slid = Platform::TASK_ADDR_MAX
+                .checked_sub(len)
+                .map(|s| s & !(ALIGN - 1))
+                .filter(|s| *s >= Platform::TASK_ADDR_MIN)
+                .and_then(|s| PageRange::<ALIGN>::new(s, s + len));
+            match slid {
+                Some(slid) => {
+                    litebox_util_log::warn!(
+                        orig_start:% = suggested_range.start, orig_end:% = suggested_range.end,
+                        slid_start:% = slid.start, max:% = Platform::TASK_ADDR_MAX, len:% = len;
+                        "insert_mapping: hint ended above TASK_ADDR_MAX, sliding it down rather than failing the allocation"
+                    );
+                    slid
+                }
+                // The length itself does not fit between `TASK_ADDR_MIN` and `TASK_ADDR_MAX`, so
+                // no position exists and this is a genuine capacity failure, not a bad hint --
+                // fall through to the unconditional rejection below, which reports it as such.
+                None => suggested_range,
+            }
+        } else {
+            suggested_range
+        };
         let (start, end) = (suggested_range.start, suggested_range.end);
+        // Both bounds rejections are logged unconditionally, for the same reason the two other
+        // rare-path rejections in this function are (see their comments): the caller only ever
+        // sees an opaque `AllocationError`, and by the time it surfaces -- e.g. as `fork()`'s
+        // "failed to allocate destination mapping" -- every number needed to tell a genuinely
+        // out-of-bounds request apart from a merely unusable *hint* has been thrown away.
         if start < Platform::TASK_ADDR_MIN {
+            litebox_util_log::warn!(
+                start:% = start, end:% = end, min:% = Platform::TASK_ADDR_MIN,
+                behavior:? = fixed_address_behavior;
+                "insert_mapping: rejecting range starting below TASK_ADDR_MIN"
+            );
             return Err(AllocationError::BelowMinAddress);
         }
         if end > Platform::TASK_ADDR_MAX {
+            litebox_util_log::warn!(
+                start:% = start, end:% = end, max:% = Platform::TASK_ADDR_MAX,
+                len:% = end.wrapping_sub(start), behavior:? = fixed_address_behavior;
+                "insert_mapping: rejecting range ending above TASK_ADDR_MAX"
+            );
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
@@ -872,16 +1667,33 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             FixedAddressBehavior::Replace => {
                 if self.vmas.overlaps(&(start..end)) {
+                    // `VM_FOREIGN_LIVE_NEVER_REPLACE` (see that flag's own doc comment) is an
+                    // unconditional refusal, regardless of partial vs. full coverage: unlike an
+                    // ordinary empty-flags `Vmem::new` placeholder (which a real `MAP_FIXED` is
+                    // legitimately allowed to steal, see the case below), this marks memory a
+                    // DIFFERENT, still-live process owns -- there is no "legitimate ELF segment
+                    // placement" reading of overwriting that, ever.
+                    if let Some((r, _)) = self.vmas.iter().find(|(r, vma)| {
+                        r.start < end
+                            && r.end > start
+                            && vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+                    }) {
+                        litebox_util_log::warn!(
+                            target_start:% = start, target_end:% = end, overlapping:? = r;
+                            "insert_mapping: MAP_FIXED target overlaps memory a different, still-live process owns, rejecting as AddressPartiallyInUse"
+                        );
+                        return Err(AllocationError::AddressPartiallyInUse);
+                    }
                     if self.vmas.gaps(&(start..end)).next().is_some()
                         // A partial overlap is only unsafe to blindly `Replace` over when some
                         // piece of it is a REAL guest mapping (non-empty flags) this shim doesn't
-                        // own the full picture of. An empty-flags entry is one of `new_excluding`'s
+                        // own the full picture of. An empty-flags entry is one of `Vmem::new`'s
                         // own reserved-but-not-guest-visible placeholders -- reserved specifically
                         // so *some* guest allocation doesn't land there and silently alias host
                         // memory, not a promise that no guest allocation may ever legitimately need
                         // that exact address. A `MAP_FIXED` request (real Linux: unconditionally
                         // overwrites whatever is there) whose target happens to straddle one of
-                        // these placeholders is exactly the case `new_excluding`'s own reservation
+                        // these placeholders is exactly the case `Vmem::new`'s own reservation
                         // was defending against becoming unrepresentable -- allow it through rather
                         // than rejecting a legitimate ELF segment placement (confirmed live: cc1's
                         // own large BSS/data segment straddling a small reserved placeholder,
@@ -969,7 +1781,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // adds `PROT_EXEC` to for a JIT).
             let widest_permissions = MemoryRegionPermissions::READ
                 | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC;
+                | MemoryRegionPermissions::EXEC
+                | vma.flags.write_qualifier();
             let dest_ptr = self
                 .platform
                 .map_shared_memory(
@@ -988,7 +1801,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         AllocationError::OutOfMemory
                     }
                 })?;
-            let actual_permissions = MemoryRegionPermissions::from_bits(permissions).unwrap();
+            let actual_permissions =
+                MemoryRegionPermissions::from_bits(permissions).unwrap() | vma.flags.write_qualifier();
             if actual_permissions != widest_permissions {
                 let mapped_range =
                     dest_ptr.as_usize()..(dest_ptr.as_usize() + suggested_range.len());
@@ -1015,6 +1829,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         };
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
+        if vma.shared_handle.is_some() {
+            // This IS the real Windows/platform view-creation call (`map_shared_memory` above,
+            // in the `Some(shared_handle)` branch) -- `new_start..new_end` is the REAL view's own
+            // full original extent, exactly as the platform returned it. Record it now,
+            // unconditionally overwriting whatever `view_base`/`view_len` the caller's `vma`
+            // carried in (e.g. `0` for a freshly-`new_shared`-constructed one, or a stale prior
+            // view's extent when `resize_mapping`/`move_mappings` re-map the SAME handle at a
+            // new address): every path that reaches here (`create_pages`,
+            // `map_existing_shared_pages`, `resize_mapping`'s in-place expand,
+            // `move_mappings`, `Vmem::duplicate`) is, itself, the moment a NEW real view comes
+            // into existence, so this is always the correct, current, authoritative value --
+            // never stale. `remove_mapping`'s full-coverage check is the only reader, and it
+            // must always see the extent of the view that is ACTUALLY mapped right now.
+            vma.view_base = new_start;
+            vma.view_len = new_end - new_start;
+        }
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
@@ -1087,48 +1917,47 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // copying without restructuring this loop.
         //
         // Ranges with empty flags are the platform's host-reserved placeholders inserted by
-        // `Self::new`/`Self::new_excluding` (not real guest mappings, and not necessarily even
+        // `Self::new` (not real guest mappings, and not necessarily even
         // readable) -- `dest` gets its own copy of those from its own construction, so skip them
         // here rather than trying to copy host-runtime memory that is none of the guest's
-        // business.
+        // business. `VM_FOREIGN_LIVE_NEVER_REPLACE` ranges (see that flag's own doc comment) get
+        // the identical treatment despite being non-empty: they mark a DIFFERENT, still-live
+        // process's own memory (seeded into a `CLONE_VFORK` child's fresh `Vmem` by
+        // `new_for_vfork_execve_detach`), not real content belonging to `self` -- `dest` must not
+        // copy it as if it were this process's own heap/stack, only continue refusing to place
+        // anything over the same addresses (which `dest`'s own placeholder, inserted the same way,
+        // already guarantees on its own account).
         let regions: Vec<(Range<usize>, VmArea<Platform, ALIGN>)> = self
             .vmas
             .iter()
-            .filter(|(_, vma)| !vma.flags.is_empty())
+            .filter(|(_, vma)| {
+                !vma.flags.is_empty() && !vma.flags.contains(VmFlags::VM_FOREIGN_LIVE_NEVER_REPLACE)
+            })
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
 
-        // Non-shared regions must be relocated in COHERENT GROUPS, not independently: real guest
-        // code (any dynamically-linked or PIE binary, which is the overwhelming majority) uses
-        // RIP-relative addressing across ELF segments -- e.g. a `call *offset(%rip)` in `.text`
-        // reading a function pointer out of `.got`, which are always mapped as SEPARATE regions
-        // (one per `PT_LOAD` segment / `mmap` call) but at a FIXED relative distance from each
-        // other, guaranteed by the original single coherent virtual address layout the linker
-        // computed. Relocating each region independently (as this function used to do, in the
-        // same style still used below for `PROT_NONE` guard pages and `VM_SHARED` regions, where
-        // no such cross-region relationship exists) would let two regions of the SAME loaded
-        // object land at DIFFERENT relative offsets in the child, silently corrupting every
-        // RIP-relative reference that crosses a region boundary -- observed as a NULL-pointer
-        // crash jumping through a GOT-style table whose entries read back wrong after `fork()`.
-        //
-        // The fix: partition regions into contiguity-based groups (adjacent-or-near regions,
-        // i.e. the segments of one loaded ELF image, separated by no more than
-        // `MAX_INTRA_GROUP_GAP`) rather than one single span covering the WHOLE address space --
-        // a single global span would also force the guest's stack (placed far from the ELF's own
-        // low-address segments, with no RIP-relative relationship to them at all) into the same
-        // reservation, requiring an absurdly large, likely-unsatisfiable allocation. Each group is
-        // reserved as ONE contiguous span at a single freshly-chosen base address, then every
-        // region within it is placed at `group_new_base + (region.start - group_min_start)` --
-        // preserving every pairwise relative offset within the group exactly, the same guarantee
-        // real Linux `fork()` gets for free by giving the child the SAME virtual addresses as the
-        // parent (see this function's "Known deviation" doc section on why that specific
-        // guarantee isn't available here). Regions in DIFFERENT groups (e.g. the stack vs. the
-        // main ELF image) have no such relationship and may land anywhere independently.
-        let max_intra_group_gap: usize = 16 * ALIGN;
+        // Non-shared regions must be relocated in COHERENT GROUPS (adjacent-or-near regions kept
+        // at the same relative offsets), not independently -- otherwise RIP-relative references
+        // that cross a region boundary (e.g. `.text` -> `.got`) silently corrupt in the child.
+        // `max_intra_group_gap` is a gap-distance heuristic, currently sized for glibc's 64MiB
+        // per-thread arenas (musl mallocng needed only 16MiB; this is a known allocator-specific
+        // fragility, not a permanent fix). See docs/fork-region-grouping-design.md for the full
+        // bug history, both allocators' measured gap sizes, and the provenance-based replacement
+        // this heuristic is meant to be superseded by.
+        let max_intra_group_gap: usize = 64 * 1024 * 1024;
+        // Each entry's `end` is the region's RESERVED extent, not its VMA extent: a mapping
+        // created with `CreatePagesFlags::ENSURE_SPACE_AFTER` holds `reserved_extra` further
+        // bytes of address space past its VMA that carry no VMA of their own (see
+        // `VmArea::reserved_extra`). Grouping on VMA extents alone made every child's group
+        // reservation short by exactly that headroom, so `insert_mapping(Hint)` could place a
+        // later group inside what was an earlier group's headroom and silently break the
+        // pairwise relative offsets this grouping exists to preserve. The headroom still gets no
+        // VMA and no copied content in the child -- only the reserved SPAN is sized to match the
+        // parent's, exactly as the parent itself holds it: reserved, unpopulated address space.
         let mut sorted_non_shared: Vec<Range<usize>> = regions
             .iter()
             .filter(|(_, vma)| vma.shared_handle.is_none())
-            .map(|(r, _)| r.clone())
+            .map(|(r, vma)| r.start..r.end.saturating_add(vma.reserved_extra))
             .collect();
         sorted_non_shared.sort_by_key(|r| r.start);
         let mut groups: Vec<Range<usize>> = Vec::new();
@@ -1140,6 +1969,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 _ => groups.push(r),
             }
         }
+        // Per `docs/fork-region-grouping-design.md`, the guest STACK merging into the same group
+        // as heap/ELF regions at the current `max_intra_group_gap` is harmless for correctness.
         // For each source address, the `(group_source_base, group_dest_base)` of the group it
         // falls in -- looked up per-region in the main loop below via a linear scan (`groups` is
         // small: one entry per ELF image / stack / independent mmap cluster, not per region).
@@ -1153,8 +1984,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // individual regions placed within it via `Replace` below are tracked in `dest.vmas`
             // (each `insert_mapping` call replaces this placeholder's tracking for its own
             // sub-range).
-            let placeholder_vma =
-                VmArea::<DestPlatform, ALIGN>::new(VmFlags::VM_OWN_FORK_PADDING, false);
+            let placeholder_vma = VmArea::<DestPlatform, ALIGN>::new(
+                // `VM_MAY_ACCESS_FLAGS` for the same reason `new_adopting_inherited_memory` gives
+                // its own padding placeholders every `VM_MAY*` bit: whatever of this span no real
+                // region goes on to replace stays a tracked, owned, unmapped VMA of this child,
+                // and `mprotect` over it has to behave as it does over anonymous memory.
+                VmFlags::VM_OWN_FORK_PADDING | VmFlags::VM_MAY_ACCESS_FLAGS,
+                false,
+            );
             let base_ptr = unsafe {
                 dest.insert_mapping(
                     span_page_range,
@@ -1327,10 +2164,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // elsewhere in this module solves the identical problem via its `before_perms` /
             // `after_perms` split; do the same here by protecting down to `vma`'s real flags
             // only after the copy succeeds.
-            let writable_vma = VmArea::new(
+            let mut writable_vma = VmArea::new(
                 (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_WRITE,
                 vma.is_file_backed,
             );
+            // Carry the source's growth headroom into the child's own VMA. `VmArea::new` cannot
+            // know it (it takes only flags and `is_file_backed`), so without this the child's
+            // copy records `reserved_extra = 0` and a FORK OF THIS CHILD would compute its group
+            // spans from a zeroed value -- reintroducing, one generation down, exactly the
+            // short-reservation bug this field exists to prevent. Shells and dbus fork
+            // repeatedly, so the grandchild case is reachable in the real workload.
+            writable_vma.reserved_extra = vma.reserved_extra;
             // Place at this region's fixed position within `non_shared_span` (reserved above),
             // preserving its exact relative offset from every other non-shared region -- see
             // `non_shared_span`'s doc comment for why this must NOT be independently relocated.
@@ -1369,7 +2213,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     dest_ptr.as_usize() + length.as_usize(),
                 )
                 .ok_or(VmemDuplicateError::UnAligned)?;
-                unsafe { dest.protect_mapping(dest_range, vma.flags.into()) }
+                unsafe { dest.protect_mapping(dest_range, vma.flags.into(), "fork_duplicate") }
                     .map_err(|_| VmemDuplicateError::DestUnwritable)?;
             }
         }
@@ -1417,42 +2261,61 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
-        vma: VmArea<Platform, ALIGN>,
+        mut vma: VmArea<Platform, ALIGN>,
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
-        let total_length = (length
-            + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
-                DEFAULT_RESERVED_SPACE_SIZE
-            } else {
-                0
-            })
-        .unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
+        let reserved_extra = if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
+            DEFAULT_RESERVED_SPACE_SIZE
+        } else {
+            0
+        };
+        // Record the headroom on the VMA itself. `get_unmmaped_area` below claims
+        // `length + reserved_extra` of address space but `insert_mapping` tracks only `length`,
+        // deliberately (see `ENSURE_SPACE_AFTER`'s doc comment) -- so without this field the
+        // trailing reservation is invisible to everything that reasons from VMA extents, most
+        // consequentially `Vmem::duplicate`'s group-span computation. See
+        // `VmArea::reserved_extra`'s doc comment for the live fault this caused.
+        vma.reserved_extra = reserved_extra;
+        let total_length = (length + reserved_extra).unwrap();
+        let fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
+        // A section-backed (shared) mapping is the one path whose base the platform can only take
+        // at allocation-granularity alignment, so its hint is computed in granule units -- see
+        // `shared_view_base`. Every other path keeps the page-granular search.
+        let new_addr = if !fixed_addr && vma.shared_handle.is_some() {
+            self.shared_view_base(
                 suggested_address,
                 total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
             )
-            .ok_or(AllocationError::OutOfMemory)?;
+        } else {
+            self.get_unmmaped_area(
+                suggested_address,
+                total_length,
+                fixed_addr,
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+            )
+        }
+        .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        unsafe {
+        let behavior = if fixed_addr {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint
+        };
+        let result = unsafe {
             self.insert_mapping(
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
-                    } else {
-                        FixedAddressBehavior::Replace
-                    }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
+                behavior,
             )
-        }
+        };
+        result
     }
 
     /// Resize a range in the virtual address space.
@@ -1495,49 +2358,142 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             core::cmp::Ordering::Greater => {}
         }
 
-        // grow
-        if range.end > cur_range.end {
-            // we can't remap across vm area boundaries
-            return Err(VmemResizeError::InvalidAddr {
-                range: cur_range.clone(),
-                addr: range.end,
-            });
-        }
+        let (cur_range, cur_vma) = if range.end > cur_range.end {
+            let mut position = cur_range.end;
+            loop {
+                let (next_range, next_vma) =
+                    self.vmas
+                        .get_key_value(&position)
+                        .ok_or(VmemResizeError::InvalidAddr {
+                            range: cur_range.clone(),
+                            addr: position,
+                        })?;
+                if next_range.end >= range.end {
+                    break (next_range, next_vma);
+                }
+                position = next_range.end;
+            }
+        } else {
+            (cur_range, cur_vma)
+        };
 
+        let (tail_start, tail_vma) = (cur_range.start, *cur_vma);
         if range.end == cur_range.end {
             // expand the current range
             let r = range.end..new_end;
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            if cur_vma.is_file_backed() {
-                unimplemented!("file-backed mapping expansion is not supported yet");
+            // A file-backed mapping with a real shared-memory handle (e.g. a `wl_shm`/memfd
+            // `MAP_SHARED` pool grown via `mremap`, `libwayland-cursor`'s own pool-growth
+            // pattern) is expanded through the exact same `insert_mapping` -> `map_shared_memory`
+            // path as an anonymous `MAP_SHARED` mapping below: `insert_mapping` already maps a
+            // fresh VIEW of the SAME underlying shared object at the new address when
+            // `vma.shared_handle` is `Some`, so no byte-copy or new handle is needed here -- the
+            // content lives in the shared object, not in either view. Only a *private*
+            // file-backed mapping (no shared handle: `MAP_PRIVATE` file-backed, or a platform with
+            // no real shared-memory backend at all -- see `VmArea::shared_handle`'s doc comment)
+            // has no live handle to re-map and so genuinely cannot be expanded in place; growth
+            // for that case is not implemented.
+            if cur_vma.is_file_backed() && cur_vma.shared_handle.is_none() {
+                unimplemented!("private file-backed mapping expansion is not supported yet");
+            }
+            // A section-backed (shared) mapping must NOT be "expanded" by mapping an extra view:
+            // `insert_mapping` below maps a view of the SAME object at the object's offset 0 (the
+            // platform's `map_shared_memory` has no offset argument on this path), so the bytes
+            // the guest expects at `range.end..new_end` would alias the object's FIRST bytes
+            // instead of extending it -- silent data corruption, not growth. Its view length is
+            // also the DELTA (`new_end - range.end`), which for a grown mapping can exceed the
+            // object's own fixed size, and that is refused outright with `ERROR_ACCESS_DENIED`.
+            // Report `RangeOccupied` so `MemoryManager::remap_pages` routes the growth through
+            // `move_mappings`, which grows the object itself and re-maps the whole mapping at its
+            // new size -- real `mremap(MREMAP_MAYMOVE)` behaviour.
+            if cur_vma.shared_handle.is_some() {
+                return Err(VmemResizeError::RangeOccupied(range.end..new_end));
             }
             let range = PageRange::new(range.end, new_end).unwrap();
             // Try to extend the mapping. Although we checked that there are no
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
+            let (diag_cur_start, diag_cur_end, diag_is_shared) = (
+                cur_range.start,
+                cur_range.end,
+                cur_vma.shared_handle.is_some(),
+            );
             match unsafe {
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
-                Ok(_) => {}
-                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
+                Ok(_) => {
+                    if tail_vma.shared_handle.is_none() && !tail_vma.is_file_backed() {
+                        self.vmas.insert(tail_start..new_end, tail_vma);
+                    }
+                }
+                Err(AllocationError::OutOfMemory) => {
+                    litebox_util_log::debug!(
+                        expand_start:% = range.start, expand_end:% = new_end,
+                        cur_range_start:% = diag_cur_start, cur_range_end:% = diag_cur_end,
+                        is_shared:% = diag_is_shared;
+                        "resize_mapping: DIAG in-place expand insert_mapping returned OutOfMemory"
+                    );
+                    return Err(VmemResizeError::OutOfMemory);
+                }
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
                     | AllocationError::AddressPartiallyInUse,
                 ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(
-                    AllocationError::Unaligned
-                    | AllocationError::BelowMinAddress
-                    | AllocationError::AboveMaxAddress,
-                ) => unreachable!(),
+                // An in-place expansion that would run past either end of the usable address
+                // space is a genuine capacity answer, not an impossible one: `new_end` comes
+                // from the caller's requested size, so `mremap`-style growth near the top of
+                // the address space reaches it normally. Real Linux answers that with `ENOMEM`.
+                //
+                // This used to be `unreachable!()`, which turned an ordinary out-of-space
+                // condition into a host-side panic that killed the whole guest. Reached live
+                // once selkies got far enough into its own startup to grow a mapping there:
+                // `internal error: entered unreachable code` at this line, with no other
+                // symptom to point at the real cause.
+                Err(AllocationError::BelowMinAddress | AllocationError::AboveMaxAddress) => {
+                    litebox_util_log::debug!(
+                        expand_start:% = range.start, expand_end:% = new_end,
+                        cur_range_start:% = diag_cur_start, cur_range_end:% = diag_cur_end;
+                        "resize_mapping: in-place expand fell outside the usable address space"
+                    );
+                    return Err(VmemResizeError::OutOfMemory);
+                }
+                // `range` is built from page-aligned bounds by construction, so a misalignment
+                // here really would be a bug in this function rather than a caller error.
+                Err(AllocationError::Unaligned) => {
+                    unreachable!("resize_mapping builds `range` from page-aligned bounds")
+                }
             }
             return Ok(());
         }
 
         // has to split the current range and move it to somewhere else
         Err(VmemResizeError::RangeOccupied(range.end..cur_range.end))
+    }
+
+    fn coalesce_private_span(&mut self, span: &PageRange<ALIGN>) {
+        let pieces: alloc::vec::Vec<(core::ops::Range<usize>, VmArea<Platform, ALIGN>)> = self
+            .vmas
+            .overlapping(span.start..span.end)
+            .map(|(range, vma)| (range.clone(), *vma))
+            .collect();
+        let Some((first_range, first_vma)) = pieces.first().cloned() else {
+            return;
+        };
+        let mergeable = pieces.len() > 1
+            && first_range.start <= span.start
+            && pieces.iter().all(|(_, vma)| {
+                vma.shared_handle.is_none()
+                    && !vma.is_file_backed()
+                    && vma.flags == first_vma.flags
+            })
+            && pieces.windows(2).all(|pair| pair[0].0.end == pair[1].0.start)
+            && pieces.last().is_some_and(|(range, _)| range.end >= span.end);
+        if mergeable {
+            self.vmas.insert(span.start..span.end, first_vma);
+        }
     }
 
     /// Move a range from `old_range` to `suggested_new_range`.
@@ -1565,36 +2521,235 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
         assert!(new_size.as_usize() >= old_range.len());
 
-        // Check if the given range is covered by exactly one mapping
-        let (cur_range, vma) = self
-            .vmas
-            .get_key_value(&old_range.start)
-            .expect("VMEM: range not found");
-        assert!(cur_range.contains(&(old_range.end - 1)));
+        self.coalesce_private_span(&old_range);
 
-        if vma.is_file_backed() {
-            unimplemented!("file-backed mapping move is not supported yet");
+        // Check if the given range is covered by exactly one mapping.
+        //
+        // Copied out of `self.vmas` rather than held as a borrow: the non-shared placement loop
+        // below now inserts and removes placeholder entries while searching (see its own comment),
+        // and a live immutable borrow of the map would forbid that. Both values are small and
+        // `Copy`.
+        let mut vma = {
+            let (cur_range, vma) = self
+                .vmas
+                .get_key_value(&old_range.start)
+                .expect("VMEM: range not found");
+            assert!(cur_range.contains(&(old_range.end - 1)));
+            *vma
+        };
+
+        // A file-backed mapping with a real shared-memory handle (a `wl_shm`/memfd `MAP_SHARED`
+        // pool, e.g. `libwayland-cursor`'s own pool-growth pattern) must fall through to the
+        // shared-handle branch just below, exactly like an anonymous `MAP_SHARED` mapping --
+        // `is_file_backed()` alone says nothing about whether there is a live handle to re-map,
+        // only `vma.shared_handle` does. Only a mapping with NO shared handle (private
+        // file-backed, or file-backed on a platform with no real shared-memory backend -- see
+        // `VmArea::shared_handle`'s doc comment) has no live object to re-map at the new address
+        // and so genuinely cannot be moved via this path.
+        if vma.is_file_backed() && vma.shared_handle.is_none() {
+            unimplemented!("private file-backed mapping move is not supported yet");
         }
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_new_address,
+
+        // A `shared_handle` mapping (anonymous `MAP_SHARED`, e.g. weston's pixman
+        // shadow-framebuffer growing via `mremap`) must NOT go through the generic path below:
+        // that path calls `self.platform.remap_pages`, whose default implementation
+        // `allocate_pages`s brand-new PRIVATE pages at the destination and byte-copies into
+        // them -- it never touches `vma.shared_handle` at all. For a shared mapping this is
+        // simply wrong (the moved mapping silently stops being shared -- other holders of the
+        // same `shared_handle`, e.g. across a `fork()`, would no longer see writes through it),
+        // and separately it was observed live to fail outright: repeated
+        // `AllocationError::AddressInUse`/`AddressInUseByPlatform` collisions (surfaced up as
+        // `RemapError::AlreadyAllocated` -> `Errno::EFAULT`) exhausting all
+        // `MAX_PLACEMENT_RETRIES` attempts below, immediately following an unrelated
+        // `ERROR_MAPPED_ALIGNMENT` fix to `map_shared_memory`'s in-place-expand path in
+        // `resize_mapping` -- confirmed via `sys_mremap: failed ... err=Errno(14 = EFAULT)`
+        // replacing the prior `ENOMEM` for weston's exact shared shadow-fb growth. Route shared
+        // moves through `insert_mapping` instead (the same `map_shared_memory`-backed path
+        // `resize_mapping`'s in-place expand already uses), which re-maps a fresh VIEW of the
+        // SAME underlying shared object at the new address rather than allocating unrelated
+        // private memory -- no byte-copy is needed since the content lives in the shared object,
+        // not in either view.
+        if let Some(shared_handle) = vma.shared_handle {
+            // A GROWN shared mapping needs a bigger object, not just a bigger view: the object
+            // was created at the OLD length (see `grow_shared_object`), and asking the platform
+            // for a longer view than the object holds is what produced the live
+            // `diag-shm: map_shared_memory FAILED ... win32_err=5` failures. Grow it first, and
+            // re-point this VMA at the new object; the old view is still mapped at `old_range`
+            // and is dropped by the `remove_mapping` at the end of this branch, once the new
+            // mapping is live.
+            if new_size.as_usize() > old_range.len() {
+                vma.shared_handle = Some(unsafe {
+                    self.grow_shared_object(shared_handle, old_range.into(), new_size.as_usize())?
+                });
+            }
+            // `insert_mapping` rejects `start < Platform::TASK_ADDR_MIN` unconditionally, even
+            // under `FixedAddressBehavior::Hint` -- unlike `allocate_pages`, it has no "0 means
+            // let the platform pick freely" convention of its own, so a literal 0 hint here
+            // would always bounce as `BelowMinAddress` (confirmed live: this previously
+            // surfaced as `sys_mremap: failed ... err=Errno(22 = EINVAL)` for every hint-less
+            // shared-mapping move). Get a real candidate address from the same free-gap search
+            // `get_unmmaped_area` for the non-shared path below, then retry with a fresh
+            // candidate (same bounded scheme as the non-shared path's own
+            // `MAX_PLACEMENT_RETRIES` loop) if the platform still rejects it as in-use --
+            // `map_shared_memory`'s own alignment/placement quirks (e.g. the
+            // `ERROR_MAPPED_ALIGNMENT` case fixed in `map_shared_memory` above) can still cause
+            // a first-pick collision.
+            const MAX_SHARED_MOVE_RETRIES: u32 = 8;
+            let mut next_hint = suggested_new_address;
+            let mut attempt = 0u32;
+            let new_ptr = loop {
+                let new_addr = self
+                    .shared_view_base(
+                        next_hint,
+                        new_size,
+                        vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    )
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize())
+                    .ok_or(VmemMoveError::UnAligned)?;
+                match unsafe {
+                    self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Hint)
+                } {
+                    Ok(ptr) => break ptr,
+                    Err(
+                        AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+                    ) if attempt < MAX_SHARED_MOVE_RETRIES => {
+                        attempt += 1;
+                        next_hint = None;
+                    }
+                    Err(
+                        AllocationError::OutOfMemory
+                        | AllocationError::AddressInUse
+                        | AllocationError::AddressInUseByPlatform
+                        | AllocationError::AddressPartiallyInUse,
+                    ) => {
+                        return Err(VmemMoveError::OutOfMemory);
+                    }
+                    Err(
+                        AllocationError::Unaligned
+                        | AllocationError::BelowMinAddress
+                        | AllocationError::AboveMaxAddress,
+                    ) => return Err(VmemMoveError::UnAligned),
+                }
+            };
+            // Drop the old view of the same shared object; this only unmaps the view (via
+            // `unmap_shared_memory`), it does not release the underlying shared-memory object,
+            // which the new mapping above still holds a live view of.
+            unsafe { self.remove_mapping(old_range) }.map_err(|_| VmemMoveError::OutOfMemory)?;
+            return Ok(new_ptr);
+        }
+
+        // `get_unmmaped_area` only consults litebox's own `self.vmas` tracker, which has no
+        // visibility into memory the underlying platform holds outside litebox's control (on
+        // Windows: the host process's own loaded modules, thread stacks, or later host-allocator
+        // growth that postdates the one-time startup snapshot -- see
+        // `litebox_platform_windows_userland::read_memory_maps`'s own doc comment). So a placement
+        // this loop believes is free can still collide with real platform-owned memory, and
+        // `remap_pages` reports that back as `RemapError::AlreadyAllocated` rather than a
+        // genuine capacity failure -- confirmed live via a real Weston `mremap()` (its pixman
+        // shadow-framebuffer growth) landing on such an untracked Windows region and getting
+        // rejected, which Weston then reported to its Wayland client as a fatal "failed mremap"
+        // protocol error and disconnected it, cascading into every XFCE client's "cannot open
+        // display" failure. `AlreadyAllocated` at an explicit caller-suggested address is exactly
+        // the case a real Linux kernel would also just place elsewhere for (unless the caller
+        // required `MREMAP_FIXED`, which this function's caller never sets -- see `sys_mremap`'s
+        // own `MREMAP_FIXED` handling), so retry with a fresh OS/tracker-picked address instead of
+        // surfacing a permanent failure for what is really just a resolvable placement collision.
+        // Bounded (not unbounded) so a genuine, persistent AlreadyAllocated (e.g. every retry
+        // landing in the same crowded region) still terminates instead of looping forever.
+        const MAX_PLACEMENT_RETRIES: u32 = 8;
+        let mut next_hint = suggested_new_address;
+        let mut attempt = 0u32;
+        // Candidates the platform has already rejected, parked in `self.vmas` as placeholder VMAs
+        // so the next `get_unmmaped_area` cannot hand back the same address again.
+        //
+        // Dropping the hint was NOT enough, and the retry loop did not work: `get_unmmaped_area`
+        // searches `self.vmas` top-down and is deterministic, so with `self.vmas` unchanged every
+        // one of the eight attempts computed the IDENTICAL address, asked the platform about it
+        // again, and was refused again. The loop was eight copies of one attempt. Its own comment
+        // describes the intended behaviour ("retry with a fresh OS/tracker-picked address", "a
+        // genuine, persistent AlreadyAllocated ... still terminates"), which is what this makes
+        // true.
+        //
+        // Reproduced deterministically: `litebox_shim_linux`'s `syscalls::mm::tests::test_mremap`
+        // failing with `EFAULT` in roughly one multi-threaded run in four, and never once in 12
+        // single-threaded runs -- a collision with a sibling test thread's genuinely live memory,
+        // which is exactly the case this loop exists to place around.
+        //
+        // `VmFlags::empty()` is the established placeholder shape in this module: `Vmem::new` uses
+        // it for the platform's own `reserved_pages`, and `insert_mapping` already distinguishes an
+        // empty-flags entry from a real guest mapping. Every one is removed again before this
+        // function returns, on every path, so nothing leaks into the caller's address space.
+        let mut rejected: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
+        let placeholder = VmArea::<Platform, ALIGN> {
+            flags: VmFlags::empty(),
+            is_file_backed: false,
+            shared_handle: None,
+            view_base: 0,
+            view_len: 0,
+            reserved_extra: 0,
+        };
+        let result = loop {
+            let Some(new_addr) = self.get_unmmaped_area(
+                next_hint,
                 new_size,
                 false,
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
-            )
-            .ok_or(VmemMoveError::OutOfMemory)?;
-        let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
-        let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            ) else {
+                break Err(VmemMoveError::OutOfMemory);
+            };
+            let new_range =
+                PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+            match unsafe {
+                self.platform
+                    .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            } {
+                Ok(new_addr) => {
+                    let new_start = new_addr.as_usize();
+                    let new_end = new_start + new_size.as_usize();
+                    // The placeholders must come out BEFORE the real mapping goes in: one of them
+                    // can be adjacent to (or, if the platform relocated the mapping itself,
+                    // overlapping) the range being inserted, and a `RangeMap` insert over a
+                    // placeholder would otherwise be resolved against an entry that is about to
+                    // stop existing.
+                    for range in &rejected {
+                        self.vmas.remove(range.clone());
+                    }
+                    rejected.clear();
+                    self.vmas.insert(new_start..new_end, vma);
+                    self.vmas.remove(old_range.into());
+                    return Ok(new_addr);
+                }
+                Err(RemapError::AlreadyAllocated) if attempt < MAX_PLACEMENT_RETRIES => {
+                    litebox_util_log::debug!(
+                        attempt:% = attempt, new_addr:% = new_addr, vmas_count:% = self.vmas.iter().count();
+                        "move_mappings: DIAG AlreadyAllocated, parking candidate and retrying"
+                    );
+                    attempt += 1;
+                    // Park the refused candidate so the next search has to look elsewhere, and
+                    // drop the hint so the search is free to.
+                    let parked = new_addr..(new_addr + new_size.as_usize());
+                    self.vmas.insert(parked.clone(), placeholder);
+                    rejected.push(parked);
+                    next_hint = None;
+                }
+                Err(e) => {
+                    litebox_util_log::debug!(
+                        attempt:% = attempt, new_addr:% = new_addr, vmas_count:% = self.vmas.iter().count(),
+                        err:? = &e;
+                        "move_mappings: DIAG non-retriable RemapError, giving up"
+                    );
+                    break Err(VmemMoveError::RemapError(e));
+                }
+            }
+        };
+        // Failure path: the placeholders are bookkeeping for this search only, and leaving them
+        // behind would permanently forbid those addresses to every later allocation in this
+        // address space.
+        for range in &rejected {
+            self.vmas.remove(range.clone());
         }
-        .map_err(VmemMoveError::RemapError)?;
-
-        let new_start = new_addr.as_usize();
-        let new_end = new_start + new_size.as_usize();
-        self.vmas.insert(new_start..new_end, *vma);
-        self.vmas.remove(old_range.into());
-        Ok(new_addr)
+        result
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
@@ -1609,6 +2764,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
+        caller: &'static str,
     ) -> Result<(), VmemProtectError> {
         // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
         let flags =
@@ -1616,6 +2772,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
+            // Debug, not error: this fires once per VMA that OVERLAPS the requested range, which
+            // is the normal, expected outcome of this loop -- not a fault. At error! it emitted
+            // 3,800 lines across 200 execs (19 per exec) in a clean successful run, which both
+            // buries real errors and made error-level output useless for triage.
+            litebox_util_log::debug!(
+                caller:% = caller,
+                requested_start:% = range.start,
+                requested_end:% = range.end,
+                vma_start:% = r.start,
+                vma_end:% = r.end,
+                vma_shared:% = vma.shared_handle.is_some();
+                "diag-protect-mapping: found overlapping tracked vma"
+            );
             mappings_to_change.push((r.start, r.end, *vma));
         }
         if mappings_to_change.is_empty() {
@@ -1628,7 +2797,27 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             // flags >> 4 shift VM_MAY% in place of VM_%
             // turning on VM_% requires VM_MAY%
-            if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
+            let missing_may =
+                (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits();
+            if missing_may != 0 {
+                // Warn, not debug: this is a real `mprotect()` refusal (EACCES to the guest) and
+                // it is per-call, not per-VMA-per-call the way the "found overlapping tracked
+                // vma" line above is. The raw `VmFlags` bits are printed because the whole
+                // question is which of `VM_MAY{READ,WRITE,EXEC}` this VMA was created without --
+                // a guest later makes writable (e.g. Chromium's PartitionAlloc recommit) must have been given `VM_MAYWRITE` at
+                // `mmap` time, since `mprotect` may only ever turn on what `VM_MAY*` allows.
+                litebox_util_log::warn!(
+                    caller:% = caller,
+                    requested_start:% = range.start,
+                    requested_end:% = range.end,
+                    vma_start:% = start,
+                    vma_end:% = end,
+                    vma_flags_bits:% = vma.flags.bits(),
+                    vma_file_backed:% = vma.is_file_backed,
+                    vma_shared:% = vma.shared_handle.is_some(),
+                    requested_flags_bits:% = flags.bits();
+                    "diag-protect-mapping: refusing mprotect, VMA lacks the matching VM_MAY* permission"
+                );
                 return Err(VmemProtectError::NoAccess {
                     old: vma.flags,
                     new: flags,
@@ -1645,7 +2834,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // `intersection` is page aligned.
             unsafe {
                 self.platform
-                    .update_permissions(intersection.clone(), permissions)
+                    .update_permissions(intersection.clone(), permissions | vma.flags.write_qualifier())
             }
             .map_err(|e| {
                 // restore the original mapping
@@ -1653,33 +2842,48 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmemProtectError::ProtectError(e)
             })?;
 
+            // `end` is the ORIGINAL (pre-split) mapping's end. Growth headroom sits immediately
+            // after it, so exactly one of the slices below -- whichever still ends at `end` --
+            // owns it; every other slice must get `0`. See `VmArea::reserved_extra`'s doc
+            // comment: this is deliberately the opposite of `view_base`/`view_len`'s
+            // propagate-unchanged rule, and getting it wrong would let a fork group extend past
+            // address space it does not own.
+            let with_headroom = |slice_end: usize, mut v: VmArea<Platform, ALIGN>| {
+                if slice_end != end {
+                    v.reserved_extra = 0;
+                }
+                v
+            };
+
+            let intersection_end = intersection.end;
             self.vmas.insert(
                 intersection,
-                VmArea {
-                    flags: new_flags,
-                    is_file_backed: vma.is_file_backed,
-                    shared_handle: vma.shared_handle,
-                },
+                with_headroom(
+                    intersection_end,
+                    VmArea {
+                        flags: new_flags,
+                        is_file_backed: vma.is_file_backed,
+                        shared_handle: vma.shared_handle,
+                        view_base: vma.view_base,
+                        view_len: vma.view_len,
+                        reserved_extra: vma.reserved_extra,
+                    },
+                ),
             );
             if !before.is_empty() {
-                self.vmas.insert(before, vma);
+                let before_end = before.end;
+                self.vmas.insert(before, with_headroom(before_end, vma));
             }
             if !after.is_empty() {
-                self.vmas.insert(after, vma);
+                let after_end = after.end;
+                self.vmas.insert(after, with_headroom(after_end, vma));
             }
         }
 
         Ok(())
     }
 
-    /// Create a mapping with the given flags.
-    ///
-    /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
-    /// Otherwise, let the kernel choose an available memory region.
-    ///
-    /// `length` is the size of the pages to be created.
-    ///
-    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    /// Create a mapping of `length` pages, either anonymous or file-backed, shared or private.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -1762,6 +2966,38 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map_err(MappingError::MapError)
     }
 
+    /// Map `shared_handle` as a guest `MAP_PRIVATE` file mapping: one object serves every process
+    /// that maps the same file, and the view of it is COPY-ON-WRITE, so a write is this process's
+    /// own -- the pages are still shared until something writes, which is exactly what Linux's
+    /// `MAP_PRIVATE` file mapping does.
+    ///
+    /// The VMA carries [`VmFlags::VM_PRIVATE_FILE_COW`], which is what makes the view
+    /// copy-on-write on every platform call (see [`VmFlags::write_qualifier`]) and what survives a
+    /// `fork()` so a child inherits the same arrangement. It starts read-only, and it is created
+    /// WITH `VM_MAYWRITE`, because real Linux lets `mprotect(PROT_READ|PROT_WRITE)` succeed on a
+    /// `MAP_PRIVATE` file mapping -- the copy-on-write view is what makes that grant honest.
+    ///
+    /// [`VmFlags::VM_SHARED`] stays set even though the guest asked for `MAP_PRIVATE`: it is what
+    /// makes `fork()` carry the region as a shared object instead of eagerly copying every byte of
+    /// it into the child ([`Vmem::duplicate`], [`Self::new_adopting_existing_memory`]). That is
+    /// the whole point of the optimization -- a 324 MB binary mapped in ten processes stays one
+    /// copy -- and it costs nothing in correctness now that writes are copy-on-write.
+    pub(super) unsafe fn map_existing_shared_pages_file_private_cow(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let vm_flags = VmFlags::from(MemoryRegionPermissions::READ)
+            | VmFlags::may_flags_for_mapping(false, true)
+            | VmFlags::VM_SHARED
+            | VmFlags::VM_PRIVATE_FILE_COW;
+        let vma = VmArea::new_shared(vm_flags, true, shared_handle);
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `page_range` specifies the range of pages to check the memory permissions.
@@ -1786,6 +3022,164 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     }
 
     /*================================Internal Functions================================ */
+
+    /// Get an unmapped area in the virtual address space, aligned so the platform can actually
+    /// honour it as a shared-memory view base.
+    ///
+    /// [`PageManagementProvider::map_shared_memory`] is `MapViewOfFile3` on Windows, which accepts
+    /// an explicitly requested base ONLY at the host's allocation-granularity alignment (64 KiB):
+    /// a merely page-aligned base is refused with `ERROR_MAPPED_ALIGNMENT` (1132). That is the
+    /// first half of every live `diag-shm: map_shared_memory FAILED ... win32_err=1132` pair (10
+    /// of them in one desktop run), and it existed because [`Self::get_unmmaped_area`] computes
+    /// its candidates in PAGE units -- its fast path is literally `TASK_ADDR_MAX - length`, whose
+    /// alignment is whatever the requested length leaves behind, i.e. page alignment at best.
+    ///
+    /// So ask for one extra granule of address space and round the answer UP to a granule
+    /// boundary: the round-up shifts the start by less than one granule and the extra granule
+    /// absorbs that shift, so `length` bytes still fit inside the window `get_unmmaped_area`
+    /// proved free. This is the fix at the source -- the hint itself is now always a base the
+    /// platform can honour -- rather than letting every shared placement depend on
+    /// `map_shared_memory`'s blind retry with a null base (which the `NoReplace` in-place expand
+    /// path in `resize_mapping` never had, making it fail 100% of the time).
+    ///
+    /// Only for a NON-fixed placement: a `MAP_FIXED` request must land on the exact address the
+    /// guest named, so those keep `get_unmmaped_area`'s unrounded answer.
+    fn shared_view_base(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        is_growsdown: bool,
+    ) -> Option<usize> {
+        const GRANULE: usize = WINDOWS_ALLOCATION_GRANULARITY;
+        debug_assert!(GRANULE.is_multiple_of(ALIGN));
+        // An extra granule of search window, so rounding the start UP cannot push `length` bytes
+        // past the end of what was proven free. Fall back to the exact length if that addition
+        // cannot be represented (or is not a page multiple), rather than failing a mapping that
+        // would otherwise have fit.
+        let search_len = length
+            .as_usize()
+            .checked_add(GRANULE)
+            .and_then(NonZeroPageSize::new)
+            .unwrap_or(length);
+        let addr = self.get_unmmaped_area(suggested_address, search_len, false, is_growsdown)?;
+        let aligned = addr.next_multiple_of(GRANULE);
+        // Ordinary capacity answers, never panics: an out-of-range base must not reach the
+        // platform, and a guest that has genuinely run out of address space gets its `ENOMEM`.
+        let end = aligned.checked_add(length.as_usize())?;
+        (aligned >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX).then_some(aligned)
+    }
+
+    /// Grow a shared-memory object so a mapping of `new_len` bytes can be mapped from it.
+    ///
+    /// A platform shared-memory object is created with a FIXED size (Windows:
+    /// `CreateFileMappingW`), and no platform here can resize one in place, so a shared mapping
+    /// that GREW (`mremap` on a `MAP_SHARED` pool, e.g. weston's pixman shadow framebuffer or a
+    /// `wl_shm` pool) cannot simply be re-mapped at its new length: `map_shared_memory` would ask
+    /// for a view larger than the object, which Windows refuses with `ERROR_ACCESS_DENIED` (5) --
+    /// the second half of every live `diag-shm: map_shared_memory FAILED ... win32_err=5`, and the
+    /// reason those pairs always came in twos (first the misaligned base, then the too-long view).
+    ///
+    /// So build a fresh object of `new_len` bytes and copy the old object's contents into it,
+    /// preserving the bytes the guest could already see. Known deviation, inherent to a
+    /// fixed-size-object platform: the result is a NEW object, so a holder of `handle` that is
+    /// NOT this mapping (another `shmat` of the same SysV segment, or a `fork()`ed sibling that
+    /// mapped the old handle) keeps seeing the old, smaller one. That is strictly better than the
+    /// alternative this replaces, which was failing the growth outright with `ENOMEM`; real
+    /// `mremap` on a SysV attachment is not a pattern any observed guest relies on.
+    ///
+    /// # Safety
+    ///
+    /// `current_range` must be a live, readable-in-principle mapping of `handle` (its contents
+    /// are read through a fresh temporary view of the same object, so the guest's own permissions
+    /// on `current_range` do not matter).
+    unsafe fn grow_shared_object(
+        &mut self,
+        handle: Platform::SharedMemoryHandle,
+        current_range: core::ops::Range<usize>,
+        new_len: usize,
+    ) -> Result<Platform::SharedMemoryHandle, VmemMoveError> {
+        let copy_len = current_range.len().min(new_len);
+        let temp_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let new_handle = self
+            .platform
+            .create_shared_memory(new_len)
+            .map_err(|_| VmemMoveError::OutOfMemory)?;
+        // Map both objects temporarily, outside `self.vmas` (these are not guest mappings, they
+        // are the copy's own source and destination), at whatever address the platform chooses.
+        let (old_view, new_view) = {
+            let old_view = self.platform.map_shared_memory(
+                handle,
+                0..copy_len,
+                temp_permissions,
+                FixedAddressBehavior::Hint,
+            );
+            let new_view = self.platform.map_shared_memory(
+                new_handle,
+                0..new_len,
+                temp_permissions,
+                FixedAddressBehavior::Hint,
+            );
+            match (old_view, new_view) {
+                (Ok(old_view), Ok(new_view)) => (old_view, new_view),
+                (old_view, new_view) => {
+                    // Release whichever of the two views did get created, at its OWN length (an
+                    // unmap length that overruns a view is rejected outright by the platform).
+                    if let Ok(view) = &old_view {
+                        let start = view.as_usize();
+                        let _ =
+                            unsafe { self.platform.unmap_shared_memory(start..start + copy_len) };
+                    }
+                    if let Ok(view) = &new_view {
+                        let start = view.as_usize();
+                        let _ =
+                            unsafe { self.platform.unmap_shared_memory(start..start + new_len) };
+                    }
+                    let _ = self.platform.close_shared_memory(new_handle);
+                    return Err(VmemMoveError::OutOfMemory);
+                }
+            }
+        };
+        let copy_result: Result<(), VmemMoveError> = (|| {
+            // Chunked so a large pool does not need one allocation the size of the whole region.
+            const CHUNK: usize = 1024 * 1024;
+            let mut offset = 0usize;
+            while offset < copy_len {
+                let chunk_len = (copy_len - offset).min(CHUNK);
+                let source =
+                    Platform::RawConstPointer::<u8>::from_usize(old_view.as_usize() + offset);
+                let bytes = source
+                    .to_owned_slice(chunk_len)
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                new_view
+                    .write_slice_at_offset(isize::try_from(offset).unwrap(), &bytes)
+                    .ok_or(VmemMoveError::OutOfMemory)?;
+                offset += chunk_len;
+            }
+            Ok(())
+        })();
+        let _ = unsafe {
+            self.platform
+                .unmap_shared_memory(new_view.as_usize()..new_view.as_usize() + new_len)
+        };
+        let _ = unsafe {
+            self.platform
+                .unmap_shared_memory(old_view.as_usize()..old_view.as_usize() + copy_len)
+        };
+        copy_result?;
+        // Release the old object only once this mapping was its last holder here: other tracked
+        // mappings (e.g. a second `shmat` of the same segment) may still be using this handle
+        // value, and closing it under them would leave them unable to re-map.
+        let sole_holder = self
+            .vmas
+            .iter()
+            .filter(|(_, vma)| vma.shared_handle == Some(handle))
+            .count()
+            <= 1;
+        if sole_holder {
+            let _ = self.platform.close_shared_memory(handle);
+        }
+        Ok(new_handle)
+    }
 
     /// Get an unmapped area in the virtual address space.
     /// `suggested_range` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,
@@ -1843,7 +3237,90 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     return Some(gapped_high_limit);
                 }
             } else {
+                // The fast path places at `high_limit`, i.e. flush against the top of the usable
+                // range. Keep the same non-touching guarantee step 2 applies below, so a mapping
+                // placed here cannot abut whatever sits above it either. See `MAPPING_GUARD_GAP`.
+                let gap = Self::mapping_guard_gap();
+                let gapped = high_limit.saturating_sub(gap);
+                if gap == 0 || gapped >= last_end {
+                    return Some(gapped);
+                }
                 return Some(high_limit);
+            }
+        }
+
+        // 1.5. HELD BACK, NOT YET ENABLED -- see the `if false` guard below. This addresses a
+        // REAL, separately-measured defect, but not the one that causes the forked-Xorg crash, and
+        // it is kept dark so the primary fix (the Hint-mode foreign-claim fallback in the Windows
+        // platform's `allocate_pages`) can be measured in isolation rather than two changes being
+        // confounded in one boot. Enable and verify on its own merits afterwards.
+        //
+        // The population this governs, established by measurement: the 36 `DIAG_UNMAPPED` events
+        // in a failing run all carry sizes between ~16.79MB and ~18.83MB, which resolve exactly to
+        // a real ELF segment length plus `DEFAULT_RESERVED_SPACE_SIZE` (e.g. 18825216 - 16MiB =
+        // 2048000, glibc's own span). That is `create_mapping` passing
+        // `total_length = length + reserved_extra` for `ENSURE_SPACE_AFTER` reservations, i.e. the
+        // ELF loader's path only. The ordinary guest `mmap` sizes in the same run (233472, 40960,
+        // 8192, 2048000, 12288) appear nowhere in that set -- the two populations are disjoint, so
+        // this branch is not what places ordinary anonymous/private mappings low.
+        //
+        // The defect it fixes is nonetheless genuine: the fast path above is all-or-nothing
+        // (`high_limit`), and if the single topmost VMA reaches past that point it declines the
+        // upper region ENTIRELY. Step 2 below cannot recover it, because every candidate it
+        // considers is derived as `r.start - size` -- strictly BELOW some existing mapping -- so
+        // no code path ever examines the space between the topmost mapping's neighbours near the
+        // top of the address space. One mapping ending above `high_limit` therefore condemns the
+        // whole process, for its entire lifetime, to whatever gaps exist further down.
+        //
+        // Measured live on a forked-then-`execve`'d Xorg: 36 foreclosures in one run, with
+        // `last_end` landing on `TASK_ADDR_MAX` to the byte. The consequence is not merely
+        // untidy placement -- the process's mappings get packed into a ~120MB low window with
+        // inter-library gaps as small as a single page (against the same libraries sitting
+        // megabytes apart when the same binary runs as pid 1 and never trips this). glibc's
+        // `sysmalloc` then extended its top chunk straight across into an adjacent library's R+X
+        // text segment and faulted writing the chunk header (`mov %r9,0x8(%rcx)`), surfacing as a
+        // user-mode WRITE to a PRESENT, non-writable page (`error_code=0x7`) inside a
+        // `VM_READ | VM_EXEC` mapping -- deterministic to the byte across runs, since the packing
+        // is deterministic.
+        //
+        // So rather than give up on the upper region, walk DOWN from `high_limit` past the
+        // mappings that occupy it, taking the first gap that fits. This is the same top-down
+        // intent the fast path already has, just no longer restricted to a single candidate. The
+        // guard-gap rules are the same ones steps 1 and 2 apply: a growsdown (stack) region keeps
+        // `STACK_GUARD_GAP` below whatever sits above it, and needs a doubled gap when the region
+        // it is being placed under is itself a stack growing down into the same space.
+        // Enabled 43rd pass (2026-09-22): live-tested (isolated, same-session A/B, `.wfgy/
+        // xvfb_pass43_*`) against the Xvfb wild-pointer SIGSEGV at `0x7feffecdd400`, root cause of
+        // `DE_FAILED` since the 38th pass. Control build (this branch `if false`d) crashed at the
+        // bit-identical address within one WM_POLL cycle, as in every prior pass; the SAME session,
+        // SAME seed tar, ONLY this branch enabled, survived two independent runs through the full
+        // crash window (one all the way to `DE_FAILED after 60s`, zero crashes) -- see AGENTS.md.
+        if last_end > high_limit {
+            let mut probe = high_limit;
+            for (r, flags) in self.vmas.iter().rev() {
+                if r.start >= probe.saturating_add(size) {
+                    // Entirely above the window under consideration -- cannot constrain it.
+                    continue;
+                }
+                if probe >= low_limit && !self.vmas.overlaps(&(probe..probe + size)) {
+                    return Some(probe);
+                }
+                // `r` blocks this candidate: drop the window to sit fully below `r`, plus
+                // whichever guard gap the pair of regions requires.
+                let gap = if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
+                    Self::STACK_GUARD_GAP << 1
+                } else if is_growsdown {
+                    Self::STACK_GUARD_GAP
+                } else {
+                    0
+                };
+                let Some(next) = r.start.checked_sub(size + gap) else {
+                    break;
+                };
+                probe = next;
+                if probe < low_limit {
+                    break;
+                }
             }
         }
 
@@ -1861,13 +3338,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let gap_above_new = if is_growsdown {
                 Self::STACK_GUARD_GAP
             } else {
-                0
+                // Never zero: two ordinary mappings must not touch, or a guest that grows one of
+                // them (glibc's `sysmalloc` extending the heap) writes straight into the other.
+                // See `MAPPING_GUARD_GAP`.
+                Self::mapping_guard_gap()
             };
             // `checked_sub` underflowing here means `r` sits too close to address 0 for a
             // region of this `size` to fit BELOW it -- not that no region anywhere can fit.
             // `self.vmas.iter().rev()` walks from the highest mapped range down to the lowest,
             // so a later (lower-address) `r` is exactly where this underflow becomes likely
-            // (e.g. one of `new_excluding`'s own low, small reserved-placeholder pieces) while
+            // (e.g. one of `Vmem::new`'s own low, small reserved-placeholder pieces) while
             // an earlier, higher-address `r` may already have offered a perfectly good gap this
             // early-return would otherwise discard, or a still-lower `r` might. Skip this one
             // candidate and keep searching rather than aborting the whole scan -- mirroring the

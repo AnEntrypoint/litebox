@@ -1,3 +1,12 @@
 # Shell scripts must always check out with LF line endings -- a CRLF shebang
 # (#!/bin/sh\r) fails to exec on real Linux/macOS hosts and CI runners.
 *.sh text eol=lf
+
+# Pin sources to LF for the same reason a shebang cares, plus a costlier one: a
+# wholesale CRLF flip (an editor, or a stray core.autocrlf) turns a 100-line
+# change into a ~27k-line diff and makes every cherry-pick across it conflict
+# wholesale. `0cfe406` exists because platform/lib.rs was normalised by hand.
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.lock text eol=lf

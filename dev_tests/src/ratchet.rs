@@ -85,7 +85,14 @@ fn ratchet_globals() -> Result<()> {
             // this repo's own copy of dev_tests never actually ran against a real CI pipeline
             // until this session's first push, so this drift went undetected for a while.
             // Re-verified by direct line-count against the exact heuristic below.
-            ("litebox_platform_windows_userland/", 18),
+            // 19 rather than 18 for THREAD_WAITER_EVENT, the one new `thread_local!` the
+            // cross-process-capable `RawMutex` rewrite needed (`ADVISORY-002` §3.2): each thread's
+            // own auto-reset wait event, replacing `WaitOnAddress`/`WakeByAddressSingle` (which
+            // cannot cross a process boundary) with a kernel object a waker can eventually
+            // `DuplicateHandle` in from another process. A thread-local rather than a `TlsState`
+            // field (unlike `codewatch`/`ctxwatch`, which deliberately avoided this ratchet)
+            // because `RawMutex` is reachable from host-only threads that never install `TlsState`.
+            ("litebox_platform_windows_userland/", 19),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),

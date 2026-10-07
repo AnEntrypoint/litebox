@@ -1,0 +1,193 @@
+#!/bin/sh
+# run_xfce_xwm.sh + THREE FIXES: gsettings schema compile, gdk-pixbuf cache, and xfwm4 --replace.
+#
+# Evidence for each, from a full headless boot of the pixbuf-only variant (all stages reached,
+# TEST_DONE, 20 frames captured):
+#   xfwm4:       "Another Window Manager (Weston WM) is already running on screen :0.0" then
+#                "Could not find a screen to manage, exiting" -- XFCE ran with NO window manager.
+#   xfsettingsd: "Cannot get the default GSettingsSchemaSource" -- died at startup.
+#   xfdesktop:   survived, but "Failed to get _NET_WORKAREA" / "_NET_NUMBER_OF_DESKTOPS"
+#                (properties a WM sets) and painted ~94%% black.
+# So the black desktop is a missing WM plus missing compiled schemas, NOT image decoding: the
+# pixbuf fix verifiably worked in that same run (PIXBUF_PNG_DECODE_RC=0) and changed nothing.
+#
+# Identical to run_xfce_xwm.sh except for the block marked PIXBUF FIX below. Kept as a separate
+# script so the difference is a one-block diff rather than an edit to the known-good launcher.
+#
+# Why: the layer ships NO /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache, and gdk-pixbuf therefore
+# registers zero loaders and reports "Couldn't recognize the image file format" for EVERY format.
+# Generating the cache and pointing GDK_PIXBUF_MODULE_FILE at it makes loaders actually run --
+# verified standalone: PNG then decodes (cursor.png -> rc=0, 39361 bytes).
+#
+# Writing the cache into the loaders DIRECTORY is not enough (that was tested and reported as
+# "the cache doesn't help"); the env var is what gets it consulted. Export it BEFORE any GUI
+# component starts so xfdesktop/xfce4-panel inherit it.
+#
+# Known remaining defect this does NOT fix: files read from the read-only tar layer diverge from
+# the same bytes copied into the writable layer (every /usr/share/themes/*.xpm still fails with
+# "No XPM header found" while a /tmp copy decodes). PNG is unaffected, so wallpaper/icons should
+# work; xfwm4's XPM theme frames may not.
+# XFCE on weston, written to AVOID the concurrent-fork_verify crash:
+# every service is started ALONE and given time to settle before the next,
+# so at most one fork_verify healing pass is live at a time (the condition
+# measured clean in 8/8 runs).
+# NO 'set -x': shell tracing deterministically kills the first backgrounded
+# child via a #UD in a syscall trampoline stub (bisected 2/2 fail vs 2/2 pass).
+# It is what has been taking out dbus-daemon in every full-stack run.
+export HOME=/root
+export LD_LIBRARY_PATH=/usr/lib/weston:/usr/lib:/lib
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p /root /run/user/0 /tmp/.X11-unix /var/lib/dbus
+chmod 700 /run/user/0
+chmod 1777 /tmp/.X11-unix
+rm -f /run/seatd.sock
+
+echo STAGE_DBUS
+dbus-uuidgen --ensure=/var/lib/dbus/machine-id 2>/dev/null || true
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/xfce-bus
+# The backgrounded child can be killed between fork and execve by the
+# concurrent-fork bug (measured: SIGILL at t=0.42, dbus-daemon never execs, and
+# then EVERY component fails with "Connection refused"). The failure is
+# probabilistic, so RETRY the spawn until the socket actually appears rather
+# than accepting one silent loss and continuing into a doomed run.
+# Spawn dbus ONCE, not in a retry loop. A retry loop backgrounds the spawn from
+# inside a while loop, and that turned a probabilistic CHILD death into a
+# DETERMINISTIC death of the LAUNCHER SHELL ITSELF (two runs, bit-identical
+# rip=0x7feffff6fb11 rsp=0x7fefffeec280). Fork from the simplest possible
+# context until the underlying fork bug is fixed.
+# SINGLE spawn only. Retrying a backgrounded spawn after a child has been lost
+# to the trampoline #UD kills the LAUNCHER SHELL ITSELF (measured twice, at
+# rip=0x7feffff6fb11, with both a while-loop and a shell function). So there is
+# no scripting workaround: if dbus is lost, rerun rather than retry.
+dbus-daemon --nofork --nopidfile --nosyslog --config-file=/usr/share/dbus-1/session.conf --address="$DBUS_SESSION_BUS_ADDRESS" &
+i=0; while [ ! -e /tmp/xfce-bus ] && [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
+i=0; while [ ! -e /tmp/xfce-bus ] && [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
+if [ -e /tmp/xfce-bus ]; then echo "DBUS_UP=yes"; else echo "DBUS_UP=no"; fi
+echo DBUS_READY=$i
+sleep 2
+
+echo STAGE_SEATD
+seatd -l error &
+i=0; while [ ! -e /run/seatd.sock ] && [ "$i" -lt 40 ]; do i=$((i+1)); sleep 0.5; done
+echo SEATD_READY=$i
+sleep 2
+
+echo STAGE_WESTON
+weston --backend=drm-backend.so --socket=wayland-0 --use-pixman --shell=desktop-shell.so --logger-scopes=log > /tmp/weston.out 2>&1 &
+i=0; while [ ! -e "$XDG_RUNTIME_DIR/wayland-0" ] && [ "$i" -lt 80 ]; do i=$((i+1)); sleep 0.5; done
+echo WESTON_READY=$i
+sleep 3
+
+echo STAGE_XWAYLAND
+export WAYLAND_DISPLAY=wayland-0
+DISP=""
+i=0
+while [ "$i" -lt 200 ]; do
+  for n in 0 1 2; do [ -e "/tmp/.X11-unix/X$n" ] && DISP=":$n" && break; done
+  [ -n "$DISP" ] && break
+  i=$((i+1)); sleep 0.5
+done
+echo XFCE_DISPLAY=$DISP
+echo XWAYLAND_READY=$i
+sleep 5
+
+unset WAYLAND_DISPLAY
+export DISPLAY=$DISP
+export GDK_BACKEND=x11
+export XDG_SESSION_TYPE=x11
+export GDK_GL=disable
+export XLIB_SKIP_ARGB_VISUALS=1
+
+# Prove the X display actually ACCEPTS connections before starting anything on
+# it. Socket existence is not enough -- that was this project's original
+# launch-ordering bug.
+# xfconfd holds the session configuration. Without it xfce4-session comes up
+# with an EMPTY session and launches nothing, silently, which is exactly what
+# the previous run showed (876 X messages, then idle, zero children spawned).
+# It lives at /usr/lib/xfce4/xfconf/xfconfd, NOT on PATH, so start it by path.
+echo STAGE_XFCONFD
+# Retry xfconfd too: it is the single point every XFCE component depends on
+# (xfsettingsd/xfdesktop/xfce4-panel all die with "Connection refused" when it
+# is absent), and its own spawn can be lost the same way dbus's was.
+# Single spawn, same reason as dbus above: no backgrounding from inside a loop.
+/usr/lib/xfce4/xfconf/xfconfd > /tmp/xfconfd.out 2>&1 &
+sleep 4
+# xfconf-query returns non-zero if it cannot reach the daemon: a real liveness
+# probe, not a guess. Its output tells us WHY every component fails or works.
+xfconf-query -c xfce4-session -l > /tmp/xfconfq.out 2>&1
+echo XFCONF_PROBE_RC=$?
+head -5 /tmp/xfconfq.out 2>/dev/null
+echo XFCONFD_STARTED
+
+echo STAGE_XCHECK
+# No xdpyinfo/xrandr in this layer, so use an XFCE client that connects to X and
+# exits: --version still opens no display, but a bad DISPLAY makes GTK clients
+# fail loudly, so this distinguishes "X refuses connections" from "X is fine".
+xfce4-about --version > /tmp/xcheck.out 2>&1
+echo XCHECK_RC=$?
+head -4 /tmp/xcheck.out 2>/dev/null
+
+# xfce4-session connects to X and then launches NOTHING, silently (verified with
+# xfconfd running: zero children, empty stdout, no verbose log). So bypass it and
+# start the components the Failsafe session would have started, one at a time
+# with settle delays, keeping at most one fork_verify pass live.
+# Both environment fixes run BEFORE any GUI component starts. Ordering matters: xfsettingsd
+# is launched only a few lines below and needs the compiled schemas at ITS startup, and every
+# component needs GDK_PIXBUF_MODULE_FILE exported into its environment.
+# --- GSETTINGS SCHEMA FIX ------------------------------------------------------------------
+# The layer ships the schema XML under /usr/share/glib-2.0/schemas but NO compiled
+# gschemas.compiled, so xfsettingsd dies at startup with "Cannot get the default
+# GSettingsSchemaSource - is the gsettings-desktop-schemas package installed?". The XML and
+# glib-compile-schemas are both present, so compile them in place rather than adding a package.
+glib-compile-schemas /usr/share/glib-2.0/schemas 2>/tmp/schemas.err
+echo "GSCHEMA_COMPILE_RC=$? bytes=$(wc -c < /usr/share/glib-2.0/schemas/gschemas.compiled 2>/dev/null)"
+head -2 /tmp/schemas.err 2>/dev/null
+# --- END GSETTINGS SCHEMA FIX --------------------------------------------------------------
+
+# --- PIXBUF FIX ---------------------------------------------------------------------------
+# Generate the loaders cache and make gdk-pixbuf actually consult it. Must happen before any
+# GUI component starts so they all inherit the variable.
+export GDK_PIXBUF_MODULE_FILE=/tmp/gdk-pixbuf-loaders.cache
+gdk-pixbuf-query-loaders > "$GDK_PIXBUF_MODULE_FILE" 2>/tmp/pixbuf-query.err
+echo "PIXBUF_CACHE_RC=$? bytes=$(wc -c < "$GDK_PIXBUF_MODULE_FILE" 2>/dev/null)"
+# Prove decoding works in THIS run rather than assuming it: a PNG that fails here means the fix
+# did not take and every later "blank desktop" reading would be misattributed.
+gdk-pixbuf-csource --raw /usr/share/directfb-1.7.7/cursor.png >/tmp/png.c 2>/tmp/png.err
+echo "PIXBUF_PNG_DECODE_RC=$? bytes=$(wc -c < /tmp/png.c 2>/dev/null)"
+head -1 /tmp/png.err 2>/dev/null
+# --- END PIXBUF FIX -----------------------------------------------------------------------
+
+echo STAGE_XFWM4
+# --replace is REQUIRED: weston's own desktop-shell registers as a window manager on :0.0, so
+# xfwm4 exits immediately with "Another Window Manager (Weston WM) is already running on screen
+# :0.0 ... Could not find a screen to manage, exiting". With no WM, nothing sets _NET_WORKAREA /
+# _NET_NUMBER_OF_DESKTOPS, and xfdesktop then logs exactly those fetch failures and paints
+# nothing -- which is the black desktop.
+xfwm4 --display=$DISP --replace --compositor=off > /tmp/xfwm4.out 2>&1 &
+i=0; while [ "$i" -lt 16 ]; do i=$((i+1)); sleep 0.5; done
+echo XFWM4_WAITED
+
+echo STAGE_XFSETTINGSD
+xfsettingsd --display=$DISP > /tmp/xfsettingsd.out 2>&1 &
+i=0; while [ "$i" -lt 10 ]; do i=$((i+1)); sleep 0.5; done
+echo XFSETTINGSD_WAITED
+
+
+
+echo STAGE_XFDESKTOP
+xfdesktop --display=$DISP > /tmp/xfdesktop.out 2>&1 &
+i=0; while [ "$i" -lt 20 ]; do i=$((i+1)); sleep 0.5; done
+echo XFDESKTOP_WAITED
+
+echo STAGE_PANEL
+xfce4-panel --display=$DISP > /tmp/panel.out 2>&1 &
+i=0; while [ "$i" -lt 24 ]; do i=$((i+1)); sleep 0.5; done
+echo PANEL_WAITED
+
+for f in xfwm4 xfsettingsd xfdesktop panel; do
+  echo "=== BEGIN $f.out ==="
+  cat /tmp/$f.out 2>/dev/null || echo "(none)"
+  echo "=== END $f.out ==="
+done
+
+echo TEST_DONE

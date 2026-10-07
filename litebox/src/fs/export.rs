@@ -19,6 +19,7 @@ pub struct ExportedEntry {
     pub path: String,
     pub file_type: FileType,
     pub mode: Mode,
+    pub owner: super::UserInfo,
     /// File contents (regular files only; empty for directories/symlinks/devices).
     pub contents: Vec<u8>,
     /// Symlink target (symlinks only).
@@ -76,10 +77,27 @@ fn walk<FS: FileSystem>(
                     path: child_path.clone(),
                     file_type: FileType::Directory,
                     mode: status.mode,
+                    owner: status.owner,
                     contents: Vec::new(),
                     symlink_target: None,
                 });
                 walk(fs, &child_path, out)?;
+            }
+            // A FIFO carries no data but must still travel: arriving as a plain empty file in a
+            // cross-process `fork()` child, it would be opened as one -- reads returning instant
+            // EOF instead of blocking for a writer. See gm mutable fs-export-fifo-roundtrip.
+            FileType::Fifo => {
+                let status = fs
+                    .file_status(&*child_path)
+                    .map_err(|_| ExportError::FileStatus)?;
+                out.push(ExportedEntry {
+                    path: child_path.clone(),
+                    file_type: FileType::Fifo,
+                    mode: status.mode,
+                    owner: status.owner,
+                    contents: Vec::new(),
+                    symlink_target: None,
+                });
             }
             FileType::RegularFile => {
                 let status = fs
@@ -105,6 +123,7 @@ fn walk<FS: FileSystem>(
                     path: child_path,
                     file_type: FileType::RegularFile,
                     mode: status.mode,
+                    owner: status.owner,
                     contents,
                     symlink_target: None,
                 });
@@ -120,6 +139,7 @@ fn walk<FS: FileSystem>(
                     path: child_path,
                     file_type: FileType::Symlink,
                     mode: status.mode,
+                    owner: status.owner,
                     contents: Vec::new(),
                     symlink_target: Some(target),
                 });

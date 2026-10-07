@@ -35,10 +35,15 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     #[inline]
     #[must_use]
     fn try_lock(&self) -> bool {
-        self.raw
+        let acquired = self
+            .raw
             .underlying_atomic()
             .compare_exchange(0, 1, Acquire, Relaxed)
-            .is_ok()
+            .is_ok();
+        if acquired {
+            self.raw.note_locked();
+        }
+        acquired
     }
 
     /// Acquires this mutex, blocking the current thread until it is able to do so.
@@ -64,7 +69,10 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
                 .underlying_atomic()
                 .compare_exchange(0, 1, Acquire, Relaxed)
             {
-                Ok(_) => return, // Locked!
+                Ok(_) => {
+                    self.raw.note_locked();
+                    return; // Locked!
+                }
                 Err(s) => state = s,
             }
         }
@@ -75,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
             // to be friendlier for the caches.
             if state != 2 && self.raw.underlying_atomic().swap(2, Acquire) == 0 {
                 // We changed it from 0 to 2, so we just successfully locked it.
+                self.raw.note_locked();
                 return;
             }
 
@@ -119,6 +128,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     /// paired with a successful call to `lock`, `try_lock`, ...
     #[inline]
     unsafe fn unlock(&self) {
+        self.raw.note_unlocked();
         if self.raw.underlying_atomic().swap(0, Release) == 2 {
             // We only wake up one thread. When that thread locks the mutex, it
             // will mark the mutex as contended (2) (see lock_contended above),
@@ -234,6 +244,25 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }
+    }
+
+    /// Same as [`Self::lock`], but additionally reports whether the underlying raw mutex was just
+    /// forced open by dead-holder recovery (see [`crate::platform::RawMutex::take_poison`]) --
+    /// i.e. whether the data this guard protects may have been left mid-mutation by a holder that
+    /// died without releasing normally.
+    ///
+    /// Deliberately a SEPARATE method from [`Self::lock`], never changing that method's own return
+    /// type or behavior: most `Mutex<Platform, T>` call sites in this codebase have no sensible
+    /// "reset to a safe default" for their particular `T`, and this codebase's `Mutex` explicitly
+    /// carries no general poisoning concept (see this struct's own doc comment) -- only a caller
+    /// that DOES have such a reset (`litebox::net::Network`'s `GlobalStateHandle::net_lock`, see
+    /// its own doc comment) opts in by calling this instead of `lock`.
+    #[inline]
+    #[track_caller]
+    pub fn lock_recovering_poison(&self) -> (MutexGuard<'_, Platform, T>, bool) {
+        let guard = self.lock();
+        let recovered = self.raw.raw.take_poison();
+        (guard, recovered)
     }
 
     /// Returns a mutable reference to the underlying data.

@@ -6,6 +6,15 @@
 /// A non-cryptographically-secure random number generator.
 ///
 /// Designed to be deterministic and fast.
+///
+/// This intentionally stays a small hand-rolled xorshift* rather than `rand_core`/`rand_chacha`/
+/// `oorandom`: every call site (`net/local_ports.rs`, `platform/mock.rs`,
+/// `litebox_platform_linux_kernel`'s `snp_impl.rs`) relies on [`FastRng::new_from_seed`] being a
+/// `const fn` so a hard-coded seed can be evaluated at compile time -- including inside a `static`
+/// initializer (`static RANDOM: SpinMutex<FastRng> = SpinMutex::new(FastRng::new_from_seed(...))`
+/// in `snp_impl.rs`). None of those crates' seeding APIs are `const fn` (they perform real
+/// algorithmic/cryptographic mixing at construction), so adopting one would force restructuring
+/// every call site to lazy-init (e.g. `spin::Once`) for no behavioral benefit.
 pub struct FastRng {
     state: u64,
 }

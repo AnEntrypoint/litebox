@@ -1,0 +1,20 @@
+    168 feature=setitimer: nonzero it_interval not supported
+     30 feature=unsupported syscall fstatfs
+      8 feature=unsupported syscall membarrier
+      6 feature=fcntl(cmd = 1033, arg = 2)
+      4 feature=unsupported syscall fadvise64
+      4 feature=fcntl(cmd = 1034, arg = 48)
+      4 feature=fcntl(cmd = 1034, arg = 0)
+      3 feature=ioctl with arg Raw { cmd: 3222823994, arg: UserPtrMut(455733888) }
+      2 feature=unsupported syscall inotify_init1
+      2 feature=unsupported syscall getresuid
+      2 feature=setsockopt(level = 1, optname = 59)
+      2 feature=setsockopt(level = 1, optname = 31)
+      2 feature=setsockopt(level = 1, optname = 26)
+      2 feature=setsockopt(level = 1, optname = 16)
+      1 feature=unsupported syscall pidfd_open
+      1 feature=unsupported syscall inotify_init
+      1 feature=unsupported syscall close_range
+      1 feature=ioctl with arg Raw { cmd: 1074021792, arg: UserPtrMut(455733372) }
+      1 feature=fcntl(cmd = 1033, arg = 3)
+      1 feature=fcntl(cmd = 1033, arg = 14)

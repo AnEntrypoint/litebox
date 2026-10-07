@@ -1,0 +1,43 @@
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_0.bmp (8294454 bytes, frame 0)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_1.bmp (8294454 bytes, frame 1)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_2.bmp (8294454 bytes, frame 2)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_3.bmp (8294454 bytes, frame 3)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_4.bmp (8294454 bytes, frame 4)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_5.bmp (8294454 bytes, frame 5)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_6.bmp (8294454 bytes, frame 6)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_7.bmp (8294454 bytes, frame 7)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_8.bmp (8294454 bytes, frame 8)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_9.bmp (8294454 bytes, frame 9)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_10.bmp (8294454 bytes, frame 10)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_11.bmp (8294454 bytes, frame 11)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_12.bmp (8294454 bytes, frame 12)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_13.bmp (8294454 bytes, frame 13)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_14.bmp (8294454 bytes, frame 14)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_15.bmp (8294454 bytes, frame 15)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_16.bmp (8294454 bytes, frame 16)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_17.bmp (8294454 bytes, frame 17)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_18.bmp (8294454 bytes, frame 18)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_19.bmp (8294454 bytes, frame 19)
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073600 distinct_colors_capped64=1
+[LITEBOX_DUMP_FRAMES] wrote litebox_frame_dump_20.bmp (8294454 bytes, frame 20)
+[LITEBOX_DUMP_FRAMES] end of run: 21 frames enqueued for writing, 0 dropped due to writer backpressure

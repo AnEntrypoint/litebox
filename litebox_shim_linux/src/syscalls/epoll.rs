@@ -21,7 +21,7 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 
 use super::file::FilesState;
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
 
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform, FS: ShimFS>(
     core::marker::PhantomData<(Platform, FS)>,
@@ -42,6 +42,19 @@ bitflags::bitflags! {
     }
 }
 
+/// Whether a pty fd uses the shared transport, whose peer may be in another process and so can
+/// never notify an observer here: pollers must re-check it on a bounded interval.
+fn pty_needs_repoll<Platform: ShimPlatform, FS: ShimFS>(
+    global: &GlobalStateHandle<Platform, FS>,
+    pty: &TypedFd<super::pty::PtySubsystem<Platform>>,
+) -> bool {
+    global
+        .litebox
+        .descriptor_table()
+        .entry_handle(pty)
+        .is_some_and(|h| h.with_entry(|end: &super::pty::PtyEnd<Platform>| end.needs_repoll()))
+}
+
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
@@ -56,6 +69,22 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
+    /// The variant's name, for diagnostics.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Eventfd(_) => "eventfd",
+            Self::Epoll(_) => "epoll",
+            Self::File(_) => "file",
+            Self::Socket(_) => "socket",
+            Self::Pipe(_) => "pipe",
+            Self::Unix(_) => "unix",
+            Self::Pty(_) => "pty",
+            Self::Signalfd(_) => "signalfd",
+            Self::Timerfd(_) => "timerfd",
+            Self::Netlink(_) => "netlink",
+        }
+    }
+
     pub fn try_from(files: &FilesState<Platform, FS>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
@@ -150,11 +179,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
     /// observer is provided.
     fn poll(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
-        let poll = |iop: &dyn IOPollable| {
+        let poll = |iop: &dyn IOPollable, observer: Option<Weak<dyn Observer<Events>>>| {
             if let Some(observer) = observer {
                 iop.register_observer(observer, mask);
             }
@@ -163,7 +192,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         match self {
             EpollDescriptor::Eventfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             // Nested epoll: real Linux lets one epoll fd be added as a member of another epoll
             // set (`epoll_ctl(outer, EPOLL_CTL_ADD, inner, ...)`), reporting the inner set
@@ -175,7 +204,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             // delegates to).
             EpollDescriptor::Epoll(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::File(file) => {
                 // An evdev fd (tagged at `open()` time, see `syscalls::file::EvdevFd`'s doc
@@ -191,7 +220,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                     .with_metadata(file, |_: &crate::syscalls::file::EvdevFd| ())
                     .is_ok()
                 {
+                    if let Some(observer) = observer {
+                        global.evdev.register_observer(observer);
+                    }
                     let events = if global.evdev.has_pending() {
+                        Events::IN
+                    } else {
+                        Events::empty()
+                    };
+                    return Some(events & mask);
+                }
+                // See `DriFd`'s own doc comment for why this check exists -- identical structural
+                // shape to the `EvdevFd` check just above, for `DrmSubsystem::pending_flip_events`
+                // instead of `EvdevSubsystem`'s own queue.
+                if global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(file, |_: &crate::syscalls::file::DriFd| ())
+                    .is_ok()
+                {
+                    if let Some(observer) = observer {
+                        global.drm.register_flip_observer(observer);
+                    }
+                    let events = if global.drm.has_pending_flip_events() {
                         Events::IN
                     } else {
                         Events::empty()
@@ -234,28 +285,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                         return None;
                     }
                 };
-                Some(poll(&proxy))
+                Some(poll(&proxy, observer))
             }
-            EpollDescriptor::Pipe(fd) => global.with_linux_pipe_iopollable(fd, poll).ok(),
+            EpollDescriptor::Pipe(fd) => global
+                .with_linux_pipe_iopollable(fd, |iop| poll(iop, observer))
+                .ok(),
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Pty(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| entry.with_iopollable(poll)))
+                Some(handle.with_entry(|entry: &super::pty::PtyEnd<Platform>| {
+                    entry.poll_events(&global.pty_io(), observer, mask)
+                        & (mask | Events::ALWAYS_POLLED)
+                }))
             }
             EpollDescriptor::Signalfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Timerfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
             EpollDescriptor::Netlink(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
+                Some(handle.with_entry(|entry| poll(entry, observer)))
             }
         }
     }
@@ -281,12 +337,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     pub(crate) fn wait(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
+        diag_tid: i32,
+        diag_epfd: u32,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
+        let mut diag_iteration: u64 = 0;
         loop {
+            diag_iteration += 1;
             // A stdin interest's initial `add_interest` registration (see its doc comment on the
             // `EpollDescriptor::File` arm of `EpollDescriptor::poll`) never gets a real wakeup
             // observer -- there is no OS-level async notification for "new console input arrived"
@@ -297,8 +357,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // fix also addresses (see `PollSet::wait`'s matching doc comment for the confirmed
             // live repro). Manually re-poll stdin on a short cadence and push it into the ready
             // set if it became readable, so `pop_multiple` picks it up on the next iteration.
-            let has_stdin_interest = self.has_unready_stdin_interest(global);
-            let iteration_cx = if has_stdin_interest {
+            //
+            // `TimerfdFile` (see its own module doc comment) is readiness-only in exactly the same
+            // way -- no push wakeup, `check_io_events` only compares now-vs-deadline when actually
+            // polled -- on the documented assumption that a real timerfd consumer always calls
+            // `epoll_wait` with a bounded timeout computed from its own earliest pending deadline.
+            // Confirmed live NOT to hold for weston's own repaint-timer usage: it calls
+            // `epoll_pwait` with `timeout=None` (unbounded) even with an armed repaint timerfd in
+            // its interest set, so a deadline that elapses with no OTHER fd's traffic to
+            // incidentally wake the same `epoll_wait` first is never re-observed -- confirmed as
+            // the root cause of a real reproducible freeze (weston repaints exactly once, then
+            // never again, leaving the guest's on-screen framebuffer permanently stuck). Folding
+            // armed timerfd interests into this same bounded-repoll mechanism fixes every timerfd
+            // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
+            let has_bounded_repoll_interest =
+                self.has_unready_stdin_or_armed_timerfd_interest(global);
+            // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
+            // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
+            // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
+            // pass), unusable for a real boot. The per-Unix-entry `debug!` sites in
+            // `repoll_stdin_and_timerfd_interests` below are the throttled replacement: bounded by
+            // the (small) number of live Unix-socket epoll interests, not by iteration count.
+            litebox_util_log::trace!(
+                tid:% = diag_tid,
+                epfd:% = diag_epfd,
+                iteration:% = diag_iteration,
+                has_bounded_repoll_interest:% = has_bounded_repoll_interest;
+                "DIAG EpollFile::wait: loop iteration"
+            );
+            let iteration_cx = if has_bounded_repoll_interest {
                 cx.with_timeout(STDIN_REPOLL_INTERVAL)
             } else {
                 cx.with_timeout(None)
@@ -316,66 +403,192 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 Ok(()) => return Ok(events),
                 Err(TryOpError::TryAgain) => unreachable!(),
                 Err(TryOpError::WaitError(WaitError::TimedOut)) => {
-                    if !has_stdin_interest
+                    if !has_bounded_repoll_interest
                         || (cx.deadline().is_some() && cx.remaining_timeout().is_none())
                     {
                         return Err(WaitError::TimedOut);
                     }
-                    // Only the bounded stdin-repoll interval elapsed, not the caller's own
-                    // deadline (if any): re-poll and loop back around.
-                    self.repoll_stdin_interests(global);
+                    // Only the bounded repoll interval elapsed, not the caller's own deadline (if
+                    // any): re-poll and loop back around.
+                    self.repoll_stdin_and_timerfd_interests(global, diag_tid, diag_epfd);
                 }
                 Err(TryOpError::WaitError(e)) => return Err(e),
             }
         }
     }
 
-    /// Returns `true` if any current interest is a stdin fd that is not currently ready -- see
-    /// [`Self::wait`]'s doc comment for why this fd kind needs bounded periodic re-polling instead
-    /// of relying solely on the observer-notification wakeup every other fd kind gets.
-    fn has_unready_stdin_interest(&self, global: &GlobalState<Platform, FS>) -> bool {
+    /// Returns `true` if any current interest is a stdin fd, an armed timerfd, or an AF_UNIX
+    /// socket fd, not currently ready -- see [`Self::wait`]'s doc comment for why the first two
+    /// kinds need bounded periodic re-polling instead of relying solely on the observer-
+    /// notification wakeup every other fd kind gets. AF_UNIX joins them as of 2026-09-18, for the
+    /// same fundamental reason, live-caught on the cross-process AF_UNIX rendezvous
+    /// (`syscalls::unix`'s "Shared cross-process AF_UNIX connection data plane"): a listening
+    /// socket's `Backlog::check_io_events` can now correctly SEE a cross-process client's pending
+    /// `SharedUnixConnectQueue` request (and a `Shared`-transport connected socket can correctly
+    /// see new bytes in its peer-written ring), but nothing calls `notify_observers` on this
+    /// process's OWN `Pollee` when that happens in a DIFFERENT process -- there is no real
+    /// cross-process wake in this codebase at all (`litebox_platform_windows_userland::
+    /// xproc_sync`'s named-event primitive exists but is still unwired). Without this, a real
+    /// event-driven listener (Xvfb, dbus-daemon: both call `epoll_wait` before ever calling
+    /// `accept()`) blocks forever even once a cross-process client is genuinely waiting --
+    /// live-confirmed: owner processes sat blocked past two separate clients' full connect
+    /// attempts with zero `accept()` ever observed. Scoped to EVERY Unix socket interest, not just
+    /// listening ones (mirrors "any armed timerfd" above, not narrowed to "a timerfd that's about
+    /// to fire") -- a `Shared`-transport connected socket has exactly the same missing-wake gap on
+    /// its read side, and the cost of an unnecessary 15ms-interval re-check for an ordinary
+    /// same-process Unix socket (which still gets its real wake immediately; this only adds an
+    /// upper bound) is the same accepted tradeoff already established for timerfd/stdin.
+    fn has_unready_stdin_or_armed_timerfd_interest(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> bool {
         self.interests.lock().values().any(|entry| {
-            !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
-                && matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(file))
-                if matches!(
+            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            match entry.desc.upgrade() {
+                Some(EpollDescriptor::File(file)) => matches!(
                     global
                         .litebox
                         .descriptor_table()
                         .with_metadata(&file, |stream: &litebox::platform::StdioStream| *stream),
                     Ok(litebox::platform::StdioStream::Stdin)
-                ))
+                ),
+                Some(EpollDescriptor::Timerfd(_)) => true,
+                Some(EpollDescriptor::Unix(_)) => true,
+                // TCP readiness changes made by another process's network poll (the host publish
+                // proxy runs in the root process) notify only observers local to that process, so
+                // a listener or connection owned by a fork child needs the bounded re-check too.
+                Some(EpollDescriptor::Socket(_)) => true,
+                Some(EpollDescriptor::Pty(pty)) => pty_needs_repoll(global, &pty),
+                _ => false,
+            }
         })
     }
 
-    /// Re-polls every stdin interest and pushes it into the ready set if it has become readable.
-    /// Called after each bounded stdin-repoll interval elapses in [`Self::wait`].
-    fn repoll_stdin_interests(&self, global: &GlobalState<Platform, FS>) {
+    /// Re-polls every stdin, timerfd and Unix-socket interest and pushes it into the ready set if
+    /// it has become readable. Called after each bounded repoll interval elapses in [`Self::wait`]
+    /// -- see [`Self::has_unready_stdin_or_armed_timerfd_interest`]'s doc comment for why Unix
+    /// sockets joined this list.
+    fn repoll_stdin_and_timerfd_interests(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        diag_tid: i32,
+        diag_epfd: u32,
+    ) {
+        // Keep the fd alongside each entry (lost by a plain `.values()` iteration) so the
+        // targeted per-Unix-entry trace below can name which fd it's reporting on -- see that
+        // trace's own comment for why this is the throttled replacement for the old unthrottled
+        // per-iteration `debug!` (now `trace!` above).
+        // Entries already sitting in the ready queue (`entry.is_ready`, maintained by
+        // `ReadySet::push`/`pop_multiple`) don't need re-polling here -- skipping them keeps this
+        // throttled to genuinely-still-pending interests, mirroring `has_unready_stdin_or_armed_
+        // timerfd_interest`'s own "already ready" exclusion just above.
         let entries: alloc::vec::Vec<_> = self
             .interests
             .lock()
-            .values()
-            .filter(|entry| matches!(entry.desc.upgrade(), Some(EpollDescriptor::File(_))))
-            .cloned()
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
+                    && matches!(
+                        entry.desc.upgrade(),
+                        Some(EpollDescriptor::File(_))
+                            | Some(EpollDescriptor::Timerfd(_))
+                            | Some(EpollDescriptor::Unix(_))
+                            | Some(EpollDescriptor::Socket(_))
+                            | Some(EpollDescriptor::Pty(_))
+                    )
+            })
+            .map(|(key, entry)| (key.0, key.1, entry.clone()))
             .collect();
-        for entry in entries {
-            if let Some((_, is_ready)) = entry.poll(global)
-                && is_ready
-            {
+        // An interest whose target this process can no longer poll at all -- its fd was closed, or
+        // the number now names something else -- is dropped here rather than re-polled forever:
+        // `close(2)` takes an fd out of every epoll set that holds it, so a `None` from
+        // `EpollEntry::poll` (as opposed to `Some((None, _))`, "open but not ready") is terminal.
+        // Left in place, such an entry is re-polled on every 15ms repoll tick for the rest of the
+        // session and each poll re-reports the failure: 12,696 `epoll poll with socket fd: EBADF`
+        // warnings in one 900s chromium run (chrF4), 38% of that run's whole log.
+        let mut unpolllable: alloc::vec::Vec<EpollEntryKey> = alloc::vec::Vec::new();
+        litebox_util_log::trace!(
+            tid:% = diag_tid,
+            epfd:% = diag_epfd,
+            n_entries:% = entries.len();
+            "DIAG repoll_stdin_and_timerfd_interests: entries to check"
+        );
+        // 1-in-400 gate on the routine "still not ready" case (mirrors `SharedUnixConnectQueue::
+        // has_pending`'s own throttle, ~6s of wall time at the 15ms repoll cadence) -- an
+        // unthrottled per-entry-per-cycle `debug!` here hit unusable log volume across a full
+        // boot's many concurrently-idle Unix epoll interests (dbus-daemon, Xvfb, ...). The moment
+        // an entry actually becomes ready is logged unconditionally: that transition is the exact,
+        // rare, high-value evidence AGENTS.md's twenty-fifth-pass pickup list asked for next --
+        // whether Xvfb's real accepted-client fd is ever seen ready by this repoll at all, and with
+        // what mask.
+        static REPOLL_UNIX_DIAG_COUNTER: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let call_idx = REPOLL_UNIX_DIAG_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        for (fd, entry_ptr, entry) in entries {
+            let is_unix = matches!(entry.desc.upgrade(), Some(EpollDescriptor::Unix(_)));
+            let result = entry.poll(global);
+            if result.is_none() {
+                unpolllable.push(EpollEntryKey(fd, entry_ptr));
+                continue;
+            }
+            // ROOT CAUSE (2026-09-20, live-confirmed via cursor/mask tracing): `EpollEntry::poll`
+            // returns `(event: Option<EpollEvent>, is_still_ready: bool)`. `is_still_ready` means
+            // "keep auto-requeuing this entry for CONTINUOUS reporting" and is unconditionally
+            // `false` whenever the entry's own registration is `EDGE_TRIGGER`/`ONE_SHOT` -- BY
+            // DESIGN, matching real epoll: an edge-triggered fd is reported once per edge, not
+            // continuously. `event.is_some()` is the actual "is there a real event to report right
+            // now" signal, true regardless of edge/level. This function was pushing to the ready
+            // set on `is_still_ready` instead of `event.is_some()` -- harmless for the level-
+            // triggered stdin/timerfd cases this repoll originally covered (the two fields
+            // coincide there), but for any `EPOLLET`-registered Unix socket (exactly how Xvfb
+            // registers its accepted X11 client fd) this meant the bounded repoll could NEVER
+            // push it ready, even with real unread data sitting in its `SharedByteRing`: live
+            // trace showed `event_mask=Some(1)` (real `EPOLLIN`) paired with the old `is_ready`
+            // (i.e. `is_still_ready`) reading `false` on every single cycle. This is the actual
+            // mechanism behind the "Xvfb never reads `xset q`'s bytes" gap this whole investigation
+            // has been chasing since the twenty-fifth pass.
+            let has_event = result.as_ref().is_some_and(|(ev, _)| ev.is_some());
+            if is_unix && (has_event || call_idx % 400 == 0) {
+                litebox_util_log::debug!(
+                    tid:% = diag_tid,
+                    epfd:% = diag_epfd,
+                    fd:% = fd,
+                    has_event:% = has_event,
+                    event_mask:? = result.as_ref().and_then(|(ev, _)| ev.as_ref()).map(|ev| ev.events);
+                    "DIAG repoll: Unix epoll interest checked"
+                );
+            }
+            if has_event {
                 self.ready.push(&entry);
             }
+        }
+        if !unpolllable.is_empty() {
+            let mut interests = self.interests.lock();
+            for key in unpolllable.iter() {
+                interests.remove(key);
+            }
+            litebox_util_log::debug!(
+                tid:% = diag_tid,
+                epfd:% = diag_epfd,
+                dropped:% = unpolllable.len();
+                "DIAG repoll: dropped epoll interest(s) whose fd can no longer be polled"
+            );
         }
     }
 
     pub(crate) fn epoll_ctl(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: Option<EpollEvent>,
+        pid: i32,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap(), pid),
             EpollOp::EpollCtlMod => self.mod_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
@@ -387,12 +600,99 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
     }
 
-    fn add_interest(
+    /// Re-targets interests that another process registered (this epoll set was inherited across
+    /// `fork()`) at this process's own descriptor for the same fd number, once the registering
+    /// process's descriptor is gone. Real epoll ties an interest to the open file description,
+    /// which the inheriting process still holds; here it is tied to a descriptor handle, so the
+    /// handle has to be looked up again.
+    pub(crate) fn rebind_inherited(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
+        files: &FilesState<Platform, FS>,
+        pid: i32,
+    ) {
+        let stale: alloc::vec::Vec<(u32, usize)> = {
+            let interests = self.interests.lock();
+            interests
+                .iter()
+                .filter(|(_, entry)| entry.owner_pid != pid && entry.desc.upgrade().is_none())
+                .map(|(key, _)| (key.0, key.1))
+                .collect()
+        };
+        for (fd, ptr) in stale {
+            let Ok(file) = EpollDescriptor::try_from(files, fd as usize) else {
+                continue;
+            };
+            let mut interests = self.interests.lock();
+            let Some(old) = interests.remove(&EpollEntryKey(fd, ptr)) else {
+                continue;
+            };
+            let (mask, flags, data) = {
+                let inner = old.inner.lock();
+                (
+                    inner.mask,
+                    EpollFlags::from_bits_truncate(inner.flags.bits()),
+                    inner.data,
+                )
+            };
+            let entry = EpollEntry::new(
+                DescriptorRef::from(&file),
+                mask,
+                flags,
+                data,
+                self.ready.clone(),
+                pid,
+            );
+            if let Some(events) = file.poll(global, mask, Some(entry.weak_self.clone() as _)) {
+                if !events.is_empty() {
+                    self.ready.push(&entry);
+                }
+                interests.insert(EpollEntryKey::new(fd, &file), entry);
+            }
+        }
+    }
+
+    /// Parent side of carrying this epoll set into a cross-process `fork()` child: the interest
+    /// list, as `<target fd>:<events>:<data>` triples joined by `,`.
+    ///
+    /// An epoll instance has no shared object to hand over -- every interest holds an `Arc` into
+    /// THIS process's descriptor table -- but it is also not something a forking child may lose:
+    /// Linux `fork()` shares the instance, so each interest stays registered and keeps naming the
+    /// same open file descriptions. A daemon that builds its event loop and then forks therefore
+    /// keeps a working loop in the child, and a child handed `EBADF` on its own `epoll_wait` dies
+    /// instead. The child recreates the instance and re-registers each interest against its own
+    /// rebuilt descriptor for the same fd number (`Task::install_epoll_at_fd`) -- what
+    /// `rebind_inherited` above already does for the in-process case. An interest whose target fd
+    /// did not itself survive the fork cannot be restored, the same degradation any uncarriable
+    /// fd already has.
+    pub(crate) fn fork_carry_spec(&self) -> alloc::string::String {
+        let interests = self.interests.lock();
+        let mut spec = alloc::string::String::new();
+        for (key, entry) in interests.iter() {
+            // A stale entry (its descriptor is gone) would only be refused by the child's
+            // re-registration; naming it here would count it as a lost interest.
+            if entry.desc.upgrade().is_none() {
+                continue;
+            }
+            let (events, data) = {
+                let inner = entry.inner.lock();
+                (inner.mask.bits() | inner.flags.bits(), inner.data)
+            };
+            if !spec.is_empty() {
+                spec.push(',');
+            }
+            spec.push_str(alloc::format!("{}:{}:{}", key.0, events, data).as_str());
+        }
+        spec
+    }
+
+    pub(crate) fn add_interest(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
+        pid: i32,
     ) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
@@ -405,16 +705,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         // `insert` below will replace it with a new entry.
 
         let mask = Events::from_bits_truncate(event.events);
+        let flags = EpollFlags::from_bits_truncate(event.events);
+        let event_data = event.data;
+        let is_unix = matches!(file, EpollDescriptor::Unix(_));
+        litebox_util_log::debug!(
+            fd:% = fd,
+            mask:? = mask,
+            flags:? = flags,
+            data:% = event_data,
+            is_unix:% = is_unix;
+            "EpollFile::add_interest"
+        );
         let entry = EpollEntry::new(
             DescriptorRef::from(file),
             mask,
-            EpollFlags::from_bits_truncate(event.events),
+            flags,
             event.data,
             self.ready.clone(),
+            pid,
         );
         let events = file
             .poll(global, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
+        if is_unix {
+            // Definitive live answer to "does the very first poll at ADD time already see the
+            // ring's real data" -- every earlier check (mod_interest's own immediate re-poll,
+            // the bounded repoll) has read as structurally correct by source inspection alone;
+            // this is the one remaining unverified link (2026-09-20).
+            litebox_util_log::debug!(
+                fd:% = fd, raw_events:? = events;
+                "DIAG add_interest: initial poll result (Unix)"
+            );
+        }
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
             self.ready.push(&entry);
@@ -425,7 +747,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
     fn mod_interest(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
@@ -453,18 +775,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
 
         let mask = Events::from_bits_truncate(event.events);
+        let event_data = event.data; // copy out of the packed struct -- see `add_interest`'s
+        // identical local-variable copy just above; a direct `event.data` reference in the
+        // debug! macro below is an unaligned-field-of-packed-struct compile error.
+        // Mirrors `add_interest`'s own log -- some event loops (live-observed on this exact
+        // Xvfb/dbus boot path, 2026-09-20: `add_interest` registers with an EMPTY mask,
+        // `Events(0x0)`/only `EDGE_TRIGGER`, no real `IN` bit) register the fd once with a
+        // placeholder empty mask, then immediately `EPOLL_CTL_MOD` the real interest in --
+        // `add_interest`'s own log alone can never see that second call, so it looked
+        // indistinguishable from "the real interest is never registered at all" until this site
+        // existed too. Logged BEFORE `flags`/`mask` are moved into `inner` below (`EpollFlags`
+        // isn't `Clone`).
+        litebox_util_log::debug!(
+            fd:% = fd,
+            mask:? = mask,
+            flags:? = flags,
+            data:% = event_data,
+            is_unix:% = matches!(file, EpollDescriptor::Unix(_));
+            "EpollFile::mod_interest"
+        );
         inner.mask = mask;
         inner.flags = flags;
-        inner.data = event.data;
+        inner.data = event_data;
+        drop(inner);
 
         entry
             .is_enabled
             .store(true, core::sync::atomic::Ordering::Relaxed);
         let observer = entry.weak_self.clone();
-        drop(inner);
 
         // re-register the observer with the new mask
         if let Some(events) = file.poll(global, mask, Some(observer as _)) {
+            if matches!(file, EpollDescriptor::Unix(_)) {
+                litebox_util_log::debug!(
+                    fd:% = fd, raw_events:? = events;
+                    "DIAG mod_interest: initial poll result (Unix)"
+                );
+            }
             if !events.is_empty() {
                 // Add the updated entry to the ready list if the file is ready
                 self.ready.push(entry);
@@ -531,6 +878,10 @@ struct EpollEntry<Platform: ShimPlatform, FS: ShimFS> {
     is_ready: AtomicBool,
     is_enabled: AtomicBool,
     weak_self: Weak<Self>,
+    /// The guest pid that registered this interest. An interest registered by another process
+    /// (the epoll set was inherited across `fork()`) names that process's descriptor, which dies
+    /// when it exits even though the open file description lives on in this process.
+    owner_pid: i32,
 }
 
 struct EpollEntryInner {
@@ -546,8 +897,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         flags: EpollFlags,
         data: u64,
         ready: Arc<ReadySet<Platform, FS>>,
+        owner_pid: i32,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
+            owner_pid,
             desc,
             inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
             ready,
@@ -557,7 +910,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         })
     }
 
-    fn poll(&self, global: &GlobalState<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
+    fn data(&self) -> u64 {
+        self.inner.lock().data
+    }
+
+    fn poll(&self, global: &GlobalStateHandle<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -630,7 +987,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
 
     fn pop_multiple(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
@@ -661,6 +1018,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
+
+            litebox_util_log::debug!(
+                entry_id:% = alloc::sync::Arc::as_ptr(&entry) as usize,
+                data:% = entry.data(),
+                events_bits:% = event.as_ref().map(|e| e.events).unwrap_or(0),
+                is_still_ready:% = is_still_ready;
+                "diag-epoll-pop: entry polled"
+            );
 
             if let Some(event) = event {
                 events.push(event);
@@ -728,7 +1093,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
 
     fn scan_once<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         files: &FilesState<Platform, FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
@@ -764,9 +1129,17 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 // above. `Self::wait` detects a stdin fd up front (via `has_stdin_fd`) and falls
                 // back to bounded periodic re-polling for the whole set whenever one is present,
                 // rather than relying on an observer this arm can never actually register.
-                poll_descriptor
+                let polled = poll_descriptor
                     .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    .unwrap_or(Events::NVAL);
+                litebox_util_log::trace!(
+                    fd:% = entry.fd,
+                    kind:% = poll_descriptor.kind(),
+                    mask:? = entry.mask.bits(),
+                    revents:? = polled.bits();
+                    "poll scan"
+                );
+                polled
             } else {
                 Events::NVAL
             };
@@ -780,7 +1153,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     /// Scans the poll set for ready fds once.
     pub fn scan<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         files: &FilesState<Platform, FS>,
     ) {
         self.scan_once(global, files, None);
@@ -815,7 +1188,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     /// exchange for closing the missed-wakeup window entirely.
     pub fn wait<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {
@@ -839,22 +1212,29 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         // evdev can never signal, and misses every event pushed during that sleep, confirmed live:
         // real `CursorMoved`-driven `push_input_rel` calls landing mid-wait with a guest `select()`
         // loop that never woke for them despite retrying every 0.5s.
+        // AF_UNIX joins stdin/evdev here too, same reasoning and same 2026-09-18 fix as
+        // `EpollFile::has_unready_stdin_or_armed_timerfd_interest`'s doc comment covers in full --
+        // a `select`/`poll`-based listener (not just an `epoll_wait`-based one) has exactly the
+        // same missing-cross-process-wake gap.
         let has_unwakeable_fd = self.entries.iter().any(|entry| {
             entry.fd >= 0
                 && EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
                     .is_ok_and(|desc| {
-                        matches!(&desc, EpollDescriptor::File(file)
-                        if global.litebox.descriptor_table().with_metadata(
-                            file,
-                            |_: &crate::syscalls::file::EvdevFd| (),
-                        ).is_ok()
-                        || matches!(
-                            global.litebox.descriptor_table().with_metadata(
+                        matches!(&desc, EpollDescriptor::Unix(_))
+                            || matches!(&desc, EpollDescriptor::Socket(_))
+                            || matches!(&desc, EpollDescriptor::Pty(pty) if pty_needs_repoll(global, pty))
+                            || matches!(&desc, EpollDescriptor::File(file)
+                            if global.litebox.descriptor_table().with_metadata(
                                 file,
-                                |stream: &litebox::platform::StdioStream| *stream,
-                            ),
-                            Ok(litebox::platform::StdioStream::Stdin)
-                        ))
+                                |_: &crate::syscalls::file::EvdevFd| (),
+                            ).is_ok()
+                            || matches!(
+                                global.litebox.descriptor_table().with_metadata(
+                                    file,
+                                    |stream: &litebox::platform::StdioStream| *stream,
+                                ),
+                                Ok(litebox::platform::StdioStream::Stdin)
+                            ))
                     })
         });
         let mut register = true;
@@ -965,6 +1345,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -987,7 +1368,13 @@ mod test {
             });
         }
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid.get(),
+                0,
+            )
             .unwrap();
     }
 
@@ -1045,6 +1432,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1062,6 +1450,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1090,7 +1479,13 @@ mod test {
         // fires -- this much already worked before this test (matches phase-3's own commit).
         write_eventfd();
         let events = outer
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid.get(),
+                0,
+            )
             .unwrap();
         assert_eq!(
             events.len(),
@@ -1133,6 +1528,8 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
+                task.tid.get(),
+                0,
             )
             .unwrap();
         assert_eq!(
@@ -1218,6 +1615,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1235,6 +1633,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1263,7 +1662,13 @@ mod test {
         // First wait: matches the eventfd variant, already known to work.
         send_from_writer();
         let events = outer
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid.get(),
+                0,
+            )
             .unwrap();
         assert_eq!(
             events.len(),
@@ -1290,6 +1695,7 @@ mod test {
                 .descriptor_table()
                 .with_entry(&receiver_typed, |entry| {
                     entry.recvfrom(
+                        &task.global,
                         &task.wait_cx(),
                         &mut buf,
                         litebox_common_linux::ReceiveFlags::empty(),
@@ -1308,6 +1714,8 @@ mod test {
                     .context()
                     .with_timeout(core::time::Duration::from_secs(2)),
                 1024,
+                task.tid.get(),
+                0,
             )
             .unwrap();
         assert_eq!(
@@ -1396,6 +1804,7 @@ mod test {
                                 events: Events::IN.bits(),
                                 data: 0,
                             },
+                            1,
                         )
                         .unwrap();
                 });
@@ -1411,6 +1820,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1437,6 +1847,8 @@ mod test {
                             .context()
                             .with_timeout(core::time::Duration::from_millis(20)),
                         1024,
+                        0,
+                        0,
                     ) else {
                         continue;
                     };
@@ -1459,6 +1871,7 @@ mod test {
                             &receiver_typed,
                             |entry| {
                                 entry.recvfrom(
+                                    &global,
                                     &WaitState::new(platform())
                                         .context()
                                         .with_timeout(core::time::Duration::from_millis(0)),
@@ -1503,7 +1916,12 @@ mod test {
                         .litebox
                         .descriptor_table()
                         .with_entry(&writer_typed, |entry| {
-                            entry.sendto(&task, b"x", litebox_common_linux::SendFlags::empty(), None)
+                            entry.sendto(
+                                &task,
+                                b"x",
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                            )
                         })
                         .unwrap();
                 }
@@ -1526,7 +1944,7 @@ mod test {
         let (task, epoll) = setup_epoll();
         let (producer, consumer) =
             task.global
-                .pipes
+                .pipes()
                 .create_pipe(2, litebox::pipes::Flags::empty(), None);
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
@@ -1539,6 +1957,7 @@ mod test {
                     events: Events::IN.bits(),
                     data: 0,
                 },
+                1,
             )
             .unwrap();
 
@@ -1548,18 +1967,24 @@ mod test {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 global
-                    .pipes
+                    .pipes()
                     .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
                     .unwrap(),
                 2
             );
         });
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(
+                &task.global,
+                &WaitState::new(platform()).context(),
+                1024,
+                task.tid.get(),
+                0,
+            )
             .unwrap();
         let mut buf = [0; 2];
         task.global
-            .pipes
+            .pipes()
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);

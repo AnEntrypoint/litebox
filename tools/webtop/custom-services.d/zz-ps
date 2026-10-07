@@ -1,0 +1,6 @@
+#!/usr/bin/with-contenv bash
+export DISPLAY=:1
+mkdir -p /tmp/pub; cd /tmp/pub
+(python3 -m http.server 8000 --bind 0.0.0.0 > /tmp/http.log 2>&1 &)
+sleep 90
+while true; do xwd -root -silent > /tmp/pub/x.tmp 2>/dev/null && mv /tmp/pub/x.tmp /tmp/pub/x.xwd; sleep 8; done

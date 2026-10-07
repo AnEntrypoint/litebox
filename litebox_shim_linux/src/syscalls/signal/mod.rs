@@ -7,6 +7,7 @@
 mod aarch64;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
+pub(crate) mod xproc;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64 as arch;
@@ -22,6 +23,7 @@ use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use litebox::platform::{Instant as _, TimerHandle as _};
 #[cfg(target_arch = "x86_64")]
 use litebox::utils::TruncateExt as _;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
@@ -70,6 +72,21 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             last_exception: Cell::new(litebox::shim::ExceptionInfo::default()),
             sigreturn_trampoline: Cell::new(0),
         }
+    }
+
+    /// Overrides [`Self::new_process`]'s default `0` `sigreturn_trampoline` with the PARENT's own
+    /// already-established value, for a cross-process `fork()` child built via
+    /// `LinuxShim::adopt_forked_process` -- see that function's own doc comment on its
+    /// `sigreturn_trampoline` parameter for the full bug this closes. A real, same-process
+    /// `fork()`/`clone()` child never needs this (`Self::clone_for_new_task` already preserves the
+    /// value directly, since it starts from the parent's own live `SignalState`); this exists only
+    /// because a cross-process child is built from raw `TaskParams` instead, with no parent
+    /// `SignalState` to clone from. `sigreturn_trampoline == 0` is always a safe, correct no-op
+    /// (an address of literally `0` is never a real allocation `sys_mmap`'s own `addr == 0` return
+    /// convention could produce -- see `Task::ensure_sigreturn_trampoline`'s own use of `0` as its
+    /// "not yet allocated"/"allocation failed" sentinel).
+    pub(crate) fn set_sigreturn_trampoline_for_fork_adoption(&self, sigreturn_trampoline: usize) {
+        self.sigreturn_trampoline.set(sigreturn_trampoline);
     }
 
     /// Build the signal state for a new task from this one, via either `clone()` (a new
@@ -126,16 +143,18 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
-    /// Resets signal state for an `execve` call.
-    pub(crate) fn reset_for_exec(&self) {
-        // execve() replaces the entire address space with a fresh ELF image -- any previously
-        // allocated trampoline address is no longer valid (or even mapped); `write_signal_frame`
-        // lazily re-allocates a fresh one on next use.
-        self.sigreturn_trampoline.set(0);
+    /// Resets every installed signal handler to its default, leaving an explicitly IGNORED signal
+    /// ignored.
+    ///
+    /// That asymmetry is the kernel's, not a simplification: `flush_signal_handlers(t, 0)` skips
+    /// `SIG_IGN`, so a signal the caller deliberately ignored stays ignored across both operations
+    /// that use this. Shared by `execve` and by `CLONE_CLEAR_SIGHAND`, which have identical
+    /// handler semantics -- they differ only in what ELSE they reset, so only the handler loop
+    /// belongs here.
+    pub(crate) fn reset_handlers_to_default(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
         let handlers = Arc::make_mut(&mut handlers);
-        // Reset the handlers to defaults.
         for handler in &mut handlers.inner.get_mut().handlers {
             handler.action = SigAction {
                 sigaction: if handler.action.sigaction == SIG_IGN {
@@ -149,6 +168,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 __pad: 0,
             };
         }
+    }
+
+    /// Resets signal state for an `execve` call.
+    pub(crate) fn reset_for_exec(&self) {
+        // execve() replaces the entire address space with a fresh ELF image -- any previously
+        // allocated trampoline address is no longer valid (or even mapped); `write_signal_frame`
+        // lazily re-allocates a fresh one on next use.
+        self.sigreturn_trampoline.set(0);
+        self.reset_handlers_to_default();
         self.clear_sigaltstack();
     }
 }
@@ -273,6 +301,12 @@ impl PendingSignals {
         !(self.pending & mask).is_empty()
     }
 
+    /// Drops every queued instance of `signal` and clears its pending bit.
+    pub(crate) fn discard(&mut self, signal: Signal) {
+        self.queue.retain(|info| info.signo != signal.as_i32());
+        self.pending.remove(signal);
+    }
+
     pub(crate) fn remove(&mut self, signal: Signal) -> Siginfo {
         // Find the entry.
         let pos = self
@@ -339,6 +373,25 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         code: SI_KERNEL,
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
+    }
+}
+
+/// The `SIGCHLD` a parent receives when child `pid` terminates with `status`: `si_code`
+/// `CLD_EXITED`/`CLD_KILLED` with the child's pid, uid and exit code or signal. Programs such as
+/// util-linux `script` reap only on those codes, so a plain `SI_USER` siginfo leaves them waiting.
+pub(crate) fn siginfo_child(signal: Signal, pid: i32, uid: u32, status: ExitStatus) -> Siginfo {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    let (code, value) = match status {
+        ExitStatus::Exit(c) => (CLD_EXITED, i32::from(c.cast_unsigned())),
+        ExitStatus::Signal(s) => (CLD_KILLED, s.as_i32()),
+    };
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code,
+        __pad: 0,
+        data: SiginfoData::new_child(pid, uid, value),
     }
 }
 
@@ -423,21 +476,24 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
-        // Pass-29 diagnostic: the long-running `rip == 0` crash investigation (see FINDINGS.txt)
-        // established the guest branches to address 0 under its own power. `write_signal_frame`
-        // (x86_64.rs) sets `ctx.rip = action.sigaction` directly from caller-supplied dispositions
-        // with no validation; `action.sigaction == 0` is supposed to be structurally impossible
-        // here (the `SIG_DFL`/`SIG_IGN` match arms in `process_signals` are meant to intercept it
-        // before `deliver_signal` is ever called), but has never been empirically confirmed never
-        // to happen. Gated behind the `error!` log level (already filterable/cheap when disabled)
-        // rather than an env var, since this crate is `no_std` and has no direct env access; this
-        // is the cheapest possible falsification of the "signal delivery hands the guest a null
-        // handler" hypothesis.
-        if action.sigaction == 0 {
+        // The long-running "guest branches to an implausible rip" crash investigation (see
+        // FINDINGS.txt / AGENTS.md's 66th pass) live-captured `ctx.rip == usize::MAX` immediately
+        // after a signal delivery -- `write_signal_frame` (x86_64.rs) sets `ctx.rip =
+        // action.sigaction` directly from a caller-supplied disposition with no validation, and
+        // `switch_to_guest`'s resume trampoline (`jmp rcx`) then jumps to that value
+        // unconditionally. `SIG_DFL` (0) and `SIG_IGN` (1) are supposed to be intercepted by
+        // `process_signals`'s own match arms before `deliver_signal` is ever called, and
+        // `SIG_ERR` ((void*)-1 = `usize::MAX` in glibc/musl) should never be installed as a real
+        // handler by a well-behaved guest -- but none of that was ever actually enforced here, so
+        // a guest that races `sigaction()`/`signal()` or mishandles `SIG_ERR` can hand this code a
+        // non-function-pointer sentinel that gets jumped to as-is. Reject every disposition value
+        // that is not a real handler address rather than only diagnosing the `0` case.
+        if matches!(action.sigaction, 0 | 1 | usize::MAX) {
             litebox_util_log::error!(
-                signal:? = signal;
-                "[diag-rip0-sigdeliver] delivering signal with sigaction==0 (should be unreachable: SIG_DFL/SIG_IGN ought to have intercepted this in process_signals)"
+                signal:? = signal, sigaction:? = action.sigaction;
+                "signal delivery: rejecting implausible sigaction handler address (SIG_DFL/SIG_IGN/SIG_ERR reaching deliver_signal, which should be unreachable)"
             );
+            return Err(DeliverFault);
         }
 
         self.write_signal_frame(
@@ -468,23 +524,20 @@ struct DeliverFault;
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns the already-allocated sigreturn trampoline's guest address, or 0 if
     /// [`Task::ensure_sigreturn_trampoline`] has never been called for this address space.
-    /// Used to recognize a trap at exactly this address as the trampoline's own `brk`, not a
-    /// genuine guest breakpoint (see aarch64's `LinuxShimEntrypoints::exception`).
-    #[cfg(target_arch = "aarch64")]
+    /// Used to recognize a trap at exactly this address as the trampoline's own synthetic trap
+    /// (`brk` on aarch64, a non-executable page on x86_64), not a genuine guest breakpoint/fault
+    /// (see `LinuxShimEntrypoints::exception` for both architectures).
     pub(crate) fn sigreturn_trampoline_addr(&self) -> usize {
-        self.signals.sigreturn_trampoline.get()
+        self.signals.borrow().sigreturn_trampoline.get()
     }
 
-    /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline
-    /// (a tiny `brk #0xdead` stub), allocating it via a real guest `mmap` on first
-    /// use and caching the address for the lifetime of this address space (see
-    /// `SignalState::sigreturn_trampoline`'s doc comment for why it's invalidated on `execve`
-    /// but preserved across `clone`/`fork`). Returns 0 if the allocation itself fails (e.g. the
-    /// guest is out of address space) -- the caller treats that the same as "no restorer
-    /// available" (see `write_signal_frame`'s aarch64 doc comment).
-    ///
-    /// aarch64-only: x86_64 glibc always supplies its own real restorer transparently, so no
-    /// synthesized one is ever needed there.
+    /// Returns the guest-visible address of a litebox-synthesized `rt_sigreturn` trampoline,
+    /// allocating it via a real guest `mmap` on first use and caching the address for the
+    /// lifetime of this address space (see `SignalState::sigreturn_trampoline`'s doc comment for
+    /// why it's invalidated on `execve` but preserved across `clone`/`fork`). Returns 0 if the
+    /// allocation itself fails (e.g. the guest is out of address space) -- the caller treats
+    /// that the same as "no restorer available" (see `write_signal_frame`'s per-arch doc
+    /// comment).
     ///
     /// Uses `brk #0xdead` (a debug breakpoint trap, SIGTRAP) rather than the real
     /// `mov x8, #139 ; svc #0` (139 = __NR_rt_sigreturn) an earlier version of this trampoline
@@ -497,12 +550,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `rt_sigreturn` instead, corrupting this thread's actual execution state. `brk` traps
     /// unconditionally and unambiguously (host code never executes this specific immediate),
     /// routing cleanly to `exception_signal_handler`'s SIGTRAP dispatch instead.
+    ///
+    /// x86_64's own version (below) exists for a different, newer reason -- see its own doc
+    /// comment -- and does not use this comment's `brk`/seccomp rationale at all.
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
         // `brk #0xdead` -- see this function's doc comment. Encoded by hand (verified via
         // `as`/`objdump`) rather than depending on an assembler at build time for 4 fixed bytes.
         const TRAMPOLINE_CODE: [u8; 4] = [0xa0, 0xd5, 0x3b, 0xd4];
-        let existing = self.signals.sigreturn_trampoline.get();
+        let existing = self.signals.borrow().sigreturn_trampoline.get();
         if existing != 0 {
             return existing;
         }
@@ -515,6 +571,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             -1,
             0,
         ) else {
+            // Silent `0` here used to be indistinguishable from "not needed yet": the caller
+            // (`write_signal_frame`) then falls back to the guest's own `action.restorer`, and if
+            // that is 0 too the handler returns to address 0 -- see the `restorer == 0` refusal
+            // there. Say so, so the two are never confused again.
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get();
+                "ensure_sigreturn_trampoline: no guest page for the sigreturn trampoline (mmap failed)"
+            );
             return 0;
         };
         let addr = page.as_usize();
@@ -543,15 +607,105 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !write_ok {
             return 0;
         }
-        self.signals.sigreturn_trampoline.set(addr);
+        self.signals.borrow().sigreturn_trampoline.set(addr);
+        addr
+    }
+
+    /// x86_64 equivalent of the aarch64 function directly above, but for a different underlying
+    /// reason: x86_64 glibc DOES always transparently supply a real restorer (`action.restorer`,
+    /// almost always `__restore_rt`) via `SA_RESTORER`, so historically `write_signal_frame` just
+    /// used it directly and no synthesized trampoline existed here at all. The problem is what
+    /// that real restorer's body actually is: exactly `mov $0xf,%rax ; syscall` (the literal 9
+    /// bytes `48 c7 c0 0f 00 00 00 0f 05`), nothing else -- the whole function. Because
+    /// `litebox_syscall_rewriter` must intercept EVERY guest `syscall` instruction (there is no
+    /// seccomp/ptrace on this platform, and an unpatched `syscall` on Windows userland reaches a
+    /// real NT syscall dispatch with a Linux syscall number in `rax`, not a catchable fault), it
+    /// overwrites those exact 9 bytes in place with a `jmp`+padding to its own trampoline. That
+    /// destroys the literal byte pattern glibc's own unwind fallback (and every other tool that
+    /// lacks real CFI, including this project's own `advisor/probes/symbolize_litebox_crash.py`
+    /// and, most importantly, Xvfb's OWN in-process `xorg_backtrace()` -> glibc `backtrace()`
+    /// call, which runs INSIDE the guest with no litebox involvement at all) pattern-matches to
+    /// recognize "this return address is a signal frame, stop here" -- desyncing every guest
+    /// backtrace that ever walks through a delivered signal (root-caused
+    /// `docs/AGENTS_ARCHIVE_2026-09-22.md`'s 38th pass).
+    ///
+    /// The fix restores the EXACT SAME 9 real bytes (not a different, litebox-specific
+    /// signature) into a freshly `mmap`'d guest page instead of glibc's static `.text` -- so
+    /// `litebox_syscall_rewriter`'s offline, load-time-only scan (an explicit non-goal is ever
+    /// patching dynamically generated code, see that crate's own module doc comment) never sees
+    /// or touches it. The page is left `PROT_READ` only, NEVER `PROT_EXEC`: the bytes must stay
+    /// byte-for-byte readable (both by real glibc's own in-guest unwind fallback and by this
+    /// project's own tooling, neither of which executes them, only reads them as data to
+    /// pattern-match) but must never actually execute for real, since executing a genuine
+    /// `syscall` opcode here would reach the real host kernel exactly like an unpatched one
+    /// anywhere else. Reaching it via the signal handler's `ret` therefore always raises an
+    /// instruction-fetch access violation (Windows: DEP/NX, `ExceptionInformation[0] == 8`) at
+    /// exactly this address before the `syscall` byte would ever be decoded -- caught by
+    /// `LinuxShimEntrypoints::exception`'s x86_64 branch and redirected straight into
+    /// `sys_rt_sigreturn`, the same as aarch64's `brk` trap achieves via a different hardware
+    /// mechanism. `write_signal_frame` (`signal/x86_64.rs`) prefers this trampoline's address
+    /// over the guest's own `action.restorer` whenever allocation succeeds, falling back to the
+    /// real restorer only if it doesn't (e.g. guest out of address space) -- preserving the
+    /// previous behavior as a safety net rather than a hard requirement.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn ensure_sigreturn_trampoline(&self) -> usize {
+        // The real glibc x86_64 `__restore_rt` body, verbatim: `mov $0xf,%rax ; syscall`
+        // (0xf == __NR_rt_sigreturn). Never executed for real here (the page stays non-exec) --
+        // present purely so anything reading these bytes as data sees the real ABI signature.
+        const TRAMPOLINE_CODE: [u8; 9] = [0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05];
+        let existing = self.signals.borrow().sigreturn_trampoline.get();
+        if existing != 0 {
+            return existing;
+        }
+        let Ok(page) = self.sys_mmap(
+            0,
+            litebox::mm::linux::PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_READ_WRITE,
+            litebox_common_linux::MapFlags::MAP_PRIVATE
+                | litebox_common_linux::MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        ) else {
+            // Silent `0` here used to be indistinguishable from "not needed yet": the caller
+            // (`write_signal_frame`) then falls back to the guest's own `action.restorer`, and if
+            // that is 0 too the handler returns to address 0 -- see the `restorer == 0` refusal
+            // there. Say so, so the two are never confused again.
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get();
+                "ensure_sigreturn_trampoline: no guest page for the sigreturn trampoline (mmap failed)"
+            );
+            return 0;
+        };
+        let addr = page.as_usize();
+        let write_ok = UserPtrMut::<[u8; 9]>::from_usize(addr)
+            .write_at_offset::<Platform>(0, TRAMPOLINE_CODE)
+            .is_some();
+        // Drop write AND exec permission -- PROT_READ only. See this function's doc comment for
+        // why the page must never be executable.
+        let mprotect_ok = self
+            .sys_mprotect(
+                page,
+                litebox::mm::linux::PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_READ,
+            )
+            .is_ok();
+        if !write_ok || !mprotect_ok {
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get(), addr:? = addr,
+                write_ok:? = write_ok, mprotect_ok:? = mprotect_ok;
+                "ensure_sigreturn_trampoline: trampoline page unusable, falling back to the guest's restorer"
+            );
+            return 0;
+        }
+        self.signals.borrow().sigreturn_trampoline.set(addr);
         addr
     }
 
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
-        let old = self.signals.blocked.get();
-        self.signals.set_signal_mask(mask);
+        let old = self.signals.borrow().blocked.get();
+        self.signals.borrow().set_signal_mask(mask);
         let result = f();
-        self.signals.set_signal_mask(old);
+        self.signals.borrow().set_signal_mask(old);
         result
     }
 
@@ -572,14 +726,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
-            let oldset = self.signals.blocked.get();
+            let oldset = self.signals.borrow().blocked.get();
             oldset_ptr
                 .write_at_offset::<Platform>(0, oldset)
                 .ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.borrow().blocked.get();
             match how {
                 SigmaskHow::SIG_BLOCK => {
                     blocked = blocked | set;
@@ -591,10 +745,139 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     blocked = set;
                 }
             }
-            self.signals.set_signal_mask(blocked);
+            self.signals.borrow().set_signal_mask(blocked);
         }
 
         Ok(0)
+    }
+
+    /// Handle syscall `rt_sigsuspend`.
+    ///
+    /// Real Linux semantics: atomically replace the calling thread's signal mask with `mask`,
+    /// then block until a signal is delivered, then restore the ORIGINAL mask and return `-1`
+    /// with `EINTR` (this call never returns successfully -- a signal that actually terminates or
+    /// is otherwise handled is what makes the wait end, `sigsuspend` itself has no "wake up
+    /// normally" outcome).
+    ///
+    /// Without this, `rt_sigsuspend` fell through to the generic "unsupported syscall" fallback
+    /// (`SyscallRequest::try_from_raw`'s own default arm, `litebox_common_linux/src/lib.rs`),
+    /// returning `ENOSYS` IMMEDIATELY instead of blocking. Confirmed live: this is exactly what a
+    /// shell's own `wait` builtin (BusyBox ash included) uses to sleep until `SIGCHLD` arrives
+    /// after an initial `wait4(WNOHANG)` poll finds nothing ready -- with `rt_sigsuspend` never
+    /// actually blocking, the caller's own retry loop calls it again immediately, spinning as fast
+    /// as the host can dispatch syscalls (confirmed live: ~175,000 calls/second) instead of
+    /// sleeping until the child's `SIGCHLD` wakes it, hanging a backgrounded shell job's `wait`
+    /// forever even though the child itself exits correctly and promptly.
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        ctx: &mut PtRegs,
+        mask_ptr: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let Some(mask_ptr) = mask_ptr else {
+            return Err(Errno::EFAULT);
+        };
+        let mask = mask_ptr
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
+
+        let old_mask = self.signals.borrow().blocked.get();
+        self.signals.borrow().set_signal_mask(mask);
+        let result = self.wait_cx().sleep();
+        // Dispatch/consume the signal that woke this thread WHILE the caller-supplied (usually
+        // more permissive) mask from `sigsuspend`'s own argument is still installed -- real Linux
+        // `sigsuspend` delivers the waking signal under that temporary mask, not the original one
+        // (`sigsuspend(2)`: "the set of blocked signals is set to mask ... the original signal
+        // mask is restored after the call"). Confirmed live: restoring `old_mask` BEFORE this
+        // dispatch (the previous version of this fix) re-blocked SIGCHLD before it could be
+        // consumed, since a normal shell keeps SIGCHLD blocked by default and only unblocks it via
+        // `sigsuspend`'s own `mask` argument for the duration of exactly this call -- the signal
+        // was left queued-but-now-invisible again, making every SUBSEQUENT `sigsuspend` call
+        // return instantly (it should have blocked, since nothing new had arrived, but
+        // `has_pending_signals()` still saw the stale, never-cleared entry once its RESTORED
+        // block state briefly matched what `check_for_interrupt` samples on next entry).
+        self.process_signals(ctx);
+        self.signals.borrow().set_signal_mask(old_mask);
+        match result {
+            litebox::event::wait::WaitError::Interrupted => Err(Errno::EINTR),
+            litebox::event::wait::WaitError::TimedOut => {
+                unreachable!("sigsuspend sleep has no deadline")
+            }
+        }
+    }
+
+    /// `rt_sigtimedwait(2)`: synchronously consumes one pending signal from `set`. The signals in
+    /// `set` are normally blocked, so a blocked wake-up is not delivered as an interrupt; the wait
+    /// therefore re-checks the queues in short slices until the timeout.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set: UserPtr<SigSet>,
+        info: Option<UserPtrMut<Siginfo>>,
+        timeout: Option<UserPtr<litebox_common_linux::Timespec>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let set = set.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let deadline = match timeout {
+            None => None,
+            Some(t) => {
+                let ts = t.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                Some(core::time::Duration::try_from(ts)?)
+            }
+        };
+        let slice = core::time::Duration::from_millis(2);
+        let mut waited = core::time::Duration::ZERO;
+        loop {
+            let taken = {
+                let thread = self.signals.borrow();
+                let mut own = thread.pending.borrow_mut();
+                if let Some(sig) = own.next_matching(set) {
+                    Some((sig, own.remove(sig)))
+                } else {
+                    let mut shared = thread.shared_pending.lock();
+                    shared
+                        .next_matching(set)
+                        .map(|sig| (sig, shared.remove(sig)))
+                }
+            };
+            if let Some((sig, siginfo)) = taken {
+                if let Some(info) = info {
+                    info.write_at_offset::<Platform>(0, siginfo)
+                        .ok_or(Errno::EFAULT)?;
+                }
+                return Ok(usize::try_from(sig.as_i32()).unwrap());
+            }
+            if self.has_pending_signals() {
+                return Err(Errno::EINTR);
+            }
+            let step = match deadline {
+                Some(d) if waited >= d => return Err(Errno::EAGAIN),
+                Some(d) => slice.min(d - waited),
+                None => slice,
+            };
+            let _ = self.wait_cx().with_timeout(step).sleep();
+            waited += step;
+        }
+    }
+
+    /// `rt_tgsigqueueinfo(2)`/`rt_sigqueueinfo(2)`: delivered as a plain `tgkill`/`kill`; the
+    /// caller-supplied `siginfo` payload (`si_value`) is not carried through.
+    pub(crate) fn sys_rt_tgsigqueueinfo(
+        &self,
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    ) -> Result<usize, Errno> {
+        self.do_kill(Some(tgid), Some(tid), sig)
+    }
+
+    pub(crate) fn sys_rt_sigqueueinfo(&self, pid: i32, sig: i32) -> Result<usize, Errno> {
+        self.do_kill(Some(pid), None, sig)
     }
 
     pub(crate) fn sys_sigaltstack(
@@ -603,7 +886,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         old_ss_ptr: Option<UserPtrMut<SigAltStack>>,
         ctx: &PtRegs,
     ) -> Result<usize, Errno> {
-        let mut old_ss = self.signals.altstack.get();
+        let mut old_ss = self.signals.borrow().altstack.get();
         let is_on_stack = is_on_stack(&old_ss, arch::sp(ctx));
         if let Some(old_ss_ptr) = old_ss_ptr {
             if is_on_stack {
@@ -618,7 +901,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(Errno::EPERM);
             }
             let ss = ss_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-            self.signals.set_sigaltstack(ss)?;
+            self.signals.borrow().set_sigaltstack(ss)?;
         }
         Ok(0)
     }
@@ -632,9 +915,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         // Restore the alternate signal stack, ignoring errors.
-        self.signals.set_sigaltstack(uctx.stack).ok();
+        self.signals.borrow().set_sigaltstack(uctx.stack).ok();
 
-        self.signals.set_signal_mask(uctx.sigmask);
+        // `restore_sigcontext` below copies every GPR out of the guest's `mcontext` verbatim,
+        // `rip` included, so a ucontext that was never written (or was clobbered by the handler)
+        // resumes the task at `rip == 0` -- and by then the only thing that can still catch it is
+        // the platform's resume guard, which turns the resulting instruction-fetch fault into a
+        // SIGSEGV with no clue where the bad context came from. Diagnose it here, where the
+        // ucontext's address is still known, and refuse the restore instead. Live-caught on
+        // Chromium's sandboxed processes (guest pid 41 died exactly this way: `Exception(14)
+        // error_code=0x14` at `rip=0x0 cr2=0x0`, i.e. a user-mode instruction fetch from
+        // unmapped address 0, whose ucontext this handler returned through 36s later).
+        //
+        // `rsp == 0` gets the same treatment: it is equally unresumable and equally invisible
+        // later. Both are logged rather than silently corrected because either value is evidence
+        // about WHO wrote the frame, which is what has to be fixed -- see the `restorer == 0`
+        // refusal in `write_signal_frame` for the one path that could hand the guest a zero
+        // return address.
+        if uctx.mcontext.rip == 0 || uctx.mcontext.rsp == 0 {
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get(), uctx_addr:? = uctx_addr,
+                rip:? = uctx.mcontext.rip, rsp:? = uctx.mcontext.rsp, rax:? = uctx.mcontext.rax,
+                err:? = uctx.mcontext.err, trapno:? = uctx.mcontext.trapno,
+                fpstate:? = uctx.mcontext.fpstate;
+                "rt_sigreturn: guest ucontext carries a zero rip or rsp, refusing the restore"
+            );
+            self.force_signal(Signal::SIGSEGV, false);
+            return Err(Errno::EFAULT);
+        }
+
+        self.signals.borrow().set_signal_mask(uctx.sigmask);
 
         // Restore xmm0-xmm15 from the fpstate block this same handler's `write_signal_frame`
         // wrote, if any (non-null fpstate = this delivery genuinely captured FP state; null =
@@ -677,7 +987,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
 
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let old_act = {
             let mut inner = handlers.inner.lock();
             let handler = &mut inner[signal];
@@ -713,10 +1024,114 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
-        let signal = Signal::try_from(signal)?;
-        if tid.is_some_and(|tid| tid != self.tid) {
-            log_unsupported!("sys_tkill/sys_tgkill with a remote tid");
-            return Err(Errno::ESRCH);
+        // Signal 0 is a documented POSIX special case (`kill(2)`: "if sig is 0, then no signal is
+        // sent, but existence and permission checks are still performed") -- the standard
+        // liveness-probe idiom, used directly by `kill -0 $pid` and indirectly by every shell's
+        // own job-control bookkeeping for a backgrounded job's `$!`. `Signal::try_from` rejects 0
+        // outright (`1..=64` only), so calling it unconditionally here made EVERY `kill(pid, 0)`
+        // fail with `EINVAL` before this function ever reached its own target-existence checks
+        // below -- i.e. `kill -0` on a genuinely live process reported `EINVAL` (which callers
+        // conventionally treat identically to "not found"/dead), not because the target doesn't
+        // exist, but because the null-signal probe itself was never a valid `Signal`. Confirmed
+        // live: `sleep 30 &`'s own real, live child PID, probed one second after backgrounding,
+        // returned `sh: can't kill pid N: Invalid argument` -- `sleep 30` cannot have exited that
+        // fast, proving this was misreporting a live process as inaccessible, not a real ESRCH.
+        // `None` here means "this is the null probe": skip actually enqueuing/delivering a signal
+        // to any target below, while still running every existence/reachability check exactly as
+        // for a real signal.
+        let signal = (signal != 0)
+            .then(|| Signal::try_from(signal))
+            .transpose()?;
+        // A pid/tid a guest hands us is the one IT sees, in ITS OWN namespace -- the pid a
+        // `CLONE_NEWPID` child was given at birth, not the internal pid every registry here keys
+        // on. Translate both up front so every comparison and lookup below stays in internal
+        // terms. The non-positive encodings are namespace-independent by definition (`0` and `-1`
+        // are "my group"/"everything", `-n` is "group n"), so they pass through untouched. A pid
+        // this namespace cannot see becomes a value no lookup can ever match, which is exactly
+        // Linux's `ESRCH` for signalling outside your own namespace -- never the internal pid that
+        // number happens to spell for somebody else.
+        let unseen = i32::MAX;
+        let pid = pid.map(|p| {
+            if p > 0 {
+                self.resolve_guest_pid(p).unwrap_or(unseen)
+            } else {
+                p
+            }
+        });
+        let tid = tid.map(|t| {
+            if t > 0 {
+                self.resolve_guest_pid(t).unwrap_or(unseen)
+            } else {
+                t
+            }
+        });
+        // A `tkill`/`tgkill` targeting a DIFFERENT thread of THIS SAME process (the overwhelmingly
+        // common real-world case: glibc/musl's NPTL uses exactly this to signal one specific
+        // sibling thread for internal cross-thread synchronization handshakes, e.g. dlopen's
+        // TLS-update quiesce signal -- sent fire-and-forget, with the return value never checked
+        // by the caller). This used to be rejected outright with `ESRCH` here (there was no way
+        // to reach one specific sibling thread's own `self.signals.borrow().pending` from outside that
+        // thread's own `Task`), which glibc's internal call sites don't handle -- the signal was
+        // silently and permanently dropped, wedging both the sender (waiting on the receiver's
+        // acknowledgment) and the receiver (which never got a chance to run its handler) forever.
+        // Confirmed live as the root cause of a real, reproduced `xfce4-about`/GTK deadlock.
+        //
+        // There is still no per-sibling-thread signal queue reachable from here (`ThreadRemote`
+        // only exposes `interrupt()`, not the target `Task`'s own `Signals`), so this delivers via
+        // `shared_pending` (process-wide -- any thread of the process may pick it up, exactly like
+        // `deliver_to_child`'s process-directed delivery below) rather than a truly
+        // thread-specific queue, then interrupts ONLY the intended target thread (not every
+        // thread, unlike a real process-directed signal) so it -- not some other unrelated,
+        // already-runnable thread -- is the one woken to notice and consume it. This is not
+        // perfectly POSIX-accurate (real `tkill` is delivered to, and only to, the exact named
+        // thread; here, a different thread that happens to unblock first and check its pending
+        // signals before the target does could theoretically consume it instead), but is a large
+        // correctness improvement over unconditionally dropping the signal, and matches real
+        // behavior in the overwhelmingly common case this fixes: the sender is fire-and-forget,
+        // the target is the only thread actually blocked and waiting on this specific
+        // notification, so it is also the only thread that will actually be waiting to consume a
+        // signal at all.
+        if let Some(target_tid) = tid
+            && target_tid != self.tid.get()
+            && !self.process().has_thread(target_tid)
+            && let Some(remote) = self.global.registry_get(target_tid)
+        {
+            // A thread of ANOTHER process in this native-`fork()` family (only its main thread's
+            // tid is known here, which is its pid).
+            if let Some(signal) = signal {
+                remote
+                    .shared_pending
+                    .lock()
+                    .push(&remote.limits, signal, siginfo_kill(signal));
+                remote.interrupt_all_threads();
+            }
+            return Ok(0);
+        }
+        if let Some(target_tid) = tid
+            && target_tid != self.tid.get()
+        {
+            // Push the signal into `shared_pending` BEFORE checking whether the target thread is
+            // still live: a thread that exits between this check and the push could otherwise
+            // race a genuinely-missing target report, but pushing first and then unconditionally
+            // interrupting whatever's still there (a no-op if it already exited) matches real
+            // Linux's own "signal delivery and target liveness are checked together, atomically
+            // with respect to the target's own exit" semantics closely enough for this shim's
+            // purposes -- and, same as `deliver_to_child` above, a `None` (null-probe) signal
+            // delivers nothing at all, only the existence check below matters for it.
+            if let Some(signal) = signal
+                && !self.is_signal_ignored(signal)
+            {
+                self.signals.borrow().shared_pending.lock().push(
+                    &self.process().limits,
+                    signal,
+                    siginfo_kill(signal),
+                );
+            }
+            return if self.process().interrupt_thread(target_tid) {
+                Ok(0)
+            } else {
+                Err(Errno::ESRCH)
+            };
         }
         // Process-directed delivery to a live child `Process`: any one of its threads may end up
         // handling it, exactly like a same-process `send_shared_signal`. Real Linux's SIG_IGN
@@ -724,8 +1139,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // on its own `Task`, unreachable from a `Process` handle alone) -- `process_signals`
         // already discards an ignored signal correctly once the child wakes and looks at its own
         // handlers, so this only costs the child one spurious EINTR on an ignored signal, never
-        // an incorrect delivery.
+        // an incorrect delivery. A `None` (null-probe) signal delivers nothing at all, per the
+        // doc comment above -- only the existence/reachability check that led here matters.
         let deliver_to_child = |child: &super::process::Process<Platform>| {
+            let Some(signal) = signal else { return };
             child
                 .shared_pending
                 .lock()
@@ -734,22 +1151,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         // `pid == 0` (send to the caller's own process group), a negative `pid` (send to process
-        // group `-pid`), and `pid == -1` (send to every process the caller may signal) are
-        // approximated as "signal self plus any live child currently in that same group": this
-        // shim has no registry of *arbitrary* other live processes to enumerate a process group
-        // or the whole guest (see `sys_setpgid`'s doc comment on why sessions/cross-process pid
-        // lookups aren't modeled at all), but a live child that's been moved into the group via
-        // `setpgid()` -- the standard shell-job-control/process-supervisor pattern of putting a
-        // whole spawned pipeline into one group -- *is* reachable via `children`, covering
-        // "kill the whole pipeline"/"kill the whole group" without needing a general registry.
+        // group `-pid`), and `pid == -1` (send to every process the caller may signal): the caller
+        // is signalled directly when it is a target, and every other target is found through the
+        // cross-process process registry (`xproc`), which records each guest process's group
+        // wherever it runs.
         let self_pgid = self.sys_getpgid(0)?;
         let targets_self = match pid {
             None | Some(0 | -1) => true,
-            Some(p) if p == self.pid => true,
+            Some(p) if p == self.pid.get() => true,
             Some(p) => p.checked_neg().is_some_and(|group| group == self_pgid),
         };
         let mut delivered = targets_self;
-        if targets_self {
+        if targets_self && let Some(signal) = signal {
             self.send_signal(signal, siginfo_kill(signal));
         }
         // `tid.is_some()` (tkill/tgkill) always targets one specific thread and never carries
@@ -763,9 +1176,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 p if p < 0 => p.checked_neg(),
                 _ => None,
             });
+        if pid == Some(-1) && tid.is_none() {
+            let me = self.process();
+            let all: alloc::vec::Vec<_> = self
+                .global
+                .registry_entries()
+                .into_iter()
+                .filter(|(p, q)| *p > 1 && !Arc::ptr_eq(q, &me))
+                .map(|(_, q)| q)
+                .collect();
+            for p in &all {
+                deliver_to_child(p);
+                delivered = true;
+            }
+        }
         if let Some(group) = target_group {
-            for child in &self.process().children_in_group(group) {
-                deliver_to_child(child);
+            let reached = if pid == Some(-1) {
+                self.xproc_send_many(signal, |v| v.pid != 1)
+            } else {
+                self.xproc_send_many(signal, |v| v.pgid == group)
+            };
+            delivered |= !reached.is_empty();
+            let local_children = self.process().children_in_group(group);
+            for (child_pid, child) in &local_children {
+                if !reached.contains(child_pid) {
+                    deliver_to_child(child);
+                    delivered = true;
+                }
+            }
+            let me = self.process();
+            let registered: alloc::vec::Vec<_> = self
+                .global
+                .registry_entries()
+                .into_iter()
+                .filter(|(p, q)| {
+                    !reached.contains(p)
+                        && !Arc::ptr_eq(q, &me)
+                        && q.pgid.load(core::sync::atomic::Ordering::Relaxed) == group
+                        && !local_children.iter().any(|(_, c)| Arc::ptr_eq(c, q))
+                })
+                .map(|(_, q)| q)
+                .collect();
+            for q in &registered {
+                deliver_to_child(q);
                 delivered = true;
             }
             // A group op targeting neither self's own group nor any reachable child's group has
@@ -776,82 +1229,96 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if targets_self {
             return Ok(0);
         }
-        // A genuine remote pid (some other, specific process): still no shim-wide pid registry to
-        // find an arbitrary process by pid, but a *direct child* of the caller is reachable via
-        // `children` (populated by `do_clone`'s process-clone branch) -- covering the single most
-        // common real-world case, a supervisor/process-manager signaling a worker it spawned.
+        // Any other specific pid: the cross-process registry (`xproc`) knows every registered
+        // process, whether it runs in this host process or another one (a
+        // `LITEBOX_PROCESS_FORK=1` child). A direct local child is still found without it when the
+        // registry is disabled or full.
         if let Some(pid) = pid
             && pid > 0
-            && let Some(child) = self.process().find_child(pid)
         {
-            deliver_to_child(&child);
-            return Ok(0);
+            if self.xproc_send(pid, signal).is_ok() {
+                return Ok(0);
+            }
+            if let Some(child) = self.lookup_process(pid) {
+                deliver_to_child(&child);
+                return Ok(0);
+            }
         }
-        // Pass 141, documented gap: a cross-process `fork()` child (`LITEBOX_PROCESS_FORK=1`) is
-        // tracked in `Process::cross_process_children`, not `children` -- `find_child` above
-        // never finds it, so it would otherwise fall through to the generic "unsupported remote
-        // pid" `ESRCH` below silently. Distinguish that specific case in the log so it reads as
-        // "known, scoped-out signal delivery" rather than "the shim has no idea what this pid
-        // is" -- the child is real and reachable via `sys_wait4`, just not signalable yet; see
-        // `Process::cross_process_children`'s doc comment for the full scope statement.
-        if let Some(pid) = pid
-            && pid > 0
-            && self.process().find_cross_process_child(pid).is_some()
-        {
-            log_unsupported!(
-                "sys_kill with pid={pid}: signal delivery to a cross-process fork() child is not \
-                 implemented (pass 141 documented gap -- wait4() works, kill() does not)"
-            );
-            return Err(Errno::ESRCH);
-        }
-        log_unsupported!("sys_kill with a remote pid that isn't a direct child");
+        log_unsupported!("sys_kill with a pid that is neither registered nor a direct child");
         Err(Errno::ESRCH)
     }
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let blocked = self.signals.blocked.get();
-        let thread_pending = self.signals.pending.borrow().pending & !blocked;
-        if !thread_pending.is_empty() {
-            return true;
+        self.xproc_drain_own();
+        loop {
+            let blocked = self.signals.borrow().blocked.get();
+            let thread_pending = self.signals.borrow().pending.borrow().pending & !blocked;
+            let shared_pending = self.signals.borrow().shared_pending.lock().pending & !blocked;
+            let Some(signal) = (thread_pending | shared_pending).lowest_set() else {
+                return false;
+            };
+            if !self.is_signal_ignored(signal) {
+                return true;
+            }
+            if thread_pending.contains(signal) {
+                self.signals.borrow().pending.borrow_mut().discard(signal);
+            }
+            if shared_pending.contains(signal) {
+                self.signals.borrow().shared_pending.lock().discard(signal);
+            }
         }
-        let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
-        !shared_pending.is_empty()
     }
 
     /// Returns the set of all pending (deliverable) signals.
     #[cfg(test)]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
-        let blocked = self.signals.blocked.get();
-        let thread = self.signals.pending.borrow().pending & !blocked;
-        let shared = self.signals.shared_pending.lock().pending & !blocked;
+        let blocked = self.signals.borrow().blocked.get();
+        let thread = self.signals.borrow().pending.borrow().pending & !blocked;
+        let shared = self.signals.borrow().shared_pending.lock().pending & !blocked;
         thread | shared
     }
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        #[cfg(target_arch = "x86_64")]
+        // Debug, not warn: `process_signals` is the GENERAL signal path, not DRM-specific --
+        // the `drm-diag` prefix is leftover from a DRM investigation. It runs 32 times per
+        // exec, emitting 128 warn-level lines per exec on a completely normal run.
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), rip:% = ctx.rip, orig_rax:% = ctx.orig_rax;
+            "drm-diag: process_signals entry with ctx"
+        );
+        self.xproc_drain_own();
+        let mut iter_count: u32 = 0;
         loop {
-            let blocked = self.signals.blocked.get();
+            iter_count += 1;
+            litebox_util_log::debug!(tid:% = self.tid.get(), iter_count:% = iter_count; "drm-diag: process_signals loop iteration");
+            let blocked = self.signals.borrow().blocked.get();
             let (signal, siginfo) = {
-                let mut pending = self.signals.pending.borrow_mut();
+                let signals = self.signals.borrow();
+                let mut pending = signals.pending.borrow_mut();
                 if let Some(signal) = pending.next(blocked) {
                     (signal, pending.remove(signal))
                 } else {
                     // Then try shared pending.
-                    let mut shared = self.signals.shared_pending.lock();
+                    let signals = self.signals.borrow();
+                    let mut shared = signals.shared_pending.lock();
                     if let Some(signal) = shared.next(blocked) {
                         (signal, shared.remove(signal))
                     } else {
+                        litebox_util_log::debug!(tid:% = self.tid.get(), iter_count:% = iter_count; "drm-diag: process_signals breaking (nothing pending)");
                         break;
                     }
                 }
             };
+            litebox_util_log::debug!(tid:% = self.tid.get(), signal:? = signal; "drm-diag: process_signals dispatching signal");
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
             }
 
-            let action = self.signals.handlers.borrow().inner.lock()[signal].action;
+            let action = self.signals.borrow().handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
@@ -864,9 +1331,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // supported.
                             litebox_util_log::error!(
                                 signal:? = signal,
-                                pid:% = self.pid,
-                                tid:% = self.tid;
+                                pid:% = self.pid.get(),
+                                tid:% = self.tid.get(),
+                                comm:? = self.comm.get();
                                 "fatal signal: terminating task"
+                            );
+                            // Process-timeline diagnostic (advisor-db spec item 3): same
+                            // event, in the DIAG_TIMELINE-prefixed shape the other
+                            // exit/execve timeline lines use, for a uniform post-hoc `grep`.
+                            // 74th pass: moved onto the dedicated `litebox_diag::process_timeline`
+                            // target, same fix and same rationale as the other four
+                            // DIAG_TIMELINE sites (`syscalls/process.rs`'s `sys_exit`/
+                            // `sys_execve` comments have the full history).
+                            litebox_util_log::__private::tracing::event!(
+                                target: "litebox_diag::process_timeline",
+                                litebox_util_log::__private::tracing::Level::DEBUG,
+                                pid = %self.pid.get(),
+                                comm = ?self.comm.get(),
+                                signal = ?signal,
+                                "DIAG_TIMELINE exit_signal"
                             );
                             // `sys_exit`/`sys_exit_group` both tear down fork-child single-step
                             // verification (`end_fork_child_verification`) before calling into
@@ -895,11 +1378,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    #[cfg(target_arch = "aarch64")]
+                    // Both architectures now synthesize their own trampoline (see
+                    // `ensure_sigreturn_trampoline`'s two `#[cfg]`'d bodies above); a target with
+                    // neither `#[cfg]` arm (i.e. neither aarch64 nor x86_64) falls back to 0,
+                    // matching the old behavior for any such target.
+                    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                     let sigreturn_trampoline = self.ensure_sigreturn_trampoline();
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let sigreturn_trampoline = 0;
-                    if let Err(DeliverFault) = self.signals.deliver_signal(
+                    if let Err(DeliverFault) = self.signals.borrow().deliver_signal(
                         self.global.platform,
                         signal,
                         &siginfo,
@@ -915,8 +1402,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
+        litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: process_signals returning normally");
     }
-
 
     /// Check whether the process-wide alarm deadline has passed and, if so,
     /// enqueue `SIGALRM`.
@@ -925,7 +1412,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[cfg(feature = "alarm_fallback")]
     #[inline]
     pub(crate) fn check_alarm_deadline(&self) {
-        let mut alarm = self.process().alarm_timer.lock();
+        let process = self.process();
+        let mut alarm = process.alarm_timer.lock();
         if alarm.handle.is_some() {
             // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need
             // to check the deadline here.
@@ -935,7 +1423,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .deadline
             .is_some_and(|deadline| self.global.platform.now() >= deadline)
         {
-            alarm.deadline = None;
+            // Periodic `setitimer(ITIMER_REAL, ...)` (nonzero `it_interval`): re-arm for another
+            // `interval` instead of leaving `deadline`/`interval` cleared, exactly matching the
+            // real-platform-timer path in `queue_signals` below -- see `Alarm::interval`'s doc
+            // comment for why this emulation exists (`TimerHandle` has no native repeat concept).
+            alarm.deadline = alarm
+                .interval
+                .and_then(|interval| self.global.platform.now().checked_add(interval));
             self.send_shared_signal(
                 litebox_common_linux::signal::Signal::SIGALRM,
                 siginfo_kill(litebox_common_linux::signal::Signal::SIGALRM),
@@ -945,11 +1439,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
         if signal == litebox_common_linux::signal::Signal::SIGALRM {
-            // The platform timer fired; clear the stored deadline so that a
-            // subsequent `alarm()` call does not see a stale positive remaining
-            // time due to timer imprecision (the timer can fire slightly before
-            // the exact deadline).
-            self.process().alarm_timer.lock().deadline = None;
+            let process = self.process();
+            let mut alarm = process.alarm_timer.lock();
+            // Periodic `setitimer(ITIMER_REAL, ...)` (nonzero `it_interval`): re-arm the real
+            // platform timer for another `interval` instead of leaving it disarmed, so the next
+            // `SIGALRM` actually arrives -- see `Alarm::interval`'s doc comment. A one-shot
+            // `alarm()`/single-shot `setitimer()` has `interval == None`, matching the previous
+            // behavior exactly (clear the stored deadline so a subsequent `alarm()` call does not
+            // see a stale positive remaining time due to timer imprecision -- the timer can fire
+            // slightly before the exact deadline).
+            match alarm.interval {
+                Some(interval) => {
+                    alarm.deadline = self.global.platform.now().checked_add(interval);
+                    if let Some(handle) = &alarm.handle {
+                        handle.set_timer(interval);
+                    }
+                }
+                None => alarm.deadline = None,
+            }
         }
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
@@ -962,10 +1469,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         // Blocked signals are never ignored, since the signal handler may
         // change by the time it is unblocked.
-        if self.signals.blocked.get().contains(signal) {
+        if self.signals.borrow().blocked.get().contains(signal) {
             return false;
         }
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let inner = handlers.inner.lock();
         match inner[signal].action.sigaction {
             SIG_IGN => true,
@@ -980,6 +1488,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         self.signals
+            .borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
@@ -991,6 +1500,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
         self.signals
+            .borrow()
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
@@ -1008,33 +1518,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.force_signal_with_info(signal, force_exit, siginfo);
     }
 
-    fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
+    pub(crate) fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
         // `handle_exception_request` maps every architectural trap (not just page faults) through
         // this path: SIGFPE (`#DE`), SIGTRAP (`#BP`), SIGILL (`#UD` -- notably reachable via
         // Windows' `STATUS_PRIVILEGED_INSTRUCTION`/`hlt` mapping in
         // `litebox_platform_windows_userland`, which is how musl mallocng's `a_crash()` abort
         // primitive is delivered to the guest), alongside the original SIGKILL/SIGSEGV callers.
+        // SIGSYS joins this set as a seccomp verdict's kill/trap/trace delivery (see
+        // `syscalls::seccomp`), which is a forced signal like any other architectural trap.
         assert!(matches!(
             signal,
-            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+            Signal::SIGKILL
+                | Signal::SIGSEGV
+                | Signal::SIGFPE
+                | Signal::SIGTRAP
+                | Signal::SIGILL
+                | Signal::SIGSYS
         ));
 
         self.signals
+            .borrow()
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
 
         // Update the handler if necessary to ensure the signal is handled.
-        let handlers = self.signals.handlers.borrow();
+        let signals = self.signals.borrow();
+        let handlers = signals.handlers.borrow();
         let mut inner = handlers.inner.lock();
         let handler = &mut inner[signal];
         if force_exit
-            || self.signals.blocked.get().contains(signal)
+            || self.signals.borrow().blocked.get().contains(signal)
             || handler.action.sigaction == SIG_IGN
         {
-            let mut blocked = self.signals.blocked.get();
+            let mut blocked = self.signals.borrow().blocked.get();
             blocked.remove(signal);
-            self.signals.set_signal_mask(blocked);
+            self.signals.borrow().set_signal_mask(blocked);
             handler.action = SigAction {
                 sigaction: SIG_DFL,
                 restorer: 0,
@@ -1095,7 +1614,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             (signal, fault_address)
         };
-        self.signals.last_exception.set(*info);
+        self.signals.borrow().last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

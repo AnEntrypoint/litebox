@@ -79,10 +79,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
 {
     type Error = Errno;
 
-    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+    fn reserve(
+        &mut self,
+        len: usize,
+        align: usize,
+        cow_padding_hint: usize,
+    ) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
-        // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // still fit `len` bytes, plus `cow_padding_hint` extra bytes of slack at the low end
+        // (see `MapMemory::reserve`'s own doc comment) so a CoW-mmap of the first PT_LOAD
+        // segment has genuinely `Vmem`-reserved room to place its padded, coarser-aligned view
+        // immediately before this reservation -- see `docs/cow-mmap-fixed-address-design.md`.
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE) + cow_padding_hint;
         let hint = if self.load_high {
             // Reserve the interpreter top-down by passing no hint: LiteBox's
             // `get_unmmaped_area` then runs its top-down search and returns
@@ -93,7 +101,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // platform honoring an out-of-range hint.
             0
         } else {
-            super::DEFAULT_LOW_ADDR
+            // `DEFAULT_LOW_ADDR` alone is a single fixed hint shared by every guest ET_DYN/PIE
+            // image load, with no randomization at all -- unlike real Linux's ASLR, which exists
+            // specifically to avoid two independent processes' preferred load addresses (or a
+            // process's own image and another thread's stack) crowding the same narrow address
+            // neighborhood under litebox's shared-real-address-space model. Salting with the
+            // guest PID (genuinely distinct per process) spreads successive PIE processes' preferred
+            // load addresses across a wider low-address band, real, low-risk hardening for actual
+            // `ET_DYN` binaries. NOTE: this does NOT address the specific `gcc`-under-litebox crash
+            // this investigation traced (see `AGENTS.md`) -- that crash's binary is `ET_EXEC` (not
+            // `ET_DYN`), which takes the OTHER branch of `loader.rs`'s `load()` (`base_addr = 0`,
+            // fixed addresses baked into the ELF, no hint, no reservation, this function's `hint`
+            // value never consulted for it) -- confirmed live: this fix compiles and is harmless,
+            // but the `ET_EXEC` collision class needs a different fix (in `allocate_pages`'s own
+            // foreign-claim/collision handling, not here) -- see `AGENTS.md` for the precise,
+            // still-open next step for that.
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "pid is always non-negative in practice"
+            )]
+            // The stride must exceed a whole process image, or it spreads nothing.
+            //
+            // This was `PAGE_SIZE * 64` -- 256 KiB per pid. A real guest image plus its heap is
+            // TENS OF MEGABYTES (Xvfb's own claims here span 0x10040000-0x12144000, ~33 MiB), so
+            // consecutive pids' "spread" bases landed deep inside one another and the salt bought
+            // nothing. Measured directly: with two concurrently-live processes, pid 4 (Xvfb) and
+            // pid 9 (xfwm4) received IDENTICAL claims for both the ELF load base
+            // (0x10040000-0x10063000) and the heap (0x11063000-0x11084000). Loading the second
+            // process wrote over the first's live memory, and Xvfb then jumped through a NULL
+            // function pointer (rip=0x0) and aborted -- which is what kept the XFCE desktop from
+            // ever rendering.
+            //
+            // 256 MiB per pid is wider than any image this runs, and the band wraps at 1024 pids
+            // so a long-lived guest cannot walk the hint out of `TASK_ADDR_MAX`. This only moves
+            // the PREFERRED address: the hint stays advisory, and every existing collision check
+            // (`has_committed_page`, `find_foreign_claim`) still applies on top of it.
+            // 4 GiB, not 256 MiB. The first widening (256 KiB -> 256 MiB) stopped Xvfb (~33 MiB
+            // of mappings) colliding, but a big guest process spans far more than that: python3
+            // pulling in mesa maps a single 130 MiB libLLVM on top of its own image, libs and
+            // heap, so consecutive pids at 256 MiB still overlapped and a second python3 crashed
+            // with SIGSEGV while a first was live. A whole 32-bit address space per pid is wider
+            // than any process this runs. The band still wraps at 1024 pids, which spans 4 TiB --
+            // comfortably inside `TASK_ADDR_MAX` (~140 TiB) with room for the OS-picked mappings
+            // that live above it.
+            const PID_SALT_STRIDE: usize = 4 * 1024 * 1024 * 1024;
+            let pid_salt = (self.task.pid.get() as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
+            super::DEFAULT_LOW_ADDR + pid_salt
         };
         let mapping_ptr = self
             .task
@@ -117,6 +170,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             mapping_len,
             len,
             align,
+            cow_padding_hint,
         );
         if let Some((addr, size)) = regions.head_unmap {
             self.task.sys_munmap(UserPtrMut::from_usize(addr), size)?;
@@ -178,6 +232,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,
+    /// This process's auxiliary vector, serialized in `/proc/[pid]/auxv` form, exactly as written
+    /// to the initial stack -- see `UserStack::push_aux`. Carried out of the loader because the
+    /// complete vector only exists here: the caller supplies some entries, `load` adds the ones
+    /// that depend on where the image landed (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`), and the stack
+    /// writer adds `AT_RANDOM` last.
+    pub auxv: Vec<u8>,
 }
 
 /// Loader for ELF files
@@ -198,6 +258,25 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         path: impl litebox::path::Arg,
     ) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
+        // DIAG (this investigation pass): confirm exactly what this open actually reads,
+        // independent of the ELF header parse -- an earlier pass's ELF-header-patch workaround
+        // attempt showed the loaded program headers never reflecting an externally-edited/
+        // reimported tar's content across many verified-correct attempts; this reads the file's
+        // real size plus a small prefix directly to settle whether the FILE CONTENT ITSELF
+        // differs from what was staged.
+        {
+            use litebox_common_linux::loader::ReadAt as _;
+            let mut probe = [0u8; 16];
+            let size = (&file).size().ok();
+            let read_ok = (&file).read_at(0, &mut probe).is_ok();
+            litebox_util_log::debug!(
+                fd:% = file.fd,
+                size:? = size,
+                read_ok:% = read_ok,
+                prefix:? = probe;
+                "DIAG elf_load: FileAndParsed::new opened file, size+prefix"
+            );
+        }
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
 
@@ -235,9 +314,40 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         } else {
             None
         };
-        let result = self
-            .parsed
-            .load(&mut self.file, &mut &*platform, reserve, apply_relocations);
+        // DIAG (this investigation pass): dump every PT_LOAD segment's raw header fields right
+        // before `load()` performs its BSS zero-fill writes -- a fatal, near-null/garbage-address
+        // `write_u8_fallible` fault has been traced (this session) to `ElfParsedFile::load`'s
+        // zero-fill call (`litebox_common_linux/src/loader.rs:466`), and the leading hypothesis is
+        // a corrupted/torn read of a program header (`p_vaddr`/`p_filesz`/`p_memsz`) under
+        // concurrent fork-heavy access to the same underlying file. If any of these values look
+        // implausible (`p_vaddr` far outside the binary's expected load range, `p_filesz >
+        // p_memsz` despite the loader's own guard, etc.) right before the crash, that confirms the
+        // hypothesis directly.
+        for ph in self.parsed.pt_loads_diag() {
+            litebox_util_log::debug!(
+                p_vaddr:% = alloc::format!("{:#x}", ph.p_vaddr),
+                p_filesz:% = alloc::format!("{:#x}", ph.p_filesz),
+                p_memsz:% = alloc::format!("{:#x}", ph.p_memsz),
+                p_offset:% = alloc::format!("{:#x}", ph.p_offset),
+                p_flags:% = ph.p_flags;
+                "DIAG elf_load: PT_LOAD segment"
+            );
+        }
+        // `0x1_0000` (64KiB) is Windows' `MapViewOfFile3` allocation-granularity requirement --
+        // the only host this CoW-padding optimization currently supports (see
+        // `docs/cow-mmap-fixed-address-design.md`); every other host passes `None` and gets
+        // exactly today's behavior (`cow_padding_hint` always `0`).
+        #[cfg(target_os = "windows")]
+        let cow_alignment = Some(0x1_0000);
+        #[cfg(not(target_os = "windows"))]
+        let cow_alignment = None;
+        let result = self.parsed.load(
+            &mut self.file,
+            &mut &*platform,
+            reserve,
+            apply_relocations,
+            cow_alignment,
+        );
         Ok(result?)
     }
 }
@@ -245,12 +355,29 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
 impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     /// Parses an ELF file from the given path.
     pub fn new(task: &'a Task<Platform, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
+        // DIAG (this investigation pass): warn-level (unlike sys_open's own debug-level path
+        // logging) so this survives in captures that use LITEBOX_LOG=warn to actually reach a
+        // slow-to-trigger crash without debug-level's much higher verbosity timing it out first.
+        litebox_util_log::debug!(path:% = path; "DIAG elf_load: ElfLoader::new main path");
+        // AGENTS.md pass 260: log the load base for every ELF this loader handles so a future
+        // guest-exception capture's `rip` can be matched against these ranges by hand to
+        // identify which file (and, via the path + `nm`/`objdump` on that exact file, which
+        // symbol) actually crashed -- litebox has no `/proc/self/maps` for the guest to
+        // introspect itself, so this is the only available source of file<->address mapping.
+        litebox_util_log::debug!(
+            path:% = path;
+            "diag-elf-load-path: tracking for future crash-address correlation"
+        );
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
             // e.g., /lib64/ld-linux-x86-64.so.2
+            litebox_util_log::debug!(
+                interp_name:? = interp_name;
+                "DIAG elf_load: ElfLoader::new interp path"
+            );
             let mut interp = FileAndParsed::new(task, interp_name)?;
             // Linux places the ET_EXEC interpreter high so brk can grow above
             // the fixed-address main image without hitting ld.so.
@@ -274,15 +401,38 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
 
         // Load the main ELF file first so that it gets privileged addresses.
         //
-        // Only a true static-PIE main executable (no PT_INTERP) needs its
-        // relocations applied externally here, matching the real kernel's
-        // binfmt_elf.c. When an interpreter is present, ld.so relocates both
-        // itself and the main executable via its own internal machinery
-        // (e.g. musl's _dlstart_c self-relocation); applying relocations here
-        // too would double-relocate and corrupt the image.
-        let info = self
-            .main
-            .load_mapped(global.platform, self.interp.is_none())?;
+        // NEVER apply relocations here, for either branch. The real Linux kernel's
+        // `binfmt_elf.c` does not process `PT_DYNAMIC`/`R_X86_64_RELATIVE` relocations for
+        // ANY ELF type -- it only maps `PT_LOAD` segments at a chosen base and hands off via
+        // `AT_PHDR`/`AT_ENTRY`/`AT_BASE`. Relocation is always performed by code that runs
+        // AFTER the kernel hands off, never by the kernel itself:
+        //  - dynamically-linked (`PT_INTERP` present): `ld.so` relocates both itself and the
+        //    main executable via its own internal machinery.
+        //  - static-PIE (`ET_DYN`, no `PT_INTERP`): the C library's OWN `_start`/crt code
+        //    (glibc's `_dl_relocate_static_pie`, musl's `_dlstart_c`/`__dls2`) unconditionally
+        //    self-relocates via its `_DYNAMIC` section before calling `__libc_start_main` --
+        //    this is the entire point of static-PIE support: it must work under a kernel with
+        //    no relocation-processing capability, so glibc/musl never skip this step and have
+        //    no way to detect whether a loader already did it for them.
+        // A previous version of this loader applied `R_X86_64_RELATIVE`/RELR relocations here
+        // for the static-PIE (no-PT_INTERP) branch, on the mistaken premise that the kernel
+        // does this and litebox needed to emulate it. Live-caught (2026-09-22, `ldconfig`
+        // under `debian-xfce`, real static-PIE binary, isolated single-process repro with zero
+        // fork/concurrency): the RELR decoder's own relocation formula reads the PRE-EXISTING
+        // slot value and adds `base_addr` to it (RELR carries no explicit addend -- the
+        // existing content IS the addend, by design). Applying it once here and then AGAIN via
+        // glibc's own unconditional self-relocation added `base_addr` TWICE to every
+        // RELR-covered slot, corrupting them into doubled/garbage pointers -- confirmed via a
+        // live VEH register capture showing `rbx` (a pointer freshly loaded from one such slot)
+        // holding almost exactly double a genuine base-address-shaped sibling register, then
+        // faulting as `add (%rbx),%rdx` dereferenced it. Removing the external relocation pass
+        // entirely (relying solely on the binary's own self-relocation, exactly matching real
+        // kernel behavior for every ELF type) is the correct fix, not a narrower "only skip
+        // RELR" patch: plain `DT_RELA` `R_X86_64_RELATIVE` fixups are idempotent under double
+        // application (same fixed formula, same target, both times) and were merely silently
+        // redundant, not visibly broken, so this bug could easily have re-surfaced on the very
+        // next static-PIE binary using RELR encoding rather than legacy RELA.
+        let info = self.main.load_mapped(global.platform, false)?;
 
         // Load the interpreter ELF file, if any. The interpreter always
         // self-relocates itself before running any of its own library code,
@@ -299,6 +449,15 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
         aux.insert(AuxKey::AT_PHNUM, info.num_phdrs);
         aux.insert(AuxKey::AT_ENTRY, info.entry_point);
+        litebox_util_log::debug!(
+            main_base:% = alloc::format!("{:#x}", info.base_addr),
+            main_entry:% = alloc::format!("{:#x}", info.entry_point),
+            main_phdrs_addr:% = alloc::format!("{:#x}", info.phdrs_addr),
+            main_num_phdrs:% = info.num_phdrs,
+            interp_base:% = interp.as_ref().map_or_else(|| alloc::string::String::from("none"), |i| alloc::format!("{:#x}", i.base_addr)),
+            interp_entry:% = interp.as_ref().map_or_else(|| alloc::string::String::from("none"), |i| alloc::format!("{:#x}", i.entry_point));
+            "diag-elf-load: aux vector base/entry values"
+        );
         let entry = if let Some(interp) = &interp {
             aux.insert(AuxKey::AT_BASE, interp.base_addr);
             interp.entry_point
@@ -322,19 +481,27 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
             super::DEFAULT_STACK_SIZE,
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
-        stack
-            .init(argv, envp, aux, global.platform)
+        let auxv = stack
+            .init(argv, envp, aux, global.platform, self.path)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
+            auxv,
         })
     }
 
     /// Returns the command name from the ELF path.
     pub fn comm(&self) -> &[u8] {
         self.path.rsplit('/').next().unwrap_or("unknown").as_bytes()
+    }
+
+    /// Returns the resolved absolute guest path this loader was constructed with -- the same
+    /// path `execve` resolved the running binary to. Backs `/proc/self/exe`'s symlink target
+    /// (see `litebox::fs::procfs::ProcSelfInfo::exe_path`'s doc comment).
+    pub fn path(&self) -> &str {
+        self.path
     }
 }
 

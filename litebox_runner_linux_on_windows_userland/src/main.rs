@@ -9,6 +9,24 @@ fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_linux_on_windows_userland::CliArgs;
 
+    // Track-B investigation (fork-without-exec hang), checked FIRST, before even
+    // `is_wait4_probe_child`/`is_diagnostic_resume_child`: see `process_fork::
+    // run_external_fault_watchdog_child`'s own doc comment for the full evidence trail behind
+    // this process's existence -- a same-process watchdog thread was independently confirmed
+    // live to also stop ticking during the exact whole-process kernel-level freeze this exists to
+    // recover from, so only a genuinely external process (this one) can reliably terminate a
+    // wedged run. Never returns.
+    if litebox_platform_windows_userland::process_fork::is_fault_watchdog_child() {
+        litebox_platform_windows_userland::process_fork::run_external_fault_watchdog_child();
+    }
+
+    // Spawn this run's own external fault-terminate watchdog (a hidden, detached child of THIS
+    // process, re-executing this same binary) before any other initialization -- as early as
+    // possible, so the supervision window covers as much of this process's lifetime as it
+    // reasonably can. Best-effort/non-fatal; see `spawn_external_fault_watchdog`'s own doc
+    // comment.
+    litebox_platform_windows_userland::process_fork::spawn_external_fault_watchdog();
+
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     // `--session-daemon <runner-exe>` is this binary's own daemon-mode entry point (spawned
@@ -46,11 +64,22 @@ fn main() -> anyhow::Result<()> {
         // `resume_and_observe`/`inject_and_observe` stop reading this child's stdout pipe the
         // moment they see that marker, so any diagnostic output emitted AFTER it would never
         // reach the parent. See `diag_process_fork_globalstate_probe`'s own doc comment.
+        // Before the probe, so a cross-process fork child's own `LITEBOX_LOG` output actually
+        // appears -- `run()` (which normally installs this) is never reached on this branch.
+        litebox_runner_linux_on_windows_userland::init_logging();
         litebox_runner_linux_on_windows_userland::diag_process_fork_globalstate_probe();
         litebox_platform_windows_userland::process_fork::run_diagnostic_resume_child();
         return Ok(());
     }
 
+    // Advisor-db diagnostics (`LITEBOX_STRACE_SUMMARY=1` summary + always-on process tree): the
+    // actual print call lives in `litebox_shim_linux::syscalls::process`, triggered when the
+    // bootstrap (top-level) guest process exits -- see
+    // `Task::print_diag_reports_if_bootstrap_process`'s doc comment for why: `run()` below
+    // terminates the whole runner process via `std::process::exit`, which on Windows calls
+    // `ExitProcess` directly and does NOT run registered C-runtime `atexit` handlers (confirmed
+    // live against this exact binary/toolchain, a `libc::atexit` registration here never fired),
+    // so there is no reliable post-`run()` hook point left inside code this task may edit.
     litebox_runner_linux_on_windows_userland::run(CliArgs::parse())
 }
 

@@ -299,10 +299,71 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
     }
 }
 
+/// DIAG (AGENTS.md pass 207): allocation-free (`WriteFile`-on-stack, no heap, no stdio lock --
+/// same rationale as `litebox_platform_windows_userland`'s own `diag_raw_print`, since a
+/// diagnostic added at this exact call site was previously proven to sometimes need to survive
+/// re-entry from a thread whose heap/lock state may already be suspect) raw print of a
+/// near-null destination pointer passed to a single-byte fallible write. Gated on `dst < 0x1000`
+/// so it only ever fires for genuinely anomalous (never legitimately guest-mapped) addresses --
+/// zero overhead on every ordinary write. Exists specifically to catch the pass 206 mystery
+/// (a `write_u8_fallible` fault at `fault_addr=0x2e` immediately following a `memset_fallible`
+/// fault, call site never identified) red-handed with its exact `dst` value.
+#[cfg(target_os = "windows")]
+fn diag_near_null_write(dst: usize) {
+    if dst >= 0x1000 {
+        return;
+    }
+    let mut line = [0u8; 64];
+    let mut pos = 0usize;
+    let prefix = b"[diag-near-null-write] dst=0x";
+    line[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    // Minimal hex formatting, no `format!`/allocation.
+    let mut hexbuf = [0u8; 16];
+    let mut v = dst;
+    let mut hpos = 16;
+    if v == 0 {
+        hpos -= 1;
+        hexbuf[hpos] = b'0';
+    }
+    while v > 0 {
+        hpos -= 1;
+        let nib = (v & 0xf) as u8;
+        hexbuf[hpos] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
+        v >>= 4;
+    }
+    let hex = &hexbuf[hpos..];
+    let n = hex.len().min(line.len() - pos);
+    line[pos..pos + n].copy_from_slice(&hex[..n]);
+    pos += n;
+    line[pos] = b'\n';
+    pos += 1;
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let mut written: u32 = 0;
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                handle,
+                line.as_ptr(),
+                pos as u32,
+                &raw mut written,
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
         let dst = V::validate(dst)?;
+        #[cfg(target_os = "windows")]
+        diag_near_null_write(dst as usize);
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
         // memcpy). This match will be evaluated at compile time, so there is no
@@ -338,6 +399,43 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
             }
         })
         .ok()
+    }
+
+    fn compare_exchange_at_offset(self, count: isize, current: T, new: T) -> Option<Result<T, T>> {
+        // Only 4-byte words, which is what every futex protocol uses. Refusing other sizes keeps
+        // the "atomic" in this method's name true rather than quietly degrading.
+        if size_of::<T>() != 4 {
+            return None;
+        }
+        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+        let dst = V::validate(dst)?;
+        if !(dst as usize).is_multiple_of(align_of::<u32>()) {
+            return None;
+        }
+        // SAFETY: `T` is 4 bytes and `FromBytes + IntoBytes`, so it shares a representation with
+        // `u32`; `V::validate` has confirmed the address is accessible to the guest and the
+        // alignment check above makes the atomic well-defined. The access runs inside
+        // `with_user_memory_access` like every other access here.
+        //
+        // This is a genuine `AtomicU32::compare_exchange` rather than the exception-table
+        // fallible helpers because there is no fallible compare-exchange: a fault here would not
+        // be recoverable through the table. `V::validate` is what stands in for that, and it is
+        // the same guarantee the surrounding writes rely on.
+        V::with_user_memory_access(|| unsafe {
+            let cur: u32 = core::mem::transmute_copy(&current);
+            let nxt: u32 = core::mem::transmute_copy(&new);
+            let atomic = &*dst.cast::<core::sync::atomic::AtomicU32>();
+            match atomic.compare_exchange(
+                cur,
+                nxt,
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(v) => Ok(core::mem::transmute_copy::<u32, T>(&v)),
+                Err(v) => Err(core::mem::transmute_copy::<u32, T>(&v)),
+            }
+        })
+        .into()
     }
 
     fn mutate_subslice_with<R>(
@@ -383,5 +481,41 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
         .ok()
+    }
+
+    // Overridden for the same reason as `write_slice_at_offset` above: a single bulk
+    // `memset_fallible` covered by ONE fault-recovery region instead of `len` individual
+    // `write_at_offset` calls, each its own full VEH round-trip when the target page is not yet
+    // backed. Confirmed live: `ElfParsedFile::load`'s zero-fill of a freshly `map_file`'d ELF
+    // segment's BSS tail (up to several KiB) via the OLD per-byte loop produced a fatal,
+    // unrecoverable secondary fault during Windows exception unwind, plausibly from VEH-reentrancy
+    // exhaustion after enough single-byte round-trips in a tight loop -- this bulk path takes at
+    // most one such round-trip for the whole fill, regardless of `len`. Only takes the fast path
+    // for the all-zero-byte case this trait method exists to serve (`T = u8`, `value == 0`); any
+    // other element type/value falls back to the default per-element loop, unchanged.
+    fn fill_at_offset(self, count: isize, len: usize, value: T) -> Option<()>
+    where
+        T: Clone,
+    {
+        if len == 0 {
+            return Some(());
+        }
+        if size_of::<T>() == 1 {
+            // SAFETY: `T` is exactly one byte per the `size_of::<T>() == 1` check just above, so
+            // reinterpreting `&value` as `&u8` reads exactly the bytes `value` occupies.
+            let value_byte = unsafe { *(&raw const value).cast::<u8>() };
+            if value_byte == 0 {
+                let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+                let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, len))?;
+                return V::with_user_memory_access(|| unsafe {
+                    crate::mm::exception_table::memset_fallible(dst.cast(), len)
+                })
+                .ok();
+            }
+        }
+        for offset in count..count.checked_add_unsigned(len)? {
+            self.write_at_offset(offset, value.clone())?;
+        }
+        Some(())
     }
 }

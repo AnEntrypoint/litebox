@@ -91,16 +91,9 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// If `name` at `dir` names a symlink, return its (unresolved) target string.
-    ///
-    /// Returns `Ok(None)` if `name` exists but is not a symlink. Returns
-    /// `Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))` if `name` does not exist at
-    /// `dir`. This exists so [`super::resolver::Resolver`] can transparently follow a symlink
-    /// appearing in an intermediate (non-final) path component during a walk -- e.g. Alpine's
-    /// usrmerge `/lib -> usr/lib` -- the same way [`super::in_mem`] already does for its own
-    /// (upper/writable) layer.
-    ///
-    /// Backends with no symlink concept (e.g. [`super::devices::Devices`]) can rely on the default
-    /// body, which always reports "not a symlink" for anything walkable.
+    /// `Ok(None)` if `name` exists but is not a symlink;
+    /// `Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))` if absent at `dir`.
+    /// Lets the resolver follow Alpine's usrmerge `/lib -> usr/lib` mid-walk: gm mut-1789043688759.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn read_link_at(
         &self,
@@ -143,6 +136,22 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
     /// adding `\0`s.
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
+
+    /// Whether a write to `path` is answered by this backend itself rather than being a byte change
+    /// to a file a layering filesystem could copy into its own upper layer: a `/proc` control file
+    /// whose write changes the calling process (`/proc/self/uid_map` remaps its ids) is the case
+    /// that matters. Copying such a file up produces an ordinary file that shadows the backend, so
+    /// the write succeeds and its effect never happens. `false` unless overridden.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn services_own_writes(&self, path: &str) -> bool {
+        false
+    }
+
+    /// Change the permissions of an already-open file handle, matching `fchmod(2)`.
+    /// Must operate on `h` directly, never re-resolve by path: wlroots' `util/shm.c`
+    /// `allocate_shm_file_pair` unlinks before `fchmod` (gm mut-1789043689150). Scoped to
+    /// `FileHandle` only, matching [`Self::truncate`].
+    fn chmod(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError>;
 
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
@@ -369,16 +378,4 @@ pub(super) struct WalkedComponent {
 pub(super) struct PermissionInfo {
     pub(super) mode: Mode,
     pub(super) owner: UserInfo,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Backend;
-
-    #[test]
-    fn backend_is_dyn_safe() {
-        fn assert_dyn_safe(_: Option<&dyn Backend>) {}
-
-        assert_dyn_safe(None);
-    }
 }

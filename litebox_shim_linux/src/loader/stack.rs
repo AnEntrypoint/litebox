@@ -164,10 +164,29 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         Some(())
     }
 
-    /// Push an auxiliary vector to the stack.
+    /// Push an auxiliary vector to the stack, returning the same vector serialized in
+    /// `/proc/[pid]/auxv` form.
     ///
-    /// Returns `None` if the stack has insufficient space.
-    fn push_aux(&mut self, aux: AuxVec) -> Option<()> {
+    /// The serialization is produced HERE, from the same `aux` map in the same call that writes
+    /// the stack, so the file and the stack cannot drift apart. That identity is the entire
+    /// content of `/proc/[pid]/auxv` on real Linux -- the kernel's `fs/proc/base.c` reads it back
+    /// out of `mm->saved_auxv`, the very array it wrote to the initial stack -- and a
+    /// reconstruction assembled anywhere else would be a second implementation free to disagree
+    /// (most easily about `AT_RANDOM`, which is only inserted moments before this call).
+    ///
+    /// Note the stack is written downwards, so `push_aux` emits the terminator first and the
+    /// entries in reverse; the returned bytes are in ascending address order instead, which is
+    /// what a reader of the file expects.
+    fn push_aux(&mut self, aux: AuxVec) -> Option<Vec<u8>> {
+        let mut serialized = Vec::with_capacity((aux.len() + 1) * 2 * size_of::<usize>());
+        for (key, val) in &aux {
+            serialized.extend_from_slice(&(*key as usize).to_ne_bytes());
+            serialized.extend_from_slice(&val.to_ne_bytes());
+        }
+        // The AT_NULL terminator is part of the file's contents, not merely a stack convention.
+        serialized.extend_from_slice(&(AuxKey::AT_NULL as usize).to_ne_bytes());
+        serialized.extend_from_slice(&0usize.to_ne_bytes());
+
         // write end marker
         self.push_usize(0)?;
         self.push_usize(AuxKey::AT_NULL as usize)?;
@@ -175,7 +194,7 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
             self.push_usize(val)?;
             self.push_usize(key as usize)?;
         }
-        Some(())
+        Some(serialized)
     }
 
     /// Initialize the stack for the new process.
@@ -185,11 +204,28 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
         platform: &impl litebox::platform::CrngProvider,
-    ) -> Option<()> {
+        execfn_path: &str,
+    ) -> Option<Vec<u8>> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         self.stack_top
             .write_at_offset::<Platform>(isize::try_from(self.pos).ok()?, 0)?;
+
+        // AT_EXECFN's string, pushed before argv/envp so it sits at the very top of the stack --
+        // where the kernel puts it, above the environment block.
+        //
+        // This is not optional decoration. rustix reads the auxiliary vector, takes AT_EXECFN as a
+        // `*const c_char` and hands it to `CStr::from_ptr`; with the entry absent the pointer is
+        // NULL and the first thing that touches it is glibc's AVX2 `strlen`, which faults on
+        // `vpcmpeqb ymm1, ymm0, [rdi]` with `rdi == 0`. That is precisely how every Rust-coreutils
+        // binary in `linuxserver/webtop:ubuntu-xfce` died: SIGSEGV at cr2=0x0, immediately after
+        // reading a 208-byte /proc/self/auxv.
+        //
+        // Real Linux always supplies this entry (`fs/binfmt_elf.c`: `NEW_AUX_ENT(AT_EXECFN,
+        // bprm->exec)`), so its absence was a gap in this loader, not a quirk of the consumer.
+        let execfn = CString::new(execfn_path).ok()?;
+        self.push_cstring(&execfn)?;
+        aux.insert(AuxKey::AT_EXECFN, self.stack_top.as_usize() + self.pos);
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
@@ -215,12 +251,12 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         let final_pos = self.pos.checked_sub(size)?;
         self.pos -= final_pos - align_down(final_pos, Self::STACK_ALIGNMENT);
 
-        self.push_aux(aux)?;
+        let serialized_auxv = self.push_aux(aux)?;
         self.push_pointers(envp)?;
         self.push_pointers(argvp)?;
 
         self.push_usize(argv.len())?;
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
-        Some(())
+        Some(serialized_auxv)
     }
 }

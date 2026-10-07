@@ -21,6 +21,23 @@ bitflags::bitflags! {
         const EXEC = 1 << 2;
         /// Sharable between processes
         const SHARED = 1 << 3;
+        /// Writes through this region must be private to the writing process, never observed by
+        /// another mapper of the same object -- i.e. `MAP_PRIVATE` semantics over a real
+        /// shared-memory object.
+        ///
+        /// This is not a third access kind next to [`Self::READ`]/[`Self::WRITE`]/[`Self::EXEC`]:
+        /// it qualifies [`Self::WRITE`], and only [`Self::WRITE`]. A region carrying it with
+        /// `WRITE` reads and writes exactly like a writable region, except that a write is
+        /// guaranteed not to reach anyone else. A region carrying it WITHOUT `WRITE` is simply
+        /// read-only, and every platform maps it read-only.
+        ///
+        /// It exists because one platform object can back a mapping the guest believes is
+        /// `MAP_PRIVATE`: `Vmem::map_existing_shared_pages_file_private_cow` serves a large
+        /// private file mapping from a single section so every process shares the physical pages,
+        /// and Windows can only keep that sharing honest through a copy-on-write view
+        /// (`PAGE_WRITECOPY`) -- a `PAGE_READWRITE` view of that section would let one process's
+        /// writes be read by every other mapper of the file.
+        const COPY_ON_WRITE = 1 << 4;
     }
 }
 
@@ -72,6 +89,40 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
+    /// Notification that the guest's mapping over `range` has been removed, whether or not that
+    /// removal also required a real platform-level deallocation.
+    ///
+    /// Distinct from `deallocate_pages` on purpose. A platform may keep bookkeeping keyed by guest
+    /// address (the Windows backend keeps a claim registry used to detect one guest process's fixed
+    /// mapping colliding with another's), and that bookkeeping must be dropped whenever the guest
+    /// stops owning the address -- including on the paths that deliberately do NOT deallocate, such
+    /// as removing a subrange that overlaps a shared view, where the view must stay mapped as a
+    /// whole. Hanging the release off `deallocate_pages` alone left exactly those ranges claimed
+    /// forever.
+    ///
+    /// Default implementation does nothing, so platforms with no such bookkeeping are unaffected.
+    fn release_mapping_claim(&self, _range: core::ops::Range<usize>) {}
+
+    /// Reserve `range` in this process's address space WITHOUT committing any of it.
+    ///
+    /// The point is to own the address range -- so a later guest `mprotect` over it can commit
+    /// pages into it, and so nothing else can be handed that address in the meantime -- while
+    /// paying no memory for it yet. That is exactly the state a `PROT_NONE` mapping is in on a
+    /// platform with reserve/commit separation (Windows): real Linux `mmap(PROT_NONE)` is a
+    /// reservation too, and `mprotect` on it later is what makes it real.
+    ///
+    /// Returns whether `range` ended up backed by real (reserved or committed) memory at its own
+    /// address. `true` includes the case where something had already reserved it, which is the
+    /// common case for a `fork()` child adopting a `PROT_NONE` region that sits inside a span the
+    /// fork's own copy already reserved.
+    ///
+    /// The default answers `false`: a platform that cannot hold reserved-but-uncommitted guest
+    /// address space cannot provide what a caller asked for, and every caller treats `false` as
+    /// "leave this range untracked".
+    fn reserve_pages_without_commit(&self, _range: Range<usize>) -> bool {
+        false
+    }
+
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.
@@ -174,6 +225,16 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 
+    /// Re-read the host's own mappings, so [`Self::reserved_pages`] reflects memory the host
+    /// mapped after this provider was constructed.
+    ///
+    /// Called before duplicating an address space (`fork()`), where a stale answer is not merely
+    /// imprecise: the duplicate is placed with `MAP_FIXED` around the reserved set, so a host
+    /// mapping missing from it can be overwritten -- or, equivalently, left to be written through
+    /// by the host thread that owns it after the guest has been placed on top. The default is a
+    /// no-op, for a platform whose host mappings cannot change behind its back.
+    fn refresh_reserved_pages(&self) {}
+
     /// Attempt to allocate pages with copy-on-write semantics backed by static data.
     ///
     /// This method allows platforms that support it to create CoW mappings instead of performing
@@ -182,6 +243,33 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The default implementation returns unsupported CoW. Platforms that DO support COW should
     /// override this method to unlock better performance.
+    ///
+    /// `verified_safe_padding`: the number of bytes IMMEDIATELY BEFORE `suggested_start`, in
+    /// guest address space, that the CALLER has already confirmed (via a live query against its
+    /// own `Vmem` tracking, not a static inference) are a single, contiguous, `PROT_NONE`-
+    /// permission VMA belonging to this exact reservation -- i.e. genuinely safe for a platform
+    /// implementation to host-map into, PROVIDED it also registers that exact range back with
+    /// `Vmem` before returning (see `litebox_shim_linux::syscalls::mm::try_cow_mmap_file`'s own
+    /// query-then-register sequence, the only real caller of this contract today). A platform
+    /// with a strictly-page-offset-aligned CoW API (e.g. real Linux `mmap`) never needs any
+    /// padding and can ignore this parameter entirely. `0` means "no padding verified safe" --
+    /// every implementation MUST treat any padding need beyond this as unsafe and fall back to
+    /// [`CowAllocationError::Unaligned`], never inferring safety on its own. This is a deliberate
+    /// architectural split precisely because a same-day bug (Windows platform CoW padding,
+    /// tracked in this project's own history) was caused by a platform implementation host-
+    /// mapping padding memory `Vmem` never learned about -- the caller-verifies, platform-
+    /// executes-only-what-was-verified split makes that class of bug structurally impossible:
+    /// the platform crate has no `Vmem` access at all and can never itself decide "this is safe."
+    ///
+    /// On success, returns the content pointer (identical to `suggested_start` whenever
+    /// `fixed_address_behavior` was `Replace`/`NoReplace`) alongside `Some((padding_start,
+    /// padding_len))` if this call ALSO host-mapped a padding prefix within the caller-verified
+    /// range (always `None` when `verified_safe_padding` was unused, e.g. because the file
+    /// offset was already aligned). The caller MUST register `Some` padding with its own `Vmem`
+    /// (as an ordinary `PROT_NONE`/guest-inaccessible mapping) BEFORE any guest code can
+    /// possibly execute and reach that address range -- this return value is precisely how the
+    /// platform reports "I mapped extra host memory you don't know about yet" back across the
+    /// `Vmem`-access boundary it cannot cross itself.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn try_allocate_cow_pages(
         &self,
@@ -189,8 +277,28 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        verified_safe_padding: usize,
+    ) -> Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError> {
         Err(CowAllocationError::UnsupportedByPlatform)
+    }
+
+    /// Turns the freshly created `range` -- which the guest mapped with `permissions` -- into a
+    /// demand-paged private mapping of `source_data` (page `i` of the range is page `i` of the
+    /// source, zero past its end): the platform leaves it unfilled and copies each chunk in on
+    /// first touch, so untouched parts of a large file never become resident. Returns `false` when
+    /// unsupported, leaving the range untouched for the caller to fill eagerly.
+    ///
+    /// `permissions` is the protection the guest asked for, and the platform MUST restore exactly
+    /// that (its own translation of it) when it fills a chunk: an executable mapping that comes
+    /// back merely writable is a guest-visible SIGSEGV the first time the guest calls into it.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn try_lazy_file_pages(
+        &self,
+        range: Range<usize>,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+    ) -> bool {
+        false
     }
 
     /// An opaque handle to a platform-level shared-memory object, e.g. a Windows file-mapping
@@ -232,6 +340,88 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
         Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Creates, or opens if it already exists, a NAMED platform-level shared-memory object of
+    /// `size` bytes, identified by `name` rather than by a per-process handle value.
+    ///
+    /// [`Self::create_shared_memory`]'s handle is only ever meaningful in the process that
+    /// created it (or one it was explicitly carried into, e.g. via a fork-time `DuplicateHandle`
+    /// step) -- see that method's own doc comment: "the SAME handle... after a fork". It has no
+    /// answer for two guest processes that are NOT in a fork ancestor/descendant relationship at
+    /// all (ordinary siblings spawned independently, e.g. two ELF execs from the same shell) but
+    /// that still need to attach the SAME underlying memory -- exactly the real-Linux SysV
+    /// `shmget`/`shmat` contract (any process that knows the id can attach, regardless of
+    /// lineage), and exactly the real X11 MIT-SHM handshake (a client creates a segment, tells
+    /// the SERVER -- a genuinely unrelated process -- its id over the wire; the server then
+    /// attaches it locally). A raw handle cannot do this; a NAME can, by construction: any
+    /// process on the same host session can ask its OS for "the shared-memory object called
+    /// `name`" and get a handle to the SAME underlying object, with no cross-process call at all.
+    ///
+    /// This mirrors [`crate::sync`]'s existing `CrossProcessEvent`/named-kernel-object design
+    /// (`litebox_platform_windows_userland::xproc_sync`) for exactly the same reason stated
+    /// there: idempotent create-or-open by name is the only primitive that survives an arbitrary,
+    /// not-necessarily-fork-related process relationship on this platform.
+    ///
+    /// Every caller passing the same `name` MUST pass the same `size` (real behavior: on a
+    /// platform whose underlying primitive fixes size at creation, e.g. Windows
+    /// `CreateFileMappingW`, `size` is honored only for the FIRST caller and silently ignored --
+    /// not rejected -- for every later one, exactly as [`Self::create_shared_memory`]'s own doc
+    /// comment already documents for the single-handle case).
+    ///
+    /// The default implementation returns [`SharedMemoryError::UnsupportedByPlatform`]; see
+    /// [`Self::create_shared_memory`]'s doc comment.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Creates, or opens if it already exists, a NAMED shared-memory object of `size` bytes whose
+    /// bytes live in a real host-side FILE rather than in the platform's page file.
+    ///
+    /// [`Self::create_named_shared_memory`]'s object is pagefile-backed on Windows, so its
+    /// lifetime is the lifetime of the HANDLEs anyone holds on it: once the last process holding
+    /// one exits, the object and every byte written through it are gone. Linux SysV semantics are
+    /// the opposite -- a `shmget` segment keeps its contents, its size and its permissions until
+    /// `shmctl(IPC_RMID)`, whether or not anyone currently has it attached -- and real guest
+    /// programs depend on exactly that producer-then-later-consumer shape (X11 MIT-SHM: a client
+    /// creates a segment and hands its id to the X server, a process that was started earlier and
+    /// is not fork-related to the client at all). A file gives that: `CreateFileMappingW` over the
+    /// same host file in two unrelated processes yields views of the same bytes, and the bytes
+    /// outlive every handle.
+    ///
+    /// Every caller passing the same `name` MUST pass the same `size`, exactly as for
+    /// [`Self::create_named_shared_memory`].
+    ///
+    /// Returns [`SharedMemoryError::UnsupportedByPlatform`] where there is no session-scoped
+    /// scratch directory to put the file in; a caller that can tolerate the weaker (handle-
+    /// lifetime) semantics should fall back to [`Self::create_named_shared_memory`] on that error
+    /// rather than failing.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_file_backed_named_shared_memory(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        Err(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    /// Deletes the host-side file backing a [`Self::create_file_backed_named_shared_memory`]
+    /// object, so a later create with the same `name` starts from zero bytes again.
+    ///
+    /// This is an unlink, not a truncate: mappings of the object already established in any
+    /// process keep working and keep seeing the same bytes (the host file lives until its last
+    /// reference goes), which is exactly what `shmctl(IPC_RMID)` promises -- it drops the NAME
+    /// while leave existing attachers alone. Returns whether the file is gone. `false` only ever
+    /// means it could not be unlinked right now (a mapping still references it); it is never a
+    /// failure the caller must surface, and the caller retries when the last attacher detaches.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn delete_file_backed_named_shared_memory(&self, name: &str) -> bool {
+        false
     }
 
     /// Maps `handle` (from [`Self::create_shared_memory`]) into the address space at
@@ -283,9 +473,140 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<(), SharedMemoryError> {
         Err(SharedMemoryError::UnsupportedByPlatform)
     }
+
+    /// The host-wide name of `handle`, plus which constructor made it, so ANOTHER process can
+    /// re-open the SAME object instead of trying (and failing) to reuse this process's handle
+    /// value -- see [`SharedMemoryName`] and [`SharedObjectKind`].
+    ///
+    /// `None` for an object this platform never gave a name (every created object is named on a
+    /// platform that implements this, which is what makes a `VM_SHARED` mapping survive a
+    /// cross-process fork at all). A `None` here is HONEST: the caller skips the region rather
+    /// than substituting a private copy.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn shared_memory_object_name(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Option<(SharedMemoryName, SharedObjectKind)> {
+        None
+    }
+
+    /// Hand the fork child this process is about to spawn the [`SharedRegionCarry`] list
+    /// describing its `VM_SHARED` mappings. Called on the PARENT immediately before the spawn;
+    /// the platform carries it into the child however this platform carries fork state (an
+    /// environment variable on Windows), where [`Self::carried_fork_shared_regions`] reads it
+    /// back. Passing an empty slice MUST clear any previously exported list -- a stale one from
+    /// an earlier fork would otherwise be inherited by an unrelated later child.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn export_fork_shared_regions(&self, regions: &[SharedRegionCarry]) {}
+
+    /// The [`SharedRegionCarry`] list [`Self::export_fork_shared_regions`] exported into this
+    /// process. Empty for a process that was never spawned as a fork child, and for a platform
+    /// that does not carry it.
+    fn carried_fork_shared_regions(&self) -> alloc::vec::Vec<SharedRegionCarry> {
+        alloc::vec::Vec::new()
+    }
+
+    /// Is the whole of `range` a real view of a shared object in THIS process, as opposed to
+    /// private pages that merely hold the same bytes?
+    ///
+    /// A fork child asks this before it books a carried [`SharedRegionCarry`] as an attachment:
+    /// the parent maps the object into the child while the child is suspended, and only the child
+    /// can confirm the mapping actually landed. Answering `false` must make the caller REFUSE the
+    /// region -- recording a `shared_handle` over a private copy is precisely the silent
+    /// "looks shared, is not" bug this mechanism exists to remove.
+    ///
+    /// Defaults to `true` (take the parent's word) so a platform that does not implement this
+    /// keeps the behavior it had, which is right for every platform whose fork child inherits a
+    /// genuine view by construction (Linux's native fork).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn memory_is_shared_view(&self, range: Range<usize>) -> bool {
+        true
+    }
+}
+
+/// Maximum byte length of a [`SharedMemoryName`].
+///
+/// Bounded and stored inline so a name can sit next to a mapping's own bookkeeping and be copied
+/// verbatim across a process boundary: anything crossing that boundary must be pointer-free (see
+/// `SharedUnixConnTable`'s own pattern in AGENTS.md), and a `String` is not.
+pub const SHARED_MEMORY_NAME_MAX: usize = 128;
+
+/// A host-wide shared-memory object NAME, held inline as bytes (no heap, no pointers).
+///
+/// This is the only part of a shared-memory object's identity that MEANS THE SAME THING in two
+/// different host processes: a `SharedMemoryHandle` is a per-process kernel-object identifier
+/// (`HANDLE` value, fd number) that is simply invalid -- `ERROR_INVALID_HANDLE` / `EBADF` -- in
+/// any process that did not create it or have it duplicated in. A name does not have that
+/// problem: any process on the same host session can ask its OS for "the object called `name`"
+/// and get a handle to the same bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SharedMemoryName {
+    bytes: [u8; SHARED_MEMORY_NAME_MAX],
+    len: u8,
+}
+
+impl SharedMemoryName {
+    /// Record `name`, or `None` if it does not fit in [`SHARED_MEMORY_NAME_MAX`] bytes.
+    pub fn new(name: &str) -> Option<Self> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > SHARED_MEMORY_NAME_MAX {
+            return None;
+        }
+        let mut buf = [0u8; SHARED_MEMORY_NAME_MAX];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            bytes: buf,
+            len: u8::try_from(bytes.len()).ok()?,
+        })
+    }
+
+    /// The recorded name, exactly as [`Self::new`] was given it.
+    pub fn as_str(&self) -> &str {
+        // The only constructor validates UTF-8 (it takes a `&str`) and the length, so this is
+        // infallible; an unexpected failure degrades to an empty name, which every consumer
+        // treats as "not carriable" rather than panicking.
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+/// Which [`PageManagementProvider`] constructor produced a shared object.
+///
+/// Load-bearing for a second process that wants the SAME bytes: a pagefile-backed named section
+/// and a file-backed named section of the same name are two DIFFERENT objects, so re-opening
+/// with the wrong constructor yields a fresh, empty one -- sharing silently lost, which is the
+/// exact failure this whole mechanism exists to prevent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SharedObjectKind {
+    /// [`PageManagementProvider::create_named_shared_memory`].
+    Named,
+    /// [`PageManagementProvider::create_file_backed_named_shared_memory`].
+    FileBacked,
+}
+
+/// One `VM_SHARED` mapping described well enough for ANOTHER host process to map the same object.
+///
+/// Pointer-free by construction (a range, an inline name, two integers), so it can be serialized
+/// into a fork child's environment and read back there.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SharedRegionCarry {
+    /// The guest address range the mapping occupied in the parent.
+    pub range: Range<usize>,
+    /// The host-wide name of the backing object.
+    pub name: SharedMemoryName,
+    /// Which constructor re-opens `name`.
+    pub kind: SharedObjectKind,
+    /// The size the object was created with, so a re-open cannot ask for a shorter one.
+    pub size: usize,
+    /// The mapping's real permissions, so the view the parent creates in the child can be
+    /// narrowed from the widest protection it has to be created with to exactly this.
+    pub perms: MemoryRegionPermissions,
+    /// Raw `VmFlags` bits from the parent, so the child's `VmArea` matches the parent's.
+    pub flags: u32,
 }
 
 /// Possible errors for [`PageManagementProvider::create_shared_memory`],
+/// [`PageManagementProvider::create_named_shared_memory`],
+/// [`PageManagementProvider::create_file_backed_named_shared_memory`],
 /// [`PageManagementProvider::map_shared_memory`],
 /// [`PageManagementProvider::unmap_shared_memory`], and
 /// [`PageManagementProvider::close_shared_memory`].
@@ -377,6 +698,8 @@ pub enum PermissionUpdateError {
     /// comment).
     #[error("platform refused this permission transition")]
     Denied,
+    #[error("out of memory while committing pages")]
+    OutOfMemory,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

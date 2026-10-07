@@ -76,11 +76,21 @@ impl litebox_common_linux::loader::ReadAt for &'_ ElfFileInMemory<'_> {
 impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
     type Error = Errno;
 
-    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+    fn reserve(
+        &mut self,
+        len: usize,
+        align: usize,
+        cow_padding_hint: usize,
+    ) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
-        // still fit `len` bytes.
+        // still fit `len` bytes. `cow_padding_hint` is unused here: this platform has no
+        // CoW-mmap concept (`map_file` always copies into the in-memory ELF buffer, see
+        // this function's own doc comment), so its caller (`litebox_common_linux::loader::load`)
+        // always passes `cow_alignment: None`, making `cow_padding_hint` always `0` in practice
+        // -- accepted anyway to satisfy the shared `MapMemory` trait signature.
         let mapping_len = len
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|v| v.checked_add(cow_padding_hint))
             .ok_or(Errno::ENOMEM)?;
         let mapping_ptr = self
             .task
@@ -103,6 +113,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
             mapping_len,
             len,
             align,
+            cow_padding_hint,
         );
         if let Some((addr, size)) = regions.head_unmap {
             self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
@@ -230,10 +241,13 @@ impl<'a> ElfLoader<'a> {
         }
         let task = self.main.file.task;
         let global = &task.global;
-        let ldelf_info =
-            self.main
-                .parsed
-                .load(&mut self.main.file, &mut &*global.platform, None, true)?;
+        let ldelf_info = self.main.parsed.load(
+            &mut self.main.file,
+            &mut &*global.platform,
+            None,
+            true,
+            None,
+        )?;
 
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
             ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),

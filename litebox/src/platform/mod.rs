@@ -132,6 +132,78 @@ pub trait ThreadProvider: RawPointerProvider {
     fn set_next_spawned_thread_guest_pid(&self, pid: i32) {
         let _ = pid;
     }
+
+    /// Declares the guest stack top a same-process thread clone is about to start on (clone's
+    /// `stack` + `stack_size`), called synchronously before [`spawn_thread`](Self::spawn_thread).
+    /// The context passed to `spawn_thread` still carries the CALLER's stack pointer at that
+    /// point -- the child's is only applied later, on the new thread -- so a platform that must
+    /// know every live thread's stack (to avoid write-protecting it) can only learn it here.
+    /// Default does nothing.
+    fn note_spawned_guest_thread_stack(&self, stack_top: usize) {
+        let _ = stack_top;
+    }
+
+    /// The guest-space process id (`Task::pid`) that the CALLING host thread currently belongs to,
+    /// or `None` if this platform does not track it.
+    ///
+    /// The read side of [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid):
+    /// a platform that already propagates a guest-pid onto each real OS thread it spawns (because
+    /// every guest process here is an OS thread sharing one host process) can answer this for free,
+    /// and every thread of one guest process answers with that process's pid -- a pthread is not a
+    /// different process and must not look like one.
+    ///
+    /// # Why anything needs this
+    ///
+    /// `/proc/self` is per-process BY DEFINITION, but a [`Backend`] is shim-wide: the filesystem is
+    /// built once and shared by every guest process, and nothing in the `Backend` trait carries the
+    /// identity of the caller (`UserInfo` is credentials, not identity). Without this, the only
+    /// implementable behaviour is a single global cell -- which is what `/proc/self` WAS, reporting
+    /// whichever process most recently `execve`'d to every process that read it. For `exe` and
+    /// `cmdline` that is merely wrong; for `auxv` (rustix reads it and unwraps the result) and
+    /// `maps` (Rust's std parses it to find the main thread's stack guard before installing its
+    /// stack-overflow handler) it hands a process another process's address-space facts.
+    ///
+    /// [`Backend`]: crate::fs::backend::Backend
+    fn current_guest_pid(&self) -> Option<i32> {
+        None
+    }
+
+    /// Records that the WHOLE calling host process now is guest process `pid`, for platforms where
+    /// a guest process is a host process of its own (a native `fork()` child) rather than an OS
+    /// thread that [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)
+    /// tags. Backs [`current_guest_pid`](Self::current_guest_pid). Default: nothing.
+    fn set_process_guest_pid(&self, pid: i32) {
+        let _ = pid;
+    }
+
+    /// Temporarily attributes any host-memory-ownership bookkeeping this platform performs
+    /// (see [`set_next_spawned_thread_guest_pid`](Self::set_next_spawned_thread_guest_pid)'s
+    /// doc comment for why such bookkeeping exists at all -- `litebox_platform_windows_userland`'s
+    /// `CLAIMED_RANGES`) to `child_pid` for the duration of `f`, restoring whatever this thread's
+    /// prior attribution was before returning.
+    ///
+    /// The shim calls this to wrap `PageManager::duplicate()`'s eager address-space copy during
+    /// `fork()` (`do_clone`, before the child's own real OS thread exists to claim its own
+    /// memory): that copy necessarily runs on the PARENT's thread, so every allocation it makes
+    /// for the child's new mappings would otherwise be attributed to the PARENT's own identity.
+    /// On a platform whose collision defense treats same-owner ranges as mutually non-foreign
+    /// (exactly what makes ordinary sequential `mmap` growth on one thread cheap), two SIBLING
+    /// children of the same parent forking concurrently would then be invisible to each other's
+    /// collision checks for the whole duration of this copy -- both attributed to the same
+    /// parent owner -- letting one child's `Replace`-mode placement silently decommit/recommit
+    /// directly over a sibling child's still-copying memory with no fault, no relocation, and no
+    /// diagnostic. Attributing the copy to the CHILD's own future pid instead (known before
+    /// `duplicate()` runs -- the shim allocates it first) makes two concurrently-duplicating
+    /// children mutually foreign for the whole vulnerable window, exactly like two unrelated
+    /// guest processes, restoring the existing foreign-claim defense's coverage of this case.
+    ///
+    /// Default implementation just runs `f()` with no attribution change; platforms with no such
+    /// per-thread ownership bookkeeping (i.e. every platform except
+    /// `litebox_platform_windows_userland`) can ignore this entirely.
+    fn with_fork_duplicate_claim_owner<R>(&self, child_pid: i32, f: impl FnOnce() -> R) -> R {
+        let _ = child_pid;
+        f()
+    }
 }
 
 #[non_exhaustive]
@@ -264,14 +336,197 @@ pub trait RawMutex: Send + Sync + 'static {
         val: u32,
         time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
+
+    /// Best-effort hook: called by [`crate::sync::Mutex`] right after this raw mutex's underlying
+    /// atomic transitions from unlocked to locked (by the thread that just acquired it), before any
+    /// of the data it protects is touched. No-op by default.
+    ///
+    /// Exists for a platform whose `RawMutex` can be embedded directly in memory shared across a
+    /// process boundary (`litebox_platform_windows_userland`'s Track B shared kernel arena is the
+    /// only one today): such a platform can use this, together with [`Self::note_unlocked`], to
+    /// record enough about the current holder (e.g. its process id) that a later waiter stuck long
+    /// enough to suspect the holder died mid-hold -- the exit path of a cross-process-fork child
+    /// skips ordinary `Drop`-based unlocking by design, see that platform's own `RawMutex::block`
+    /// doc comment for the live `cdb`-confirmed orphaned-lock evidence this exists to recover from
+    /// -- can tell a genuinely-dead holder apart from one that is merely slow, without requiring
+    /// every platform (most of which have no such holder-death hazard at all) to pay for it.
+    fn note_locked(&self) {}
+
+    /// The `unlock` counterpart of [`Self::note_locked`] -- called right before this raw mutex's
+    /// underlying atomic transitions back to unlocked. No-op by default.
+    fn note_unlocked(&self) {}
+
+    /// Reads and clears, in one atomic step, whether a dead-holder recovery has forced this raw
+    /// mutex back open since the last call. `false` by default, including on every platform that
+    /// never performs such recovery in the first place (only `litebox_platform_windows_userland`'s
+    /// `RawMutex` does today -- see its own `poisoned` field doc comment for the full defect this
+    /// exists to surface: a dead holder's in-flight critical section can leave the data this mutex
+    /// protects mid-mutation/torn, which forcing the LOCK back open does nothing by itself to
+    /// repair).
+    ///
+    /// Deliberately NOT wired into ordinary [`crate::sync::Mutex::lock`] for every caller -- most
+    /// `Mutex<Platform, T>` instances in this codebase have no well-defined "safe default" to reset
+    /// `T` to, and unconditionally discarding their state on every dead-holder recovery would be
+    /// its own correctness regression. [`crate::sync::Mutex::lock_recovering_poison`] is the one
+    /// opt-in call site that consults this.
+    fn take_poison(&self) -> bool {
+        false
+    }
+}
+
+/// Identifies WHICH shared-kernel-singleton a [`SharedKernelStateProvider::create_shared_kernel_state`]/
+/// [`SharedKernelStateProvider::attach_shared_kernel_state`] call is for.
+///
+/// A platform backing this with a small, fixed number of named/env-var-carried offsets (today:
+/// `litebox_platform_windows_userland`'s `SharedArc<T>`, one arena allocation per slot) needs a
+/// stable identifier distinguishing [`crate::litebox::LiteBox`]'s own `LiteBoxX` singleton from
+/// `litebox_shim_linux::GlobalState`'s, since a bare generic `T` carries no runtime identity and
+/// both are created once per process, at two different call sites, at two different times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedKernelStateSlot {
+    /// [`crate::litebox::LiteBox`]'s own inner `LiteBoxX`.
+    LiteBoxX,
+    /// `litebox_shim_linux::GlobalState`'s inner singleton.
+    ShimGlobalState,
+}
+
+/// A provider of "create-or-attach" shared kernel state across a cross-process fork family.
+///
+/// LiteBox's top-level "kernel singleton" structures ([`crate::litebox::LiteBox`]'s own inner
+/// `LiteBoxX`, `litebox_shim_linux::GlobalState`) are ordinary `Arc`-refcounted, process-local
+/// heap allocations by default -- correct on a host with a real `fork()` (a native `fork()`
+/// already gives every child an automatic, correct COPY of the parent's whole address space,
+/// including that `Arc`'s backing allocation -- see [`ForkChildVerificationProvider`]'s own doc
+/// comment for the analogous point about stale pointers staying valid there) and correct on a
+/// host with no cross-process fork mechanism at all.
+///
+/// A platform whose emulated `fork()` can produce a genuinely SEPARATE OS process (Windows
+/// userland's `LITEBOX_PROCESS_FORK=1` cross-process fork child; see
+/// `litebox_platform_windows_userland`'s `SharedArc<T>`) cannot rely on that automatic
+/// copy-on-fork behavior: each such process independently calls `LiteBox::new`/
+/// `LinuxShimBuilder::build` at its own startup and would otherwise construct its OWN, private
+/// singleton -- a "consistent fixed-address placement, independent copy" that merely LOOKS
+/// shared (both processes may even land the allocation at the identical address) but silently
+/// diverges the moment either side mutates it, since each is really backed by separate physical
+/// pages. This trait lets such a platform instead hand every process in the fork family a
+/// genuinely shared, live instance: the root process of a fork family (never itself a fork
+/// child) creates it via [`Self::create_shared_kernel_state`]; an attach-eligible descendant
+/// instead calls [`Self::attach_shared_kernel_state`] to obtain its own independently-owned
+/// handle to the SAME live allocation the root created.
+///
+/// Mirrors [`ForkChildVerificationProvider`]'s "correct-but-unverified by default" shape: every
+/// method here has a default that is always sound. [`Self::is_shared_kernel_state_attach_child`]
+/// defaults to `false`, so a platform that never overrides anything here gets EXACTLY today's
+/// existing "always construct fresh" behavior -- unconditionally correct on every platform with
+/// real per-process OS isolation (a native `fork()`, or no cross-process fork at all); see
+/// [`ForkChildVerificationProvider`]'s own doc comment for why platforms with genuine
+/// per-guest-process OS-level memory isolation need no analogous mechanism at all.
+pub trait SharedKernelStateProvider {
+    /// An owning handle to a `T` that may be backed by genuinely shared cross-process memory on
+    /// a platform that supports it. Mirrors `alloc::sync::Arc<T>`'s ergonomics (`Clone`,
+    /// `Deref`) exactly, so call sites need no further changes beyond swapping which type
+    /// constructs the handle.
+    type Handle<T: Send + Sync + 'static>: Clone
+        + core::ops::Deref<Target = T>
+        + Send
+        + Sync
+        + 'static;
+
+    /// Whether the CALLING process should [`Self::attach_shared_kernel_state`] to an ancestor's
+    /// already-existing shared allocation for `slot`, rather than
+    /// [`Self::create_shared_kernel_state`] a fresh one of its own.
+    ///
+    /// `true` only for a cross-process fork child on a platform that both supports shared
+    /// attach AND has confirmed (by whatever platform-specific means, e.g. an inherited
+    /// fixed-base shared section landing at the expected address) that it can actually reach
+    /// the SAME allocation its ancestor created. Every other case -- the very first process in
+    /// a fork family, an ordinary same-process (thread-based) fork child, any process on a
+    /// platform with a real native `fork()` (which already gives correct, isolated per-process
+    /// state for free, see [`Self::create_shared_kernel_state`]'s own doc comment), or an
+    /// attach attempt that could not be confirmed safe -- returns `false`, the default.
+    #[expect(
+        unused_variables,
+        reason = "slot unused by the correct-but-unshared default"
+    )]
+    fn is_shared_kernel_state_attach_child(&self, slot: SharedKernelStateSlot) -> bool {
+        false
+    }
+
+    /// Places `value` into a fresh, potentially cross-process-shared allocation for `slot` and
+    /// returns an owning handle to it. Called by whichever process is the root of its fork
+    /// family (or by every process, on a platform that never returns `true` from
+    /// [`Self::is_shared_kernel_state_attach_child`] -- the default implementation here is an
+    /// ordinary `Arc::new`, correct on every such platform and identical to what every call site
+    /// did before this trait existed).
+    fn create_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: SharedKernelStateSlot,
+        value: T,
+    ) -> Self::Handle<T>;
+
+    /// Attaches to an existing `slot` allocation a prior [`Self::create_shared_kernel_state`]
+    /// call (in an ancestor process) produced, per whatever platform-specific handoff mechanism
+    /// that platform already uses to carry its shared-memory section from parent to child. Only
+    /// ever called when [`Self::is_shared_kernel_state_attach_child`] returned `true` for this
+    /// SAME `slot`, in the SAME fork family.
+    ///
+    /// Returns `None` if the attach cannot be completed (e.g. no handoff value was found for
+    /// this slot, or the shared section was not actually inherited) -- callers must fall back to
+    /// [`Self::create_shared_kernel_state`] exactly as if this process were not an attach child
+    /// at all. The default implementation always returns `None`, matching platforms that never
+    /// return `true` from [`Self::is_shared_kernel_state_attach_child`] (they never call this at
+    /// all).
+    #[expect(
+        unused_variables,
+        reason = "slot unused by the always-None correct-but-unshared default"
+    )]
+    fn attach_shared_kernel_state<T: Send + Sync + 'static>(
+        &self,
+        slot: SharedKernelStateSlot,
+    ) -> Option<Self::Handle<T>> {
+        None
+    }
+
+    /// Allocates `layout`-sized raw bytes in the same potentially-cross-process-shared arena
+    /// [`Self::create_shared_kernel_state`] itself uses, for FIXED-CAPACITY, pointer-free
+    /// "slot array" storage that must live at a fixed, cross-process-valid address but cannot be
+    /// expressed as an owned `T` handed to [`Self::create_shared_kernel_state`] -- the caller
+    /// wants a `'static`-lifetime slice/reference INTO the allocation (e.g. smoltcp's own
+    /// `SocketSet::new(&'static mut [SocketStorage<'static>])`, a self-referential shape no
+    /// owning handle can express), not an owning handle to it.
+    ///
+    /// Never reclaimed, matching every other [`Self::create_shared_kernel_state`] allocation on
+    /// a platform that actually shares this arena cross-process (bump allocator, no free list --
+    /// see `litebox_platform_windows_userland::SharedArc`'s own doc comment for why that is
+    /// deliberate, not an oversight, for kernel-singleton-shaped state: this call is meant for
+    /// FIXED, session-lifetime-sized allocations decided once up front, e.g.
+    /// [`litebox::net::Network`]'s own bounded socket-slot table, never for per-connection or
+    /// otherwise unboundedly-repeated allocation, which would exhaust a bounded shared pool).
+    ///
+    /// Returns `None` on allocation failure (arena exhaustion on a platform with a bounded
+    /// shared pool). The default implementation uses the ordinary global allocator -- correct on
+    /// every platform without genuine cross-process shared memory, exactly like
+    /// [`Self::create_shared_kernel_state`]'s own `Arc::new` default.
+    fn shared_kernel_arena_alloc_bytes(
+        &self,
+        layout: core::alloc::Layout,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        // SAFETY: `layout` is caller-provided and required (by this function's own contract) to
+        // be non-zero-sized -- every real caller allocates a fixed array of at least one
+        // element.
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        core::ptr::NonNull::new(ptr)
+    }
 }
 
 /// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
 /// value).
+#[derive(Debug)]
 pub struct ImmediatelyWokenUp;
 
 /// Named-boolean to indicate whether [`RawMutex::block_or_timeout`] was woken up or timed out.
 #[must_use]
+#[derive(Debug)]
 pub enum UnblockedOrTimedOut {
     /// Unblocked by a wake call
     Unblocked,
@@ -294,6 +549,19 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// Whether this process is the one that carries packets for the network interface.
+    ///
+    /// `Network` and its socket table are shared by every process of a cross-process-fork
+    /// family, but the packet path (the NAT gateway and its published ports) exists once, in a
+    /// single process. Only that process may drive the interface poll: a poll run by any other
+    /// process would transmit into that process's own, unconnected packet queue and the frames
+    /// would be lost. Processes that do not own the interface still service their own
+    /// descriptors and rely on the owner's poll for packet I/O. Single-process platforms are
+    /// always the owner.
+    fn owns_ip_interface(&self) -> bool {
+        true
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
@@ -450,6 +718,26 @@ where
     #[must_use]
     fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
+    /// Atomically compare-and-exchange the value at signed offset from this pointer.
+    ///
+    /// On success returns `Some(Ok(current))`; on failure `Some(Err(actual))`, carrying the value
+    /// that was actually there. `None` means the access itself could not be performed -- an invalid
+    /// pointer, a misaligned one, or a `T` this cannot be done atomically for.
+    ///
+    /// # Why this exists
+    ///
+    /// [`read_at_offset`](RawConstPointer::read_at_offset) and [`Self::write_at_offset`] are each
+    /// individually atomic for small aligned types, but a load followed by a store is NOT: another
+    /// party can change the word in between. That is exactly the shape of every lock protocol a
+    /// guest runs against a shared word, and the kernel side of `FUTEX_LOCK_PI`/`UNLOCK_PI` cannot
+    /// be implemented correctly without it -- guest userspace does its own compare-exchange on the
+    /// very same word, so a read-then-write here would race it.
+    ///
+    /// Only sizes the target can do atomically are supported (4 bytes, and 8 on 64-bit); anything
+    /// else returns `None` rather than silently degrading to a non-atomic sequence.
+    #[must_use]
+    fn compare_exchange_at_offset(self, count: isize, current: T, new: T) -> Option<Result<T, T>>;
+
     /// Write a slice of values at the given offset.
     ///
     /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
@@ -462,6 +750,30 @@ where
     {
         for (offset, v) in (count..).zip(values) {
             self.write_at_offset(offset, v.clone())?;
+        }
+        Some(())
+    }
+
+    /// Fill `len` consecutive elements starting at the given offset with `value`.
+    ///
+    /// Returns `None` under the same conditions as [`Self::write_at_offset`]; on failure, there
+    /// are no guarantees about how many elements -- if any -- have been written.
+    ///
+    /// The default implementation writes one element at a time via [`Self::write_at_offset`],
+    /// matching this trait's other default implementations. Platforms whose fallible-write
+    /// mechanism pays a fixed per-call cost when the target is not yet backed (e.g. a full
+    /// exception-dispatch round-trip per byte) should override this with a genuinely bulk fill
+    /// covered by a single fault-recovery region -- see
+    /// `litebox_platform_windows_userland`'s `RawMutPointer<u8>` impl for `UserMutPtr`, and
+    /// `litebox::mm::exception_table::memset_fallible`, for the reference implementation this was
+    /// added to support.
+    #[must_use]
+    fn fill_at_offset(self, count: isize, len: usize, value: T) -> Option<()>
+    where
+        T: Clone,
+    {
+        for offset in count..count.checked_add_unsigned(len)? {
+            self.write_at_offset(offset, value.clone())?;
         }
         Some(())
     }
@@ -609,15 +921,80 @@ pub trait ForkChildVerificationProvider {
     /// Verification ends automatically when the child reaches `execve`/`exit`/`exit_group` (at
     /// which point the stale parent addresses are no longer reachable), or when
     /// [`end_fork_child_verification`](Self::end_fork_child_verification) is called.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (`0` if never established) -- see
+    /// [`Self::spawn_cross_process_fork_child`]'s own `sigreturn_trampoline` parameter doc comment
+    /// for the full mechanism this page exists for. A `relocations` map whose `is_identity()` is
+    /// true (real for a cross-process/lazy fork child, which gets literally the same addresses as
+    /// its parent) makes `is_in_source(addr)` true for essentially every address the child
+    /// touches inside its own mapped ranges, including this deliberately-always-faulting page --
+    /// an implementor that "heals" ANY `is_in_source` hit by translating and resuming must exclude
+    /// this exact address, or it silently converts the page's designed-to-fault signal-return
+    /// recognition mechanism into an infinite same-address refault loop instead of ever letting
+    /// the real signal-return handler see the fault.
     fn begin_fork_child_verification(
         &self,
         relocations: alloc::sync::Arc<crate::mm::AddressRelocations>,
+        sigreturn_trampoline: usize,
     ) {
         let _ = relocations;
+        let _ = sigreturn_trampoline;
     }
 
     /// Stop verifying the current thread's guest execution, if it was being verified.
     fn end_fork_child_verification(&self) {}
+
+    /// Acquires this platform's process-wide fork-verify healing lock (if it has one) for the
+    /// duration of the returned guard, serializing the CALLER against every other concurrent
+    /// fork-verify healing writer -- both this platform's own reactive AV-path/single-step
+    /// healers (see [`begin_fork_child_verification`](Self::begin_fork_child_verification)'s doc
+    /// comment) and the PROACTIVE stale-pointer fixup passes `do_clone` runs on the parent's own
+    /// thread immediately after `PageManager::duplicate` (`fixup_stale_stack_pointers`/
+    /// `fixup_stale_elf_data_pointers` in `litebox_shim_linux::syscalls::process`), before the
+    /// new child's own `begin_fork_child_verification` is even called.
+    ///
+    /// # Why this exists
+    ///
+    /// A platform whose `fork()` emulation gives every guest process the SAME real address space
+    /// (Windows userland's thread-based fork -- see `litebox_platform_windows_userland::
+    /// fork_verify`'s module doc comment) has exactly one real, mutable memory image shared by
+    /// every concurrently-live guest "process". The proactive fixup passes scan and rewrite a
+    /// freshly-`fork()`ed child's own private data ranges on the PARENT's thread, entirely
+    /// unsynchronized with any other concurrently-running fork's own proactive fixup pass or any
+    /// other thread's reactive single-step/AV-path healing -- confirmed live (this investigation)
+    /// to correlate, with a clean monotonic dose-response, concurrent healing-pass overlap with a
+    /// forked child dying pre-`execve()` on a genuinely-unmapped instruction fetch. Wrapping the
+    /// call sites in `do_clone` with this guard, alongside the existing VEH-dispatch-side use in
+    /// `litebox_platform_windows_userland`, closes the gap: no two fork-verify-shaped memory
+    /// writers (proactive or reactive, on any thread) are ever active at the same instant.
+    ///
+    /// A platform with genuine per-guest-process OS-level memory isolation (real Linux/macOS
+    /// `fork()`) has no such shared-image hazard at all -- this whole trait is inert there (every
+    /// member's default implementation is a no-op), so the default guard here is a real,
+    /// zero-cost unit value that acquires and holds nothing.
+    fn lock_fork_verify_heal(&self) -> impl Sized {}
+
+    /// Returns the CALLING thread's own currently-active relocation map, if the calling thread
+    /// is itself a `fork()` descendant still under verification (i.e. `self` is running on a
+    /// thread that was itself a target of a prior [`begin_fork_child_verification`] call whose
+    /// matching [`end_fork_child_verification`] has not yet fired).
+    ///
+    /// Called on the PARENT's own thread from `do_clone`, immediately after this fork's own
+    /// `PageManager::duplicate` call, BEFORE the fresh relocation map is handed to the new
+    /// child's own [`begin_fork_child_verification`] -- lets a nested fork (a fork whose OWN
+    /// parent is itself a fork descendant, e.g. a grandchild) fold the calling thread's inherited
+    /// ancestor ranges into the grandchild's map via
+    /// [`crate::mm::AddressRelocations::merge_ancestor_ranges`], so the grandchild transitively
+    /// covers every ancestor generation instead of only its immediate parent's. `None` for a
+    /// thread that is not itself under verification (the common case: a top-level, non-nested
+    /// fork), which is exactly when no merge is needed. The default implementation returns
+    /// `None`, matching every other member's "correct-but-unverified" default.
+    fn current_thread_fork_relocations(
+        &self,
+    ) -> Option<alloc::sync::Arc<crate::mm::AddressRelocations>> {
+        None
+    }
 
     /// Diagnostic-only hook, called from `do_clone` immediately after a real `fork()`/`vfork()`
     /// duplicates the parent's address space (same call site as
@@ -736,6 +1113,52 @@ pub trait ForkChildVerificationProvider {
         )
     }
 
+    /// Arranges for `on_exit` to run (on some platform-chosen thread, NOT necessarily the calling
+    /// one) with the raw OS exit code once the real OS process identified by `handle` terminates
+    /// -- the async counterpart to [`Self::wait_for_cross_process_exit`]'s blocking wait.
+    ///
+    /// Exists because a `LITEBOX_PROCESS_FORK=1` child's exit has no path into this process's own
+    /// in-guest signal-delivery machinery otherwise. `Process::prepare_for_exit`
+    /// (`litebox_shim_linux`) notifies a live parent of an ordinary (same-process, thread-based)
+    /// child's exit by pushing `SIGCHLD` into the parent's `shared_pending` and calling
+    /// `interrupt_all_threads()` -- which wakes any thread blocked in `wait_cx().sleep()`
+    /// (`sys_pause`, `sys_rt_sigsuspend`, the `pid == -1` poll loop in `sys_wait4`/`sys_waitid`).
+    /// A cross-process child is a genuinely separate OS process reconstructing its OWN `Process`
+    /// from scratch (`new_adopting_existing_memory`), so it has no `Arc` back to the real parent's
+    /// `Process` to push into or interrupt -- confirmed live: `prepare_for_exit`'s own
+    /// `has_live_parent` gate check is unconditionally `false` for such a child, so that whole
+    /// notify step is skipped every time.
+    ///
+    /// Without this, a parent that blocks the race-free way -- mask `SIGCHLD`, then
+    /// `sigsuspend`/`pause` to atomically wait for it (the standard idiom; busybox ash's plain
+    /// `wait` builtin uses exactly this once it has more than one backgrounded job) -- hangs
+    /// forever the moment it has ANY cross-process-fork child, even after that child has already
+    /// exited: nothing will ever wake the sleeper, because no real `SIGCHLD`-equivalent is ever
+    /// delivered. An active poller (a plain `wait4(-1, ..., 0)` retry loop with no intervening
+    /// sleep) would eventually notice via `Self::wait_for_cross_process_exit`/
+    /// `Self::try_wait_for_cross_process_exit` on its own, but a signal-driven waiter never will.
+    ///
+    /// The caller (`litebox_shim_linux::syscalls::process::do_clone`, right after
+    /// `register_cross_process_child`) supplies `on_exit` to push the CHILD's own `exit_signal`
+    /// into the PARENT's `shared_pending` and call the parent's `interrupt_all_threads()` --
+    /// exactly mirroring `prepare_for_exit`'s existing same-process notify step, just reached via
+    /// a different trigger. This call returns immediately; `on_exit` runs later, asynchronously,
+    /// whenever the watched process actually exits. The default implementation is unreachable for
+    /// the same reason its siblings above are: nothing ever calls this without having first
+    /// successfully registered a real [`CrossProcessChildHandle`], which requires cross-process
+    /// fork support to exist in the first place.
+    fn spawn_cross_process_exit_notifier(
+        &'static self,
+        handle: CrossProcessChildHandle,
+        on_exit: alloc::boxed::Box<dyn FnOnce(u32) + Send>,
+    ) {
+        let _ = handle;
+        drop(on_exit);
+        unreachable!(
+            "spawn_cross_process_exit_notifier called on a platform with no cross-process fork support"
+        )
+    }
+
     /// Pass 157: after `sys_wait4` has observed cross-process child `handle`'s real exit (via
     /// [`Self::wait_for_cross_process_exit`]/[`Self::try_wait_for_cross_process_exit`]) but
     /// BEFORE reaping it from the registry, returns the raw bytes of a tar archive containing
@@ -802,19 +1225,554 @@ pub trait ForkChildVerificationProvider {
     /// `cross_process_children` registry key (matching how a thread-based child is keyed), not
     /// whatever this function returns as the process's real OS pid (needed only to interpret the
     /// `HANDLE`, never exposed to the guest).
+    ///
+    /// `inherited_pipes` carries the parent-side half of every guest pipe fd the child must come
+    /// up holding (see [`ForkPipeBridge`]). The platform is responsible for giving the child a
+    /// real, inheritable OS handle per entry and for pumping that handle to or from the matching
+    /// parent-side end; if it cannot, it must return `None` and let the caller fall back rather
+    /// than spawn a child that silently loses the fd.
+    ///
+    /// Takes `&'static self` because those pump threads outlive this call and need the platform to
+    /// build their own per-thread wait state -- every caller already holds the platform as
+    /// `&'static` (`GlobalState::platform`), so this costs nothing.
+    ///
+    /// `comm` is the PARENT's own current `Task::comm` bytes (raw, NUL-padded, `TASK_COMM_LEN`
+    /// long) -- on real Linux a forked child's `comm` is the parent's, verbatim, until the
+    /// child's own `execve` (or `PR_SET_NAME`) renames it. The thread-based `clone()` path already
+    /// gets this right (`comm: self.comm.clone()`), but the CHILD's own freshly-built `Task`
+    /// (`adopt_forked_process`, never `clone_for_new_task`) has no `self` to copy from, so the
+    /// caller must thread the parent's value through explicitly -- same shape as
+    /// `sigreturn_trampoline` below, and found the same way (by reading `adopt_forked_process`'s
+    /// own unconditional `[0; TASK_COMM_LEN]` next to the correct thread-based `self.comm.clone()`
+    /// and asking why they differed). Without this, EVERY cross-process fork child starts with an
+    /// empty `comm` regardless of what its parent was actually named, until its own `execve`.
+    ///
+    /// `sigreturn_trampoline` is the PARENT's own already-established
+    /// `Task::ensure_sigreturn_trampoline` address (0 if never established) -- real guest memory
+    /// at that address is already correctly carried over by the ordinary group-copy mechanism,
+    /// but the CHILD's own freshly-built `Task`/`SignalState` (`adopt_forked_process`, never
+    /// `clone_for_new_task`) starts this at `0` unless the caller threads it through explicitly.
+    /// Without this, a forked child that never re-establishes its OWN trampoline (the common case
+    /// for a `fork()`-without-`execve()` child, e.g. a shell subshell, which keeps running the
+    /// SAME already-initialized glibc/signal state its parent set up) can be delivered a signal
+    /// whose real ABI-correct, deliberately-non-executable trampoline page the host's own
+    /// sigreturn-recognition logic no longer recognizes as such -- see
+    /// `Task::ensure_sigreturn_trampoline`'s x86_64 doc comment for why that page is never meant
+    /// to be actually executed, only recognized.
     fn spawn_cross_process_fork_child(
-        &self,
+        &'static self,
         relocations: &crate::mm::AddressRelocations,
         full_gprs: ForkFullGprSnapshot,
+        inherited_pipes: alloc::vec::Vec<(i32, ForkPipeBridge)>,
+        inherited_files: alloc::vec::Vec<ForkInheritedFile>,
+        inherited_eventfds: alloc::vec::Vec<ForkInheritedEventfd>,
+        inherited_shim_fds: alloc::vec::Vec<ForkInheritedShimFd>,
+        comm: [u8; 16],
+        sigreturn_trampoline: usize,
+        identity: ForkChildIdentity,
     ) -> Option<CrossProcessChildHandle> {
+        let _ = inherited_shim_fds;
         let _ = relocations;
         let _ = full_gprs;
+        let _ = inherited_pipes;
+        let _ = inherited_files;
+        let _ = inherited_eventfds;
+        let _ = comm;
+        let _ = sigreturn_trampoline;
+        let _ = identity;
+        None
+    }
+
+    /// The host OS's id for the process this code runs in, or `0` when the platform has no
+    /// cross-process signal delivery. `0` disables `litebox_shim_linux`'s cross-process process
+    /// registry (`syscalls::signal::xproc`) entirely, leaving signal delivery in-process only.
+    fn current_host_pid(&self) -> u32 {
+        0
+    }
+
+    /// The host process id of the cross-process fork child behind `handle`, if recoverable.
+    fn cross_process_child_host_pid(&self, handle: CrossProcessChildHandle) -> Option<u32> {
+        let _ = handle;
+        None
+    }
+
+    /// Starts this host process's cross-process signal wake listener: a platform thread that
+    /// runs `on_wake` once right away and then every time another host process calls
+    /// [`Self::wake_signal_listener`] with this process's host pid. Idempotent per host process;
+    /// returns whether a listener is running.
+    fn start_signal_wake_listener(
+        &'static self,
+        on_wake: alloc::boxed::Box<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        drop(on_wake);
+        false
+    }
+
+    /// Wakes the signal listener of host process `host_pid`. `false` when it has none (not yet
+    /// started, or already exited).
+    fn wake_signal_listener(&self, host_pid: u32) -> bool {
+        let _ = host_pid;
+        false
+    }
+
+    /// Ends the calling host process with `exit_code` after letting its background network work
+    /// finish, so it never dies holding a lock shared with other host processes. Returns only if
+    /// the platform cannot do that.
+    fn exit_host_process_quiesced(&self, exit_code: u32) -> bool {
+        let _ = exit_code;
+        false
+    }
+
+    /// Waits up to `timeout_ms` for host process `host_pid` to exit. `true` once it has exited.
+    fn wait_for_host_process_exit(&self, host_pid: u32, timeout_ms: u32) -> bool {
+        let _ = (host_pid, timeout_ms);
+        false
+    }
+
+    /// Terminates host process `host_pid` with `exit_code` (guest `SIGKILL` to a process that
+    /// owns its own host process). `false` if it could not be terminated.
+    fn terminate_host_process(&self, host_pid: u32, exit_code: u32) -> bool {
+        let _ = (host_pid, exit_code);
+        false
+    }
+
+    /// Whether this platform has a REAL `fork()` -- a single syscall that gives a cross-process
+    /// child its own address space as a copy-on-write duplicate of the caller's, with every open
+    /// fd (`FD_CLOEXEC` ones included; the kernel only honours that flag at a later `execve`, not
+    /// at `fork()` itself) and the calling thread's entire register/TLS state inherited for free.
+    ///
+    /// [`Self::spawn_cross_process_fork_child`]'s five-parameter shape -- relocations to
+    /// translate, a register snapshot to inject, pipes/files/eventfds to individually bridge or
+    /// reopen -- exists ENTIRELY to compensate for a host that has no such syscall (Windows:
+    /// `CreateProcess` starts a disjoint process with an empty address space and none of the
+    /// parent's handles, so every one of those must be reconstructed by hand). A host that
+    /// answers `true` here skips all of it: see [`Self::native_fork`].
+    ///
+    /// Default `false` -- unconditionally safe for any platform, since [`Self::native_fork`]'s
+    /// default already matches (returns `None`, meaning "no such syscall").
+    ///
+    /// The "reverse wine" answer for this specific capability: Wine implements Windows syscalls
+    /// on Linux primitives, keeping a userspace server (`wineserver`) only for the semantics
+    /// Linux genuinely lacks. litebox runs the opposite direction -- Linux syscalls on whatever
+    /// host it's given -- so its own reverse-wine discipline is the same shape, mirrored: use the
+    /// HOST's real primitive directly wherever the host's own semantics already match what the
+    /// guest syscall needs, and reserve a userspace (shim-level) reimplementation for exactly the
+    /// gap where the host lacks it. `fork()` is the clean case of that gap NOT existing: a real
+    /// POSIX host already has the exact primitive `clone()`/`fork()` asks for, so `true` here
+    /// means "don't reimplement it" -- [`Self::spawn_cross_process_fork_child`]'s whole apparatus
+    /// is the userspace reimplementation this trait keeps around specifically for hosts (Windows)
+    /// where the gap is real, the same role `wineserver` plays for Wine's own genuine gaps.
+    fn has_native_fork(&self) -> bool {
+        false
+    }
+
+    /// Calls the host's real `fork()`. Only ever called when [`Self::has_native_fork`] is `true`.
+    ///
+    /// Returns `Some(0)` if this call is returning in the CHILD's own copy of the calling
+    /// thread's stack (the callee must treat the in-progress guest syscall as returning `0`, the
+    /// `fork()` ABI's child-side contract, and must NOT register anything into
+    /// `Process::cross_process_children` -- there is nothing to wait for from inside the child
+    /// itself), `Some(child_pid)` if this call is returning in the PARENT (the callee registers a
+    /// [`CrossProcessChildHandle`] keyed by this pid and reports it as the guest's `fork()`
+    /// return value), or `None` if the underlying `fork()` call itself failed (e.g. `EAGAIN`,
+    /// `ENOMEM`) -- the caller falls back to the thread-based relocating fork exactly as it would
+    /// for [`Self::spawn_cross_process_fork_child`] returning `None`.
+    ///
+    /// A real `fork()` duplicates every host thread's worth of memory but only the CALLING
+    /// thread itself -- every sibling host thread (other guest threads of this same guest
+    /// process, and, under this architecture's single-shared-address-space model, every thread
+    /// belonging to every OTHER guest process) simply does not exist in the child, exactly
+    /// matching real Linux's own `fork()` semantics for a multithreaded process. If one of those
+    /// now-vanished threads held a lock reachable from the child's own continued execution, that
+    /// lock is locked forever in the child -- POSIX's well-known, general "fork() in a
+    /// multithreaded program" hazard, not a litebox-specific defect. The caller is responsible
+    /// for quiescing the locks it knows to be at risk (see
+    /// `litebox_shim_linux::GlobalState::with_shimwide_locks_held`) immediately around this call,
+    /// the same way glibc's own `__libc_fork` quiesces malloc's arena locks before calling the
+    /// kernel -- this method itself does no quiescing of its own, since it has no visibility into
+    /// the shim-level locks above it.
+    ///
+    /// # Safety
+    /// Must be called with no Rust-level borrow (e.g. a `RefCell`/lock guard) live across the
+    /// call that the child's continued execution would need to independently re-derive -- a
+    /// borrow's runtime state is duplicated exactly as-is into the child, so a guard that looks
+    /// "held" to the child but whose releasing code never runs there (because the thread that
+    /// would have run it doesn't exist in the child) is as unsound as the same pattern would be
+    /// around a raw `libc::fork()` call directly.
+    unsafe fn native_fork(&self) -> Option<i32> {
+        None
+    }
+
+    /// Ends the calling host process, a native-`fork()` child (see [`Self::native_fork`]), with
+    /// `status` as its raw host exit code once its guest process has fully exited.
+    ///
+    /// A native child is the forking guest thread and nothing else: the runner's `main` thread,
+    /// which is what normally turns the guest's exit status into the host process's, exists only
+    /// in the parent. Without this the child's last thread just returns and the host reports exit
+    /// code `0` to the parent's `waitpid`, losing every non-zero guest status. The default is a
+    /// no-op: only a platform that returns `true` from [`Self::has_native_fork`] is ever asked.
+    /// Whether the kernel state a native-`fork()` child inherits is memory it SHARES with its
+    /// parent (rather than a private copy-on-write duplicate). When it is, a lock the parent held
+    /// across the `fork()` is one lock seen by both processes, so the child must not release it.
+    /// Non-consuming check of whether the native-fork child `handle` has already exited (it is
+    /// left un-reaped so `wait4` can still collect its status). `false` when unknown.
+    fn cross_process_child_has_exited(&self, handle: CrossProcessChildHandle) -> bool {
+        let _ = handle;
+        false
+    }
+
+    fn native_fork_shares_kernel_state(&self) -> bool {
+        false
+    }
+
+    fn exit_native_fork_child(&self, status: i32) {
+        let _ = status;
+    }
+
+    /// On a host with no real `fork()`, litebox maps every guest process into ONE shared host
+    /// address space (see [`Self::has_native_fork`]'s doc comment). A fixed-address (`ET_EXEC`)
+    /// ELF image occasionally needs the EXACT SAME address a still-live ancestor or sibling
+    /// guest process already occupies -- impossible to satisfy within that one shared space, and
+    /// on a host with genuinely independent per-process address spaces (a real `fork()`, or any
+    /// two ordinary Windows processes) this situation cannot occur at all.
+    ///
+    /// Called once `sys_execve` has found no way to load the new image into THIS process's own
+    /// address space (an unrecoverable collision after every ordinary relocation attempt has
+    /// already failed) -- i.e. real Linux's own `execve()` guarantee (a genuinely FRESH address
+    /// space, every time, `vfork`-originated or not) cannot be honoured by staying in this
+    /// process. The platform's only remaining way to still honour it is the one thing a host
+    /// without `fork()` is actually good at: starting a genuinely separate process. Unlike
+    /// [`Self::spawn_cross_process_fork_child`], there is no existing execution state to carry
+    /// across -- the old program's memory is already torn down by the time this is called -- just
+    /// the new program's own `path`/`argv`/`envp`, exactly what a real `execve()` itself needs.
+    ///
+    /// Synchronous and blocking: by the time this is called there is nothing else for the calling
+    /// thread to do except wait for the new process and adopt its exit status, exactly as if this
+    /// process's own `execve()` had succeeded and that program had then run to completion -- so
+    /// this does the whole thing (spawn, wait, return the raw exit status) rather than handing
+    /// back a handle for some other call to wait on later.
+    ///
+    /// Returns `None` if this platform has no way to do this (the correct default on every
+    /// platform with a real `fork()` -- the collision this exists for cannot occur there) or if
+    /// the spawn itself failed; the caller's existing fallback (kill the guest with `SIGSEGV`,
+    /// matching real Linux's own behaviour for an unrecoverable post-point-of-no-return `execve`
+    /// failure) still applies either way.
+    ///
+    /// The result's `exported_writable_layer`, when present, is a tar archive of every file the
+    /// child created or modified -- the SAME shape [`Self::take_cross_process_writable_layer_
+    /// export`] hands a cross-process FORK's parent at `wait4` time, for the identical reason:
+    /// the child is a genuinely separate process with its own independently-COW'd filesystem
+    /// state, so whatever it wrote (e.g. the very directories this new program needs to find
+    /// already in place) is invisible to this one unless explicitly carried back. Unlike the
+    /// fork case, there is no later `wait4` to carry it at -- this IS the continuing guest
+    /// process, so the caller imports it immediately, inline, rather than deferring to a
+    /// registry keyed by a handle nothing else needs.
+    fn spawn_exec_collision_child(
+        &self,
+        path: &str,
+        argv: &[alloc::ffi::CString],
+        envp: &[alloc::ffi::CString],
+    ) -> Option<ExecCollisionChildResult> {
+        let _ = (path, argv, envp);
         None
     }
 }
 
-/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS process,
-/// stored in the shim's `Process::cross_process_children` registry (see
+/// The outcome of [`ForkChildVerificationProvider::spawn_exec_collision_child`] -- see its own
+/// doc comment for the full reasoning behind each field.
+#[derive(Debug)]
+pub struct ExecCollisionChildResult {
+    /// The replacement process's raw exit status, to be adopted as this guest process's own.
+    pub raw_status: i32,
+    /// A tar archive of the replacement process's writable-layer changes, if any, to be imported
+    /// into this (continuing) guest process's own filesystem before it exits.
+    pub exported_writable_layer: Option<alloc::vec::Vec<u8>>,
+}
+
+/// A regular file a cross-process `fork()` child must come up holding at a particular fd.
+///
+/// Unlike a pipe, a file needs no bridge at all: the child's filesystem is the parent's (see
+/// `FORK_CHILD_PARENT_LAYER_ENV_VAR` in the Windows platform crate), so it can simply reopen the
+/// same path and seek to the same place. That is enough for by far the commonest case -- a shell
+/// that saved its own script fd out of the way before forking, which is what `/init`'s `preinit`
+/// does and what kept every one of its forks off the cross-process path.
+///
+/// **The offset is copied, not shared.** A real `fork()` leaves parent and child pointing at ONE
+/// open file description, so a read in either advances the other's offset; a reopen gives them
+/// independent ones. That difference is invisible to a child that closes the fd, `execve`s, or
+/// reads a file the parent has finished with -- and visible to one that interleaves reads with its
+/// parent on the same descriptor, which this cannot support and does not pretend to.
+#[derive(Debug, Clone)]
+pub struct ForkInheritedFile {
+    /// The guest fd number the child must find this file at.
+    pub fd: i32,
+    /// Absolute path to reopen.
+    pub path: alloc::string::String,
+    /// The parent's open flags, as an `OFlags` bit pattern. Creation flags are the caller's to
+    /// strip; reopening must never create or truncate.
+    pub flags: u32,
+    /// The parent's current file offset, to seek to after reopening.
+    pub offset: u64,
+}
+
+/// An eventfd a cross-process `fork()` child must recreate at the same fd number.
+///
+/// An eventfd has no OS object behind it -- it is a 64-bit counter and two behaviour bits -- so
+/// unlike a pipe it needs no bridge and unlike a file it needs no reopen. The child simply builds
+/// one with the same state.
+///
+/// **The counter is copied, not shared**, exactly as [`ForkInheritedFile`]'s offset is. A real
+/// `fork()` leaves both processes on ONE open file description, so a read in either drains the
+/// other's counter; recreating gives them independent ones. Invisible to a child that `execve`s,
+/// closes it, or uses it only to wake its own event loop -- which is what GLib does with the
+/// eventfds a desktop process holds, and why carrying them this way is worth far more than
+/// refusing the fork. Visible, and unsupported, only to a parent and child that deliberately
+/// signal each other through the inherited counter.
+#[derive(Debug, Clone, Copy)]
+pub struct ForkInheritedEventfd {
+    /// The guest fd number the child must find this eventfd at.
+    pub fd: i32,
+    /// The parent's counter value at fork time.
+    pub count: u64,
+    /// `EFD_*` bits: `SEMAPHORE` and `NONBLOCK`. `CLOEXEC` is a descriptor-table property the
+    /// child's own fd table carries, not part of the object.
+    pub flags: u32,
+}
+
+/// What one read of a [`ForkPipeBridge::Source`]'s parent-side pipe produced.
+///
+/// A pump thread must be able to tell these three apart: forwarding [`Self::Empty`] as EOF closes
+/// the child's read end early, and treating EOF as [`Self::Empty`] leaves the thread parked in a
+/// read that can never complete -- one leaked thread and OS handle per child that exits first.
+/// `Option<usize>` collapses the two, which is why this exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkPipeRead {
+    /// `n` bytes were placed in the buffer; `n > 0`.
+    Bytes(usize),
+    /// Nothing is available yet, but a writer may still produce bytes. The pump retries -- and
+    /// re-checks whether the child is still alive first, which is what stops the leak.
+    Empty,
+    /// No writer is left and nothing is buffered, so no read can ever return anything again.
+    Eof,
+}
+
+/// A host-side handle on one end of a PARENT's in-memory pipe, handed across to
+/// [`ForkChildVerificationProvider::spawn_cross_process_fork_child`] so the platform can bridge a
+/// cross-process `fork()` child's pipe fd to it.
+///
+/// litebox's pipes are pure in-memory `ringbuf` objects with no OS handle behind them (see
+/// `crate::pipes`), so nothing about one survives a process boundary. The platform therefore gives
+/// the child a real inheritable OS pipe at the same fd number and runs a pump thread bridging the
+/// two, in whichever direction this end calls for:
+///
+/// * [`Self::Sink`] -- the guest fd is a pipe's SENDER, so the child writes. The pump reads the OS
+///   pipe and writes into this end; the child's writes reappear in the parent's own pipe, where
+///   the guest's reader is blocked. This is shell command substitution.
+/// * [`Self::Source`] -- the guest fd is a pipe's RECEIVER, so the child reads. The pump reads
+///   this end and writes into the OS pipe. This is a shell pipeline's second stage.
+///
+/// Erased to boxed closures rather than exposing `pipes::DetachedPipeEnd` in the trait: they are
+/// built in `litebox_shim_linux`, where the descriptor table and pipe registry live, and the
+/// platform needs no knowledge of either -- only bytes, in one direction.
+///
+/// **Dropping the bridge is how EOF is delivered.** Each variant owns the last non-descriptor
+/// reference to its end, so dropping it shuts that end down and notifies the peer -- the same
+/// signal a guest gives by closing its last descriptor.
+pub enum ForkPipeBridge {
+    /// The child writes; bytes flow child -> parent. See the type's own doc comment.
+    Sink(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>>),
+    /// The child reads; bytes flow parent -> child. See the type's own doc comment.
+    Source(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>>),
+}
+
+impl ForkPipeBridge {
+    /// Whether the parent-side pipe has no writer left and nothing buffered, so the only thing any
+    /// reader can still get from it is end-of-file. A [`Self::Source`] may deliver that at once,
+    /// however many sibling bridges still hold the end: it steals no bytes, and waiting for the
+    /// siblings instead deadlocks a shell's job-control sync pipe, whose read end both pipeline
+    /// children carry and neither closes until the other has read EOF.
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        match self {
+            Self::Sink(_) => false,
+            Self::Source(e) => e.at_eof(),
+        }
+    }
+
+    /// How many references to the parent-side pipe end are alive, this bridge included.
+    ///
+    /// `1` means this bridge is the sole owner. For a [`Self::Sink`] that says dropping it will
+    /// actually deliver EOF. For a [`Self::Source`] it says something the platform must wait for:
+    /// the guest parent has closed its own descriptor, so draining the pipe into the child no
+    /// longer steals bytes from a reader still live in this process.
+    ///
+    /// It is not sufficient on its own: holding a reference and reading from it are two different
+    /// things, and a parent that keeps a descriptor open while it waits for a wrapper child of its
+    /// own (`timeout`, `env`, `nohup`, `setpriv`) never drops to `1` at all -- the pipe then has
+    /// nobody draining it and the child blocks for ever. See [`Self::pending_bytes`].
+    #[must_use]
+    pub fn owners(&self) -> usize {
+        match self {
+            Self::Sink(e) => e.owners(),
+            Self::Source(e) => e.owners(),
+        }
+    }
+
+    /// Bytes waiting in a [`Self::Source`]'s pipe; `0` for a [`Self::Sink`].
+    ///
+    /// Sampled over time this separates "the guest parent is still reading this end" from "the
+    /// guest parent merely holds a reference to it": a non-zero count that does not change is
+    /// data nobody is consuming, so forwarding it to the child steals nothing from a real reader.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        match self {
+            Self::Sink(_) => 0,
+            Self::Source(e) => e.pending_bytes(),
+        }
+    }
+
+    /// Whether bytes already buffered in a [`Self::Source`]'s pipe are destined for the child that
+    /// carries this end, so the platform's pump may drain them out of the parent.
+    ///
+    /// On a real `fork()` parent and child share ONE pipe, buffered bytes included: whichever of
+    /// them reads first gets them, and a parent that never reads loses nothing by the child taking
+    /// them. A bridge is not a shared pipe -- it is a pump that reads on the child's behalf and
+    /// pushes what it gets into the child's own OS pipe, so draining takes the bytes away from the
+    /// parent even while the parent still holds a descriptor on the same end and intends to read
+    /// them itself.
+    ///
+    /// That is only provably safe for the child's STDIN: bytes the parent buffered there are
+    /// waiting for the child by construction. Any other inherited read end the parent may be
+    /// reading itself -- libuv's global signal lock, a pipe holding exactly one byte whose
+    /// disappearance blocks its next locker for ever, is the case that cost a debugging session --
+    /// so there the pump leaves the buffer alone.
+    #[must_use]
+    pub fn buffered_belongs_to_child(&self) -> bool {
+        match self {
+            Self::Sink(_) => false,
+            Self::Source(e) => e.buffered_belongs_to_child,
+        }
+    }
+
+    /// Record whether the guest fd this bridge carries is close-on-exec.
+    pub fn set_cloexec(&mut self, cloexec: bool) {
+        match self {
+            Self::Sink(e) => e.cloexec = cloexec,
+            Self::Source(e) => e.cloexec = cloexec,
+        }
+    }
+
+    /// Whether the guest fd this bridge carries is close-on-exec.
+    #[must_use]
+    pub fn cloexec(&self) -> bool {
+        match self {
+            Self::Sink(e) => e.cloexec(),
+            Self::Source(e) => e.cloexec(),
+        }
+    }
+}
+
+impl core::fmt::Debug for ForkPipeBridge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Sink(_) => "ForkPipeBridge::Sink(..)",
+            Self::Source(_) => "ForkPipeBridge::Source(..)",
+        })
+    }
+}
+
+/// One direction of a [`ForkPipeBridge`]: the transfer closure, plus the liveness probe both
+/// variants need.
+pub struct ForkPipeEnd<F> {
+    transfer: F,
+    owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+    at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
+    pending: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+    buffered_belongs_to_child: bool,
+    cloexec: bool,
+}
+
+impl<F> ForkPipeEnd<F> {
+    /// Wrap a transfer closure plus the liveness probes: how many references to the underlying pipe
+    /// end are alive, whether the pipe can only ever yield end-of-file, how much it has buffered,
+    /// and whether that buffer is the child's to take (see
+    /// [`ForkPipeBridge::buffered_belongs_to_child`]).
+    #[must_use]
+    pub fn new(
+        transfer: F,
+        owners: impl Fn() -> usize + Send + 'static,
+        at_eof: impl Fn() -> bool + Send + 'static,
+        pending: impl Fn() -> usize + Send + 'static,
+        buffered_belongs_to_child: bool,
+    ) -> Self {
+        Self {
+            transfer,
+            owners: alloc::boxed::Box::new(owners),
+            at_eof: alloc::boxed::Box::new(at_eof),
+            pending: alloc::boxed::Box::new(pending),
+            buffered_belongs_to_child,
+            cloexec: false,
+        }
+    }
+
+    /// Mark the guest fd this end belongs to as close-on-exec, so the child's rebuilt fd is too.
+    #[must_use]
+    pub fn with_cloexec(mut self, cloexec: bool) -> Self {
+        self.cloexec = cloexec;
+        self
+    }
+
+    /// Whether the guest fd this end belongs to is close-on-exec.
+    #[must_use]
+    pub fn cloexec(&self) -> bool {
+        self.cloexec
+    }
+
+    /// Whether the parent-side pipe can only ever yield end-of-file (see
+    /// [`ForkPipeBridge::at_eof`]).
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        (self.at_eof)()
+    }
+
+    /// See [`ForkPipeBridge::pending_bytes`].
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        (self.pending)()
+    }
+
+    /// See [`ForkPipeBridge::buffered_belongs_to_child`].
+    #[must_use]
+    pub fn buffered_belongs_to_child(&self) -> bool {
+        self.buffered_belongs_to_child
+    }
+
+    /// See [`ForkPipeBridge::owners`].
+    #[must_use]
+    pub fn owners(&self) -> usize {
+        (self.owners)()
+    }
+}
+
+impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>> {
+    /// Write `buf` into the parent-side pipe. Short writes are possible, exactly as for a guest
+    /// `write(2)` on a pipe; the caller loops. `None` means the pipe is gone.
+    pub fn write(&mut self, buf: &[u8]) -> Option<usize> {
+        (self.transfer)(buf)
+    }
+}
+
+impl ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>> {
+    /// Read from the parent-side pipe into `buf`, giving up after a bounded wait so the pump can
+    /// come back and re-check whether the child it serves is still alive. See [`ForkPipeRead`];
+    /// in particular [`ForkPipeRead::Empty`] is NOT end-of-file.
+    pub fn read(&mut self, buf: &mut [u8]) -> ForkPipeRead {
+        (self.transfer)(buf)
+    }
+}
+
+/// An opaque, platform-defined handle to a cross-process `fork()` child's real OS TASK, stored in
+/// the shim's `Process::cross_process_children` registry (see
 /// `litebox_shim_linux::syscalls::process::Process`'s doc comment) instead of the normal
 /// same-process `Arc<Process>` a thread-based `fork()` child uses.
 ///
@@ -822,11 +1780,43 @@ pub trait ForkChildVerificationProvider {
 /// associated type on [`ForkChildVerificationProvider`], so `litebox_shim_linux`'s `Process`
 /// struct -- which is generic over `Platform: ShimPlatform` but must stay `Send`/`Sync` without
 /// per-platform `unsafe impl` boilerplate -- can hold it directly. The platform implementation is
-/// solely responsible for interpreting this value correctly (on Windows: a raw `HANDLE` value,
-/// kept alive for as long as this registry entry exists -- see the entry's own removal/`CloseHandle`
-/// discipline in `sys_wait4`).
+/// solely responsible for interpreting this value correctly (on Windows, as of pass 59: the
+/// child TASK's own initiating THREAD `HANDLE`, deliberately NOT the Windows process handle --
+/// see `litebox_platform_windows_userland::process_fork::wait_for_thread_exit`'s doc comment for
+/// why process-scoped waiting silently never signals once the child spawns any further OS thread
+/// of its own -- e.g. its own internal `fork()` falling back to the thread-based path -- that
+/// outlives the specific task a parent's `wait4()` actually asked about).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossProcessChildHandle(pub usize);
+
+/// An fd whose state only the shim understands (a unix socket), described by `spec`: an opaque
+/// string the shim wrote in the parent and parses again in a cross-process fork child. The
+/// platform only transports it.
+#[derive(Debug, Clone)]
+pub struct ForkInheritedShimFd {
+    pub fd: i32,
+    pub spec: alloc::string::String,
+}
+
+/// The guest identity a cross-process fork child must come up with: the pid the parent's
+/// `fork()` returned (so `getpid()` in the child equals `$!` in the parent), its parent's pid,
+/// and the process group it inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkChildIdentity {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    /// The PID namespace the child was born into: `0` for the initial namespace, whose pids are the
+    /// internal ones, otherwise the id [`crate::fs`]-level code never sees and only the shim's
+    /// namespace table interprets.
+    pub pid_ns: i32,
+    /// The pid the child holds in `pid_ns` -- its `getpid()`, and what its parent's `wait4`/`kill`
+    /// call it. Equals `pid` for the initial namespace.
+    pub ns_pid: i32,
+    /// [`Self::ns_pid`] for the child's initial thread (its `gettid()`), equal to `ns_pid` because a
+    /// fresh process's main thread has `pid == tid`.
+    pub ns_tid: i32,
+}
 
 /// A minimal, platform-agnostic snapshot of the three registers a diagnostic cross-process
 /// register-injection probe (pass 118) needs: where the child's translated instruction pointer,
@@ -920,6 +1910,110 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// Returns whether the given host environment variable is set to any non-empty value.
+    ///
+    /// Used by `#![no_std]` shim code (which has no direct way to read host process
+    /// environment) to gate optional diagnostics (e.g. `LITEBOX_STRACE_SUMMARY`,
+    /// `LITEBOX_CAPTURE_PROC_IO`) behind a host env var, mirroring how
+    /// `LITEBOX_VEH_TRACE`/`LITEBOX_LOG` are already read in the `std`-enabled runner/platform
+    /// crates. Default implementation always returns `false` (env var unset) so existing
+    /// platform implementations that don't override this keep their prior behavior.
+    fn env_flag(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Returns the given host environment variable's VALUE, or `None` when unset or empty.
+    ///
+    /// [`Self::env_flag`] answers only "is this set", which forces any diagnostic that needs a
+    /// parameter -- a filter, a threshold, a target list -- to be hard-coded in the shim instead.
+    /// That is exactly what happened to the syscall timeline, whose target process list was a
+    /// fixed `["xfwm4", "xfdesktop", "xfce4-panel", "xfce4-about"]` and therefore useless for
+    /// investigating any other desktop; changing the subject of an investigation required editing
+    /// and rebuilding the shim. A value-returning lookup lets the same bounded diagnostic be aimed
+    /// at whatever is actually being investigated, without loosening the bound that keeps it from
+    /// becoming an every-process firehose.
+    ///
+    /// Same default-`None` policy as `env_flag`, so platform implementations that don't override
+    /// it keep their prior behavior (every value-parameterised diagnostic simply stays off).
+    fn env_value(&self, _name: &str) -> Option<alloc::string::String> {
+        None
+    }
+
+    fn spill_available(&self) -> bool {
+        false
+    }
+
+    fn spill_write(&self, _slot: u32, _offset: u64, _bytes: &[u8]) -> bool {
+        false
+    }
+
+    fn spill_set_len(&self, _slot: u32, _length: u64) -> bool {
+        false
+    }
+
+    fn spill_read_at(&self, _slot: u32, _offset: u64, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    /// Returns the number of logical CPUs the host makes available to this process.
+    ///
+    /// Backs the guest-visible `/proc/cpuinfo` synthesis (see `litebox::fs::procfs::Procfs`):
+    /// GLib's `g_get_num_processors()` and several GUI toolkits size internal thread pools by
+    /// counting `processor` lines in that file, so an inaccurate count here silently yields a
+    /// wrongly-sized thread pool rather than a visible error. Default implementation reports `1`
+    /// (a safe, always-correct-if-conservative lower bound) so existing platform implementations
+    /// that don't override this keep working, just without the real host core count.
+    fn cpu_count(&self) -> usize {
+        1
+    }
+
+    /// Returns whether the OS process identified by `pid` (a real, host-level process id -- e.g.
+    /// the value already used as `owner_pid`/`self_pid` in `litebox_shim_linux::syscalls::unix`'s
+    /// `unix_addr_presence`/`SharedUnixConnectQueue` diagnostics) is still alive.
+    ///
+    /// Used to reclaim fixed-capacity shared-arena state (e.g.
+    /// `syscalls::unix::SharedUnixConnTable`'s connection slots) whose only release path is a
+    /// cooperative `Drop` that never runs when the owning process is torn down externally
+    /// (`TerminateProcess`/a supervisory timeout-kill) instead of exiting normally -- confirmed
+    /// live 2026-09-18 (Track B, twentieth pass): every `LITEBOX_PROCESS_FORK=1` child caught
+    /// stuck in `sys_ppoll` on a cross-process AF_UNIX connection and then killed by the boot
+    /// script's own timeout leaked its `SharedUnixConnTable` slot forever, permanently exhausting
+    /// the (deliberately small, `SHARED_UNIX_CONN_CAPACITY`-bounded) pool after only a handful of
+    /// such kills and silently ECONNREFUSED-ing every X11/D-Bus client that tried to connect
+    /// afterward -- the actual mechanism behind a desktop that (intermittently, depending on how
+    /// many prior connects had already been killed) never finished booting.
+    ///
+    /// Default `true` (assume alive) so a platform that cannot cheaply answer this just never
+    /// reclaims -- matching every existing platform's prior behavior exactly rather than risking a
+    /// false "dead" verdict that steals a genuinely live process's state.
+    fn is_process_alive(&self, _pid: u32) -> bool {
+        true
+    }
+
+    /// Real host memory, as `(total_kb, available_kb)`, for `/proc/meminfo`.
+    ///
+    /// # Why this must be real, not a fixed value
+    ///
+    /// `/proc/meminfo`'s `MemFree`/`MemAvailable` are not decorative: allocation-sizing logic in
+    /// real guest programs reads them and sizes buffers/pools from them. Reporting a fixed
+    /// over-estimate is therefore not the "safe" choice it looks like -- it is an instruction to
+    /// the guest to allocate memory the host does not have.
+    ///
+    /// Measured live against `linuxserver/webtop:debian-xfce`: a hardcoded `MemTotal` of 4 GiB
+    /// with `MemFree` derived as 3/4 of it (exactly 3 GiB) produced an Xorg allocation that
+    /// plateaued at 3104-3128 MiB across three separate runs -- byte-for-byte the advertised
+    /// `MemFree` -- with a transient peak near 8.9 GiB while the final growth step held both old
+    /// and new buffers. On a 15 GiB host shared with other work that repeatedly tripped an
+    /// external low-memory watchdog, killing the guest with no error and no exit status, a
+    /// failure indistinguishable from a real hang.
+    ///
+    /// Default implementation reports a conservative 1 GiB total / 512 MiB available: safe on any
+    /// host, and low enough that a guest sizing from it cannot exhaust a real machine. Platforms
+    /// that can query the host (Windows: `GlobalMemoryStatusEx`) should override it.
+    fn memory_info_kb(&self) -> (u64, u64) {
+        (1024 * 1024, 512 * 1024)
+    }
 }
 
 /// A provider for thread-local storage.

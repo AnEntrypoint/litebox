@@ -14,7 +14,7 @@ use elf::parse::ParseAt as _;
 use litebox::{
     mm::linux::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
-    utils::{ReinterpretSignedExt as _, TruncateExt as _},
+    utils::TruncateExt as _,
 };
 use thiserror::Error;
 use zerocopy::FromBytes;
@@ -75,13 +75,18 @@ struct TrampolineInfo {
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
+///
+/// `pub` so other guest-runtime crates (e.g. `litebox_shim_linux`, which independently needs to
+/// read this exact same tail-of-file layout to detect a pre-patched binary before this loader's
+/// own `parse_trampoline` ever runs) can parse it with `zerocopy::FromBytes` too, instead of
+/// hand-rolling a second, divergent parser for the identical on-disk format.
 #[repr(C, packed)]
 #[derive(FromBytes)]
-struct TrampolineHeader64 {
-    magic: u64,
-    file_offset: u64,
-    vaddr: u64,
-    trampoline_size: u64,
+pub struct TrampolineHeader64 {
+    pub magic: u64,
+    pub file_offset: u64,
+    pub vaddr: u64,
+    pub trampoline_size: u64,
 }
 
 /// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
@@ -359,14 +364,9 @@ impl ElfParsedFile {
         let mut buf = alloc::vec![0u8; len + 1];
         file.read_at(ph.p_offset, &mut buf[..len])
             .map_err(ElfParseError::Io)?;
-        buf.truncate(
-            buf.iter()
-                .position(|&b| b == 0)
-                .expect("we null terminated it at allocation time"),
-        );
-        Ok(Some(
-            alloc::ffi::CString::new(buf).expect("truncated away null bytes"),
-        ))
+        let cstr = core::ffi::CStr::from_bytes_until_nul(&buf)
+            .expect("we null terminated it at allocation time");
+        Ok(Some(alloc::borrow::ToOwned::to_owned(cstr)))
     }
 
     fn pt_loads(&self) -> impl Iterator<Item = elf::segment::ProgramHeader> + '_ {
@@ -374,21 +374,49 @@ impl ElfParsedFile {
             .filter(|ph| ph.p_type == elf::abi::PT_LOAD)
     }
 
+    /// DIAG (investigation pass, see `elf.rs`'s `load_mapped` call site doc comment): exposes
+    /// [`Self::pt_loads`] publicly so a caller can inspect raw program-header fields immediately
+    /// before [`Self::load`] performs its BSS zero-fill writes, to check for a corrupted/torn read
+    /// as the root cause of a `write_u8_fallible` fault traced to that call.
+    pub fn pt_loads_diag(&self) -> impl Iterator<Item = elf::segment::ProgramHeader> + '_ {
+        self.pt_loads()
+    }
+
     /// Load the ELF file into memory.
+    ///
+    /// `cow_alignment`, if set, is the file-offset alignment granularity a platform's CoW-mmap
+    /// path needs (e.g. Windows' `MapViewOfFile3`, 64KiB) -- when the FIRST `PT_LOAD` segment's
+    /// own `p_offset` isn't a multiple of it, `mapper.reserve`'s `cow_padding_hint` is set to the
+    /// misalignment (bounded to `cow_alignment - PAGE_SIZE`, the most a coarser-than-page
+    /// alignment could ever need) so a platform that supports it can place a padded CoW view
+    /// immediately before the reservation. `None` (real Linux, `litebox_shim_optee`) always
+    /// passes `0`, preserving today's exact behavior. See `docs/cow-mmap-fixed-address-design.md`.
     pub fn load<M: MapMemory>(
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         reserve_trampoline: Option<usize>,
         apply_relocations: bool,
+        cow_alignment: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
             let mut min = usize::MAX;
             let mut max = 0usize;
             let mut align = PAGE_SIZE;
+            // The file offset of whichever PT_LOAD segment has the lowest `p_vaddr` -- that
+            // segment is the one that ends up mapped at the reservation's own start (`min`,
+            // page-aligned down to become `aligned_ptr` after `reserve()`), so it's the only
+            // segment whose CoW padding need can be satisfied by widening this reservation's
+            // low end. Any other segment's padding falls inside this same contiguous
+            // reservation already (see the design doc) and needs no extra reservation here.
+            let mut first_segment_offset = None;
             for ph in self.pt_loads() {
-                min = min.min(ph.p_vaddr.trunc());
+                let vaddr = ph.p_vaddr.trunc();
+                if vaddr <= min {
+                    first_segment_offset = Some(ph.p_offset);
+                }
+                min = min.min(vaddr);
                 max = max.max(
                     (ph.p_vaddr
                         .checked_add(ph.p_memsz)
@@ -415,7 +443,34 @@ impl ElfParsedFile {
             let span = max
                 .checked_sub(min)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?;
-            mapper.reserve(span, align).map_err(ElfLoadError::Map)?
+            // Pass 353 CORRECTION: this used to additionally require `align >= cow_alignment`
+            // (the reservation's own alignment being at least as coarse as the 64KiB CoW
+            // padding granularity), on the assumption that a real ET_DYN binary's largest
+            // `PT_LOAD` `p_align` is "typically >= 2MiB". That assumption is false for every
+            // musl-linked binary this project actually loads: `readelf -l` on the real
+            // `/bin/busybox` and `/lib/ld-musl-x86_64.so.1` in this project's own canonical
+            // layer shows `Align = 0x1000` (4KiB, the page size) on every `PT_LOAD`, not
+            // megabytes -- so the removed guard silently zeroed `cow_padding_hint` for every
+            // real exec in this codebase, which is why pass 352's live-wired CoW padding never
+            // fired (`verified_safe_padding` was always 0: no `PROT_NONE` slack was ever
+            // reserved to find, live-traced via a temporary per-branch diagnostic in
+            // `get_memory_permissions` and `try_cow_mmap_file`, both fully reverted before this
+            // commit). `nonzero_head_room_guarantees_room_before_aligned_ptr_with_page_size_align`
+            // (below) empirically confirms `compute_reserved_regions`'s own head-room guarantee
+            // holds identically at `align = PAGE_SIZE` as it does at `align = 2MiB` -- the guard
+            // was protecting against a geometry that was never actually at risk.
+            let cow_padding_hint = match (cow_alignment, first_segment_offset) {
+                (Some(cow_alignment), Some(p_offset)) => {
+                    // The CoW attempt for this segment will want a view starting at file offset
+                    // `p_offset` rounded DOWN to `cow_alignment`, so it needs exactly this many
+                    // bytes of guest address space immediately before the segment's own vaddr.
+                    (p_offset % cow_alignment as u64).trunc()
+                }
+                _ => 0,
+            };
+            mapper
+                .reserve(span, align, cow_padding_hint)
+                .map_err(ElfLoadError::Map)?
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.
             0
@@ -801,7 +856,25 @@ pub trait MapMemory {
     ///
     /// `align` must be a power of two. Fails if any of the parameters are not
     /// page-aligned.
-    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error>;
+    ///
+    /// `cow_padding_hint` is extra slack to reserve immediately *before* the returned address,
+    /// beyond what `len`/`align` alone would require -- `0` for a caller with no use for it
+    /// (real Linux, `litebox_shim_optee`). A platform that can turn a CoW mmap of the FIRST
+    /// `PT_LOAD` segment into a real zero-copy mapping, but whose CoW API needs the mapped file
+    /// *offset* aligned to a granularity coarser than `PAGE_SIZE` (Windows'
+    /// `MapViewOfFile3`, 64KiB), can request enough of this slack to place a CoW view's padded,
+    /// coarser-aligned start immediately before this reservation's own start -- see
+    /// `litebox_shim_linux`'s `ElfFile::reserve` and `docs/cow-mmap-fixed-address-design.md` for
+    /// the full design this threads into. Implementations that ignore this parameter (return
+    /// `len`/`align`-only behavior regardless of its value) are still correct, just unable to
+    /// support that CoW optimization -- it is advisory slack, not a hard requirement on the
+    /// implementation.
+    fn reserve(
+        &mut self,
+        len: usize,
+        align: usize,
+        cow_padding_hint: usize,
+    ) -> Result<usize, Self::Error>;
 
     /// Map file data, replacing any existing mappings.
     ///
@@ -874,13 +947,24 @@ pub struct ReservedRegions {
 /// PT_LOAD span of `0x6403D68`), the kernel rejected the `munmap` with
 /// `EINVAL`, surfacing as `execve` → `ENOEXEC` for any guest fork+exec
 /// of node.
+///
+/// `min_head_room`, if non-zero, guarantees `aligned_ptr - min_head_room >= mapping_ptr` --
+/// i.e. at least `min_head_room` bytes of this SAME reservation exist immediately before the
+/// returned `aligned_ptr`, not yet trimmed by `head_unmap` (see [`MapMemory::reserve`]'s
+/// `cow_padding_hint` parameter, which this implements). `0` (the default for every caller
+/// before this parameter existed) reduces to exactly today's behavior: `aligned_ptr` is simply
+/// `mapping_ptr`'s next `align`-aligned address, with no head-room guarantee. The caller is
+/// responsible for sizing `mapping_len` large enough to cover `min_head_room` in addition to
+/// `len`'s own over-allocation slack -- this function does not itself compute or require a
+/// bigger `mapping_len`, it only respects the room the caller already provided.
 pub fn compute_reserved_regions(
     mapping_ptr: usize,
     mapping_len: usize,
     len: usize,
     align: usize,
+    min_head_room: usize,
 ) -> ReservedRegions {
-    let aligned_ptr = mapping_ptr.next_multiple_of(align);
+    let aligned_ptr = (mapping_ptr + min_head_room).next_multiple_of(align);
     let end = aligned_ptr + len;
     let mapping_end = mapping_ptr + mapping_len;
     // The kernel rounds the mmap allocation up to a whole number of pages,
@@ -888,10 +972,20 @@ pub fn compute_reserved_regions(
     // `[mapping_ptr, mapping_end.next_multiple_of(PAGE_SIZE))`.
     let mapping_end_aligned = mapping_end.next_multiple_of(PAGE_SIZE);
 
-    let head_unmap = if aligned_ptr == mapping_ptr {
+    // Trim everything before the guaranteed head-room range, never the head-room range
+    // itself: `[mapping_ptr, aligned_ptr - min_head_room)`, rounded DOWN to a whole page (like
+    // the tail trim below, `munmap` needs page-aligned addresses and `min_head_room` is not
+    // itself required to be page-aligned), is released, leaving at least
+    // `[aligned_ptr - min_head_room, aligned_ptr)` genuinely still reserved (not yet
+    // `munmap`'d) for a caller that asked for `min_head_room` -- see this function's own doc
+    // comment. `min_head_room == 0` reduces this to exactly the pre-existing
+    // `[mapping_ptr, aligned_ptr)` trim (already page-aligned, since `mapping_ptr` and
+    // `aligned_ptr` both are).
+    let head_room_start = page_align_down(aligned_ptr - min_head_room);
+    let head_unmap = if head_room_start <= mapping_ptr {
         None
     } else {
-        Some((mapping_ptr, aligned_ptr - mapping_ptr))
+        Some((mapping_ptr, head_room_start - mapping_ptr))
     };
 
     let tail_start = end.next_multiple_of(PAGE_SIZE);
@@ -934,12 +1028,7 @@ impl<Platform: RawPointerProvider> AccessMemory for &Platform {
 
     fn zero(&mut self, address: usize, len: usize) -> Result<(), Fault> {
         let addr = Platform::RawMutPointer::<u8>::from_usize(address);
-        // TODO: add a fill method to [`RawMutPointer`] and use it.
-        for i in 0..len {
-            addr.write_at_offset(i.reinterpret_as_signed(), 0)
-                .ok_or(Fault)?;
-        }
-        Ok(())
+        addr.fill_at_offset(0, len, 0).ok_or(Fault)
     }
 }
 
@@ -1010,7 +1099,7 @@ mod reserve_regions_tests {
         let len = 0x10_0000; // 1 MiB, page-aligned
         let align = PAGE_SIZE;
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, 0);
         assert_eq!(r.aligned_ptr, mapping_ptr);
         assert_eq!(r.head_unmap, None);
         assert_eq!(r.tail_unmap, None);
@@ -1026,7 +1115,7 @@ mod reserve_regions_tests {
         let mapping_len = len + (align - PAGE_SIZE);
         // mapping_ptr page-aligned but not align-aligned.
         let mapping_ptr = 0x4000_0000 + PAGE_SIZE;
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, 0);
         assert_eq!(r.aligned_ptr % align, 0);
         assert!(r.aligned_ptr >= mapping_ptr);
         assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
@@ -1049,7 +1138,7 @@ mod reserve_regions_tests {
         let align = PAGE_SIZE;
         let len = NODE_LEN;
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, 0);
         assert_eq!(r.aligned_ptr, mapping_ptr);
         assert_eq!(r.head_unmap, None);
         assert_eq!(r.tail_unmap, None);
@@ -1084,7 +1173,7 @@ mod reserve_regions_tests {
             "old tail size happened to be page-aligned",
         );
 
-        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, 0);
         assert_eq!(r.aligned_ptr, old_aligned_ptr);
         let (tail_start, tail_size) = r.tail_unmap.expect("tail trim expected with large align");
         // Tail covers everything from the page after the requested end to
@@ -1107,11 +1196,112 @@ mod reserve_regions_tests {
         let mapping_len = page_aligned_len + (align - PAGE_SIZE);
         for offset_pages in 0..8 {
             let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
-            let r = compute_reserved_regions(mapping_ptr, mapping_len, page_aligned_len, align);
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, page_aligned_len, align, 0);
             assert_eq!(r.aligned_ptr % align, 0);
             let head = r.head_unmap.map_or(0, |(_, s)| s);
             let tail = r.tail_unmap.map_or(0, |(_, s)| s);
             assert_eq!(head + tail, align - PAGE_SIZE);
+            assert_page_aligned(&r);
+        }
+    }
+
+    /// `min_head_room == 0` (every caller before this parameter existed) must reduce to
+    /// EXACTLY today's `aligned_ptr` choice -- a required regression guard for
+    /// `docs/cow-mmap-fixed-address-design.md`'s reservation-widening change.
+    #[test]
+    fn zero_head_room_matches_pre_existing_behavior() {
+        let align = 0x20_0000; // 2 MiB, a realistic PT_LOAD p_align
+        let len = 0x123_000;
+        let mapping_len = len + (align - PAGE_SIZE);
+        for offset_pages in 0..8 {
+            let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
+            let with_zero = compute_reserved_regions(mapping_ptr, mapping_len, len, align, 0);
+            let old_aligned_ptr = mapping_ptr.next_multiple_of(align);
+            assert_eq!(with_zero.aligned_ptr, old_aligned_ptr);
+        }
+    }
+
+    /// `min_head_room != 0` guarantees `aligned_ptr - min_head_room >= mapping_ptr`, i.e. that
+    /// many bytes of this SAME reservation genuinely exist immediately before `aligned_ptr` --
+    /// the property `docs/cow-mmap-fixed-address-design.md`'s CoW-padding trick depends on.
+    #[test]
+    fn nonzero_head_room_guarantees_room_before_aligned_ptr() {
+        let align = 0x20_0000; // 2 MiB
+        let len = 0x123_000;
+        let cow_padding = 0x1_0000 - PAGE_SIZE; // max possible 64KiB-granularity padding
+        // mapping_len must additionally cover cow_padding, matching what a real caller
+        // (`ElfFile::reserve`) would request.
+        let mapping_len = len + (align - PAGE_SIZE) + cow_padding;
+        for offset_pages in 0..16 {
+            let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, cow_padding);
+            assert_eq!(r.aligned_ptr % align, 0);
+            assert!(
+                r.aligned_ptr >= mapping_ptr + cow_padding,
+                "aligned_ptr {:#x} does not leave {cow_padding:#x} bytes of room before it \
+                 (mapping_ptr {:#x})",
+                r.aligned_ptr,
+                mapping_ptr,
+            );
+            // The room before aligned_ptr must be inside this reservation, not trimmed away by
+            // head_unmap -- i.e. head_unmap (if any) must end at or before aligned_ptr -
+            // cow_padding, never past it.
+            if let Some((head_addr, head_size)) = r.head_unmap {
+                assert!(
+                    head_addr + head_size <= r.aligned_ptr - cow_padding,
+                    "head_unmap [{head_addr:#x}, {:#x}) overlaps the guaranteed head-room \
+                     range ending at {:#x}",
+                    head_addr + head_size,
+                    r.aligned_ptr - cow_padding,
+                );
+            }
+            assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
+            assert_page_aligned(&r);
+        }
+    }
+
+    // Pass 353: same guarantee, but with `align == PAGE_SIZE` (4KiB) -- the REAL value every
+    // musl-linked binary in this project's own layers actually has (confirmed live via
+    // `readelf -l` on `/bin/busybox` and `/lib/ld-musl-x86_64.so.1`: every `PT_LOAD` reports
+    // `Align = 0x1000`, not the multi-megabyte value `MappingInfo::load`'s own `cow_padding_hint`
+    // guard comment assumed "typical" for a real ET_DYN binary). `nonzero_head_room_guarantees_
+    // room_before_aligned_ptr` above only ever exercised `align = 2MiB`, so this specific,
+    // now-known-to-be-the-common-case geometry was never actually tested -- this is exactly why
+    // the `align >= cow_alignment` guard silently zeroed `cow_padding_hint` for every real exec
+    // this session measured and nobody noticed sooner. This test exists to settle, with real
+    // evidence rather than a source comment's untested assumption, whether the SAME geometric
+    // guarantee (`compute_reserved_regions` leaves genuine, unmapped head-room before
+    // `aligned_ptr`) still holds when `align` is finer than `cow_padding`'s own 64KiB
+    // granularity -- if it does, the `align >= cow_alignment` guard in `MappingInfo::load` is
+    // unnecessarily conservative and should be relaxed; if it does NOT, the guard is load-bearing
+    // and must stay.
+    #[test]
+    fn nonzero_head_room_guarantees_room_before_aligned_ptr_with_page_size_align() {
+        let align = PAGE_SIZE; // 4 KiB -- the real value, not the 2MiB the other test exercises
+        let len = 0x123_000;
+        let cow_padding = 0x1_0000 - PAGE_SIZE; // max possible 64KiB-granularity padding
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE) + cow_padding;
+        for offset_pages in 0..16 {
+            let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align, cow_padding);
+            assert_eq!(r.aligned_ptr % align, 0);
+            assert!(
+                r.aligned_ptr >= mapping_ptr + cow_padding,
+                "aligned_ptr {:#x} does not leave {cow_padding:#x} bytes of room before it \
+                 (mapping_ptr {:#x}, align {align:#x})",
+                r.aligned_ptr,
+                mapping_ptr,
+            );
+            if let Some((head_addr, head_size)) = r.head_unmap {
+                assert!(
+                    head_addr + head_size <= r.aligned_ptr - cow_padding,
+                    "head_unmap [{head_addr:#x}, {:#x}) overlaps the guaranteed head-room \
+                     range ending at {:#x} (align {align:#x})",
+                    head_addr + head_size,
+                    r.aligned_ptr - cow_padding,
+                );
+            }
+            assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
             assert_page_aligned(&r);
         }
     }

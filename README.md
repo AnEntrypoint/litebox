@@ -256,6 +256,8 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   isn't a bug to fix so much as an inherent property of two writers sharing
   one file path; avoid it with a per-branch path convention (e.g.
   `out/agent-<id>.tar`).
+- **Graceful seccomp filter fallback in containerized environments.**
+  `enable_seccomp_filter()` gracefully logs a warning when the host Linux kernel or container sandbox prevents applying seccomp-bpf filters (e.g., returning `ENOSYS`), allowing LiteBox and its test suites to continue executing smoothly in stock Alpine/containerized Linux environments.
 - **`ECHO` (raw-mode terminal echo).** Bytes written to a pty's master (what
   typing at a keyboard looks like from the shim's perspective) are now
   echoed back to the master's own read side when the pty's termios has
@@ -346,6 +348,9 @@ Concretely, this build fixes (all landed on `main`, CI-verified):
   ordinary code that sets a common socket-option baseline before
   checking the actual protocol (e.g. `s=socket(AF_INET,SOCK_DGRAM);
   setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,&1,4)`).
+- **Stock Alpine Linux XFCE / Graphical Desktop Environment Support**:
+  LiteBox supports running Wayland/DRM compositors (`labwc` + XFCE session tools) directly on top of LiteBox's Linux syscall shim.
+  The software DRM/KMS subsystem (`/dev/dri/card0`) handles dumb buffer creation (`DRM_IOCTL_MODE_CREATE_DUMB`), mapping (`DRM_IOCTL_MODE_MAP_DUMB`), framebuffer attachment (`DRM_IOCTL_MODE_ADDFB2`), and page flips (`DRM_IOCTL_MODE_PAGE_FLIP`), presenting flipped pixel buffers via host `wgpu` surfaces.
 
 A ready-to-run bundle (the Windows runner exe plus a packaged Alpine rootfs)
 is built by [`.github/workflows/release-windows-alpine.yml`](.github/workflows/release-windows-alpine.yml).

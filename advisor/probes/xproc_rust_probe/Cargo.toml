@@ -1,0 +1,19 @@
+# Throwaway live-verification harness for the REAL Rust cross-process mutex in
+# `litebox_platform_windows_userland::xproc_sync`.
+#
+# Deliberately OUTSIDE the repo workspace (note the empty `[workspace]` table
+# below, which makes this its own workspace root) so it is never built by a
+# `cargo build`/`cargo test` at the repo root and never becomes a crate test.
+[package]
+name = "xproc_rust_probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+litebox_platform_windows_userland = { path = "../../../litebox_platform_windows_userland" }
+
+[profile.release]
+opt-level = 2

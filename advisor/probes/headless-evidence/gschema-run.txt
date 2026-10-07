@@ -1,0 +1,130 @@
+GSCHEMA_COMPILED=ok
+   2.986264200s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=10 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+   6.800495100s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=2073600 first8=[0, 0, 0, 255, 0, 0, 0, 255] mid8=[
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+   6.880496800s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=2073600 first8=[0, 0, 0, 255, 0, 0, 0, 255] mid8=[
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+   7.188473700s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=2073600 first8=[0, 0, 0, 255, 0, 0, 0, 255] mid8=[
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+   7.292250900s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=2073600 first8=[0, 0, 0, 255, 0, 0, 0, 255] mid8=[
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+   7.401151200s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=2073600 first8=[0, 0, 0, 255, 0, 0, 0, 255] mid8=[
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=0 distinct_colors_capped64=1
+   7.514146100s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[13, 6, 0, 255, 13, 6, 0, 255] mid8
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.561607200s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[18, 9, 0, 255, 18, 9, 0, 255] mid8
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.605643500s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[19, 9, 0, 255, 19, 9, 0, 255] mid8
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.653061900s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[20, 10, 0, 255, 20, 10, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.701212400s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[21, 10, 0, 255, 21, 10, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.749027300s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[22, 10, 0, 255, 22, 10, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.799544300s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[22, 11, 0, 255, 22, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.848140400s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[22, 11, 0, 255, 22, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.893383200s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[22, 11, 0, 255, 22, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.939510000s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   7.986707400s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.035047100s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.087457000s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.137067700s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.182507300s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.226807600s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+   8.273540300s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  29.568385800s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=36 tid=36 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 
+  29.568410900s ERROR litebox_shim_linux::syscalls::signal: DIAG_TIMELINE exit_signal pid=36 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, 0, 0, 0, 0] sign
+  29.888243800s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=6221904 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  29.936911800s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221888 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  31.021611000s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=54 tid=54 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 
+  31.021629500s ERROR litebox_shim_linux::syscalls::signal: DIAG_TIMELINE exit_signal pid=54 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, 0, 0, 0, 0] sign
+  45.592741900s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=100 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+  45.989019700s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=111 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, 0, 0, 0, 0] sta
+  46.087142100s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=109 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, 0, 0, 0, 0] sta
+  46.089822700s ERROR litebox_shim_linux::syscalls::signal: fatal signal: terminating task signal=Signal(9) pid=110 tid=110 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109
+  46.089858900s ERROR litebox_shim_linux::syscalls::signal: DIAG_TIMELINE exit_signal pid=110 comm=[100, 98, 117, 115, 45, 100, 97, 101, 109, 111, 110, 0, 0, 0, 0, 0] sig
+  46.162151200s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=108 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+  46.198315600s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=6221888 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=2073597 distinct_colors_capped64=64
+  46.281522400s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=2258766 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+  46.328284800s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=1 bytes_len=8294400 nonzero_bytes=2258766 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+  46.373178700s ERROR litebox_shim_linux::syscalls::drm: diag-drm-scanout-bytes fb_id=2 bytes_len=8294400 nonzero_bytes=2258766 first8=[23, 11, 0, 255, 23, 11, 0, 255] mi
+[LITEBOX_DUMP_FRAMES] frame 1920x1080 pitch=7680 non_black_pixels=92036 distinct_colors_capped64=64
+  46.789208900s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=115 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+  47.697481900s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=119 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+  55.663896900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257625600 requested_end=5257646080 vm
+  55.663984500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257629696 requested_end=5257633792 vm
+  55.664017400s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libxcb-present.so.0") start=5257
+  55.664043500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257646080 requested_end=5257650176 vm
+  55.664056500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257629696 requested_end=5257633792 vm
+  55.664188900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257629696 requested_end=5257633792 vm
+  55.664212200s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257646080 requested_end=5257650176 vm
+  55.664276900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257633792 requested_end=5257637888 vm
+  55.664748100s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257691136 requested_end=5257728000 vm
+  55.664853200s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257703424 requested_end=5257715712 vm
+  55.664887800s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libxcb-xfixes.so.0") start=52577
+  55.664915200s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257728000 requested_end=5257732096 vm
+  55.664928800s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257703424 requested_end=5257715712 vm
+  55.665265300s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257703424 requested_end=5257715712 vm
+  55.665289900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257728000 requested_end=5257732096 vm
+  55.665358200s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257715712 requested_end=5257719808 vm
+  55.665637900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257756672 requested_end=5257822208 vm
+  55.665732500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257785344 requested_end=5257801728 vm
+  55.665764800s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libxcb-randr.so.0") start=525778
+  55.665792000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257822208 requested_end=5257826304 vm
+  55.665804900s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257785344 requested_end=5257801728 vm
+  55.666189600s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257785344 requested_end=5257801728 vm
+  55.666213500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257822208 requested_end=5257826304 vm
+  55.666294600s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257801728 requested_end=5257814016 vm
+  55.666582400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257887744 requested_end=5257953280 vm
+  55.666689300s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257900032 requested_end=5257928704 vm
+  55.666722000s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libudev.so.1") start=5257900032 
+  55.666750700s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257953280 requested_end=5257957376 vm
+  55.666764000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257900032 requested_end=5257928704 vm
+  55.668171500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257900032 requested_end=5257928704 vm
+  55.668219000s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5257953280 requested_end=5257957376 vm
+  55.668333700s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5257928704 requested_end=5257940992 vm
+  55.673455100s ERROR litebox_platform_windows_userland::fork_verify: diag-vprotect: write_usize_fault_tolerant widen tid=ThreadId(136) addr=5231103248 old_protect=2 ok=t
+  55.673516000s ERROR litebox_platform_windows_userland::fork_verify: diag-vprotect: write_usize_fault_tolerant restore tid=ThreadId(136) addr=5231103248 restored_to=2 ok
+  55.675877800s ERROR litebox_platform_windows_userland::fork_verify: diag-vprotect: write_usize_fault_tolerant widen tid=ThreadId(136) addr=5231103720 old_protect=2 ok=t
+  55.675937200s ERROR litebox_platform_windows_userland::fork_verify: diag-vprotect: write_usize_fault_tolerant restore tid=ThreadId(136) addr=5231103720 restored_to=2 ok
+  55.689117500s ERROR litebox_platform_windows_userland::fork_verify: diag-fv-lifecycle: end (cleared) tid=ThreadId(136) had_map=true range_count=18
+  55.689191600s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE execve pid=132 ppid=1000 comm=[115, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] argv0=/bin/s
+  55.701511600s ERROR litebox_shim_linux::loader::elf: diag-elf-load-path: tracking for future crash-address correlation path=/bin/sleep
+  55.703507700s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=303038464 requested_end=303063040 vma_
+  55.703998700s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=303063040 requested_end=303689728 vma_
+  55.704052600s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/bin/sleep") start=303063040 len=626688 o
+  55.704216500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=303689728 requested_end=303828992 vma_
+  55.704596400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5449908224 requested_end=5449990144 vm
+  55.704939300s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5449990144 requested_end=5450354688 vm
+  55.704991500s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/lib/ld-musl-x86_64.so.1") start=54499901
+  55.705185400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5450596352 requested_end=5450608640 vm
+  55.705409500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5450354688 requested_end=5450575872 vm
+  55.705644400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5450596352 requested_end=5450608640 vm
+  55.705679700s ERROR litebox_shim_linux::loader::elf: diag-elf-load: aux vector base/entry values main_base=0x12100000 main_entry=0x12106ed1 main_phdrs_addr=0x12100040 m
+  55.715920800s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5459087360 requested_end=5459091456 vm
+  55.716002100s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5450575872 requested_end=5450579968 vm
+  55.716114100s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=303828992 requested_end=303845376 vma_
+  55.838464500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5258018816 requested_end=5449846784 vm
+  55.964841400s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=create_mapping requested_start=5263749120 requested_end=5373956096 vm
+  55.970576100s ERROR litebox_shim_linux::syscalls::mm: diag-exec-mmap: tracking for future crash-address correlation path=Some("/usr/lib/libLLVM.so.22.1") start=52637491
+  55.970647300s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5449846784 requested_end=5449850880 vm
+  55.970663500s ERROR litebox::mm::linux: diag-protect-mapping: found overlapping tracked vma caller=guest_mprotect requested_start=5263749120 requested_end=5373956096 vm
+  56.227609900s ERROR litebox_shim_linux::syscalls::process: DIAG_TIMELINE exit_group pid=132 comm=[115, 108, 101, 101, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] status=0
+  56.227674300s ERROR litebox_platform_windows_userland::fork_verify: diag-fv-lifecycle: end (cleared) tid=ThreadId(136) had_map=false range_count=0

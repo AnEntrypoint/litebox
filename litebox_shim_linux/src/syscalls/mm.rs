@@ -9,7 +9,7 @@ use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer, RawMutPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions, SharedMemoryError},
     },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
@@ -24,6 +24,644 @@ use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 #[cfg(target_arch = "x86_64")]
 use object::endian::LittleEndian;
 
+/// Whether the copy-on-write file-mapping fast path is allowed to run. Default **off**.
+///
+/// Off by default because the path is currently INCORRECT on Windows, and separately is not
+/// buying anything. Both halves are measured, not assumed:
+///
+/// * **Incorrect.** A `MapViewOfFile3` CoW view can only be destroyed whole -- Windows has no
+///   partial-unmap for a mapped view -- so when the guest `mmap(MAP_FIXED)`s a sub-range of a
+///   view (exactly what `ld.so` does: one whole-library view, then a fixed sub-mmap per
+///   `PT_LOAD`), the flanking remainder either side of that sub-range dies with it. Nothing in
+///   this codebase can reconstruct those flanks as equivalent CoW mappings, because no
+///   guest-address -> file/offset tracking exists (`VmArea` records only `is_file_backed: bool`),
+///   so the best available recovery re-creates them as anonymous ZERO-FILL pages. That is
+///   memory-safe but silently lossy, and for a shared library the lost bytes are real content.
+///   Measured directly: with this path enabled, `python3 -c "import pixelflux"` fails with
+///   `ImportError: Error relocating .../libplacebo-...so: dovi_rpu_get_header: symbol not found`
+///   even though `libdovi-...so` is present and correct in the same directory -- the symbol is
+///   missing because the pages holding it were zero-filled. With this path disabled, the same
+///   import succeeds, as does `import pcmflux`. That is selkies' entire capture/encode layer, and
+///   therefore the webtop's whole video path.
+/// * **Not buying anything.** See AGENTS.md, "Windows CoW-mmap performance": the optimisation was
+///   investigated to a conclusion and found to have "zero practical effect" on real tar-packed
+///   execs, because `MapViewOfFile3` requires 64 KiB file-offset alignment while real ELF
+///   `PT_LOAD` file offsets are only page-aligned. It succeeds mainly on deliberately
+///   realignment-padded images -- which is precisely where it now does damage.
+///
+/// Set `LITEBOX_COW_MMAP=1` to opt back in (e.g. to continue the alignment/CoW investigation the
+/// open PRD rows describe). Nothing else about the CoW implementation is changed by this flag; it
+/// only decides whether the fast path is attempted at all.
+static COW_MMAP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable (or disable) the copy-on-write file-mapping fast path. See [`COW_MMAP_ENABLED`].
+///
+/// The shim is `no_std` and cannot read an environment variable itself, so the runner forwards
+/// `LITEBOX_COW_MMAP` on its behalf -- the same arrangement `set_mapping_guard_gap_disabled`
+/// already uses for `LITEBOX_NO_MAPPING_GUARD_GAP`.
+pub fn set_cow_mmap_enabled(enabled: bool) {
+    COW_MMAP_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the copy-on-write file-mapping fast path may be attempted.
+fn cow_mmap_enabled() -> bool {
+    COW_MMAP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One System V shared-memory segment.
+///
+/// **This is NOT a single host address valid in every guest process.** An earlier revision of
+/// this type assumed "litebox runs every guest process inside ONE real host address space",
+/// which was true of the original thread-based fork model (every guest "process" a thread inside
+/// one Windows process) but is false the moment `LITEBOX_PROCESS_FORK=1`'s cross-process fork
+/// path is taken: a guest process attaching a segment it did not create is then a genuinely
+/// separate Windows process, with its own private address space, in which the CREATOR's
+/// `addr` was never mapped to anything at all. `shmat` handing that raw numeric value back
+/// produced a real, wild, unmapped pointer in the attaching process -- read by whatever copy
+/// eventually touched it, an ordinary `memmove`/`memcpy` -- root-caused to this exact defect via
+/// the live `LITEBOX_DIAG_FATALDUMP=1` register capture of the second Xvfb SIGSEGV (51st pass):
+/// `rsi` (the wild source pointer) never moved with Xvfb's own ASLR base across independent
+/// boots, which is exactly what a value copied verbatim out of the shared `GlobalState` table
+/// (rather than derived from this process's own, ASLR'd, mmap placement) looks like from the
+/// crash site. The X11 MIT-SHM extension makes this reachable on every real desktop boot: a
+/// client creates a segment and tells the SERVER (Xvfb, never fork-related to the client) its id
+/// over the wire; the server's own `shmat` is exactly the non-creator attach this bug breaks.
+///
+/// Fixed (51st pass) by keying each segment to a NAMED platform shared-memory object
+/// (`PageManagementProvider::create_named_shared_memory`, `Local\litebox_sysvshm_<shmid>`)
+/// instead of a bare address: every attacher, including the creator's own first `shmat`, now
+/// opens that name and establishes a REAL mapping in ITS OWN address space via the existing
+/// `map_existing_shared_pages` machinery (same primitive `syscalls::file`'s memfd/`wl_shm`
+/// bridging already uses) -- see `Task::sys_shmat`. The resulting address is per-process (real
+/// Linux `shmat` addresses are never guaranteed identical across processes either), so this type
+/// no longer carries one at all.
+#[derive(Clone, Copy)]
+pub(crate) struct SysvShmSegment {
+    /// Size in bytes, rounded up to a page.
+    size: usize,
+    /// The `key` this segment was created for, or `IPC_PRIVATE` (0).
+    key: i32,
+    /// Number of live `shmat` attachments across every process combined.
+    attaches: usize,
+    /// Set by `shmctl(IPC_RMID)`. Real Linux keeps a removed segment alive until the last
+    /// detach, and so does this.
+    removed: bool,
+    /// Creator's uid/gid and the permission bits from `shmget`, reported by `IPC_STAT` (the X
+    /// server's MIT-SHM `ShmAttach` checks them against the client).
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+/// Upper bound on simultaneously live SysV shm segments in one guest session (X11's MIT-SHM
+/// extension allocates one per client-side pixmap/framebuffer pool, plus Xvfb's own `-shmem`
+/// framebuffer). Matches real Linux's own default `shmmni` (4096) rather than a hand-picked
+/// smaller number: an XFCE session is not one client -- every GTK app, chromium's software
+/// compositor and selkies' capture each hold several at once, and a full that reports `ENOSPC`
+/// from `shmget` reads to a client as "cannot allocate a frame buffer", i.e. a window that maps
+/// and never paints. A fixed-size, pointer-free slot array -- deliberately NOT a `BTreeMap`,
+/// see [`SysvShmTable`].
+pub(crate) const MAX_SYSV_SHM_SEGMENTS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct ShmSlot {
+    shmid: i32,
+    segment: SysvShmSegment,
+}
+
+/// All System V shared-memory segments, plus the key -> id index `shmget` needs.
+///
+/// A fixed-size, pointer-free slot array -- deliberately NOT a `BTreeMap` (the type this field
+/// used before the 2026-09-18 systematic `GlobalState`-field audit). `GlobalState::sysv_shm` is
+/// genuinely, correctly meant to be shared across the whole cross-process-fork family (see its
+/// own doc comment: "any process that knows the key or id can attach", exactly what X11's
+/// MIT-SHM extension and Xvfb's own `-shmem` framebuffer rely on for real cross-process content
+/// sharing), so unlike `unix_addr_table`/`fifo_registry` (fixed the same 2026-09-18 audit pass by
+/// shadowing them as per-process-private on `GlobalStateHandle` instead) this table cannot simply
+/// be made per-process -- two DIFFERENT guest processes' `shmget(same key)` genuinely must
+/// resolve to the same segment. A `BTreeMap`'s heap-allocated nodes are the SAME defect class
+/// already fixed a dozen times over elsewhere in this crate (see `GlobalStateHandle`'s own doc
+/// comment): an attaching cross-process-fork child's copy of the root pointer is the first
+/// creator's, meaningless in its own address space. `SysvShmSegment` itself is already fully
+/// `Copy`/pointer-free (a handful of `usize`/`i32`/`bool` fields, no `Vec`/`Box`/`Arc`), so a
+/// flat array of `Option<ShmSlot>` needs no `unsafe` and no second `SharedKernelStateProvider`
+/// slot -- it inherits whatever cross-process sharing `GlobalState` itself already gets for free,
+/// the same reasoning `syscalls::unix::SharedUnixAddrPresenceTable`'s own doc comment gives.
+/// `shmid` values are NOT slot indices (real Linux `shmid`s are opaque, monotonically-issued via
+/// `GlobalState::next_shmid`, and this table must tolerate holes as segments are removed), so
+/// every lookup is a linear scan over [`MAX_SYSV_SHM_SEGMENTS`] slots -- cheap, since these
+/// syscalls (`shmget`/`shmat`/`shmdt`/`shmctl`) are rare compared to the data-plane operations
+/// that actually move pixels.
+pub(crate) struct SysvShmTable {
+    slots: [Option<ShmSlot>; MAX_SYSV_SHM_SEGMENTS],
+}
+
+impl SysvShmTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: [None; MAX_SYSV_SHM_SEGMENTS],
+        }
+    }
+
+    fn index_of_id(&self, shmid: i32) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, Some(s) if s.shmid == shmid))
+    }
+
+    /// A `shmctl(IPC_RMID)`'d segment no longer answers its key, exactly as on Linux: RMID frees
+    /// the key for a fresh `shmget` immediately, while the segment itself (and its bytes) lives
+    /// on until its last detach. Without this, `shmget(same key)` after an RMID hands back the
+    /// dying segment -- the observed `fresh_after_rmid shmid=1 same=True` -- and a client that
+    /// recreated its buffer after tearing the old one down keeps reading the OLD contents.
+    fn index_of_key(&self, key: i32) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            matches!(slot, Some(s) if s.segment.key == key && !s.segment.removed)
+        })
+    }
+
+    fn get_mut(&mut self, shmid: i32) -> Option<&mut SysvShmSegment> {
+        let i = self.index_of_id(shmid)?;
+        Some(&mut self.slots[i].as_mut().unwrap().segment)
+    }
+
+    /// `fork()`'s half of the `exit_shm()` accounting [`Task::detach_sysv_shm_on_process_exit`]
+    /// performs, and the reason the two must be kept symmetric. Real Linux's `dup_mmap()` calls
+    /// `shm_open()` for every VMA it copies, i.e. a fork ADDS one `shm_nattch` per inherited
+    /// attachment; `exit_shm()`'s `shm_close()` is what takes it away again. A fork that copies
+    /// the attachment records without this increment lets a child's own exit drive a segment's
+    /// count down to zero while its PARENT still maps it -- the exact shape that frees the slot
+    /// and unlinks the backing store underneath a live attacher.
+    ///
+    /// Called once per inherited attachment RECORD, not once per distinct `shmid`: the same
+    /// segment attached at two addresses counts twice, matching Linux's
+    /// one-`shm_nattch`-per-VMA rule (and `take_all_shm_attachments`, which yields it twice).
+    ///
+    /// A `shmid` with no live slot is skipped rather than resurrected: nothing can be attached
+    /// to a segment that has already been destroyed.
+    pub(crate) fn record_inherited_attachments(&mut self, shmids: impl Iterator<Item = i32>) {
+        for shmid in shmids {
+            if let Some(seg) = self.get_mut(shmid) {
+                seg.attaches = seg.attaches.saturating_add(1);
+            }
+        }
+    }
+
+    fn remove(&mut self, shmid: i32) {
+        if let Some(i) = self.index_of_id(shmid) {
+            self.slots[i] = None;
+        }
+    }
+
+    fn insert(&mut self, shmid: i32, segment: SysvShmSegment) -> Result<(), Errno> {
+        let free = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_none())
+            .ok_or(Errno::ENOSPC)?;
+        self.slots[free] = Some(ShmSlot { shmid, segment });
+        Ok(())
+    }
+}
+
+/// Host name of the shared-memory object backing SysV segment `shmid`.
+///
+/// The `shmid` alone is the whole identity, on purpose: `GlobalState::next_shmid` is a
+/// cross-process atomic inside the shared kernel arena (every guest process, fork-related or
+/// not, gets the SAME `GlobalState` -- see its construction inside `create_shared_kernel_state`),
+/// so two processes that never met agree on which object a given `shmid` names. No pid, no
+/// per-process component: adding one would give each process its own private segment, which is
+/// the exact bug this design replaced.
+fn sysv_shm_object_name(shmid: i32) -> alloc::string::String {
+    alloc::format!("litebox_sysvshm_{shmid}")
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Create-or-open the host-side backing store of segment `shmid`, sized to `size`.
+    ///
+    /// This is what makes a real Linux `shmget` segment: the backing store must exist -- and must
+    /// keep every byte written to it -- from `shmget` until `shmctl(IPC_RMID)`, independently of
+    /// whether any process currently has it attached. A pagefile-backed named section cannot do
+    /// that (its lifetime is its HANDLEs': the last process out takes the bytes with it), so this
+    /// asks the platform for a FILE-backed one and treats "no file backing here" as "fall back to
+    /// the old handle-lifetime behaviour" rather than as a failure. Idempotent, so both
+    /// `sys_shmget` and `sys_shmat` call it.
+    fn ensure_sysv_shm_backing(&self, shmid: i32, size: usize) -> Result<(), Errno> {
+        let name = sysv_shm_object_name(shmid);
+        match self
+            .global
+            .platform
+            .create_file_backed_named_shared_memory(&name, size)
+        {
+            Ok(handle) => {
+                // Only the file has to outlive this call, not a HANDLE on it: `shmat` opens the
+                // object again (by name, from the file) in whichever process attaches. Releasing
+                // the handle here keeps `shmget` from leaking one kernel object per segment.
+                let _ = self.global.platform.close_shared_memory(handle);
+                Ok(())
+            }
+            Err(SharedMemoryError::UnsupportedByPlatform) => Ok(()),
+            Err(_) => {
+                litebox_util_log::error!(
+                    shmid:% = shmid, size:% = size;
+                    "sysv shm: backing store could not be created"
+                );
+                Err(Errno::ENOMEM)
+            }
+        }
+    }
+
+    /// Unlink segment `shmid`'s backing store. Best effort, never reported to the guest -- see
+    /// `PageManagementProvider::delete_file_backed_named_shared_memory`: a host that still has
+    /// the file referenced (an attacher that has not detached yet) simply defers the unlink, and
+    /// the last detach retries it.
+    fn release_sysv_shm_backing(&self, shmid: i32) {
+        let name = sysv_shm_object_name(shmid);
+        let _ = self
+            .global
+            .platform
+            .delete_file_backed_named_shared_memory(&name);
+    }
+
+    /// `shmget(key, size, shmflg)`.
+    ///
+    /// System V shared memory was entirely unimplemented, which is what stopped the webtop's
+    /// video: X11's MIT-SHM extension is how a screen-capture client moves framebuffer bytes, and
+    /// selkies' `pixelflux` capture aborts with a bare "shmget failed" without it -- the browser
+    /// then sits on "Waiting for stream..." forever with no other diagnostic.
+    pub(crate) fn sys_shmget(&self, key: i32, size: usize, shmflg: i32) -> Result<usize, Errno> {
+        const IPC_PRIVATE: i32 = 0;
+        const IPC_CREAT: i32 = 0o1000;
+        const IPC_EXCL: i32 = 0o2000;
+
+        let mut table = self.global.sysv_shm.lock();
+
+        if key != IPC_PRIVATE
+            && let Some(existing_idx) = table.index_of_key(key)
+        {
+            if shmflg & (IPC_CREAT | IPC_EXCL) == (IPC_CREAT | IPC_EXCL) {
+                return Err(Errno::EEXIST);
+            }
+            // A caller asking for MORE than the existing segment holds cannot be satisfied by
+            // handing it back, and silently returning a too-small segment would corrupt whatever
+            // wrote past the end.
+            let existing_slot = table.slots[existing_idx]
+                .as_ref()
+                .expect("index_of_key only ever returns an occupied slot");
+            if size > existing_slot.segment.size {
+                return Err(Errno::EINVAL);
+            }
+            return Ok(usize::try_from(existing_slot.shmid).unwrap());
+        }
+
+        if key != IPC_PRIVATE && shmflg & IPC_CREAT == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if size == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let page = litebox::mm::linux::PAGE_SIZE;
+        let rounded = size.checked_next_multiple_of(page).ok_or(Errno::EINVAL)?;
+
+        // No ADDRESS is created here -- matching real Linux, where `shmget` only reserves an
+        // id/size and the first REAL mapping happens at `shmat` time, in whichever process calls
+        // it (see `SysvShmSegment`'s own doc comment for why this changed: the previous
+        // single-canonical-address design was wrong under cross-process fork). The segment's
+        // BACKING STORE is created here though: real Linux keeps a segment -- its bytes, its size,
+        // its permissions -- from `shmget` until `shmctl(IPC_RMID)` whether or not anyone ever
+        // attaches, and a producer that `shmget`s, writes and exits must leave those bytes behind
+        // for a consumer that only execs much later.
+        let shmid = self
+            .global
+            .next_shmid
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        table
+            .insert(
+                shmid,
+                SysvShmSegment {
+                    size: rounded,
+                    key,
+                    attaches: 0,
+                    removed: false,
+                    uid: self.creds().euid,
+                    gid: self.creds().egid,
+                    mode: u32::try_from(shmflg & 0o777).unwrap_or(0o600),
+                },
+            )
+            .map_err(|_| Errno::ENOMEM)?;
+        // The backing store is created OUTSIDE the table lock: `table` is a cross-process arena
+        // lock and this is host file IO, so it must not be held while this process blocks on the
+        // host (the same rule `perform_network_interaction` was fixed to obey for `net_lock`).
+        drop(table);
+        if let Err(err) = self.ensure_sysv_shm_backing(shmid, rounded) {
+            self.global.sysv_shm.lock().remove(shmid);
+            return Err(err);
+        }
+        litebox_util_log::debug!(
+            key:% = key, shmid:% = shmid, size:% = rounded;
+            "sysv shm: created segment"
+        );
+        Ok(usize::try_from(shmid).unwrap())
+    }
+
+    /// `shmat(shmid, shmaddr, shmflg)`.
+    ///
+    /// Establishes a REAL mapping of the segment in the CALLING process's own address space --
+    /// every process does this independently (including the creator's own first attach), via a
+    /// named platform shared-memory object keyed by `shmid` (see `SysvShmSegment`'s own doc
+    /// comment for why: a bare address handed to a non-creating process, the previous design,
+    /// is wild/unmapped there under cross-process fork). The returned address is therefore
+    /// per-process, matching real Linux (`shmat` gives no cross-process address guarantee
+    /// either). A non-null `shmaddr` asking to place the segment somewhere specific is refused
+    /// with `EINVAL` rather than honoured -- no caller in practice needs it (every real caller,
+    /// including Xlib's MIT-SHM, passes `NULL`).
+    pub(crate) fn sys_shmat(
+        &self,
+        shmid: i32,
+        shmaddr: usize,
+        _shmflg: i32,
+    ) -> Result<usize, Errno> {
+        if shmaddr != 0 {
+            log_unsupported!("shmat with a caller-chosen address ({shmaddr:#x})");
+            return Err(Errno::EINVAL);
+        }
+        let size = {
+            let mut table = self.global.sysv_shm.lock();
+            let Some(seg) = table.get_mut(shmid) else {
+                return Err(Errno::EINVAL);
+            };
+            // An `IPC_RMID`'d segment is STILL attachable while somebody holds it. Linux's
+            // `do_shmat` carries no `SHM_DEST` check at all: `IPC_RMID` only sets that flag and
+            // frees the KEY, and the segment dies later, when the last detach drops `shm_nattch`
+            // to 0 with the flag still set (`shm_may_destroy`). Refusing here is therefore not
+            // hardening, it is a deviation -- and MIT-SHM makes it fatal. `XShmAttach` writes its
+            // request and does NOT wait for a reply, and every real MIT-SHM client `shmctl`s
+            // `IPC_RMID` on the very next line so its buffer cannot outlive it, so the server's
+            // own `shmat` normally lands AFTER the RMID; `ProcShmAttach` turns any failure there
+            // into `BadAccess`, and the client dies before it maps a window. That is the whole of
+            // chrD50's dead desktop: xfwm4, xfce4-panel and xfdesktop each took this error, and
+            // appm1's xfce4-terminal/thunar/mousepad the same.
+            // A removed segment with NO attacher left is already destroyed, so its id is dead --
+            // that, and only that, is the case where EINVAL is the right answer.
+            if seg.removed && seg.attaches == 0 {
+                return Err(Errno::EINVAL);
+            }
+            seg.attaches += 1;
+            seg.size
+        };
+        let rollback_attach = || {
+            let mut table = self.global.sysv_shm.lock();
+            if let Some(seg) = table.get_mut(shmid) {
+                seg.attaches = seg.attaches.saturating_sub(1);
+            }
+        };
+        // Idempotent create-or-open by name (see `create_named_shared_memory`'s own doc comment):
+        // the FIRST attacher (almost always the creator's own first `shmat`, since `shmget`
+        // itself no longer maps anything -- see `SysvShmSegment`'s doc comment) creates the real
+        // object; every later attacher, in any process, opens the SAME one by shmid.
+        //
+        // FILE-backed where the platform can do it, because the segment has to survive every
+        // process that ever held a handle on it (see `ensure_sysv_shm_backing`); the
+        // pagefile-backed named object is only the fallback for a platform with no scratch
+        // directory, i.e. exactly today's behaviour, never a hard failure.
+        let name = sysv_shm_object_name(shmid);
+        let handle = match self
+            .global
+            .platform
+            .create_file_backed_named_shared_memory(&name, size)
+        {
+            Ok(handle) => handle,
+            Err(SharedMemoryError::UnsupportedByPlatform) => {
+                let section = alloc::format!("Local\\{name}");
+                match self.global.platform.create_named_shared_memory(&section, size) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        rollback_attach();
+                        return Err(Errno::ENOMEM);
+                    }
+                }
+            }
+            Err(_) => {
+                litebox_util_log::error!(
+                    shmid:% = shmid, size:% = size;
+                    "sysv shm: backing store could not be opened"
+                );
+                rollback_attach();
+                return Err(Errno::ENOMEM);
+            }
+        };
+        let Some(len) = litebox::mm::linux::NonZeroPageSize::new(size) else {
+            rollback_attach();
+            return Err(Errno::EINVAL);
+        };
+        // SAFETY: `handle` is a real shared-memory object sized to match `len` -- never shorter,
+        // since both creation paths above are handed the full segment `size`, which is what keeps
+        // the view length within its section (`MapViewOfFile3` answers a too-long view with
+        // win32_err 5, and a requested base that is not 64 KiB-aligned with 1132; `Vmem`'s
+        // `shared_view_base` handles the second). Mapping it at a platform-chosen (non-fixed)
+        // address is sound -- no guest code has observed this address range before this call
+        // returns it.
+        let ptr = match unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                len,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            Ok(p) => p,
+            Err(_) => {
+                rollback_attach();
+                return Err(Errno::ENOMEM);
+            }
+        };
+        let addr = ptr.as_usize();
+        self.files.borrow().record_shm_attachment(addr, shmid);
+        litebox_util_log::debug!(
+            shmid:% = shmid, addr:% = addr, size:% = size;
+            "sysv shm: attached segment"
+        );
+        Ok(addr)
+    }
+
+    /// `shmdt(shmaddr)`.
+    ///
+    /// Releases this process's bookkeeping (the shared attach count and the per-process
+    /// reverse-lookup entry -- see `FilesState::shm_attachments`'s doc comment) AND unmaps the
+    /// local mapping, which is what real Linux's `shmdt` does. It used to do only the first half,
+    /// which was survivable while `shmat` refused every RMID'd segment: MIT-SHM never got far
+    /// enough to detach anything. Now that it does, the X server detaches one segment per client
+    /// surface for the whole session, so a `shmdt` that leaves its mapping behind leaks one guest
+    /// address region each time -- and the leak is in the one process that cannot afford it.
+    pub(crate) fn sys_shmdt(&self, shmaddr: usize) -> Result<usize, Errno> {
+        let Some(shmid) = self.files.borrow().take_shm_attachment(shmaddr) else {
+            return Err(Errno::EINVAL);
+        };
+        let mut table = self.global.sysv_shm.lock();
+        let (size, drop_now) = if let Some(seg) = table.get_mut(shmid) {
+            seg.attaches = seg.attaches.saturating_sub(1);
+            (Some(seg.size), seg.removed && seg.attaches == 0)
+        } else {
+            (None, false)
+        };
+        if drop_now {
+            table.remove(shmid);
+        }
+        // Drop the cross-process arena lock before the host file IO below.
+        drop(table);
+        if let Some(size) = size {
+            // Best effort and never reported to the guest: a real `shmdt` of a live attachment
+            // cannot fail, so a failure here means this mapping is already gone (an `munmap` the
+            // guest issued itself over the same range), and the attachment record is what matters.
+            let _ = self.sys_munmap(UserPtrMut::<u8>::from_usize(shmaddr), size);
+        }
+        // Last detach of a removed segment: nothing references the backing store any more, so
+        // this is the point where it can actually be unlinked.
+        if drop_now {
+            self.release_sysv_shm_backing(shmid);
+        }
+        Ok(0)
+    }
+
+    /// Real Linux's `exit_shm()`: every attachment a process still holds dies with its last
+    /// thread. Called from `Task::prepare_for_exit`'s process-exit branch.
+    ///
+    /// Without this, a segment whose owner `shmget`s, `shmat`s, `shmctl(IPC_RMID)`s and then
+    /// exits -- the universal MIT-SHM idiom, since RMID is how a client guarantees its buffer
+    /// cannot outlive it -- keeps its [`SysvShmTable`] slot for the rest of the session:
+    /// `removed` is set but `attaches` never reaches zero, because `sys_shmdt` was the only
+    /// thing that ever decremented it and these clients never call it. Each XFCE startup
+    /// therefore burns slots permanently, and once the table is full `shmget` answers `ENOMEM`
+    /// to everyone -- including a client whose whole presentation path is an `XShmPutImage`, so
+    /// its window maps and never paints.
+    ///
+    /// One decrement per recorded attachment, matching Linux's one-`shm_nattch`-per-VMA
+    /// accounting -- and one INCREMENT per inherited record on the other side, which is what
+    /// `FilesState::fork_duplicate` now performs (Linux's `dup_mmap()` -> `shm_open()`). An
+    /// inherited attachment therefore nets to zero across the child's own lifetime instead of
+    /// being charged against the parent that still maps the segment. The only residual
+    /// imbalance is the safe direction: a `fork()` that duplicated the records but never
+    /// produced a child (a failed native `fork()`, a failed `spawn_thread`) leaves the count
+    /// one too high, which merely delays a slot's reclaim and never destroys a live one.
+    pub(crate) fn detach_sysv_shm_on_process_exit(&self) {
+        let attached = self.files.borrow().take_all_shm_attachments();
+        if attached.is_empty() {
+            return;
+        }
+        let mut destroyed: BTreeSet<i32> = BTreeSet::new();
+        {
+            let mut table = self.global.sysv_shm.lock();
+            for shmid in &attached {
+                let Some(seg) = table.get_mut(*shmid) else {
+                    continue;
+                };
+                seg.attaches = seg.attaches.saturating_sub(1);
+                if seg.removed && seg.attaches == 0 {
+                    destroyed.insert(*shmid);
+                }
+            }
+            for shmid in &destroyed {
+                table.remove(*shmid);
+            }
+        }
+        // Backing-store unlink is host file IO, so it runs after the cross-process arena lock is
+        // dropped -- the same rule `sys_shmget`'s own `ensure_sysv_shm_backing` call obeys.
+        for shmid in &destroyed {
+            self.release_sysv_shm_backing(*shmid);
+        }
+        litebox_util_log::debug!(
+            n_attached:% = attached.len(), n_destroyed:% = destroyed.len();
+            "sysv shm: process exit detached attachments"
+        );
+    }
+
+    /// `shmctl(shmid, cmd, buf)`.
+    ///
+    /// `IPC_RMID` and `IPC_STAT` are implemented; both are what MIT-SHM clients use (they attach,
+    /// immediately mark the segment removed so it cannot leak, and keep using it until detach).
+    pub(crate) fn sys_shmctl(
+        &self,
+        shmid: i32,
+        cmd: i32,
+        buf: Option<UserPtrMut<u8>>,
+    ) -> Result<usize, Errno> {
+        const IPC_RMID: i32 = 0;
+        const IPC_STAT: i32 = 2;
+
+        let mut table = self.global.sysv_shm.lock();
+        let Some(seg) = table.get_mut(shmid) else {
+            return Err(Errno::EINVAL);
+        };
+
+        match cmd {
+            IPC_RMID => {
+                seg.removed = true;
+                let drop_now = seg.attaches == 0;
+                if drop_now {
+                    table.remove(shmid);
+                }
+                // Drop the cross-process arena lock before the host file IO below.
+                drop(table);
+                // Real Linux drops the segment here but keeps the memory alive until the last
+                // detach, and so does the backing store: the unlink only removes the NAME, so an
+                // attacher's mapping still works. When nobody is attached there is nothing left to
+                // keep it for; when someone is, the last `shmdt` unlinks it instead -- deliberately
+                // NOT unlinked while `attaches > 0`, because a later attacher would then re-create
+                // the file empty and silently get zeros, which is the very bug this fixes.
+                if drop_now {
+                    self.release_sysv_shm_backing(shmid);
+                }
+                Ok(0)
+            }
+            IPC_STAT => {
+                // `struct shmid_ds` on x86-64: a 48-byte `ipc_perm` followed by `shm_segsz`.
+                // Only the size and the attach count are meaningfully knowable here; the
+                // timestamps and pids are zeroed rather than fabricated.
+                let Some(buf) = buf else {
+                    return Err(Errno::EFAULT);
+                };
+                let size = seg.size;
+                for i in 0..48isize {
+                    let _ = buf.write_at_offset::<Platform>(i, 0u8);
+                }
+                // `struct ipc64_perm`: key, uid, gid, cuid, cgid (i32/u32 each), then mode.
+                for (off, v) in [
+                    (0isize, seg.key as u32),
+                    (4, seg.uid),
+                    (8, seg.gid),
+                    (12, seg.uid),
+                    (16, seg.gid),
+                    (20, seg.mode),
+                ] {
+                    for (i, b) in v.to_le_bytes().iter().enumerate() {
+                        let _ = buf.write_at_offset::<Platform>(off + i as isize, *b);
+                    }
+                }
+                for (i, b) in size.to_le_bytes().iter().enumerate() {
+                    let off = 48isize + isize::try_from(i).unwrap();
+                    let _ = buf.write_at_offset::<Platform>(off, *b);
+                }
+                // `shm_nattch` (`unsigned long`, offset 88): past `shm_segsz` (48) and the three
+                // `shm_{a,d,c}time` timestamps (56/64/72) and the two pids (80/84). Cheap and
+                // real -- `attaches` is the live cross-process attach count -- so report it rather
+                // than leaving a field every MIT-SHM caller can see as zero.
+                let nattch = u64::try_from(seg.attaches).unwrap_or(u64::MAX);
+                for (i, b) in nattch.to_le_bytes().iter().enumerate() {
+                    let off = 88isize + isize::try_from(i).unwrap();
+                    let _ = buf.write_at_offset::<Platform>(off, *b);
+                }
+                Ok(0)
+            }
+            other => {
+                log_unsupported!("shmctl cmd={other}");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+}
+
 /// Per-memfd real shared-memory state, keyed by the backing in-mem file's own `(dev, ino)` (see
 /// `GlobalState::memfds`'s doc comment for why this lives shim-wide, mirroring
 /// `syscalls::file::FlockRegistry`'s identical `(dev, ino)`-keying rationale).
@@ -33,6 +671,26 @@ pub(crate) struct MemfdEntry<Platform: PageManagementProvider<{ litebox::mm::lin
     /// resolves against `size.next_multiple_of(PAGE_SIZE)`, matching `create_shared_memory`'s own
     /// page-rounding).
     pub(crate) size: usize,
+    /// Whether `handle` has ever been `mmap`'d since it was (re)created.
+    ///
+    /// Once a SECOND party maps this handle -- a peer process (a fork child, an `SCM_RIGHTS`
+    /// receiver), or simply this process a second time, e.g. the compositor mapping a `wl_shm`
+    /// pool the client already drew into through its own mapping -- the in-mem file cannot be
+    /// assumed to reflect the object's contents any more, because writes through a mapping never
+    /// reach the file. Historically that is also what gated a first-`mmap` file -> object sync
+    /// here; that sync is gone (see `try_memfd_mmap`), because the object is now the ONE store
+    /// and is kept current by `Task::memfd_write_through` instead, so this flag is bookkeeping
+    /// only. It is still carried across a resize by `resize_memfd_shared_backing`.
+    ///
+    /// Confirmed live (the hazard this flag was introduced for): this is why every dumped frame
+    /// ever captured under `--gui` showed only weston-desktop-shell's own repainted-every-second
+    /// clock widget and nothing else -- every surface that painted once and then waited for
+    /// damage got mmap-wiped back to black the moment the compositor mapped the client's pool.
+    pub(crate) mapped: bool,
+    /// The host-wide name of `handle` when it was created by `create_named_shared_memory`, so a
+    /// descriptor for this memfd can be passed to another host process (fork, `SCM_RIGHTS`) which
+    /// opens the same object by name. `None` for an anonymous object that cannot leave this process.
+    pub(crate) name: Option<alloc::string::String>,
 }
 pub(crate) type MemfdRegistry<Platform> = BTreeMap<(usize, usize), MemfdEntry<Platform>>;
 
@@ -94,6 +752,22 @@ pub(crate) type ElfPatchKey = (i32, i32);
 
 pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
 
+/// Identity of one code segment, as content rather than as a name.
+///
+/// `(device, inode)` identifies the FILE -- so the many hardlinked aliases of one library (mesa
+/// ships fourteen DRI driver names for a single megadriver) share one entry, and a path that is
+/// later replaced does not alias a stale scan -- and `(offset, len)` identifies the segment within
+/// it. Deliberately NOT the path: two paths can be one file, and one path can become two files.
+pub(crate) type SegmentScanKey = (u64, u64, usize, usize);
+
+/// Executable code ranges per file; see [`crate::GlobalState::exec_ranges_cache`].
+pub(crate) type ExecRangesCache =
+    BTreeMap<(u64, u64), alloc::sync::Arc<alloc::vec::Vec<core::ops::Range<u64>>>>;
+
+/// Scans shared by every mapping of a file; see [`crate::GlobalState::segment_scan_cache`].
+pub(crate) type SegmentScanCache =
+    BTreeMap<SegmentScanKey, alloc::sync::Arc<litebox_syscall_rewriter::SegmentScanTemplate>>;
+
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -153,13 +827,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
         // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
-        {
+        let cow_attempt = cow_mmap_enabled()
+            .then(|| self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset))
+            .flatten();
+        litebox_util_log::debug!(
+            fd:% = fd, len:% = len, offset:% = offset,
+            cow_took_path:% = cow_attempt.is_some();
+            "DIAG do_mmap_file: path chosen"
+        );
+        let result = if let Some(cow_result) = cow_attempt {
             cow_result?
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+            let memcpy_result =
+                self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset);
+            litebox_util_log::debug!(
+                fd:% = fd, len:% = len, offset:% = offset,
+                memcpy_ok:% = memcpy_result.is_ok(),
+                memcpy_addr:% = memcpy_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                "DIAG do_mmap_file: memcpy fallback result"
+            );
+            memcpy_result?
         };
+
+        // AGENTS.md pass 260: log path<->address for every executable file-backed mapping, so a
+        // future guest-exception capture's `rip` can be matched by hand against these ranges to
+        // identify which shared library/binary actually crashed (litebox has no `/proc/self/maps`
+        // for the guest to introspect itself -- this is the only available source of that
+        // correlation, reusing the same `lookup_fd_path` mechanism `readlink("/proc/self/fd/N")`
+        // already relies on).
+        if is_exec {
+            let path = self.files.borrow().lookup_fd_path(fd as usize);
+            litebox_util_log::debug!(
+                path:? = path, start:% = result.as_usize(), len:% = len, offset:% = offset;
+                "diag-exec-mmap: tracking for future crash-address correlation"
+            );
+        }
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
@@ -230,8 +932,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
+                |_| None,
             )
             .ok()??;
+        // DIAG (AGENTS.md pass 223/224): confirm empirically whether this CoW mapping path is
+        // even reached for the calls that end up EEXIST-failing, since pass 223's own code
+        // reading could not fully rule it out without a live capture. `try_allocate_cow_pages`
+        // IS implemented on Windows userland (`WindowsUserland::try_allocate_cow_pages`,
+        // `litebox_platform_windows_userland/src/lib.rs`: `CreateFileMappingW` +
+        // `MapViewOfFile3`) -- this print exists to check whether reaching this far (i.e.
+        // `get_static_backing_data` succeeding) at all correlates with the still-open EEXIST
+        // regression.
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), offset:% = offset, static_len:% = static_data.len();
+            "DIAG try_cow_mmap_file: static_data resolved, about to attempt CoW"
+        );
 
         if offset > static_data.len() {
             return None;
@@ -268,6 +983,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             perms
         };
 
+        // How much padding space, immediately BEFORE `suggested_addr`, this call is willing to
+        // let a platform's `try_allocate_cow_pages` use for a misaligned-file-offset workaround
+        // (see that trait method's own doc comment in `litebox/src/platform/page_mgmt.rs` for
+        // the full contract, and `docs/cow-mmap-fixed-address-design.md` for the design this
+        // implements). Bounded at `MAX_COW_VERIFIED_PADDING` (60KiB): the largest padding ANY
+        // known platform constraint (Windows' 64KiB `MapViewOfFile3` allocation granularity
+        // minus one page) could ever need -- a generous upper bound to QUERY, not a promise that
+        // this much is actually free; the live query below determines the real, safe amount.
+        //
+        // THIS QUERY IS THE ENTIRE SAFETY BOUNDARY for the padding trick: it asks `Vmem`'s own,
+        // CURRENT, live state (not a static inference about what the ELF loader's reservation
+        // "should" contain) whether the exact byte range immediately preceding `suggested_addr`
+        // is a single, contiguous, `PROT_NONE` (fully inaccessible) mapping -- i.e. genuinely
+        // still part of this process's own untouched ELF reservation slack, never anything a
+        // platform implementation infers or assumes on its own (see that trait method's doc
+        // comment for why: it structurally has no `Vmem` access to check this itself). Any
+        // answer other than "yes, PROT_NONE, for the full requested window" makes
+        // `verified_safe_padding` clamp down to exactly how much (if any) genuinely qualifies --
+        // `try_allocate_cow_pages` NEVER receives a padding budget this call has not itself,
+        // just now, confirmed live.
+        const MAX_COW_VERIFIED_PADDING: usize = 0x1_0000 - PAGE_SIZE;
+        let verified_safe_padding = suggested_addr
+            .filter(|&addr| addr >= MAX_COW_VERIFIED_PADDING)
+            .and_then(|addr| {
+                // Query progressively smaller windows (in page steps) rather than only the
+                // maximal one: `get_memory_permissions` returns `None` for ANY partial overlap
+                // (see its own doc comment / `litebox/src/mm/linux.rs`), so a reservation that
+                // genuinely has, say, 8KiB of real PROT_NONE slack immediately before
+                // `suggested_addr` (not the full 60KiB max) would otherwise report "unsafe" for
+                // the whole window and get zero padding credit, even though a smaller amount is
+                // fully safe and would still unlock the common case. Try from the largest window
+                // down to one page, first `Some` hit wins.
+                (1..=MAX_COW_VERIFIED_PADDING / PAGE_SIZE)
+                    .rev()
+                    .map(|n| n * PAGE_SIZE)
+                    .find_map(|candidate| {
+                        let start = addr.checked_sub(candidate)?;
+                        let ptr = litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(start)?;
+                        let size =
+                            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(candidate)?;
+                        let perms = self.process().pm().get_memory_permissions(ptr, size)?;
+                        // `PROT_NONE` == no permission bits set at all -- anything else (even a
+                        // READ-only mapping) is real content this call must not overwrite.
+                        perms.is_empty().then_some(candidate)
+                    })
+            })
+            .unwrap_or(0);
+
         // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
         // unified lock, so there is a theoretical race if two threads concurrently attempt a
         // fixed-address mapping with replacement at the same address. In practice this is benign:
@@ -279,8 +1042,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &static_data[offset..offset + len],
             permissions,
             fixed_behavior,
+            verified_safe_padding,
         ) {
-            Ok(ptr) => {
+            Ok((ptr, padding_range)) => {
+                // AGENTS.md pass 212: this CoW mapping path bypasses `litebox_common_linux::mm
+                // ::do_mmap`'s own shared fixed-address-mismatch check (this crate's other
+                // mmap path, `do_mmap_file_memcpy`, goes through it) by calling
+                // `try_allocate_cow_pages` directly -- needs the same guard. Real Linux's
+                // `MAP_FIXED` contract is "map exactly here or fail", never silently relocate;
+                // a platform's own `allocate_pages` can still choose to relocate a `Replace`
+                // request away from a foreign-claimed range rather than corrupt another live
+                // process (see `litebox_platform_windows_userland`'s `allocate_pages`), and this
+                // was root-caused (pass 212) to letting the ELF loader's BSS zero-fill target
+                // completely unmapped memory when that relocation silently happened underneath
+                // a `MAP_FIXED` ELF-segment mapping.
+                if fixed_behavior == FixedAddressBehavior::Replace
+                    && let Some(requested) = suggested_addr
+                    && ptr.as_usize() != requested
+                {
+                    return Some(Err(MappingError::OutOfMemory));
+                }
+                // Register any padding prefix the platform ALSO host-mapped BEFORE registering
+                // (or letting the guest observe) the real content range -- this ordering is the
+                // whole point of the caller-verifies/platform-executes split (see the trait
+                // method's own doc comment): there must never be a window where `Vmem` doesn't
+                // yet know about host-mapped memory. `replace: true` mirrors the content
+                // registration below (a padding range can, in principle, coincide with a range
+                // this same reservation already holds -- an ordinary PROT_NONE-over-PROT_NONE
+                // overwrite is a correct no-op, never a real conflict, since this is
+                // this-process-owned slack by construction of the live query above, never
+                // another mapping's space).
+                if let Some((padding_start, padding_len)) = padding_range {
+                    let padding_range = PageRange::new(padding_start, padding_start + padding_len)
+                        .expect("platform-reported padding range must be page-aligned");
+                    // SAFETY: `padding_start..padding_start+padding_len` is exactly the host-
+                    // mapped-but-guest-inaccessible range `try_allocate_cow_pages` just created
+                    // (per its own contract) as part of the SAME view as the content range below
+                    // -- registering it here, before this function returns and before the guest
+                    // can resume, closes the pass-343/344 untracked-memory window by
+                    // construction.
+                    unsafe {
+                        self.process().pm().register_existing_mapping(
+                            padding_range,
+                            MemoryRegionPermissions::empty(),
+                            true,
+                            true,
+                            flags.contains(MapFlags::MAP_SHARED),
+                        )
+                    }
+                    .unwrap();
+                }
                 let range =
                     PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
                         .unwrap();
@@ -302,6 +1113,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// The `len` bytes of `fd`'s static backing data starting at `offset` (clipped to the data's
+    /// end), if `fd` has any.
+    fn static_backing_slice(&self, fd: i32, offset: usize, len: usize) -> Option<&'static [u8]> {
+        let raw_fd = usize::try_from(u32::try_from(fd).ok()?).ok()?;
+        let files = self.files.borrow();
+        let data = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()??;
+        let start = offset.min(data.len());
+        let end = offset.saturating_add(len).min(data.len());
+        Some(&data[start..end])
+    }
+
     /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
     /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
     fn do_mmap_file_memcpy(
@@ -313,7 +1149,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        // The lazy range must hand a chunk back at exactly the protection this mapping was
+        // requested with, not at read-write: a `PROT_READ|PROT_EXEC` mapping that fills as
+        // `PAGE_READWRITE` is writable but not executable, so the guest's first call into it faults
+        // instead of running. Computed before `op` so the closure never borrows `prot` (which
+        // `do_mmap` below takes by value).
+        let mut lazy_permissions = MemoryRegionPermissions::empty();
+        lazy_permissions.set(
+            MemoryRegionPermissions::READ,
+            prot.contains(ProtFlags::PROT_READ),
+        );
+        lazy_permissions.set(
+            MemoryRegionPermissions::WRITE,
+            prot.contains(ProtFlags::PROT_WRITE),
+        );
+        lazy_permissions.set(
+            MemoryRegionPermissions::EXEC,
+            prot.contains(ProtFlags::PROT_EXEC),
+        );
+        let lazy_source = self.static_backing_slice(fd, offset, len);
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
+            if let Some(source) = lazy_source {
+                let start = ptr.as_usize();
+                let mapped_len = len.next_multiple_of(PAGE_SIZE);
+                if <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_lazy_file_pages(
+                    self.global.platform,
+                    start..start + mapped_len,
+                    source,
+                    lazy_permissions,
+                ) {
+                    return Ok(len);
+                }
+            }
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
@@ -343,12 +1210,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if size == 0 {
                     break;
                 }
-                // ptr is a valid pointer returned by do_mmap.
-                ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
-                    .unwrap();
+                // `copy_from_slice` answers `None` when the destination pages cannot be written
+                // at all -- a `PROT_NONE` file mapping of >= 64 MiB is created reserved-but-
+                // never-committed (see `allocate_pages`'s `reserve_only`), and a concurrent
+                // `munmap` of this range mid-loop is the other case. Both used to `.unwrap()`
+                // here and panicked, which kills the whole guest session. Report it as an
+                // ordinary mapping failure instead: real Linux's `mmap(2)` returns ENOMEM for
+                // a mapping it cannot back.
+                if ptr
+                    .copy_from_slice::<Platform>(copied, &buffer[..size])
+                    .is_none()
+                {
+                    return Err(MappingError::OutOfMemory);
+                }
                 copied += size;
                 file_offset += size;
             }
+            litebox_util_log::debug!(
+                fd:% = fd, requested_len:% = len, copied:% = copied, offset:% = offset;
+                "DIAG do_mmap_file_memcpy: copy loop finished"
+            );
             Ok(copied)
         };
         let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
@@ -386,17 +1267,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         // Captures both the memfd identity key AND (if this fd is one) the file's CURRENT bytes
         // in one lookup, so the sync step below never needs a second, separate fd resolution.
-        let (key, current_bytes) = files
+        // Only the identity is looked up here: reading the file's bytes for every mmap of every
+        // file (to find out afterwards that it is not a memfd) copied whole libraries and locale
+        // archives through a buffer of the file's size on each call.
+        let key = files
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| {
                     let status = files.fs.fd_file_status(typed_fd).ok()?;
-                    let key = (status.node_info.dev, status.node_info.ino);
-                    let mut buf = alloc::vec![0u8; status.size];
-                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
-                    buf.truncate(n);
-                    Some((key, buf))
+                    Some((status.node_info.dev, status.node_info.ino))
                 },
+                |_| None,
                 |_| None,
                 |_| None,
                 |_| None,
@@ -408,8 +1289,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .ok()
             .flatten()?;
-        let memfds = self.global.memfds.lock();
-        let entry = memfds.get(&key)?;
+        let mut memfds = self.global.memfds.lock();
+        let entry = memfds.get_mut(&key)?;
         // A memfd's backing shared-memory object is exactly `entry.size` bytes (the last
         // `ftruncate`'d size, rounded up to a whole page by `create_shared_memory` itself); a
         // client mapping a stale offset/length past that (e.g. before ever calling `ftruncate`,
@@ -419,34 +1300,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Err(MappingError::UnAligned));
         }
         let handle = entry.handle;
+        // The shared object -- NOT the in-mem file -- is a sized memfd's ONE store, so there is
+        // deliberately NO "seed the object from the file's bytes" step here any more. The object
+        // is already current: `resize_memfd_shared_backing` seeds it from the file at
+        // `ftruncate`/`fallocate` time and carries the old object's bytes across a resize, and
+        // every `write(2)`/`pwrite(2)` afterwards is mirrored into it by
+        // `Task::memfd_write_through` (which is also what `read(2)`/`pread(2)` answer from, via
+        // `Task::memfd_read_through`). Copying the file over the object here would therefore only
+        // ever DESTROY live content: the file is a zero-filled mirror of page-rounded length, so
+        // the first `mmap` after a fork child (or an `SCM_RIGHTS` receiver) drew into the object
+        // wiped everything that process had written -- measured in `shmvis12`, where a parent that
+        // had never mapped its own memfd saw all-zero bytes where the child had just written.
+        entry.mapped = true;
         drop(memfds);
         drop(files);
-        // Sync in whatever bytes the guest already wrote via ordinary `write()`/`pwrite()` calls
-        // before ever mmapping (the real Wayland `wl_shm` pattern this bridges: `ftruncate` then
-        // `write()` the pixel data, THEN the peer -- typically a different process/thread, e.g.
-        // the compositor -- `mmap()`s the same fd to read it, see this function's own doc comment
-        // for why an ordinary in-mem file can't support `MAP_SHARED|PROT_WRITE` directly). A
-        // transient, private, exclusively-owned mapping the caller never observes -- copies bytes
-        // in and unmaps immediately, before returning the REAL mapping requested below.
-        if let Some(sync_len) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) {
-            // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
-            // observed this address, so writing into it and unmapping it immediately after is
-            // sound; `handle` itself outlives this transient mapping (owned by `memfds`).
-            if let Ok(ptr) = unsafe {
-                self.process().pm().map_existing_shared_pages(
-                    None,
-                    sync_len,
-                    litebox::mm::linux::CreatePagesFlags::empty(),
-                    handle,
-                )
-            } {
-                let copy_len = current_bytes.len().min(aligned_len);
-                let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
-                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
-                let _ =
-                    litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned_len);
-            }
-        }
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         let create_flags = {
             let mut f = litebox::mm::linux::CreatePagesFlags::empty();
@@ -470,11 +1337,557 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
             return Some(Err(MappingError::UnAligned));
         };
+        // Note: `map_shared_memory` (litebox_platform_windows_userland/src/lib.rs) already logs
+        // a `nonzero_in_sample` content digest for every mapping it establishes, gated behind
+        // `LITEBOX_DRM_TRACE=1` -- this is the "sample the CLIENT buffer like the scanout buffer"
+        // instrumentation the investigation needs (see AGENTS.md's "Rendering/scanout blocker"
+        // section); no separate digest is needed here.
         Some(
             unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, handle)
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
+    /// Keeps a `MAP_SHARED` file mapping coherent with `write()`/`pwrite()` to the same file.
+    ///
+    /// The shared object behind a mapping is a separate allocation seeded from the file once (see
+    /// `try_shared_file_mmap`); without this, bytes written to the file afterwards never reach
+    /// mappers. That is exactly how SQLite (Chromium's every database) works: it maps the file
+    /// read-only and writes it with `pwrite`, so it read back stale zeros, decided the database
+    /// was corrupt, and the browser aborted on a `CHECK`. A no-op unless the file has a mapping.
+    pub(crate) fn propagate_write_to_shared_mapping(
+        &self,
+        raw_fd: usize,
+        explicit_offset: Option<usize>,
+        written: &[u8],
+    ) {
+        if written.is_empty() || self.global.shared_files.lock().is_empty() {
+            return;
+        }
+        let files = self.files.borrow();
+        let Some(key) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    Some((status.node_info.dev, status.node_info.ino))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        drop(files);
+        let (handle, size) = {
+            let shared = self.global.shared_files.lock();
+            match shared.get(&key) {
+                Some(e) => (e.handle, e.size),
+                None => return,
+            }
+        };
+        // Where the write landed: the explicit offset, else the position now that it advanced.
+        let offset = match explicit_offset {
+            Some(o) => o,
+            None => match self.sys_lseek(
+                i32::try_from(raw_fd).unwrap_or(-1),
+                0,
+                litebox::fs::SeekWhence::RelativeToCurrentOffset,
+            ) {
+                Ok(pos) => pos.saturating_sub(written.len()),
+                Err(_) => return,
+            },
+        };
+        if offset >= size {
+            return;
+        }
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(size) else {
+            return;
+        };
+        // SAFETY: a fresh private mapping of `handle`, written and unmapped here; `handle` is
+        // owned by `shared_files` and outlives it.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let n = written.len().min(size - offset);
+            let _ = ptr.write_slice_at_offset(offset as isize, &written[..n]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, size);
+        }
+    }
+
+    /// If `fd` is an ordinary file and the guest asked for a `MAP_SHARED` mapping, back it with a
+    /// real shared-memory object -- keyed by the file's `(dev, ino)`, so every process mapping the
+    /// same file binds to the SAME object and sees the others' writes -- and return `Some(result)`.
+    /// Returns `None` for anonymous or `MAP_PRIVATE` mappings, which keep their existing paths.
+    ///
+    /// Read-only mappers must go through here too, not just writable ones. `MAP_SHARED` means
+    /// "these mappers see each other's writes", and that is precisely a property that cannot be
+    /// delivered by giving the reader its own snapshot of the file's bytes while the writer gets
+    /// a shared object -- they would simply be different memory. dconf is built out of exactly
+    /// that asymmetry: the writer (`dconf_shm_flag`) maps the flag byte `PROT_WRITE`, while every
+    /// reader (`dconf_shm_open`) maps the same byte `PROT_READ`, and the reader polls it to learn
+    /// that its cached copy of the database is stale.
+    ///
+    /// This exists because rejecting the combination outright with `ENODEV` (as the check just
+    /// below this call site used to do for every file) is not a survivable answer for the callers
+    /// that use it. `dconf` -- and therefore every GSettings write in a MATE, GNOME or XFCE
+    /// session -- does exactly this, in `shm/dconf-shm.c`:
+    ///
+    /// ```text
+    ///     fd  = open (".../dconf/user", O_RDWR | O_CREAT, 0600);
+    ///     ftruncate (fd, 1);
+    ///     shm = mmap (NULL, 1, PROT_WRITE, MAP_SHARED, fd, 0);
+    ///     close (fd);
+    ///     g_assert (shm != MAP_FAILED);
+    /// ```
+    ///
+    /// so `ENODEV` there is not graceful degradation, it is
+    /// `dconf:ERROR:../shm/dconf-shm.c:142:dconf_shm_flag: assertion failed: (shm != MAP_FAILED)`
+    /// and `dconf-service` aborting mid-call. Every dconf write afterwards then fails with
+    /// `GDBus.Error:...NoReply: Message recipient disconnected from message bus without replying`
+    /// -- which is precisely why `mate-panel` came up with no panels at all under LiteBox: a
+    /// panel's entire layout (`org.mate.panel`'s toplevel list) lives in dconf, and an empty
+    /// toplevel list means zero panels, with no error of its own to show for it.
+    ///
+    /// Note the `PROT_WRITE` with no `PROT_READ` above: that is legal on Linux and is what dconf
+    /// asks for, so this path must not assume a readable mapping. It does not -- the platform
+    /// layer already widens write-only to read/write, since Windows has no write-only page
+    /// protection.
+    ///
+    /// KNOWN LIMITATIONS, stated rather than papered over. Both are consequences of the shared
+    /// object being a separate allocation from the file's own byte storage:
+    ///
+    /// 1. Writes through the mapping are visible to every other MAPPER of the file, but are not
+    ///    propagated back into its byte storage, so a later `read()` still returns the pre-`mmap`
+    ///    contents. Closing that needs a write-back path this shim has nowhere to hang: the
+    ///    mapping outlives the descriptor (POSIX requires that, and the dconf sequence above
+    ///    closes the fd immediately after mapping), and there is no fd-to-path or open-by-inode
+    ///    route to reacquire the file at `munmap`/`msync` time.
+    /// 2. The object is seeded from the file once, by the first mapper. A file rewritten IN PLACE
+    ///    with `write()` afterwards will not show its new bytes to mappers. Rewriting by
+    ///    `rename()` over the top -- what dconf-service itself does with the database, and the
+    ///    normal atomic-replace idiom -- is unaffected, because the replacement is a different
+    ///    inode and therefore a different key, hence a fresh object seeded from the new contents.
+    pub(crate) fn has_shared_file_mappings(&self) -> bool {
+        !self.global.shared_files.lock().is_empty()
+    }
+
+    pub(crate) fn shared_file_write_through(&self, raw_fd: usize, start: usize, bytes: &[u8]) {
+        let key = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let status = files.fs.fd_file_status(typed_fd).ok()?;
+                        Some((status.node_info.dev, status.node_info.ino))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None)
+                .ok()
+                .flatten()
+        };
+        let Some(key) = key else {
+            return;
+        };
+        let (handle, size) = match self.global.shared_files.lock().get(&key) {
+            Some(entry) => (entry.handle, entry.size),
+            None => return,
+        };
+        let end = start.saturating_add(bytes.len()).min(size);
+        if start >= end {
+            return;
+        }
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(align_up(end, PAGE_SIZE)) else {
+            return;
+        };
+        // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
+        if let Ok(ptr) = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                None,
+                length,
+                litebox::mm::linux::CreatePagesFlags::empty(),
+                handle,
+            )
+        } {
+            let _ = ptr.write_slice_at_offset(start as isize, &bytes[..end - start]);
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ = litebox_common_linux::mm::sys_munmap(
+                &self.process().pm(),
+                user_ptr,
+                align_up(end, PAGE_SIZE),
+            );
+        }
+    }
+
+    fn try_shared_file_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        if flags.contains(MapFlags::MAP_ANONYMOUS) || !flags.contains(MapFlags::MAP_SHARED) {
+            return None;
+        }
+        // Only whole-file mappings from offset 0 share an object here. A non-zero offset would
+        // need per-offset objects to stay coherent with each other, and nothing observed asks
+        // for one -- falling through leaves such a call on the old `ENODEV` answer rather than
+        // silently giving it an incoherent mapping.
+        if offset != 0 {
+            return None;
+        }
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let files = self.files.borrow();
+        // One lookup for both the identity key and the file's CURRENT bytes, exactly as
+        // `try_memfd_mmap` does -- the seed step below must not need a second fd resolution.
+        let (key, current_bytes) = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    let status = files.fs.fd_file_status(typed_fd).ok()?;
+                    let key = (status.node_info.dev, status.node_info.ino);
+                    let mut buf = alloc::vec![0u8; status.size];
+                    let n = files.fs.read(typed_fd, &mut buf, Some(0)).unwrap_or(0);
+                    buf.truncate(n);
+                    Some((key, buf))
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()?;
+        drop(files);
+
+        let aligned_len = align_up(len, PAGE_SIZE);
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(aligned_len) else {
+            return Some(Err(MappingError::UnAligned));
+        };
+
+        let mut shared = self.global.shared_files.lock();
+        let (handle, already_mapped) = match shared.get_mut(&key) {
+            // Reuse only when the existing object is big enough for what is being asked for.
+            // Handing back a shorter one would let the guest address past its end.
+            Some(entry) if entry.size >= aligned_len => {
+                let was = entry.mapped;
+                entry.mapped = true;
+                (entry.handle, was)
+            }
+            _ => {
+                let handle = self
+                    .global
+                    .platform
+                    .create_shared_memory(aligned_len)
+                    .ok()?;
+                shared.insert(
+                    key,
+                    MemfdEntry {
+                        handle,
+                        size: aligned_len,
+                        mapped: true,
+                        name: None,
+                    },
+                );
+                (handle, false)
+            }
+        };
+        // `shared` stays locked until the first mapper has seeded the object, so a concurrent
+        // second mapper cannot see it half-initialised.
+
+        // Seed the object from the file's current bytes on the FIRST mapping only. After that the
+        // shared object is the sole source of truth, and re-copying the (now stale) file bytes
+        // over it would wipe whatever other mappers have written -- the same hazard
+        // `MemfdEntry::mapped` documents at length for memfds.
+        if !already_mapped && !current_bytes.is_empty() {
+            // SAFETY: a fresh, private, non-fixed mapping of `handle` -- no guest code has ever
+            // observed this address, so writing into it and unmapping it immediately is sound;
+            // `handle` itself outlives this transient mapping (owned by `shared_files`).
+            if let Ok(ptr) = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    length,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            } {
+                let copy_len = current_bytes.len().min(aligned_len);
+                let _ = ptr.write_slice_at_offset(0, &current_bytes[..copy_len]);
+                let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+                let _ = litebox_common_linux::mm::sys_munmap(
+                    &self.process().pm(),
+                    user_ptr,
+                    aligned_len,
+                );
+            }
+        }
+
+        drop(shared);
+
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match if addr == 0 { None } else { Some(addr) } {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        Some(
+            unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
+            }
+            .map(UserPtrMut::from_platform_ptr::<Platform>),
+        )
+    }
+
+    /// A large, read-only, private mapping of an ordinary file (locale archives, icon and font
+    /// caches, ...) is served from ONE shared object instead of a per-process copy.
+    ///
+    /// Copying such a file into every mapper's private memory multiplies it by the process count:
+    /// every glibc program maps the multi-hundred-megabyte locale archive, so a desktop of sixty
+    /// processes spent gigabytes on sixty identical copies. The object is shared but the VIEW of it
+    /// is copy-on-write (see [`Vmem::map_existing_shared_pages_file_private_cow`]), so sharing it is
+    /// indistinguishable from a private copy for the guest -- including after an
+    /// `mprotect(PROT_READ|PROT_WRITE)`, which Linux always lets succeed on a `MAP_PRIVATE` file
+    /// mapping and which now yields this process's own pages -- while a process that never writes
+    /// still shares the physical pages with every other mapper. Executable mappings and ELF files
+    /// are excluded and keep their private, patchable copies.
+    ///
+    /// Returns `None` whenever the mapping does not qualify, leaving the ordinary path untouched.
+    fn try_shared_private_file_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        const MIN_SHARED_LEN: usize = 256 * 1024;
+        // `PROT_NONE` is a RESERVATION the guest `mprotect`s into use later -- that is the
+        // dynamic loader's own shape -- so it must not be pinned to this function's
+        // permanently-read-only shared view. That view carries no `VM_MAYWRITE`, so the later
+        // `mprotect(PROT_READ|PROT_WRITE)` is refused with EACCES where Linux always lets a
+        // private file mapping become writable, and it also hands the guest read access it
+        // never asked for. Measured (`.wfgy/cb45.sh`): `mmap(PROT_NONE)` on an 8 MiB regular
+        // file followed by `mprotect(PROT_READ|PROT_WRITE)` returns EACCES in the parent and in
+        // a cross-process fork child alike (arm F2, `vma_flags_bits=89` = `VM_READ|VM_SHARED|
+        // VM_MAYREAD|VM_MAYEXEC`), while arm F1 -- the same file mapped RW and round-tripped
+        // through `PROT_NONE` and back -- succeeds.
+        if flags.contains(MapFlags::MAP_ANONYMOUS)
+            || flags.contains(MapFlags::MAP_SHARED)
+            || prot.intersects(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC)
+            || prot.is_empty()
+            || offset != 0
+            || align_up(len, PAGE_SIZE) < MIN_SHARED_LEN
+        {
+            return None;
+        }
+        let raw_fd = u32::try_from(fd).ok().map(|v| v as usize)?;
+        let aligned_len = align_up(len, PAGE_SIZE);
+
+        // Identity and size of the file, plus whether it is an ELF image (those keep their
+        // private, patchable copies).
+        let (key, file_size) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| {
+                        let status = files.fs.fd_file_status(typed_fd).ok()?;
+                        if status.file_type != litebox::fs::FileType::RegularFile {
+                            return None;
+                        }
+                        let mut magic = [0u8; 4];
+                        let n = files.fs.read(typed_fd, &mut magic, Some(0)).unwrap_or(0);
+                        if n == 4 && magic == *b"\x7fELF" {
+                            return None;
+                        }
+                        Some(((status.node_info.dev, status.node_info.ino), status.size))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()?
+        };
+        let object_len = align_up(file_size, PAGE_SIZE);
+        // A mapping longer than the file would expose pages past its end.
+        if object_len == 0 || aligned_len > object_len {
+            return None;
+        }
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned_len)?;
+
+        let read_chunk = |at: usize, buf: &mut [u8]| -> usize {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |typed_fd| files.fs.read(typed_fd, buf, Some(at)).unwrap_or(0),
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                    |_| 0,
+                )
+                .unwrap_or(0)
+        };
+
+        let mut shared = self.global.shared_files.lock();
+        let (handle, needs_seed) = match shared.get_mut(&key) {
+            Some(entry) if entry.size == object_len => (entry.handle, !entry.mapped),
+            _ => {
+                let handle = self.global.platform.create_shared_memory(object_len).ok()?;
+                shared.insert(
+                    key,
+                    MemfdEntry {
+                        handle,
+                        size: object_len,
+                        mapped: false,
+                        name: None,
+                    },
+                );
+                (handle, true)
+            }
+        };
+        if needs_seed {
+            // Fill the object from the file once, a chunk at a time, through a transient
+            // writable mapping in this process. `shared` stays locked so nobody maps it half
+            // filled.
+            let full = litebox::mm::linux::NonZeroPageSize::new(object_len)?;
+            // SAFETY: a fresh, non-fixed mapping of `handle` that no guest code has seen; it is
+            // unmapped again before returning.
+            let ptr = unsafe {
+                self.process().pm().map_existing_shared_pages(
+                    None,
+                    full,
+                    litebox::mm::linux::CreatePagesFlags::empty(),
+                    handle,
+                )
+            }
+            .ok()?;
+            let mut chunk = alloc::vec![0u8; 1 << 20];
+            let mut at = 0usize;
+            let mut ok = true;
+            while at < file_size {
+                let want = (file_size - at).min(chunk.len());
+                let n = read_chunk(at, &mut chunk[..want]);
+                if n == 0 {
+                    ok = false;
+                    break;
+                }
+                if ptr
+                    .write_slice_at_offset(at as isize, &chunk[..n])
+                    .is_none()
+                {
+                    ok = false;
+                    break;
+                }
+                at += n;
+            }
+            let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
+            let _ =
+                litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, object_len);
+            if !ok {
+                shared.remove(&key);
+                return None;
+            }
+            if let Some(entry) = shared.get_mut(&key) {
+                entry.mapped = true;
+            }
+        }
+        drop(shared);
+
+        let create_flags = {
+            let mut f = litebox::mm::linux::CreatePagesFlags::empty();
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::FIXED_ADDR,
+                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f.set(
+                litebox::mm::linux::CreatePagesFlags::NOREPLACE,
+                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+            );
+            f
+        };
+        let suggested_addr = match if addr == 0 { None } else { Some(addr) } {
+            Some(a) => match litebox::mm::linux::NonZeroAddress::new(a) {
+                Some(n) => Some(n),
+                None => return Some(Err(MappingError::UnAligned)),
+            },
+            None => None,
+        };
+        Some(
+            unsafe {
+                self.process().pm().map_existing_shared_pages_file_private_cow(
+                    suggested_addr,
+                    length,
+                    create_flags,
+                    handle,
+                )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )
@@ -510,15 +1923,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| false,
                 |_| false,
                 |_| false,
+                |_| false,
             )
             .unwrap_or(false);
         if !is_dri {
             return None;
         }
-        let (shared_handle, buffer_size) = self
-            .global
-            .drm
-            .lookup_by_map_offset(offset as u64)?;
+        // A `DRM_IOCTL_PRIME_HANDLE_TO_FD`-exported fd (see `DrmPrimeFdMarker`'s own doc comment,
+        // `syscalls::file`) carries the exported buffer's fake `MAP_DUMB` offset as PER-FD
+        // metadata -- real PRIME/dma-buf fds are always mapped at offset 0 by the caller (there
+        // is no second offset namespace the way the original DRM device fd's `MAP_DUMB` has one),
+        // so this resolves the buffer from the fd's own tag rather than from the guest-supplied
+        // `offset` argument, which is expected to be `0` here.
+        let prime_map_offset = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd, |m: &crate::syscalls::file::DrmPrimeFdMarker| {
+                            m.map_offset
+                        })
+                        .ok()
+                },
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten();
+        let effective_offset = prime_map_offset.unwrap_or(offset as u64);
+        let (shared_handle, buffer_size) =
+            self.global.drm.lookup_by_map_offset(effective_offset)?;
         let aligned_len = align_up(len, PAGE_SIZE);
         if aligned_len > buffer_size.next_multiple_of(PAGE_SIZE) {
             // Guest asked to map more than the buffer actually holds -- real Linux rejects an
@@ -549,14 +1992,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Err(MappingError::UnAligned));
         };
         let _ = prot;
-        Some(
-            unsafe {
-                self.process()
-                    .pm()
-                    .map_existing_shared_pages(suggested_addr, length, create_flags, shared_handle)
-            }
-            .map(UserPtrMut::from_platform_ptr::<Platform>),
-        )
+        let result = unsafe {
+            self.process().pm().map_existing_shared_pages(
+                suggested_addr,
+                length,
+                create_flags,
+                shared_handle,
+            )
+        };
+        // Log the GUEST-visible address this dumb buffer lands at -- unlike the host
+        // presentation thread's own transient per-flip mapping (a fresh address every
+        // time), this is the fixed address weston's own process actually reads/writes
+        // through for the buffer's whole lifetime, which is what a decommit/unmap
+        // range needs to be compared against to catch a cross-process reclaim hitting
+        // this VMA.
+        if let Ok(ptr) = &result {
+            litebox_util_log::debug!(
+                addr:% = ptr.as_usize(), len:% = aligned_len;
+                "diag-drm-fb-addr"
+            );
+        }
+        Some(result.map(UserPtrMut::from_platform_ptr::<Platform>))
     }
 
     /// Handle syscall `mmap`
@@ -569,9 +2025,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
+        // 2026-09-10 Track-B Xvfb-crash investigation (docs/track-b-fork-fix-progress.md):
+        // "DIAG sys_mmap: entry" below only logs the REQUESTED parameters, never the actual
+        // returned address for an `addr == 0` (let-the-platform-choose) call -- which is every
+        // anonymous mmap a dynamic linker makes for a library's BSS/TLS-bookkeeping tail. This
+        // wrapper logs the result too, closing that gap: lets a future capture directly answer
+        // "did any mmap call's RETURNED range overlap the crash region" instead of only "was
+        // that exact size ever requested".
+        let result = self.sys_mmap_inner(addr, len, prot, flags, fd, offset);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), addr:% = addr, len:% = len,
+            ok:% = result.is_ok(),
+            returned_start:% = result.as_ref().map(|p| p.as_usize()).unwrap_or(0),
+            returned_end:% = result.as_ref().map(|p| p.as_usize() + len).unwrap_or(0);
+            "DIAG sys_mmap: result"
+        );
+        result
+    }
+
+    fn sys_mmap_inner(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), addr:% = addr, len:% = len, prot:? = prot, flags:? = flags,
+            fd:% = fd, offset:% = offset;
+            "DIAG sys_mmap: entry"
+        );
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
+        }
+
+        // A descriptor reopened read-only (`open("/proc/self/fd/N", O_RDONLY)` on a memfd) must
+        // not yield a writable shared mapping -- the whole point of such a reopen.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && flags.contains(MapFlags::MAP_SHARED)
+            && prot.contains(ProtFlags::PROT_WRITE)
+            && let Ok(raw) = usize::try_from(fd)
+        {
+            let files = self.files.borrow();
+            let readonly = files
+                .run_on_raw_fd(
+                    raw,
+                    |typed| {
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed, |super::file::ReopenedAccess(a)| {
+                                *a == litebox::fs::OFlags::empty()
+                            })
+                            .unwrap_or(false)
+                    },
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                    |_| false,
+                )
+                .unwrap_or(false);
+            if readonly {
+                return Err(Errno::EACCES);
+            }
         }
 
         // A DRM dumb-buffer `mmap()` (real clients always use `MAP_SHARED | PROT_WRITE` here --
@@ -595,6 +2119,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // ordinary-file path, not of memfd specifically.
         if !flags.contains(MapFlags::MAP_ANONYMOUS)
             && let Some(result) = self.try_memfd_mmap(addr, len, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
+        }
+
+        // An ordinary file mapped WRITABLE and MAP_SHARED gets a real shared-memory object,
+        // resolved before the rejection below -- see `try_shared_file_mmap` for why that
+        // rejection was fatal rather than degrading for the callers that hit it. Read-only
+        // shared mappings deliberately fall past this and keep their existing path.
+        if !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && let Some(result) = self.try_shared_file_mmap(addr, len, &flags, fd, offset)
         {
             return result.map_err(Errno::from);
         }
@@ -647,23 +2181,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EOVERFLOW);
         }
 
+        if let Some(result) =
+            self.try_shared_private_file_mmap(addr, aligned_len, &prot, &flags, fd, offset)
+        {
+            return result.map_err(Errno::from);
+        }
+
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         };
-        // Temporary (see FINDINGS.txt PASS 48): trace every mmap's returned guest address so a
-        // return value landing in the host allocator's own reserved region (a bug this
-        // investigation is actively chasing) is caught the moment it is produced, not just
-        // later when something dereferences the resulting bad pointer.
-        if let Ok(r) = &result {
-            litebox_util_log::debug!(
-                tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
-                addr:% = addr, len:% = aligned_len, returned:% = r.as_usize();
-                "sys_mmap: returned"
-            );
-        }
         result.map_err(Errno::from)
     }
 
@@ -678,7 +2207,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // while investigating the mallocng `.meta=0` use-after-free (a group pointer's crashing
         // address had zero matches anywhere in an otherwise-complete debug trace).
         litebox_util_log::debug!(
-            tid:% = self.tid, host_tid:% = self.global.platform.host_debug_tid(),
+            tid:% = self.tid.get(), host_tid:% = self.global.platform.host_debug_tid(),
             addr:% = addr.as_usize(), len:% = len, ok:% = result.is_ok();
             "sys_munmap"
         );
@@ -704,7 +2233,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         for ((pid, _), state) in cache.iter_mut() {
             // The unmapped range is an address in *this* process's address space; entries owned by
             // other processes describe unrelated address spaces (see [`ElfPatchKey`]).
-            if *pid != self.pid {
+            if *pid != self.pid.get() {
                 continue;
             }
             state.file_mappings.retain(|&(vaddr, seg_len)| {
@@ -727,7 +2256,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         litebox_util_log::debug!(
-            tid:% = self.tid, addr:% = addr.as_usize(), len:% = len, prot:? = prot;
+            pid:% = self.pid.get(), tid:% = self.tid.get(), addr:% = addr.as_usize(), len:% = len, prot:? = prot;
             "sys_mprotect: entry"
         );
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
@@ -739,7 +2268,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let result = self.sys_mprotect_raw(addr, len, prot);
         litebox_util_log::debug!(
-            tid:% = self.tid, ok:% = result.is_ok();
+            tid:% = self.tid.get(), ok:% = result.is_ok();
             "sys_mprotect: returned"
         );
         result
@@ -757,6 +2286,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_common_linux::mm::sys_mprotect(&self.process().pm(), addr, len, prot)
     }
 
+    /// `msync`: mappings here are coherent with their backing file at write time (see
+    /// `propagate_write_to_shared_mapping`), so there is nothing left to flush.
+    pub(crate) fn sys_mincore(
+        &self,
+        addr: UserPtrMut<u8>,
+        length: usize,
+        vec: UserPtrMut<u8>,
+    ) -> Result<(), Errno> {
+        let page = litebox::mm::linux::PAGE_SIZE;
+        if addr.as_usize() % page != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pages = length.div_ceil(page);
+        // Every mapped page is reported resident: guest memory is backed by shared
+        // memfd/anonymous pages that are never swapped out.
+        let resident = alloc::vec![1u8; pages];
+        vec.write_slice_at_offset::<Platform>(0, &resident)
+            .ok_or(Errno::EFAULT)
+    }
+
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        _length: usize,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        const MS_ASYNC: u32 = 1;
+        const MS_INVALIDATE: u32 = 2;
+        const MS_SYNC: u32 = 4;
+        if addr.as_usize() % litebox::mm::linux::PAGE_SIZE != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn sys_mremap(
         &self,
@@ -766,14 +2333,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        litebox_common_linux::mm::sys_mremap(
+        let flags_for_log = alloc::format!("{flags:?}");
+        let result = litebox_common_linux::mm::sys_mremap(
             &self.process().pm(),
             old_addr,
             old_size,
             new_size,
             flags,
             new_addr,
-        )
+        );
+        if let Err(e) = &result {
+            // `sys_mremap` previously had no logging at all -- confirmed live as a real gap
+            // via a genuine Weston `mremap()` failure (its pixman shadow-framebuffer growth)
+            // that was completely invisible in `LITEBOX_LOG=debug` output, only surfacing
+            // indirectly as Weston's own `wl_output.error` "failed mremap" event to its
+            // client, which then cascaded into a GTK "cannot open display" failure with zero
+            // syscall-level evidence pointing back at the actual `mremap()` call. Only log the
+            // failure path (mirroring `sys_brk`'s pattern just below); a successful mremap is
+            // already visible via the ordinary `mmap`/`mprotect` traces around it.
+            litebox_util_log::debug!(
+                tid:% = self.tid.get(), old_addr:% = old_addr.as_usize(), old_size:% = old_size,
+                new_size:% = new_size, flags:% = flags_for_log, new_addr:% = new_addr, err:? = e;
+                "sys_mremap: failed"
+            );
+        }
+        result
     }
 
     /// Handle syscall `brk`
@@ -822,7 +2406,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             for (&(pid, fd), state) in cache.iter() {
                 // Only this process's own entries describe this address space; another process's
                 // absolute `file_mappings` addresses are meaningless here (see [`ElfPatchKey`]).
-                if pid != self.pid || state.pre_patched {
+                if pid != self.pid.get() || state.pre_patched {
                     continue;
                 }
                 for &(seg_start, seg_len) in &state.file_mappings {
@@ -861,6 +2445,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 continue;
             }
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
+            // AGENTS.md pass 260 follow-up: the direct mmap(PROT_EXEC)-time diagnostic missed
+            // the actual weston crash addresses entirely -- this is the OTHER route a mapping
+            // gains PROT_EXEC (an mmap(PROT_READ) followed later by mprotect(PROT_EXEC), the
+            // classic dynamic-linker lazy-mapping idiom), so track it here too.
+            let path = self.files.borrow().lookup_fd_path(fd as usize);
+            litebox_util_log::debug!(
+                path:? = path, start:% = patch_start, len:% = patch_len;
+                "diag-exec-mmap: tracking via mprotect(PROT_EXEC) for future crash-address correlation"
+            );
             self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
     }
@@ -898,6 +2491,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return;
         }
+        // NOTE (not yet fixed): `ElfPatchKey` is `(pid, fd)` and nothing re-keys a parent's
+        // entries onto the child's pid at `fork()`. So a forked child, whose address space
+        // already holds the parent's ALREADY-PATCHED code copied byte for byte, looks its own pid
+        // up, misses, and re-initializes patch state from scratch -- computing a fresh
+        // `trampoline_addr` while the copied code still jumps to the parent's. Worth revisiting.
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
@@ -1036,9 +2634,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
+    ///
+    /// Parses the SAME `TrampolineHeader64` wire layout
+    /// `litebox_common_linux::loader::parse_trampoline` itself parses (via the same
+    /// `zerocopy::FromBytes` derive), rather than a second, independently-maintained
+    /// hand-rolled `from_le_bytes` decoder for the identical bytes -- two divergent parsers for
+    /// one on-disk format is how they'd silently disagree if either one were ever updated alone.
     #[cfg(target_arch = "x86_64")]
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
-        const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
+        use litebox_common_linux::loader::TrampolineHeader64;
+        use zerocopy::FromBytes as _;
+
+        const HEADER_SIZE: usize = core::mem::size_of::<TrampolineHeader64>();
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
@@ -1060,10 +2667,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
         }
-        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
-        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
-        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
-        (true, file_offset, vaddr, trampoline_size)
+        let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
+            return (false, 0, 0, 0);
+        };
+        (
+            true,
+            header.file_offset,
+            header.vaddr,
+            header.trampoline_size,
+        )
+    }
+
+    /// Probe for a free address within JMP rel32 range (`0x7FFF_0000`) of a code segment
+    /// (`code_addr..code_end`), by trying real `MAP_FIXED_NOREPLACE` attempts at
+    /// exponentially-increasing offsets on alternating sides of `preferred_addr` -- the
+    /// ELF-computed "just past this file's last `PT_LOAD`" hint that a plain
+    /// `MAP_FIXED_NOREPLACE` at that exact address has already failed for (some other mapping
+    /// occupies it; common in a cross-process-fork child, whose adopted VMA layout starts far
+    /// denser than a freshly-booted process's).
+    ///
+    /// Exists because `Vmem::get_unmmaped_area`'s own "let the VM choose" fallback (what the
+    /// caller reaches for next if this returns `Err`) has NO notion of "nearby": a `suggested_
+    /// address` that is occupied and not `MAP_FIXED` is silently ignored, and the fully generic
+    /// top-down/gap search that runs instead returns the first free gap ANYWHERE in the guest's
+    /// address space, which can land billions of bytes away from `preferred_addr` with nothing
+    /// to stop it (live-diagnosed 2026-09-17: a freshly cross-process-forked child's very first
+    /// `execve`, e.g. plain `mkdir`, landed a library's trampoline ~140 TB from its code segment,
+    /// `distance > 0x7FFF_0000`, triggering `apply_trap_fallback` -- which poisons every `syscall`
+    /// in that segment to a crash trap -- and the guest died the first time it actually executed
+    /// one). Deliberately a LOCAL probe scoped to just this one caller, not a change to
+    /// `get_unmmaped_area` itself (used by every `mmap()` in the system): each candidate is a
+    /// real, cheap-on-failure syscall (no side effects beyond the attempt itself), and the
+    /// exponential step (doubling each round, both directions) bounds the total probe count to
+    /// `PROBE_ROUNDS * 2` regardless of how far a usable gap turns out to be, rather than a linear
+    /// scan that could need hundreds of thousands of steps to cross a multi-GB packed region.
+    fn probe_nearby_trampoline_slot(
+        &self,
+        preferred_addr: usize,
+        code_addr: usize,
+        code_end: usize,
+        size: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        const JMP_REL32_RANGE: usize = 0x7FFF_0000;
+        const PROBE_ROUNDS: u32 = 24;
+        let mut step = size.next_power_of_two().max(PAGE_SIZE);
+        for _ in 0..PROBE_ROUNDS {
+            for candidate in [
+                preferred_addr.checked_add(step),
+                preferred_addr.checked_sub(step),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // Stay within JMP rel32 range of BOTH ends of the code segment -- matches the
+                // real check the caller applies to whatever address this returns.
+                if candidate.abs_diff(code_addr) > JMP_REL32_RANGE
+                    || candidate.abs_diff(code_end) > JMP_REL32_RANGE
+                {
+                    continue;
+                }
+                if let Ok(addr) = self.do_mmap_anonymous(
+                    Some(candidate),
+                    size,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                ) {
+                    return Ok(addr);
+                }
+            }
+            let Some(next_step) = step.checked_mul(2) else {
+                break;
+            };
+            step = next_step;
+        }
+        Err(MappingError::OutOfMemory)
     }
 
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
@@ -1208,14 +2885,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 // Protect as RX immediately.
-                if self
-                    .sys_mprotect_raw(
-                        tramp_ptr,
-                        tramp_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    )
-                    .is_err()
-                {
+                if let Err(err) = self.sys_mprotect_raw(
+                    tramp_ptr,
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                ) {
+                    litebox_util_log::error!(
+                        tramp_addr:% = tramp_ptr.as_usize(),
+                        tramp_len:% = tramp_len,
+                        errno:? = err;
+                        "diag-tramp-mprotect-fail: pre-patched trampoline mprotect(RX) failed, tearing down via munmap -- syscall rewriting for this binary is now BROKEN"
+                    );
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
@@ -1233,21 +2913,88 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
 
+            // Size the initial allocation from a cheap upper bound on how many `syscall`
+            // (`0F 05`) byte pairs this segment can possibly contain, rather than a flat
+            // `PAGE_SIZE` guess. A real container-image binary (e.g. GNU bash, vs. the
+            // busybox this was originally sized against) routinely needs far more than one
+            // page of stubs: undersizing here used to fall through to the `trampoline_mapped_len`
+            // "extend" path below, which only ever tries ONE fixed, exactly-adjacent address via
+            // `MAP_FIXED_NOREPLACE` with no fallback -- unlike this initial allocation's own
+            // try-fixed-then-let-the-VM-choose fallback a few lines down. Any unrelated mapping
+            // already occupying that single adjacent address (common; nothing reserves it) made
+            // the extend fail outright, which nukes EVERY syscall in the whole segment to an
+            // `ICEBP;HLT` crash trap (`apply_trap_fallback`) -- including the ones that were
+            // otherwise perfectly patchable -- so the guest died on the first syscall it ever
+            // executed after load (confirmed live: `docker.io/edgelevel/alpine-xfce-vnc`'s `/bin/sh`
+            // == bash, SIGILL within 3s of exec, 480 syscalls trap-poisoned by one failed 4KiB
+            // extension). Counting the byte pairs is the same sound-upper-bound technique
+            // `litebox_syscall_rewriter::patch_code_segment`'s own fast-reject scan already relies
+            // on: a real `syscall` is always exactly `0F 05` with no prefix that changes those
+            // bytes, so this can only OVER-count (data or another instruction's encoding
+            // containing that pair), never under-count, and sizing off an over-count is safe.
+            let syscall_upper_bound = mapped_addr
+                .to_owned_slice::<Platform>(len)
+                .map(|owned| {
+                    let buf = owned.into_vec();
+                    buf.windows(2)
+                        .filter(|w| w[0] == 0x0F && w[1] == 0x05)
+                        .count()
+                })
+                .unwrap_or(0);
+            // Per-syscall stub upper bound: the fixed lea+jmp+jmp-back sequence
+            // (`hook_syscalls_in_section`) is 18 bytes, plus up to `SYSCALL_CONTEXT_INSTRUCTIONS`
+            // (8) re-encoded instructions of at most 15 bytes (x86-64's own max instruction
+            // length) each on the richer pre/post-syscall paths -- 128 comfortably covers that
+            // with headroom, and only pads address space (never committed memory) if it
+            // overshoots.
+            const MAX_STUB_BYTES_PER_SYSCALL: usize = 128;
+            const TRAMPOLINE_ENTRY_BYTES: usize = 8;
+            // Capped: `syscall_upper_bound` counts raw `0F 05` byte pairs anywhere in the
+            // mapping, including non-code data (rodata sharing the segment, or an unrelated
+            // byte pair inside another instruction's encoding) -- real code never approaches
+            // this density, so a huge count here means the segment is huge and mostly NOT
+            // syscalls, not that it genuinely needs gigabytes of trampoline. 4 MiB covers over
+            // 32,000 real syscall sites (every real-world binary seen so far needs under 1,000)
+            // while bounding the one-time address-space/commit cost for a large, data-heavy
+            // mapping. A segment that legitimately needs more than this still has the existing
+            // `trampoline_mapped_len`-extension path as a backstop, unchanged.
+            const MAX_INITIAL_TRAMPOLINE_SIZE: usize = 4 * 1024 * 1024;
+            let initial_tramp_size = align_up(
+                TRAMPOLINE_ENTRY_BYTES
+                    + syscall_upper_bound.saturating_mul(MAX_STUB_BYTES_PER_SYSCALL),
+                PAGE_SIZE,
+            )
+            .max(PAGE_SIZE)
+            .min(MAX_INITIAL_TRAMPOLINE_SIZE);
+
             // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
+            // trampoline address is available. If that fails, probe nearby
+            // addresses within JMP rel32 range (see `probe_nearby_trampoline_slot`'s
+            // own doc comment for why this step exists: the generic "let the VM
+            // manager choose" fallback below has no notion of "nearby" and can
+            // land anywhere in the guest's address space). Only if EVERY nearby
+            // candidate is also occupied does this fall through to that fully
+            // generic choice, still re-validated against the JMP rel32 range below.
+            let far_end_hint = addr_usize.saturating_add(len);
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
-                    PAGE_SIZE,
+                    initial_tramp_size,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 )
                 .or_else(|_| {
+                    self.probe_nearby_trampoline_slot(
+                        tramp_addr,
+                        addr_usize,
+                        far_end_hint,
+                        initial_tramp_size,
+                    )
+                })
+                .or_else(|_| {
                     self.do_mmap_anonymous(
                         None,
-                        PAGE_SIZE,
+                        initial_tramp_size,
                         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                         MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                     )
@@ -1270,7 +3017,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(
+                    UserPtrMut::<u8>::from_usize(actual_addr),
+                    initial_tramp_size,
+                );
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -1284,13 +3034,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(
+                    UserPtrMut::<u8>::from_usize(actual_addr),
+                    initial_tramp_size,
+                );
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
-            state.trampoline_mapped_len = PAGE_SIZE;
+            state.trampoline_mapped_len = initial_tramp_size;
         }
 
         // Performance guard: skip if this exact range was already patched.
@@ -1371,23 +3124,103 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
         let syscall_entry_addr = state.trampoline_addr as u64;
 
-        let patch_result = litebox_syscall_rewriter::patch_code_segment(
-            &mut code_buf,
-            code_vaddr,
-            trampoline_write_vaddr,
-            syscall_entry_addr,
-        );
-        let patch_result = match patch_result {
-            Ok((stubs, skipped_addrs)) => {
-                if !skipped_addrs.is_empty() {
+        // Rewrite only the parts of this mapping that hold CODE, and scan each of them once per
+        // file rather than once per mapping.
+        //
+        // Two separate things, both forced by measurement, both about the same 130 MB library:
+        //
+        // * WHAT to patch. A `PROT_EXEC` mapping is not all code -- `libLLVM`'s first `PT_LOAD` is
+        //   `RX` and holds `.dynsym`, `.gnu.version*` and 42 MB of `.rodata` next to `.text`.
+        //   Patching all of it corrupted the symbol tables and broke every mesa consumer; see
+        //   `litebox_syscall_rewriter::executable_section_file_ranges` for the full chain.
+        // * HOW OFTEN to scan. The disassembly is a pure function of the bytes, so it is cached per
+        //   `(file, span)` and reused by every later mapping of that span, in any process; see
+        //   `litebox_syscall_rewriter::SegmentScanTemplate`.
+        //
+        // When the file's code ranges cannot be determined (no section headers, unreadable, not an
+        // ELF64) this falls back to treating the whole mapping as code -- the pre-existing
+        // behaviour, no worse than before, and still correct for the ordinary case where the
+        // mapping IS just a text segment.
+        let map_file_start = file_offset.unwrap_or(0) as u64;
+        let map_file_end = map_file_start.saturating_add(len as u64);
+        let mut spans: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        match self.executable_file_ranges(fd) {
+            Some(ranges) => {
+                for range in ranges.iter() {
+                    let start = range.start.max(map_file_start);
+                    let end = range.end.min(map_file_end);
+                    if start < end {
+                        spans.push((
+                            (start - map_file_start) as usize,
+                            (end - map_file_start) as usize,
+                        ));
+                    }
+                }
+            }
+            None => spans.push((0, len)),
+        }
+
+        let mut all_stubs: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut all_skipped: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut patch_err = None;
+        for (span_start, span_end) in spans {
+            let span_len = span_end - span_start;
+            let scan_key =
+                self.segment_scan_key(fd, (map_file_start as usize) + span_start, span_len);
+            let cached = scan_key.and_then(|key| {
+                self.global
+                    .segment_scan_cache
+                    .lock()
+                    .get(&key)
+                    .map(alloc::sync::Arc::clone)
+            });
+            let template = match cached {
+                Some(template) => Ok(template),
+                None => {
+                    litebox_syscall_rewriter::scan_code_segment(&code_buf[span_start..span_end])
+                        .map(|scanned| {
+                            let scanned = alloc::sync::Arc::new(scanned);
+                            if let Some(key) = scan_key {
+                                self.global
+                                    .segment_scan_cache
+                                    .lock()
+                                    .insert(key, alloc::sync::Arc::clone(&scanned));
+                            }
+                            scanned
+                        })
+                }
+            };
+            let outcome = template.and_then(|template| {
+                litebox_syscall_rewriter::patch_code_segment_scanned(
+                    &template,
+                    &mut code_buf[span_start..span_end],
+                    code_vaddr + span_start as u64,
+                    trampoline_write_vaddr + all_stubs.len() as u64,
+                    syscall_entry_addr,
+                )
+            });
+            match outcome {
+                Ok((stubs, skipped_addrs)) => {
+                    all_stubs.extend_from_slice(&stubs);
+                    all_skipped.extend_from_slice(&skipped_addrs);
+                }
+                Err(e) => {
+                    patch_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let patch_result = match patch_err {
+            Some(e) => Err(e),
+            None => {
+                if !all_skipped.is_empty() {
                     litebox_util_log::warn!(
-                        count:? = skipped_addrs.len(), addrs:? = skipped_addrs;
+                        count:? = all_skipped.len(), addrs:? = all_skipped;
                         "syscall instruction(s) could not be patched"
                     );
                 }
-                Ok(stubs)
+                Ok(all_stubs)
             }
-            Err(e) => Err(e),
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
@@ -1401,17 +3234,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if tramp_pages_needed > state.trampoline_mapped_len {
                     let extra_start = state.trampoline_addr + state.trampoline_mapped_len;
                     let extra_len = tramp_pages_needed - state.trampoline_mapped_len;
-                    if self
-                        .do_mmap_anonymous(
-                            Some(extra_start),
-                            extra_len,
-                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                            MapFlags::MAP_ANONYMOUS
-                                | MapFlags::MAP_PRIVATE
-                                | MapFlags::MAP_FIXED_NOREPLACE,
-                        )
-                        .is_err()
-                    {
+                    litebox_util_log::debug!(
+                        extra_start:% = format_args!("{extra_start:#x}"),
+                        extra_end:% = format_args!("{:#x}", extra_start + extra_len),
+                        extra_len:% = extra_len,
+                        trampoline_addr:% = format_args!("{:#x}", state.trampoline_addr),
+                        trampoline_mapped_len:% = state.trampoline_mapped_len;
+                        "diag-tramp-extend: about to extend trampoline region"
+                    );
+                    let extend_result = self.do_mmap_anonymous(
+                        Some(extra_start),
+                        extra_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS
+                            | MapFlags::MAP_PRIVATE
+                            | MapFlags::MAP_FIXED_NOREPLACE,
+                    );
+                    litebox_util_log::debug!(
+                        ok:% = extend_result.is_ok(),
+                        result_addr:% = extend_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                        "diag-tramp-extend: do_mmap_anonymous result"
+                    );
+                    if extend_result.is_err() {
                         litebox_util_log::warn!("failed to expand trampoline region");
                         self.apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
@@ -1486,9 +3330,79 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         true
     }
 
+    /// The file-offset ranges of `fd`'s file that hold executable code, read from its ELF section
+    /// headers and cached per `(device, inode)`.
+    ///
+    /// `None` means "could not tell" -- not an ELF64, no section header table, or an unreadable
+    /// one. Callers must fall back to treating the whole mapping as code, never to skipping the
+    /// rewrite: an unpatched `syscall` instruction escapes to the host kernel.
+    fn executable_file_ranges(
+        &self,
+        fd: i32,
+    ) -> Option<alloc::sync::Arc<alloc::vec::Vec<core::ops::Range<u64>>>> {
+        let stat = self.sys_fstat(fd).ok()?;
+        let key = (stat.st_dev, stat.st_ino);
+        if let Some(cached) = self.global.exec_ranges_cache.lock().get(&key) {
+            return Some(alloc::sync::Arc::clone(cached));
+        }
+
+        let mut header = [0u8; litebox_syscall_rewriter::ELF_HEADER_LEN];
+        self.read_exact_at(fd, &mut header, 0)?;
+        // What an ELF header means is the rewriter's business, and it already has `object`'s own
+        // struct definitions -- decoding `e_shoff`/`e_shentsize`/`e_shnum` by hand here would be a
+        // second, divergent copy of that knowledge expressed as byte offsets.
+        let (e_shoff, e_shentsize, e_shnum) =
+            litebox_syscall_rewriter::section_header_table_location(&header)?;
+        let total = e_shentsize.checked_mul(e_shnum)?;
+        // A sanity bound, so a corrupt header cannot ask for an unbounded allocation.
+        if total > 16 * 1024 * 1024 {
+            return None;
+        }
+        let mut section_headers = alloc::vec![0u8; total];
+        self.read_exact_at(fd, &mut section_headers, usize::try_from(e_shoff).ok()?)?;
+
+        let ranges =
+            alloc::sync::Arc::new(litebox_syscall_rewriter::executable_section_file_ranges(
+                &section_headers,
+                e_shentsize,
+                e_shnum,
+            ));
+        if ranges.is_empty() {
+            return None;
+        }
+        self.global
+            .exec_ranges_cache
+            .lock()
+            .insert(key, alloc::sync::Arc::clone(&ranges));
+        Some(ranges)
+    }
+
+    /// Fill `buf` from `offset` in `fd`, looping over short reads. `None` if it cannot be filled.
+    fn read_exact_at(&self, fd: i32, buf: &mut [u8], offset: usize) -> Option<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            match self.sys_read(fd, &mut buf[done..], Some(offset + done)) {
+                Ok(0) => return None,
+                Ok(n) => done += n,
+                Err(Errno::EINTR) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// The [`SegmentScanCache`] key for the `len` bytes at `offset` in `fd`'s file.
+    ///
+    /// `None` when the descriptor has no stable `(dev, ino)` to key on, in which case the caller
+    /// simply scans for itself -- see the call site in `maybe_patch_exec_segment`.
+    fn segment_scan_key(&self, fd: i32, offset: usize, len: usize) -> Option<SegmentScanKey> {
+        let stat = self.sys_fstat(fd).ok()?;
+        Some((stat.st_dev, stat.st_ino, offset, len))
+    }
+
     /// The [`ElfPatchCache`] key for `fd` in *this* task's process. See [`ElfPatchKey`].
     fn elf_patch_key(&self, fd: i32) -> ElfPatchKey {
-        (self.pid, fd)
+        (self.pid.get(), fd)
     }
 
     /// Finalize the ELF patching state for `fd`.
@@ -1945,10 +3859,7 @@ mod tests {
 
         task.sys_ftruncate(fd, 0x1000).unwrap();
         let content = [0xDD_u8, 0xCC, 0xBB, 0xAA].repeat(4);
-        assert_eq!(
-            task.sys_write(fd, &content, None).unwrap(),
-            content.len()
-        );
+        assert_eq!(task.sys_write(fd, &content, None).unwrap(), content.len());
 
         let addr = task
             .sys_mmap(
@@ -1971,12 +3882,20 @@ mod tests {
         task.sys_close(fd).unwrap();
     }
 
-    /// A fresh `memfd_create` fd (before any `ftruncate`) has no real shared-memory object
-    /// registered yet -- `mmap` on it must fall through to the ordinary file-backed path (which
-    /// correctly rejects `MAP_SHARED|PROT_WRITE` on a zero-length file), not panic or silently
-    /// succeed against stale/wrong state.
+    /// A fresh `memfd_create` fd (before any `ftruncate`) has no shared-memory object registered
+    /// yet. `mmap(MAP_SHARED|PROT_WRITE)` on it must still produce a usable mapping rather than
+    /// panicking or reading stale state -- which is also what real Linux does: a zero-length memfd
+    /// can be mapped, and it is only an ACCESS past the end of the object that raises `SIGBUS`.
+    ///
+    /// This test previously asserted `ENODEV`, which was correct for the implementation that
+    /// existed when it was written: `mmap(MAP_SHARED|PROT_WRITE)` on anything file-backed was
+    /// refused outright. `try_shared_file_mmap` (see its doc comment -- `dconf`, and therefore
+    /// every GSettings write in a MATE/GNOME/XFCE session, cannot survive that `ENODEV`)
+    /// deliberately replaced that answer with a real shared object, and this expectation was never
+    /// updated. It was not noticed because the whole test binary was crashing at test 9 of 181
+    /// before reaching here -- see the VEH exception-code whitelist for that.
     #[test]
-    fn test_memfd_create_mmap_before_ftruncate_does_not_panic() {
+    fn test_memfd_create_mmap_before_ftruncate_is_usable() {
         let task = init_platform(None);
 
         let fd = task
@@ -1984,7 +3903,7 @@ mod tests {
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
 
-        let err = task
+        let addr = task
             .sys_mmap(
                 0,
                 0x1000,
@@ -1993,9 +3912,16 @@ mod tests {
                 fd,
                 0,
             )
-            .unwrap_err();
-        assert_eq!(err, Errno::ENODEV);
+            .expect("mmap of a fresh memfd must produce a mapping, not ENODEV");
 
+        // Zero-filled to start with, like any fresh anonymous memory, and actually writable --
+        // "did not panic" alone would also be satisfied by a mapping that faults on first touch.
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0_u8);
+        addr.write_slice_at_offset::<Platform>(0, &[0x5a; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0x5a_u8);
+
+        task.sys_munmap(addr, PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
     }
 
@@ -2163,21 +4089,36 @@ mod tests {
             content.as_slice(),
         );
 
-        // mprotect to add write permission should fail
-        let err = task
-            .sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-            .unwrap_err();
-        assert_eq!(err, Errno::EACCES);
+        // `mprotect` adding write permission SUCCEEDS here, and that is correct: the fd above was
+        // opened `O_RDWR`, and real Linux only answers `EACCES` when the file was opened without
+        // write permission. This asserted `EACCES` for as long as `MAP_SHARED` mapped the file
+        // read-only at the host level, which is no longer how it works (see
+        // `try_shared_file_mmap`); the expectation outlived the implementation it described.
+        task.sys_mprotect(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .expect("mprotect may add write to a MAP_SHARED mapping of an O_RDWR fd");
+        // And the promotion is real, not merely accepted.
+        addr.write_slice_at_offset::<Platform>(0, b"W").unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), b'W');
 
         task.sys_munmap(addr, len).unwrap();
         task.sys_close(fd).unwrap();
     }
 
+    /// `mmap(MAP_SHARED|PROT_WRITE)` on a file-backed fd gives every mapper of that file the SAME
+    /// memory -- the guarantee `try_shared_file_mmap` exists to provide, and the one `dconf` builds
+    /// its staleness flag out of (a writer maps the byte `PROT_WRITE`, readers map it `PROT_READ`
+    /// and poll it; see that function's doc comment for why refusing this made `mate-panel` come up
+    /// with no panels at all).
+    ///
+    /// Two separate histories meet in this test. It was originally written because the combination
+    /// used to `todo!()` and crash the whole runner on an idiom as ordinary as Python's
+    /// `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`; the fix then was to refuse it
+    /// with `ENODEV`, which is what this asserted. `try_shared_file_mmap` later replaced that
+    /// refusal with real shared memory and left the assertion behind. Neither the staleness nor the
+    /// failure was visible, because the test binary was crashing before this test ran -- see the
+    /// VEH exception-code whitelist.
     #[test]
-    fn test_map_shared_writable_file_returns_enodev_instead_of_panicking() {
-        // Regression test: `mmap(MAP_SHARED | PROT_WRITE)` on a file-backed fd used to
-        // unconditionally panic (`todo!()`), crashing the whole runner on an ordinary idiom like
-        // Python's `mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_WRITE)`.
+    fn test_map_shared_writable_file_is_shared_between_mappers() {
         let task = init_platform(None);
         let fd = task
             .sys_open(
@@ -2187,8 +4128,92 @@ mod tests {
             )
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, b"seed", None).unwrap(), 4);
 
-        let err = task
+        let writer = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .expect("MAP_SHARED|PROT_WRITE on a file must map, not fail with ENODEV");
+
+        // Seeded from the file's current bytes by the first mapper.
+        assert_eq!(writer.read_at_offset::<Platform>(0).unwrap(), b's');
+
+        // A SECOND, independent read-only mapping of the same file must be the same memory, not a
+        // private snapshot -- this is the whole point, and an identically-seeded private copy would
+        // pass a content check while failing this one.
+        let reader = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .expect("a second MAP_SHARED mapping of the same file must succeed");
+        writer
+            .write_slice_at_offset::<Platform>(0, b"MADE")
+            .unwrap();
+        assert_eq!(reader.read_at_offset::<Platform>(0).unwrap(), b'M');
+
+        // The documented limitation, asserted rather than left to drift: writes through the
+        // mapping do NOT reach the file's byte storage, so a `read()` still sees the pre-`mmap`
+        // contents. If that ever changes, this is the test that should be updated to say so.
+        let mut via_read = [0u8; 4];
+        assert_eq!(task.sys_read(fd, &mut via_read, Some(0)).unwrap(), 4);
+        assert_eq!(&via_read, b"seed");
+
+        task.sys_munmap(reader, PAGE_SIZE).unwrap();
+        task.sys_munmap(writer, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    /// Contrast case for [`test_map_shared_writable_file_returns_enodev_instead_of_panicking`]
+    /// just above: a file created under `/dev/shm` is real Linux's own tmpfs, so unlike an
+    /// ordinary file it must NOT hit that `ENODEV` rejection -- `MAP_SHARED|PROT_WRITE` there is
+    /// exactly the real shared-memory semantics glibc's `shm_open` relies on (see
+    /// `syscalls::file::is_dev_shm_path`'s doc comment for the open-time `MemfdMarker` tagging
+    /// this exercises, and the runner's `initialize_root_in_mem_layer` for why `/dev/shm` exists
+    /// as a directory at all). Live-verified against a real freestanding guest probe
+    /// (`advisor/probes/shm_probe.c`) doing the identical `open+ftruncate+mmap+write+read-back`
+    /// sequence before this unit test was written -- this is the regression-test-level
+    /// equivalent.
+    #[test]
+    fn test_dev_shm_file_supports_map_shared_write() {
+        let task = init_platform(None);
+        // `/dev` already exists in this test's own fixture tar (`litebox/src/fs/test.tar`) --
+        // unlike the real runner's fresh in-mem layer, which needs it created explicitly (see
+        // `initialize_root_in_mem_layer`'s doc comment) -- so only `/dev/shm` needs creating here.
+        let _ = task.sys_mkdirat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev",
+            (Mode::RWXU | Mode::RGRP | Mode::ROTH).bits(),
+        );
+        task.sys_mkdirat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev/shm",
+            (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits(),
+        )
+        .unwrap();
+
+        let fd = task
+            .sys_open(
+                "/dev/shm/probe_name",
+                OFlags::RDWR | OFlags::CREAT | OFlags::EXCL,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+
+        task.sys_ftruncate(fd, 0x1000).unwrap();
+
+        let addr = task
             .sys_mmap(
                 0,
                 0x1000,
@@ -2197,8 +4222,13 @@ mod tests {
                 fd,
                 0,
             )
-            .unwrap_err();
-        assert_eq!(err, Errno::ENODEV);
+            .unwrap();
+        addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     #[test]

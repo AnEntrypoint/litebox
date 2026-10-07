@@ -68,7 +68,14 @@ impl<Instant: litebox::platform::Instant> TimerState<Instant> {
         let Some(deadline) = self.deadline else {
             return;
         };
-        let Some(overdue) = now.checked_duration_since(&deadline) else {
+        let overdue_opt = now.checked_duration_since(&deadline);
+        let remaining_opt = deadline.checked_duration_since(&now);
+        litebox_util_log::debug!(
+            overdue:? = overdue_opt,
+            remaining_if_future:? = remaining_opt;
+            "DIAG TimerState::resync"
+        );
+        let Some(overdue) = overdue_opt else {
             return; // deadline is still in the future
         };
         if self.interval.is_zero() {
@@ -106,10 +113,24 @@ pub(crate) struct TimerfdFile<Platform: RawSyncPrimitivesProvider + TimeProvider
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     pollee: Pollee<Platform>,
+    /// Whether this fd was created with `CLOCK_REALTIME` (`true`) rather than `CLOCK_MONOTONIC`
+    /// or one of its close cousins (`false`) -- set once at `timerfd_create(2)` time, consulted
+    /// by `sys_timerfd_settime`'s `TFD_TIMER_ABSTIME` handling to convert the guest's absolute
+    /// deadline into this platform's monotonic `Instant` domain against the RIGHT epoch. Getting
+    /// this wrong (previously: always assuming realtime, regardless of what the guest actually
+    /// requested) meant a `CLOCK_MONOTONIC`-based absolute deadline -- a small "seconds since some
+    /// monotonic reference point" value -- compared as smaller than wall-clock "now" (a ~1.7-billion-
+    /// second Unix timestamp), which unconditionally took the "already past" branch and armed the
+    /// timer to fire immediately. Confirmed live: this is exactly what starved weston's own
+    /// internal event-loop timerfd of ever legitimately expiring on its own schedule -- it fired
+    /// immediately on every arm, and because weston's dispatch callback for it never actually
+    /// needed to run yet, nothing called `read()`, leaving the fd stuck permanently
+    /// `Events::IN`-ready and its owning thread spinning in `epoll_wait` forever.
+    is_realtime: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<Platform> {
-    pub(crate) fn new(platform: &'static Platform, flags: TfdFlags) -> Self {
+    pub(crate) fn new(platform: &'static Platform, flags: TfdFlags, is_realtime: bool) -> Self {
         let mut status = OFlags::RDONLY;
         status.set(OFlags::NONBLOCK, flags.contains(TfdFlags::NONBLOCK));
 
@@ -118,7 +139,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
             state: Mutex::new(TimerState::default()),
             status: AtomicU32::new(status.bits()),
             pollee: Pollee::new(),
+            is_realtime,
         }
+    }
+
+    /// Whether this fd was created with `CLOCK_REALTIME` -- see [`Self::is_realtime`]'s doc
+    /// comment. Consulted by `sys_timerfd_settime`'s `TFD_TIMER_ABSTIME` handling.
+    pub(crate) fn is_realtime(&self) -> bool {
+        self.is_realtime
     }
 
     /// Arms/disarms the timer per `timerfd_settime(2)` semantics. `value`/`interval` are already
@@ -137,8 +165,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
         state.deadline = deadline;
         state.interval = interval;
         state.accrued = 0;
+        // Re-check readiness against the NEW deadline before deciding whether to notify: an
+        // unconditional `notify_observers` here (the previous behavior) marks any registered
+        // `EpollEntry` observer as immediately "ready" via its `Observer::on_events` ->
+        // `ReadySet::push` -> `is_ready = true`, REGARDLESS of whether the new deadline is
+        // actually due yet. Confirmed live via a full XFCE repro trace
+        // (`.wfgy/xfce-build/epolldiag1_clean.log`): weston re-arms its own repaint timerfd with
+        // a legitimate near-future deadline (~9-14ms out), this spuriously marks the epoll
+        // interest `is_ready`, and `EpollFile::has_unready_stdin_or_armed_timerfd_interest`
+        // (which short-circuits `is_ready` entries as "already ready, no bounded repoll needed")
+        // then lets weston's own `epoll_pwait(timeout=None)` call commit to an UNBOUNDED wait --
+        // permanently, since nothing else was pending to wake it, and the real (not-yet-actually-
+        // ready) timerfd is never re-observed until some unrelated fd traffic happens to wake the
+        // same epoll instance first. Only notifying when the new deadline is ALREADY due (i.e.
+        // `resync` against `now` immediately finds it overdue) preserves the one case that
+        // legitimately needs an immediate wakeup, without falsely marking a genuinely-future
+        // deadline "ready".
+        state.resync(now);
+        let already_due = state.accrued > 0;
         drop(state);
-        self.pollee.notify_observers(Events::IN);
+        if already_due {
+            self.pollee.notify_observers(Events::IN);
+        }
         prev
     }
 
@@ -176,7 +224,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> TimerfdFile<P
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> IOPollable for TimerfdFile<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> IOPollable
+    for TimerfdFile<Platform>
+{
     fn check_io_events(&self) -> Events {
         let now = self.platform.now();
         let mut state = self.state.lock();
@@ -210,7 +260,7 @@ mod tests {
     #[test]
     fn disarmed_timerfd_is_never_ready_and_read_returns_eagain() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         assert_eq!(tfd.check_io_events(), Events::empty());
         assert_eq!(tfd.read(), Err(Errno::EAGAIN));
     }
@@ -218,7 +268,7 @@ mod tests {
     #[test]
     fn single_shot_timer_becomes_ready_and_reports_one_expiration() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         let deadline = now.checked_add(core::time::Duration::from_millis(20));
         tfd.set_time(deadline, core::time::Duration::ZERO);
@@ -239,7 +289,7 @@ mod tests {
     #[test]
     fn periodic_timer_accrues_multiple_missed_expirations() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         let interval = core::time::Duration::from_millis(10);
         let deadline = now.checked_add(interval);
@@ -260,7 +310,7 @@ mod tests {
     #[test]
     fn set_time_with_zero_value_disarms() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK);
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::NONBLOCK, false);
         let now = platform().now();
         tfd.set_time(
             now.checked_add(core::time::Duration::from_millis(5)),
@@ -275,7 +325,7 @@ mod tests {
     #[test]
     fn blocking_read_without_nonblock_is_a_documented_narrow_gap() {
         let _task = crate::syscalls::tests::init_platform(None);
-        let tfd = super::TimerfdFile::new(platform(), TfdFlags::empty());
+        let tfd = super::TimerfdFile::new(platform(), TfdFlags::empty(), false);
         assert_eq!(tfd.read(), Err(Errno::EOPNOTSUPP));
     }
 }

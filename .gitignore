@@ -130,7 +130,6 @@ tags
 [._]*.un~
 
 ### VisualStudioCode ###
-.vscode/*
 
 # Local History for Visual Studio Code
 .history/
@@ -183,7 +182,6 @@ build/
 .eggs/
 .venv/
 venv/
-.env
 *.pyo
 .mypy_cache/
 .ruff_cache/
@@ -201,6 +199,17 @@ dev_bench/unixbench/*.zip
 ### Local tooling state ###
 .gm/
 .agentplug-kv/
+.agentplug/
+.wfgyxfce-*.ps1
+
+### On-disk cache of rewritten OCI layers (litebox_packager::oci::cache) --
+### keyed by (layer_digest, rewriter_version); safe to delete any time, a
+### repeat boot just re-pulls+re-rewrites and repopulates it ###
+/.litebox-cache/
+
+### Stray local build/test artifacts (not committed products) ###
+target-myfork/
+alpine-fresh-test.tar
 
 ### Test-generated artifacts ###
 litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
@@ -208,4 +217,29 @@ litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked
 ### Local repro/debug scratch (packaged rootfs tarballs, gdb investigation sessions) ###
 /alpine-rootfs.tar
 /alpine-rootfs-fresh.tar
+/layer_timeline*.tar
 /.wfgy/
+/pass_*.log
+/pass_*.txt
+/pass*.png
+/litebox_frame_dump_*.bmp
+/frame_dump/
+/overlay*/
+
+# Compiled guest probe binaries -- build with the host clang line in each .c file
+/advisor/probes/xwire_probe
+/advisor/probes/bigfork_probe
+/advisor/probes/tramp_fork_probe
+
+### Scratch scripts/layers injected into a guest run (--resume-from overlays, frame dumps, etc.) --
+### these are throwaway build artifacts, never committed source; regenerate as needed
+/probe_*.tar
+/*.bmp
+/*.log
+/scratch*
+
+### Probe-captured frame dumps and debug logs -- never go in git per the standing repo-hygiene
+### lesson (AGENTS.md), regardless of which subdirectory a probe happens to write them into
+advisor/probes/**/*.bmp
+advisor/probes/**/*.log
+node_modules

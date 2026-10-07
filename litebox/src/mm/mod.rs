@@ -23,7 +23,7 @@ use crate::{
     mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{MemoryRegionPermissions, RemapError},
+        page_mgmt::{MemoryRegionPermissions, RemapError, SharedRegionCarry},
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -98,6 +98,12 @@ pub struct AddressRelocations {
 }
 
 impl AddressRelocations {
+    /// Whether no address was moved, as for a `vfork` child that shares its parent's address space.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     /// Reconstructs an [`AddressRelocations`] from its raw parallel-vector parts.
     ///
     /// Diagnostic-only (pass 122 of `scratchpad/jqrepro/FINDINGS.txt`'s investigation): the real
@@ -417,6 +423,51 @@ impl AddressRelocations {
         self.executable[index]
     }
 
+    /// Folds `ancestor`'s own tracked ranges into `self`, producing a map that transitively
+    /// covers every earlier fork generation `ancestor` itself already covered -- the fix for the
+    /// nested-fork (fork-of-a-fork) grandparent-generation staleness gap: a grandchild's own
+    /// `AddressRelocations` (built fresh by [`PageManager::duplicate`] at ITS fork call) only
+    /// knows about its immediate parent's current address space, with no visibility into
+    /// generations the parent inherited from ITS OWN parent in turn. `self` is the map this
+    /// fork's own `duplicate()` call just produced (child-relative-to-parent); `ancestor` is the
+    /// PARENT's own currently-active relocation map (parent-relative-to-grandparent, and so on
+    /// transitively -- already folded by this SAME method when the parent's own fork happened, if
+    /// the parent was itself a fork descendant under verification).
+    ///
+    /// Each `ancestor` range is carried forward one of two ways:
+    /// - If its `dest_base` (the address it lives at IN THE PARENT, which is also where it lives
+    ///   in the freshly-forked child right up until this fork's own duplication may have moved
+    ///   it) falls inside one of `self`'s own SOURCE ranges, that address was itself relocated
+    ///   again by this fork -- translate it through `self` so the ancestor's entry ends up
+    ///   pointing at its CURRENT destination in the new child, not a now-stale mid-generation one.
+    /// - Otherwise that ancestor-owned memory was untouched by this specific fork (it is not part
+    ///   of what `duplicate()` just relocated) and is still valid at its old translated location
+    ///   -- appended as-is.
+    ///
+    /// A range translated through `self` this way keeps its ORIGINAL (oldest-known) source range
+    /// and its now-current destination base, so `is_in_source`/`translate` continue to recognize
+    /// the value in whatever ancestor-generation form it might still appear in verbatim, exactly
+    /// as they already do for `self`'s own one-generation ranges. All parallel per-range
+    /// metadata (`executable`/`private_data`/`is_file_backed`/`flags`) is carried over verbatim
+    /// from `ancestor`, preserving the index-alignment invariant `is_executable_range` and
+    /// friends depend on. `group_relocations` and `heap_top` are left as `self`'s own (the
+    /// current fork's own group/heap-top bookkeeping remains authoritative for this generation;
+    /// ancestor groups are not currently consumed by any caller that would need them chained).
+    #[must_use]
+    pub fn merge_ancestor_ranges(mut self, ancestor: &Self) -> Self {
+        for (i, (ancestor_source_range, ancestor_dest_base)) in ancestor.ranges.iter().enumerate() {
+            let dest_base = self
+                .translate(*ancestor_dest_base)
+                .unwrap_or(*ancestor_dest_base);
+            self.ranges.push((ancestor_source_range.clone(), dest_base));
+            self.executable.push(ancestor.executable[i]);
+            self.private_data.push(ancestor.private_data[i]);
+            self.is_file_backed.push(ancestor.is_file_backed[i]);
+            self.flags.push(ancestor.flags[i]);
+        }
+        self
+    }
+
     /// Returns whether `addr` falls within a DESTINATION range that was executable (`VM_EXEC`) in
     /// the SOURCE address space at the moment of duplication -- i.e. `addr` is inside the child's
     /// own relocated copy of guest code.
@@ -637,7 +688,33 @@ where
 {
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        // Same reason as in `duplicate`: this address space is placed around whatever the host
+        // has mapped, and the host keeps mapping memory after the platform was constructed.
+        litebox.x.platform.refresh_reserved_pages();
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
+        Self { vmem }
+    }
+
+    /// Like [`Self::new`], but for the ONE case where that is not enough: a `CLONE_VFORK` child
+    /// detaching into its own fresh address space at `execve()` time, via
+    /// `detach_pm_for_vfork_execve` in `litebox_shim_linux`. See
+    /// [`linux::Vmem::new_for_vfork_execve_detach`]'s doc comment for the full bug this closes
+    /// (a real, delayed `STATUS_ACCESS_VIOLATION` in a still-live parent whose memory a vfork
+    /// child's own `execve` silently overwrote) and why [`Self::new`] alone -- sufficient for
+    /// every OTHER caller, including a plain `fork()` child's `execve` -- is not sufficient here.
+    ///
+    /// `parent_occupied` should be `self`'s own [`Self::tracked_regions`] -- i.e. the OLD
+    /// `PageManager` this child is about to detach from -- read and passed BEFORE the swap, while
+    /// the ranges it describes are still this same shared, live address space.
+    pub fn new_for_vfork_execve_detach(
+        litebox: &LiteBox<Platform>,
+        parent_occupied: impl Iterator<Item = Range<usize>>,
+    ) -> Self {
+        litebox.x.platform.refresh_reserved_pages();
+        let vmem = RwLock::new(linux::Vmem::new_for_vfork_execve_detach(
+            litebox.x.platform,
+            parent_occupied,
+        ));
         Self { vmem }
     }
 
@@ -663,13 +740,55 @@ where
     /// region is adopted with its flags but WITHOUT a usable platform shared-memory handle (the
     /// parent's handle is meaningless in this process), so a caller should surface a non-zero
     /// second count rather than treat such a region as fully reconstructed.
+    ///
+    /// `group_spans` is the set of coarser, 64KiB-rounded reservation-group spans the CALLER
+    /// actually reserved+committed real host memory for (Windows cross-process fork only --
+    /// `litebox_platform_windows_userland::process_fork`'s `copy_one_group`/`reserve_group_lazy`;
+    /// empty for a real, native-`fork()`-COW adoption, which has no such rounding at all). Each
+    /// span may extend up to 65535 bytes past its own real, page-granular guest VMAs on either
+    /// side -- alignment padding `regions` has no entry for at all, since `regions` is real,
+    /// per-VMA guest layout with no notion of the coarser group rounding. Recorded here as
+    /// `VmFlags::VM_OWN_FORK_PADDING` placeholders so this process's own later guest `mmap()`
+    /// bookkeeping never mistakes that real, already-committed host memory for free address
+    /// space -- see `linux::Vmem::new_adopting_existing_memory`'s own doc comment for the full
+    /// bug this closes (found live investigating the `LITEBOX_LAZY_FORK_COMMIT=1` subshell
+    /// crash).
     pub fn new_adopting_existing_memory(
         litebox: &LiteBox<Platform>,
         regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
         brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
     ) -> (Self, usize, usize) {
-        let (vmem, adopted, shared) =
-            linux::Vmem::new_adopting_existing_memory(litebox.x.platform, regions, brk);
+        let (vmem, adopted, shared) = linux::Vmem::new_adopting_existing_memory(
+            litebox.x.platform,
+            regions,
+            brk,
+            group_spans,
+        );
+        (
+            Self {
+                vmem: RwLock::new(vmem),
+            },
+            adopted,
+            shared,
+        )
+    }
+
+    /// [`Self::new_adopting_existing_memory`] for a child that inherited the parent's address
+    /// space natively: every region, `PROT_NONE` reservations and shared mappings included, is
+    /// tracked because each really exists in the child.
+    pub fn new_adopting_inherited_memory(
+        litebox: &LiteBox<Platform>,
+        regions: impl Iterator<Item = (Range<usize>, u32, bool)>,
+        brk: usize,
+        group_spans: impl Iterator<Item = Range<usize>>,
+    ) -> (Self, usize, usize) {
+        let (vmem, adopted, shared) = linux::Vmem::new_adopting_inherited_memory(
+            litebox.x.platform,
+            regions,
+            brk,
+            group_spans,
+        );
         (
             Self {
                 vmem: RwLock::new(vmem),
@@ -731,10 +850,24 @@ where
         litebox: &LiteBox<Platform>,
     ) -> Result<(Self, AddressRelocations), VmemDuplicateError> {
         let source_vmem = self.vmem.read();
-        let source_ranges: Vec<Range<usize>> = source_vmem.iter().map(|(r, _)| r.clone()).collect();
         let heap_top = source_vmem.brk;
-        let mut dest_vmem =
-            linux::Vmem::new_excluding(litebox.x.platform, source_ranges.into_iter());
+        // The host's own mappings are what the destination must be placed around, and they are
+        // not fixed: on Linux the `--gui` presenter loads a Vulkan driver and spawns worker
+        // threads long after this provider was constructed. Reading them once at startup let a
+        // forked child's address space land on top of live host memory, which showed up as the
+        // child's heap being corrupted from underneath it -- glibc's own
+        // `malloc.c:2601 (sysmalloc): assertion failed` in a `dbus-daemon` forked under `--gui`,
+        // and not once in the identical run without it.
+        //
+        // The destination `Vmem` used to be built with the PARENT's own live ranges excluded
+        // from the platform's reserved set (`Vmem::new_excluding`), on the reasoning that the
+        // child was going to claim those exact addresses as its own copy. It does not, and
+        // cannot: the copy is placed wherever the platform finds room (this function's own
+        // group placement, below). What the exclusion did instead was leave the child believing
+        // the parent's live memory was free, so after the child's own `execve` its new image
+        // could be loaded straight on top of it. See `Vmem::new`'s own doc comment.
+        litebox.x.platform.refresh_reserved_pages();
+        let mut dest_vmem = linux::Vmem::new(litebox.x.platform);
         let linux::DuplicateOutcome {
             relocations,
             group_relocations,
@@ -830,7 +963,8 @@ where
                 PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
             // `protect` should succeed, as we just created the mapping.
             let mut vmem = self.vmem.write();
-            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+            unsafe { vmem.protect_mapping(range, after_perms, "create_mapping") }
+                .expect("failed to protect mapping");
         }
         Ok(addr)
     }
@@ -905,6 +1039,20 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
     }
 
+    /// Every `VM_SHARED` mapping this address space holds, described well enough for a fork child
+    /// on another host process to attach to the SAME object.
+    ///
+    /// This is the parent half of carrying a real shared mapping across a cross-process `fork()`.
+    /// Hand the result to `Platform::export_fork_shared_regions` immediately before the spawn;
+    /// the child's own `PageManager::new_adopting_existing_memory` picks it up from there. A
+    /// mapping whose object has no host-wide name is simply absent from the list: it cannot be
+    /// reconstructed elsewhere, and the child reports it as unrestorable rather than quietly
+    /// mapping a private copy of it.
+    #[must_use]
+    pub fn shared_region_carry(&self) -> Vec<SharedRegionCarry> {
+        self.vmem.read().shared_region_carry()
+    }
+
     /// Map an already-existing shared-memory handle (from a prior real allocation this platform
     /// made, e.g. a device emulation layer's own backing storage for a virtual resource) into a
     /// second, independent address range in this same address space -- read-write, no
@@ -929,7 +1077,35 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let mut vmem = self.vmem.write();
-        unsafe { vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle) }
+        unsafe {
+            vmem.map_existing_shared_pages(suggested_address, length, flags, perms, shared_handle)
+        }
+    }
+
+    /// Map a shared-memory object read-only as a guest `MAP_PRIVATE` file mapping: one object
+    /// serves every process that maps the same large file, and the view is copy-on-write, so this
+    /// process can later `mprotect` it writable and write privately (see
+    /// [`Self::map_existing_shared_pages`] for the genuinely shared, writable counterpart).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::map_existing_shared_pages`].
+    pub unsafe fn map_existing_shared_pages_file_private_cow(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        shared_handle: Platform::SharedMemoryHandle,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let mut vmem = self.vmem.write();
+        unsafe {
+            vmem.map_existing_shared_pages_file_private_cow(
+                suggested_address,
+                length,
+                flags,
+                shared_handle,
+            )
+        }
     }
 
     /// Create read-only pages.
@@ -1010,6 +1186,70 @@ where
         }
     }
 
+    /// Create pages with an arbitrary combination of read/write/exec permissions.
+    ///
+    /// Real `mmap(2)` accepts any combination of `PROT_READ`/`PROT_WRITE`/`PROT_EXEC` -- not just
+    /// the four combinations [`create_executable_pages`](Self::create_executable_pages),
+    /// [`create_writable_pages`](Self::create_writable_pages),
+    /// [`create_readable_pages`](Self::create_readable_pages) and
+    /// [`create_inaccessible_pages`](Self::create_inaccessible_pages) each hardcode.
+    /// `PROT_READ|PROT_WRITE|PROT_EXEC` in particular is the combination every GTK program asks
+    /// for to hold its closure trampolines. Pages are created writable so `op` can populate them,
+    /// then protected down to whatever was actually asked for. The one exception is an anonymous
+    /// mapping with no permissions at all, which is created inaccessible and never committed --
+    /// see the note on `before_perms` in the body.
+    ///
+    /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
+    ///
+    /// `length` is the size of the pages to be created.
+    ///
+    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_pages_with_permissions<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        // A file-backed mapping is populated by `op`, so its pages must be committed and writable
+        // while `op` runs even when the guest asked for NO access at all: `mmap(PROT_NONE)` on a
+        // large file is a reservation the guest `mprotect`s into use later (the dynamic loader's
+        // shape), and the file bytes have to be there by then. Without this, the request reaches
+        // the platform with empty permissions, which on the Windows backend reserves the range
+        // without committing it, so every write from `op` failed and `mmap()` panicked the whole
+        // guest session instead of returning an errno. Anonymous `PROT_NONE` keeps the
+        // never-committed path -- there is nothing to populate and a guard reservation must stay
+        // free.
+        let before_perms = if permissions.is_empty() && !flags.contains(CreatePagesFlags::MAP_FILE) {
+            MemoryRegionPermissions::empty()
+        } else {
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+        };
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                permissions,
+                op,
+            )
+        }
+    }
+
     /// Create stack pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -1060,7 +1300,16 @@ where
     ///
     /// ## Returns
     ///
-    /// If the operation is successful, it returns the new program break address.
+    /// The program break after the call: the requested address when the change was made, and the
+    /// UNCHANGED break when it could not be. Growth that cannot be satisfied is not an error --
+    /// real Linux's `brk(2)` returns an address on every path (`SYSCALL_DEFINE1(brk, ...)` falls
+    /// through to `out: return origbrk` for each of its failure cases) and never a negative
+    /// errno, and glibc's `__brk` relies on exactly that: it stores whatever the syscall returned
+    /// into `__curbrk` and only *then* compares it against the address it asked for to decide
+    /// whether to report `ENOMEM`. An `Err` here reaches that wrapper as `-12`, which it records
+    /// as the process's current break, and every subsequent heap computation runs off that
+    /// garbage -- observed as `malloc(): corrupted top size` and an abort in a guest whose only
+    /// real problem was a heap with no room above it to grow into.
     ///
     /// # Panics
     ///
@@ -1098,19 +1347,21 @@ where
         }
 
         if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            return Err(MappingError::OutOfMemory);
+            return Ok(vmem.brk);
         }
         if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
             let (suggested_address, length) = range.start_and_length();
             let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            let placed = unsafe {
+            let Ok(placed) = (unsafe {
                 vmem.create_pages(
                     Some(suggested_address),
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     perms,
                 )
-            }?;
+            }) else {
+                return Ok(vmem.brk);
+            };
             // `create_pages`'s `FIXED_ADDR` request is `FixedAddressBehavior::Replace`, which the
             // platform is allowed to silently RELOCATE away from the requested address (e.g. when
             // a sibling guest process's live claim occupies the target range -- see
@@ -1130,15 +1381,12 @@ where
             if placed.as_usize() != suggested_address.as_usize() {
                 unsafe {
                     vmem.remove_mapping(
-                        PageRange::new(
-                            placed.as_usize(),
-                            placed.as_usize() + length.as_usize(),
-                        )
-                        .ok_or(MappingError::UnAligned)?,
+                        PageRange::new(placed.as_usize(), placed.as_usize() + length.as_usize())
+                            .ok_or(MappingError::UnAligned)?,
                     )
                 }
                 .ok();
-                return Err(MappingError::OutOfMemory);
+                return Ok(vmem.brk);
             }
         }
         vmem.brk = brk;
@@ -1273,18 +1521,31 @@ where
         unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
-    /// Internal common function used by `make_pages_*` to change page permissions.
-    fn change_page_permissions(
+    /// Changes page permissions to an arbitrary combination of read/write/exec.
+    ///
+    /// This is the general primitive underlying `make_pages_*` -- prefer one of those named
+    /// helpers when the desired permission set is one of the common cases they cover. Callers
+    /// needing a combination without a named helper (e.g. directly implementing a real Linux
+    /// `mprotect(2)`, which accepts any of the 8 legal `PROT_READ`/`PROT_WRITE`/`PROT_EXEC`
+    /// combinations, not just the ones with a named helper here) should call this directly.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent access to the memory region that the new
+    /// permissions would not allow (e.g. no concurrent execute access when narrowing away
+    /// `EXEC`, no concurrent write access when narrowing away `WRITE`).
+    pub unsafe fn change_page_permissions(
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
         new_permissions: MemoryRegionPermissions,
+        caller: &'static str,
     ) -> Result<(), VmemProtectError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len)
             .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
-        unsafe { vmem.protect_mapping(range, new_permissions) }
+        unsafe { vmem.protect_mapping(range, new_permissions, caller) }
     }
 
     /// Make pages readable and writable.
@@ -1297,11 +1558,17 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-        )
+        // SAFETY: caller upholds this function's own documented precondition (no
+        // concurrent `execute` access), which is equal to or stronger than
+        // `change_page_permissions`'s precondition.
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                "make_pages_writable",
+            )
+        }
     }
 
     /// Make pages readable and executable.
@@ -1314,11 +1581,17 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-        )
+        // SAFETY: caller upholds this function's own documented precondition (no
+        // concurrent `write` access), which is equal to or stronger than
+        // `change_page_permissions`'s precondition.
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                "make_pages_executable",
+            )
+        }
     }
 
     /// Make pages readable only.
@@ -1331,7 +1604,17 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ)
+        // SAFETY: caller upholds this function's own documented precondition (no
+        // concurrent `write`/`execute` access), which is equal to or stronger than
+        // `change_page_permissions`'s precondition.
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ,
+                "make_pages_readable",
+            )
+        }
     }
 
     /// Make pages inaccessible.
@@ -1344,7 +1627,17 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty())
+        // SAFETY: caller upholds this function's own documented precondition (no
+        // concurrent access at all), which is equal to or stronger than
+        // `change_page_permissions`'s precondition.
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::empty(),
+                "make_pages_inaccessible",
+            )
+        }
     }
 
     /// Make pages readable, writable and executable.
@@ -1368,13 +1661,19 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ
-                | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC,
-        )
+        // SAFETY: caller upholds this function's own documented preconditions above
+        // (legitimate use, sanitized/controlled memory region), which are equal to
+        // or stronger than `change_page_permissions`'s precondition.
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC,
+                "make_pages_rwx",
+            )
+        }
     }
 
     /// Register an already-allocated memory region in the VMA tracker.

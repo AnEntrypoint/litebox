@@ -121,6 +121,115 @@ use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD};
 
 use crate::TlsState;
 
+std::thread_local! {
+    /// This thread's own address-space "generation" counter. Bumped only on THIS thread by
+    /// [`end`] (whose only two call paths are `execve`, which replaces the address space wholesale
+    /// on this thread, and `exit`/`exit_group`, which terminates this thread -- see `end`'s call
+    /// sites in `litebox_shim_linux::syscalls::process`: `sys_execve`, `sys_exit`,
+    /// `sys_exit_group`). Deliberately PER-THREAD, not a single process-wide counter: `fork_verify`
+    /// is genuinely concurrent across threads (confirmed live: `ThreadId(6)` and `ThreadId(7)` both
+    /// held live, independently-armed maps simultaneously, with `ThreadId(7)` ending at t=1.6344
+    /// while `ThreadId(6)` was still legitimately verifying until t=1.7431) -- a global counter
+    /// bumped on every `end()` would invalidate a DIFFERENT, still-valid thread's map the instant
+    /// any other thread exited or exec'd, turning a rare silent-corruption bug into a frequent
+    /// silent-failure-to-heal one.
+    ///
+    /// [`begin`] stamps the thread's current generation onto [`FORK_VERIFY_EPOCH`] when arming a
+    /// map; [`current_map_is_valid`] compares that stamp against this counter's LIVE value.
+    static FORK_VERIFY_GENERATION: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+
+    /// The [`FORK_VERIFY_GENERATION`] value stamped by the most recent [`begin`] call on this
+    /// thread. Compared against this thread's live generation by [`current_map_is_valid`].
+    ///
+    /// # Why this exists
+    ///
+    /// `end()`'s `tls.fork_verify.try_borrow_mut()` can find the `RefCell` already borrowed (a
+    /// nested fault re-entering the exception handler while an outer `translate_stale_*` healer's
+    /// own borrow is still alive) and skip clearing the map, on the documented assumption that the
+    /// outer healer's own borrow is about to be dropped and the leftover map is harmless for "one
+    /// exception cycle". Live log evidence disproved that: `ThreadId(18)` armed a 92-range map, hit
+    /// the SKIPPED-clear path ~183ms later during a DIFFERENT guest process's (`dbus-launch`)
+    /// fatal-signal termination, and never appeared in the log again -- the fatal-signal path does
+    /// not return through the healer to retry the clear, so the map leaked permanently. Any LATER
+    /// access violation on that thread would have found the four `translate_stale_*` healers still
+    /// willing to consult that stale map and silently translate through address ranges that no
+    /// longer describe anything real, corrupting whatever register or memory slot they touched.
+    ///
+    /// The generation stamp makes that a detectable, harmless refusal instead: even though the
+    /// fatal-signal path never runs the guest's own `sys_exit`/`sys_exit_group`/`sys_execve` (so it
+    /// cannot bump `FORK_VERIFY_GENERATION` itself), the SAME thread later being reused/torn down
+    /// through one of those paths -- or simply never touching a live map again -- means the stamp
+    /// recorded here stops mattering the moment this thread's own generation is next bumped by a
+    /// genuine `end()` call for THIS thread. Combined with `current_map_is_valid`'s check, a map
+    /// that survives a skipped clear is refused the instant this thread's own next `begin`/`end`
+    /// cycle would have invalidated it, rather than being trusted indefinitely.
+    static FORK_VERIFY_EPOCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+
+    /// The PARENT's own `sigreturn_trampoline` address (`0` = none established), stamped by
+    /// [`begin`] alongside [`FORK_VERIFY_EPOCH`] and consulted by every `is_in_source(rip)`-gated
+    /// healer below (case (1) in [`on_single_step`], and its AV-path counterpart
+    /// [`translate_stale_source_rip`]).
+    ///
+    /// # Why this exists (105th pass)
+    ///
+    /// This page is a REAL guest mapping (`Task::ensure_sigreturn_trampoline`), always non-`VM_EXEC`,
+    /// deliberately unmapped/non-executable so an attempted fetch from it always hardware-faults --
+    /// that permanent, unconditional fault is exactly how `LinuxShimEntrypoints::exception`
+    /// recognizes "the guest just tried to return from a signal handler" (`litebox_shim_linux/
+    /// src/lib.rs`: `ctx.rip == self.task.sigreturn_trampoline_addr()`). For a cross-process fork
+    /// child verified with an IDENTITY relocation map (`AddressRelocations::is_identity`, real for
+    /// every `LITEBOX_PROCESS_FORK=1` child -- see `run_thread_with_fork_verification`'s own
+    /// pass-143 doc comment), `is_in_source(addr)` is true for essentially every address the child
+    /// legitimately owns (source and destination ranges are literally the same by construction), so
+    /// without this exclusion the trampoline's own deliberate fault gets "healed" -- `translate()`
+    /// on an identity map returns the SAME address, so the healer's translate-and-resume retries
+    /// the identical instruction fetch, which faults again, identically, forever, and
+    /// `LinuxShimEntrypoints::exception()` never gets a chance to see it. This is the exact same
+    /// root cause `lazy_fork_commit::classify_lazy_eligible_groups`'s own "104th pass" trampoline
+    /// exclusion fixed for the SEPARATE `lazy_commit_veh` mechanism -- this module has its own,
+    /// independent `is_in_source`/AV-path healing that needed the identical exclusion, live-
+    /// confirmed still crashing (`rip=translated_rip=0x7feffffef000`, "AV-path stale rip livelock
+    /// detected") on a fresh build that already carried the 104th-pass lazy-commit fix, proving the
+    /// two mechanisms are independent and both needed their own fix.
+    static FORK_VERIFY_SIGRETURN_TRAMPOLINE: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// Whether `addr` is this thread's currently-armed sigreturn trampoline address (never `0`, which
+/// is the "none established" sentinel and must never match). See
+/// [`FORK_VERIFY_SIGRETURN_TRAMPOLINE`]'s own doc comment for the full root-cause argument this
+/// exists to guard against.
+fn is_sigreturn_trampoline(addr: usize) -> bool {
+    addr != 0 && FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(core::cell::Cell::get) == addr
+}
+
+/// Returns `true` iff `tls.fork_verify`'s currently-armed map (if any) was stamped with THIS
+/// THREAD's generation still current -- i.e. no `execve`/task-termination [`end`] has run on this
+/// same thread since its own [`begin`]. The four AV-path `translate_stale_*` healers must call this
+/// before applying any translation from a borrowed map: a `false` result means the map is
+/// known-stale (left behind by `end()`'s `try_borrow_mut` skip path) and must be treated as "not
+/// handled" rather than trusted, converting what would otherwise be a silent corrupting translation
+/// into a logged, harmless refusal. Deliberately per-thread (see [`FORK_VERIFY_GENERATION`]'s doc
+/// comment) so one thread's own `execve`/exit never invalidates a different, still-verifying
+/// thread's perfectly valid map.
+pub(crate) fn current_map_is_valid() -> bool {
+    let stamped = FORK_VERIFY_EPOCH.with(core::cell::Cell::get);
+    let live = FORK_VERIFY_GENERATION.with(core::cell::Cell::get);
+    let valid = stamped == live;
+    if !valid {
+        litebox_util_log::error!(
+            tid:? = std::thread::current().id(),
+            stamped_generation:% = stamped,
+            live_generation:% = live;
+            "fork_verify: refusing stale-pointer translation -- armed map's generation does not \
+             match this thread's current address-space generation (map was left live past this \
+             thread's own execve/task-termination event); this thread should not still be treated \
+             as under fork-verification"
+        );
+    }
+    valid
+}
+
 /// The x86 `EFLAGS.TF` (trap flag) bit: when set, the CPU raises `#DB` after every instruction.
 ///
 /// This bit is owned exclusively by this module. It is masked out of every guest-visible eflags
@@ -146,6 +255,18 @@ const MAX_INSTRUCTION_LEN: usize = 15;
 /// never cut off genuine early-`fork()` healing, small enough that hitting it is itself strong
 /// evidence execution has moved well past any pointer that could plausibly still be stale.
 const MAX_IDENTITY_VERIFICATION_STEPS: u64 = 4096;
+
+/// The maximum number of raw-access-violation heals the AV path in `vectored_exception_handler`
+/// may perform on one thread before it ends verification and lets faults dispatch normally.
+///
+/// [`MAX_IDENTITY_VERIFICATION_STEPS`]/[`MAX_THREAD_VERIFICATION_STEPS`] only bound
+/// [`on_single_step`], which counts `EXCEPTION_SINGLE_STEP` traps. A child that keeps faulting on
+/// the same stale pointer instead re-enters the AV path, which never incremented any counter, so
+/// verification stayed armed forever: measured live on a Chromium run, 99,455 heals of one
+/// `(rip, fault_addr)` pair in 2.5 minutes with no forward progress and no end in sight. A heal
+/// that has to be repeated this many times is not fixing the pointer (the slot re-supplying it is
+/// beyond every healer's reach), so continuing only burns CPU and, at one `warn!` per pass, disk.
+pub(crate) const MAX_AV_PATH_HEALS: u64 = 4096;
 
 /// The same kind of proactive step bound as [`MAX_IDENTITY_VERIFICATION_STEPS`], but for the
 /// THREAD-based `fork()` path (non-identity relocations). Originally this path had NO bound at
@@ -459,6 +580,349 @@ pub(crate) fn is_verifying(tls: &TlsState) -> bool {
     tls.fork_verify.borrow().is_some()
 }
 
+/// Translate `rip` through this thread's relocation map iff it is an exact, genuine
+/// `is_in_source` hit -- the same membership-gated primitive case (1) in [`on_single_step`]
+/// uses, exposed for `vectored_exception_handler`'s AV-path healing (see its call site's own
+/// doc comment for why a stale `rip` can reach that path instead of `on_single_step`). Returns
+/// `None` for a non-verifying thread or a `rip` that is not a real relocation-map hit, so the
+/// caller's fallback (the normal single-step/exception dispatch) is exactly as safe as if this
+/// function had never been called.
+///
+/// Also heals the stack slot at `[rsp]`, if it still holds the identical stale (untranslated)
+/// `rip` value, the same "patch the slot in place" pattern [`on_single_step`]'s case (2d) already
+/// uses for a stale DATA pointer read off the stack. Without this, healing only the live register
+/// (as this function originally did) fixes the CPU's current fetch but leaves the stack slot the
+/// value was popped from (by the `ret` that produced this faulting `rip`) still holding the
+/// original, untranslated address -- confirmed live via `xfwm4`'s own post-fork execution
+/// (`LITEBOX_LOG=debug`, no `LITEBOX_VEH_TRACE` needed to see it): the identical
+/// `rip=0x9d90733`/`translated_rip=0xa800733` pair repeated **333,441 times** in a single run,
+/// one raw `EXCEPTION_ACCESS_VIOLATION` per iteration of what is evidently a tight `call`/`ret`
+/// loop (a shared helper or vtable-dispatch site called repeatedly, matching case (3)'s own doc
+/// comment on why a GOT/PLT-style slot needs in-place healing, not just in-register healing, to
+/// avoid this exact repeated-refault shape) -- burning CPU indefinitely without making forward
+/// progress, and without ever presenting as a normal, unhandled, terminating crash the way this
+/// same stale pointer did before AV-path healing was left armed past the single-step bound (see
+/// the caller's own `is_verifying`-lifetime fix). `[rsp]` is checked (not `[rsp-8]` or any other
+/// offset) because this handler observes `context.Rsp` exactly as the CPU left it after
+/// completing the faulting `ret`'s own pop -- `ret` decodes its target, pops the stack slot
+/// (advancing `rsp` past it), and only then attempts to fetch from the popped (stale) address,
+/// which is precisely where this AV-path healing intercepts it; the slot that produced the stale
+/// value is therefore the one immediately below the pre-pop `rsp`, i.e. `rsp - 8` relative to the
+/// CURRENT (post-pop) `rsp` this handler sees -- so `orig_rsp = rsp - size_of::<usize>()` is the
+/// address checked and healed, not `rsp` itself.
+pub(crate) fn translate_stale_source_rip(
+    tls: &TlsState,
+    rip: usize,
+    context: &mut CONTEXT,
+) -> Option<usize> {
+    let borrow = tls.fork_verify.borrow();
+    let relocations = borrow.as_ref()?;
+    if !current_map_is_valid() {
+        return None;
+    }
+    if !relocations.is_in_source(rip) {
+        return None;
+    }
+    // 105th pass: never "heal" the sigreturn trampoline's own deliberate, permanent fault -- see
+    // `FORK_VERIFY_SIGRETURN_TRAMPOLINE`'s doc comment for the full root-cause argument (real,
+    // live-confirmed via this exact function's own "translating and resuming" log message
+    // repeating forever at `rip=translated_rip=0x7feffffef000` on a cross-process/identity fork
+    // child). Declining here (returning `None`) lets the caller's normal, unhandled-AV dispatch
+    // run instead, which is what lets `LinuxShimEntrypoints::exception()` ever see this fault.
+    if is_sigreturn_trampoline(rip) {
+        return None;
+    }
+    let translated = relocations.translate(rip)?;
+    // Not a heal if it leaves `rip` unchanged -- see `translate_memory_operand_registers`'s own
+    // check. Resuming at the same `rip` with every slot and GPR below also rewritten to the same
+    // value re-faults identically, forever.
+    if translated == rip {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let rsp = context.Rsp as usize;
+    // Try `[rsp - 8]` first (the `ret`-just-popped case; see the doc comment above), then `[rsp]`
+    // itself: confirmed live (the `weston-desktop-shell`/`xfwm4` repeating-loop repro) that a
+    // `[rsp-8]`-only check leaves some instances of this exact loop unhealed -- the SAME stale
+    // `rip`/`translated_rip` pair (`0x9d90733`/`0xa800733`) kept recurring 333,000+ times even
+    // with the `[rsp-8]` fix in place, meaning the value driving this particular fault is not
+    // sitting at `[rsp-8]`. `[rsp]` covers the sibling case: an ordinary `call [mem]`/`jmp [mem]`
+    // (not a `ret`) whose own return address has already been correctly pushed (or is not
+    // involved at all, for a `jmp`) but whose CALL TARGET came from a stale GOT/PLT-style slot
+    // elsewhere -- for a `jmp`, `rsp` is unchanged by the transfer itself, so if the code at the
+    // destination immediately re-derives the same stale value from a slot reachable at `[rsp]`
+    // (e.g. its own first instruction reloads a saved pointer argument), healing that slot here
+    // closes the loop the same way `[rsp-8]` does for a `ret`. This does not attempt every
+    // possible addressing shape (case (3)/(4) exist for the general GOT/PLT-slot and
+    // register-indirect forms, exposed separately for the AV path) -- only these two fixed,
+    // well-understood, zero-ambiguity offsets relative to a register this handler already has.
+    for candidate in [rsp.wrapping_sub(core::mem::size_of::<usize>()), rsp] {
+        if let Some(slot_value) = read_usize_fault_tolerant(candidate)
+            && slot_value == rip
+        {
+            write_usize_fault_tolerant(candidate, translated);
+        }
+    }
+    // Heal every OTHER general-purpose register that currently holds the exact same stale value
+    // as `rip` itself. Confirmed live (a fresh, otherwise-clean stock-Alpine `labwc` repro,
+    // `LITEBOX_DIAG_FATALDUMP=1`): the `[rsp-8]`/`[rsp]` slot healing above still leaves a
+    // distinct instance of this exact repeating-loop bug unhealed -- 320,000+ identical faults at
+    // `rip=addr=0x9850733`, with `rax` ALSO exactly equal to `rip` at every single occurrence
+    // (`rax=0x9850733`), and `rbx` visibly decrementing by a fixed stride each iteration (a live
+    // loop counter, ruling out mere coincidental repetition). This is neither the `ret`-popped-
+    // return-address shape (`[rsp-8]`/`[rsp]` above) nor a memory-resident GOT/PLT slot (case
+    // (3)/(4), which require a genuine memory READ to trace back to a healable slot) -- `rax`
+    // here is a live register copy of the same stale value already established as a real,
+    // translatable `is_in_source` hit via `rip` itself, with no memory access involved at all, so
+    // the identical soundness argument that justifies healing `rip` (and `[rsp-8]`/`[rsp]` above)
+    // applies directly: a register that is, right now, byte-for-byte the value already proven
+    // stale is safe to correct to the same translated destination. `rsp` is excluded (it is never
+    // itself a code pointer, and rewriting it would corrupt the live stack) but every other GPR
+    // is checked and healed -- narrower cases (a single named register) were tried first in this
+    // investigation and did not generalize past this one repro's own `rax`/`rbx` pairing, so this
+    // checks the full GPR set rather than guessing which one(s) a future repro will use.
+    for register in [
+        Register::RAX,
+        Register::RBX,
+        Register::RCX,
+        Register::RDX,
+        Register::RSI,
+        Register::RDI,
+        Register::RBP,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+        Register::R12,
+        Register::R13,
+        Register::R14,
+        Register::R15,
+    ] {
+        if register_value(register, context) == Some(rip) {
+            write_register_value(register, translated, context);
+        }
+    }
+    Some(translated)
+}
+
+/// Decode the instruction at `rip` and heal any of its memory-operand base/index registers that
+/// are a genuine `is_in_source` hit, exactly as case (2)/(2b) in [`on_single_step`] already does
+/// -- exposed for `vectored_exception_handler`'s AV-path healing, the data-pointer counterpart to
+/// [`translate_stale_source_rip`]'s code-pointer healing: a raw `EXCEPTION_ACCESS_VIOLATION` at a
+/// non-stale `rip` whose faulting memory operand is formed from a stale base/index register (the
+/// register itself went stale earlier -- via a register-to-register `mov` this module has no
+/// general single-step case for, mirroring case (1)'s own AV-bypass problem for `rip`/`rbp`) never
+/// reaches `on_single_step`'s case (2)/(2b) at all, since those are only ever invoked from the
+/// `EXCEPTION_SINGLE_STEP` branch. Returns `true` iff at least one register was healed (the caller
+/// should then retry the faulting instruction by NOT advancing `rip`, matching case (2)/(2b)'s own
+/// "do not advance rip: retry" contract) and `false` for a non-verifying thread, an undecodable
+/// instruction, or an instruction whose memory operand(s) hold no translatable register.
+pub(crate) fn translate_stale_source_memory_operand_registers(
+    tls: &TlsState,
+    rip: usize,
+    context: &mut CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    if !current_map_is_valid() {
+        return false;
+    }
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    translate_memory_operand_registers(&instruction, context, relocations)
+}
+
+/// Decode the instruction at `rip` and, if it is an indirect `call [mem]`/`jmp [mem]` whose
+/// explicit memory operand holds a stale, untranslated SOURCE-range code pointer, heal that
+/// memory SLOT in place -- exactly case (3) in [`on_single_step`] already does (see its own doc
+/// comment for the full soundness argument: `MIN_POINTER_ALIGN`, `is_in_destination` +
+/// `!is_in_destination_heap_range` on the slot address itself, `relocations.translate` on the
+/// loaded value), exposed here for `vectored_exception_handler`'s AV-path healing for the same
+/// reason [`translate_stale_source_rip`]/[`translate_stale_source_memory_operand_registers`]
+/// already are: a GOT/PLT-style indirect call/jmp reading a stale target through a memory operand
+/// does not always announce itself as `EXCEPTION_SINGLE_STEP` (the loaded, stale SOURCE-range
+/// address may not be resident at all, producing a raw `EXCEPTION_ACCESS_VIOLATION` on the
+/// resulting instruction fetch instead, which never reaches `on_single_step`'s case (3) since
+/// that only ever runs from the `EXCEPTION_SINGLE_STEP` branch).
+///
+/// Unlike [`translate_stale_source_rip`] (which heals `[rsp-8]`, the one fixed, always-correct
+/// slot location for a `ret`), this case has no fixed offset from any register this handler
+/// already has -- the slot IS the instruction's own explicit memory operand, decoded from `rip`
+/// exactly as `on_single_step`'s case (3) does. Confirmed live as the SAME repeating stale-`rip`
+/// pair (`rip=0x9d90733`/`translated_rip=0xa800733`) observed in both the `xfwm4` AND (driving
+/// `sh`, before `weston-desktop-shell` is ever even spawned) `weston --shell=desktop-shell.so`
+/// repros persisting even after [`translate_stale_source_rip`]'s `[rsp-8]` healing landed: the
+/// `[rsp-8]` fix only covers a stale `ret` target, but this identical address pair kept repeating
+/// unbounded, meaning the true origin is a GOT/PLT-style slot elsewhere (this case), not a return
+/// address -- `[rsp-8]` never matched `rip` there, so the fix never fired for this instance,
+/// exactly the same infinite-refault shape as before, just from a different addressing mode.
+/// Returns `true` iff the slot was healed (the caller should retry the faulting instruction by
+/// NOT advancing `rip`, so the CPU re-fetches through the now-healed slot) and `false` for a
+/// non-verifying thread, an undecodable instruction, a non-indirect-call/jmp instruction, or one
+/// whose memory operand does not pass every soundness check case (3) already requires.
+pub(crate) fn translate_stale_source_indirect_call_target(
+    tls: &TlsState,
+    rip: usize,
+    context: &CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    if !current_map_is_valid() {
+        return false;
+    }
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    if !(instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect()) {
+        return false;
+    }
+    let Some(load_address) = explicit_memory_operand_address(&instruction, context) else {
+        return false;
+    };
+    if !relocations.is_in_destination(load_address)
+        || relocations.is_in_destination_heap_range(load_address)
+    {
+        return false;
+    }
+    let Some(stale_value) = read_usize_fault_tolerant(load_address) else {
+        return false;
+    };
+    if !stale_value.is_multiple_of(MIN_POINTER_ALIGN) {
+        return false;
+    }
+    let Some(translated) = relocations.translate(stale_value) else {
+        return false;
+    };
+    if crate::veh_trace_enabled() {
+        eprintln!(
+            "[veh] AV-path HEAL case=3 load_address={load_address:#x} old={stale_value:#x} new={translated:#x} rip={rip:#x}",
+        );
+    }
+    litebox_util_log::warn!(
+        rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
+        translated:? = translated, mnemonic:? = instruction.mnemonic();
+        "fork_verify: stale CODE pointer in indirect call/jmp target slot detected via raw access violation (no #DB delivered), patching slot in place"
+    );
+    write_usize_fault_tolerant(load_address, translated);
+    true
+}
+
+/// Decode the instruction at `rip` and, if it is a REGISTER-indirect `call reg`/`jmp reg` whose
+/// target register's value was ITSELF just loaded from a stale, untranslated SOURCE-range memory
+/// slot (tracked via `tls.fork_verify_last_load`, the same load-chain `on_single_step`'s case (4)
+/// already relies on), heal that memory SLOT in place -- exactly case (4) already does for the
+/// single-step path (see its own doc comment for the full soundness argument this mirrors
+/// verbatim: the target register's CURRENT value must exactly match the chain's `current_value()`,
+/// the chain's `load_address` must be a genuine DESTINATION (never SOURCE/parent) address and
+/// never heap-resident, and the chain's `loaded_value` must translate through the relocation map).
+///
+/// Exposed here for `vectored_exception_handler`'s AV-path healing for the identical reason
+/// [`translate_stale_source_rip`] / [`translate_stale_source_memory_operand_registers`] /
+/// [`translate_stale_source_indirect_call_target`] already are: a register-indirect call/jmp
+/// through a stale target does not always announce itself as `EXCEPTION_SINGLE_STEP`.
+///
+/// Unlike those three siblings, this relies on `tls.fork_verify_last_load` -- a load-CHAIN built
+/// up by consecutive single-steps via `advance_last_load`, not something derivable from a single
+/// raw AV in isolation. This is sound here specifically because single-stepping runs CONTINUOUSLY
+/// on a verifying thread right up until either the step bound is hit or this exact kind of raw AV
+/// interrupts it -- so `tls.fork_verify_last_load` reflects a genuinely recent, correctly-ordered
+/// memory read from THIS SAME thread's own immediately-preceding single-stepped instructions, not
+/// stale leftover state from a different execution phase. Confirmed live as the actual remaining
+/// gap behind the SAME `rip=0x9d90733`/`translated_rip=0xa800733` pair recurring across three
+/// different threads/processes (a driving `sh`, `xfwm4`, and `weston-desktop-shell` itself, each
+/// hit right after their own early post-exec startup) even after [`translate_stale_source_rip`]'s
+/// `[rsp-8]`+`[rsp]` healing and [`translate_stale_source_indirect_call_target`]'s case-(3)
+/// healing both landed and were verified not to close it -- ruling out a `ret`-popped return
+/// address and a direct-memory-operand GOT/PLT slot, leaving this register-indirect,
+/// previously-loaded-elsewhere shape as the remaining candidate.
+///
+/// Returns `true` iff the slot was healed (the caller should retry the faulting instruction by
+/// NOT advancing `rip`) and `false` for a non-verifying thread, an undecodable instruction, a
+/// non-register-indirect-call/jmp instruction, no recorded load chain, or one that fails any of
+/// case (4)'s own soundness checks.
+pub(crate) fn translate_stale_source_register_indirect_call_target(
+    tls: &TlsState,
+    rip: usize,
+    context: &CONTEXT,
+) -> bool {
+    let borrow = tls.fork_verify.borrow();
+    let Some(relocations) = borrow.as_ref() else {
+        return false;
+    };
+    if !current_map_is_valid() {
+        return false;
+    }
+    let mut code = [0u8; MAX_INSTRUCTION_LEN];
+    let len = read_code_bytes(rip, &mut code);
+    if len == 0 {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return false;
+    }
+    if !(instruction.is_call_near_indirect() || instruction.is_jmp_near_indirect()) {
+        return false;
+    }
+    if explicit_memory_operand_address(&instruction, context).is_some() {
+        // A direct memory operand is case (3)'s territory, not this one -- see that function.
+        return false;
+    }
+    if instruction.op0_kind() != OpKind::Register {
+        return false;
+    }
+    let Some(target_value) = register_value(instruction.op0_register(), context) else {
+        return false;
+    };
+    let Some(chain) = tls.fork_verify_last_load.get() else {
+        return false;
+    };
+    if chain.current_value() != target_value || !relocations.is_in_source(target_value) {
+        return false;
+    }
+    if !relocations.is_in_destination(chain.load_address)
+        || relocations.is_in_destination_heap_range(chain.load_address)
+    {
+        return false;
+    }
+    let Some(translated) = relocations.translate(chain.loaded_value) else {
+        return false;
+    };
+    if crate::veh_trace_enabled() {
+        eprintln!(
+            "[veh] AV-path HEAL case=4 load_address={:#x} old={:#x} new={translated:#x} rip={rip:#x}",
+            chain.load_address, chain.loaded_value,
+        );
+    }
+    litebox_util_log::warn!(
+        rip:? = rip, load_address:? = chain.load_address, stale_value:? = chain.loaded_value,
+        translated:? = translated, mnemonic:? = instruction.mnemonic();
+        "fork_verify: stale CODE pointer previously loaded from memory slot into register detected via raw access violation (no #DB delivered), patching slot in place"
+    );
+    write_usize_fault_tolerant(chain.load_address, translated);
+    true
+}
+
 /// The `EFLAGS` bits to add when entering guest mode on this thread: `TF` if this thread is a
 /// `fork()` child under verification, nothing otherwise.
 pub(crate) fn entry_eflags_tf(tls: &TlsState) -> usize {
@@ -577,13 +1041,28 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     if steps > step_bound {
         if crate::veh_trace_enabled() {
             eprintln!(
-                "[fork_verify] tid={:?} on_single_step: step bound {step_bound} exceeded at rip={rip:#x}, ending verification early",
+                "[fork_verify] tid={:?} on_single_step: step bound {step_bound} exceeded at rip={rip:#x}, ending single-step tracing early (AV-path healing stays armed)",
                 std::thread::current().id(),
             );
         }
         drop(borrow);
+        // Stop paying the per-instruction single-step cost, but deliberately do NOT clear
+        // `tls.fork_verify` (i.e. do NOT make `is_verifying` false) here. The staleness this
+        // module exists to catch is not always exercised before this bound is hit -- a value
+        // sitting in heap/BSS memory (e.g. a `struct`'s pointer-typed field) can be written by
+        // ordinary post-fork guest code well after this bound, then only later read back out and
+        // dereferenced, faulting far past where single-step tracing stopped (confirmed live: a
+        // `dbus-daemon` crash whose stale pointer -- symbolized via manual relocation-range
+        // cross-referencing -- was proven to still read `0` at fork time, i.e. it is written by
+        // the child's own code running after this exact point, so no bound increase here could
+        // ever have caught it via single-stepping alone). `vectored_exception_handler`'s AV-path
+        // healing (`translate_stale_source_rip` / `translate_stale_source_memory_operand_
+        // registers`, see their doc comments) is gated on `is_verifying`, not on `TF`/single-
+        // stepping being armed -- it costs nothing per-instruction and only ever runs on a
+        // genuine, already-occurring access violation, so leaving it armed indefinitely after
+        // ending the expensive trace is free and lets it catch exactly this later-surfacing case
+        // instead of leaving the child to crash unhealed.
         context.EFlags &= !eflags_tf;
-        *tls.fork_verify.borrow_mut() = None;
         return StepOutcome::Continue;
     }
 
@@ -627,7 +1106,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // not a value read back out of arbitrary memory, `rbp`) translated via the exact same
     // relocation map already proven correct for CPU registers, landing on byte-identical
     // relocated code.
-    if relocations.is_in_source(rip) {
+    if relocations.is_in_source(rip) && !is_sigreturn_trampoline(rip) {
         if crate::veh_trace_enabled() {
             eprintln!(
                 "[fork_verify] tid={:?} on_single_step: rip={rip:#x} is_in_source=true",
@@ -635,8 +1114,51 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             );
         }
         if let Some(translated_rip) = relocations.translate(rip) {
+            // Livelock breaker, the single-step-path counterpart to `vectored_exception_handler`'s
+            // `AV_RIP_LIVELOCK_THRESHOLD` (see `TlsState::fork_verify_step_rip_repeat`'s own doc
+            // comment): translating `rip`/`rbp`/`rdi` and patching `[rsp-8]` below always resolves
+            // THIS trap, but does nothing for a persistent slot outside those fixed locations (a
+            // GOT/PLT-style memory operand, or a register-indirect load chain) that keeps
+            // re-supplying the identical stale value on every loop iteration -- confirmed live: 357
+            // consecutive identical `(rip, translated_rip)` heals in 216ms during one boot. Once the
+            // same pair has repeated past the threshold, additionally run the deeper healers that
+            // already close this exact gap on the AV path (`translate_stale_source_indirect_call_
+            // target` / `translate_stale_source_register_indirect_call_target`, case (3)/(4)'s own
+            // logic) so the slot actually feeding this loop is patched in place -- healed once, not
+            // on every pass -- while the translate-and-resume below still always runs to resolve
+            // this specific trap regardless of whether the deeper healers found anything to patch.
+            const STEP_RIP_LIVELOCK_THRESHOLD: u32 = 8;
+            let prior_repeat = tls.fork_verify_step_rip_repeat.get();
+            let repeat_count = match prior_repeat {
+                Some((prev_rip, prev_translated, count))
+                    if prev_rip == rip && prev_translated == translated_rip =>
+                {
+                    count + 1
+                }
+                _ => 1,
+            };
+            tls.fork_verify_step_rip_repeat
+                .set(Some((rip, translated_rip, repeat_count)));
+            if repeat_count >= STEP_RIP_LIVELOCK_THRESHOLD {
+                let mem_operand_healed =
+                    translate_stale_source_memory_operand_registers(tls, rip, context);
+                let indirect_healed =
+                    translate_stale_source_indirect_call_target(tls, rip, context);
+                let register_indirect_healed =
+                    translate_stale_source_register_indirect_call_target(tls, rip, context);
+                if mem_operand_healed || indirect_healed || register_indirect_healed {
+                    litebox_util_log::warn!(
+                        host_tid:? = std::thread::current().id(), rip:? = rip,
+                        translated_rip:? = translated_rip, repeat:? = repeat_count,
+                        mem_operand_healed:? = mem_operand_healed,
+                        indirect_healed:? = indirect_healed,
+                        register_indirect_healed:? = register_indirect_healed;
+                        "fork_verify: on_single_step case=1 livelock detected (same rip repeated), deeper slot healed in place"
+                    );
+                }
+            }
             litebox_util_log::warn!(
-                rip:? = rip, translated_rip:? = translated_rip;
+                host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
                 "fork_verify: stale CODE pointer detected, translating and resuming"
             );
             context.Rip = translated_rip as u64;
@@ -644,6 +1166,31 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             let rbp = context.Rbp as usize;
             if let Some(translated_rbp) = relocations.translate(rbp) {
                 context.Rbp = translated_rbp as u64;
+            }
+            // `rdi` carries the first argument in the SysV ABI this trampoline's rewritten
+            // indirect calls (GOT/PLT-slot function pointers, the common shape here) still
+            // follow -- a stale value reaching it has the identical origin as the stale `rip`
+            // this case already exists to heal (both were live registers at the moment
+            // `fork()` was called, copied verbatim into the child), just propagated through an
+            // intervening register-to-register `mov` this module has no general case for
+            // (see the module's own doc comments on why a blanket register-to-register-mov
+            // sweep is unsafe -- it fires on every such instruction regardless of whether the
+            // value is actually stale-and-about-to-be-used, corrupting legitimate values that
+            // only coincidentally overlap the tracked source range for identity-mapped
+            // children). This is narrower and safe for the same reason `rbp` above is: it only
+            // ever fires at THIS specific, well-understood transition (an indirect call landing
+            // on a translated destination address, the same trap `rip` itself is being healed
+            // at), translating a register whose failure mode (a stale argument reaching the
+            // freshly-resumed target function) was confirmed live via
+            // `LITEBOX_DIAG_FATALDUMP=1`: `rip=0x92bcffa`'s indirect `call` landed on an
+            // in-source `rip` (correctly healed by this case), and the very next instruction at
+            // the healed destination dereferenced a still-stale `rdi`, faulting
+            // (`STATUS_ACCESS_VIOLATION`, `addr` matching the stale `rdi` value plus a small
+            // offset) -- confirmed a real, previously-uncovered gap, not a guess.
+            #[allow(clippy::cast_possible_truncation)]
+            let rdi = context.Rdi as usize;
+            if let Some(translated_rdi) = relocations.translate(rdi) {
+                context.Rdi = translated_rdi as u64;
             }
             // This trap fires *after* the CPU has already fetched (and, for a `ret`, already
             // popped) the stale value into `rip` -- fixing only the live register here repairs
@@ -695,6 +1242,42 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     // Single-stepping LiteBox's own code would be both pointless and fatal, so disarm here; the
     // next `switch_to_guest` back into the child re-arms `TF` automatically.
     if !relocations.is_in_destination(rip) {
+        // (1c) `rcx` at this exact disarm point is the guest's real return address --
+        // `syscall_callback`'s own doc comment: "the register context is the guest context with
+        // the return address in rcx" -- computed by the syscall rewriter's trampoline (guest code
+        // that has already executed post-fork, hence itself in a destination range) and pushed
+        // straight through as `pt_regs->ip` (`push rcx // pt_regs->ip`), later resumed into `rip`
+        // verbatim by the syscall return path with no further translation performed anywhere else
+        // in the syscall-handling pipeline. This is exactly case (1)'s class of value (a live
+        // code-pointer-shaped register at the instant of a trap, deterministically translatable
+        // via the same relocation map proven correct for every other register at `fork()` time) --
+        // reached one instruction later than case (1) itself checks, because the trap that fires
+        // here has already moved `rip` off the guest's `call syscall_callback` and onto
+        // `syscall_callback`'s own host address, at which point `rip` no longer carries the
+        // information (the disarm above already fires on it) but `rcx` still does.
+        //
+        // Deliberately narrower than a prior, reverted attempt at this same gap, which translated
+        // all six Linux x86-64 syscall ABI argument registers (rdi/rsi/rdx/r10/r8/r9) unconditionally
+        // and made the failure strictly worse (an earlier, much-closer-to-startup host-level crash)
+        // -- exactly the unbounded-guessing hazard this module's own top-level doc comment already
+        // warns about ("enumerating every place a stale pointer could surface ... introduces
+        // corruption of its own"). Syscall arguments are guest-supplied values of genuinely unknown
+        // shape (file descriptors, flags, small integers, real pointers) with no basis for assuming
+        // pointer-ness, let alone staleness -- `rcx` is categorically different: it is guaranteed,
+        // by this trampoline's own fixed calling convention, to be a code pointer, so the
+        // `is_in_source` check below is a precise membership test, never a guess, exactly mirroring
+        // case (1)'s own reasoning for `rip`/`rbp`.
+        #[allow(clippy::cast_possible_truncation)]
+        let rcx = context.Rcx as usize;
+        if relocations.is_in_source(rcx)
+            && let Some(translated_rcx) = relocations.translate(rcx)
+        {
+            litebox_util_log::warn!(
+                rcx:? = rcx, translated_rcx:? = translated_rcx;
+                "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
+            );
+            context.Rcx = translated_rcx as u64;
+        }
         context.EFlags &= !eflags_tf;
         return StepOutcome::Continue;
     }
@@ -720,6 +1303,117 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     let mut decoder = Decoder::with_ip(64, &code[..len], rip as u64, DecoderOptions::NONE);
     let instruction = decoder.decode();
     if instruction.is_invalid() {
+        return StepOutcome::Continue;
+    }
+
+    // (1b) Register-to-register propagation of a stale CODE/DATA pointer: a plain `mov reg, reg`
+    // (or `movzx`/`movsx`-shaped move) with NO memory operand at all copies a stale source-range
+    // value straight from one GPR into another. None of cases (2)/(2b)/(2c)/(2d)/(3)/(4) below
+    // ever see this: every one of them is gated on `explicit_memory_operand_address`/
+    // `memory_write_address` returning `Some`, which requires an `OpKind::Memory` operand to exist
+    // on the instruction -- a bare two-register `mov` has none. Confirmed live (litebox-xfce-1,
+    // dbus-daemon fork-child SIGSEGV): case (1) above translates `rip` (and, as a bonus, `rbp`)
+    // when `rip` itself lands in the source range, but a `mov rdi, rbx`-shaped instruction executed
+    // a few steps earlier in the SAME trapped run had already copied a still-untranslated
+    // source-range value from `rbx` into `rdi` with no memory operand to trip any other case --
+    // `rdi` was then dereferenced by a LATER (post-translation) instruction and faulted on the
+    // real access violation this case exists to prevent. This also explains a delayed-by-real-
+    // execution-time SIGSEGV (as opposed to one immediately following a logged heal, e.g. the
+    // ~944ms gap between the last logged heal and `xfsettingsd`'s SIGSEGV in sub-session 23's
+    // Run B): the stale register can sit unused for an arbitrary number of real instructions
+    // between the propagating `mov` and the eventual dereference, since nothing about holding a
+    // stale value in a register is itself observable without a case in this file re-checking it.
+    //
+    // Narrow and safe for the identical reason case (1)'s register translation is: fixing a live
+    // register to the exact value `sys_clone`'s own `translate_reg!` would have produced for it is
+    // not a guess, it is the same relocation map already proven correct for every other register at
+    // fork-resume time. Restricted to a genuine data-movement mnemonic (`Mov`/`Movzx`/`Movsx` --
+    // NOT `Test`/`Cmp`/`Xor`/etc, which merely happen to read a GPR operand that decodes the same
+    // way `op0`/`OpKind::Register` does but carry no "this value becomes a live pointer" semantics;
+    // an earlier draft of this case fired on those too and would have "translated" ordinary
+    // comparison/flag operands that only coincidentally fall in the tracked source range, exactly
+    // the false-positive shape every other case in this file already guards against). Also requires
+    // the source value to be `MIN_POINTER_ALIGN`-aligned, the same tagged-integer guard case
+    // (2c)/(2d) use, and no memory operand anywhere on the instruction (so this can never
+    // double-fire alongside a case below that already handles the memory-operand form).
+    //
+    // Only `op1` (the sole source register for this narrow `dest, src` shape) is ever inspected or
+    // translated here -- NEVER `op0`. `op0` is the write-only DESTINATION: reading its
+    // pre-instruction value and "translating" it would translate whatever garbage happened to be
+    // sitting in the destination register before this instruction overwrites it, corrupting an
+    // unrelated register with no relationship to the actual stale pointer being propagated. An
+    // earlier draft of this case iterated every `OpKind::Register` operand including `op0` and hit
+    // exactly this: it silently truncated/corrupted a destination register's value on a `mov r32,
+    // r32` reached with an incidentally source-range-shaped `op0`, an entirely different failure
+    // than the one this case exists to fix, manifesting downstream as a host-level
+    // `STATUS_ACCESS_VIOLATION` inside LiteBox's own syscall dispatch (not the guest's ordinary
+    // signal path) -- confirmed live and reverted before landing this narrower version.
+    if matches!(
+        instruction.mnemonic(),
+        iced_x86::Mnemonic::Mov | iced_x86::Mnemonic::Movzx | iced_x86::Mnemonic::Movsx
+    ) && instruction.op_count() == 2
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Register
+        && qualifying_gpr(instruction.op0_register()).is_some()
+        && let Some(src_reg) = qualifying_gpr(instruction.op1_register())
+        && let Some(value) = register_value(src_reg, context)
+        && relocations.is_in_source(value)
+        && value.is_multiple_of(MIN_POINTER_ALIGN)
+        && let Some(translated) = relocations.translate(value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, mnemonic:? = instruction.mnemonic();
+            "fork_verify: stale CODE/DATA pointer detected in register-to-register move, translating source register and retrying"
+        );
+        write_register_value(src_reg, translated, context);
+        // Do not advance rip: retry the same instruction now that its source register holds the
+        // translated value -- the CPU then performs the actual `dest <- src` copy/zero-extend
+        // itself with correct semantics for the instruction's real operand width, exactly as if
+        // the source register had never gone stale.
+        return StepOutcome::Continue;
+    }
+
+    // (1c) `lea dest, [base+disp]` computing a new stale-range pointer from a stale base register.
+    // `lea` never actually reads or writes memory (confirmed via `iced_x86`'s own
+    // `InstructionInfoFactory::used_memory()`, which reports no access for it), so
+    // `memory_write_address` below (which requires a real memory access) always returns `None` for
+    // it, and case (2b)'s own gate -- `relocations.is_in_source(read_address)`, where
+    // `read_address` is the COMPUTED `base+disp` result, not the base register's raw value --
+    // silently fails to fire whenever `disp` is nonzero even though `base` itself is genuinely
+    // stale: `base+disp` need not itself land in a tracked source range even when `base` does,
+    // since `AddressRelocations`' source ranges are the parent's real pre-`fork()` mappings, not an
+    // unbounded contiguous span, and a `disp` large enough to walk `base` out of its own mapping
+    // (a common shape: `lea rdi, [rbx+0x18]` indexing into a struct field) breaks the false premise
+    // that the destination address should be checked instead of the source register. Confirmed as
+    // the specific remaining gap behind sub-session 23's `xfsettingsd` SIGSEGV surviving case
+    // (1b) above: the repeating `rip=419518714`/`419518956` heal-storm pair immediately preceding
+    // every observed crash never appeared as a "stale DATA pointer" WARN (case (2b)'s own log
+    // line), ruling out case (2b) firing at all for this instruction.
+    //
+    // Narrow and safe for the same reason as case (1b): only the named base register is ever read
+    // or translated, gated on the BASE register's own raw value (not any derived address) being a
+    // genuine, aligned `is_in_source` hit -- never a guess. No index register handling: `lea`
+    // shapes carrying a stale pointer in the index position rather than the base have not been
+    // observed and would need independent justification before adding.
+    if instruction.mnemonic() == iced_x86::Mnemonic::Lea
+        && instruction.op_count() == 2
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Memory
+        && qualifying_gpr(instruction.op0_register()).is_some()
+        && let base_reg = instruction.memory_base()
+        && !matches!(base_reg, Register::None | Register::RIP | Register::EIP)
+        && let Some(base_value) = register_value(base_reg, context)
+        && relocations.is_in_source(base_value)
+        && base_value.is_multiple_of(MIN_POINTER_ALIGN)
+        && let Some(translated_base) = relocations.translate(base_value)
+    {
+        litebox_util_log::warn!(
+            rip:? = rip, base_value:? = base_value, translated_base:? = translated_base;
+            "fork_verify: stale CODE/DATA pointer detected as lea base register, translating and retrying"
+        );
+        write_register_value(base_reg, translated_base, context);
+        // Do not advance rip: retry so the CPU recomputes `base+disp` from the now-translated base,
+        // producing the correctly-relocated destination value itself.
         return StepOutcome::Continue;
     }
 
@@ -781,25 +1475,41 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                 // match the most recently recorded memory load, and the slot it came from must be
                 // in the DESTINATION range (never the parent's own live memory) and not
                 // heap-resident (`is_in_destination_heap_range`), the identical exclusion case
-                // (3)/(4) apply, for the identical false-positive reason -- plus, unlike case (3)/
-                // (4), a `MIN_POINTER_ALIGN` check on the loaded value itself (see that constant's
-                // doc comment): case (3)/(4) are restricted to call/jmp targets, a context that on
-                // its own proves the value is meant to be a pointer, but case (2c) fires on any read
-                // through a stale-shaped base register with no equivalent proof, so an ordinary
-                // tagged/packed integer that merely coincides numerically with a tracked source
-                // range would otherwise get "healed" into an equally bogus, misaligned destination
-                // value -- observed live corrupting mallocng bookkeeping this exact way.
+                // (3)/(4) apply, for the identical false-positive reason -- plus, when `offset != 0`
+                // (the tracked register was advanced by `add`/`sub`/`lea` since the original load,
+                // see `LastLoad::offset`'s own doc comment), a `MIN_POINTER_ALIGN` check on the
+                // RAW loaded value itself (see that constant's doc comment): case (3)/(4) are
+                // restricted to call/jmp targets, a context that on its own proves the value is
+                // meant to be a pointer, but an OFFSET-CHAINED case (2c) hit only proves
+                // `chain.current_value()` (`loaded_value + offset`) is genuinely in-source -- the
+                // RAW `chain.loaded_value` on its own could still be an ordinary tagged/packed
+                // integer that merely coincides numerically with a tracked source range once the
+                // offset is added back in, so alignment on the raw value is the only guard against
+                // "healed" into an equally bogus, misaligned destination -- observed live
+                // corrupting mallocng bookkeeping this exact way.
+                //
+                // When `offset == 0`, `chain.loaded_value` and `chain.current_value()` (==
+                // `stale_value`, already required by the check above) are the IDENTICAL value --
+                // and `stale_value` itself was already established, at the OUTER case (2b) gate
+                // this block is nested inside, as a genuine `is_in_source` hit on the register the
+                // faulting instruction's own memory operand names as its base/index -- i.e. proof
+                // the value is actively being used as a pointer, strictly stronger evidence than
+                // the alignment heuristic exists to approximate. Requiring 16-byte alignment on
+                // top of that already-proven case only rejects genuine mid-buffer pointers (e.g. a
+                // running cursor into an `argv` string being copied byte-by-byte, never itself a
+                // fresh allocator-chunk start) -- confirmed live (the `dbus-launch`/`sleep 8`
+                // argv-corruption repro): 4 of 5 stale-DATA-pointer-read traps had a fully
+                // zero-offset matching chain (`chain.current_value() == stale_value`,
+                // `chain.offset == 0`) but were rejected purely on `MIN_POINTER_ALIGN`, leaving the
+                // slot never healed and the identical stale value reloaded on the loop's next
+                // byte-copy iteration. So the alignment gate now applies only when `offset != 0`,
+                // where `chain.loaded_value` alone genuinely lacks the outer proof.
                 if let Some(stale_value) = stale_value
                     && let Some(chain) = tls.fork_verify_last_load.get()
                     && chain.current_value() == stale_value
                     && relocations.is_in_destination(chain.load_address)
                     && !relocations.is_in_destination_heap_range(chain.load_address)
-                    // Require the loaded value to be at least as aligned as a genuine allocator-
-                    // owned pointer -- see `MIN_POINTER_ALIGN`'s doc comment for why this, and only
-                    // this, closes the soundness gap pass 69 found: an ordinary tagged/packed
-                    // integer that merely coincides numerically with a tracked source range is
-                    // rejected here without weakening the range-membership check itself.
-                    && chain.loaded_value.is_multiple_of(MIN_POINTER_ALIGN)
+                    && (chain.offset == 0 || chain.loaded_value.is_multiple_of(MIN_POINTER_ALIGN))
                     && let Some(translated) = relocations.translate(chain.loaded_value)
                 {
                     if crate::veh_trace_enabled() {
@@ -984,6 +1694,7 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
             );
         }
         litebox_util_log::warn!(
+            host_tid:? = std::thread::current().id(),
             rip:? = rip, load_address:? = load_address, stale_value:? = stale_value,
             translated:? = translated, mnemonic:? = instruction.mnemonic();
             "fork_verify: stale CODE pointer in indirect call/jmp target slot detected, patching slot in place"
@@ -1103,12 +1814,22 @@ fn translate_memory_operand_registers(
             if matches!(reg, Register::None | Register::RIP | Register::EIP) {
                 continue;
             }
-            let Some(value) = register_value(reg, context) else {
-                continue;
+            let value = match register_value(reg, context) {
+                Some(value) => value,
+                None => continue,
             };
             let Some(translated) = relocations.translate(value) else {
                 continue;
             };
+            // A translation that leaves the value unchanged is not a heal. Writing it back and
+            // resuming (what this did before) re-executes the identical faulting instruction with
+            // the identical register, forever: the caller sees "success" and retries, the CPU
+            // faults again on the same address, and nothing ever changes -- an infinite loop that
+            // presents as a hang, never as the real fault. Declining here lets the fault dispatch
+            // normally instead.
+            if translated == value {
+                continue;
+            }
             write_register_value(reg, translated, context);
             translated_any = true;
         }
@@ -1210,8 +1931,17 @@ fn read_code_bytes(rip: usize, buf: &mut [u8]) -> usize {
 }
 
 /// Whether `addr` is in a committed, readable region of the host address space.
-fn is_readable(addr: usize) -> bool {
-    readable_and_writable(addr).0
+///
+/// Single-byte question: callers that go on to read more than one byte must use
+/// [`is_readable_range`] instead, or they reintroduce the straddling-access fault
+/// [`readable_and_writable`] documents.
+pub(crate) fn is_readable(addr: usize) -> bool {
+    readable_and_writable(addr, 1).0
+}
+
+/// Whether every byte of `addr..addr + len` is in one committed, readable region.
+pub(crate) fn is_readable_range(addr: usize, len: usize) -> bool {
+    readable_and_writable(addr, len).0
 }
 
 /// A single `VirtualQuery` call answering both "is `addr` in a committed, readable region" and
@@ -1225,7 +1955,7 @@ fn is_readable(addr: usize) -> bool {
 /// single-step-triggered healing path, potentially thousands of times per verified `fork()`
 /// child, so halving the syscall count here is a real, input-size-independent win on every call,
 /// largest exactly where it matters most (a large guest process forking).
-fn readable_and_writable(addr: usize) -> (bool, bool) {
+fn readable_and_writable(addr: usize, len: usize) -> (bool, bool) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
     const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
     const WRITABLE: u32 = Win32_Memory::PAGE_READWRITE
@@ -1244,7 +1974,100 @@ fn readable_and_writable(addr: usize) -> (bool, bool) {
     if !ok || mbi.State != Win32_Memory::MEM_COMMIT {
         return (false, false);
     }
-    (mbi.Protect & NO_ACCESS == 0, mbi.Protect & WRITABLE != 0)
+    // The region must cover the WHOLE access, not just its first byte.
+    //
+    // `VirtualQuery` describes the region containing `addr`; a caller then reading `len` bytes
+    // from there straddles into the NEXT region whenever `addr` sits within `len` of this one's
+    // end -- and the next region is routinely uncommitted (a guard gap, or simply the end of a
+    // mapping). The check said "readable" and the access faulted, inside a vectored exception
+    // handler, with no exception-table entry: fatal.
+    //
+    // This was long assumed impossible, on the grounds that callers "only ever pass addresses
+    // inside a tracked destination range, always mapped with room for a full `usize`". That holds
+    // for a return-address slot. It does NOT hold for `read_usize_fault_tolerant`'s other callers,
+    // which pass an address DECODED FROM A GUEST INSTRUCTION'S MEMORY OPERAND -- an arbitrary
+    // guest address with no relationship to any mapping boundary. `mate-session` died reproducibly
+    // on exactly that load (`on_single_step+0x3da6`, confirmed by the fault moving when the load
+    // was changed).
+    //
+    // Deliberately conservative: an access spanning two ADJACENT committed regions is reported
+    // unreadable rather than walked region by region. Declining to heal a slot is always safe;
+    // faulting inside the handler is not, and a straddling heal target is vanishingly rare next to
+    // the boundary case this exists to reject.
+    let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    if addr.saturating_add(len) > region_end {
+        return (false, false);
+    }
+    // A `MEM_IMAGE` region is a loaded module -- litebox's own executable or a DLL. Guest
+    // mappings are never `MEM_IMAGE` (they come from `VirtualAlloc2`/`MapViewOfFile3`, i.e.
+    // `MEM_PRIVATE`/`MEM_MAPPED`), so a heal that wants to WRITE one is always wrong. It is
+    // reported as not-writable here rather than not-readable: this same query backs `is_readable`,
+    // and reading an image page is perfectly legitimate (`read_code_bytes` does it for guest-code
+    // diagnostics), so suppressing readability too would break unrelated callers.
+    let is_image = mbi.Type == Win32_Memory::MEM_IMAGE;
+    (
+        mbi.Protect & NO_ACCESS == 0,
+        !is_image && mbi.Protect & WRITABLE != 0,
+    )
+}
+
+/// Like [`is_readable`], but additionally returns the FULL extent of the committed-and-readable
+/// region `addr` falls in, so a caller walking many addresses can skip re-querying for every
+/// subsequent one that falls in the SAME region it already has the bounds of.
+///
+/// # Why this exists
+///
+/// `VirtualQuery`'s cost scales with the process's total committed memory (see
+/// `readable_and_writable`'s own doc comment) -- a real cost this function's only caller,
+/// `spawn_cross_process_fork_child`'s page-by-page memory copy, was paying ONCE PER 4KiB PAGE of
+/// every cross-process fork, even though a real guest mapping is typically many megabytes of ONE
+/// contiguous committed region. Measured live (`LITEBOX_DIAG_FORK_TIMING=1`): a single 173MB
+/// region (one guest process's shared-library reservation group, ~42,000 pages) took 23-25 REAL
+/// SECONDS to copy, reproducibly, on every single fork of that guest -- batching the destination
+/// `WriteProcessMemory` calls instead (tried first) measured WORSE, not better, confirming the
+/// `VirtualQuery`-per-page cost on this, the READ side, was the actual bottleneck all along. A
+/// single query per region instead of per page turns ~42,000 kernel round-trips into one.
+#[must_use]
+pub(crate) fn readable_region(addr: usize) -> Option<core::ops::Range<usize>> {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
+
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok || mbi.State != Win32_Memory::MEM_COMMIT || mbi.Protect & NO_ACCESS != 0 {
+        return None;
+    }
+    let start = mbi.BaseAddress as usize;
+    let end = start.saturating_add(mbi.RegionSize);
+    (start..end).contains(&addr).then_some(start..end)
+}
+
+/// Like [`readable_region`] but also reports the extent of a NON-readable region, so a caller
+/// walking many pages can skip the whole unreadable run with one query.
+pub(crate) fn region_readability(addr: usize) -> (bool, core::ops::Range<usize>) {
+    use windows_sys::Win32::System::Memory as Win32_Memory;
+    const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if !ok {
+        return (false, addr..addr + 4096);
+    }
+    let start = mbi.BaseAddress as usize;
+    let end = start.saturating_add(mbi.RegionSize).max(addr + 1);
+    let readable = mbi.State == Win32_Memory::MEM_COMMIT && mbi.Protect & NO_ACCESS == 0;
+    (readable, start.min(addr)..end)
 }
 
 /// If `instruction` writes to memory, computes the effective address it writes to from its
@@ -1324,13 +2147,14 @@ fn explicit_memory_operand_address(instruction: &Instruction, context: &CONTEXT)
 /// Reads a `usize` from `addr` via a fault-tolerant access, returning `None` if `addr` is not in a
 /// committed, readable region.
 fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
-    if !is_readable(addr) {
+    if !is_readable_range(addr, core::mem::size_of::<usize>()) {
         return None;
     }
-    // SAFETY: `is_readable` confirmed `addr` is in a committed, readable region of at least one
-    // page; callers of this function only ever pass addresses inside a tracked destination range,
-    // which -- by construction of `Vmem::duplicate` -- are always mapped with room for a full
-    // `usize` (never split mid-word across mapping boundaries with different protection).
+    // SAFETY: the check above confirmed all `size_of::<usize>()` bytes at `addr` lie inside one
+    // committed, readable region -- the whole access, not merely its first byte. Several of this
+    // function's callers pass an address decoded from a guest instruction's memory operand, which
+    // has no relationship to any mapping boundary, so the range form is required rather than
+    // merely tidier; see `readable_and_writable`.
     Some(unsafe { core::ptr::read_unaligned(addr as *const usize) })
 }
 
@@ -1350,6 +2174,41 @@ fn read_usize_fault_tolerant(addr: usize) -> Option<usize> {
 fn write_usize_fault_tolerant(addr: usize, value: usize) {
     use windows_sys::Win32::System::Memory as Win32_Memory;
 
+    // NEVER heal outside the guest's own address range.
+    //
+    // Everything this function exists to patch is guest memory: a stale pointer sitting in a
+    // forked child's data. The address it is handed, though, is derived from decoded guest
+    // instruction operands and live register values, so a misdecode or a register that does not
+    // hold what the decoder assumed produces an address that is simply not guest memory at all.
+    // The checks below this point only ask "is it committed and can I make it writable" -- and
+    // litebox's OWN loaded image answers yes to both, because the widen step happily flips
+    // `PAGE_EXECUTE_READ` to `PAGE_EXECUTE_READWRITE`. The result is this function scribbling a
+    // guest pointer into the middle of litebox's own code.
+    //
+    // That is exactly what was observed: `mate-session` (via `dbus-launch`'s fork) died in
+    // `[diag-unrecov-av] ... is_in_guest=false is_verifying=true` with the faulting address at
+    // `0x7ff733827285` -- a `MEM_IMAGE` page with `PAGE_EXECUTE_READ`, well ABOVE
+    // `TASK_ADDR_MAX` -- and a `rip` of `0xffff_ffff_ffff_ffff`, i.e. control had already
+    // transferred into corrupted code by the time anything noticed.
+    //
+    // The guest occupies `TASK_ADDR_MIN..TASK_ADDR_MAX` by construction (see
+    // `PageManagementProvider`), and litebox's own image and heap live above it. So a target
+    // outside that window is never a legitimate heal, and refusing it costs nothing: the
+    // alternative is not "heal something useful", it is "corrupt the host".
+    const TASK_MIN: usize = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        0x1000,
+    >>::TASK_ADDR_MIN;
+    const TASK_MAX: usize = <crate::WindowsUserland as litebox::platform::PageManagementProvider<
+        0x1000,
+    >>::TASK_ADDR_MAX;
+    if addr < TASK_MIN || addr.saturating_add(core::mem::size_of::<usize>()) > TASK_MAX {
+        litebox_util_log::warn!(
+            addr:% = addr, value:% = value, task_min:% = TASK_MIN, task_max:% = TASK_MAX;
+            "fork_verify: refusing to heal an address outside the guest address space"
+        );
+        return;
+    }
+
     // Hold the process-wide `VIRTUAL_PROTECT_LOCK` for the entire query-flip-write-restore span,
     // not just around the `VirtualProtect` calls: an ordinary guest `mprotect()` on an unrelated
     // thread (`WindowsUserland::update_permissions`, which takes the same lock) can otherwise
@@ -1363,7 +2222,7 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
 
     // See `readable_and_writable`'s doc comment for why this is one query instead of separate
     // `is_writable`/`is_readable` calls.
-    let (readable, writable) = readable_and_writable(addr);
+    let (readable, writable) = readable_and_writable(addr, core::mem::size_of::<usize>());
 
     if writable {
         // SAFETY: the query above confirmed `addr` is in a committed, writable region; see
@@ -1376,6 +2235,27 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
     if !readable {
         // Not committed/accessible at all: nothing to patch.
         return;
+    }
+    // Readable but not writable can still mean "a loaded module's read-only page", which the
+    // widen-and-write path below would happily flip to `PAGE_EXECUTE_READWRITE` and scribble
+    // into. `readable_and_writable` already refuses to call an image page writable; re-check the
+    // region type here so the fallback cannot route around that.
+    {
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        let queried = unsafe {
+            Win32_Memory::VirtualQuery(
+                addr as *const core::ffi::c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if queried && mbi.Type == Win32_Memory::MEM_IMAGE {
+            litebox_util_log::warn!(
+                addr:% = addr, protect:% = mbi.Protect;
+                "fork_verify: refusing to heal inside a loaded module (MEM_IMAGE)"
+            );
+            return;
+        }
     }
 
     // Committed and readable but not currently writable: temporarily flip to
@@ -1392,6 +2272,13 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
             &raw mut old_protect,
         ) != 0
     };
+    litebox_util_log::debug!(
+        tid:? = std::thread::current().id(),
+        addr:% = addr,
+        old_protect:% = old_protect,
+        ok:% = ok;
+        "diag-vprotect: write_usize_fault_tolerant widen"
+    );
     if !ok {
         return;
     }
@@ -1399,14 +2286,21 @@ fn write_usize_fault_tolerant(addr: usize, value: usize) {
     // `read_usize_fault_tolerant`'s comment covers why a full `usize` is always in-bounds here.
     unsafe { core::ptr::write_unaligned(addr as *mut usize, value) };
     let mut restored = 0u32;
-    unsafe {
+    let restore_ok = unsafe {
         Win32_Memory::VirtualProtect(
             addr as *mut core::ffi::c_void,
             core::mem::size_of::<usize>(),
             old_protect,
             &raw mut restored,
-        );
-    }
+        ) != 0
+    };
+    litebox_util_log::debug!(
+        tid:? = std::thread::current().id(),
+        addr:% = addr,
+        restored_to:% = old_protect,
+        ok:% = restore_ok;
+        "diag-vprotect: write_usize_fault_tolerant restore"
+    );
 }
 
 /// Reads the 64-bit value of `register` (or the enclosing 64-bit register, for narrower
@@ -1561,8 +2455,10 @@ mod codewatch {
         }
     }
 
+    /// Resolved once at startup; see [`crate::VehGates`] for why this must not read the
+    /// environment at the use site.
     pub(super) fn enabled() -> bool {
-        std::env::var_os("LITEBOX_CODEWATCH").is_some()
+        crate::veh_gates().codewatch
     }
 
     /// Whether `addr` falls inside any currently watched region.
@@ -1737,10 +2633,17 @@ pub(crate) fn addr_is_codewatched_for_diagnostics(addr: usize) -> bool {
 /// after `fork()`, so it stays live, readable host memory in this same process -- see
 /// `AddressRelocations::is_in_source`'s doc comment). Returns `None` if `dest_addr` does not
 /// fall within any tracked destination range, or if `tls` is not a verifying fork child.
+/// Returns `(source_addr, None)` when `source_addr` could not actually be read (e.g. unmapped),
+/// distinct from `(source_addr, Some([0u8; 8]))` when the read genuinely succeeded and returned
+/// zero bytes -- a caller printing this diagnostic must be able to tell "the parent's memory
+/// really is zero here" apart from "this diagnostic failed to read the parent's memory at all"
+/// (an earlier revision silently conflated the two into an identical-looking `[0u8; 8]" in both
+/// cases, which made every capture using this function's own output ambiguous about which one
+/// actually happened -- see the investigation this fix is part of).
 pub(crate) fn reverse_translate_and_read_for_diagnostics(
     tls: &TlsState,
     dest_addr: usize,
-) -> Option<(usize, [u8; 8])> {
+) -> Option<(usize, Option<[u8; 8]>)> {
     let borrow = tls.fork_verify.borrow();
     let relocations = borrow.as_ref()?;
     let (source_range, dest_base) =
@@ -1754,9 +2657,9 @@ pub(crate) fn reverse_translate_and_read_for_diagnostics(
     let mut buf = [0u8; 8];
     let n = read_code_bytes(source_addr, &mut buf);
     if n == 0 {
-        return Some((source_addr, [0u8; 8]));
+        return Some((source_addr, None));
     }
-    Some((source_addr, buf))
+    Some((source_addr, Some(buf)))
 }
 
 pub(crate) fn describe_crash_page_for_diagnostics(rip: usize) {
@@ -1817,7 +2720,7 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
         // meaningful if a write provably *does* trap. `LITEBOX_CODEWATCH=selftest` proves it by
         // writing one byte back to itself per armed range and checking the trap fires; it is a
         // separate mode because it deliberately perturbs the pages under investigation.
-        if armed && std::env::var_os("LITEBOX_CODEWATCH").is_some_and(|v| v == "selftest") {
+        if armed && crate::veh_gates().codewatch_selftest {
             let probe = start + 0x100;
             // SAFETY: `probe` is inside a committed, just-armed executable destination range, and
             // the value written is the one just read back, so guest state is left unchanged.
@@ -1844,16 +2747,13 @@ fn arm_codewatch(relocations: &litebox::mm::AddressRelocations) {
 /// since it is not CPU debug state at all, so this reuses `arm_codewatch`'s machinery instead of
 /// building that cross-thread plumbing. Same env var also gates `ctxwatch`'s Dr1 mechanism, which
 /// harmlessly still tries and fails to arm (logged, non-fatal) alongside this.
+/// Resolved once at startup; see [`crate::VehGates`].
 fn watchaddr_data_enabled() -> bool {
-    std::env::var_os("LITEBOX_DIAG_WATCHADDR").is_some()
+    crate::veh_gates().watchaddr.is_some()
 }
 
 fn arm_watchaddr_data() {
-    let Some(addr) = std::env::var("LITEBOX_DIAG_WATCHADDR")
-        .ok()
-        .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .filter(|&a| a != 0)
-    else {
+    let Some(addr) = crate::veh_gates().watchaddr else {
         return;
     };
     let page = addr & !0xfff;
@@ -1877,7 +2777,59 @@ fn arm_watchaddr_data() {
 
 /// Per-thread arm/disarm entry points, called through
 /// [`litebox::platform::ForkChildVerificationProvider`].
-pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>) {
+pub(crate) fn begin(
+    relocations: alloc::sync::Arc<litebox::mm::AddressRelocations>,
+    sigreturn_trampoline: usize,
+) {
+    // AGENTS.md pass 242: this whole diagnostic block (added passes 199-203) used to run
+    // UNCONDITIONALLY on every single `begin()` call -- i.e. every `fork()`, not just while
+    // actively debugging -- including a `CLAIMED_RANGES.try_lock()` (plus `ACTIVE_THREADS`/
+    // `LIVE_THREAD_STACKS`) on the SAME lock `reclaim_ranges_for_fork_child` (pass 217/218)
+    // already acquires on every newly-spawned thread's very first action. Pass 240 captured
+    // live evidence that `CLAIMED_RANGES`'s mutex is genuinely contended at the EXACT `begin()`
+    // call immediately preceding the still-unexplained whole-CONTEXT-corruption crash under a
+    // real, heavily-forking XFCE session -- this diagnostic itself was adding a real, always-on
+    // contention point on that same lock, on every single fork, for a debugging aid that should
+    // never have been unconditional in production once its own investigation moved past the
+    // narrow "why exactly the 8th call" question passes 199-203 were originally chasing. Gate it
+    // behind `diag_fataldump_enabled()` (this file's own established convention for "only pay
+    // this cost while actively investigating") so ordinary `fork()`s no longer pay this lock
+    // acquisition at all.
+    if crate::diag_fataldump_enabled() {
+        static DIAG_BEGIN_COUNT: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+        let diag_begin_count =
+            DIAG_BEGIN_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+        // `try_lock`, not `lock`, since `begin()` may run in a context where one of these is
+        // already held on this same thread -- a diagnostic must never risk deadlocking the very
+        // call it's observing.
+        let diag_claimed_ranges_occupied = crate::CLAIMED_RANGES
+            .try_lock()
+            .map(|c| c.iter().filter(|s| s.is_some()).count())
+            .unwrap_or(usize::MAX);
+        let diag_active_threads_len = crate::ACTIVE_THREADS
+            .try_lock()
+            .map(|t| t.len())
+            .unwrap_or(usize::MAX);
+        let diag_live_thread_stacks_len = crate::LIVE_THREAD_STACKS
+            .try_lock()
+            .map(|t| t.len())
+            .unwrap_or(usize::MAX);
+        let diag_next_claim_seq = crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+        let diag_real_win_tid =
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let mut diag_handle_count: u32 = 0;
+        let diag_handle_count_ok = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessHandleCount(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                &raw mut diag_handle_count,
+            )
+        } != 0;
+        eprintln!(
+            "[diag-fv-count] tid={:?} win_tid={diag_real_win_tid} begin() call #{diag_begin_count} claimed_ranges={diag_claimed_ranges_occupied} active_threads={diag_active_threads_len} live_thread_stacks={diag_live_thread_stacks_len} next_claim_seq={diag_next_claim_seq} handle_count={diag_handle_count} handle_count_ok={diag_handle_count_ok}",
+            std::thread::current().id(),
+        );
+    }
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} begin", std::thread::current().id());
     }
@@ -1888,13 +2840,31 @@ pub(crate) fn begin(relocations: alloc::sync::Arc<litebox::mm::AddressRelocation
             relocations.ranges(),
         );
     }
+    // Debug, not error: fork_verify begin/end is ordinary per-fork lifecycle bookkeeping, emitted
+    // 3 times per exec (600 lines across 200 execs) on every successful run. See the
+    // exec-path-27ms PRD row -- at error! these drowned out real faults entirely.
+    litebox_util_log::debug!(
+        tid:? = std::thread::current().id(),
+        win_tid:% = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+        range_count:% = relocations.ranges().len();
+        "diag-fv-lifecycle: begin"
+    );
     arm_codewatch(&relocations);
     arm_watchaddr_data();
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
-        if std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_none() {
+        if !crate::veh_gates().forkverify_off {
             tls.fork_verify_step_count.set(0);
+            tls.fork_verify_av_heal_count.set(0);
+            tls.fork_verify_step_rip_repeat.set(None);
+            // Stamp this thread with its OWN current generation before arming the map, so
+            // `current_map_is_valid` can later detect a leftover map that survived this same
+            // thread's own `end()`-triggered generation bump (execve, or a leaked skip-clear on
+            // task termination -- see `FORK_VERIFY_GENERATION`'s doc comment) without needing to
+            // track per-map validity any other way. Deliberately per-thread, not global.
+            FORK_VERIFY_EPOCH.with(|e| e.set(FORK_VERIFY_GENERATION.with(core::cell::Cell::get)));
+            FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(|t| t.set(sigreturn_trampoline));
             *tls.fork_verify.borrow_mut() = Some(relocations);
         }
     }
@@ -1906,6 +2876,20 @@ std::thread_local! {
 }
 
 pub(crate) fn end() {
+    // Bump THIS thread's own generation unconditionally, regardless of whether the
+    // `try_borrow_mut` below actually manages to clear `tls.fork_verify`. `end()`'s only two call
+    // paths are `execve` (replaces this thread's address space wholesale) and
+    // `exit`/`exit_group` (terminates this thread) -- see `litebox_shim_linux::syscalls::process`'s
+    // `sys_execve`/`sys_exit`/`sys_exit_group`, the only callers of
+    // `end_fork_child_verification()`, which is this function's only caller. So every `end()` call
+    // genuinely IS one of the two address-space-invalidating events for the CALLING thread, making
+    // an unconditional per-thread bump here correct: a map left behind by the `try_borrow_mut` skip
+    // path below is immediately stamped-stale (its recorded generation no longer matches this
+    // thread's live one) even though the `Option` itself is still `Some`. This is deliberately
+    // per-thread (see `FORK_VERIFY_GENERATION`'s doc comment) so it never invalidates a different,
+    // still-verifying thread's own live map.
+    FORK_VERIFY_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    FORK_VERIFY_SIGRETURN_TRAMPOLINE.with(|t| t.set(0));
     if crate::diag_rip0_enabled() {
         eprintln!("[diag-fv] tid={:?} end", std::thread::current().id());
     }
@@ -1923,6 +2907,30 @@ pub(crate) fn end() {
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: as above.
         let tls = unsafe { &*tls };
-        *tls.fork_verify.borrow_mut() = None;
+        // A nested fault during one of the AV-path stale-pointer healers (`translate_stale_*`)
+        // can re-enter the exception handler while an outer `tls.fork_verify.borrow()` from that
+        // healer is still alive on the same thread's stack -- if handling of that nested fault
+        // ends up calling `end()` (e.g. verification is deemed complete/aborted mid-healing),
+        // `borrow_mut()` here would panic on an already-borrowed `RefCell`. Confirmed live during
+        // a real XFCE launch. Use `try_borrow_mut` and skip clearing in that rare case rather than
+        // crashing the whole guest thread -- the outer healer's own borrow is about to be dropped
+        // when it returns, so at worst this leaves `fork_verify` set one exception cycle longer
+        // than ideal, never permanently.
+        if let Ok(mut slot) = tls.fork_verify.try_borrow_mut() {
+            let had_map = slot.is_some();
+            let range_count = slot.as_ref().map_or(0, |r| r.ranges().len());
+            litebox_util_log::debug!(
+                tid:? = std::thread::current().id(),
+                had_map:% = had_map,
+                range_count:% = range_count;
+                "diag-fv-lifecycle: end (cleared)"
+            );
+            *slot = None;
+        } else {
+            litebox_util_log::debug!(
+                tid:? = std::thread::current().id();
+                "diag-fv-lifecycle: end (SKIPPED clear -- already borrowed, map left live)"
+            );
+        }
     }
 }

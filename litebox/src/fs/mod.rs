@@ -22,11 +22,10 @@ pub mod in_mem;
 pub(crate) mod inode_allocator;
 pub mod layered;
 pub mod nine_p;
+pub mod procfs;
 pub mod resolver;
+pub mod static_files;
 pub mod tar_ro;
-
-#[cfg(test)]
-mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
@@ -113,8 +112,42 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         reset_offset: bool,
     ) -> Result<(), TruncateError>;
 
+    /// Whether a write to `path` must reach this filesystem's own backend instead of being copied
+    /// into some layer above it: true for a file whose write is an action on the caller (`/proc/
+    /// self/uid_map` remaps its ids) rather than a byte change to stored contents. `false` unless
+    /// overridden. See [`backend::Backend::services_own_writes`].
+    fn services_own_writes(&self, _path: &str) -> bool {
+        false
+    }
+
+    /// Whether the bytes reachable through `path` exist ONLY in this process's own writable
+    /// layer, i.e. no other host process would find them by reopening that path.
+    ///
+    /// This is the question an fd handoff across a process boundary has to answer: `"reopen this
+    /// path"` (`F|`, see `Task::scm_carry_spec`) is right for rootfs content -- both sides land on
+    /// the same stored bytes -- and wrong for a file one process created in a layer it does not
+    /// share, where the receiver's `open` answers `ENOENT`. A `true` here means the sender must
+    /// carry CONTENT instead. `false` unless overridden; see [`layered::FileSystem`].
+    fn only_in_own_writable_layer(&self, _path: &str) -> bool {
+        false
+    }
+
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+
+    /// Change the permissions of a file via an already-open file descriptor, matching the
+    /// semantics of `fchmod(2)`. MUST operate on the fd's already-open inode and MUST NOT
+    /// re-resolve `fd` to a path: a caller may `unlink` the file first and then `fchmod` the
+    /// still-open fd, as wlroots' `util/shm.c` `allocate_shm_file_pair` does.
+    fn chmod_fd(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError>;
+
+    /// The access-mode/status flags `fd` was actually opened with, for `fcntl(F_GETFL)` to report
+    /// correctly. Defaults to `None` (the caller then reports `O_RDONLY`); override it wherever
+    /// per-fd open flags are tracked, as [`layered::FileSystem`] does -- without that override
+    /// `F_GETFL` broke xkbcomp's `fdopen`. See gm mutable fs-mod-openflags-fcntl-getfl-xkbcomp.
+    fn open_flags(&self, _fd: &TypedFd<Self>) -> Option<OFlags> {
+        None
+    }
 
     /// Change the owner of a file
     fn chown(
@@ -140,39 +173,33 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
 
-    /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists.
-    ///
-    /// Regular-file and symlink renames are supported (directory rename returns
-    /// [`RenameError::IsADirectory`]) -- this covers the common "atomically replace a file with a
-    /// freshly-written temp file" pattern (e.g. package managers like `apk` installing a
-    /// downloaded package), which is the scenario this method exists to support. `from` and `to`
-    /// must resolve within the same filesystem/layer, matching Linux's `EXDEV` restriction on
-    /// cross-filesystem rename (implementations that can't support the general case return
-    /// [`RenameError::CrossDevice`] for a cross-layer attempt, e.g. renaming a file that currently
-    /// only exists in a read-only layer of a [`layered`] filesystem).
+    /// Rename (move) `from` to `to`, atomically replacing `to` if it already exists. Regular files
+    /// and symlinks only ([`RenameError::IsADirectory`] for a directory); `from` and `to` must be
+    /// in the same filesystem/layer, else [`RenameError::CrossDevice`], matching Linux's `EXDEV`.
+    /// Exists for the atomic replace-with-a-temp-file pattern, e.g. `apk` installing a package.
     fn rename(&self, from: impl path::Arg, to: impl path::Arg) -> Result<(), RenameError>;
 
-    /// Create a hard link at `newpath` referring to the same underlying file as `oldpath`.
-    ///
-    /// Both paths independently refer to the SAME file content and metadata afterward (a write
-    /// through one path is visible through the other, matching Linux's `link(2)`); the
-    /// underlying file is only actually removed once every linking path has been unlinked.
-    /// `oldpath` must name a regular file, never a directory (Linux's `link(2)` returns `EPERM`
-    /// for a directory; this is the same restriction real Linux enforces to keep the filesystem
-    /// tree acyclic). This exists to support the common "atomic lock-file acquisition" pattern
-    /// (create a uniquely-named temp file, then `link()` it to the real lock path -- an
-    /// `EEXIST`-if-already-locked check with no TOCTOU window a plain `open(O_CREAT|O_EXCL)`
-    /// alone doesn't give across NFS-like semantics), e.g. Xorg's own lock-file handling.
+    /// Create a hard link at `newpath` aliasing `oldpath`: both paths share content and metadata
+    /// (a write through one is visible through the other), and the file is removed only once every
+    /// linking path is unlinked. `oldpath` must be a regular file, never a directory (Linux's
+    /// `link(2)` `EPERM`, keeping the tree acyclic). For atomic lock files, e.g. Xorg's own.
     fn link(&self, oldpath: impl path::Arg, newpath: impl path::Arg) -> Result<(), LinkError>;
 
-    /// Create a symbolic link at `linkpath` pointing to `target`.
-    ///
-    /// `target` is stored verbatim (it is never itself resolved or validated at creation time,
-    /// matching Linux's `symlink(2)`, which happily creates dangling or relative-target
-    /// symlinks). This exists to support the common "package manager installs a shared-library
-    /// symlink" pattern (e.g. `apk` extracting `usr/lib/libfoo.so -> libfoo.so.1.2.3`).
+    /// Create a symbolic link at `linkpath` pointing to `target`. `target` is stored verbatim,
+    /// never resolved or validated at creation time -- dangling and relative targets are legal,
+    /// as in Linux's `symlink(2)`. For e.g. `apk` installing a shared-library symlink
+    /// (`usr/lib/libfoo.so -> libfoo.so.1.2.3`).
     fn symlink(&self, target: impl path::Arg, linkpath: impl path::Arg)
     -> Result<(), SymlinkError>;
+
+    /// Create a named pipe (FIFO) at `path`: an ordinary directory entry whose [`FileType`] is
+    /// [`FileType::Fifo`] and which holds no data, so `stat` reports `S_IFIFO` and `open` knows to
+    /// hand back a pipe -- the pipe itself is the shim's business, not this trait's. Errors mirror
+    /// [`FileSystem::mkdir`]'s; defaults to [`MkdirError::ReadOnlyFileSystem`].
+    fn make_fifo(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError> {
+        let _ = (path, mode);
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
 
     /// Read the target of the symbolic link at `path`.
     ///
@@ -193,20 +220,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
 
-    /// Equivalent to [`Self::file_status`], but does not follow a symlink named by the FINAL
-    /// path component (matching `lstat(2)`/`fstatat(AT_SYMLINK_NOFOLLOW)` semantics): if
-    /// `path`'s last component is itself a symlink, this returns the symlink's OWN metadata
-    /// (`file_type: FileType::Symlink`, `size` = the length of its target string) rather than
-    /// the metadata of whatever it points at -- including for a dangling symlink, which must
-    /// still succeed here even though the target does not exist.
-    ///
-    /// Every path component *before* the final one is still resolved normally (following any
-    /// intermediate symlinks), exactly like [`Self::file_status`].
-    ///
-    /// The default body preserves this trait's original, symlink-following behavior for any
-    /// implementer that has no real symlink concept of its own (or already returns correct
-    /// lstat-shaped data from `file_status`, e.g. [`in_mem::FileSystem`], whose own entries are
-    /// never transparently followed to begin with).
+    /// Equivalent to [`Self::file_status`], but does not follow a symlink named by the FINAL path
+    /// component (`lstat(2)`/`AT_SYMLINK_NOFOLLOW`): returns the symlink's own metadata, and must
+    /// succeed for a dangling symlink. Earlier components resolve normally. The default body keeps
+    /// the following behavior, right for an implementer with no symlinks (e.g. [`in_mem`]).
     fn symlink_metadata(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError> {
         self.file_status(path)
     }
@@ -276,6 +293,8 @@ pub enum FileType {
     Directory,
     CharacterDevice,
     Symlink,
+    /// A named pipe (FIFO), created by [`FileSystem::make_fifo`].
+    Fifo,
 }
 
 bitflags! {
@@ -399,19 +418,15 @@ pub struct FileStatus {
     pub atime: Timestamp,
     /// Last modification time
     pub mtime: Timestamp,
+    /// Number of hard links to this node.
+    pub nlink: usize,
 }
 
 impl FileStatus {
-    /// Build the [`FileStatus`] for a symlink itself (never the file/directory it points at) --
-    /// what [`FileSystem::symlink_metadata`] returns for a path whose final component is a
-    /// symlink. `target_len` is the byte length of the symlink's (unresolved) target string.
-    ///
-    /// Real Linux always reports a symlink's own mode as `lrwxrwxrwx`: the permission bits on a
-    /// symlink itself are meaningless (any access check follows the link instead), so this does
-    /// not take a `mode` parameter and always sets full `rwxrwxrwx` permission bits.
-    /// `owner`/`node_info`/`blksize`/`atime`/`mtime` are supplied by the caller, since a
-    /// filesystem backend without a first-class symlink-metadata store of its own can
-    /// reasonably approximate them from the containing directory's own status.
+    /// Build the [`FileStatus`] for a symlink itself (never the file it points at) -- what
+    /// [`FileSystem::symlink_metadata`] returns for a path whose final component is a symlink.
+    /// `target_len` is the byte length of the unresolved target. Takes no `mode`: Linux always
+    /// reports a symlink's own mode as `lrwxrwxrwx`, so full `rwxrwxrwx` bits are always set.
     #[must_use]
     pub fn symlink(
         target_len: usize,
@@ -430,6 +445,7 @@ impl FileStatus {
             blksize,
             atime,
             mtime,
+            nlink: 1,
         }
     }
 }
@@ -447,6 +463,215 @@ pub struct Timestamp {
     pub sec: i64,
     /// Nanosecond remainder, in `[0, 1_000_000_000)`.
     pub nsec: u32,
+}
+
+/// The wall clock file timestamps are taken from.
+///
+/// The in-memory file system is generic over a platform that need not know about time, so the
+/// platform registers a plain function once at startup instead. Unset, every timestamp stays `0`.
+pub mod clock {
+    use super::Timestamp;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static NOW_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers the function that returns the current wall-clock time.
+    pub fn set_now_fn(f: fn() -> Timestamp) {
+        NOW_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// The current time, or the epoch when no clock was registered.
+    #[must_use]
+    pub fn now() -> Timestamp {
+        let raw = NOW_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return Timestamp::default();
+        }
+        // SAFETY: only `set_now_fn` stores here, and it stores a `fn() -> Timestamp`.
+        let f: fn() -> Timestamp = unsafe { core::mem::transmute(raw) };
+        f()
+    }
+}
+
+/// The identity every file-system permission check acts as, per host process.
+///
+/// A `static` is deliberate: each native-`fork()`ed guest process has its own copy of this
+/// memory, so every process checks (and creates files as) its own credentials, while the file
+/// system objects themselves are shared. The shim updates it whenever a task's credentials change.
+pub mod ident {
+    use super::UserInfo;
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    static USER: AtomicU32 = AtomicU32::new(u32::MAX);
+    static GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// Sets the acting uid/gid (ids above `u16::MAX` are clamped).
+    pub fn set(user: u32, group: u32) {
+        USER.store(user.min(u32::from(u16::MAX)), Ordering::Relaxed);
+        GROUP.store(group.min(u32::from(u16::MAX)), Ordering::Relaxed);
+    }
+
+    /// Identity of the calling thread, registered by the platform. A root guard is scoped to the
+    /// thread that took it: a process-wide flag made every OTHER thread act as root while one
+    /// thread copied a file up, so a concurrent `mkdir` came out root-owned and its own creator
+    /// then failed to search it.
+    static THREAD_ID_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to name the calling thread (any stable non-zero-distinguishing id).
+    pub fn set_thread_id_fn(f: fn() -> usize) {
+        THREAD_ID_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    static THREAD_ALIVE_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how to test whether a thread id (as returned by the function given to
+    /// [`set_thread_id_fn`]) still names a live thread. Locks in memory shared between processes
+    /// use it to recover from a holder that died without releasing.
+    pub fn set_thread_alive_fn(f: fn(usize) -> bool) {
+        THREAD_ALIVE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// A guest-writable id-map control file: `/proc/self/{uid_map,gid_map,setgroups}`. Writing one
+    /// is how a process in a new user namespace declares which outer ids it maps (`setgroups`
+    /// instead takes `deny`/`allow`).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum IdMapFile {
+        UidMap,
+        GidMap,
+        Setgroups,
+    }
+
+    static ID_MAP_WRITE_FN: AtomicUsize = AtomicUsize::new(0);
+    static ID_MAP_READ_FN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers how a write to one of those files is applied to the calling process. Takes the
+    /// file and the bytes written; returns `Ok(())` or an errno.
+    pub fn set_id_map_write_fn(f: fn(IdMapFile, &[u8]) -> Result<(), u32>) {
+        ID_MAP_WRITE_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Registers how the current contents of one of those files are rendered.
+    pub fn set_id_map_read_fn(f: fn(IdMapFile) -> alloc::vec::Vec<u8>) {
+        ID_MAP_READ_FN.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Applies `buf` to `file`; `EPERM` when no guest process model registered a handler (and
+    /// `EIO` when the caller is not a guest thread at all).
+    pub fn write_id_map_file(file: IdMapFile, buf: &[u8]) -> Result<(), u32> {
+        let raw = ID_MAP_WRITE_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return Err(1);
+        }
+        // SAFETY: only `set_id_map_write_fn` stores here, and it stores its own fn type.
+        let f: fn(IdMapFile, &[u8]) -> Result<(), u32> = unsafe { core::mem::transmute(raw) };
+        f(file, buf)
+    }
+
+    /// Current contents of `file`, empty when nothing registered a renderer.
+    #[must_use]
+    pub fn read_id_map_file(file: IdMapFile) -> alloc::vec::Vec<u8> {
+        let raw = ID_MAP_READ_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return alloc::vec::Vec::new();
+        }
+        // SAFETY: only `set_id_map_read_fn` stores here, and it stores its own fn type.
+        let f: fn(IdMapFile) -> alloc::vec::Vec<u8> = unsafe { core::mem::transmute(raw) };
+        f(file)
+    }
+
+    /// Non-zero token naming the calling thread, or 0 when the platform registered no id function.
+    #[must_use]
+    pub fn thread_token() -> u32 {
+        current_thread().map_or(0, |t| t as u32)
+    }
+
+    /// Whether the thread named by `token` (from [`thread_token`]) is still alive; `true` when
+    /// that cannot be determined.
+    #[must_use]
+    pub fn thread_token_alive(token: u32) -> bool {
+        let raw = THREAD_ALIVE_FN.load(Ordering::Relaxed);
+        if raw == 0 || token == 0 {
+            return true;
+        }
+        // SAFETY: only `set_thread_alive_fn` stores here, and it stores a `fn(usize) -> bool`.
+        let f: fn(usize) -> bool = unsafe { core::mem::transmute(raw) };
+        f((token as usize).wrapping_sub(1))
+    }
+
+    fn current_thread() -> Option<usize> {
+        let raw = THREAD_ID_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            return None;
+        }
+        // SAFETY: only `set_thread_id_fn` stores here, and it stores a `fn() -> usize`.
+        let f: fn() -> usize = unsafe { core::mem::transmute(raw) };
+        Some(f().wrapping_add(1))
+    }
+
+    const ROOT_SLOTS: usize = 64;
+    /// Threads currently inside a root guard (thread id + 1; 0 = free slot), one entry per guard.
+    static ROOT_TIDS: [AtomicUsize; ROOT_SLOTS] = [const { AtomicUsize::new(0) }; ROOT_SLOTS];
+    /// Fallback when no thread-id function is registered or every slot is taken: process-wide.
+    static ROOT_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+    /// While alive, permission checks on the creating thread act as root: the layered file
+    /// system's internal copy-up (creating ancestors and the upper copy of a lower file) is done
+    /// by the "kernel", not as the calling user.
+    pub struct RootGuard {
+        slot: Option<usize>,
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            match self.slot {
+                Some(slot) => ROOT_TIDS[slot].store(0, Ordering::Release),
+                None => {
+                    ROOT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Acts as root on this thread until the returned guard drops.
+    #[must_use]
+    pub fn root_guard() -> RootGuard {
+        if let Some(tid) = current_thread() {
+            for (slot, cell) in ROOT_TIDS.iter().enumerate() {
+                if cell
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return RootGuard { slot: Some(slot) };
+                }
+            }
+        }
+        ROOT_DEPTH.fetch_add(1, Ordering::Relaxed);
+        RootGuard { slot: None }
+    }
+
+    fn thread_is_root() -> bool {
+        if ROOT_DEPTH.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        match current_thread() {
+            Some(tid) => ROOT_TIDS.iter().any(|c| c.load(Ordering::Acquire) == tid),
+            None => false,
+        }
+    }
+
+    /// The acting identity, if the shim has set one.
+    #[must_use]
+    pub fn get() -> Option<UserInfo> {
+        if thread_is_root() {
+            return Some(UserInfo::ROOT);
+        }
+        let user = USER.load(Ordering::Relaxed);
+        let group = GROUP.load(Ordering::Relaxed);
+        (user != u32::MAX && group != u32::MAX).then(|| UserInfo {
+            user: user as u16,
+            group: group as u16,
+        })
+    }
 }
 
 /// User information
@@ -481,6 +706,50 @@ pub struct DirEntry {
 impl UserInfo {
     /// The root user
     pub const ROOT: Self = Self { user: 0, group: 0 };
+}
+
+static EFFECTIVE_IDENTITY_ASSIGNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static EFFECTIVE_IDENTITY_USER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EFFECTIVE_IDENTITY_GROUP: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn narrowed_id(id: u32) -> u16 {
+    u16::try_from(id).unwrap_or(u16::MAX - 1)
+}
+
+/// Declares the credentials of the running guest process: every permission check made by the file
+/// systems of this host process uses them, and root bypasses read and write permission bits.
+pub fn set_effective_identity(user: u32, group: u32) {
+    EFFECTIVE_IDENTITY_USER.store(user, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_GROUP.store(group, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_ASSIGNED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn effective_identity() -> Option<UserInfo> {
+    EFFECTIVE_IDENTITY_ASSIGNED
+        .load(core::sync::atomic::Ordering::Acquire)
+        .then(|| UserInfo {
+            user: narrowed_id(EFFECTIVE_IDENTITY_USER.load(core::sync::atomic::Ordering::Relaxed)),
+            group: narrowed_id(EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed)),
+        })
+}
+
+/// Runs `body` with root credentials, for bookkeeping that must see every file regardless of the
+/// guest process that happens to be running it.
+pub fn with_root_identity<R>(body: impl FnOnce() -> R) -> R {
+    let previous = (
+        EFFECTIVE_IDENTITY_ASSIGNED.load(core::sync::atomic::Ordering::Acquire),
+        EFFECTIVE_IDENTITY_USER.load(core::sync::atomic::Ordering::Relaxed),
+        EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed),
+    );
+    set_effective_identity(0, 0);
+    let _root = ident::root_guard();
+    let result = body();
+    EFFECTIVE_IDENTITY_USER.store(previous.1, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_GROUP.store(previous.2, core::sync::atomic::Ordering::Relaxed);
+    EFFECTIVE_IDENTITY_ASSIGNED.store(previous.0, core::sync::atomic::Ordering::Release);
+    result
 }
 
 /// The size reported as the size of a directory.
