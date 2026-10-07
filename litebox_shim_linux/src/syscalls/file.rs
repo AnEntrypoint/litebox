@@ -1227,9 +1227,18 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
         let (ptr, excludes) = match arena {
             Some(ptr) => (ptr.cast::<SharedFlockRegion<Platform>>(), true),
             None => {
-                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Leak a process-private allocation so every
-                // later access stays memory-safe, and let `excludes` disable the table.
+                // Arena exhausted: still never a panic for the GUEST (AGENTS.md's standing rule --
+                // the host process IS the whole guest session). Leak a process-private allocation so
+                // every later access stays memory-safe, and let `excludes` disable the table.
+                //
+                // The ONE panic that remains on this path is the null case below: no arena AND no
+                // host memory for a region of tens of KiB. It is deliberately not converted to an
+                // errno because there is nothing honest left to degrade to -- `flock(2)` without a
+                // slot array cannot exclude anybody, and a `SharedFlockTable` whose `region` is
+                // optional (every access falling back to `SharedFlockOutcome::Unavailable`, i.e. to
+                // the per-process `FlockFile`) is the real fix, tracked as an open item. Host OOM at
+                // this size ends the session on any design; what is NOT acceptable is a guest
+                // reaching it, and a guest cannot: this runs once per fork family at build time.
                 litebox_util_log::error!(
                     bytes:% = layout.size();
                     "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
@@ -1752,9 +1761,12 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         let (ptr, excludes) = match arena {
             Some(ptr) => (ptr.cast::<SharedRecordLockRegion<Platform>>(), true),
             None => {
-                // Arena exhausted: still never a panic (the host process IS the whole guest session).
-                // Leak a process-private allocation so every later access stays memory-safe, and let
-                // `excludes` disable the table.
+                // Arena exhausted: still never a panic for the GUEST (the host process IS the whole
+                // guest session). Leak a process-private allocation so every later access stays
+                // memory-safe, and let `excludes` disable the table. The null case below is the same
+                // deliberately-unconverted panic as `SharedFlockTable::new`'s -- see the comment
+                // there for why an optional `region` is the real fix, and why a guest cannot reach
+                // it (this runs once per fork family at build time, never from a syscall).
                 litebox_util_log::error!(
                     bytes:% = layout.size();
                     "shared record lock table: shared kernel arena exhausted; fcntl(2) record locks \
@@ -5128,8 +5140,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
-                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                    // `raw_fd` is not a slot this descriptor table has: Linux answers EBADF for a
+                    // `dup2` target it cannot install. An insert that fails (the store could not
+                    // grow to `raw_fd`) drops `new_fd`, i.e. closes it -- the same "nothing was
+                    // installed" outcome as the assert this replaces, and never a panic (a panic
+                    // here lands in the host process, which IS the whole guest session).
+                    let _ = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
                 }
                 return Err(Errno::EBADF);
             }
@@ -9607,7 +9623,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         raw_fd += 1;
                     }
                     let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-                    assert!(success);
+                    if !success {
+                        // The store could not grow to `raw_fd`, so this dup has no slot to land in.
+                        // EMFILE, never a panic: the host process IS the whole guest session.
+                        return Err(DupFdError::TooManyFiles);
+                    }
                     raw_fd
                 }
             };

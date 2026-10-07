@@ -11086,7 +11086,17 @@ impl ConsoleStdinReader {
                     this.ready.notify_all();
                     return;
                 }
-                panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+                // This pump thread has no caller to hand an errno to, so a read failure it cannot
+                // explain ends the pump as EOF rather than panicking -- a panic here lands in the
+                // host process, and the host process IS the whole guest session, so every other
+                // guest process would die for one thread's stdin.
+                litebox_util_log::error!(
+                    err:% = err;
+                    "ReadFile(STD_INPUT_HANDLE) failed in the console pump; ending stdin as EOF"
+                );
+                this.eof.store(true, Ordering::SeqCst);
+                this.ready.notify_all();
+                return;
             }
             if read == 0 {
                 // A successful zero-byte read is EOF (matches `read_from_raw_handle`'s previous
@@ -11181,7 +11191,13 @@ fn read_from_raw_handle(
         if err == Win32_Foundation::ERROR_BROKEN_PIPE {
             return Ok(0);
         }
-        panic!("ReadFile(STD_INPUT_HANDLE) failed: error={err}");
+        // Any other `ReadFile` failure is an EIO the guest can observe, never a panic: a panic on
+        // this path lands in the host process, and the host process IS the whole guest session.
+        litebox_util_log::error!(
+            err:% = err;
+            "ReadFile(STD_INPUT_HANDLE) failed; reporting EIO to the guest"
+        );
+        return Err(litebox::platform::StdioReadError::Io);
     }
     Ok(read as usize)
 }
@@ -11632,7 +11648,13 @@ fn write_to_raw_handle(
         if err == Win32_Foundation::ERROR_BROKEN_PIPE || err == Win32_Foundation::ERROR_NO_DATA {
             return Err(litebox::platform::StdioWriteError::Closed);
         }
-        panic!("WriteFile(stdio handle) failed: error={err}");
+        // Any other `WriteFile` failure is an EIO the guest can observe, never a panic: a panic on
+        // this path lands in the host process, and the host process IS the whole guest session.
+        litebox_util_log::error!(
+            err:% = err;
+            "WriteFile(stdio handle) failed; reporting EIO to the guest"
+        );
+        return Err(litebox::platform::StdioWriteError::Io);
     }
     Ok(written as usize)
 }
@@ -13973,7 +13995,46 @@ unsafe extern "C-unwind" fn exception_handler(
         // every mallocng-assert trap, including ones the guest's own signal handling could
         // otherwise report/recover from normally.
         code if code == 0xc0000096u32.cast_signed() => (Exception::INVALID_OPCODE, 0, 0),
-        code => panic!("Unhandled Win32 exception code: {code:#x}"),
+        // Windows delivers several traps this handler never enumerated, and an unenumerated code
+        // used to reach a catch-all `panic!` -- which lands in the host process, and the host
+        // process IS the whole guest session, so one guest's `STATUS_STACK_OVERFLOW` (ordinary
+        // infinite recursion, i.e. SIGSEGV on real Linux) killed every other guest process at once.
+        // Each of these is now delivered as the signal real hardware would raise instead.
+        code if code == 0x80000001u32.cast_signed() => {
+            // `STATUS_GUARD_PAGE`: a touched guard page is a stack/heap bound -- SIGSEGV. The
+            // error code is the same layout as the page-fault arm above: bit1 write, bit2 user.
+            (Exception::PAGE_FAULT, 0b110, 0)
+        }
+        code if code == 0xc00000fdu32.cast_signed() => {
+            // `STATUS_STACK_OVERFLOW`: SIGSEGV (what Linux raises for an unhandled one).
+            (Exception::PAGE_FAULT, 0b110, 0)
+        }
+        code if code == 0xc0000006u32.cast_signed() => {
+            // `STATUS_IN_PAGE_ERROR`: the page could not be brought in -- a fault, not a panic.
+            (Exception::PAGE_FAULT, 0b100, 0)
+        }
+        code if code == 0x80000004u32.cast_signed() => {
+            // `STATUS_SINGLE_STEP`: SIGTRAP, as Linux' #DB handler raises TF-step traps.
+            (Exception::BREAKPOINT, 0, 0)
+        }
+        code if (0xc000008e..=0xc0000093).contains(&(code as u32)) => {
+            // The `STATUS_FLOAT_*` family: SIGFPE, as Linux' #MF handler raises for an unmasked
+            // floating-point trap.
+            (Exception::DIVIDE_ERROR, 0, 0)
+        }
+        code => {
+            // Still unknown: deliver SIGSEGV rather than end the session. THROTTLED - a guest that
+            // loops on a trap it cannot handle must not bury the log (standing repo rule).
+            static UNHANDLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let seen = UNHANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if seen < 8 || seen % 1024 == 0 {
+                litebox_util_log::error!(
+                    code:% = code, seen:% = seen + 1;
+                    "unhandled Win32 exception code; delivering SIGSEGV to the guest"
+                );
+            }
+            (Exception::PAGE_FAULT, 0b110, 0)
+        }
     };
 
     let info = litebox::shim::ExceptionInfo {
