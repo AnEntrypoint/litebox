@@ -189,10 +189,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         assert!(self.current_working_dir.ends_with('/'));
         let path = path.as_rust_str()?;
         if path.starts_with('/') {
-            // Absolute path
             Ok(path.normalized()?)
         } else {
-            // Relative path
             Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
         }
     }
@@ -788,13 +786,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
-        // Just a sanity check
         assert!(matches!(
             removed,
             Some(FileType::RegularFile | FileType::Symlink | FileType::Fifo)
         ));
         let removed = root.entries.remove(&path).unwrap();
-        // Just a sanity check
         assert!(matches!(
             removed,
             Entry::File(File { .. }) | Entry::Symlink(_)
@@ -1142,10 +1138,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
-        // Just a sanity check
         assert!(matches!(removed, Some(FileType::Directory)));
         let removed = root.entries.remove(&path).unwrap();
-        // Just a sanity check
         assert!(matches!(removed, Entry::Dir(_)));
         Ok(())
     }
@@ -1190,7 +1184,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
         let mut entries: Vec<DirEntry> = Vec::new();
 
-        // Add "."
         entries.push(DirEntry {
             name: ".".into(),
             file_type: FileType::Directory,
@@ -1201,7 +1194,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         });
 
-        // Add ".."
         entries.push(DirEntry {
             name: "..".into(),
             file_type: FileType::Directory,
