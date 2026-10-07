@@ -38,9 +38,23 @@ pub(crate) mod tests;
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
-            litebox::fs::OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed))
-                .unwrap()
-                & litebox::fs::OFlags::STATUS_FLAGS_MASK
+            // `status` is only ever written through `set_status` (and masked at open time), so
+            // every value reachable today is a valid `OFlags` -- but `get_status` runs on EVERY
+            // read of this fd, so `from_bits(..).unwrap()` here is one unvalidated `fetch_or`
+            // away from killing the whole guest session over a single unknown bit. Fall back to
+            // the recognized flags instead: identical to the old result for every valid value.
+            let raw = self.status.load(core::sync::atomic::Ordering::Relaxed);
+            let flags = match litebox::fs::OFlags::from_bits(raw) {
+                Some(flags) => flags,
+                None => {
+                    litebox_util_log::warn!(
+                        raw:% = raw;
+                        "fd status flags carry bits outside OFlags; reporting the recognized ones"
+                    );
+                    litebox::fs::OFlags::from_bits_truncate(raw)
+                }
+            };
+            flags & litebox::fs::OFlags::STATUS_FLAGS_MASK
         }
 
         pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {

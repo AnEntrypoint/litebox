@@ -1037,52 +1037,63 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+    // The image's own `Env` is the BASE of the guest environment, the way it is for every real
+    // container runtime: `docker run` starts the container with the ENV its image config declared,
+    // and an explicit `-e` overrides it. litebox started the guest with NO environment at all
+    // unless `-e` was passed, which is why in-guest `python3` reported an empty `sys.executable`
+    // (its argv[0] PATH search had no `PATH` to search) and `HOME`/`TERM` were unset.
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    #[allow(clippy::items_after_statements, reason = "kept next to its only caller")]
+    fn extend_env(env_pairs: &mut Vec<(String, String)>, entries: impl IntoIterator<Item = String>) {
+        for entry in entries {
+            let Some((name, value)) = entry.split_once('=') else {
+                continue;
+            };
+            match env_pairs.iter_mut().find(|(known, _)| known == name) {
+                Some(slot) => slot.1 = value.to_owned(),
+                None => env_pairs.push((name.to_owned(), value.to_owned())),
+            }
+        }
+    }
+    if let Some(image_ref) = cli_args.oci_image.as_deref() {
+        extend_env(&mut env_pairs, litebox_packager::oci::image_env(image_ref));
+    }
+    extend_env(
+        &mut env_pairs,
+        cli_args.environment_variables.iter().cloned(),
+    );
+    if cli_args.forward_environment_variables {
+        extend_env(&mut env_pairs, std::env::vars().map(|(k, v)| {
+            // Windows' own env var names are case-insensitive but reported with whatever
+            // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
+            // env var lookups (including the guest's own PATH-based executable search) are
+            // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
+            // different, useless variable while the `PATH` Linux tools actually look up is
+            // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
+            // installed binary (e.g. after `npm install`) despite the install itself
+            // succeeding, because the guest's `execve`/shell PATH search had nothing to
+            // search. Normalize this one, specific, known-mismatched name rather than
+            // case-folding every forwarded variable, which could needlessly collide two
+            // differently-cased Windows variables that mean different things on Linux.
+            //
+            // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
+            // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
+            // meaningless to the guest -- without this prefix, forwarding PATH at all is
+            // strictly worse than not forwarding it, since it shadows the guest's own
+            // otherwise-implicit default search locations with a value that matches nothing.
+            if k.eq_ignore_ascii_case("PATH") {
+                format!("PATH={LINUX_DEFAULT_PATH}:{v}")
+            } else {
+                format!("{k}={v}")
+            }
+        }));
+    }
+    let envp: Vec<_> = env_pairs
+        .into_iter()
+        .filter_map(|(k, v)| {
+            std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>()).ok()
+        })
         .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                // Windows' own env var names are case-insensitive but reported with whatever
-                // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
-                // env var lookups (including the guest's own PATH-based executable search) are
-                // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
-                // different, useless variable while the `PATH` Linux tools actually look up is
-                // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
-                // installed binary (e.g. after `npm install`) despite the install itself
-                // succeeding, because the guest's `execve`/shell PATH search had nothing to
-                // search. Normalize this one, specific, known-mismatched name rather than
-                // case-folding every forwarded variable, which could needlessly collide two
-                // differently-cased Windows variables that mean different things on Linux.
-                //
-                // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
-                // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
-                // meaningless to the guest -- without this prefix, forwarding PATH at all is
-                // strictly worse than not forwarding it, since it shadows the guest's own
-                // otherwise-implicit default search locations with a value that matches nothing.
-                if k.eq_ignore_ascii_case("PATH") {
-                    let v = format!("{LINUX_DEFAULT_PATH}:{v}");
-                    std::ffi::CString::new(
-                        "PATH"
-                            .bytes()
-                            .chain(*b"=")
-                            .chain(v.bytes())
-                            .collect::<Vec<u8>>(),
-                    )
-                    .unwrap()
-                } else {
-                    std::ffi::CString::new(
-                        k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
-                    )
-                    .unwrap()
-                }
-            }))
-            .collect()
-    } else {
-        envp
-    };
 
     let fs_for_export = cli_args
         .export_writable_layer
@@ -1099,7 +1110,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let fs_for_fork = initial_file_system.clone();
         litebox_platform_windows_userland::process_fork::register_parent_writable_layer_exporter(
             Box::new(move |path| {
-                export_writable_layer(&fs_for_fork, path).map_err(|e| format!("{e}"))
+                export_writable_layer(&fs_for_fork, path, false).map_err(|e| format!("{e}"))
             }),
         );
     }
@@ -1276,7 +1287,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     if let Some(export_path) = &cli_args.export_writable_layer {
         let fs = fs_for_export.expect("fs_for_export set whenever export_writable_layer is set");
-        export_writable_layer(&fs, export_path)
+        export_writable_layer(&fs, export_path, false)
             .unwrap_or_else(|e| panic!("failed to write --export-writable-layer archive: {e}"));
     }
 
@@ -1598,7 +1609,7 @@ fn diag_process_fork_globalstate_probe_inner() {
         let fs_for_fork = fs.clone();
         litebox_platform_windows_userland::process_fork::register_parent_writable_layer_exporter(
             Box::new(move |path| {
-                export_writable_layer(&fs_for_fork, path).map_err(|e| format!("{e}"))
+                export_writable_layer(&fs_for_fork, path, false).map_err(|e| format!("{e}"))
             }),
         );
     }
@@ -2411,7 +2422,10 @@ fn diag_process_fork_task_resume_probe(
         });
     if let Some(tar_path) = tar_path_for_naming {
         let export_path = pf::cross_process_writable_export_path(&tar_path, std::process::id());
-        match export_writable_layer(&fs_for_export, &export_path) {
+        // The PARENT already holds everything this child adopted, so it gets only what changed:
+        // handing it the adopted copies too lets it revert a sibling's finished write (see
+        // [`AdoptedState`]).
+        match export_writable_layer(&fs_for_export, &export_path, true) {
             Ok(()) => {
                 eprintln!(
                     "[process_fork_diag] task-resume-probe (child): exported writable layer to {}",
@@ -2440,7 +2454,10 @@ fn diag_process_fork_task_resume_probe(
                         "litebox-container-fs-publish-{}.tar",
                         std::process::id()
                     ));
-                    if std::fs::copy(&export_path, &scratch).is_ok() {
+                    // A FULL export, not a copy of `export_path`: that archive is now a delta
+                    // against the parent's layer, and a later sibling seeding from this shared
+                    // snapshot has no such layer to apply it to -- it needs the whole layer.
+                    if export_writable_layer(&fs_for_export, &scratch, false).is_ok() {
                         let _ = litebox_platform_windows_userland::process_fork::publish_as_container_fs_snapshot(scratch);
                     } else {
                         let _ = std::fs::remove_file(&scratch);
@@ -2660,6 +2677,191 @@ fn write_merged_rootfs_index_cache(
 
 static ADOPTED_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// What an adopted path looked like at the instant this process seeded it from a parent's
+/// writable-layer tar.
+///
+/// A cross-process fork child re-exports its ENTIRE writable layer as it exits -- adopted paths
+/// included -- and the parent applies every regular file in that archive as a whole-file replace.
+/// So a child that never touched a file still hands back the copy it adopted, and when it happens
+/// to be reaped after a sibling that DID write that file, the parent's import silently reverts the
+/// sibling's finished work. Recording the adopted state lets the export tell "I changed this" from
+/// "I merely carried it".
+#[derive(Clone, PartialEq, Eq)]
+struct AdoptedState {
+    file_type: litebox::fs::FileType,
+    mode: litebox::fs::Mode,
+    user: u16,
+    group: u16,
+    /// Hash of the entry's payload: a regular file's contents, or a symlink's target.
+    hash: u64,
+    /// Length of the adopted payload.
+    len: u64,
+    /// Per-block hashes of an adopted REGULAR file's contents, `None` for every other kind and for
+    /// a file too large to track. Comparing these at export names the byte ranges this process
+    /// actually changed, so the export can send those instead of a whole file that would overwrite
+    /// a sibling's writes to regions it never touched.
+    blocks: Option<Vec<u64>>,
+}
+
+static ADOPTED_STATE: std::sync::Mutex<Vec<(String, AdoptedState)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Granularity at which an adopted file's bytes are hashed, or `None` for a file too large to be
+/// worth it. Fine for small files, so a patch does not spill into a region a sibling wrote; coarse
+/// for big ones, so the hashes stay far smaller than the bytes they describe.
+fn merge_block_size(len: u64) -> Option<usize> {
+    const SMALL_LIMIT: u64 = 1024 * 1024;
+    const LARGE_LIMIT: u64 = 64 * 1024 * 1024;
+    if len <= SMALL_LIMIT {
+        Some(128)
+    } else if len <= LARGE_LIMIT {
+        Some(4096)
+    } else {
+        None
+    }
+}
+
+fn payload_blocks(payload: &[u8]) -> Option<Vec<u64>> {
+    let block = merge_block_size(payload.len() as u64)?;
+    Some(payload.chunks(block).map(payload_hash).collect())
+}
+
+/// Marks a tar entry whose payload is a byte-range patch rather than the whole file. Carried in
+/// `gname`, which nothing else in this pipeline reads. Followed by ` a <base>` (append the payload
+/// at `max(reader_len, base)`) or ` r <offset> <final_len>` (write at `offset`, zero-extend to
+/// `final_len`). An absent marker means the payload is the whole file.
+const MERGE_MAGIC: &str = "lbxmerge";
+
+/// The bytes an exported entry would restore: a regular file's contents, or a symlink's target --
+/// the only two kinds that carry data.
+fn export_payload(entry: &litebox::fs::export::ExportedEntry) -> &[u8] {
+    match &entry.symlink_target {
+        Some(target) => target.as_bytes(),
+        None => &entry.contents,
+    }
+}
+
+fn payload_hash(payload: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether `entry` is byte-for-byte what this process adopted it as, so exporting it would only
+/// restate a copy the reader already has. An entry with no recorded state is never skipped: that
+/// means this process never adopted a layer, and withholding an unattributed file would lose it.
+fn unchanged_since_adoption(
+    entry: &litebox::fs::export::ExportedEntry,
+    adopted: Option<&AdoptedState>,
+) -> bool {
+    let Some(adopted) = adopted else {
+        return false;
+    };
+    // Compare only the permission bits: the export writes `mode & 0o7777` into the archive, so
+    // comparing the untruncated modes would call every adopted file changed for no reason.
+    adopted.file_type == entry.file_type
+        && adopted.mode.bits() & 0o7777 == entry.mode.bits() & 0o7777
+        && adopted.user == entry.owner.user
+        && adopted.group == entry.owner.group
+        && adopted.hash == payload_hash(export_payload(entry))
+}
+
+/// How a reader must apply one exported regular file's payload.
+enum MergeKind {
+    /// The payload IS the file: replace it.
+    Whole,
+    /// The payload is the tail this process appended past `base`, the length it adopted the file
+    /// at. A reader whose copy has grown since must land it at the END of its own copy, not at
+    /// `base`, or two concurrent appenders each starting from the same length still overwrite one
+    /// another.
+    Append { base: usize },
+    /// The payload is `range` bytes of the file at `offset`; the reader zero-extends to
+    /// `final_len` so a growing file keeps its length.
+    Range { offset: usize, final_len: usize },
+}
+
+impl MergeKind {
+    /// `gname` text telling a reader how to apply the payload, `None` when the payload is the whole
+    /// file (every archive that is not one of these exports).
+    fn groupname(&self) -> Option<String> {
+        match self {
+            MergeKind::Whole => None,
+            MergeKind::Append { base } => Some(format!("{MERGE_MAGIC} a {base}")),
+            MergeKind::Range { offset, final_len } => {
+                Some(format!("{MERGE_MAGIC} r {offset} {final_len}"))
+            }
+        }
+    }
+}
+
+/// A diff producing more pieces than this, or rewriting most of the file, is sent whole instead.
+const MAX_MERGE_PIECES: usize = 64;
+
+/// Split a regular file's contents into the pieces worth sending: everything for an untracked file,
+/// just the appended tail for a file grown past what was adopted, and only the changed block ranges
+/// otherwise. Returns ranges into `contents`.
+fn merge_pieces(
+    contents: &[u8],
+    adopted: Option<&AdoptedState>,
+) -> Vec<(MergeKind, std::ops::Range<usize>)> {
+    let whole = || vec![(MergeKind::Whole, 0..contents.len())];
+    let Some(adopted) = adopted else {
+        return whole();
+    };
+    let (Some(blocks), Some(block)) = (&adopted.blocks, merge_block_size(adopted.len)) else {
+        return whole();
+    };
+    let adopted_len = adopted.len as usize;
+
+    // Re-hash the child's first `adopted_len` bytes on the ADOPTED file's own grid: that is the
+    // only way to tell "grew past what I adopted" from "rewrote what I adopted" without keeping
+    // the adopted bytes themselves.
+    if contents.len() >= adopted_len
+        && contents[..adopted_len]
+            .chunks(block)
+            .map(payload_hash)
+            .eq(blocks.iter().copied())
+    {
+        return if contents.len() == adopted_len {
+            Vec::new()
+        } else {
+            vec![(MergeKind::Append { base: adopted_len }, adopted_len..contents.len())]
+        };
+    }
+
+    let mut pieces: Vec<(MergeKind, std::ops::Range<usize>)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut run_end = 0usize;
+    for (i, chunk) in contents.chunks(block).enumerate() {
+        if blocks.get(i) == Some(&payload_hash(chunk)) {
+            if let Some(start) = run_start.take() {
+                pieces.push((
+                    MergeKind::Range { offset: start, final_len: contents.len() },
+                    start..run_end,
+                ));
+            }
+        } else {
+            if run_start.is_none() {
+                run_start = Some(i * block);
+            }
+            run_end = i * block + chunk.len();
+        }
+    }
+    if let Some(start) = run_start.take() {
+        pieces.push((
+            MergeKind::Range { offset: start, final_len: contents.len() },
+            start..run_end,
+        ));
+    }
+
+    let patched = pieces.iter().map(|(_, range)| range.len()).sum::<usize>();
+    if pieces.is_empty() || pieces.len() > MAX_MERGE_PIECES || patched * 2 > contents.len() {
+        return whole();
+    }
+    pieces
+}
+
 fn whiteout_tar_path(path: &str) -> Option<String> {
     let (directory, name) = path.trim_start_matches('/').rsplit_once('/').unwrap_or(("", path.trim_start_matches('/')));
     (!name.is_empty()).then(|| {
@@ -2676,16 +2878,42 @@ fn whiteout_tar_path(path: &str) -> Option<String> {
 ///
 /// Only the upper layer is walked -- the read-only lower layer (the packaged base rootfs) is
 /// never re-exported, so the archive is a delta, not a full rootfs snapshot.
+/// `only_changed` withholds every entry this process merely carried: one it adopted from a parent
+/// and never touched (see [`AdoptedState`]). Use it for the archive a cross-process fork child
+/// leaves for its PARENT, whose own layer already holds everything the child adopted -- passing the
+/// whole layer there lets a sibling that merely overlapped a finished write revert it on reap.
+/// Paths the child adopted and then deleted are still emitted, as whiteouts.
 fn export_writable_layer<Upper, Lower>(
     fs: &litebox::fs::layered::FileSystem<Platform, Upper, Lower>,
     export_path: &std::path::Path,
+    only_changed: bool,
 ) -> Result<()>
 where
     Upper: litebox::fs::FileSystem,
     Lower: litebox::fs::FileSystem,
 {
-    let entries = litebox::fs::with_root_identity(|| litebox::fs::export::export_all(fs.upper()))
-        .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
+    let all_entries =
+        litebox::fs::with_root_identity(|| litebox::fs::export::export_all(fs.upper()))
+            .map_err(|e| anyhow!("failed to walk writable layer: {e:?}"))?;
+
+    let states_guard = ADOPTED_STATE.lock().ok();
+    let adopted_state: std::collections::HashMap<&str, &AdoptedState> = match &states_guard {
+        Some(states) => states
+            .iter()
+            .map(|(path, state)| (path.as_str(), state))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    };
+    let entries: Vec<&litebox::fs::export::ExportedEntry> = if only_changed {
+        all_entries
+            .iter()
+            .filter(|entry| {
+                !unchanged_since_adoption(entry, adopted_state.get(entry.path.as_str()).copied())
+            })
+            .collect()
+    } else {
+        all_entries.iter().collect()
+    };
 
     if std::env::var_os("LITEBOX_DIAG_FORK_SNAPSHOT").is_some() {
         let tmp_entries: Vec<&str> = entries
@@ -2723,12 +2951,28 @@ where
                     .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
             }
             litebox::fs::FileType::RegularFile => {
-                header.set_entry_type(tar::EntryType::Regular);
-                header.set_size(entry.contents.len() as u64);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, tar_path, entry.contents.as_slice())
-                    .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+                let pieces = if only_changed {
+                    merge_pieces(
+                        &entry.contents,
+                        adopted_state.get(entry.path.as_str()).copied(),
+                    )
+                } else {
+                    vec![(MergeKind::Whole, 0..entry.contents.len())]
+                };
+                for (kind, range) in pieces {
+                    let payload = &entry.contents[range];
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(payload.len() as u64);
+                    if let Some(groupname) = kind.groupname() {
+                        header
+                            .set_groupname(&groupname)
+                            .map_err(|e| anyhow!("merge metadata for {tar_path}: {e}"))?;
+                    }
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, tar_path, payload)
+                        .map_err(|e| anyhow!("failed to add {tar_path} to export tar: {e}"))?;
+                }
             }
             // A FIFO is metadata only, like a directory -- but it must still be archived, or a
             // cross-process fork child would receive it as a plain empty file.
@@ -2759,7 +3003,10 @@ where
             _ => {}
         }
     }
-    let present: std::collections::HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    // `present` is built from the UNFILTERED walk: an entry withheld by `only_changed` is
+    // unchanged, not deleted, and emitting a whiteout for it would delete it from the reader.
+    let present: std::collections::HashSet<&str> =
+        all_entries.iter().map(|entry| entry.path.as_str()).collect();
     let adopted = ADOPTED_PATHS.lock().map(|paths| paths.clone()).unwrap_or_default();
     for path in adopted.iter().filter(|path| !present.contains(path.as_str())) {
         let Some(whiteout) = whiteout_tar_path(path) else {
@@ -2825,8 +3072,12 @@ fn import_writable_layer(
             }
         }
 
+        let mut seeded_type = litebox::fs::FileType::RegularFile;
+        let mut seeded_payload: Vec<u8> = Vec::new();
+
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
+                seeded_type = litebox::fs::FileType::Directory;
                 // Ignore AlreadyExists: the guest's default fs layout may have already created
                 // this directory (e.g. `/tmp`, `/etc`).
                 let _ = fs.mkdir(&*path, mode);
@@ -2837,10 +3088,13 @@ fn import_writable_layer(
             // blocking for a writer. `AlreadyExists` is fine: these archives are round-tripped
             // between a parent and its cross-process `fork()` children, so a child's export
             // restates everything it adopted.
-            tar::EntryType::Fifo => match fs.make_fifo(&*path, mode) {
-                Ok(()) | Err(litebox::fs::errors::MkdirError::AlreadyExists) => {}
-                Err(e) => return Err(anyhow!("failed to recreate fifo {path}: {e:?}")),
-            },
+            tar::EntryType::Fifo => {
+                seeded_type = litebox::fs::FileType::Fifo;
+                match fs.make_fifo(&*path, mode) {
+                    Ok(()) | Err(litebox::fs::errors::MkdirError::AlreadyExists) => {}
+                    Err(e) => return Err(anyhow!("failed to recreate fifo {path}: {e:?}")),
+                }
+            }
             tar::EntryType::Symlink => {
                 let target = entry
                     .link_name()
@@ -2848,6 +3102,8 @@ fn import_writable_layer(
                     .ok_or_else(|| anyhow!("symlink entry {path} has no target"))?
                     .to_string_lossy()
                     .into_owned();
+                seeded_type = litebox::fs::FileType::Symlink;
+                seeded_payload = target.as_bytes().to_vec();
                 match fs.symlink(&*target, &*path) {
                     Ok(()) => {}
                     // Replace an existing link, for the same round-tripping reason as above --
@@ -2865,6 +3121,7 @@ fn import_writable_layer(
                 let mut contents = Vec::new();
                 std::io::Read::read_to_end(&mut entry, &mut contents)
                     .map_err(|e| anyhow!("failed to read {path} from archive: {e}"))?;
+                seeded_payload = contents.clone();
                 // Some archives (e.g. ones built by appending individual files with
                 // `tarfile.open(path, 'a')` or GNU `tar -r` rather than a full
                 // directory-recursive `tar -c`) omit the intermediate `Directory`
@@ -2910,6 +3167,26 @@ fn import_writable_layer(
         }
         let _ = fs.chmod(&*path, mode);
         let _ = fs.chown(&*path, Some(owner_user), Some(owner_group));
+        // Remember how this path arrived, so this process's own exit export can leave it out
+        // unless it really changed -- see [`AdoptedState`].
+        if let Ok(mut states) = ADOPTED_STATE.lock() {
+            let blocks = match seeded_type {
+                litebox::fs::FileType::RegularFile => payload_blocks(&seeded_payload),
+                _ => None,
+            };
+            states.push((
+                path.clone(),
+                AdoptedState {
+                    file_type: seeded_type,
+                    mode,
+                    user: owner_user,
+                    group: owner_group,
+                    hash: payload_hash(&seeded_payload),
+                    len: seeded_payload.len() as u64,
+                    blocks,
+                },
+            ));
+        }
     }
     if diag {
         eprintln!(

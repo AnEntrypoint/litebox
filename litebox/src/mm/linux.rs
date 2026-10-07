@@ -158,6 +158,20 @@ bitflags::bitflags! {
         /// Linux's `fork()` + `MAP_PRIVATE` file mapping does.
         const VM_PRIVATE_FILE_COW = 1 << 11;
 
+        /// Set by `madvise(MADV_DONTFORK)` and cleared by `MADV_DOFORK`: the range is NOT copied
+        /// into a `fork()` child, which simply has no mapping there afterwards.
+        ///
+        /// It lives in this flag word for the same reason [`Self::VM_PRIVATE_FILE_COW`] does: the
+        /// word is what crosses a `fork()`, copied verbatim by [`Vmem::duplicate`]. Before this
+        /// existed the advice was a documented no-op, which is a real gap now that fork works --
+        /// an allocator that marks its arena `MADV_DONTFORK` (so a forked child does not inherit
+        /// gigabytes of heap it will never touch) got a full copy anyway.
+        ///
+        /// Linux's own `VM_DONTCOPY` is NOT inherited by the child, and neither is this: the range
+        /// it marks is the one thing `duplicate()` withholds, so nothing carrying the bit reaches
+        /// the child's own VMA list at all.
+        const VM_DONT_FORK = 1 << 12;
+
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
             | Self::VM_EXEC.bits();
@@ -2061,6 +2075,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let mut brk_relocation: Option<(Range<usize>, usize)> = None;
 
         for (range, vma) in regions {
+            // `madvise(MADV_DONTFORK)`: this range is withheld from the child, which ends up with
+            // NO mapping here -- a hole, not a copy. It still counted towards its group's reserved
+            // span above, so every other region in that group keeps the exact relative offset it
+            // had in the parent and no RIP-relative reference across the gap moves; skipping the
+            // region later (rather than filtering it out of `regions` up front) is what preserves
+            // that. This is the only consumer of `VM_DONT_FORK`.
+            if vma.flags.contains(VmFlags::VM_DONT_FORK) {
+                continue;
+            }
             let page_range = PageRange::<ALIGN>::new(range.start, range.end)
                 .ok_or(VmemDuplicateError::UnAligned)?;
             let (_, length) = page_range.start_and_length();
@@ -2870,6 +2893,73 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     },
                 ),
             );
+            if !before.is_empty() {
+                let before_end = before.end;
+                self.vmas.insert(before, with_headroom(before_end, vma));
+            }
+            if !after.is_empty() {
+                let after_end = after.end;
+                self.vmas.insert(after, with_headroom(after_end, vma));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Turn `set` on and `clear` off in every VMA overlapping `range`, splitting the VMAs at the
+    /// range's edges and leaving the platform's page permissions alone.
+    ///
+    /// This is how `madvise(MADV_DONTFORK)` / `MADV_DOFORK` travel: the advice is a property of
+    /// the VMA, not of the pages, so unlike [`Vmem::protect_mapping`] there is no
+    /// `update_permissions` call here -- the guest's view of the bytes does not change. The split
+    /// itself is the same three-way one (before / intersection / after), including the
+    /// `reserved_extra` rule, because a partially-advised VMA becomes two VMAs that each have to
+    /// carry the right growth headroom for `Vmem::duplicate`'s group spans to stay correct.
+    ///
+    /// An empty overlap is `InvalidRange`, which `madvise(2)` reports as `ENOMEM`.
+    pub(super) fn update_range_flags(
+        &mut self,
+        range: PageRange<ALIGN>,
+        set: VmFlags,
+        clear: VmFlags,
+    ) -> Result<(), VmemProtectError> {
+        let range = range.start..range.end;
+        let mut mappings_to_change = Vec::new();
+        for (r, vma) in self.vmas.overlapping(range.clone()) {
+            mappings_to_change.push((r.start, r.end, *vma));
+        }
+        if mappings_to_change.is_empty() {
+            return Err(VmemProtectError::InvalidRange(range));
+        }
+
+        for (start, end, vma) in mappings_to_change {
+            if start >= range.start && end <= range.end {
+                // Wholly inside the advised range: the advice applies to the whole VMA, so it is
+                // rewritten in place and no split is needed.
+                let mut advised = vma;
+                advised.flags = (vma.flags | set) & !clear;
+                self.vmas.remove(start..end);
+                self.vmas.insert(start..end, advised);
+                continue;
+            }
+            self.vmas.remove(start..end);
+            let intersection = range.start.max(start)..range.end.min(end);
+            let before = start..intersection.start;
+            let after = intersection.end..end;
+            // Only the slice that still ends at the ORIGINAL `end` owns the growth headroom --
+            // see `protect_mapping`'s identical `with_headroom` rule.
+            let with_headroom = |slice_end: usize, mut v: VmArea<Platform, ALIGN>| {
+                if slice_end != end {
+                    v.reserved_extra = 0;
+                }
+                v
+            };
+            let mut advised = vma;
+            advised.flags = (vma.flags | set) & !clear;
+            let intersection_end = intersection.end;
+            self.vmas
+                .insert(intersection, with_headroom(intersection_end, advised));
+            // The untouched remainder keeps the flags it had, including NOT carrying the advice.
             if !before.is_empty() {
                 let before_end = before.end;
                 self.vmas.insert(before, with_headroom(before_end, vma));

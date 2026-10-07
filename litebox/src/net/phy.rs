@@ -48,6 +48,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let received = if let Some(packet) = self.loopback.pop_front() {
             let size = packet.len().min(DEVICE_MTU);
+            diag_loop("delivered", &packet[..size], self.loopback.len());
             self.receive_buffer[..size].copy_from_slice(&packet[..size]);
             Some(size)
         } else {
@@ -112,6 +113,56 @@ fn is_local_ipv4(packet: &[u8]) -> bool {
         && (packet[16] == 127 || packet[16..20] == super::INTERFACE_IP_ADDR.octets())
 }
 
+/// One `diag-loop` line for a guest-to-guest packet, at whichever end of [`Device::loopback`] it
+/// passes: `sent` is the push in [`TxToken::consume`], `delivered` the pop in [`Device::receive`].
+///
+/// [`Device::loopback`] is the ONLY path such a packet takes and `platform`'s send/receive hooks
+/// never see it, so an instrument placed there is blind to exactly the traffic a probe generates
+/// when it dials a port in its own guest: chrF21 logged 68 connect refusals on 8081 and not one
+/// `diag-loop` line, because every packet that decided them went through this queue. Seeing both
+/// ends is what separates "the SYN was never taken off the queue" from "the SYN was delivered and
+/// answered with an RST", which no amount of port bookkeeping can distinguish.
+///
+/// Only SYN/FIN/RST are logged as they pass; the rest are counted and sampled 1-in-512, because a
+/// stream's own data packets would otherwise be the whole log.
+fn diag_loop(dir: &'static str, packet: &[u8], depth: usize) {
+    if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return;
+    }
+    let ihl = ((packet[0] & 0xf) as usize) * 4;
+    if packet.len() < ihl + 20 {
+        return;
+    }
+    let tcp = &packet[ihl..];
+    let flags = tcp[13];
+    if flags & 0x07 == 0 {
+        static OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+            return;
+        }
+    }
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    // Bound as locals and handed over as `&str`: the log macro takes a `str` value, and an owned
+    // `String` written straight into the field list does not satisfy it.
+    let src = alloc::format!(
+        "{}.{}.{}.{}:{}",
+        packet[12], packet[13], packet[14], packet[15],
+        u16::from_be_bytes([tcp[0], tcp[1]])
+    );
+    let dst = alloc::format!(
+        "{}.{}.{}.{}:{}",
+        packet[16], packet[17], packet[18], packet[19],
+        u16::from_be_bytes([tcp[2], tcp[3]])
+    );
+    litebox_util_log::debug!(
+        tag = super::host_process_tag(), dir:% = dir, depth = depth,
+        src = src.as_str(), dst = dst.as_str(),
+        flags = flags, seq = seq, ack = ack;
+        "diag-loop: a guest-to-guest TCP packet crossed the loopback queue"
+    );
+}
+
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<'_, Platform> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -121,6 +172,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
         let res = f(packet);
         if is_local_ipv4(packet) {
             self.loopback.push_back(packet.to_vec());
+            diag_loop("sent", packet, self.loopback.len());
         } else {
             self.platform
                 .send_ip_packet(packet)

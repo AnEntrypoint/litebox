@@ -1991,6 +1991,21 @@ pub trait SystemInfoProvider {
         true
     }
 
+    /// The host-level process id of the process calling this, or `0` when the platform cannot say.
+    ///
+    /// Identity a LIVENESS question can be asked about, which a value that merely differs between
+    /// processes is not: `Network` records this as the owner of a listening port's accept queue and
+    /// later asks [`Self::is_process_alive`] about that recorded value, so a tag, an address or a
+    /// per-process counter would let two processes look different without ever answering "is the
+    /// recorded one gone". `0` is not a valid pid, so every caller reads it as "unknown" and
+    /// declines to act rather than guessing.
+    ///
+    /// Default `0` for the same reason `is_process_alive` defaults to `true`: a platform that
+    /// cannot answer keeps its prior behavior instead of driving a decision it cannot support.
+    fn current_pid(&self) -> u32 {
+        0
+    }
+
     /// Real host memory, as `(total_kb, available_kb)`, for `/proc/meminfo`.
     ///
     /// # Why this must be real, not a fixed value

@@ -802,6 +802,7 @@ impl<
                     | TruncateError::IsTerminalDevice
                     | TruncateError::ClosedFd
                     | TruncateError::PathOnlyFd
+                    | TruncateError::FileTooLarge
                     | TruncateError::Io,
                 )
                 | OpenError::PathError(
@@ -1368,6 +1369,11 @@ impl<
                                     }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),
+                                // A size the lower layer cannot back is a refusal of THIS size,
+                                // not a reason to copy the file up and try the same size again.
+                                Err(TruncateError::FileTooLarge) => {
+                                    Err(TruncateError::FileTooLarge)
+                                }
                             }
                         } else {
                             // The lower level truncate will correctly identify dir/file and handle

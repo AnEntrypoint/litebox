@@ -863,6 +863,22 @@ impl RawDescriptorStorage {
         new
     }
 
+    /// The raw integer [`Self::fd_into_raw_integer`] would assign next, without storing
+    /// anything.
+    ///
+    /// Lets a caller enforce its own limit BEFORE handing a descriptor over: `fd_into_raw_integer`
+    /// consumes the `TypedFd`, so an over-limit slot could otherwise only be undone by peeling the
+    /// descriptor back out of the table, which needs an owned `TypedFd` the table cannot always
+    /// give back (see `litebox_shim_linux`'s `FilesState::insert_raw_fd`, whose `Err` variant
+    /// hands the descriptor to its caller so it can be closed).
+    #[must_use]
+    pub fn next_free_raw_integer(&self) -> usize {
+        self.stored_fds
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.stored_fds.len())
+    }
+
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.

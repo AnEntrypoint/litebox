@@ -824,6 +824,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         shared_flock: syscalls::file::SharedFlockTable::new(&platform),
                         record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
+                        shared_record_locks: syscalls::file::SharedRecordLockTable::new(&platform),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
                         process_table: syscalls::signal::xproc::SharedProcessTable::new(
                             self.platform,
@@ -2566,7 +2567,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // `read()` of a subprocess's stdout pipe or a socket.
                     match self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset) {
                         Ok(cur_loc) => self
-                            .pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                            .pread_with_user_buf(
+                                fd,
+                                buf,
+                                count,
+                                i64::try_from(cur_loc).map_err(|_| Errno::EINVAL)?,
+                            )
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
                                 self.sys_lseek(
@@ -2574,19 +2580,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
                                 )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
-                                .expect("lseek failed");
+                                .map(|_| ())
+                                .unwrap_or(());
                             }),
                         Err(Errno::EBADF) => Err(Errno::EBADF),
                         Err(Errno::ESPIPE) => self.read_with_user_buf_no_offset(fd, buf, count),
-                        Err(Errno::EINVAL) => {
-                            unreachable!(
-                                "seekable file should not return EINVAL when getting current offset"
-                            );
-                        }
-                        Err(e) => {
-                            unimplemented!("unexpected error from lseek: {}", e);
-                        }
+                        Err(e) => Err(e),
                     }
                 }
             }
@@ -4222,9 +4221,21 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `flock_registry` alone had stopped doing (`.wfgy/flockx1.sh`).
     shared_flock: syscalls::file::SharedFlockTable<Platform>,
     /// POSIX (`fcntl`) record locks held by any guest process, owned by pid.
+    ///
+    /// Only reachable through `GlobalStateHandle::record_locks()` when the platform has NATIVE
+    /// `fork()`: a `Vec` allocates on the heap of the process that first pushed to it, so a
+    /// cross-process `fork()` child would read another process's addresses. On Windows that
+    /// accessor therefore hands out a per-process table instead, which is why cross-process
+    /// exclusion lives in `shared_record_locks` below.
     record_locks: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::file::RecordLock>>,
     /// Woken whenever a record lock is released, so `F_SETLKW` waiters retry.
     record_lock_pollee: litebox::event::polling::Pollee<Platform>,
+    /// Cross-process `fcntl(2)` record-lock exclusion: a fixed array of flat, pointer-free rows in
+    /// the shared kernel arena, one per byte-range claim, with cross-process waiter wakeup. Same
+    /// shape and same reasons as `shared_flock` above, but keyed per (process, range) rather than
+    /// per file, because POSIX record locks exclude by byte range. Without it two guest processes
+    /// running in different host processes are BOTH granted the same write lock (`.wfgy/reclock1.sh`).
+    shared_record_locks: syscalls::file::SharedRecordLockTable<Platform>,
     // NOTE: this struct deliberately has NO `pty_registry`/`daemon_pty_masters` fields --
     // ELEVENTH instance of the SAME cross-process-garbage-pointer defect class documented on
     // `GlobalStateHandle`'s own doc comment. Unlike `fifo_registry` (whose own doc comment

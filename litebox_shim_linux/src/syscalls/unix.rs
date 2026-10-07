@@ -694,10 +694,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
             cloexec: bool,
         ) -> Result<usize, ()> {
             if cloexec {
-                let old = litebox
+                // `MSG_CMSG_CLOEXEC` on an fd that is ALREADY close-on-exec is a no-op, so
+                // `set_fd_metadata` may legitimately hand back the flag it just replaced. Never
+                // assert on that: this runs on every donated fd, and an idempotent request must
+                // not take the whole session down.
+                let _ = litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(&fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
-                debug_assert!(old.is_none());
             }
             files.insert_raw_fd(fd).map_err(|_| ())
         }
@@ -719,6 +722,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
         // reporting `MSG_CTRUNC` rather than failing the whole read (the byte payload the fd was
         // sent alongside has already been legitimately delivered by this point).
         res.map_err(|()| Errno::EMFILE)
+    }
+
+    /// Releases a duplicate [`crate::syscalls::net::Task::resolve_scm_rights_fds`] made for a
+    /// donation that is actually crossing a PROCESS boundary: that data plane carries a descriptor
+    /// as a text spec (`RingFdMail`, rebuilt by the receiver) and never hands the `TypedFd` to
+    /// anyone, so the duplicate would otherwise sit in the SENDER's descriptor table for the rest
+    /// of the session.
+    ///
+    /// That residue is not a harmless fd leak. The duplicate holds an `Arc` reference to the same
+    /// descriptor entry, so the sender's own later `close(2)` of the donated fd sees a shared entry
+    /// and gets `CloseResult::Duplicated` -- which never runs the subsystem close. Measured
+    /// (xproc29): a listening socket donated to a fork child and then closed by the parent, with
+    /// the child reaped, still answered its port (`CONNECTED`) where a listener closed without a
+    /// donation is `ECONNREFUSED`; the same residue is what makes the shared socket table grow
+    /// monotonically across a run that frees every socket it opens (xproc28: `sockets=24` ->
+    /// `sockets=46`).
+    ///
+    /// [`litebox::fd::Descriptors::remove`] drops exactly this process's reference and nothing
+    /// more: the sender's own fd keeps the object alive. It hands the entry back only when no other
+    /// reference is left (the sender closed its own fd concurrently), and that one is closed
+    /// properly instead of dropped.
+    pub(super) fn release_undelivered_duplicate(self, global: &GlobalStateHandle<Platform, FS>) {
+        fn go<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalStateHandle<Platform, FS>,
+            fd: litebox::fd::TypedFd<S>,
+        ) {
+            let _ = global.litebox.descriptor_table_mut().remove(&fd);
+        }
+        match self {
+            AnyDupFd::Fs(fd) => go(global, fd),
+            AnyDupFd::Pipes(fd) => go(global, fd),
+            AnyDupFd::Eventfd(fd) => go(global, fd),
+            AnyDupFd::Epoll(fd) => go(global, fd),
+            AnyDupFd::Unix(fd) => go(global, fd),
+            AnyDupFd::Pty(fd) => go(global, fd),
+            AnyDupFd::Signalfd(fd) => go(global, fd),
+            AnyDupFd::Timerfd(fd) => go(global, fd),
+            AnyDupFd::Netlink(fd) => go(global, fd),
+            AnyDupFd::Net(fd) => global.net_lock().release_duplicate_descriptor(&fd),
+            // A `Carried` spec is a plain string: nothing was duplicated for it.
+            AnyDupFd::Carried(_) => {}
+        }
     }
 }
 
@@ -928,18 +973,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// Prefers an atomic all-or-nothing write (temporary backpressure resolves via the normal
     /// `EAGAIN`-then-retry path); a byte stream degrades to a genuine short write only for a
     /// single message bigger than the whole ring, a record-framed slot refuses one (`EMSGSIZE`).
-    fn send(&self, msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
-        let fd_specs = if msg.fds.is_empty() {
+    fn send(&self, mut msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
+        // This data plane carries a donated descriptor as its TEXT SPEC alone (`RingFdMail`,
+        // rebuilt on the receiving side), so the `TypedFd`s `resolve_scm_rights_fds` duplicated
+        // into this process's descriptor table have no receiver here. Release them now, before
+        // every path out of this function -- a `Message` handed back to the caller on error is
+        // dropped there, which would leave them behind just the same. See
+        // `AnyDupFd::release_undelivered_duplicate` for why leaving them behind keeps the donated
+        // object open forever.
+        let donated = core::mem::take(&mut msg.fds);
+        let n_donated = donated.len();
+        for fd in donated {
+            fd.release_undelivered_duplicate(self.global);
+        }
+        let fd_specs = if n_donated == 0 {
             None
         } else {
             let specs: Option<Vec<&str>> = msg.fd_specs.iter().map(|s| s.as_deref()).collect();
             let joined = specs
-                .filter(|s| s.len() == msg.fds.len())
+                .filter(|s| s.len() == n_donated)
                 .map(|s| s.join("\u{1e}"))
                 .filter(|s| s.len() <= RING_FD_MAIL_SPEC_BYTES);
             let Some(joined) = joined else {
+                // A donation this data plane cannot carry whole travels as NOTHING -- not even
+                // the parts that had a spec -- so each of those specs' placeholder holds dies
+                // with this message unless it is released here (see
+                // `UnixSocket::release_unadopted_carries`).
+                UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
                 litebox_util_log::warn!(
-                    slot:% = self.slot, n_fds:% = msg.fds.len();
+                    slot:% = self.slot, n_fds:% = n_donated;
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
                      files, pty slaves, eventfds, shm/memfd snapshots and unix sockets that \
                      `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound or \
@@ -955,10 +1017,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         let (_, write_ring) = self.rings();
         if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
         {
+            UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
             return Err((msg, Errno::EPIPE));
         }
         if self.slot_ref().framed.load(Ordering::Acquire) {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
+                UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
                 return Err((msg, Errno::EMSGSIZE));
             }
             return if write_ring.try_write_record_with_fds(&msg.data, fd_specs) {
@@ -969,6 +1033,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             };
         }
         if msg.data.is_empty() {
+            // Linux drops ancillary data sent with no real data at all, so these fds go nowhere
+            // -- which is exactly a carry that has to be released here.
+            UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
             return Ok(0);
         }
         if msg.data.len() > SHARED_UNIX_CONN_BUF {
@@ -1372,7 +1439,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             } else {
                 read_ring.try_write_all(&data)
             };
-            debug_assert!(written, "capacity was checked above");
+            if !written {
+                // Both branches above bound `need` against the ring's capacity before this
+                // point (the fresh-slot one against `SHARED_UNIX_CONN_BUF`, the existing-slot
+                // one against `free_space()`), so this is unreachable today -- but a
+                // `debug_assert!` is compiled out of the release binary while the loop it
+                // guards is not, and silently dropping the rest of the peer's queued data is
+                // worse than refusing the promotion. `fork_carry` then keeps the fork on the
+                // thread-based path, as it already does for every other `Err` here.
+                return Err("more unread data queued on a unix socket than its shared ring holds");
+            }
         }
         if first_promotion && recv_channel.is_peer_shutdown() {
             read_ring.shutdown();
@@ -1405,7 +1481,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     /// for an over-sized single write (see [`SharedView::send`]).
     fn try_sendto(
         &self,
-        msg: Message<Platform, FS>,
+        mut msg: Message<Platform, FS>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<usize, (Message<Platform, FS>, Errno)> {
         let (connected_send_channel, link) = match &self.transport {
             ConnTransport::Shared { .. } => {
@@ -1422,6 +1499,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             drop(_guard);
             return view.send(msg);
         }
+        // An in-process delivery hands the receiver a real duplicate of every donated fd, so no
+        // spec travels and the placeholder hold `Task::scm_carry_spec` counted on the donated
+        // endpoint's shared slot has nothing left to keep alive. Release it here, and take the
+        // specs out of the message so a retry of the SAME message cannot release that hold a
+        // second time: an extra release underflows the side's holder count and frees a slot
+        // another endpoint is still reading.
+        UnixSocket::<Platform, FS>::release_unadopted_carries(
+            global,
+            &core::mem::take(&mut msg.fd_specs),
+        );
         // TODO: write partial data?
         let len = msg.data.len();
         let sock_id = self as *const _ as usize;
@@ -2192,13 +2279,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         addr: Option<UnixSocketAddr>,
         fds: Vec<AnyDupFd<Platform, FS>>,
         fd_specs: Vec<Option<String>>,
+        global: &GlobalStateHandle<Platform, FS>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message {
             data: buf.to_vec(),
             fds,
             fd_specs,
         });
-        wait_on_events_polling(
+        let res = wait_on_events_polling(
             &cx.with_timeout(timeout),
             is_nonblocking,
             Events::OUT,
@@ -2217,7 +2305,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     if addr.is_some() {
                         return Err(TryOpError::Other(Errno::EISCONN));
                     }
-                    match conn.try_sendto(msg.take().unwrap()) {
+                    match conn.try_sendto(msg.take().unwrap(), global) {
                         Ok(n) => Ok(n),
                         Err((m, Errno::EAGAIN)) => {
                             let _ = msg.replace(m);
@@ -2228,7 +2316,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 })
             },
         )
-        .map_err(Errno::from)
+        .map_err(Errno::from);
+        // A message the loop never posted -- `SO_SNDTIMEO` expired, or the connection was gone
+        // before the first try -- still carries every donated fd's placeholder hold. Those are
+        // released here and nowhere else: the retry path deliberately keeps them, because the
+        // same message is offered again and its specs are what travel on success.
+        if let Some(msg) = msg {
+            UnixSocket::<Platform, FS>::release_unadopted_carries(global, &msg.fd_specs);
+        }
+        res
     }
 
     fn recvfrom(
@@ -2953,6 +3049,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     addr,
                     fds,
                     fd_specs,
+                    &task.global,
                 )
             }
             UnixSocketInner::Datagram(datagram) => {
@@ -4357,11 +4454,12 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
 /// value ever built on the stack is a single ~14.5 KiB slot.
 pub(crate) struct SharedUnixConnTable<Platform: ShimPlatform> {
     slots: &'static mut [SharedConnSlot<Platform>],
-    /// `false` only when the arena allocation itself failed and [`Self::new`] fell back to a
-    /// process-private one: such a table can never serve a genuinely cross-process connection
-    /// (another process has no way to reach those bytes), so [`Self::alloc`] refuses everything
-    /// instead of handing out indices into memory no peer can see. Degrades every cross-process
-    /// AF_UNIX attempt to its ordinary errno path; never a panic.
+    /// `false` whenever [`Self::new`] could not place the pool in the cross-process shared arena
+    /// (whether it then fell back to a process-private allocation or got no memory at all): such
+    /// a table can never serve a genuinely cross-process connection (another process has no way to
+    /// reach those bytes), so [`Self::alloc`] refuses everything instead of handing out indices
+    /// into memory no peer can see. Degrades every cross-process AF_UNIX attempt to its ordinary
+    /// errno path; never a panic.
     arena_backed: bool,
 }
 
@@ -4377,30 +4475,52 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             core::alloc::Layout::array::<SharedConnSlot<Platform>>(SHARED_UNIX_CONN_CAPACITY)
                 .expect("SHARED_UNIX_CONN_CAPACITY slot-array layout computation cannot overflow");
         let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let arena_backed = arena.is_some();
-        let ptr = arena
-            .unwrap_or_else(|| {
-                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Fall back to a leaked process-private
-                // allocation so every later `get`/`free` stays memory-safe, and let `alloc`
-                // refuse everything via `arena_backed`.
+        // Same shape as `SharedProcessTable::new`'s own arena handling: a pool this process
+        // cannot place is an EMPTY pool, never a panic -- `alloc` then refuses every caller,
+        // exactly as `arena_backed == false` already does, and cross-process AF_UNIX degrades
+        // to the in-process path instead of the session dying here.
+        let (ptr, count, arena_backed) = match arena {
+            Some(ptr) => (
+                ptr.cast::<SharedConnSlot<Platform>>(),
+                SHARED_UNIX_CONN_CAPACITY,
+                true,
+            ),
+            None => {
                 litebox_util_log::error!(
                     capacity:% = SHARED_UNIX_CONN_CAPACITY,
                     bytes:% = layout.size();
                     "shared unix connection table: shared kernel arena exhausted; cross-process \
                      AF_UNIX is disabled in this process"
                 );
-                // SAFETY: `layout` has a non-zero size (`SHARED_UNIX_CONN_CAPACITY` slots).
-                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                    .expect("shared unix connection table: fallback allocation failed")
-            })
-            .cast::<SharedConnSlot<Platform>>();
-        for i in 0..SHARED_UNIX_CONN_CAPACITY {
-            // SAFETY: `ptr` names `SHARED_UNIX_CONN_CAPACITY` contiguous, uninitialized
-            // `SharedConnSlot`s per `layout`, so `add(i)` stays inside that region for every
-            // `i < SHARED_UNIX_CONN_CAPACITY`, and `write`-ing a freshly built value into
-            // uninitialized memory (rather than dropping a prior one) is exactly what `write` is
-            // for. Writing them ONE AT A TIME through the pointer is the entire point of this
+                match core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) }) {
+                    Some(ptr) => (
+                        ptr.cast::<SharedConnSlot<Platform>>(),
+                        SHARED_UNIX_CONN_CAPACITY,
+                        false,
+                    ),
+                    None => {
+                        // Both the shared arena AND the process heap refused the pool. An empty
+                        // slot slice is a valid, never-dereferenced stand-in: it hands out no
+                        // index, so every caller takes its "no slot available" path.
+                        litebox_util_log::error!(
+                            bytes:% = layout.size();
+                            "shared unix connection table: fallback allocation failed; \
+                             cross-process AF_UNIX is disabled in this process"
+                        );
+                        (
+                            core::ptr::NonNull::<SharedConnSlot<Platform>>::dangling(),
+                            0,
+                            false,
+                        )
+                    }
+                }
+            }
+        };
+        for i in 0..count {
+            // SAFETY: `ptr` names `count` contiguous, uninitialized `SharedConnSlot`s per
+            // `layout`, so `add(i)` stays inside that region for every `i < count`, and
+            // `write`-ing a freshly built value into uninitialized memory (rather than dropping a
+            // prior one) is exactly what `write` is for. Writing them ONE AT A TIME through the pointer is the entire point of this
             // function: `SharedConnSlot::new_empty()` is ~14.5 KiB of stack at a time, where a
             // `[SharedConnSlot; SHARED_UNIX_CONN_CAPACITY]` value would be ~15 MiB of it.
             unsafe {
@@ -4408,14 +4528,13 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             }
         }
         Self {
-            // SAFETY: `ptr` is non-null, aligned per `layout`, and all `SHARED_UNIX_CONN_CAPACITY`
-            // slots at it were just initialized by the loop above. `'static` is sound because this
-            // allocation is arena-backed and never reclaimed (or, on the fallback path, a leaked
-            // global-allocator allocation), and nothing else holds a reference to it, so handing
-            // out an exclusive `&'static mut` is sound.
-            slots: unsafe {
-                core::slice::from_raw_parts_mut(ptr.as_ptr(), SHARED_UNIX_CONN_CAPACITY)
-            },
+            // SAFETY: `ptr` is non-null, aligned per `layout`, and all `count` slots at it were
+            // just initialized by the loop above (`count` is 0 only on the "no memory at all"
+            // path, where a zero-length slice is never dereferenced). `'static` is sound because
+            // this allocation is arena-backed and never reclaimed (or, on the fallback path, a
+            // leaked global-allocator allocation), and nothing else holds a reference to it, so
+            // handing out an exclusive `&'static mut` is sound.
+            slots: unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), count) },
             arena_backed,
         }
     }
@@ -5270,6 +5389,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             is_client,
         }
         .release_holder_for(release_host);
+    }
+
+    /// [`Self::release_unadopted_carry`] for every spec a message still holds: the placeholder
+    /// holds are counted one per donated fd (`Task::scm_carry_spec`), so "release this message's
+    /// carries" means releasing each of its specs.
+    ///
+    /// Called on every exit that does not post the specs as fd mail -- an in-process delivery that
+    /// hands the receiver real duplicates instead, a donation the data plane refuses, a give-up
+    /// after a full ring. A `C` spec that DOES travel is released by whoever rebuilds it
+    /// (`Self::from_fork_spec`) or drops it (`Self::recvfrom`); any other exit leaks one holder
+    /// count per donated socket, and a leaked count keeps its slot both `OCCUPIED` and
+    /// `held_live` -- "gone" is host-process liveness, not fd state -- until this whole host
+    /// process exits. `chrF15` (2026-10-06) filled all 4096 slots that way inside a minute and
+    /// left every later carry refused with `shared unix connection table full`.
+    pub(super) fn release_unadopted_carries(
+        global: &GlobalStateHandle<Platform, FS>,
+        specs: &[Option<String>],
+    ) {
+        for spec in specs.iter().flatten() {
+            Self::release_unadopted_carry(global, spec);
+        }
     }
 
     /// Rebuilds, in a cross-process fork child, the socket a parent's [`Self::fork_carry`]

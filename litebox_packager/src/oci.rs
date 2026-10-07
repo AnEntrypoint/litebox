@@ -433,14 +433,24 @@ pub mod cache {
         }
     }
 
+    /// An image reference flattened into a filename-safe stem: every character a Windows filename
+    /// rejects becomes `_`.
+    fn safe_image_ref(image_ref: &str) -> String {
+        image_ref
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .collect()
+    }
+
     /// Where the resolved layer list for an image reference is recorded (see
     /// [`store_resolved_layers`]).
     fn resolved_layers_path(image_ref: &str) -> PathBuf {
-        let safe: String = image_ref
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
-            .collect();
-        Path::new(CACHE_DIR).join(format!("ref_{safe}.layers.json"))
+        Path::new(CACHE_DIR).join(format!("ref_{}.layers.json", safe_image_ref(image_ref)))
+    }
+
+    /// Where the image's own `Env` is recorded (see [`store_image_env`]).
+    fn image_env_path(image_ref: &str) -> PathBuf {
+        Path::new(CACHE_DIR).join(format!("ref_{}.env.json", safe_image_ref(image_ref)))
     }
 
     /// Records the layer list `image_ref` resolved to, so a later run can start without the
@@ -461,6 +471,30 @@ pub mod cache {
         std::fs::read_to_string(resolved_layers_path(image_ref))
             .ok()
             .filter(|json| !json.trim().is_empty())
+    }
+
+    /// Records the `Env` the image's own config blob declared, so a run that never fetches the
+    /// manifest (every cross-process fork child, and any `LITEBOX_OCI_USE_LAST_RESOLVED` run) still
+    /// starts the guest with the environment its image asked for. Best effort, like
+    /// [`store_resolved_layers`]: a failure to write costs only the environment, never the run.
+    pub fn store_image_env(image_ref: &str, env: &[String]) {
+        let Ok(json) = serde_json::to_string(env) else {
+            return;
+        };
+        let path = image_env_path(image_ref);
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::create_dir_all(CACHE_DIR).is_ok() && std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The `Env` recorded by the last manifest fetch for `image_ref`, if any.
+    pub fn load_image_env(image_ref: &str) -> Option<Vec<String>> {
+        let json = std::fs::read_to_string(image_env_path(image_ref))
+            .ok()
+            .filter(|json| !json.trim().is_empty())?;
+        serde_json::from_str(&json).ok()
     }
 
     /// Build the cache file path for a given layer digest (e.g. `sha256:abcd...`) and rewriter
@@ -763,6 +797,31 @@ pub mod cache {
     }
 }
 
+/// `config.Env` out of an OCI image config blob -- the environment every real container runtime
+/// gives the container it starts. `None` when the blob is not an image config or carries no
+/// string-array `Env`: an unexpected blob costs the guest its image environment, never the run.
+fn parse_image_env(config_json: &str) -> Option<Vec<String>> {
+    let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    let env = config.get("config")?.get("Env")?.as_array()?;
+    Some(
+        env.iter()
+            .filter_map(|entry| entry.as_str())
+            .filter(|entry| entry.contains('='))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The environment the image itself declared, as recorded by the last pull that actually fetched
+/// the manifest. Empty -- never an error -- when nothing is recorded yet, or when
+/// `LITEBOX_IMAGE_ENV_OFF` is set.
+pub fn image_env(image_ref: &str) -> Vec<String> {
+    if std::env::var_os("LITEBOX_IMAGE_ENV_OFF").is_some_and(|v| v != "0") {
+        return Vec::new();
+    }
+    cache::load_image_env(image_ref).unwrap_or_default()
+}
+
 /// Pull an OCI image's manifest and every layer's bytes into memory, decompressing gzip layers
 /// as they arrive and rewriting each layer's executable ELFs immediately afterward, before
 /// moving to the next layer -- the runtime-loading counterpart to [`pull_and_extract`]. Only ONE
@@ -943,7 +1002,7 @@ fn pull_layers_in_memory_impl(
             for attempt in 1..=3u32 {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(45),
-                    client.pull_image_manifest(&reference, &auth),
+                    client.pull_manifest_and_config(&reference, &auth),
                 )
                 .await;
                 match result {
@@ -960,7 +1019,7 @@ fn pull_layers_in_memory_impl(
                     eprintln!("  Manifest fetch attempt {attempt}/3 failed, retrying");
                 }
             }
-            let (manifest, _digest) = fetched.ok_or_else(|| {
+            let (manifest, _digest, config_json) = fetched.ok_or_else(|| {
                 last_err
                     .unwrap_or_else(|| anyhow::anyhow!("no attempt made"))
                     .context(format!("failed to pull manifest for {reference}"))
@@ -972,15 +1031,18 @@ fn pull_layers_in_memory_impl(
                 );
             }
 
-            // No image-config blob pull here, unlike `pull_and_extract`: `PulledLayers` has no
-            // `config`/`config_json` field and neither runtime caller
-            // (`litebox_runner_linux_on_windows_userland`) ever reads one -- the program to run
-            // is always given explicitly on this runner's own command line, never derived from
-            // the image's ENTRYPOINT/CMD. Fetching and parsing it was pure wasted work: one
-            // whole extra network round-trip (blob GET + the manifest GET above, with no HTTP
-            // keep-alive across them since every cross-process fork child re-execs with a
-            // brand-new `Client`) on every single `--oci-image` boot AND every cross-process fork
-            // of one, for a value nothing downstream ever looked at.
+            // The config blob comes back with the manifest (`pull_manifest_and_config`), and its
+            // `Env` IS the container's starting environment for every real container runtime, so
+            // record it for the run: the guest used to boot with NO environment at all unless `-e`
+            // was passed, which is why in-guest `python3` reported an empty `sys.executable` (its
+            // PATH search had nothing to search) and `HOME`/`TERM` were unset. Recorded to the
+            // cache rather than returned, because this is the ONLY path that ever contacts the
+            // registry: a cross-process fork child resolves nothing and a
+            // `LITEBOX_OCI_USE_LAST_RESOLVED` run contacts nothing, and both still have to boot
+            // with the image's environment.
+            if let Some(env) = parse_image_env(&config_json) {
+                cache::store_image_env(image_ref, &env);
+            }
 
             if verbose {
                 eprintln!("  Pulled manifest ({} layer(s))", manifest.layers.len());

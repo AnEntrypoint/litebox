@@ -63,6 +63,8 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    #[error("the file would be larger than this store can back")]
+    FileTooLarge,
     #[error("I/O error")]
     Io,
 }
@@ -98,6 +100,8 @@ pub enum TruncateError {
     IsTerminalDevice,
     #[error("operation not permitted on an O_PATH file descriptor")]
     PathOnlyFd,
+    #[error("the file would be larger than this store can back")]
+    FileTooLarge,
     #[error("I/O error")]
     Io,
 }

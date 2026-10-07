@@ -943,7 +943,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if self.is_exiting() {
                 return;
             }
-            assert!(!inner.group_exit);
+            // A group exit has already been recorded for this process -- by a sibling thread that
+            // won the race into this function, or by an earlier `exit_group` from this very thread
+            // (e.g. one reached through signal delivery). There is nothing left for this call to
+            // do, and real Linux's `do_group_exit` is idempotent the same way. Marking this thread
+            // exiting too covers the one case the `is_exiting()` check above does not: a thread
+            // that is no longer in `inner.threads` (already detached) was never covered by the
+            // `is_exiting` sweep below, so without this it would keep running guest code inside a
+            // process whose exit status is already set. Never `assert!` here -- a panic on this
+            // path (reachable from the `exit_group` syscall and from signal delivery) kills the
+            // host runner, i.e. the entire guest session.
+            if inner.group_exit {
+                thread.remote.is_exiting.store(true, Ordering::Relaxed);
+                return;
+            }
             inner.exit_status = status;
             inner.group_exit = true;
             // Widens `detach_thread`'s own `notify` condition to also fire at `new_count == 1`
@@ -1804,7 +1817,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Capabilities are not modelled (see `CapBSetRead`): no ambient capability is ever
             // set, and lowering/clearing one is trivially satisfied.
             PrctlArg::CapAmbient(_) => Ok(0),
-            _ => unimplemented!(),
+            _ => Err(Errno::EINVAL),
         }
     }
 
@@ -1830,7 +1843,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
                 Err(Errno::EINVAL)
             }
-            _ => unimplemented!(),
+            _ => Err(Errno::EINVAL),
         }
     }
 }
@@ -3337,9 +3350,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             match found.expect("poll_once only returns true after `found` is set") {
                 AnyChildExit::CrossProcess(cross_pid, raw_exit) => {
-                    let handle = process.find_cross_process_child(cross_pid).expect(
-                        "pid just read from cross_process_children must still be registered",
-                    );
+                    // `poll_once` records this pid and drops the registry lock before returning,
+                    // so another thread of this same process can reap the very same cross-process
+                    // child in between -- Linux answers ECHILD for a pid that is no longer our
+                    // child, and the alternative (`expect`) panics the host runner, which IS the
+                    // whole guest session.
+                    let Some(handle) = process.find_cross_process_child(cross_pid) else {
+                        return Err(Errno::ECHILD);
+                    };
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
                     self.xproc_unregister(cross_pid);
@@ -4256,7 +4274,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // range's own start: the child reserves at the parent's bases, so `translate()` is the
         // identity and `fork_verify` in the child sees no spurious "stale pre-fork pointer".
         let pm = self.process().pm();
-        let layout = pm.tracked_regions();
+        // `madvise(MADV_DONTFORK)`: a range carrying `VM_DONT_FORK` is withheld from the child, so
+        // the child adopts NO VMA for it and has a genuine HOLE there -- a later `mmap` may claim
+        // it, and touching it before that faults, exactly as on real Linux. `Vmem::duplicate`
+        // already does this for the in-process fork path; without it here the advice was a silent
+        // no-op on the production cross-process fork and the child simply got a full copy (madvx1,
+        // 2026-10-07: `dontfork` read exactly like `baseline` -- `child_code=0` where `3` was
+        // required, with the `invalid` guard correctly returning `rc=-1 errno=12`).
+        //
+        // The filter is applied to `layout` ITSELF and not to the vectors derived from it:
+        // `ranges`, the copy groups, `flags`, `executable` and `is_file_backed` have to stay
+        // index-aligned with one another (`vma_layout()` zips them positionally), so filtering one
+        // of them alone shifts every later region onto its neighbour's flags -- which is what an
+        // earlier version of this fix did, and it mislabels every region after a withheld one.
+        let withheld_from_child = |flags: u32| {
+            litebox::mm::linux::VmFlags::from_bits_truncate(flags)
+                .contains(litebox::mm::linux::VmFlags::VM_DONT_FORK)
+        };
+        let tracked = pm.tracked_regions();
+        let withheld: alloc::vec::Vec<core::ops::Range<usize>> = tracked
+            .iter()
+            .filter(|(_, flags, _)| withheld_from_child(*flags))
+            .map(|(range, _, _)| range.clone())
+            .collect();
+        let layout: alloc::vec::Vec<_> = tracked
+            .into_iter()
+            .filter(|(_, flags, _)| !withheld_from_child(*flags))
+            .collect();
         if layout.is_empty() {
             return None;
         }
@@ -4264,6 +4308,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let heap_top = pm.tracked_region_summary().1;
         let ranges: alloc::vec::Vec<(core::ops::Range<usize>, usize)> = layout
             .iter()
+            .filter(|(_, flags, _)| !withheld_from_child(*flags))
             .map(|(range, _, _)| (range.clone(), range.start))
             .collect();
 
@@ -4328,6 +4373,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 _ => groups.push(start..end),
             }
+        }
+        // A withheld range seeds no group of its own (it is gone from `layout` above), but a
+        // NEIGHBOUR's span is widened out to its enclosing granule and two widened spans merge when
+        // they touch, so a withheld range can still land INSIDE a group -- `copy_one_group` would
+        // then commit the parent's bytes there and `Vmem::adopt` would cover them with a
+        // `VM_OWN_FORK_PADDING` VMA, so the child could `mprotect` it and the advice would still be
+        // a no-op. Carve the withheld span back out, shrunk INWARD to granule boundaries: a group's
+        // base has to stay granule-aligned (`VirtualAlloc2` + `MEM_ADDRESS_REQUIREMENTS` rejects
+        // anything else with `ERROR_INVALID_PARAMETER`), and the <=64 KiB sliver left at each end
+        // belongs to the neighbour's own widened span and cannot be reserved on its own.
+        if !withheld.is_empty() {
+            let mut carved: alloc::vec::Vec<core::ops::Range<usize>> =
+                alloc::vec::Vec::new();
+            for group in groups {
+                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> =
+                    alloc::vec::Vec::new();
+                pieces.push(group);
+                for w in &withheld {
+                    let cut_start = w.start.next_multiple_of(GRANULE);
+                    let cut_end = w.end & !(GRANULE - 1);
+                    if cut_start >= cut_end {
+                        continue;
+                    }
+                    let mut next: alloc::vec::Vec<core::ops::Range<usize>> =
+                        alloc::vec::Vec::new();
+                    for p in pieces {
+                        if cut_end <= p.start || cut_start >= p.end {
+                            next.push(p);
+                            continue;
+                        }
+                        if cut_start > p.start {
+                            next.push(p.start..cut_start);
+                        }
+                        if cut_end < p.end {
+                            next.push(cut_end..p.end);
+                        }
+                    }
+                    pieces = next;
+                }
+                carved.extend(pieces);
+            }
+            groups = carved;
         }
         let total_bytes: usize = groups.iter().map(core::ops::Range::len).sum();
         litebox_util_log::debug!(
@@ -6971,7 +7058,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
         if pid.is_some() {
-            unimplemented!("Getting robust list for a specific PID is not supported yet");
+            return Err(Errno::EPERM);
         }
         let head = self
             .thread
@@ -6984,11 +7071,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(Errno::EFAULT)
     }
 
-    pub(crate) fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
+    /// Current real time as a duration since the Unix epoch, or `EINVAL` if the platform's clock
+    /// reads a time before the epoch -- a clock-reading failure is a guest-visible `clock_gettime`
+    /// error (Linux answers EINVAL for a time it cannot represent), never a panic: the host process
+    /// IS the whole guest session.
+    pub(crate) fn real_time_as_duration_since_epoch(&self) -> Result<core::time::Duration, Errno> {
         let now = self.global.platform.current_time();
         let unix_epoch = <Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
-        now.duration_since(&unix_epoch)
-            .expect("must be after unix epoch")
+        now.duration_since(&unix_epoch).map_err(|_| Errno::EINVAL)
     }
 
     /// Handle syscall `clock_gettime`.
@@ -7008,7 +7098,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let duration = match clockid {
             litebox_common_linux::ClockId::RealTime => {
                 // CLOCK_REALTIME
-                self.real_time_as_duration_since_epoch()
+                self.real_time_as_duration_since_epoch()?
             }
             litebox_common_linux::ClockId::Monotonic => {
                 // CLOCK_MONOTONIC
@@ -7030,7 +7120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             litebox_common_linux::ClockId::RealTimeCoarse => {
                 // CLOCK_REALTIME_COARSE - approximated by reusing CLOCK_REALTIME's source.
-                self.real_time_as_duration_since_epoch()
+                self.real_time_as_duration_since_epoch()?
             }
             litebox_common_linux::ClockId::ProcessCputimeId
             | litebox_common_linux::ClockId::ThreadCputimeId => {
@@ -7173,7 +7263,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
         }
         if let Some(tv) = tv {
-            tv.write_at_offset::<Platform>(0, self.real_time_as_duration_since_epoch().into())
+            tv.write_at_offset::<Platform>(0, self.real_time_as_duration_since_epoch()?.into())
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(())
@@ -7184,7 +7274,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         tloc: Option<UserPtrMut<litebox_common_linux::time_t>>,
     ) -> Result<litebox_common_linux::time_t, Errno> {
-        let time = self.real_time_as_duration_since_epoch();
+        let time = self.real_time_as_duration_since_epoch()?;
         let seconds: u64 = time.as_secs();
         let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
         if let Some(tloc) = tloc {
@@ -7247,8 +7337,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .create_timer(litebox_common_linux::signal::Signal::SIGALRM)
             {
                 Ok(handle) => alarm.handle = Some(handle),
-                Err(litebox::platform::TimerCreationError::Unsupported) => {}
-                Err(_) => unimplemented!(),
+                Err(_) => {}
             }
         }
         if let Some(handle) = &alarm.handle {
@@ -8286,7 +8375,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 0
             }
-            _ => unimplemented!("Unsupported futex operation"),
+            _ => return Err(Errno::ENOSYS),
         };
         Ok(res)
     }
@@ -8793,16 +8882,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok(0);
         }
 
+        // The guest's TLS register is cleared as part of `execve` teardown. The value written is
+        // the fixed `0` (nothing the guest asked for can make the platform refuse it), so a failure
+        // here is host-side -- and by this point we are past the point of no return for the OLD
+        // program image, so it degrades exactly like this function's other late failures (warn +
+        // SIGSEGV) rather than panicking the host runner.
         #[cfg(target_arch = "x86_64")]
-        self.global
+        let clear_tls = self
+            .global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
-            .expect("failed to clear guest TLS on execve");
+            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0);
         #[cfg(target_arch = "aarch64")]
-        self.global
+        let clear_tls = self
+            .global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0)
-            .expect("failed to clear guest TLS on execve");
+            .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0);
+        if let Err(e) = clear_tls {
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), error:? = e;
+                "sys_execve: failed to clear guest TLS after point of no return, killing process with SIGSEGV"
+            );
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGSEGV,
+            ));
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
+            return Ok(0);
+        }
 
         // Cloned BEFORE the call (cheap -- small `Vec<CString>`s), solely for the collision
         // hand-off below: `load_program` takes both by value, and they are needed again, intact,
@@ -9107,20 +9215,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
+                    // A guest-supplied TLS base this platform refuses is already rejected back
+                    // in `sys_clone` (which answers EPERM, exactly as Linux does) BEFORE this
+                    // thread is ever spawned, so a rejection here is a host-side failure, not a
+                    // guest-reachable one -- and it must never panic the host runner (the host
+                    // process IS the whole guest session). This thread has not executed a single
+                    // guest instruction yet, so marking it exiting is enough: `prepare_to_run_guest`
+                    // (see `enter_shim`) then answers `ContinueOperation::Terminate`, and only
+                    // THIS thread dies instead of the whole session.
                     #[cfg(target_arch = "x86_64")]
-                    {
-                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
-                            .unwrap();
-                    }
+                    let set_tls = self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
                     #[cfg(target_arch = "aarch64")]
-                    {
-                        self.global
-                            .platform
-                            .set_arch_specific_register(
-                                &ArchSpecificRegister::TpidrEl0,
-                                tls.as_usize(),
-                            )
-                            .unwrap();
+                    let set_tls = self
+                        .global
+                        .platform
+                        .set_arch_specific_register(
+                            &ArchSpecificRegister::TpidrEl0,
+                            tls.as_usize(),
+                        )
+                        .map_err(Errno::from);
+                    if let Err(e) = set_tls {
+                        litebox_util_log::warn!(
+                            tid:% = self.tid.get(), error:? = e;
+                            "init_thread_context: could not set the new thread's TLS, terminating it"
+                        );
+                        self.exit_thread(0);
+                        return;
                     }
                 }
 

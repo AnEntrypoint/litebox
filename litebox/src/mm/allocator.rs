@@ -73,8 +73,16 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
         Self {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
                 let page_aligned_size = layout.size().next_power_of_two();
+                // A rescue runs only after the heap has already failed, and a `GlobalAlloc`
+                // cannot report failure to its caller -- so the ONLY thing it can do for a
+                // request this allocator can never serve is add nothing and let the allocation
+                // fail. That is what makes a FALLIBLE caller work: `Vec::try_reserve` then gets
+                // an `Err` it can turn into an errno. `unimplemented!` here instead took the
+                // whole guest session down on `ftruncate(memfd, 1 << 40)` -- the host process IS
+                // the session, so a panic on this path is not an errno anybody can observe,
+                // it is the end of every guest process at once (panicx1 run 4).
                 if page_aligned_size.trailing_zeros() as usize >= ORDER {
-                    unimplemented!("requested size {page_aligned_size:#} is too large");
+                    return;
                 }
                 let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
                 else {

@@ -407,7 +407,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,
-            _ => unimplemented!(),
+            SockType::SeqPacket => {
+                let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
+                NetworkProxy::Datagram(proxy)
+            }
+            _ => NetworkProxy::Raw,
         };
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
         // can access it without holding the network lock and the network subsystem can access it without
@@ -588,7 +592,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         // SO_KEEPALIVE,&1,4)`, a real pattern in libraries that set a common
                         // socket-option baseline before checking the actual protocol.
                     }
-                    _ => unimplemented!(),
+                    other => return Err(other.into()),
                 }
             }
             Ok(())
@@ -710,14 +714,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                         return Err(Errno::EINVAL);
                     }
+                    // A `TCP_*` option on a non-TCP socket is an ordinary errno, never a panic:
+                    // `setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, ..)` on a UDP socket reaches
+                    // this with `NotTcpSocket`, which is Linux's `ENOPROTOOPT` (92).
                     self.net_lock()
                         .set_tcp_option(
                             fd,
                             litebox::net::TcpOptionData::KEEPALIVE(Some(
                                 core::time::Duration::from_secs(u64::from(val)),
                             )),
-                        )
-                        .expect("set TCP_KEEPALIVE should succeed");
+                        )?;
                 }
             },
         }
@@ -872,7 +878,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                             litebox::net::CongestionControl::Reno => "reno",
                             litebox::net::CongestionControl::Cubic => "cubic",
                             litebox::net::CongestionControl::None => "none",
-                            _ => unimplemented!(),
+                            _ => "cubic",
                         };
                         let len = name.len().min(len as usize);
                         optval
@@ -919,8 +925,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     ) -> Result<SocketFd<Platform>, TryOpError<Errno>> {
         self.net_lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
-            AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
-            _ => unimplemented!(),
+            AcceptError::InvalidFd | AcceptError::NotListening | _ => {
+                TryOpError::Other(e.into())
+            }
         })
     }
 
@@ -1031,9 +1038,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         // Another thread bound it in the meantime - that's fine
                     }
                     litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
-                    litebox::net::errors::BindError::UnsupportedAddress(_)
-                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
-                    _ => unimplemented!(),
+                    _ => return Err(err.into()),
                 }
             }
             // Get the assigned port
@@ -1110,7 +1115,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
             match self.get_socket_type(fd)? {
-                SockType::Datagram | SockType::Raw => {
+                SockType::Datagram | SockType::Raw | SockType::SeqPacket => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
                 SockType::Stream => {
@@ -1238,7 +1243,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
                     Err(TryOpError::Other(Errno::EBADF))
                 }
-                Err(_) => unimplemented!(),
+                Err(e) => Err(TryOpError::Other(e.into())),
             },
         ) {
             Ok(()) => Ok(()),
@@ -1342,7 +1347,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         log_unsupported!("raw sockets (SOCK_RAW)");
                         return Err(Errno::EPERM);
                     }
-                    _ => unimplemented!(),
+                    _ => {
+                        log_unsupported!("socket(type = {ty:?})");
+                        return Err(Errno::EPROTONOSUPPORT);
+                    }
                 };
                 let socket = self.global.net_lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
@@ -1412,7 +1420,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })?
             }
 
-            _ => unimplemented!(),
+            _ => {
+                log_unsupported!("socket(domain = {domain:?})");
+                return Err(Errno::EAFNOSUPPORT);
+            }
         };
         Ok(u32::try_from(file).unwrap())
     }
@@ -1479,7 +1490,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Errno::EMFILE
                 })?;
                 let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                    self.do_close(raw_fd1).unwrap();
+                    // `raw_fd1` was inserted successfully just above, so closing it is expected
+                    // to succeed -- but a failure there is an ordinary fd leak, not something
+                    // that may kill the session: the guest's answer is `EMFILE` either way.
+                    if let Err(close_err) = self.do_close(raw_fd1) {
+                        litebox_util_log::warn!(
+                            tid:% = self.tid.get(),
+                            fd:% = raw_fd1,
+                            errno:? = close_err;
+                            "socketpair: closing the first fd after the second hit EMFILE failed"
+                        );
+                    }
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
@@ -1637,10 +1658,17 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
             size_of::<CSockInet6Addr>()
         }
         SocketAddress::Unix(v) => {
-            let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
-            family_ptr
-                .write_at_offset::<Platform>(0, AddressFamily::UNIX as u16)
-                .ok_or(Errno::EFAULT)?;
+            // `*addrlen` is the guest's DECLARED buffer size, which may be smaller than the full
+            // address (0 and 1 both underflowed the subtraction below: a panic in debug, and in
+            // release a wrapped length that copied the whole path past the guest's buffer). Linux
+            // never fails here: it copies at most the declared length and reports the FULL length
+            // of the address back (see the `Inet` arms above, which do the same).
+            if addrlen_val as usize >= size_of::<u16>() {
+                let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
+                family_ptr
+                    .write_at_offset::<Platform>(0, AddressFamily::UNIX as u16)
+                    .ok_or(Errno::EFAULT)?;
+            }
             match v {
                 UnixSocketAddr::Unnamed => {
                     // only write family
@@ -1662,7 +1690,7 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 }
                 UnixSocketAddr::Path(path) => {
                     let offset = offset_of!(CSockUnixAddr, path);
-                    let max_len = addrlen_val as usize - offset;
+                    let max_len = (addrlen_val as usize).saturating_sub(offset);
                     let name = &path.as_bytes()[..path.len().min(max_len)];
                     addr.write_slice_at_offset::<Platform>(isize::try_from(offset).unwrap(), name)
                         .ok_or(Errno::EFAULT)?;
@@ -1791,9 +1819,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
             if let Err(err) = write_sockaddr_to_user::<Platform>(remote_addr, addr, addrlen) {
-                // If we fail to write the address back to user, we need to close the accepted socket.
-                self.sys_close(i32::try_from(fd).unwrap())
-                    .expect("close a newly-accepted socket failed");
+                // If we fail to write the address back to user, we need to close the accepted
+                // socket. Failing to close it leaks an fd (the guest still gets the address
+                // write's errno), which must never take the whole session down with it -- a
+                // reachable `expect` here killed every guest in the process.
+                if let Err(close_err) = self.sys_close(i32::try_from(fd).unwrap()) {
+                    litebox_util_log::warn!(
+                        tid:% = self.tid.get(),
+                        fd:% = fd,
+                        errno:? = close_err;
+                        "accept: closing a newly-accepted socket failed"
+                    );
+                }
                 return Err(err);
             }
         }

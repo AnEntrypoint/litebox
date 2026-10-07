@@ -1548,6 +1548,42 @@ where
         unsafe { vmem.protect_mapping(range, new_permissions, caller) }
     }
 
+    /// Set or clear the `MADV_DONTFORK` advice on a range (see [`VmFlags::VM_DONT_FORK`]).
+    ///
+    /// This is what `madvise(MADV_DONTFORK)` / `MADV_DOFORK` actually do. The advice is a
+    /// property of the VMA rather than of the pages, so unlike `change_page_permissions` this
+    /// does not re-protect anything -- it only records whether a later `fork()` should copy the
+    /// range into the child.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the range is one whose inheritance semantics it owns (an
+    /// allocator's own arena, say): marking a region another component expects to find in a child
+    /// makes that child's address space differ from what that component assumes.
+    pub unsafe fn set_range_dont_fork(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        dont_fork: bool,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        let (set, clear) = if dont_fork {
+            (
+                linux::VmFlags::VM_DONT_FORK,
+                linux::VmFlags::empty(),
+            )
+        } else {
+            (
+                linux::VmFlags::empty(),
+                linux::VmFlags::VM_DONT_FORK,
+            )
+        };
+        vmem.update_range_flags(range, set, clear)
+    }
+
     /// Make pages readable and writable.
     ///
     /// # Safety

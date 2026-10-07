@@ -30,7 +30,6 @@ pub fn do_mmap<
     let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
     let flags = {
         let mut create_flags = CreatePagesFlags::empty();
-        // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
         create_flags.set(
             CreatePagesFlags::FIXED_ADDR,
             flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
@@ -169,10 +168,12 @@ pub fn sys_mprotect<
     }
     // Linux rounds the length up to a whole page: libmagic maps a 10353312-byte file and then
     // `mprotect`s exactly that length, which used to fail with ENOMEM (`PageRange` rejects an
-    // unaligned end) and made `file` unusable.
-    let len = len
-        .checked_next_multiple_of(litebox::mm::linux::PAGE_SIZE)
-        .ok_or(Errno::ENOMEM)?;
+    // unaligned end) and made `file` unusable; Chromium protects a `0x101a`-byte region. Rounding
+    // is CHECKED because an unchecked `next_multiple_of` panics on overflow, and a guest-reachable
+    // call must answer an errno instead.
+    let Some(len) = len.checked_next_multiple_of(litebox::mm::linux::PAGE_SIZE) else {
+        return Err(Errno::ENOMEM);
+    };
 
     let addr = addr.to_platform_ptr::<Platform>();
     // Real Linux `mprotect(2)` accepts ANY combination of PROT_READ/PROT_WRITE/PROT_EXEC (8
@@ -204,10 +205,6 @@ pub fn sys_mprotect<
         }
         permissions
     };
-    // Linux rounds the length up to a whole page (Chromium protects a `0x101a`-byte region).
-    let len = len
-        .checked_next_multiple_of(PAGE_SIZE)
-        .ok_or(Errno::ENOMEM)?;
     unsafe { pm.change_page_permissions(addr, len, permissions, "guest_mprotect") }
         .map_err(Errno::from)
 }
@@ -303,22 +300,25 @@ pub fn sys_madvise<
     if len == 0 {
         return Ok(());
     }
-    let aligned_len = len.next_multiple_of(PAGE_SIZE);
-    if aligned_len == 0 {
-        // overflow
+    let Some(aligned_len) = len.checked_next_multiple_of(PAGE_SIZE) else {
         return Err(Errno::EINVAL);
-    }
+    };
     let Some(_end) = addr.as_usize().checked_add(aligned_len) else {
         return Err(Errno::EINVAL);
     };
 
     let addr = addr.to_platform_ptr::<Platform>();
     match advice {
-        crate::MadviseBehavior::Normal
-        | crate::MadviseBehavior::DontFork
-        | crate::MadviseBehavior::DoFork => {
-            // No-op for now, as we don't support fork yet.
-            Ok(())
+        crate::MadviseBehavior::Normal => Ok(()),
+        crate::MadviseBehavior::DontFork => {
+            // SAFETY: the advice concerns only whether a later `fork()` copies this range into
+            // its child, and the range is guest memory the caller owns (it was validated as
+            // mapped-and-owned by the caller of `madvise(2)` itself).
+            unsafe { pm.set_range_dont_fork(addr, aligned_len, true) }.map_err(Errno::from)
+        }
+        crate::MadviseBehavior::DoFork => {
+            // SAFETY: same as `DontFork` above; this only withdraws that advice.
+            unsafe { pm.set_range_dont_fork(addr, aligned_len, false) }.map_err(Errno::from)
         }
         crate::MadviseBehavior::DontNeed => {
             // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
