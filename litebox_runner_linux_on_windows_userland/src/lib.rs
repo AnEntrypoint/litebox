@@ -1037,52 +1037,63 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+    // The image's own `Env` is the BASE of the guest environment, the way it is for every real
+    // container runtime: `docker run` starts the container with the ENV its image config declared,
+    // and an explicit `-e` overrides it. litebox started the guest with NO environment at all
+    // unless `-e` was passed, which is why in-guest `python3` reported an empty `sys.executable`
+    // (its argv[0] PATH search had no `PATH` to search) and `HOME`/`TERM` were unset.
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    #[allow(clippy::items_after_statements, reason = "kept next to its only caller")]
+    fn extend_env(env_pairs: &mut Vec<(String, String)>, entries: impl IntoIterator<Item = String>) {
+        for entry in entries {
+            let Some((name, value)) = entry.split_once('=') else {
+                continue;
+            };
+            match env_pairs.iter_mut().find(|(known, _)| known == name) {
+                Some(slot) => slot.1 = value.to_owned(),
+                None => env_pairs.push((name.to_owned(), value.to_owned())),
+            }
+        }
+    }
+    if let Some(image_ref) = cli_args.oci_image.as_deref() {
+        extend_env(&mut env_pairs, litebox_packager::oci::image_env(image_ref));
+    }
+    extend_env(
+        &mut env_pairs,
+        cli_args.environment_variables.iter().cloned(),
+    );
+    if cli_args.forward_environment_variables {
+        extend_env(&mut env_pairs, std::env::vars().map(|(k, v)| {
+            // Windows' own env var names are case-insensitive but reported with whatever
+            // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
+            // env var lookups (including the guest's own PATH-based executable search) are
+            // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
+            // different, useless variable while the `PATH` Linux tools actually look up is
+            // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
+            // installed binary (e.g. after `npm install`) despite the install itself
+            // succeeding, because the guest's `execve`/shell PATH search had nothing to
+            // search. Normalize this one, specific, known-mismatched name rather than
+            // case-folding every forwarded variable, which could needlessly collide two
+            // differently-cased Windows variables that mean different things on Linux.
+            //
+            // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
+            // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
+            // meaningless to the guest -- without this prefix, forwarding PATH at all is
+            // strictly worse than not forwarding it, since it shadows the guest's own
+            // otherwise-implicit default search locations with a value that matches nothing.
+            if k.eq_ignore_ascii_case("PATH") {
+                format!("PATH={LINUX_DEFAULT_PATH}:{v}")
+            } else {
+                format!("{k}={v}")
+            }
+        }));
+    }
+    let envp: Vec<_> = env_pairs
+        .into_iter()
+        .filter_map(|(k, v)| {
+            std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>()).ok()
+        })
         .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                // Windows' own env var names are case-insensitive but reported with whatever
-                // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
-                // env var lookups (including the guest's own PATH-based executable search) are
-                // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
-                // different, useless variable while the `PATH` Linux tools actually look up is
-                // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
-                // installed binary (e.g. after `npm install`) despite the install itself
-                // succeeding, because the guest's `execve`/shell PATH search had nothing to
-                // search. Normalize this one, specific, known-mismatched name rather than
-                // case-folding every forwarded variable, which could needlessly collide two
-                // differently-cased Windows variables that mean different things on Linux.
-                //
-                // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
-                // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
-                // meaningless to the guest -- without this prefix, forwarding PATH at all is
-                // strictly worse than not forwarding it, since it shadows the guest's own
-                // otherwise-implicit default search locations with a value that matches nothing.
-                if k.eq_ignore_ascii_case("PATH") {
-                    let v = format!("{LINUX_DEFAULT_PATH}:{v}");
-                    std::ffi::CString::new(
-                        "PATH"
-                            .bytes()
-                            .chain(*b"=")
-                            .chain(v.bytes())
-                            .collect::<Vec<u8>>(),
-                    )
-                    .unwrap()
-                } else {
-                    std::ffi::CString::new(
-                        k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
-                    )
-                    .unwrap()
-                }
-            }))
-            .collect()
-    } else {
-        envp
-    };
 
     let fs_for_export = cli_args
         .export_writable_layer
