@@ -694,10 +694,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
             cloexec: bool,
         ) -> Result<usize, ()> {
             if cloexec {
-                let old = litebox
+                // `MSG_CMSG_CLOEXEC` on an fd that is ALREADY close-on-exec is a no-op, so
+                // `set_fd_metadata` may legitimately hand back the flag it just replaced. Never
+                // assert on that: this runs on every donated fd, and an idempotent request must
+                // not take the whole session down.
+                let _ = litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(&fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
-                debug_assert!(old.is_none());
             }
             files.insert_raw_fd(fd).map_err(|_| ())
         }
@@ -1436,7 +1439,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             } else {
                 read_ring.try_write_all(&data)
             };
-            debug_assert!(written, "capacity was checked above");
+            if !written {
+                // Both branches above bound `need` against the ring's capacity before this
+                // point (the fresh-slot one against `SHARED_UNIX_CONN_BUF`, the existing-slot
+                // one against `free_space()`), so this is unreachable today -- but a
+                // `debug_assert!` is compiled out of the release binary while the loop it
+                // guards is not, and silently dropping the rest of the peer's queued data is
+                // worse than refusing the promotion. `fork_carry` then keeps the fork on the
+                // thread-based path, as it already does for every other `Err` here.
+                return Err("more unread data queued on a unix socket than its shared ring holds");
+            }
         }
         if first_promotion && recv_channel.is_peer_shutdown() {
             read_ring.shutdown();
@@ -4442,11 +4454,12 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
 /// value ever built on the stack is a single ~14.5 KiB slot.
 pub(crate) struct SharedUnixConnTable<Platform: ShimPlatform> {
     slots: &'static mut [SharedConnSlot<Platform>],
-    /// `false` only when the arena allocation itself failed and [`Self::new`] fell back to a
-    /// process-private one: such a table can never serve a genuinely cross-process connection
-    /// (another process has no way to reach those bytes), so [`Self::alloc`] refuses everything
-    /// instead of handing out indices into memory no peer can see. Degrades every cross-process
-    /// AF_UNIX attempt to its ordinary errno path; never a panic.
+    /// `false` whenever [`Self::new`] could not place the pool in the cross-process shared arena
+    /// (whether it then fell back to a process-private allocation or got no memory at all): such
+    /// a table can never serve a genuinely cross-process connection (another process has no way to
+    /// reach those bytes), so [`Self::alloc`] refuses everything instead of handing out indices
+    /// into memory no peer can see. Degrades every cross-process AF_UNIX attempt to its ordinary
+    /// errno path; never a panic.
     arena_backed: bool,
 }
 
@@ -4462,30 +4475,52 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             core::alloc::Layout::array::<SharedConnSlot<Platform>>(SHARED_UNIX_CONN_CAPACITY)
                 .expect("SHARED_UNIX_CONN_CAPACITY slot-array layout computation cannot overflow");
         let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let arena_backed = arena.is_some();
-        let ptr = arena
-            .unwrap_or_else(|| {
-                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Fall back to a leaked process-private
-                // allocation so every later `get`/`free` stays memory-safe, and let `alloc`
-                // refuse everything via `arena_backed`.
+        // Same shape as `SharedProcessTable::new`'s own arena handling: a pool this process
+        // cannot place is an EMPTY pool, never a panic -- `alloc` then refuses every caller,
+        // exactly as `arena_backed == false` already does, and cross-process AF_UNIX degrades
+        // to the in-process path instead of the session dying here.
+        let (ptr, count, arena_backed) = match arena {
+            Some(ptr) => (
+                ptr.cast::<SharedConnSlot<Platform>>(),
+                SHARED_UNIX_CONN_CAPACITY,
+                true,
+            ),
+            None => {
                 litebox_util_log::error!(
                     capacity:% = SHARED_UNIX_CONN_CAPACITY,
                     bytes:% = layout.size();
                     "shared unix connection table: shared kernel arena exhausted; cross-process \
                      AF_UNIX is disabled in this process"
                 );
-                // SAFETY: `layout` has a non-zero size (`SHARED_UNIX_CONN_CAPACITY` slots).
-                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                    .expect("shared unix connection table: fallback allocation failed")
-            })
-            .cast::<SharedConnSlot<Platform>>();
-        for i in 0..SHARED_UNIX_CONN_CAPACITY {
-            // SAFETY: `ptr` names `SHARED_UNIX_CONN_CAPACITY` contiguous, uninitialized
-            // `SharedConnSlot`s per `layout`, so `add(i)` stays inside that region for every
-            // `i < SHARED_UNIX_CONN_CAPACITY`, and `write`-ing a freshly built value into
-            // uninitialized memory (rather than dropping a prior one) is exactly what `write` is
-            // for. Writing them ONE AT A TIME through the pointer is the entire point of this
+                match core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) }) {
+                    Some(ptr) => (
+                        ptr.cast::<SharedConnSlot<Platform>>(),
+                        SHARED_UNIX_CONN_CAPACITY,
+                        false,
+                    ),
+                    None => {
+                        // Both the shared arena AND the process heap refused the pool. An empty
+                        // slot slice is a valid, never-dereferenced stand-in: it hands out no
+                        // index, so every caller takes its "no slot available" path.
+                        litebox_util_log::error!(
+                            bytes:% = layout.size();
+                            "shared unix connection table: fallback allocation failed; \
+                             cross-process AF_UNIX is disabled in this process"
+                        );
+                        (
+                            core::ptr::NonNull::<SharedConnSlot<Platform>>::dangling(),
+                            0,
+                            false,
+                        )
+                    }
+                }
+            }
+        };
+        for i in 0..count {
+            // SAFETY: `ptr` names `count` contiguous, uninitialized `SharedConnSlot`s per
+            // `layout`, so `add(i)` stays inside that region for every `i < count`, and
+            // `write`-ing a freshly built value into uninitialized memory (rather than dropping a
+            // prior one) is exactly what `write` is for. Writing them ONE AT A TIME through the pointer is the entire point of this
             // function: `SharedConnSlot::new_empty()` is ~14.5 KiB of stack at a time, where a
             // `[SharedConnSlot; SHARED_UNIX_CONN_CAPACITY]` value would be ~15 MiB of it.
             unsafe {
@@ -4493,14 +4528,13 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             }
         }
         Self {
-            // SAFETY: `ptr` is non-null, aligned per `layout`, and all `SHARED_UNIX_CONN_CAPACITY`
-            // slots at it were just initialized by the loop above. `'static` is sound because this
-            // allocation is arena-backed and never reclaimed (or, on the fallback path, a leaked
-            // global-allocator allocation), and nothing else holds a reference to it, so handing
-            // out an exclusive `&'static mut` is sound.
-            slots: unsafe {
-                core::slice::from_raw_parts_mut(ptr.as_ptr(), SHARED_UNIX_CONN_CAPACITY)
-            },
+            // SAFETY: `ptr` is non-null, aligned per `layout`, and all `count` slots at it were
+            // just initialized by the loop above (`count` is 0 only on the "no memory at all"
+            // path, where a zero-length slice is never dereferenced). `'static` is sound because
+            // this allocation is arena-backed and never reclaimed (or, on the fallback path, a
+            // leaked global-allocator allocation), and nothing else holds a reference to it, so
+            // handing out an exclusive `&'static mut` is sound.
+            slots: unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), count) },
             arena_backed,
         }
     }

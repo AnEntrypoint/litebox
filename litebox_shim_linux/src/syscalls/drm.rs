@@ -688,12 +688,29 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         }
         let Some((handle, size, width, height, pitch, pixel_format)) = ({
             let framebuffers = self.framebuffers.lock();
-            framebuffers.get(&fb_id).map(|fb| {
+            framebuffers.get(&fb_id).and_then(|fb| {
                 let buffers = self.buffers.lock();
-                let buffer = buffers
-                    .get(&fb.handle)
-                    .expect("add_fb2 only ever records a handle that exists in self.buffers, and destroy_dumb never removes an fb referencing a destroyed buffer (see destroy_dumb's own doc comment: real Linux leaves dangling fb references, matched deliberately)");
-                (buffer.handle, buffer.size, fb.width, fb.height, buffer.pitch, fb.pixel_format)
+                // `destroy_dumb` deliberately leaves a framebuffer pointing at a destroyed buffer
+                // (real Linux does the same; userspace is expected to RMFB first), so an ordinary
+                // CREATE_DUMB -> ADDFB2 -> DESTROY_DUMB -> PAGE_FLIP/SETCRTC sequence reaches here
+                // with nothing live behind `fb_id`. Real Linux answers ENOENT to such a flip, but
+                // this callback reports nothing to the guest (see its own contract above), so warn
+                // and skip the present rather than kill the session.
+                let Some(buffer) = buffers.get(&fb.handle) else {
+                    litebox_util_log::warn!(
+                        fb_id:? = fb_id, handle:? = fb.handle;
+                        "drm-ioctl: framebuffer references a destroyed dumb buffer, skipping flip"
+                    );
+                    return None;
+                };
+                Some((
+                    buffer.handle,
+                    buffer.size,
+                    fb.width,
+                    fb.height,
+                    buffer.pitch,
+                    fb.pixel_format,
+                ))
             })
         }) else {
             return;

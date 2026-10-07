@@ -649,12 +649,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         // XXX(jb): should we try to somehow enforce that it is set at the smallest
         // available/unassigned FD number?
         let mut rds = self.raw_descriptor_store.write();
-        let raw_fd = rds.fd_into_raw_integer(typed_fd);
+        // Check the limit BEFORE handing `typed_fd` over: `fd_into_raw_integer` consumes it, so
+        // an over-`RLIMIT_NOFILE` slot could otherwise only be undone by peeling the descriptor
+        // back out of the table -- and that rollback needs `Arc::into_inner` to succeed, i.e. it
+        // is sound only while `StoredFd`'s `Arc` has no other clone, which nothing here can
+        // guarantee forever. Checking first keeps the `Err` variant (the descriptor itself, for
+        // the caller to close) available on every path, so an over-limit `open`/`socket` answers
+        // EMFILE the way it always did instead of taking the whole session down.
         let max_fd = self.max_fd.load(Ordering::Relaxed);
-        if raw_fd > max_fd {
-            let orig = rds.fd_consume_raw_integer::<Subsystem>(raw_fd).unwrap();
-            return Err(alloc::sync::Arc::into_inner(orig).unwrap());
+        if rds.next_free_raw_integer() > max_fd {
+            return Err(typed_fd);
         }
+        let raw_fd = rds.fd_into_raw_integer(typed_fd);
         Ok(raw_fd)
     }
 }
@@ -2936,7 +2942,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let files = self.files.borrow();
             let size = files.fs.fd_file_status(fd).map_or(0, |s| s.size);
             if size > 0 {
-                let mut buf = alloc::vec![0u8; size];
+                // `size` is the length the guest's own `ftruncate`+`write` gave this memfd, so
+                // `alloc::vec![0u8; size]` would abort the host process on an absurd one -- and
+                // the host process IS the whole guest session. Reserve fallibly instead.
+                let mut buf = alloc::vec::Vec::new();
+                buf.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
+                buf.resize(size, 0);
                 let n = files.fs.read(fd, &mut buf, Some(0)).unwrap_or(0);
                 buf.truncate(n);
                 carry_bytes = buf;
@@ -4877,7 +4888,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // trait's `mkdir` signature or any of its many backends -- `set_times` alone already
         // has this deliberately storage-only contract satisfied correctly by its own real caller
         // (`sys_utimensat`), so reusing it here needs no new plumbing at all.
-        let now = self.real_time_as_duration_since_epoch();
+        let now = self.real_time_as_duration_since_epoch().unwrap_or_default();
         let now = litebox::fs::Timestamp {
             sec: now.as_secs().reinterpret_as_signed(),
             nsec: now.subsec_nanos(),
@@ -6417,7 +6428,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Ok(None);
                 }
                 if tv_nsec == litebox_common_linux::UTIME_NOW {
-                    let now = self.real_time_as_duration_since_epoch();
+                    let now = self.real_time_as_duration_since_epoch().unwrap_or_default();
                     return Ok(Some(litebox::fs::Timestamp {
                         sec: now.as_secs().reinterpret_as_signed(),
                         nsec: now.subsec_nanos(),
@@ -6457,7 +6468,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let now = || {
-            let now = self.real_time_as_duration_since_epoch();
+            let now = self.real_time_as_duration_since_epoch().unwrap_or_default();
             litebox::fs::Timestamp {
                 sec: now.as_secs().reinterpret_as_signed(),
                 nsec: now.subsec_nanos(),
@@ -7684,7 +7695,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // `timerfd_settime`'s `TFD_TIMER_ABSTIME` against `CLOCK_REALTIME`).
                             // Convert by comparing against the current wall-clock reading and
                             // applying the same offset to `now`.
-                            let wall_now = self.real_time_as_duration_since_epoch();
+                            let wall_now =
+                                self.real_time_as_duration_since_epoch().unwrap_or_default();
                             if value > wall_now {
                                 now.checked_add(value - wall_now)
                             } else {
@@ -9257,6 +9269,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None
         };
         let timeout = timeout.read::<Platform>()?;
+        // `nfds` is a guest-supplied count, not a size this host may allocate with: `PollSet::
+        // with_capacity(nfds)` and `Vec::with_capacity(nfds)` below would otherwise try to
+        // allocate it before a single guest byte is read. Same bound `sys_pselect` applies to
+        // its own `nfds`, and Linux answers EINVAL for it.
+        if nfds >= i32::MAX as usize
+            || nfds
+                > self
+                    .process()
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+        {
+            return Err(Errno::EINVAL);
+        }
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);

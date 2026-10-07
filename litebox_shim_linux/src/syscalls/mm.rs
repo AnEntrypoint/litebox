@@ -2579,9 +2579,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
                 let Some(base) = base_addr else {
-                    panic!(
-                        "fatal: pre-patched ET_DYN binary but cannot determine load base address"
+                    // A crafted ET_DYN whose mapped `p_offset` matches no `PT_LOAD` leaves the load
+                    // base unknowable, and a pre-patched binary's jumps are relative to it. Guessing
+                    // would write a trampoline over an arbitrary address, so record nothing instead:
+                    // the caller then finds no patch state and leaves the mapping unpatched.
+                    litebox_util_log::warn!(
+                        fd:? = fd, mapped_addr:? = mapped_addr, file_offset:? = file_offset;
+                        "pre-patched ET_DYN binary but cannot determine load base address, skipping"
                     );
+                    return;
                 };
                 let vaddr: usize = tramp_vaddr.trunc();
                 base + vaddr
@@ -2741,45 +2747,93 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// If `already_rw` is true, the segment is assumed to already be writable
     /// and the initial mprotect RW is skipped.
     ///
-    /// Panics on infrastructure failures (mprotect/read/write/disassembly).
+    /// Degrades to leaving the segment as it is (with a `warn!`) on any mprotect/read/write/
+    /// disassembly failure rather than panicking: the bytes here are guest-supplied and need not
+    /// be decodable x86 at all, and an mprotect/write failure is ordinary host memory pressure.
+    /// Neither can kill the session -- this fn returns `()` and every caller already treats a
+    /// missed trap as survivable, so a panic here would only take the whole guest down with it.
     fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
-        if !already_rw {
-            self.sys_mprotect_raw(
+        let addr = mapped_addr.as_usize();
+        // Only the call that made the segment RW has to put it back; a caller passing
+        // `already_rw = true` owns the segment's protection itself.
+        let restore_rx = |task: &Self| {
+            let _ = task.sys_mprotect_raw(
                 mapped_addr,
                 len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            )
-            .expect("fatal: failed to mprotect code segment RW for trap fallback");
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            );
+        };
+        let made_rw = already_rw
+            || self
+                .sys_mprotect_raw(
+                    mapped_addr,
+                    len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                )
+                .is_ok();
+        if !made_rw {
+            litebox_util_log::warn!(
+                addr:? = addr, len:? = len;
+                "failed to mprotect code segment RW for trap fallback, leaving it unpatched"
+            );
+            return;
         }
 
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            panic!("fatal: failed to read code segment for trap fallback");
+            litebox_util_log::warn!(
+                addr:? = addr, len:? = len;
+                "failed to read code segment for trap fallback, leaving it unpatched"
+            );
+            if !already_rw {
+                restore_rx(self);
+            }
+            return;
         };
         let mut code_buf = code_owned.into_vec();
-        let code_vaddr = mapped_addr.as_usize() as u64;
-        let count = litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr)
-            .unwrap_or_else(|e| {
-                panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
-            });
-        if count > 0 {
+        let code_vaddr = addr as u64;
+        match litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr) {
+            Ok(count) => {
+                if count > 0 {
+                    litebox_util_log::warn!(
+                        count:? = count, addr:? = addr, len:? = len;
+                        "applied trap fallback to syscall instructions"
+                    );
+                }
+            }
+            Err(e) => {
+                litebox_util_log::warn!(
+                    err:? = e, addr:? = addr, len:? = len;
+                    "failed to disassemble code segment for trap fallback, leaving it unpatched"
+                );
+                if !already_rw {
+                    restore_rx(self);
+                }
+                return;
+            }
+        }
+        if mapped_addr
+            .copy_from_slice::<Platform>(0, &code_buf)
+            .is_none()
+        {
             litebox_util_log::warn!(
-                count:? = count, addr:? = mapped_addr.as_usize(), len:? = len;
-                "applied trap fallback to syscall instructions"
+                addr:? = addr, len:? = len;
+                "failed to write trap bytes back to code segment, leaving it unpatched"
             );
         }
-        assert!(
-            mapped_addr
-                .copy_from_slice::<Platform>(0, &code_buf)
-                .is_some(),
-            "fatal: failed to write trap bytes back to code segment"
-        );
 
-        self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        )
-        .expect("fatal: failed to restore code segment to RX after trap fallback");
+        if self
+            .sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            )
+            .is_err()
+        {
+            litebox_util_log::warn!(
+                addr:? = addr, len:? = len;
+                "failed to restore code segment to RX after trap fallback"
+            );
+        }
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -3255,19 +3309,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .copy_from_slice::<Platform>(0, &stubs)
                     .is_none()
                 {
+                    litebox_util_log::warn!("failed to write trampoline stubs");
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    panic!("fatal: failed to write trampoline stubs");
+                    // The rewritten jumps in `code_buf` (deliberately not written back) have no
+                    // stubs to land on, so this segment would keep its raw `syscall`s -- poison
+                    // them rather than let them reach the host.
+                    self.apply_trap_fallback(mapped_addr, len, false);
+                    return true;
                 }
 
                 if mapped_addr
                     .copy_from_slice::<Platform>(0, &code_buf)
                     .is_none()
                 {
+                    litebox_util_log::warn!("failed to write patched code back to code segment");
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
@@ -3275,7 +3335,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    panic!("fatal: failed to write patched code back to code segment");
+                    self.apply_trap_fallback(mapped_addr, len, false);
+                    return true;
                 }
                 state.trampoline_cursor = new_cursor;
                 state.runtime_patches_committed = true;
@@ -3289,8 +3350,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .copy_from_slice::<Platform>(0, &code_buf)
                         .is_none()
                 {
+                    litebox_util_log::warn!("failed to write trap bytes back to code segment");
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    panic!("fatal: failed to write trap bytes back to code segment");
+                    restore_trampoline_rx(self, state);
+                    // Still RW here, so the fallback writes in place without a second mprotect.
+                    self.apply_trap_fallback(mapped_addr, len, true);
+                    return true;
                 }
             }
             Err(e) => {

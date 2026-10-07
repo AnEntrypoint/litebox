@@ -943,7 +943,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if self.is_exiting() {
                 return;
             }
-            assert!(!inner.group_exit);
+            // A group exit has already been recorded for this process -- by a sibling thread that
+            // won the race into this function, or by an earlier `exit_group` from this very thread
+            // (e.g. one reached through signal delivery). There is nothing left for this call to
+            // do, and real Linux's `do_group_exit` is idempotent the same way. Marking this thread
+            // exiting too covers the one case the `is_exiting()` check above does not: a thread
+            // that is no longer in `inner.threads` (already detached) was never covered by the
+            // `is_exiting` sweep below, so without this it would keep running guest code inside a
+            // process whose exit status is already set. Never `assert!` here -- a panic on this
+            // path (reachable from the `exit_group` syscall and from signal delivery) kills the
+            // host runner, i.e. the entire guest session.
+            if inner.group_exit {
+                thread.remote.is_exiting.store(true, Ordering::Relaxed);
+                return;
+            }
             inner.exit_status = status;
             inner.group_exit = true;
             // Widens `detach_thread`'s own `notify` condition to also fire at `new_count == 1`
@@ -3337,9 +3350,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             match found.expect("poll_once only returns true after `found` is set") {
                 AnyChildExit::CrossProcess(cross_pid, raw_exit) => {
-                    let handle = process.find_cross_process_child(cross_pid).expect(
-                        "pid just read from cross_process_children must still be registered",
-                    );
+                    // `poll_once` records this pid and drops the registry lock before returning,
+                    // so another thread of this same process can reap the very same cross-process
+                    // child in between -- Linux answers ECHILD for a pid that is no longer our
+                    // child, and the alternative (`expect`) panics the host runner, which IS the
+                    // whole guest session.
+                    let Some(handle) = process.find_cross_process_child(cross_pid) else {
+                        return Err(Errno::ECHILD);
+                    };
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
                     self.xproc_unregister(cross_pid);
@@ -7053,11 +7071,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(Errno::EFAULT)
     }
 
-    pub(crate) fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
+    /// Current real time as a duration since the Unix epoch, or `EINVAL` if the platform's clock
+    /// reads a time before the epoch -- a clock-reading failure is a guest-visible `clock_gettime`
+    /// error (Linux answers EINVAL for a time it cannot represent), never a panic: the host process
+    /// IS the whole guest session.
+    pub(crate) fn real_time_as_duration_since_epoch(&self) -> Result<core::time::Duration, Errno> {
         let now = self.global.platform.current_time();
         let unix_epoch = <Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
-        now.duration_since(&unix_epoch)
-            .expect("must be after unix epoch")
+        now.duration_since(&unix_epoch).map_err(|_| Errno::EINVAL)
     }
 
     /// Handle syscall `clock_gettime`.
@@ -7077,7 +7098,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let duration = match clockid {
             litebox_common_linux::ClockId::RealTime => {
                 // CLOCK_REALTIME
-                self.real_time_as_duration_since_epoch()
+                self.real_time_as_duration_since_epoch()?
             }
             litebox_common_linux::ClockId::Monotonic => {
                 // CLOCK_MONOTONIC
@@ -7099,7 +7120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             litebox_common_linux::ClockId::RealTimeCoarse => {
                 // CLOCK_REALTIME_COARSE - approximated by reusing CLOCK_REALTIME's source.
-                self.real_time_as_duration_since_epoch()
+                self.real_time_as_duration_since_epoch()?
             }
             litebox_common_linux::ClockId::ProcessCputimeId
             | litebox_common_linux::ClockId::ThreadCputimeId => {
@@ -7242,7 +7263,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
         }
         if let Some(tv) = tv {
-            tv.write_at_offset::<Platform>(0, self.real_time_as_duration_since_epoch().into())
+            tv.write_at_offset::<Platform>(0, self.real_time_as_duration_since_epoch()?.into())
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(())
@@ -7253,7 +7274,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         tloc: Option<UserPtrMut<litebox_common_linux::time_t>>,
     ) -> Result<litebox_common_linux::time_t, Errno> {
-        let time = self.real_time_as_duration_since_epoch();
+        let time = self.real_time_as_duration_since_epoch()?;
         let seconds: u64 = time.as_secs();
         let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
         if let Some(tloc) = tloc {
@@ -8861,16 +8882,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok(0);
         }
 
+        // The guest's TLS register is cleared as part of `execve` teardown. The value written is
+        // the fixed `0` (nothing the guest asked for can make the platform refuse it), so a failure
+        // here is host-side -- and by this point we are past the point of no return for the OLD
+        // program image, so it degrades exactly like this function's other late failures (warn +
+        // SIGSEGV) rather than panicking the host runner.
         #[cfg(target_arch = "x86_64")]
-        self.global
+        let clear_tls = self
+            .global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
-            .expect("failed to clear guest TLS on execve");
+            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0);
         #[cfg(target_arch = "aarch64")]
-        self.global
+        let clear_tls = self
+            .global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0)
-            .expect("failed to clear guest TLS on execve");
+            .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, 0);
+        if let Err(e) = clear_tls {
+            litebox_util_log::warn!(
+                tid:% = self.tid.get(), error:? = e;
+                "sys_execve: failed to clear guest TLS after point of no return, killing process with SIGSEGV"
+            );
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGSEGV,
+            ));
+            {
+                self.process().signal_vfork_done();
+                self.signal_native_vfork_gate();
+            }
+            return Ok(0);
+        }
 
         // Cloned BEFORE the call (cheap -- small `Vec<CString>`s), solely for the collision
         // hand-off below: `load_program` takes both by value, and they are needed again, intact,
@@ -9175,20 +9215,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
+                    // A guest-supplied TLS base this platform refuses is already rejected back
+                    // in `sys_clone` (which answers EPERM, exactly as Linux does) BEFORE this
+                    // thread is ever spawned, so a rejection here is a host-side failure, not a
+                    // guest-reachable one -- and it must never panic the host runner (the host
+                    // process IS the whole guest session). This thread has not executed a single
+                    // guest instruction yet, so marking it exiting is enough: `prepare_to_run_guest`
+                    // (see `enter_shim`) then answers `ContinueOperation::Terminate`, and only
+                    // THIS thread dies instead of the whole session.
                     #[cfg(target_arch = "x86_64")]
-                    {
-                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
-                            .unwrap();
-                    }
+                    let set_tls = self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()));
                     #[cfg(target_arch = "aarch64")]
-                    {
-                        self.global
-                            .platform
-                            .set_arch_specific_register(
-                                &ArchSpecificRegister::TpidrEl0,
-                                tls.as_usize(),
-                            )
-                            .unwrap();
+                    let set_tls = self
+                        .global
+                        .platform
+                        .set_arch_specific_register(
+                            &ArchSpecificRegister::TpidrEl0,
+                            tls.as_usize(),
+                        )
+                        .map_err(Errno::from);
+                    if let Err(e) = set_tls {
+                        litebox_util_log::warn!(
+                            tid:% = self.tid.get(), error:? = e;
+                            "init_thread_context: could not set the new thread's TLS, terminating it"
+                        );
+                        self.exit_thread(0);
+                        return;
                     }
                 }
 
