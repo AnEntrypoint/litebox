@@ -294,6 +294,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             litebox::fs::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::WriteError::FileTooLarge => Errno::EFBIG,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => Errno::EIO,
         }
@@ -731,6 +732,7 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd
             | litebox::fs::errors::TruncateError::PathOnlyFd => Errno::EBADF,
+            litebox::fs::errors::TruncateError::FileTooLarge => Errno::EFBIG,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }

@@ -493,7 +493,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             *offset.as_mut().unwrap_or(position)
         };
-        let end_position = write_position.checked_add(buf.len()).unwrap();
+        let end_position = write_position
+            .checked_add(buf.len())
+            .ok_or(WriteError::FileTooLarge)?;
+        // One fallible reserve for the whole growth this write can cause, so the `resize` and
+        // `extend` below can never reallocate: same reason as `truncate`'s -- a length this
+        // store cannot back must answer an error, and a `pwrite` at offset `1 << 40` is exactly
+        // the guest-supplied number that used to reach an allocation that could only panic.
+        if end_position > file.data.len() {
+            let extra = end_position - file.data.len();
+            file.data
+                .to_mut()
+                .try_reserve_exact(extra)
+                .map_err(|_| WriteError::FileTooLarge)?;
+        }
         let start = if write_position < file.data.len() {
             let start = write_position;
             let end = end_position.min(file.data.len());
@@ -598,7 +611,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 alloc::borrow::Cow::Owned(d) => d.truncate(length),
             },
             core::cmp::Ordering::Equal => (),
-            core::cmp::Ordering::Greater => file_data.data.to_mut().resize(length, 0),
+            // An in-mem file's bytes are ONE contiguous host allocation, so a length the host
+            // cannot back is not a partial write -- it is an allocation the global allocator
+            // cannot fail out of (`mm/allocator.rs`'s rescue has no way to say no), and a panic
+            // here is the end of the whole guest session, not an errno. Reserve fallibly and
+            // answer "too large" instead; `ftruncate(fd, 1 << 40)` is how panicx1 found this.
+            core::cmp::Ordering::Greater => {
+                let data = file_data.data.to_mut();
+                data.try_reserve_exact(length - data.len())
+                    .map_err(|_| TruncateError::FileTooLarge)?;
+                data.resize(length, 0);
+            }
         }
         file_data.perms.mtime = super::clock::now();
         if reset_offset {
