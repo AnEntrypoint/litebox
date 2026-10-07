@@ -611,6 +611,10 @@ fn report_connect_failure(what: &'static str, port: u16) {
 /// 8081 refused at t=90/120/150/180 s while `diag-connect` held 101 lines and not one of them was
 /// a failure -- every one was the `in-progress` of the first call.) `elapsed_us` against
 /// `timeout_us` is that distinction: a refusal lands early, a timeout at or past the deadline.
+/// `sockets` is how many sockets THIS process's socket set holds at that instant - the same count
+/// `diag-port` prints as `sockets=`. chrF32 needed it: its refusals read `slots=none` while the
+/// poller's own heartbeat read `port=8081 slots=8 listening=8` at the same wall clock, so either
+/// the two processes hold DIFFERENT socket sets or one of them is not seeing the shared one.
 fn report_connect_outcome(
     what: &'static str,
     port: u16,
@@ -618,6 +622,7 @@ fn report_connect_outcome(
     elapsed_us: u64,
     timeout_us: u64,
     slots: &str,
+    sockets: usize,
     state: &'static str,
     closed_here: bool,
 ) {
@@ -631,6 +636,7 @@ fn report_connect_outcome(
         elapsed_us = elapsed_us,
         timeout_us = timeout_us,
         slots:% = slots,
+        sockets = sockets,
         state:% = state,
         closed_here = closed_here,
         n = n;
@@ -646,6 +652,7 @@ fn report_connect_outcome(
         elapsed_us = elapsed_us,
         timeout_us = timeout_us,
         slots:% = slots,
+        sockets = sockets,
         state:% = state,
         closed_here = closed_here;
         "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
@@ -2021,6 +2028,7 @@ where
                                 elapsed.total_micros(),
                                 TCP_CONNECT_TIMEOUT.total_micros(),
                                 &port_slots_at(socket_set, peer_port),
+                                socket_set.iter().count(),
                                 match state {
                                     tcp::State::Listen => "L",
                                     tcp::State::SynReceived => "SR",
