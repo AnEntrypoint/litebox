@@ -2733,6 +2733,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
             // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
             // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                -1,
+                &self.comm.get(),
+                "prepare",
+            );
             let code = match self.process().wait_for_exit() {
                 ExitStatus::Exit(code) => i32::from(code) & 0xff,
                 ExitStatus::Signal(sig) => 128 + sig.as_i32(),
@@ -2763,6 +2771,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.tid.get(),
                 status,
                 &self.comm.get(),
+                "exit",
             );
         }
         // The `Task` will be dropped on the way out of the shim, which will
@@ -2789,6 +2798,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.tid.get(),
                 status,
                 &self.comm.get(),
+                "exit_group",
             );
         }
         // Tear down occurs similarly to `sys_exit`.

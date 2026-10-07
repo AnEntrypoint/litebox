@@ -2313,14 +2313,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .platform
                 .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
         });
-        crate::diag::init_child_exit_trail(|| {
-            self.global
-                .platform
-                .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL")
-        });
+        crate::diag::init_child_exit_trail(
+            || {
+                self.global
+                    .platform
+                    .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL")
+            },
+            self.global.platform,
+        );
         let comm_bytes = self.comm.get();
         crate::diag::record_syscall_trail(
             syscall_number,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
+        // `syscall_number`-based, before dispatch, because a `CreateProcessW`-spawned fork child
+        // never reaches the `IS_NATIVE_FORK_CHILD` exit sites -- see
+        // `diag::maybe_dump_child_exit_trail`. A no-op unless that diagnostic is armed.
+        crate::diag::maybe_dump_child_exit_trail(
+            self.global.platform,
+            syscall_number,
+            self.pid.get(),
+            self.tid.get(),
+            &comm_bytes,
             [
                 ctx.syscall_arg(0) as u64,
                 ctx.syscall_arg(1) as u64,
