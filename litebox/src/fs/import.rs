@@ -132,7 +132,7 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
                 block_index += payload_blocks;
 
                 let contents: &[u8] = tar_data.get(content_start..content_end).unwrap_or(&[]);
-                record(import_file(fs, &path, mode, contents));
+                record(import_file(fs, &path, mode, contents, merge_spec_of(header)));
             }
             _ => {
                 // Character devices and hardlinks: not produced by `export_all`, skipped.
@@ -161,6 +161,47 @@ fn whiteout_target(path: &str) -> Option<String> {
     Some(format!("{directory}/{removed}"))
 }
 
+/// How one regular file's payload is to be applied to the reader's own copy.
+///
+/// A cross-process fork child's export is a patch, not a snapshot: `Whole` replaces the file, while
+/// `Append`/`Range` carry only the bytes that process changed, so a sibling's writes to regions it
+/// never touched survive. Encoded by the writer in the tar `gname` field; anything unrecognized is
+/// `Whole`, which is what every archive that is not one of those exports means.
+#[derive(Clone, Copy)]
+enum MergeSpec {
+    /// The payload IS the file.
+    Whole,
+    /// The payload is a tail appended past `base`, the length the writer adopted the file at. It
+    /// lands at the END of the reader's copy if that has grown since, so two writers that both
+    /// appended from the same length do not overwrite one another.
+    Append { base: usize },
+    /// The payload is a byte range at `offset`; the file is then zero-extended to `final_len`.
+    Range { offset: usize, final_len: usize },
+}
+
+/// Prefix the writer puts in `gname` to mark a patch payload: `lbxmerge a <base>` or
+/// `lbxmerge r <offset> <final_len>`.
+const MERGE_MAGIC: &str = "lbxmerge";
+
+fn merge_spec_of(header: &tar_no_std::PosixHeader) -> MergeSpec {
+    let Ok(gname) = header.gname.as_str() else {
+        return MergeSpec::Whole;
+    };
+    let Some(fields) = gname.strip_prefix(MERGE_MAGIC) else {
+        return MergeSpec::Whole;
+    };
+    let mut fields = fields.split(' ').filter(|part| !part.is_empty());
+    let number = |part: Option<&str>| part.and_then(|value| value.parse::<usize>().ok());
+    match fields.next() {
+        Some("a") => number(fields.next()).map_or(MergeSpec::Whole, |base| MergeSpec::Append { base }),
+        Some("r") => match (number(fields.next()), number(fields.next())) {
+            (Some(offset), Some(final_len)) => MergeSpec::Range { offset, final_len },
+            _ => MergeSpec::Whole,
+        },
+        _ => MergeSpec::Whole,
+    }
+}
+
 /// Writes one regular file. The import applies another process's writes to the one shared
 /// filesystem, so a file whose mode forbids writing (e.g. Xvfb's 0444 `/tmp/.X1-lock`, re-exported
 /// by every child) is made writable for the write and its mode restored afterward.
@@ -169,8 +210,12 @@ fn import_file<FS: FileSystem>(
     path: &str,
     mode: Mode,
     contents: &[u8],
+    merge: MergeSpec,
 ) -> Result<(), ImportError> {
-    let flags = OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC;
+    let mut flags = OFlags::WRONLY | OFlags::CREAT;
+    if matches!(merge, MergeSpec::Whole) {
+        flags |= OFlags::TRUNC;
+    }
     let (fd, restore_mode) = match fs.open(path, flags, mode) {
         Ok(fd) => (fd, false),
         Err(super::errors::OpenError::AccessNotAllowed) => {
@@ -183,16 +228,51 @@ fn import_file<FS: FileSystem>(
         }
         Err(e) => return Err(ImportError::Open(String::from(path), e)),
     };
+    let existing_len = fs.file_status(path).map(|status| status.size).unwrap_or(0);
     let mut result = Ok(());
-    let mut written = 0;
-    while written < contents.len() {
-        match fs.write(&fd, &contents[written..], None) {
-            Ok(0) => break,
-            Ok(n) => written += n,
-            Err(_) => {
-                result = Err(ImportError::Write);
-                break;
+    if matches!(merge, MergeSpec::Whole) {
+        let mut written = 0;
+        while written < contents.len() {
+            match fs.write(&fd, &contents[written..], None) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(_) => {
+                    result = Err(ImportError::Write);
+                    break;
+                }
             }
+        }
+    } else {
+        // A patch: where to land it, and how long the writer's own copy ended up.
+        let (at, extend_to) = match merge {
+            MergeSpec::Append { base } => (existing_len.max(base), None),
+            MergeSpec::Range { offset, final_len } => (offset, Some(final_len)),
+            MergeSpec::Whole => (0, None),
+        };
+        // `truncate` grows a short file with zero bytes, so a patch past the end lands at its
+        // offset instead of being appended where it does not belong.
+        if at > existing_len && fs.truncate(&fd, at, true).is_err() {
+            result = Err(ImportError::Write);
+        }
+        if result.is_ok() {
+            let mut written = 0;
+            while written < contents.len() {
+                match fs.write(&fd, &contents[written..], Some(at + written)) {
+                    Ok(0) => break,
+                    Ok(n) => written += n,
+                    Err(_) => {
+                        result = Err(ImportError::Write);
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_ok()
+            && let Some(final_len) = extend_to
+            && final_len > at + contents.len()
+            && fs.truncate(&fd, final_len, true).is_err()
+        {
+            result = Err(ImportError::Write);
         }
     }
     if fs.close(&fd).is_err() && result.is_ok() {
