@@ -679,6 +679,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // makes `import pixelflux` fail to resolve a symbol that is present on disk) and, per
     // AGENTS.md's own closed investigation, of no practical benefit on real images.
     litebox_shim_linux::set_cow_mmap_enabled(std::env::var_os("LITEBOX_COW_MMAP").is_some());
+    // Same arrangement again, for the two A/B switches of the stale-socket-handle fix: `litebox`
+    // is `no_std` and cannot read the environment, and both switches exist so ONE binary can
+    // measure the fix both ways (see `litebox::net::set_socket_type_fallible_off` /
+    // `set_socket_generation_off`). Default OFF = the fix is ON.
+    litebox::net::set_socket_type_fallible_off(
+        std::env::var_os("LITEBOX_SOCKET_TYPE_FALLIBLE_OFF").is_some(),
+    );
+    litebox::net::set_socket_generation_off(std::env::var_os("LITEBOX_SOCKET_GEN_OFF").is_some());
     // Real boot lock, not a remembered rule: two concurrent litebox_runner processes
     // sharing this host silently starve each other (host memory/CPU contention),
     // producing a symptom -- truncated log, no crash, no exit -- that is
