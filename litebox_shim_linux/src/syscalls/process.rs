@@ -1317,7 +1317,6 @@ pub(crate) struct Credentials {
 const CAP_FULL: u64 = (1 << 41) - 1;
 const CAP_SETUID_BIT: u64 = 1 << 7;
 const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
-const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
@@ -5371,23 +5370,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             log_unsupported!("clone with CLONE_NEWPID and a flag it cannot share: {flags:?}");
             return Err(Errno::EINVAL);
         }
-        // Creating a PID namespace requires `CAP_SYS_ADMIN` in the user namespace that will OWN it:
-        // root in the initial one, or the owner of a user namespace -- which is exactly what
-        // Chromium's zygote keeps (`Credentials::SetCapabilities`) so it can put every renderer in
-        // a namespace of its own.
+        // A PID namespace used to require `CAP_SYS_ADMIN` in the user namespace that would own it
+        // -- root in the initial one, or the owner of a user namespace. That gate is gone, and
+        // `CLONE_NEWUSER` in the same clone needs no check at all either (its caller becomes the
+        // owner of the namespace that owns the new PID namespace by construction).
         //
-        // `CLONE_NEWUSER` in the same clone is the unprivileged way in, and needs no capability at
-        // all: the caller creates the user namespace that owns the new PID namespace, so it is its
-        // owner by construction (Linux validates against the NEW user namespace, not the old one).
-        // Chromium's zygote relies on precisely this -- it runs as an unprivileged uid and passes
-        // `CLONE_NEWUSER|CLONE_NEWPID` in one clone.
-        if flags.contains(CloneFlags::NEWPID)
-            && !flags.contains(CloneFlags::NEWUSER)
-            && !self.creds().holds_capability(CAP_SYS_ADMIN_BIT)
-        {
-            log_unsupported!("clone with CLONE_NEWPID without CAP_SYS_ADMIN");
-            return Err(Errno::EPERM);
-        }
+        // The removed check is what broke Chromium's zygote: it forks every renderer/utility
+        // process with `clone(CLONE_NEWPID | SIGCHLD)` -- observed as arg0 `0x20000011`, with NO
+        // `CLONE_NEWUSER`, from an unprivileged guest uid -- so `holds_capability` was false, the
+        // clone answered EPERM, `Zygote::Fork` returned -1, and Chromium logged
+        // `Zygote could not fork: process_type utility numfds 6 child_pid -1` followed by
+        // `NOTREACHED hit. Did not receive ping from zygote child`, then died. Confirmed in
+        // isolation by probe20: `clone(SIGCHLD)` and `clone(SIGCHLD|CLONE_NEWUSER)` both succeed
+        // and `clone(SIGCHLD|CLONE_NEWPID)` is the only one that answers EPERM.
+        //
+        // That gate guarded the HOST's PID namespace, which is not what is at stake here: this
+        // namespace is litebox's own object (see `syscalls::pidns`), created inside the sandbox
+        // litebox already gives every guest, so refusing it protected nothing -- it only refused a
+        // feature this shim genuinely implements. Real Linux never reaches this shape either,
+        // because an unprivileged Chromium there fails its sandbox probe up front and demands
+        // `--no-sandbox`; litebox answers those probes positively, so it must also answer the fork
+        // they lead to. `--uid 0` is not an alternative: Chromium refuses it outright ("Running as
+        // root without --no-sandbox is not supported", crbug.com/638180).
         if flags.intersects(!supported_clone_flags) {
             log_unsupported!(
                 "clone with unsupported flags: {:?}",
