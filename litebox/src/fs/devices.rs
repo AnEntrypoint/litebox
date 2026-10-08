@@ -640,6 +640,7 @@ where
                 .read_from_stdin(buf)
                 .map_err(|e| match e {
                     crate::platform::StdioReadError::Closed => ReadError::Io,
+                    crate::platform::StdioReadError::Io => ReadError::Io,
                 }),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
@@ -699,6 +700,7 @@ where
             .write_to(stream, buf)
             .map_err(|e| match e {
                 crate::platform::StdioWriteError::Closed => WriteError::Io,
+                crate::platform::StdioWriteError::Io => WriteError::Io,
             })
     }
 

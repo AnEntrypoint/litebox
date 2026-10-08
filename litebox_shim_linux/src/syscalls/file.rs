@@ -5241,8 +5241,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
-                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                    // `raw_fd` is not a slot this descriptor table has: Linux answers EBADF for a
+                    // `dup2` target it cannot install. An insert that fails (the store could not
+                    // grow to `raw_fd`) drops `new_fd`, i.e. closes it -- the same "nothing was
+                    // installed" outcome as the assert this replaces, and never a panic (a panic
+                    // here lands in the host process, which IS the whole guest session).
+                    let _ = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
                 }
                 return Err(Errno::EBADF);
             }
@@ -9765,7 +9769,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         raw_fd += 1;
                     }
                     let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-                    assert!(success);
+                    if !success {
+                        // The store could not grow to `raw_fd`, so this dup has no slot to land in.
+                        // EMFILE, never a panic: the host process IS the whole guest session.
+                        return Err(DupFdError::TooManyFiles);
+                    }
                     raw_fd
                 }
             };

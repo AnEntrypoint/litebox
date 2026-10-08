@@ -829,6 +829,8 @@ where
 pub enum StdioReadError {
     #[error("input stream has been closed")]
     Closed,
+    #[error("the host refused this read")]
+    Io,
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`StdioProvider::write_to`].
@@ -837,6 +839,8 @@ pub enum StdioReadError {
 pub enum StdioWriteError {
     #[error("output stream has been closed")]
     Closed,
+    #[error("the host refused this write")]
+    Io,
 }
 
 /// Possible standard output/error streams
