@@ -555,6 +555,80 @@ pub fn first_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     trail.entries[..trail.next].to_vec()
 }
 
+/// How many of a process's LAST syscalls the last-trail child-exit diagnostic keeps.
+///
+/// The mirror of [`FIRST_TRAIL_LEN`]: a chromium churn child's first 512 are the zygote
+/// SPECIALIZE sequence every child shares, while its last 512 are whatever it did immediately
+/// before its `exit_group(0)` -- which is where "its channel answered 0 bytes" and "it shut
+/// itself down" stop looking alike.
+const LAST_TRAIL_LEN: usize = 512;
+
+#[derive(Clone, Copy)]
+struct LastTrailEntry {
+    number: usize,
+    args: [u64; 3],
+    /// The value the guest got back in `rax`: a byte count, or `-errno` (`Errno` is encoded that
+    /// way), or 0 for a channel read that hit EOF.
+    ret: u64,
+}
+
+impl LastTrailEntry {
+    const EMPTY: Self = Self {
+        number: 0,
+        args: [0; 3],
+        ret: 0,
+    };
+}
+
+struct LastTrail {
+    entries: [LastTrailEntry; LAST_TRAIL_LEN],
+    next: usize,
+    filled: usize,
+}
+
+impl LastTrail {
+    const NEW: Self = Self {
+        entries: [LastTrailEntry::EMPTY; LAST_TRAIL_LEN],
+        next: 0,
+        filled: 0,
+    };
+}
+
+/// See [`LAST_TRAIL_LEN`]. One per host process, like [`FIRST_TRAIL`], read at the same exit.
+static LAST_TRAIL: spin::Mutex<LastTrail> = spin::Mutex::new(LastTrail::NEW);
+
+/// Remembers a process's most recent syscalls, overwriting the oldest once [`LAST_TRAIL_LEN`] of
+/// them have been seen. Called after dispatch, so `ret` is the value the guest saw.
+///
+/// Gated on the knob's budget, because unlike [`record_first_trail`] this one never fills up and
+/// stops: ungated it would spin-lock and write on every syscall of every process forever, and the
+/// budget is nonzero exactly when the knob is armed.
+pub fn record_last_trail(number: usize, args: [u64; 3], ret: u64) {
+    if CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut trail = LAST_TRAIL.lock();
+    let slot = trail.next;
+    trail.entries[slot] = LastTrailEntry { number, args, ret };
+    trail.next = (slot + 1) % LAST_TRAIL_LEN;
+    if trail.filled < LAST_TRAIL_LEN {
+        trail.filled += 1;
+    }
+}
+
+/// The recorded suffix of this process's syscall history, oldest first.
+pub fn last_trail_oldest_first() -> Vec<LastTrailEntry> {
+    let trail = LAST_TRAIL.lock();
+    let start = if trail.filled == LAST_TRAIL_LEN {
+        trail.next
+    } else {
+        0
+    };
+    (0..trail.filled)
+        .map(|i| trail.entries[(start + i) % LAST_TRAIL_LEN])
+        .collect()
+}
+
 /// The trail's entries, oldest first, for the fatal-exception diagnostic.
 pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     let trail = SYSCALL_TRAIL.lock();
@@ -620,7 +694,9 @@ where
     ) {
         return;
     }
-    if CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire) == 0 && CHILD_EXIT_TRAIL_COMM.lock().is_empty() {
+    let first_armed = !(CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire) == 0
+        && CHILD_EXIT_TRAIL_COMM.lock().is_empty());
+    if !first_armed && !child_exit_last_trail_armed() {
         return;
     }
     if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
@@ -632,7 +708,10 @@ where
         }
         IS_FORK_CHILD_HOST.store(true, Ordering::Release);
     }
-    emit_child_exit_trail(platform, pid, tid, args[0] as i32, comm, "hook");
+    if first_armed {
+        emit_child_exit_trail(platform, pid, tid, args[0] as i32, comm, "hook");
+    }
+    emit_child_exit_last_trail(platform, pid, tid, args[0] as i32, comm, "hook");
 }
 
 /// True once this host process has been seen to carry the cross-process fork child's register
@@ -643,6 +722,50 @@ static IS_FORK_CHILD_HOST: AtomicBool = AtomicBool::new(false);
 /// One trail per child, whichever exit site gets there first -- a child's `sys_exit_group` and its
 /// later `prepare_for_exit` would otherwise dump the same life twice.
 static CHILD_EXIT_TRAIL_DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// The `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST` knob's own latch, budget, comm filter and one-dump
+/// flag: the two knobs are independent, so a child is worth its last syscalls whether or not its
+/// first ones were asked for.
+static CHILD_EXIT_TRAIL_LAST_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+static CHILD_EXIT_TRAIL_LAST_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_EXIT_TRAIL_LAST_INIT: AtomicBool = AtomicBool::new(false);
+static CHILD_EXIT_TRAIL_LAST_DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last-trail knob is armed in this host process. Read on every syscall by
+/// [`record_last_trail`], so it stays one atomic load in the common case.
+pub fn child_exit_last_trail_armed() -> bool {
+    !(CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire) == 0
+        && CHILD_EXIT_TRAIL_LAST_COMM.lock().is_empty())
+}
+
+/// Parses the value grammar the per-child diagnostics share -- `<n>`, `<comm>` or `<comm>:<n>`,
+/// plus the `1`/`true`/`yes`/`on` spellings of "on" -- into a child budget and a comm prefix
+/// (empty means "any child").
+fn parse_child_trail_target(
+    value: Option<String>,
+    default_budget: usize,
+    comm_budget: usize,
+) -> (usize, Vec<u8>) {
+    match value {
+        None => (0, Vec::new()),
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => (default_budget, Vec::new()),
+        Some(v) => {
+            let v = v.trim();
+            match v.parse::<usize>() {
+                Ok(n) => (n, Vec::new()),
+                // `<comm>` or `<comm>:<count>` -- the count is what bounds a comm that matches
+                // hundreds of children (chromium's churn), since the default comm budget does not.
+                Err(_) => match v.rsplit_once(':') {
+                    Some((comm, n)) if !comm.is_empty() => (
+                        n.trim().parse::<usize>().unwrap_or(comm_budget),
+                        comm.as_bytes().to_vec(),
+                    ),
+                    _ => (comm_budget, v.as_bytes().to_vec()),
+                },
+            }
+        }
+    }
+}
 
 /// Call once, early, with a closure performing the platform's `env_value` lookup for
 /// `LITEBOX_DIAG_CHILD_EXIT_TRAIL`. Idempotent, same lazy-latch pattern as
@@ -667,29 +790,11 @@ pub fn init_child_exit_trail<Platform: litebox::platform::StdioProvider>(
     if CHILD_EXIT_TRAIL_INIT.load(Ordering::Acquire) {
         return;
     }
-    let (budget, comm) = match value() {
-        None => (0, Vec::new()),
-        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
-            (DEFAULT_CHILD_EXIT_TRAIL_BUDGET, Vec::new())
-        }
-        Some(v) => {
-            let v = v.trim();
-            match v.parse::<usize>() {
-                Ok(n) => (n, Vec::new()),
-                // `<comm>` or `<comm>:<count>` -- the count is what bounds a comm that matches
-                // hundreds of children (chromium's churn), since the default comm budget does not.
-                Err(_) => match v.rsplit_once(':') {
-                    Some((comm, n)) if !comm.is_empty() => (
-                        n.trim()
-                            .parse::<usize>()
-                            .unwrap_or(CHILD_EXIT_TRAIL_COMM_BUDGET),
-                        comm.as_bytes().to_vec(),
-                    ),
-                    _ => (CHILD_EXIT_TRAIL_COMM_BUDGET, v.as_bytes().to_vec()),
-                },
-            }
-        }
-    };
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        DEFAULT_CHILD_EXIT_TRAIL_BUDGET,
+        CHILD_EXIT_TRAIL_COMM_BUDGET,
+    );
     *CHILD_EXIT_TRAIL_COMM.lock() = comm;
     CHILD_EXIT_TRAIL_BUDGET.store(budget, Ordering::Release);
     CHILD_EXIT_TRAIL_INIT.store(true, Ordering::Release);
@@ -698,6 +803,39 @@ pub fn init_child_exit_trail<Platform: litebox::platform::StdioProvider>(
         let _ = platform.write_to(
             litebox::platform::StdioOutStream::Stderr,
             alloc::format!("[diag-child-exit-init] budget={budget} comm={comm}\n").as_bytes(),
+        );
+    }
+}
+
+/// Arms the LAST-syscalls variant, from `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST`. Same value grammar
+/// as [`init_child_exit_trail`] (`<n>`, `<comm>` or `<comm>:<n>`), read through the same parser,
+/// and prints one `[diag-child-exit-init] trail=last` line per host process for the same reason:
+/// so a run with no last-trails reads as "the child never saw this variable" rather than "the
+/// child never exited".
+///
+/// Independent of the other knob: either may be set alone, and setting both prints both trails.
+pub fn init_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
+    value: impl FnOnce() -> Option<String>,
+    platform: &Platform,
+) {
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    if CHILD_EXIT_TRAIL_LAST_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        DEFAULT_CHILD_EXIT_TRAIL_BUDGET,
+        CHILD_EXIT_TRAIL_COMM_BUDGET,
+    );
+    *CHILD_EXIT_TRAIL_LAST_COMM.lock() = comm;
+    CHILD_EXIT_TRAIL_LAST_BUDGET.store(budget, Ordering::Release);
+    CHILD_EXIT_TRAIL_LAST_INIT.store(true, Ordering::Release);
+    if budget != 0 {
+        let comm = String::from_utf8_lossy(&CHILD_EXIT_TRAIL_LAST_COMM.lock()).into_owned();
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!("[diag-child-exit-init] trail=last budget={budget} comm={comm}\n")
+                .as_bytes(),
         );
     }
 }
@@ -775,6 +913,81 @@ pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
     }
 }
 
+/// Takes one child slot out of `slot`, false once the budget is spent.
+fn spend_child_trail_budget(slot: &AtomicUsize) -> bool {
+    let mut budget = slot.load(Ordering::Acquire);
+    while budget != 0 {
+        match slot.compare_exchange_weak(budget, budget - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => budget = current,
+        }
+    }
+    false
+}
+
+/// Prints this task's LAST syscalls to stderr, each one with the value the guest got back, if
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST` armed this diagnostic and a budget slot is still
+/// available. Completely inert when that knob is unset, so a run that armed only the FIRST trail
+/// is byte-identical to what it printed before this existed.
+///
+/// THE RETURN VALUE IS THE POINT: `read(21, buf, 8)` is one line whether it got 8 bytes, hit EOF
+/// or got `-ECONNRESET`, and those are three different answers to "why did this child stop".
+/// Same [`emit_child_exit_trail`] header convention plus `trail=last`, so the two trails stay
+/// separable in a log where both knobs are set.
+pub fn emit_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    pid: i32,
+    tid: i32,
+    status: i32,
+    comm: &[u8],
+    site: &str,
+) {
+    if !child_exit_last_trail_armed() {
+        return;
+    }
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    let wanted = CHILD_EXIT_TRAIL_LAST_COMM.lock();
+    let comm_ok = wanted.is_empty()
+        || trimmed == wanted.as_slice()
+        || wanted.starts_with(trimmed);
+    let budget = CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire);
+    let entries = last_trail_oldest_first();
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        alloc::format!(
+            "[diag-child-exit] trail=last site={site} pid={pid} tid={tid} comm={} status={status} budget={budget} comm_ok={comm_ok} entries={}\n",
+            String::from_utf8_lossy(trimmed),
+            entries.len(),
+        )
+        .as_bytes(),
+    );
+    if !comm_ok {
+        return;
+    }
+    if CHILD_EXIT_TRAIL_LAST_DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !spend_child_trail_budget(&CHILD_EXIT_TRAIL_LAST_BUDGET) {
+        return;
+    }
+    let comm = String::from_utf8_lossy(trimmed);
+    for (i, entry) in entries.iter().enumerate() {
+        let signed = entry.ret as i64;
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-exit] trail=last pid={pid} tid={tid} comm={comm} status={status} i={i} syscall={} arg0={:#x} arg1={:#x} arg2={:#x} ret={signed}\n",
+                syscall_name(entry.number),
+                entry.args[0],
+                entry.args[1],
+                entry.args[2],
+            )
+            .as_bytes(),
+        );
+    }
+}
+
 /// How many IPC lines `LITEBOX_DIAG_CHILD_IPC` prints per child host process.
 const CHILD_IPC_DEFAULT_BUDGET: usize = 200;
 
@@ -797,27 +1010,11 @@ pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
     if CHILD_IPC_INIT.load(Ordering::Acquire) {
         return;
     }
-    let (budget, comm) = match value() {
-        None => (0, Vec::new()),
-        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
-            (CHILD_IPC_DEFAULT_BUDGET, Vec::new())
-        }
-        Some(v) => {
-            let v = v.trim();
-            match v.parse::<usize>() {
-                Ok(n) => (n, Vec::new()),
-                Err(_) => match v.rsplit_once(':') {
-                    Some((comm, n)) if !comm.is_empty() => (
-                        n.trim()
-                            .parse::<usize>()
-                            .unwrap_or(CHILD_IPC_DEFAULT_BUDGET),
-                        comm.as_bytes().to_vec(),
-                    ),
-                    _ => (CHILD_IPC_DEFAULT_BUDGET, v.as_bytes().to_vec()),
-                },
-            }
-        }
-    };
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        CHILD_IPC_DEFAULT_BUDGET,
+        CHILD_IPC_DEFAULT_BUDGET,
+    );
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let own = String::from_utf8_lossy(&comm[..end]).into_owned();
     *CHILD_IPC_COMM.lock() = comm;

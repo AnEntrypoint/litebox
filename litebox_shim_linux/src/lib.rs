@@ -2321,6 +2321,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             self.global.platform,
         );
+        crate::diag::init_child_exit_last_trail(
+            || {
+                self.global
+                    .platform
+                    .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST")
+            },
+            self.global.platform,
+        );
         crate::diag::init_child_ipc(
             || self.global.platform.env_value("LITEBOX_DIAG_CHILD_IPC"),
             self.global.platform,
@@ -2424,6 +2432,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.pid.get(),
             self.tid.get(),
             &self.comm.get(),
+        );
+        // Same placement, for the same reason: the ring keeps the value the guest saw, which only
+        // exists after dispatch. One atomic load per syscall when the knob is unset.
+        crate::diag::record_last_trail(
+            syscall_number,
+            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            return_value as u64,
         );
         #[cfg(target_arch = "x86_64")]
         {

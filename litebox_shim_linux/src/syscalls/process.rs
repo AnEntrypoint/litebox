@@ -2741,6 +2741,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 &self.comm.get(),
                 "prepare",
             );
+            crate::diag::emit_child_exit_last_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                -1,
+                &self.comm.get(),
+                "prepare",
+            );
             let code = match self.process().wait_for_exit() {
                 ExitStatus::Exit(code) => i32::from(code) & 0xff,
                 ExitStatus::Signal(sig) => 128 + sig.as_i32(),
@@ -2773,6 +2781,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 &self.comm.get(),
                 "exit",
             );
+            crate::diag::emit_child_exit_last_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit",
+            );
         }
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
@@ -2793,6 +2809,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.print_diag_reports_if_bootstrap_process();
         if IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
             crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit_group",
+            );
+            crate::diag::emit_child_exit_last_trail(
                 self.global.platform,
                 self.pid.get(),
                 self.tid.get(),
