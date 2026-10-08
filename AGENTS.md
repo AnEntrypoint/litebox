@@ -159,20 +159,12 @@ that cannot fail is not evidence** (a control that must succeed plus an INVALID 
 - Logs: verbosity from `LITEBOX_LOG`, not `RUST_LOG`; **`debug!` fields take `&str`, not an owned `String`**. **Timestamps are PER-PROCESS UPTIME; `.err` lines carry ANSI escapes.** **The `tag=`/`dtag=` fields DO NOT identify a host process.** Socket census is `local_port:state:remote_port`; a listening slot is `0:L:0`, so the census CANNOT prove a port is armed. **`LITEBOX_*` env flags are read from the HOST env by `platform.env_flag`, not from `--env`.**
 
 ## Guest stack: chromium + selkies (full recipe in the `-06f` appendix, verbatim in `-07m`)
-Full recipe in the `-06f` appendix (verbatim `-07m`, `-07q`).
-
-- **TWO chromium failure modes - do not merge.** (a) `Crashing due to FD ownership
-  violation:` + `zygote_host_impl_linux.cc:129] No usable sandbox!` = the
-  `CanCreateProcessInNewUserNS()` probe. (b) rc=133 (SIGTRAP) with NO sandbox line =
-  crashpad (fixed `2b622b4`). **`--no-zygote` alone is refused.**
-- **CDP FROM INSIDE THE GUEST + THE HOST BROWSER ARE THE TWO HALVES OF THE PROOF**: guest
-  `--remote-debugging-port=9222 --remote-allow-origins=*` + `GET /json/list` + RAW stdlib websocket;
-  host chrome-devtools MCP `navigate_page`/`take_screenshot`; judge a frame only after ~60 s of STREAM
-  time (white/grey is PRE-FIRST-PAINT). **Selkies' capture REQUIRES MIT-SHM**; **XWD: decode with the
-  MASKS** (`f[14..16]` = r/g/b). **SELKIES**: binds `--port=` (NOT `CUSTOM_WS_PORT`), always
-  `--enable-basic-auth=false`; **EXITS ON ITS OWN after its last client leaves**, so a published port
-  going `000` is the APP LEAVING. **A published host client dials `GUEST_IP_ADDR:g`, so a guest server
-  taking published connections HAS TO BIND 0.0.0.0.** Run ONE chromium.
+Windows/webtop recipe, verbatim in the `-06f` appendix and `-07q`. Two chromium failure modes that
+must not be merged: (a) `Crashing due to FD ownership violation:` + `No usable sandbox!` = the
+`CanCreateProcessInNewUserNS()` probe; (b) rc=133 (SIGTRAP) with NO sandbox line = crashpad. The
+proof is CDP from inside the guest PLUS the host browser; judge a frame only after ~60 s of STREAM
+time. Selkies binds `--port=` and needs `--enable-basic-auth=false`; it EXITS when its last client
+leaves, so a published port going `000` is the APP LEAVING.
 
 ## Closed - do not re-attempt without a genuinely new approach
 
