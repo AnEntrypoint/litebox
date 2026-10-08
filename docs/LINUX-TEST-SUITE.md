@@ -235,6 +235,85 @@ too - `litebox_platform_windows_userland` is empty on this host and still counte
 `static` anywhere under a listed prefix needs a field instead where one is available, or a
 justified bump in the same commit.**
 
+## Fourth pass: the tick counter that made an orphan sweep retire a LIVE port
+
+Symptom, after that third pass: `cargo test -p litebox --lib` never finished. Re-run with
+`-- --test-threads=1`, the last line was
+
+```
+test net::tests::test_bidirectional_tcp_communication_manual ...
+```
+
+with one thread at 100% CPU and no `ok`. That test ends in an **unbounded `accept` loop**
+(`Err(AcceptError::NoConnectionsReady) => {}`), so a hang there means the port was armed and then
+stopped being reachable.
+
+### Mechanism: "no referent recorded" was read as "no LIVE referent"
+
+`Network::reclaim_orphaned_listen_queues` (the 1-in-512 sweep that frees a row whose referents all
+died without closing, since a killed process never spends its `refs`) counts referents that are
+still alive and retires the row when that count is 0. Its filter drops pid 0:
+
+```rust
+let live = remaining.iter().filter(|pid| **pid != 0 && (**pid == me || is_process_alive(**pid))).count();
+if live > 0 { continue; }
+... self.retire_listen_queue(index);
+```
+
+`ListenQueue::record_referent` declines pid 0 as well, and `SystemInfoProvider::current_pid`
+returns **0** -- the documented "unknown", and this crate's own `MockPlatform` (its
+`SystemInfoProvider` impl only overrides the two methods with no default). So for a port a test
+had just armed, `ref_pids` was all zeros, `live` was 0, and the row was retired: `retire_listen_queue`
+tears the armed backlog out of the shared socket set. A listening socket destroyed with nothing
+ever closed -- the exact deaf-port shape the sweep exists to clean up after.
+
+### Why it only appeared now
+
+The counter was a function-local `static TICKS` shared by every `Network` **in the process**, so
+only the first `Network` to tick ever swept on count 0; the third pass turned it into the
+`Network::reclaim_tick` field, so now **every** `Network` sweeps on its first tick. In the manual
+test the first tick is the explicit `comms()` right after `listen()` + `connect()` -- `Manual`
+mode makes `automated_platform_interaction` a no-op, so no earlier call consumes count 0. That is
+why `_default` and `_automatic` passed: their first tick lands before `listen()` ever arms a row.
+**A per-instance tick counter means tick 0 of every instance sweeps, so every invariant here has
+to hold on an instance's first tick, not just on some process's.**
+
+### The fix
+
+A row that records **no** referent pid is a row with no liveness information, not a row with a dead
+referent, so the sweep skips it:
+
+```rust
+if !remaining.iter().any(|pid| *pid != 0) { continue; }
+```
+
+### Both ways
+
+- **With** the guard: `cargo test -p litebox --lib -- net::tests::` = 5 passed, including
+  `test_bidirectional_tcp_communication_manual` (0.01 s).
+- **Without** it (the condition temporarily `&& !cfg!(all())`): the new
+  `test_reclaim_orphaned_listen_queue_needs_a_known_dead_referent` **FAILED** at its first arm
+  (`a port nobody closed must stay armed even when this platform cannot name a referent`), and the
+  manual test was **still running after 60 s** and had to be killed (exit 124).
+
+That new test carries all three arms in one binary, so the guard cannot decay into "never sweep":
+no referent recorded -> stays armed; a live referent -> stays armed; **every referent
+`mark_dead` on the mock platform -> the row is reclaimed.** The third arm needed a way to make a
+pid dead, which `MockPlatform` had no answer for (`is_process_alive` defaults to `true`): it now
+has a `dead_pids: RwLock<Vec<u32>>` **field** and a `mark_dead()` helper -- a field, not a
+`static`, so `dev_tests`' ratchet does not move.
+
+**RULE: a sweep over shared state may only reclaim what it has EVIDENCE about -- "no information"
+is never "evidence of death". A pid a platform cannot name (0) is unknown, and every other reader
+of it declines to act rather than guessing.**
+
+### State after this pass
+
+`cargo test --no-fail-fast` = **58 targets ok, 0 failed**; `-p litebox --lib` = **70 passed**
+(69 + the new test; `cargo test --release -p litebox --lib` = 69, the debug-only one being the
+usual `debug_assertions` gate). `cargo build`, `cargo check --all-targets` and
+`cargo clippy --all-targets --all-features` all exit 0.
+
 **TRAP: `cargo test ... 2>&1 | tail -40; echo "TEST=$?"` reports `tail`'s status, not cargo's.**
 The first run of this merged tree printed `TEST=0` and `EXIT=0` while the real result was
 `error: 1 target failed`. Use `${PIPESTATUS[0]}` (or write rc to the log without a pipe) whenever
