@@ -38,6 +38,10 @@ pub(crate) struct MockPlatform {
     pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
     pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
     pub(crate) stderr_queue: RwLock<VecDeque<Vec<u8>>>,
+    /// Pids [`SystemInfoProvider::is_process_alive`] must answer `false` for, so a test can drive
+    /// a liveness-based reclaim path (a referent that died without closing). Empty unless a test
+    /// calls [`Self::mark_dead`], so every other test keeps the trait default's "assume alive".
+    dead_pids: RwLock<Vec<u32>>,
 }
 
 impl MockPlatform {
@@ -53,7 +57,13 @@ impl MockPlatform {
             stdin_queue: RwLock::new(VecDeque::new()),
             stdout_queue: RwLock::new(VecDeque::new()),
             stderr_queue: RwLock::new(VecDeque::new()),
+            dead_pids: RwLock::new(Vec::new()),
         }))
+    }
+
+    /// Records `pid` as no longer alive, for the tests that need a dead referent.
+    pub(crate) fn mark_dead(&self, pid: u32) {
+        self.dead_pids.write().unwrap().push(pid);
     }
 }
 
@@ -305,7 +315,7 @@ impl ArchSpecificProvider for MockPlatform {
 // `get_syscall_entry_point`/`memory_info_kb`/`env_flag`/`env_value`/`get_vdso_address`), so a
 // mock-platform test exercises the same code paths as the real Linux platform rather than a
 // mock-only variant. In particular `current_pid()` stays `0` ("unknown", callers decline to act)
-// and `is_process_alive()` stays `true`.
+// and `is_process_alive()` stays `true` except for a pid a test named with `mark_dead`.
 impl SystemInfoProvider for MockPlatform {
     fn get_syscall_entry_point(&self) -> usize {
         0
@@ -313,6 +323,10 @@ impl SystemInfoProvider for MockPlatform {
 
     fn get_vdso_address(&self) -> Option<usize> {
         None
+    }
+
+    fn is_process_alive(&self, pid: u32) -> bool {
+        !self.dead_pids.read().unwrap().contains(&pid)
     }
 }
 

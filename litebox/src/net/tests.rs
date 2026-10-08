@@ -173,3 +173,86 @@ fn test_reset_after_poisoning_clears_torn_state_and_frees_ports() {
         "Expected InProgress error, got {err:?}",
     );
 }
+
+/// Binds 8080 and arms its shared accept queue, returning the row index.
+fn arm_listener(network: &mut Network<MockPlatform>) -> usize {
+    let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let listener_fd = network
+        .socket(Protocol::Tcp)
+        .expect("Failed to create TCP socket");
+    network
+        .bind(&listener_fd, &listen_addr)
+        .expect("Failed to bind TCP socket");
+    network
+        .listen(&listener_fd, 1)
+        .expect("Failed to listen on TCP socket");
+    network
+        .listen_queue_index(8080)
+        .expect("listen() armed a shared accept queue row for 8080")
+}
+
+/// The 1-in-512 sweep that frees a listening port's shared accept queue once no LIVE referent
+/// names it any more may only retire a row it has LIVENESS INFORMATION about.
+///
+/// Three arms, one binary, each of which fails if the guard is wrong in that direction:
+///
+/// * `unknown` -- no referent pid was recorded at all, because `SystemInfoProvider::current_pid`
+///   answered `0` (the trait default, and this crate's own `MockPlatform`) and
+///   `ListenQueue::record_referent` declines it. The row must STAY armed: reading "no live
+///   referent" out of "no referent known" retired a port whose owner had just armed it and was
+///   about to `accept` on it, which is exactly the deaf-port shape this sweep exists to clean up
+///   after. Live: `test_bidirectional_tcp_communication_manual` hung in `accept` forever, its port
+///   retired on the first tick that swept it.
+/// * `live` -- a recorded referent that is alive: must stay armed (the ordinary case).
+/// * `dead` -- a recorded referent that is gone: MUST be retired, or the guard above is a blanket
+///   "never sweep" and the leaked-row reason for this sweep comes straight back.
+#[test]
+fn test_reclaim_orphaned_listen_queue_needs_a_known_dead_referent() {
+    const REFERENT: u32 = 0x5eed;
+
+    // (1) unknown: no pid recorded -> stays armed.
+    let platform = MockPlatform::new();
+    let litebox = LiteBox::new(platform);
+    let mut network = Network::new(&litebox);
+    let index = arm_listener(&mut network);
+    network.listen_queues[index].ref_pids = [0; MAX_QUEUE_REF_OWNERS];
+    // The sweep runs on the tick whose counter is a multiple of 512, so land one there.
+    network.reclaim_tick = 512;
+    network.maintain_listening_queues();
+    assert_eq!(
+        network.listen_queue_index(8080),
+        Some(index),
+        "a port nobody closed must stay armed even when this platform cannot name a referent"
+    );
+
+    // (2) live: a referent that is alive -> stays armed.
+    let platform = MockPlatform::new();
+    let litebox = LiteBox::new(platform);
+    let mut network = Network::new(&litebox);
+    let index = arm_listener(&mut network);
+    network.listen_queues[index].ref_pids = [0; MAX_QUEUE_REF_OWNERS];
+    network.listen_queues[index].ref_pids[0] = REFERENT;
+    network.reclaim_tick = 512;
+    network.maintain_listening_queues();
+    assert_eq!(
+        network.listen_queue_index(8080),
+        Some(index),
+        "a port with a live referent must stay armed"
+    );
+
+    // (3) dead: every referent gone -> retired, the row freed for another port.
+    let platform = MockPlatform::new();
+    let litebox = LiteBox::new(platform);
+    let mut network = Network::new(&litebox);
+    let index = arm_listener(&mut network);
+    network.listen_queues[index].ref_pids = [0; MAX_QUEUE_REF_OWNERS];
+    network.listen_queues[index].ref_pids[0] = REFERENT;
+    platform.mark_dead(REFERENT);
+    network.reclaim_tick = 512;
+    network.maintain_listening_queues();
+    assert_eq!(
+        network.listen_queue_index(8080),
+        None,
+        "a port whose only referent died without closing must be reclaimed"
+    );
+}

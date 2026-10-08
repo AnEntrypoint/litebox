@@ -1874,6 +1874,19 @@ where
                 continue;
             }
             let remaining = self.listen_queues[index].referent_pids();
+            // A row that records NO referent is a row this sweep cannot ask about, not a row whose
+            // referent died. `ListenQueue::record_referent` declines pid 0, which is exactly what
+            // `SystemInfoProvider::current_pid` returns when the platform cannot name one (the
+            // trait default, and this crate's own `MockPlatform`), so every slot can read 0 while
+            // the process that armed the port is sitting in its accept loop. Counting that as "no
+            // live referent" retired the port on the very first tick that swept it -- a live
+            // process's listening socket torn down with nothing ever closed, the same deaf-port
+            // shape this sweep exists to clean up after. Decline to act, as every other reader of
+            // pid 0 does. (Live: `test_bidirectional_tcp_communication_manual` hung in `accept`
+            // forever, its port retired one tick after `listen()` armed it.)
+            if !remaining.iter().any(|pid| *pid != 0) {
+                continue;
+            }
             let live = remaining
                 .iter()
                 .filter(|pid| {
