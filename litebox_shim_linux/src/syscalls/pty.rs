@@ -1578,6 +1578,24 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> crate::GlobalStateHandle<Platfor
         ids
     }
 
+    /// Make the filesystem's `/dev/pts` mirror match [`Self::live_pty_ids`], so listing that
+    /// directory names a pty ANOTHER host process allocated.
+    ///
+    /// The mirror (`pts_registry`) is per-process and `ptmx_open` only inserts into its own, which
+    /// is why `ls /dev/pts` in a second guest process printed nothing while ptys were open: `ls`
+    /// is its own host process and its mirror is empty. A list is a snapshot either way -- a pty
+    /// allocated after this point is not in it, exactly as on real devpts -- so rebuilding from
+    /// the union is not a loss. Called from the open path alone (`do_open_resolved`), never per
+    /// `getdents`, so a directory walk costs one rebuild and no lock is held across host I/O.
+    pub(crate) fn sync_pts_registry(&self) {
+        let ids = self.live_pty_ids();
+        let mut registry = self.pts_registry.write();
+        registry.clear();
+        for id in ids {
+            registry.insert(id);
+        }
+    }
+
     /// Handle `open("/dev/pts/<id>")`. For a published pty (any process of the fork family may
     /// have allocated it) this is a new [`PtyEnd::SharedSlave`] file description, counted as an
     /// open slave; for an unpublished in-process pty it duplicates the registered slave entry.
