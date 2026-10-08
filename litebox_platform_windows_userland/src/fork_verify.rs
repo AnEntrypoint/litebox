@@ -1284,10 +1284,22 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         if relocations.is_in_source(rcx)
             && let Some(translated_rcx) = relocations.translate(rcx)
         {
-            litebox_util_log::warn!(
-                rcx:? = rcx, translated_rcx:? = translated_rcx;
-                "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
-            );
+            // Same rule as case (1): a translation that leaves the value where it was is not a
+            // heal. chrF55 (identity map, verification forced back on) emitted 4,847 of these in
+            // 150 s and NOT ONE of them changed `rcx` -- `translated_rcx == rcx` in 4847/4847 --
+            // because on an identity map `translate` is the identity function. Calling that
+            // "stale pointer detected" is a lie that buries the cases that really do move.
+            if translated_rcx == rcx {
+                litebox_util_log::debug!(
+                    rcx:? = rcx;
+                    "fork_verify: rcx is a source-range return address whose translation is a no-op, resuming"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    rcx:? = rcx, translated_rcx:? = translated_rcx;
+                    "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
+                );
+            }
             context.Rcx = translated_rcx as u64;
         }
         context.EFlags &= !eflags_tf;
