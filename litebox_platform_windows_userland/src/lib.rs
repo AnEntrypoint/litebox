@@ -310,6 +310,10 @@ pub(crate) struct VehGates {
     pub(crate) watchaddr: Option<usize>,
     /// `LITEBOX_FORKVERIFY_OFF`
     pub(crate) forkverify_off: bool,
+    /// `LITEBOX_FORKVERIFY_IDENTITY`: arm fork verification even for an IDENTITY relocation map,
+    /// i.e. restore the behaviour before the cross-process-fork fix. That is the OFF switch for
+    /// the fix, not a diagnostic -- see `fork_verify::begin`.
+    pub(crate) forkverify_identity: bool,
     /// `LITEBOX_DIAG_GS_BASE_REPAIR`
     pub(crate) gs_base_repair: bool,
     /// `LITEBOX_DIAG_FS_BASE_REPAIR` (94th pass, mirrors `gs_base_repair` above): logs every time
@@ -342,6 +346,7 @@ impl VehGates {
                 .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .filter(|&a| a != 0),
             forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
+            forkverify_identity: std::env::var_os("LITEBOX_FORKVERIFY_IDENTITY").is_some(),
             gs_base_repair: std::env::var_os("LITEBOX_DIAG_GS_BASE_REPAIR").is_some(),
             fs_base_repair: std::env::var_os("LITEBOX_DIAG_FS_BASE_REPAIR").is_some(),
         }

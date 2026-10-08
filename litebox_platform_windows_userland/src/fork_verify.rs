@@ -1157,10 +1157,22 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                     );
                 }
             }
-            litebox_util_log::warn!(
-                host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
-                "fork_verify: stale CODE pointer detected, translating and resuming"
-            );
+            // A translation that leaves `rip` where it was is not a heal -- it is the identity map
+            // (or a range that happens to map to itself), and this case then fires on essentially
+            // every instruction the child executes. chrF51: 3.6M of these in one 300 s run, every
+            // single one with `translated_rip == rip`, 823 MB of log. Raise only a real heal to
+            // warn; a no-op is debug, which `LITEBOX_LOG=warn` then never prints.
+            if translated_rip == rip {
+                litebox_util_log::debug!(
+                    host_tid:? = std::thread::current().id(), rip:? = rip;
+                    "fork_verify: rip in a source range whose translation is a no-op, resuming"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
+                    "fork_verify: stale CODE pointer detected, translating and resuming"
+                );
+            }
             context.Rip = translated_rip as u64;
             #[allow(clippy::cast_possible_truncation)]
             let rbp = context.Rbp as usize;
@@ -2854,7 +2866,31 @@ pub(crate) fn begin(
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
-        if !crate::veh_gates().forkverify_off {
+        // A cross-process fork child is handed an IDENTITY relocation map
+        // (`AddressRelocations::identity_for_cross_process`, see the call site in
+        // `platform_fork`: the child's real memory always lives at SOURCE coordinates). For such a
+        // map `translate` is the identity function, so there is no stale pointer to heal -- yet
+        // verification still re-armed `TF` on every instruction and case (1) below still fired,
+        // "healing" `rip` to itself: chrF51 measured 823 MB of `rip == translated_rip` warn lines
+        // in one 300 s chromium run, one per single-step, capped at
+        // `MAX_IDENTITY_VERIFICATION_STEPS` (4096) per child -- ~940 KB of log and 4096 Windows
+        // exception round-trips per fork, buying nothing. Arming verification on a map that
+        // cannot relocate anything is the whole cost and none of the benefit, so don't.
+        // `LITEBOX_FORKVERIFY_IDENTITY=1` restores the old behaviour (the OFF switch for this).
+        let identity_is_vacuous =
+            relocations.is_identity() && !crate::veh_gates().forkverify_identity;
+        let armed = !crate::veh_gates().forkverify_off && !identity_is_vacuous;
+        // Without this line the two paths are indistinguishable from outside: `fvid1` read
+        // ok=30 in both arms with near-identical .err, and the only way to tell WHY was to guess.
+        // `identity=true` says the child came through the cross-process fork (the sole
+        // `identity_for_cross_process` call site, `lib.rs:14720`); `armed` says whether this fix
+        // let it skip verification. Run with
+        // `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=debug` to see it.
+        litebox_util_log::debug!(
+            host_tid:? = std::thread::current().id(), identity:? = relocations.is_identity(), armed:? = armed;
+            "fork_verify: begin"
+        );
+        if armed {
             tls.fork_verify_step_count.set(0);
             tls.fork_verify_av_heal_count.set(0);
             tls.fork_verify_step_rip_repeat.set(None);
