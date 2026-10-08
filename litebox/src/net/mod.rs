@@ -236,6 +236,14 @@ where
     /// shared state alone, with no descriptor table involved -- see [`ListenQueue`]'s own doc
     /// comment for the failures this retires.
     listen_queues: [ListenQueue; LISTEN_QUEUE_SLOTS],
+    /// Tick counter gating [`Self::reclaim_orphaned_listen_queues`]'s 1-in-512 sweep.
+    ///
+    /// A field of `Network` (already shared, constructed once per fork family) rather than the
+    /// function-local `static` it started as: a `static` here is counted by `dev_tests`'s
+    /// `ratchet_globals`, which is right to count it -- the state belongs to the instance being
+    /// swept, and sweeping from shared state is exactly what this queue rework is about. Being
+    /// shared also means one process's ticks are every process's, which is the intent.
+    reclaim_tick: u32,
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -306,6 +314,7 @@ where
             shared_across_fork: [None; MAX_SOCKETS],
             accepted_slots: [None; MAX_SOCKETS],
             listen_queues: core::array::from_fn(|_| ListenQueue::EMPTY),
+            reclaim_tick: 0,
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -1846,8 +1855,9 @@ where
     /// session. Checking liveness per pid is a syscall, so this runs once every 512 ticks rather
     /// than on every tick in every process.
     fn reclaim_orphaned_listen_queues(&mut self) {
-        static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+        let tick = self.reclaim_tick;
+        self.reclaim_tick = self.reclaim_tick.wrapping_add(1);
+        if tick % 512 != 0 {
             return;
         }
         let me = self.litebox.platform().current_pid();

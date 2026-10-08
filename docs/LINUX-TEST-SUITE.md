@@ -202,3 +202,40 @@ takes. Check host RAM before believing a runner SIGSEGV.**
 `-p litebox` 69, `-p litebox_common_linux` 10, `-p litebox_platform_linux_userland` 3,
 `-p litebox_shim_optee` 10. `cargo build`, `cargo check --all-targets` and
 `cargo clippy --all-targets --all-features` all exit 0.
+
+## Third pass: the merge brought a `dev_tests` ratchet failure
+
+After `origin/main` (and `origin/inetfix`) were merged in, `cargo test --no-fail-fast` reported
+**`error: 1 target failed: -p dev_tests --lib`** while every other target stayed green.
+
+`dev_tests` is not a guest test at all - it is a **source ratchet**: `dev_tests/src/ratchet.rs`
+counts, per crate prefix, the lines matching three heuristics (`transmute`, a line-initial
+`static`, `MaybeUninit`) and fails when a count **increases**. Upstream's two new commits had
+added one function-local `static` each:
+
+- `litebox/src/net/mod.rs` - `static TICKS: AtomicU32` inside `reclaim_orphaned_listen_queues`
+  (the 1-in-512 orphaned-listen-queue sweep) -> `litebox/` 45 -> 46;
+- `litebox_platform_windows_userland/src/lib.rs` - `static UNHANDLED: AtomicU32`, throttling the
+  `error!` for an exception code the handler does not enumerate -> 112 -> 113.
+
+Two different fixes, chosen on the shape of each site:
+
+- **`TICKS` became a field.** `reclaim_orphaned_listen_queues(&mut self)` already had `&mut self`,
+  so the counter belongs on `Network` (`reclaim_tick: u32`, initialized to 0 in `Network::new`),
+  which is exactly the shared per-fork-family object the sweep runs over - and being shared is
+  better here, since one process's ticks are then every process's. No `static`, no ratchet bump;
+  `litebox/` stays at 45.
+- **`UNHANDLED` stayed a `static` and the ratchet was bumped to 113.** That arm is inside a free
+  function in the exception handler with no `&self` to hang a field on, and the throttle is
+  mandatory by this repo's own standing rule (a guest looping on a trap must not bury the log).
+  The bump carries a comment, matching how every earlier bump in that file is justified.
+
+**RULE: `dev_tests` reads the SOURCE, not the compiled crate, so it fails on a `cfg`-gated file
+too - `litebox_platform_windows_userland` is empty on this host and still counted. Adding a
+`static` anywhere under a listed prefix needs a field instead where one is available, or a
+justified bump in the same commit.**
+
+**TRAP: `cargo test ... 2>&1 | tail -40; echo "TEST=$?"` reports `tail`'s status, not cargo's.**
+The first run of this merged tree printed `TEST=0` and `EXIT=0` while the real result was
+`error: 1 target failed`. Use `${PIPESTATUS[0]}` (or write rc to the log without a pipe) whenever
+a suite's verdict is piped through `tail`.

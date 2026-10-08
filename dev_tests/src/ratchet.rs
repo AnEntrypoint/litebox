@@ -120,7 +120,12 @@ fn ratchet_globals() -> Result<()> {
             // `fork_verify.rs` 5, `net.rs` 4, and 3 singletons of one each. As with the `litebox/`
             // drift above, this is many passes each adding one process-wide table without bumping
             // this number, not one new design.
-            ("litebox_platform_windows_userland/", 112),
+            // 113 rather than 112 for `UNHANDLED`, the `AtomicU32` throttling the one `error!` for
+            // an exception code this handler still does not enumerate (the unenumerated code used
+            // to reach a catch-all `panic!`, which ends the whole guest session). A free function
+            // inside the handler has no `&self` to hang a field on, and the throttle is mandatory
+            // by this repo's own standing rule - a guest looping on a trap must not bury the log.
+            ("litebox_platform_windows_userland/", 113),
             // `ALLOC` is the runner's `#[global_allocator]`: a `SharedHeap` living in the shared
             // arena, which the allocator trait requires to be a `static`.
             ("litebox_runner_linux_userland/", 1),
