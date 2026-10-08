@@ -775,6 +775,156 @@ pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
     }
 }
 
+/// How many IPC lines `LITEBOX_DIAG_CHILD_IPC` prints per child host process.
+const CHILD_IPC_DEFAULT_BUDGET: usize = 200;
+
+static CHILD_IPC_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_IPC_INIT: AtomicBool = AtomicBool::new(false);
+static CHILD_IPC_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+
+/// Arms the fork-child IPC tracer, same lazy-latch and value grammar as
+/// [`init_child_exit_trail`] (`<n>`, `<comm>` or `<comm>:<n>`), and prints one
+/// `[diag-child-ipc-init]` line per host process so a silent instrument is distinguishable from a
+/// child that never made an IPC syscall.
+pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
+    value: impl FnOnce() -> Option<String>,
+    platform: &Platform,
+    pid: i32,
+    ppid: i32,
+    comm: &[u8],
+) {
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    if CHILD_IPC_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let (budget, comm) = match value() {
+        None => (0, Vec::new()),
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => {
+            (CHILD_IPC_DEFAULT_BUDGET, Vec::new())
+        }
+        Some(v) => {
+            let v = v.trim();
+            match v.parse::<usize>() {
+                Ok(n) => (n, Vec::new()),
+                Err(_) => match v.rsplit_once(':') {
+                    Some((comm, n)) if !comm.is_empty() => (
+                        n.trim()
+                            .parse::<usize>()
+                            .unwrap_or(CHILD_IPC_DEFAULT_BUDGET),
+                        comm.as_bytes().to_vec(),
+                    ),
+                    _ => (CHILD_IPC_DEFAULT_BUDGET, v.as_bytes().to_vec()),
+                },
+            }
+        }
+    };
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let own = String::from_utf8_lossy(&comm[..end]).into_owned();
+    *CHILD_IPC_COMM.lock() = comm;
+    CHILD_IPC_BUDGET.store(budget, Ordering::Release);
+    CHILD_IPC_INIT.store(true, Ordering::Release);
+    if budget != 0 {
+        // `ppid` is here because "which process is forking 700 times a minute" is the question
+        // this instrument exists to answer, and a child's own pid cannot name its parent.
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-ipc-init] pid={pid} ppid={ppid} budget={budget} comm={own}\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Prints one line per IPC-shaped syscall a cross-process fork child makes, WITH ITS RETURN VALUE.
+///
+/// A trail of arguments alone cannot answer the question the churn poses: `read(21, buf, 4)` looks
+/// identical whether it got its 4 bytes, got EOF, or got `-ECONNRESET`, and a child whose command
+/// channel answered 0 bytes explains itself (`exit 0` right after) while one that got 4 does not.
+/// Called after dispatch, so `ret` is the value the guest actually sees: positive for a byte count,
+/// `-errno` for a failure (`Errno` is encoded that way into `rax`).
+///
+/// Restricted to a fork child (same `LITEBOX_INTERNAL_FORK_CHILD_GPRS` test
+/// [`maybe_dump_child_exit_trail`] uses) and to syscalls that carry a channel: the root process
+/// makes thousands of these per second and would drown the log.
+pub fn maybe_trace_child_ipc<Platform>(
+    platform: &Platform,
+    syscall_number: usize,
+    args: [u64; 3],
+    ret: u64,
+    pid: i32,
+    tid: i32,
+    comm: &[u8],
+) where
+    Platform: litebox::platform::StdioProvider + litebox::platform::SystemInfoProvider,
+{
+    if CHILD_IPC_BUDGET.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if !matches!(
+        ::syscalls::Sysno::new(syscall_number),
+        Some(
+            ::syscalls::Sysno::read
+                | ::syscalls::Sysno::readv
+                | ::syscalls::Sysno::recvmsg
+                | ::syscalls::Sysno::recvfrom
+                | ::syscalls::Sysno::write
+                | ::syscalls::Sysno::writev
+                | ::syscalls::Sysno::sendto
+                | ::syscalls::Sysno::sendmsg
+                | ::syscalls::Sysno::socket
+                | ::syscalls::Sysno::socketpair
+                | ::syscalls::Sysno::connect
+                | ::syscalls::Sysno::bind
+                | ::syscalls::Sysno::execve
+        )
+    ) {
+        return;
+    }
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    let wanted = CHILD_IPC_COMM.lock();
+    if !wanted.is_empty()
+        && !(trimmed == wanted.as_slice() || wanted.starts_with(trimmed))
+    {
+        return;
+    }
+    if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
+        if platform.env_value("LITEBOX_INTERNAL_FORK_CHILD_GPRS").is_none() {
+            return;
+        }
+        IS_FORK_CHILD_HOST.store(true, Ordering::Release);
+    }
+    let mut budget = CHILD_IPC_BUDGET.load(Ordering::Acquire);
+    while budget != 0 {
+        match CHILD_IPC_BUDGET.compare_exchange_weak(
+            budget,
+            budget - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => budget = current,
+        }
+    }
+    if budget == 0 {
+        return;
+    }
+    let signed = ret as i64;
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        alloc::format!(
+            "[diag-child-ipc] pid={pid} tid={tid} comm={} syscall={} arg0={:#x} arg1={:#x} arg2={:#x} ret={signed}\n",
+            String::from_utf8_lossy(trimmed),
+            syscall_name(syscall_number),
+            args[0],
+            args[1],
+            args[2],
+        )
+        .as_bytes(),
+    );
+}
+
 fn syscall_name(number: usize) -> String {
     #[cfg(target_arch = "x86_64")]
     {

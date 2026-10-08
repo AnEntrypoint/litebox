@@ -2321,6 +2321,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             self.global.platform,
         );
+        crate::diag::init_child_ipc(
+            || self.global.platform.env_value("LITEBOX_DIAG_CHILD_IPC"),
+            self.global.platform,
+            self.pid.get(),
+            self.ppid.get(),
+            &self.comm.get(),
+        );
         let comm_bytes = self.comm.get();
         crate::diag::record_syscall_trail(
             syscall_number,
@@ -2406,6 +2413,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
+        // After dispatch: this is the only place the guest's own view of the result exists, and a
+        // channel that answered 0 bytes is a different bug from one that answered -ECONNRESET --
+        // see `diag::maybe_trace_child_ipc`. A no-op unless that diagnostic is armed.
+        crate::diag::maybe_trace_child_ipc(
+            self.global.platform,
+            syscall_number,
+            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            return_value as u64,
+            self.pid.get(),
+            self.tid.get(),
+            &self.comm.get(),
+        );
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
