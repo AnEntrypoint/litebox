@@ -3734,6 +3734,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(alloc::format!("T|{flags}|{}|{name}", bytes.len()))
     }
 
+    /// [`Self::snapshot_nameless_file_stage`] for a descriptor that cannot be read through --
+    /// an `O_WRONLY` fd -- by reading the same bytes through a temporary read-only handle on the
+    /// same path, then restoring the SENDER's own flags on the spec so the receiver's copy is as
+    /// writable as the sender's was.
+    fn snapshot_via_readonly_reopen(
+        &self,
+        path: &str,
+        sender_flags: u32,
+    ) -> Option<alloc::string::String> {
+        const AT_FDCWD: i32 = -100;
+        let raw = self
+            .sys_openat(AT_FDCWD, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .ok()?;
+        let spec = usize::try_from(raw)
+            .ok()
+            .and_then(|raw| self.snapshot_nameless_file_stage(raw).ok());
+        let _ = self.sys_close(i32::try_from(raw).unwrap_or(-1));
+        let spec = spec?;
+        // `T|<flags>|<size>|<name>`: the temporary handle is `O_RDONLY`, the sender's fd was not.
+        let mut parts = spec.splitn(4, '|');
+        let kind = parts.next()?;
+        let _flags = parts.next()?;
+        let size = parts.next()?;
+        let name = parts.next()?;
+        Some(alloc::format!("{kind}|{sender_flags}|{size}|{name}"))
+    }
+
+    /// One-token-per-ancestor view of what this process can actually see at `path`: `d` exists,
+    /// `-` missing, `x` the lookup itself failed. Purely a diagnostic for the carried-directory
+    /// rebuild above -- it never changes anything.
+    fn diag_dir_chain(&self, path: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for (i, c) in path.char_indices() {
+            if c != '/' || i == 0 {
+                continue;
+            }
+            out.push(match self.files.borrow().fs.file_status(&path[..i]) {
+                Ok(_) => 'd',
+                Err(_) => '-',
+            });
+        }
+        out.push(match self.files.borrow().fs.file_status(path) {
+            Ok(_) => 'd',
+            Err(_) => '-',
+        });
+        out
+    }
+
+    /// Create every missing ancestor of `path` and then `path` itself, returning how many
+    /// `mkdir`s succeeded. Only ever used to give a carried directory fd somewhere to land, and
+    /// every failure is ignored: a missing parent must not become a new reason to lose the fd.
+    fn mkdir_chain(&self, path: &str) -> usize {
+        const AT_FDCWD: i32 = -100;
+        let _root = litebox::fs::ident::root_guard();
+        // 0777, not 0700: the directories are created under `root_guard()`, so they are owned by
+        // root, and a receiver running as an unprivileged guest uid then cannot search or open
+        // them at all -- the reopen answered EACCES even though `mkdir` had just succeeded, and
+        // the carried directory fd was still lost. Measured: `chain=dddd created=1
+        // reopened=false`, i.e. the leaf really was created and still refused the opener.
+        let mode = (Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::RGRP | Mode::WGRP
+            | Mode::XGRP | Mode::ROTH | Mode::WOTH | Mode::XOTH)
+            .bits();
+        let mut created = 0;
+        for (i, c) in path.char_indices() {
+            if c == '/' && i > 0 && self.sys_mkdirat(AT_FDCWD, &path[..i], mode).is_ok() {
+                created += 1;
+            }
+        }
+        if self.sys_mkdirat(AT_FDCWD, path, mode).is_ok() {
+            created += 1;
+        }
+        created
+    }
+
     fn rebuild_snapshot_file(
         &self,
         flags: u32,
@@ -3741,13 +3815,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         name: &str,
         cloexec: bool,
     ) -> Result<usize, Errno> {
+        // 2026-10-08: this used to build its carrier file under `/dev/shm`, which the chromium
+        // rootfs does not contain at all (`diag-snap`: every directory the receiver could reach
+        // answered ENOENT, and `/` EACCES), so EVERY `T|` byte-snapshot failed to rebuild with
+        // ENOENT -- the same shape `install_shm_file` had already been moved off of for memfds.
+        // The snapshot's bytes already live in the named shared object, so hand it to
+        // `install_shm_file`: it attaches by name and puts the carrier at the ROOT under
+        // `root_guard`, which needs no guest directory, and it truncates to `size` exactly.
+        if !self
+            .global
+            .platform
+            .env_flag("LITEBOX_FILE_CARRY_FIX_OFF")
+        {
+            return self.install_shm_file(name, size, flags, cloexec);
+        }
         const AT_FDCWD: i32 = -100;
         let aligned = size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
         let handle = self
             .global
             .platform
             .create_named_shared_memory(name, aligned)
-            .map_err(|_| Errno::ENOMEM)?;
+            .map_err(|_| {
+                litebox_util_log::warn!(
+                    name:% = name, size:% = aligned;
+                    "diag-snap: snapshot rebuild lost the carried object"
+                );
+                Errno::ENOMEM
+            })?;
         let length = litebox::mm::linux::NonZeroPageSize::new(aligned).ok_or(Errno::EINVAL)?;
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
         let ptr = unsafe {
@@ -3767,22 +3861,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
         let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
-        let path = alloc::format!(
-            "/dev/shm/.litebox-snapshot-{}-{}",
-            self.global.platform.current_host_pid(),
-            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        );
-        let creator = self.sys_openat(
-            AT_FDCWD,
-            path.as_str(),
-            OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?;
-        let creator = i32::try_from(creator).map_err(|_| Errno::EINVAL)?;
+        // The rebuilt copy is created and then unlinked, so it needs a directory that exists in
+        // THIS guest: `/dev/shm` is not guaranteed (the chromium rootfs has no `/dev` at all), and
+        // a missing directory cost every `T|` carry its ENOENT.
+        // Legacy path (kill switch): `/dev/shm` only, the behaviour before this fix.
+        let dirs: &[&str] = &["/dev/shm"];
+        let mut path: Option<alloc::string::String> = None;
+        let mut creator: Option<i32> = None;
+        for dir in dirs {
+            let candidate = alloc::format!(
+                "{}/.litebox-snapshot-{}-{}",
+                dir,
+                self.global.platform.current_host_pid(),
+                MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            );
+            match self.sys_openat(
+                AT_FDCWD,
+                candidate.as_str(),
+                OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(raw) => {
+                    creator = Some(i32::try_from(raw).map_err(|_| Errno::EINVAL)?);
+                    path = Some(candidate);
+                    break;
+                }
+                Err(e)
+                    if matches!(
+                        e,
+                        Errno::ENOENT | Errno::EACCES | Errno::EPERM | Errno::ENOTDIR
+                    ) =>
+                {
+                    litebox_util_log::warn!(
+                        dir:% = dir, errno:? = e;
+                        "diag-snap: snapshot scratch directory unusable"
+                    );
+                    continue
+                }
+                Err(e) => {
+                    litebox_util_log::warn!(
+                        dir:% = dir, errno:? = e;
+                        "diag-snap: snapshot scratch directory refused"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        if path.is_none() {
+            litebox_util_log::warn!(
+                name:% = name;
+                "diag-snap: no usable snapshot scratch directory"
+            );
+        }
+        let path = path.ok_or(Errno::ENOENT)?;
+        let creator = creator.ok_or(Errno::ENOENT)?;
         let written = self.sys_write(creator, &bytes, None);
         let _ = self.sys_close(creator);
         if let Err(e) = written {
             let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+            litebox_util_log::warn!(
+                path:% = path.as_str(), size:% = size, errno:? = e;
+                "diag-snap: writing the snapshot copy failed"
+            );
             return Err(e);
         }
         let mut reopen =
@@ -3792,6 +3932,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen, Mode::empty());
         let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        if let Err(e) = &raw {
+            litebox_util_log::warn!(
+                path:% = path.as_str(), flags:% = flags, errno:? = e;
+                "diag-snap: reopening the snapshot copy failed"
+            );
+        }
         raw.map(|fd| fd as usize)
     }
 
@@ -10063,10 +10209,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
     ) -> Option<alloc::string::String> {
         let (path, flags, offset) = self.carriable_file_for_raw_fd(raw_fd)?;
-        if self.path_only_in_own_writable_layer(&path)
-            && let Some(spec) = self.snapshot_nameless_file_for_carry(raw_fd)
-        {
-            return Some(spec);
+        if self.path_only_in_own_writable_layer(&path) {
+            match self.snapshot_nameless_file_stage(raw_fd) {
+                Ok(spec) => return Some(spec),
+                Err(reason) => {
+                    // A descriptor opened `O_WRONLY` cannot be read through, and that alone used to
+                    // cost the carry its snapshot: the file then went out as `F|` and the receiver
+                    // -- where this path does not exist, the whole reason it is "own layer" --
+                    // answered ENOENT. The bytes are still reachable by name, so snapshot them
+                    // through a temporary read-only handle and put the SENDER's own flags back, so
+                    // the receiver's copy is writable as the sender's was.
+                    let via_reopen = if self
+                        .global
+                        .platform
+                        .env_flag("LITEBOX_FILE_CARRY_FIX_OFF")
+                    {
+                        None
+                    } else {
+                        self.snapshot_via_readonly_reopen(&path, flags)
+                    };
+                    litebox_util_log::warn!(
+                        path:% = path.as_str(), flags:% = flags, reason:% = reason,
+                        reopened:% = via_reopen.is_some();
+                        "diag-fcarry: own-writable-layer file could not be snapshotted through its own descriptor"
+                    );
+                    if let Some(spec) = via_reopen {
+                        return Some(spec);
+                    }
+                }
+            }
         }
         Some(alloc::format!("F|{flags}|{offset}|{path}"))
     }
@@ -10456,7 +10627,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if cloexec {
                     flags |= OFlags::CLOEXEC;
                 }
-                let raw = self.sys_openat(AT_FDCWD, path, flags, Mode::empty())?;
+                // A carried DIRECTORY fd names a path that may exist only in the SENDER's own
+                // writable layer (that layer is per host process), so this process's reopen
+                // answers ENOENT (a path nobody here ever created) or EACCES (a path whose
+                // ancestor is missing from this process's tree, so the lookup itself is refused),
+                // `recvmsg` reports MSG_CTRUNC and the child dies. Measured: 396 of 402 rebuild
+                // failures in one 120 s run were `EACCES` on
+                // `--user-data-dir`/Default/Session Storage, and each one killed the
+                // `Chrome_ChildIOT` process it was handed to (399 of them in that run). Recreate
+                // the chain so the receiver at least holds a dirfd at the path the sender had; a
+                // directory has no bytes to carry.
+                let tried = self.sys_openat(AT_FDCWD, path, flags, Mode::empty());
+                let raw = match tried {
+                    Ok(raw) => raw,
+                    Err(e)
+                        if matches!(e, Errno::ENOENT | Errno::EACCES)
+                            && flags.contains(OFlags::DIRECTORY)
+                            && !self
+                                .global
+                                .platform
+                                .env_flag("LITEBOX_FILE_CARRY_FIX_OFF") =>
+                    {
+                        let chain = self.diag_dir_chain(path);
+                        let created = self.mkdir_chain(path);
+                        let retried = self.sys_openat(AT_FDCWD, path, flags, Mode::empty());
+                        litebox_util_log::warn!(
+                            path:% = path, err:? = e, chain:% = chain,
+                            created:% = created, reopened:% = retried.is_ok();
+                            "diag-fcarry: carried directory was not in this process's tree"
+                        );
+                        retried?
+                    }
+                    Err(e) => return Err(e),
+                };
                 if offset != 0 {
                     let offset = isize::try_from(offset).map_err(|_| Errno::EINVAL)?;
                     self.sys_lseek(
