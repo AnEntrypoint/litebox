@@ -3049,12 +3049,45 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         name: &str,
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        // A token from another process names an object that ALREADY exists, so hand back its
+        // handle directly. Doing it here, rather than at each caller, is what keeps every
+        // receiver -- `install_shm_file`, `rebuild_snapshot_file`, `adopt_carried_shared` --
+        // working on a token without knowing tokens exist.
+        if let Some(h) =
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::shared_memory_from_token(
+                self, name,
+            )
+        {
+            return Ok(h);
+        }
         // FNV-1a; 0 is reserved for "anonymous".
         let mut key: usize = 0xcbf2_9ce4_8422_2325_u64 as usize;
         for b in name.bytes() {
             key = (key ^ usize::from(b)).wrapping_mul(0x0100_0000_01b3);
         }
+        // There is deliberately NO filesystem (`/dev/shm`) fallback when the pool's 128-slot
+        // named-segment table is spent. Host-side `open()` for writing is not reachable from
+        // platform code at all: `enable_seccomp_filter_inner` allow-lists `SYS_open` ONLY with
+        // `flags == O_RDONLY`, so an `O_RDWR|O_CREAT` of `/dev/shm/litebox-...` came back EINVAL
+        // (measured: `named_shm_object: /dev/shm/* -> errno 22`). Widening that rule is not an
+        // option -- it is the rule that stops a guest `open()` from creating real host files.
+        // Carry the POOL HANDLE instead; see `shared_memory_token_for`.
         shared_heap::pool_segment(key | 1, size).ok_or(SharedMemoryError::UnsupportedByPlatform)
+    }
+
+    fn shared_memory_token_for(&self, handle: Self::SharedMemoryHandle) -> Option<String> {
+        // A pool handle is `POOL_HANDLE_TAG | byte offset` into the pool memfd that EVERY process
+        // of the session inherited, so the NUMBER ITSELF -- not a name -- is this object's identity
+        // in every process: no table slot, no host-wide name, and no limit on how many there are.
+        (handle & shared_heap::POOL_HANDLE_TAG != 0).then(|| alloc::format!("lbxpool:{handle:x}"))
+    }
+
+    fn shared_memory_from_token(&self, token: &str) -> Option<Self::SharedMemoryHandle> {
+        let handle = usize::from_str_radix(token.strip_prefix("lbxpool:")?, 16).ok()?;
+        // Reject anything that is not a pool offset: a token is trusted only as far as the handle
+        // it decodes to, and a bare fd would be read back in a process where that number means
+        // something else entirely.
+        (handle & shared_heap::POOL_HANDLE_TAG != 0).then_some(handle)
     }
 
     fn map_shared_memory(
@@ -4210,7 +4243,25 @@ unsafe extern "C" fn exception_signal_handler(
     if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
         let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
         let addr = unsafe { info.si_addr() } as u64;
-        let mut buf = [0u8; 128];
+        // THIS THREAD'S FS BASE AT FAULT TIME, which is the whole point of this diag: the kernel
+        // does not touch FSBASE when it delivers a signal, so this is exactly the `%fs` the guest
+        // had when it trapped -- i.e. the base a stack-protector epilogue's `mov %fs:0x28,%rax`
+        // dereferenced. `diag-guest-exception`'s `fs_base=` is instead the shim's LAST-SAVED
+        // value (written by `syscall_callback`'s `rdfsbase` on the guest's most recent syscall),
+        // so that line's `slot == guard` comparison is CIRCULAR (it reads the guard with the saved
+        // base) and can never show a mismatch. A `[diag-fault] fault_fs=` that differs from the
+        // neighbouring `diag-guest-exception: stack canary check fs_base=` is the proof that the
+        // guest's `%fs:0x28` was read from the WRONG TLS block -- a FALSE-POSITIVE stack-canary
+        // check, not guest stack corruption.
+        let fault_fs: u64;
+        unsafe {
+            core::arch::asm! {
+                "rdfsbase {}",
+                out(reg) fault_fs,
+                options(nomem, preserves_flags)
+            }
+        }
+        let mut buf = [0u8; 160];
         let mut n = 0;
         let mut put = |b: &[u8]| {
             for &c in b {
@@ -4250,6 +4301,9 @@ unsafe extern "C" fn exception_signal_handler(
         for i in (0..nd).rev() {
             put(&[digits[i]]);
         }
+        put(b" fault_fs=0x");
+        hex(fault_fs, &mut h);
+        put(&h);
         put(b"\n");
         unsafe { libc::write(2, buf.as_ptr().cast(), n) };
         // Frame-pointer walk (Chromium and most distro binaries keep frame pointers): the

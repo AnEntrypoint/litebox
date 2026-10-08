@@ -268,7 +268,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 // over a genuinely-missing-mapping explanation.
                 rax:% = format_args!("{:#x}", ctx.rax), rdx:% = format_args!("{:#x}", ctx.rdx),
                 rcx:% = format_args!("{:#x}", ctx.rcx), rsi:% = format_args!("{:#x}", ctx.rsi),
-                rdi:% = format_args!("{:#x}", ctx.rdi);
+                rdi:% = format_args!("{:#x}", ctx.rdi),
+                // 2026-10-08: a stripped PIE names no local variables, and the callee-saved
+                // registers are exactly where a leaf frame keeps the things the crash is ABOUT
+                // (`rbx` = this function's sret pointer, `r12` = the size the caller asked for,
+                // `r13`/`r14`/`r15` = `this` and the object it is filling in). Printing only
+                // rax..rdi threw away the very fields that identify which request failed.
+                rbx:% = format_args!("{:#x}", ctx.rbx), r8:% = format_args!("{:#x}", ctx.r8),
+                r9:% = format_args!("{:#x}", ctx.r9), r10:% = format_args!("{:#x}", ctx.r10),
+                r11:% = format_args!("{:#x}", ctx.r11), r12:% = format_args!("{:#x}", ctx.r12),
+                r13:% = format_args!("{:#x}", ctx.r13), r14:% = format_args!("{:#x}", ctx.r14),
+                r15:% = format_args!("{:#x}", ctx.r15);
                 "diag-guest-exception: pre-signal snapshot"
             );
             // 2026-10-08 chromium GPU/renderer stack-canary investigation: BOTH crash `rip`s are
@@ -309,6 +319,97 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     slot_low_byte_zero:% = slot.map_or(false, |s| s & 0xff == 0),
                     frame_bytes:% = format_args!("{:02x?}", frame.as_deref());
                     "diag-guest-exception: stack canary check"
+                );
+            }
+            // 2026-10-08: the crash site is `cmpb $0x0,-0x160(%rbp)` right after
+            // `PlatformSharedMemoryRegion::Take()` in mojo's `Broker::GetWritableSharedMemoryRegion`.
+            // The register snapshot names no locals, so dump THIS frame's own scratch window: it
+            // holds the region object (0x40 bytes), the two broker fds and the vector the handles
+            // arrived in. `handles` is a `std::vector<PlatformHandle>` (24 bytes: begin/end/cap)
+            // living at `rbp-0x250`, so `[rbp-0x250]`/`[rbp-0x248]` are its data pointer and its
+            // one-past-the-end -- reading them says how many fds mojo actually got back, which the
+            // register dump cannot. Reads are best-effort: an unmapped address yields `None`, never
+            // a second fault inside the handler.
+            {
+                let read_u64 = |addr: usize| -> Option<u64> {
+                    let b = UserPtr::<u8>::from_usize(addr).to_owned_slice::<Platform>(8);
+                    let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
+                    Some(u64::from_le_bytes(w))
+                };
+                let window_start = (ctx.rbp as usize).saturating_sub(0x260);
+                let frame = UserPtr::<u8>::from_usize(window_start)
+                    .to_owned_slice::<Platform>(0x270);
+                let (h_begin, h_end) = (
+                    read_u64((ctx.rbp as usize).saturating_sub(0x250)),
+                    read_u64((ctx.rbp as usize).saturating_sub(0x248)),
+                );
+                let handles = match (h_begin, h_end) {
+                    (Some(b), Some(e)) if e > b && e - b <= 0x400 => {
+                        UserPtr::<u8>::from_usize(b as usize)
+                            .to_owned_slice::<Platform>((e - b) as usize)
+                    }
+                    _ => None,
+                };
+                litebox_util_log::warn!(
+                    window_start:% = format_args!("{:#x}", window_start),
+                    frame:% = format_args!("{:02x?}", frame.as_deref()),
+                    handles_begin:? = h_begin, handles_end:? = h_end,
+                    handles_bytes:% = format_args!("{:02x?}", handles.as_deref());
+                    "diag-guest-exception: crashing frame window"
+                );
+            }
+            // 2026-10-08: a crash `rip` inside a stripped 327 MB PIE names no function, and the
+            // syscall trail only says what the thread DID, not where in chromium's call graph it
+            // died. So walk the frame-pointer chain here: `[rbp]` is the caller's saved rbp and
+            // `[rbp+8]` is the return address, i.e. the call site in the caller. Every return
+            // address is printed both raw and as `file_va = rip - GUEST_LOAD_BIAS`, which is what
+            // `objdump --adjust-vma` needs for a binary whose PT_LOAD vaddrs start at 0 (the
+            // guest maps the PIE at a biased base, so the on-disk offset is `va - 0x1000` for
+            // exec segment 2 and `va - 0x2000` for segment 3 once the bias is removed).
+            {
+                let read_u64 = |addr: usize| -> Option<u64> {
+                    let b = UserPtr::<u8>::from_usize(addr).to_owned_slice::<Platform>(8);
+                    let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
+                    Some(u64::from_le_bytes(w))
+                };
+                // The bias chromium's PIE was mapped at this run, measured from the crash `rip`
+                // against the ELF's own vaddrs (0x9133314c2 -> 0x33314c2). It is a PROPERTY OF THE
+                // RUN, not of the binary -- a different ASLR draw maps it elsewhere -- so `raw`
+                // below is the authoritative field and this one is only a convenience: subtract
+                // the bias you actually measured before handing it to `objdump --adjust-vma`.
+                const GUEST_LOAD_BIAS: u64 = 0x9_1000_0000;
+                let mut raw = [0u64; 24];
+                let mut biased = [0u64; 24];
+                let mut n = 0usize;
+                let mut rbp = ctx.rbp as usize;
+                for _ in 0..24 {
+                    let ret = match read_u64(rbp.saturating_add(8)) {
+                        Some(v) => v,
+                        None => break, // unmapped -- the chain ends here, honestly
+                    };
+                    if ret < 0x1_0000 {
+                        break; // not a plausible text address
+                    }
+                    raw[n] = ret;
+                    biased[n] = ret.wrapping_sub(GUEST_LOAD_BIAS);
+                    n += 1;
+                    let next = match read_u64(rbp) {
+                        Some(v) => v as usize,
+                        None => break,
+                    };
+                    // A frame-pointer chain is strictly increasing up the stack; anything else
+                    // (0, a wrap, a backwards jump) is the end of a real chain -- never loop.
+                    if next <= rbp || next.saturating_sub(rbp) > 0x10_0000 {
+                        break;
+                    }
+                    rbp = next;
+                }
+                litebox_util_log::warn!(
+                    rbp:% = format_args!("{:#x}", ctx.rbp),
+                    bias:% = format_args!("{:#x}", GUEST_LOAD_BIAS),
+                    raw:% = format_args!("{:x?}", &raw[..n]),
+                    file_va:% = format_args!("{:x?}", &biased[..n]);
+                    "diag-guest-exception: frame-pointer backtrace"
                 );
             }
             for (i, entry) in crate::diag::syscall_trail_oldest_first().iter().enumerate() {
@@ -2362,6 +2463,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ctx.syscall_arg(2) as u64,
             ],
         );
+        // 154th pass: watch the guest FS base at every syscall entry. Chromium's GPU process
+        // takes `__stack_chk_fail`'s branch with an INTACT canary slot -- [-0x30(%rbp)] ==
+        // [%fs:0x28] at the exception, 12/12 at rip 0x33314c2 -- which can only mean `%fs:0x28`
+        // read something ELSE at the `cmp -0x30(%rbp),%rax`. The platform saves whatever FS
+        // holds on entry, so a wrong FS base that survives into guest code is visible right
+        // here, at the very next syscall that thread makes.
+        {
+            // ONE atomic word, so the (tid, fs) pair a comparison is made against is always a
+            // snapshot some thread really wrote -- two separate loads of two separate statics
+            // let another host thread interleave between them and fabricate a "change".
+            // Layout: tid in the top 16 bits, fs base in the low 48 (a canonical x86_64 base
+            // never needs more). A tid above 0xffff aliases; that only costs a false report.
+            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            use core::sync::atomic::Ordering;
+            if let Ok(fs) = self
+                .global
+                .platform
+                .get_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase)
+            {
+                let tid = (self.tid.get() as u32) & 0xffff;
+                let fs = (fs as u64) & 0xffff_ffff_ffff;
+                let pack = ((tid as u64) << 48) | fs;
+                let prev = LAST.swap(pack, Ordering::Relaxed);
+                if (prev >> 48) == tid as u64 {
+                    let prev_fs = prev & 0xffff_ffff_ffff;
+                    if prev_fs != fs {
+                        litebox_util_log::warn!(
+                            tid:% = self.tid.get(), fs_base:% = format_args!("{fs:#x}"),
+                            prev_fs_base:% = format_args!("{prev_fs:#x}"),
+                            syscall:% = syscall_number;
+                            "diag-fsbase: guest FS base moved between two syscalls of one thread"
+                        );
+                    }
+                }
+            }
+        }
         let is_target = crate::diag::syscall_timeline_enabled()
             && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
                 || crate::diag::is_syscall_timeline_target_pid(self.pid.get())

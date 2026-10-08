@@ -3078,13 +3078,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .create_named_shared_memory(&object_name, page_aligned_size)
         {
             Ok(handle) => (handle, Some(object_name)),
-            Err(_) => (
-                self.global
+            Err(_) => {
+                let handle = self
+                    .global
                     .platform
                     .create_shared_memory(page_aligned_size)
-                    .map_err(|_| Errno::ENOMEM)?,
-                None,
-            ),
+                    .map_err(|_| Errno::ENOMEM)?;
+                // The named table is spent (128 slots, never freed -- see
+                // `create_named_shared_memory`). The object still exists; it just has no NAME. Ask
+                // the platform whether its handle is itself a cross-process identity and use that
+                // in place of a name, so the memfd is still carryable. Without this the object was
+                // uncarryable and the whole `sendmsg(SCM_RIGHTS)` was refused, which killed the
+                // receiving child (`cs4`: 8 refused fds, all `size=131072`, all
+                // `memfd=registered-but-unnamed`).
+                (handle, self.global.platform.shared_memory_token_for(handle))
+            }
         };
         if !carry_bytes.is_empty()
             && let Some(new_len) = litebox::mm::linux::NonZeroPageSize::new(page_aligned_size)
@@ -3379,9 +3387,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(Ok(read))
     }
 
+    /// The flags `fcntl(F_GETFL)` answers for a regular-file descriptor: its open-time flags, with
+    /// the access mode REPLACED by any narrower one a `/proc/self/fd/N` reopen recorded, and with
+    /// the `F_SETFL`-mutable flags taken from `StdioStatusFlags`.
+    ///
+    /// Both halves of that are load-bearing and MUST be read from here, never from
+    /// `fs.open_flags(fd)` directly, because the raw open flags are NOT what the guest sees. A
+    /// `/proc/self/fd/N` reopen of an unnamed file is a `dup` (`sys_openat`), so the new descriptor
+    /// inherits the ORIGINAL access mode and its read-only-ness exists only as `ReopenedAccess`
+    /// metadata; `F_SETFL` likewise writes metadata and nothing else.
+    fn regular_file_getfl<Subsystem>(
+        &self,
+        open_flags: OFlags,
+        fd: &TypedFd<Subsystem>,
+    ) -> OFlags
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let mut flags = open_flags;
+        if let Ok(narrowed) = self
+            .global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |ReopenedAccess(a)| *a)
+        {
+            flags = (flags & ACCESS_MODE_MASK.complement()) | narrowed;
+        }
+        let set = self
+            .global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |crate::StdioStatusFlags(f)| *f & SETFL_MUTABLE_FLAGS);
+        match set {
+            Ok(set) => (flags & SETFL_MUTABLE_FLAGS.complement()) | set,
+            // No per-description state means nothing has called `F_SETFL` on this fd.
+            Err(_) => flags,
+        }
+    }
+
     /// `(host-wide object name, size, open flags)` of a `memfd_create`/`/dev/shm` fd whose shared
     /// backing is a named object, else `None`. Such a descriptor can be handed to another host
     /// process, which opens the same object by name and so shares the memory rather than a copy.
+    ///
+    /// The flags reported here are the ones `fcntl(F_GETFL)` answers for this descriptor -- NOT the
+    /// descriptor's raw open-time flags. Those two differ for exactly the fd chromium builds every
+    /// shared-memory pair out of: `open("/proc/self/fd/" + fd, O_RDONLY|O_CLOEXEC)` on an unnamed
+    /// file is a `dup` here (`sys_openat`'s `/proc/self/fd` arm), so the new descriptor KEEPS the
+    /// original `O_RDWR` in its open flags and its read-only-ness lives only in the
+    /// `ReopenedAccess` metadata that arm attaches. `F_GETFL` reads that metadata; this used to
+    /// read the raw flags, so every Mojo `ScopedFDPair` reached the receiver with BOTH halves
+    /// `O_RDWR`, and `PlatformSharedMemoryRegion::Take` -- which demands `O_RDWR` on the first fd
+    /// and `O_RDONLY` on the second -- failed the region with error 3. Chromium answers that with
+    /// `IMMEDIATE_CRASH`, so the GPU process died and was respawned ~3x/second and no renderer was
+    /// ever launched.
     pub(crate) fn carriable_shm_for_raw_fd(
         &self,
         raw_fd: usize,
@@ -3397,7 +3455,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .with_metadata(fd, |_: &MemfdMarker| ())
                         .ok()?;
                     let status = files.fs.fd_file_status(fd).ok()?;
-                    let flags = files.fs.open_flags(fd)?;
+                    let open_flags = files.fs.open_flags(fd)?;
+                    // Diagnostic A/B only: `LITEBOX_SHM_CARRY_GETFL_OFF=1` restores the raw
+                    // open-time flags, so one binary proves both sides of the FDPair bug.
+                    let flags = if self
+                        .global
+                        .platform
+                        .env_flag("LITEBOX_SHM_CARRY_GETFL_OFF")
+                    {
+                        open_flags
+                    } else {
+                        self.regular_file_getfl(open_flags, fd)
+                    };
                     Some(((status.node_info.dev, status.node_info.ino), flags.bits()))
                 },
                 |_| None,
@@ -3444,17 +3513,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.platform.current_host_pid(),
             MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         );
+        // 2026-10-08: every failure below used to be flattened to one errno, so "a Mojo buffer
+        // failed to cross into the child" named neither the STEP nor the real error. `install_shm_file`
+        // is 5 steps deep (named object -> carrier create -> truncate -> reopen -> registry) and the
+        // one observed failure was EEXIST from somewhere in them; name the step and keep the errno.
+        let stage_log = |stage: &str, e: Errno| {
+            litebox_util_log::warn!(
+                stage:% = stage, name:% = name, size:% = size, path:% = path.as_str(),
+                errno:% = format_args!("{:?}", e),
+                host_pid:% = self.global.platform.current_host_pid();
+                "diag-shmcarry: install_shm_file failed"
+            );
+            e
+        };
         let handle = self
             .global
             .platform
             .create_named_shared_memory(name, size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
-            .map_err(|_| Errno::ENOMEM)?;
+            .map_err(|_| stage_log("create_named_shared_memory", Errno::ENOMEM))?;
         // Creating and unlinking that name is the kernel's own bookkeeping, never subject to the
         // caller's permissions on `/`, exactly as in `sys_memfd_create`.
         let _root = litebox::fs::ident::root_guard();
         let create_flags = OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC;
-        let creator =
-            self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)?;
+        let creator = self
+            .sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)
+            .map_err(|e| stage_log("carrier_create_openat", e))?;
         let key = {
             let files = self.files.borrow();
             files
@@ -3486,11 +3569,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen_flags, Mode::empty());
         let _ = self.sys_close(i32::try_from(creator).map_err(|_| Errno::EINVAL)?);
         let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
-        let raw = raw?;
+        let raw = raw.map_err(|e| stage_log("carrier_reopen_openat", e))?;
         let key = key.ok_or_else(|| {
             let _ = i32::try_from(raw).map(|fd| self.sys_close(fd));
-            Errno::EBADF
+            stage_log("carrier_truncate_or_status", Errno::EBADF)
         })?;
+        // 2026-10-08: the success counterpart of the `diag-shmcarry` failure lines above -- without
+        // a count of the carries that DO land, "one EEXIST" cannot be told apart from "every Mojo
+        // buffer fails" and "one flaky carrier path out of a hundred good ones".
+        litebox_util_log::warn!(
+            name:% = name, size:% = size, flags:% = flags, cloexec:% = cloexec,
+            fd:% = raw, host_pid:% = self.global.platform.current_host_pid();
+            "diag-shmcarry: install_shm_file ok"
+        );
         self.global.memfds.lock().insert(
             key,
             super::mm::MemfdEntry {
@@ -3553,10 +3644,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// its children), copied into a fresh named shared object so the receiving process can rebuild
     /// a private copy: `T|<flags>|<size>|<object name>`. A read-only handoff is exact; writes made
     /// afterwards by either side are not shared.
+    /// [`Self::snapshot_nameless_file_stage`] with the stage collapsed to "it worked or it did
+    /// not", for the two call sites that only need the spec.
     pub(crate) fn snapshot_nameless_file_for_carry(
         &self,
         raw_fd: usize,
     ) -> Option<alloc::string::String> {
+        self.snapshot_nameless_file_stage(raw_fd).ok()
+    }
+
+    /// Same work, but naming the step that failed. A refusal log line that says only "cannot
+    /// cross a process boundary" is unactionable -- see [`Self::carry_refusal_detail`].
+    pub(crate) fn snapshot_nameless_file_stage(
+        &self,
+        raw_fd: usize,
+    ) -> Result<alloc::string::String, &'static str> {
         let (flags, bytes) = {
             let files = self.files.borrow();
             files
@@ -3586,7 +3688,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_| None,
                 )
                 .ok()
-                .flatten()?
+                .flatten()
+                .ok_or("not-a-snapshottable-file")?
         };
         let name = alloc::format!(
             "Local\\litebox_snap_{}_{}",
@@ -3594,12 +3697,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         );
         let aligned = bytes.len().next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
-        let handle = self
+        // Same name-or-token shape as `resize_memfd_shared_backing`: a spent name table must not
+        // cost the sender its ability to carry this file at all.
+        let (handle, name) = match self
             .global
             .platform
             .create_named_shared_memory(&name, aligned)
-            .ok()?;
-        let length = litebox::mm::linux::NonZeroPageSize::new(aligned)?;
+        {
+            Ok(h) => (h, Some(name)),
+            Err(_) => {
+                let h = self
+                    .global
+                    .platform
+                    .create_shared_memory(aligned)
+                    .map_err(|_| "create_shared_memory failed")?;
+                (h, self.global.platform.shared_memory_token_for(h))
+            }
+        };
+        let name = name.ok_or("shared object has no cross-process identity")?;
+        let length = litebox::mm::linux::NonZeroPageSize::new(aligned)
+            .ok_or("snapshot size is not a whole number of pages")?;
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
         let ptr = unsafe {
             self.process().pm().map_existing_shared_pages(
@@ -3609,12 +3726,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 handle,
             )
         }
-        .ok()?;
+        .map_err(|_| "map_existing_shared_pages failed")?;
         let written = ptr.write_slice_at_offset(0, &bytes);
         let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
         let _ = litebox_common_linux::mm::sys_munmap(&self.process().pm(), user_ptr, aligned);
-        written?;
-        Some(alloc::format!("T|{flags}|{}|{name}", bytes.len()))
+        written.ok_or("write_slice_at_offset failed")?;
+        Ok(alloc::format!("T|{flags}|{}|{name}", bytes.len()))
     }
 
     fn rebuild_snapshot_file(
@@ -6722,29 +6839,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // blocking. `stdio::tests::test_stdio_flags_with_dup` asserts exactly
                             // this round-trip and had been failing it invisibly -- the test binary
                             // was crashing before the failure could be reported.
-                            let mut open_flags = files.fs.open_flags(fd).unwrap_or(OFlags::empty());
-                            if let Ok(narrowed) = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |ReopenedAccess(a)| *a)
-                            {
-                                open_flags =
-                                    (open_flags & ACCESS_MODE_MASK.complement()) | narrowed;
-                            }
-                            let set = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::StdioStatusFlags(f)| {
-                                    *f & SETFL_MUTABLE_FLAGS
-                                });
-                            Ok(match set {
-                                Ok(set) => (open_flags & SETFL_MUTABLE_FLAGS.complement()) | set,
-                                // No per-description state yet means nothing has called `F_SETFL`
-                                // on this fd, so the open-time flags ARE the current flags.
-                                Err(_) => open_flags,
-                            })
+                            // Both sources are read by `regular_file_getfl`, which is also what the
+                            // `S|` shared-memory carry spec uses to describe an fd to another
+                            // process -- the two MUST agree, or a descriptor changes access mode
+                            // on its way across `SCM_RIGHTS`.
+                            Ok(self.regular_file_getfl(
+                                files.fs.open_flags(fd).unwrap_or(OFlags::empty()),
+                                fd,
+                            ))
                         },
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
@@ -10172,6 +10274,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// A regular file whose bytes live only in THIS process's writable layer is carried as `T|`,
     /// not `F|` -- see [`Self::carriable_file_spec_for_raw_fd`].
+    ///
+    /// 2026-10-08: a refusal used to log only `kind=file`, which named neither the object nor the
+    /// reason, while one uncarryable fd refuses the WHOLE `sendmsg` -- so a single unnamed file
+    /// silently cost Chromium's children their Mojo IPC channel ("Terminating current process
+    /// after 15 seconds with no connection", every child, forever). [`Self::carry_refusal_detail`]
+    /// is what the log line now prints alongside it.
+    pub(crate) fn carry_refusal_detail(&self, raw_fd: usize) -> alloc::string::String {
+        let (ftype, size, ino, dev, rdev, is_memfd) = {
+            let files = self.files.borrow();
+            files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |fd| {
+                        let s = files.fs.fd_file_status(fd).ok()?;
+                        let is_memfd = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |_: &MemfdMarker| ())
+                            .is_ok();
+                        Some((
+                            alloc::format!("{:?}", s.file_type),
+                            s.size,
+                            s.node_info.ino,
+                            s.node_info.dev,
+                            s.node_info.rdev.map(|r| r.get()).unwrap_or(0),
+                            is_memfd,
+                        ))
+                    },
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                    |_| None,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or((
+                    alloc::string::String::from("no-status"),
+                    0usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    false,
+                ))
+        };
+        let path_known = self.files.borrow().lookup_fd_path(raw_fd).is_some();
+        let snapshottable = self.snapshot_carriable_file_for_raw_fd(raw_fd);
+        // Which half of the memfd carry failed: the registry lookup (this fd was never
+        // `ftruncate`d, so no shared object exists yet) or the name (an object with no name
+        // cannot be reopened by another host process).
+        let memfd_state = if !is_memfd {
+            "not-a-memfd"
+        } else {
+            match self.global.memfds.lock().get(&(dev, ino)) {
+                None => "unregistered",
+                Some(e) if e.name.is_none() => "registered-but-unnamed",
+                Some(_) => "registered-and-named",
+            }
+        };
+        let stage = match self.snapshot_nameless_file_stage(raw_fd) {
+            Ok(_) => "snapshot-ok",
+            Err(e) => e,
+        };
+        alloc::format!(
+            "ftype={ftype} size={size} ino={ino} dev={dev} rdev={rdev} \
+             path_known={path_known} snapshottable={snapshottable} memfd={memfd_state} stage={stage}"
+        )
+    }
+
     pub(crate) fn scm_carry_spec(
         &self,
         raw_fd: usize,
@@ -10187,6 +10363,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok(Some(alloc::format!("E|{count}|{flags}")));
         }
         if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(raw_fd) {
+            // 2026-10-08: `PlatformSharedMemoryRegion::Take()` rejects a carried memfd when
+            // `fcntl(fd,F_GETFL) & O_ACCMODE` is not the access mode the sender's descriptor had --
+            // chromium's FDPair is `{O_RDWR fd, O_RDONLY fd}` and the read-only half comes back
+            // O_RDWR here. Log the SENDER's own flags so that claim can be checked against the
+            // receiving side's `install_shm_file` line instead of inferred.
+            litebox_util_log::warn!(
+                raw_fd:% = raw_fd, name:% = name.as_str(), size:% = size,
+                flags:% = flags, accmode:% = flags & 0x3;
+                "diag-shmcarry: S-spec from sender descriptor"
+            );
             return Ok(Some(alloc::format!("S|{flags}|{size}|{name}")));
         }
         if self.raw_fd_subsystem_name(raw_fd) == "unix-socket" {

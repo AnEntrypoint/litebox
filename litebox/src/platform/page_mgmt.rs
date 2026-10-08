@@ -380,6 +380,45 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(SharedMemoryError::UnsupportedByPlatform)
     }
 
+    /// A string that ANOTHER process can hand back to [`Self::shared_memory_from_token`] to get a
+    /// handle to the very object `handle` names, WITHOUT going through a host-wide name.
+    ///
+    /// This is the escape hatch for a platform whose named objects come out of a FINITE table: a
+    /// `create_named_shared_memory` that has spent every slot returns
+    /// [`SharedMemoryError::UnsupportedByPlatform`], and on such a platform the object is then
+    /// uncarryable -- which is what exhausted after the 128th Mojo channel buffer, killing every
+    /// chromium child that came after it. A platform whose handles are ALREADY cross-process
+    /// identities overrides both this and [`Self::shared_memory_from_token`], so its objects stay
+    /// carryable no matter how full its name table is.
+    ///
+    /// `None` means "this handle has no identity outside the process that made it". The default is
+    /// `None`: on most platforms a handle is a per-process kernel object (a Windows `HANDLE`, a
+    /// Linux fd), so the named path is genuinely the only way to share one.
+    ///
+    /// A caller MUST treat the returned string as opaque, and MUST NOT assume it is a name -- in
+    /// particular it is not safe to hand it to [`Self::create_named_shared_memory`] and expect
+    /// create-or-open semantics. It is only ever meaningful to `shared_memory_from_token`, and
+    /// only for as long as the object it names is still alive.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn shared_memory_token_for(
+        &self,
+        handle: Self::SharedMemoryHandle,
+    ) -> Option<alloc::string::String> {
+        None
+    }
+
+    /// The inverse of [`Self::shared_memory_token_for`]: the handle a token from another process
+    /// names, or `None` when this platform does not issue tokens or does not recognize this one.
+    ///
+    /// The default is `None`, matching [`Self::shared_memory_token_for`]'s default.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn shared_memory_from_token(
+        &self,
+        token: &str,
+    ) -> Option<Self::SharedMemoryHandle> {
+        None
+    }
+
     /// Creates, or opens if it already exists, a NAMED shared-memory object of `size` bytes whose
     /// bytes live in a real host-side FILE rather than in the platform's page file.
     ///
