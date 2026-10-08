@@ -3431,8 +3431,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         cloexec: bool,
     ) -> Result<usize, Errno> {
         const AT_FDCWD: i32 = -100;
+        // Root, NOT `/dev/shm` (what this used to use): this carrier file is shim bookkeeping --
+        // it is unlinked before this returns, so no guest code ever observes the name -- and it
+        // therefore must not depend on the guest rootfs happening to contain a `/dev/shm`
+        // directory. Chromium's rootfs has none, so EVERY memfd Mojo carried into a child failed
+        // to rebuild here with ENOENT, and `recvmsg` reported that as its OWN error, killing the
+        // child's Mojo channel (96 dead children a run, each logging "Terminating current process
+        // after 15 seconds with no connection"). Same reasoning -- and the same root-level
+        // placement -- as `sys_memfd_create`'s `/.memfd:{id}`.
         let path = alloc::format!(
-            "/dev/shm/.litebox-carried-{}-{}",
+            "/.litebox-carried-{}-{}",
             self.global.platform.current_host_pid(),
             MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         );
@@ -3441,6 +3449,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .platform
             .create_named_shared_memory(name, size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
             .map_err(|_| Errno::ENOMEM)?;
+        // Creating and unlinking that name is the kernel's own bookkeeping, never subject to the
+        // caller's permissions on `/`, exactly as in `sys_memfd_create`.
+        let _root = litebox::fs::ident::root_guard();
         let create_flags = OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC;
         let creator =
             self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)?;

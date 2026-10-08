@@ -271,6 +271,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 rdi:% = format_args!("{:#x}", ctx.rdi);
                 "diag-guest-exception: pre-signal snapshot"
             );
+            // 2026-10-08 chromium GPU/renderer stack-canary investigation: BOTH crash `rip`s are
+            // the `int3`/`ud2` padding sitting immediately after `call __stack_chk_fail`, i.e. the
+            // canary-mismatch branch fired AND `__stack_chk_fail` came back. The `rip` alone
+            // cannot separate the two remaining explanations:
+            //   (a) genuine guest stack corruption reached the slot the prologue wrote, or
+            //   (b) `%fs:0x28` read back a DIFFERENT value than the prologue stored -- the guest
+            //       FS base moved mid-function, so the check is a FALSE POSITIVE.
+            // So dump both sides of the comparison: `slot` is what the prologue stored at
+            // `rbp-0x30` (the ABI location for the guard under `-fstack-protector-*`), `guard` is
+            // what the epilogue re-read from `%fs:0x28`. A glibc canary's LOW BYTE IS ALWAYS ZERO
+            // (so that a `strcpy`-style overrun cannot terminate early at a NUL), which makes
+            // `slot & 0xff != 0` proof on its own that the slot was overwritten.
+            if let Ok(fs_base) = self
+                .task
+                .global
+                .platform
+                .get_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase)
+            {
+                let read_u64 = |addr: usize| -> Option<u64> {
+                    let b = UserPtr::<u8>::from_usize(addr).to_owned_slice::<Platform>(8);
+                    let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
+                    Some(u64::from_le_bytes(w))
+                };
+                let slot_addr = (ctx.rbp as usize).saturating_sub(0x30);
+                let guard_addr = fs_base.saturating_add(0x28);
+                let slot = read_u64(slot_addr);
+                let guard = read_u64(guard_addr);
+                let frame = UserPtr::<u8>::from_usize((ctx.rbp as usize).saturating_sub(0x40))
+                    .to_owned_slice::<Platform>(0x48);
+                litebox_util_log::warn!(
+                    fs_base:% = format_args!("{:#x}", fs_base),
+                    rbp:% = format_args!("{:#x}", ctx.rbp),
+                    slot_addr:% = format_args!("{:#x}", slot_addr), slot:? = slot,
+                    guard_addr:% = format_args!("{:#x}", guard_addr), guard:? = guard,
+                    equal:% = (slot.is_some() && slot == guard),
+                    slot_low_byte_zero:% = slot.map_or(false, |s| s & 0xff == 0),
+                    frame_bytes:% = format_args!("{:02x?}", frame.as_deref());
+                    "diag-guest-exception: stack canary check"
+                );
+            }
             for (i, entry) in crate::diag::syscall_trail_oldest_first().iter().enumerate() {
                 litebox_util_log::warn!(
                     i:% = i,

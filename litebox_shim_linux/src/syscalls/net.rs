@@ -2775,6 +2775,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // was sent alongside is still genuinely delivered.
         let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
         let mut written_fds = alloc::vec::Vec::new();
+        // Set when a donated fd had to be dropped below, so the read can report `MSG_CTRUNC`.
+        let mut dropped_fd = false;
         for fd in fds {
             let carried_spec = match &fd {
                 AnyDupFd::Carried(spec) => Some(spec.clone()),
@@ -2800,6 +2802,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
                 Err(e) => {
+                    // The `EMFILE` rule above, generalized to EVERY way a donated fd can fail to
+                    // be rebuilt: the fd is DROPPED and the read still succeeds (with
+                    // `MSG_CTRUNC`), never turned into `recvmsg`'s own errno. The bytes were
+                    // already consumed from the socket by the time we get here, so returning `Err`
+                    // loses a perfectly good message -- which is exactly what killed every
+                    // Chromium child: one un-rebuildable memfd made the child's Mojo `recvmsg`
+                    // answer ENOENT, so the invitation was never seen and the child terminated
+                    // itself after 15 s. Linux behaves this way for a reason: an ancillary
+                    // failure is never a transport failure.
                     if let Some(spec) = carried_spec {
                         litebox_util_log::warn!("recvmsg: rebuilding a carried SCM_RIGHTS fd failed errno={e:?} spec={spec}");
                         crate::syscalls::unix::UnixSocket::release_unadopted_carry(
@@ -2807,7 +2818,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             &spec,
                         );
                     }
-                    return Err(e);
+                    dropped_fd = true;
                 }
             }
         }
@@ -2884,8 +2895,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
         let flags_offset = core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_flags);
         let flags_ptr = UserPtrMut::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
+        let out_flags = if dropped_fd {
+            ret_flags | ReceiveFlags::CTRUNC
+        } else {
+            ret_flags
+        };
         flags_ptr
-            .write_at_offset::<Platform>(0, ret_flags)
+            .write_at_offset::<Platform>(0, out_flags)
             .ok_or(Errno::EFAULT)?;
 
         Ok(total_received)

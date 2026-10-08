@@ -408,6 +408,22 @@ pub(crate) fn decode_cross_process_exit_status(raw_exit_code: u32) -> ExitStatus
 static IS_NATIVE_FORK_CHILD: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// The guest pid this host process IS, once it has become a native-`fork()` child (see
+/// [`IS_NATIVE_FORK_CHILD`]); `0` before then.
+///
+/// The flag alone is NOT enough to decide that the host process may now die. This host process
+/// can hold several guest processes at once: a native-`fork()` child that goes on to spawn its
+/// own children without leaving this host process -- Chromium's sandboxed zygote is exactly that
+/// shape, and its `Credentials::ChrootToSafeEmptyDir()` helper is a `CLONE_VM|CLONE_FS|
+/// CLONE_VFORK` child that `chroot`s and immediately `_exit`s INSIDE the zygote's own host
+/// process. That helper is a guest process of its own, so its last thread exiting reports
+/// `process_exited == true` -- and gating only on the flag ended the whole host process right
+/// there, killing the zygote that had just returned from `clone()` and was about to send
+/// `ZYGOTE_OK`. Measured: the zygote's trace ends mid-`wait4` at the instant that helper
+/// finished tearing down, and the browser blocks forever in the `recvmsg` that was waiting for
+/// `ZYGOTE_OK`. Only the guest process this host process was forked AS may end it.
+static NATIVE_FORK_CHILD_PID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
 /// The stack pointer a native-`fork()` child must resume with, when the guest passed a `stack` to
 /// `clone()` (glibc's `posix_spawn` does: the child runs a function on a fresh stack). Set in the
 /// child by `reinit_as_native_fork_child`, consumed once by the syscall-return path.
@@ -2720,7 +2736,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.release_record_locks();
             self.global.registry_remove(self.pid.get());
         }
-        if process_exited && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+        // Only the guest process this host process was natively forked AS may end it -- see
+        // `NATIVE_FORK_CHILD_PID`'s doc comment: a short-lived in-process child of that process
+        // (Chromium's `CLONE_VFORK` chroot helper) reports `process_exited == true` too, and
+        // ending the host process there killed the zygote before it could send `ZYGOTE_OK`.
+        let native_fork_child_pid = NATIVE_FORK_CHILD_PID.load(Ordering::Relaxed);
+        let ends_host_process = process_exited
+            && IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed)
+            && native_fork_child_pid != 0
+            && native_fork_child_pid == self.pid.get();
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(), pid:% = self.pid.get(),
+            process_exited:% = process_exited,
+            native_fork_child_pid:% = native_fork_child_pid,
+            ends_host_process:% = ends_host_process;
+            "DIAG prepare_for_exit: native-fork host-process exit decision"
+        );
+        if ends_host_process {
             // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
             // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
             let code = match self.process().wait_for_exit() {
@@ -4969,6 +5001,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             NATIVE_CHILD_SP.store(sp, Ordering::Relaxed);
         }
         IS_NATIVE_FORK_CHILD.store(true, Ordering::Relaxed);
+        NATIVE_FORK_CHILD_PID.store(new_pid, Ordering::Relaxed);
         // The child's copy of `credentials` points at the same `Arc` as the parent's without
         // owning a reference count of its own; take one so that replacing or dropping it here
         // never frees memory the parent still uses.
