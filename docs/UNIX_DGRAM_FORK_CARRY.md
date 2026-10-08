@@ -100,3 +100,27 @@ the current SIGSEGV.
 turn both into a working fork (`CHILD_...=OK`), with the INVALID guard still `rc=1 bytes=0`, and with
 `unix.rs`'s stream arms unchanged. Both ways: `LITEBOX_..._OFF`-style switch if the new carry is
 gated at all, or simply the before/after of the same probe.
+
+## Status: RE-CONFIRMED live 2026-10-08 (`unixrx1b`, via `.wfgy/runprobe.sh`)
+
+```
+sock_stream_before=OK      sock_stream_after=OK     sock_stream_never=TIMEOUT
+sock_seqpacket_after=OK    sock_seqpacket_never=TIMEOUT
+sock_dgram_after=status=11 sock_dgram_never=status=11      <- the bug
+sock_child_writes=OK (parent_read=OK)     panics=0
+```
+
+Two things this settles:
+
+- The bug is REAL and reproducible on a current build, not a ghost like chrF47's panic cascade was.
+  Verify reproduction again before starting; do not repeat that mistake.
+- `sock_seqpacket_*` succeeding proves the stream `C`-spec machinery carries fine, so **dgram is the
+  only socket kind still refused** (`connect-in-progress`, `unix.rs:5139`, is the other refusal but is
+  a transient state, not a kind). The fix is therefore local to the dgram arm.
+
+Neither dgram arm printed a CHILD line at all -- the child dies INSIDE the fork, before its own first
+`print`, so this is the relocating fork's SIGSEGV and not a later "socket was rebuilt empty" symptom.
+Beware: `from_fork_spec:5423` rebuilds the current `"{status:x};D"` spec as a FRESH EMPTY socket, so a
+half-finished carry can turn this SIGSEGV into a silent wrong-answer (child reads EOF and exits 0).
+A fix must be judged on the CHILD line reading `result=OK bytes=5 got=b'HELLO'`, never on the parent's
+`status=` alone.
