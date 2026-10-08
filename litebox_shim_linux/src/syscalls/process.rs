@@ -2676,6 +2676,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.pid_namespaces.release(self.tid.get());
         }
         if process_exited {
+            // Linux destroys a PID namespace when its INIT (pid 1 in it) exits -- it
+            // `zap_pid_ns_processes`es everything else still in it and puts the namespace, whether
+            // or not any of those processes has been reaped. Chromium depends on exactly that: it
+            // forks every renderer/utility into its own `CLONE_NEWPID` namespace and its zygote
+            // reaps a child only when the browser explicitly asks (`Zygote::to_reap_`,
+            // `zygote_linux.cc:172`) -- so a child that nobody asked about stays a zombie, and
+            // without this the namespace (and the one slot of `MAX_NAMESPACES` it occupies) stayed
+            // referenced by that zombie forever. Measured: 256 slots all still `sealed` and all
+            // still referenced after ~62 s, so `clone(CLONE_NEWPID)` began answering EAGAIN, the
+            // zygote's `fork()` returned -1 and Chromium logged `Zygote could not fork`.
+            let ns = self.pid_ns.get();
+            // Same A/B switch as `create`'s `reclaim_dead`: with it set, this behaves exactly as it
+            // did before -- a namespace stayed referenced by a zombie init until its parent
+            // happened to reap it, and the slot was never recycled.
+            if ns != crate::syscalls::pidns::INITIAL_NS
+                && self.ns_pid.get() == 1
+                && !self
+                    .global
+                    .platform
+                    .env_flag("LITEBOX_PIDNS_RECLAIM_OFF")
+            {
+                self.global.pid_namespaces.init_exited(ns);
+            }
             // Real Linux's own `do_exit()` -> `exit_mm()` releases the whole address space once
             // the last thread of a process exits, exactly like `execve()` already does via
             // `release_memory` (`process.rs`'s own `sys_execve`, above). This shim's ordinary
@@ -5545,10 +5568,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `CLONE_NEWPID` creates one, whose first task is pid 1 there (and gets a pid in every
         // ancestor too, which is what lets the parent still `wait4` for it).
         let child_ns_id = if flags.contains(CloneFlags::NEWPID) {
-            self.global
+            // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (dead namespace slots are
+            // never recycled) so one binary proves both sides of the leak, see
+            // `PidNamespaceTable::create`.
+            let reclaim_dead = !self
+                .global
+                .platform
+                .env_flag("LITEBOX_PIDNS_RECLAIM_OFF");
+            let created = self
+                .global
                 .pid_namespaces
-                .create(self.pid_ns.get())
-                .ok_or(Errno::EAGAIN)?
+                .create(self.pid_ns.get(), reclaim_dead);
+            if created.is_none() {
+                litebox_util_log::warn!(
+                    tid:% = self.tid.get(), comm:? = self.comm.get(), flags:? = flags;
+                    "clone(CLONE_NEWPID): no pid namespace slot -- answering EAGAIN (see the pidns warning above)"
+                );
+            }
+            created.ok_or(Errno::EAGAIN)?
         } else {
             self.pid_ns.get()
         };
