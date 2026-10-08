@@ -101,7 +101,18 @@ turn both into a working fork (`CHILD_...=OK`), with the INVALID guard still `rc
 `unix.rs`'s stream arms unchanged. Both ways: `LITEBOX_..._OFF`-style switch if the new carry is
 gated at all, or simply the before/after of the same probe.
 
-## Status: RE-CONFIRMED live 2026-10-08 (`unixrx1b`, via `.wfgy/runprobe.sh`)
+## Status: IMPLEMENTED `2f19a93` (2026-10-08), PROVEN BOTH WAYS
+
+`unixrx1c` (ON): `sock_dgram_after` CHILD `result=OK bytes=5 got=b'HELLO'`, `sock_dgram_never` CHILD
+`result=TIMEOUT` (NOT EOF - the failure the caveat below warns about), 0 panics / 0 exceptions.
+`unixrx1d` (OFF, `LITEBOX_UNIX_DGRAM_CARRY_OFF=1`): BOTH dgram arms `status=11` with NO CHILD line,
+2 exceptions. Stream/seqpacket arms identical in both. The switch sits in `fork_carry_check`, so it
+restores the refusal -> relocating fork exactly, and it gates the `net.rs` SCM_RIGHTS eligibility
+path with it.
+
+---
+
+## Status history: RE-CONFIRMED live 2026-10-08 (`unixrx1b`, via `.wfgy/runprobe.sh`)
 
 ```
 sock_stream_before=OK      sock_stream_after=OK     sock_stream_never=TIMEOUT
