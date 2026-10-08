@@ -754,6 +754,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// `prctl(PR_SET_SECCOMP, mode, prog)`, the pre-`seccomp(2)` form: no flags, no `TSYNC`.
     pub(crate) fn sys_prctl_set_seccomp(&self, mode: u32, prog: usize) -> Result<usize, Errno> {
+        let result = self.do_prctl_set_seccomp(mode, prog);
+        // `prctl(PR_SET_SECCOMP)` is rare enough to log every time, and its errno is load-bearing:
+        // Chromium's `KernelSupportsSeccompBPF()` probes with a NULL program and reads EFAULT as
+        // "this kernel has seccomp-bpf", so a wrong errno here silently disables (or with the
+        // ordering above, used to disable) Chromium's whole sandbox.
+        litebox_util_log::warn!(
+            tid:% = self.tid.get(), mode:% = mode, prog:% = format_args!("{prog:#x}"),
+            nnp:% = self.seccomp_no_new_privs(), result:? = result;
+            "diag-seccomp: prctl(PR_SET_SECCOMP)"
+        );
+        result
+    }
+
+    fn do_prctl_set_seccomp(&self, mode: u32, prog: usize) -> Result<usize, Errno> {
         match mode {
             m if m == u32::from(SECCOMP_MODE_STRICT) => {
                 self.check_can_install()?;
@@ -762,8 +776,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             m if m == u32::from(SECCOMP_MODE_FILTER) => {
-                self.check_can_install()?;
+                // Order matters exactly as it does in `sys_seccomp` above, and for the same
+                // reason: Linux copies the program out of userspace BEFORE it looks at
+                // `no_new_privs`, so a NULL `prog` answers EFAULT even for a caller that could
+                // never install a filter. Chromium's `SandboxBPF::KernelSupportsSeccompBPF()`
+                // probes with `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, nullptr)` and reads
+                // EFAULT as "this kernel has seccomp-bpf"; checking the privilege first turned
+                // that probe into EACCES, so the renderer concluded the sandbox was unsupported
+                // and took its own unsupported-sandbox `IMMEDIATE_CRASH` path.
                 let prog = self.read_fprog(prog)?;
+                self.check_can_install()?;
                 self.process().seccomp.add_filter(prog);
                 self.publish_proc_seccomp();
                 Ok(0)
