@@ -259,46 +259,40 @@ pub fn mainthread_enabled() -> bool {
     MAINTHREAD_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// One throttle slot PER PID for [`mainthread_should_emit`].
-/// A single process-global `static` shares ONE 250 ms budget across every guest main thread in
-/// the host process, so one busy thread starves the others and "silent" becomes
-/// indistinguishable from "unsampled" -- which is exactly the question this instrument exists
-/// to answer. Each slot packs `(last_ms << 32) | pid`; 0 means free.
+/// The first version packed `(ms << 32) | pid` into ONE u64, and `ms << 32` OVERFLOWS for a
+/// millisecond clock (ms since the epoch is ~1.8e12, so `<< 32` needs 73 bits): the stored
+/// "previous ms" was silently truncated to its low 32 bits, `now - prev` was therefore always
+/// enormous, and every dispatch emitted -- 38k lines in 45 s where the throttle allows 180.
+/// Keep the two halves in separate atomics so no packing is needed.
 const MAINTHREAD_SLOTS: usize = 64;
-static MAINTHREAD_LAST: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
+static MAINTHREAD_PID: [core::sync::atomic::AtomicU32; MAINTHREAD_SLOTS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAINTHREAD_SLOTS];
+static MAINTHREAD_MS: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAINTHREAD_SLOTS];
 const MAINTHREAD_THROTTLE_MS: u64 = 250;
 
 /// Rate-limit one main-thread line for `pid` to [`MAINTHREAD_THROTTLE_MS`], per pid.
 pub fn mainthread_should_emit(pid: i32, now_ms: u64) -> bool {
-    let key = pid as u32 as u64;
-    let packed = |ms: u64| (ms << 32) | key;
-    for slot in &MAINTHREAD_LAST {
-        let cur = slot.load(core::sync::atomic::Ordering::Relaxed);
-        if cur != 0 && cur as u32 as u64 == key {
-            return now_ms.saturating_sub(cur >> 32) >= MAINTHREAD_THROTTLE_MS
-                && slot
-                    .compare_exchange(
-                        cur,
-                        packed(now_ms),
-                        core::sync::atomic::Ordering::Relaxed,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok();
+    use core::sync::atomic::Ordering::Relaxed;
+    let key = pid as u32;
+    for i in 0..MAINTHREAD_SLOTS {
+        if MAINTHREAD_PID[i].load(Relaxed) != key {
+            continue;
         }
+        let prev = MAINTHREAD_MS[i].load(Relaxed);
+        return now_ms.saturating_sub(prev) >= MAINTHREAD_THROTTLE_MS
+            && MAINTHREAD_MS[i]
+                .compare_exchange(prev, now_ms, Relaxed, Relaxed)
+                .is_ok();
     }
-    // Unseen pid: claim the first free slot and emit. The first sighting of a main thread is
-    // worth one line even at t=0.
-    for slot in &MAINTHREAD_LAST {
-        if slot
-            .compare_exchange(
-                0,
-                packed(now_ms),
-                core::sync::atomic::Ordering::Relaxed,
-                core::sync::atomic::Ordering::Relaxed,
-            )
+    // Unseen pid: claim the first free slot (pid 0 is never a real pid, so it marks "free") and
+    // emit. The first sighting of a main thread is worth one line even at t=0.
+    for i in 0..MAINTHREAD_SLOTS {
+        if MAINTHREAD_PID[i]
+            .compare_exchange(0, key, Relaxed, Relaxed)
             .is_ok()
         {
+            MAINTHREAD_MS[i].store(now_ms, Relaxed);
             return true;
         }
     }
