@@ -1,34 +1,24 @@
-# litebox - current state (2026-10-08d; recompact of `-08c`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08c.md`)
+# litebox - current state (2026-10-08c; recompact of `-08b`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08b.md`)
 
 `process.rs`/`file.rs`/`unix.rs`/`epoll.rs`/`mm.rs` = `litebox_shim_linux/src/syscalls/<x>`; `platform/lib.rs` = `litebox_platform_windows_userland/src/lib.rs`; `fork.rs` = `.../process_fork.rs`; **`net.rs` = `litebox/src/net/mod.rs` (NOT `syscalls/net.rs`); `platform/net.rs` = `litebox_platform_windows_userland/src/net.rs`**. This file wins; mechanism prose and verbatim pre-edit text live in `docs/AGENTS_ARCHIVE_*` and `docs/HARNESS-LESSONS.md`.
 
 ## Where things stand
 
 - **LINUX-HOST CHROMIUM: THE FORK FAILURE AND THE CARRIED-FD DEATHS ARE FIXED (`7d5c9be7`, `dd94fef9`); 3 RENDERERS NOW START AND STAY ALIVE, BUT NO PAGE EVER LOADS (`dump_dom_lines=0`).** The `Zygote could not fork` was **EAGAIN** (namespace slots held by zombie inits), the 686-deaths/120 s child loop was the carried-fd rebuilds - both fixed BOTH WAYS on one binary. Now: `carry_fail=6` (all `/proc/<already-exited pid>/{statm,status}`, a CORRECT ENOENT), `init_sandbox=1`, `zygote_fail=0`, 3x `Activated seccomp-bpf sandbox for process type: renderer`, NO renderer death. **What still blocks it: after t≈15 s the browser goes SILENT (300 s run: same 20 KB, `rc=124`) while its MAIN thread burns a full CPU at ~16.5k syscalls/s (85% `clock_gettime`, ONE fixed `rip`) interleaved with `ppoll(timeout=0ns)`.** The guest clock is NOT the cause (refuted below). `cargo test --release -p litebox_shim_linux --lib` = **221 passed; 0 failed; 1 ignored**.
-  **`/proc/<pid>` ENOENT IS FIXED AND CHANGES NOTHING** (Fixed, newest first): `register_new=16`,
-  `proc_task_miss=0`/`proc_stat_miss=0`, yet `Navigate=0`, `WebContents=0`, `dump_dom_lines=0` and
-  `gpu_sandbox_warn=1` on BOTH arms. **THE BROWSER MAIN THREAD BURNS ~16.5k syscalls/s (85%
-  `clock_gettime` at one fixed `rip` + `ppoll(timeout=0ns)`) AND NEVER ISSUES A NAVIGATION** - that
-  loop is what to map next (`file_off = vaddr - base`, recompute the exec `PT_LOAD` base per run).
-- **GOAL (sandboxed chromium - its OWN sandbox, no `--no-sandbox` - visible in a HOST BROWSER):
-  MET `4281283`; RE-PROVEN by chrF35 (`9cd6327`+): DevTools 200 at t=15 s, CDP `vis:"visible"`/
-  `rs:"complete"`, `Page.captureScreenshot` 800x600 blue=99.78%, NO `No usable sandbox` in stderr.**
-  Decode such a PNG with PowerShell `System.Drawing`+`GetPixel` (`Read` returns NOTHING).
+- **GOAL (sandboxed chromium - its OWN sandbox, no `--no-sandbox` - visible): MET `4281283` on the WINDOWS harness, RE-PROVEN by chrF35 (`9cd6327`+): DevTools 200 at t=15 s, CDP `vis:"visible"`/`rs:"complete"`, `Page.captureScreenshot` 800x600 blue=99.78%, NO `No usable sandbox` in chromium's stderr. **Decode such a PNG with `System.Drawing`+`GetPixel` (`Read` returns NOTHING).**
 - **ONE SHARED ACCEPT QUEUE PER PORT (`57b87eb`, PROVEN by chrF34): a listening port's backlog is
   `Network::listen_queues` - ONE row per port in the arena, maintained by ANY process's tick - not
-  `TcpServerSpecific::socket_set_handles` inside ONE process's descriptor entry** (a parked
-  `descriptor_table_mut()`, an `iter_mut_nowait` skip, or that process exiting left the port deaf).
-  chrF34: `maintained=[8081, 8082, 9222]` x23,870 from EVERY process; refusals 2 vs chrF32's 22.
-- **THE PUBLISHED-PORT FAILURE IS FIXED (`7efefc5`)**: `pump_tcp_flows` gated its graceful FIN on
-  `!socket.is_open()`, and smoltcp's `is_open()` is TRUE in CLOSE-WAIT, so the guest parked in
-  FIN-WAIT-2 with the reply queued; pub8 0/63 -> pub9 116 OK, pub10 152 OK/1 fail. **RULE:
-  `state=CloseWait` + `recv_queue=N` = the reply is here and the host has NOT been told it ended.**
-- **APP CENSUS: 21 of 22 ARMS PAINT ON A SETTLED DESKTOP; `xvidtune` IS THE X SERVER, NOT
-  LITEBOX** (missing `XFree86-VidModeExtension` on ":1"). **RULE: settle ~120 s after `xfdesktop`
-  (90 s is NOT enough), warm-up arm first, 45 s per arm, and SLICE IT (~5 arms/run).** Only catch: `xman` needs `/tmp/man/man1/hello.1`.
-- **THE IMAGE TAG IS A MOVING TARGET** (webtop re-pushed 2026-10-05): compare a run's layer
-  digests before calling a chromium change a regression; a restore named `.layers.OLDGOOD.json`
-  FAILS SILENTLY - the pin is the copy over `ref_docker.io_linuxserver_webtop_debian-xfce.layers.json`.
+  `TcpServerSpecific::socket_set_handles`, a `Vec` inside ONE process's descriptor entry.** chrF34:
+  `maintained=[8081, 8082, 9222]` x23,870 from EVERY process; refusals 2 vs chrF32's 22.
+- **THE PUBLISHED-PORT FAILURE IS FIXED (`7efefc5`).** `pump_tcp_flows` gated its graceful FIN on `!socket.is_open()`, and **smoltcp's `is_open()` is TRUE in CLOSE-WAIT**, so the guest sat in FIN-WAIT-2 with the reply in its `recv_queue` (222) while the host blocked in `ReadToEnd`. pub8 0 of 63 -> **pub9 116 OK**. **RULE: `state=CloseWait` + `recv_queue=N` = the reply is here and the host has NOT been told the exchange ended.**
+- **APP CENSUS: 21 of 22 ARMS PAINT ON A SETTLED DESKTOP; `xvidtune` IS THE X SERVER, NOT LITEBOX**
+  (`XFree86-VidModeExtension` missing on ":1"); the only app catch is `xman` (`/tmp/man/man1/hello.1`,
+  else rc=1). **RULE: settle ~120 s after `xfdesktop` (90 s is NOT enough), warm-up arm first, 45 s per
+  arm - 23 arms do NOT fit 1400 s, so SLICE IT (~5 arms/run).**
+- **THE IMAGE TAG IS A MOVING TARGET.** `.../webtop:debian-xfce` re-pushed 2026-10-05: every run that
+  painted used the OLD layers. **Compare a run's layer digests before calling a chromium change a
+  regression.** A restore named `.layers.OLDGOOD.json` FAILS SILENTLY - the pin is the copy over
+  `ref_docker.io_linuxserver_webtop_debian-xfce.layers.json`.
 - **Branches**: THERE IS ONE BRANCH, `main`. `inetfix` was merged at `efa9a4db`, reappeared on the remote (`e4f749d`) and is merged again - delete it, never work on it. **`drmevdev` DOES NOT EXIST on this remote; `ae6926d` is not in this repo.** Land on `main`. **COMMIT AS `lanmower`** - the tree's default identity is `anentrypoint`; amend if a commit lands under it.
 - **Before ANY run**: sweep runners (on Windows by CIM - `Stop-Process -Force`/`taskkill` FAIL on
   orphaned fork children); close other browsers; free RAM at the gate.
@@ -87,7 +77,6 @@ is a HOST process: a panic, an abort or an OOM ends the whole run, not one guest
 - **`dd94fef9` A CARRIED FD MUST BE REBUILDABLE IN THE RECEIVER, NOT MERELY NAMED** (`file.rs` `carriable_file_spec_for_raw_fd` / `rebuild_carried_fd`). **RULE: a spec the receiver cannot open is a dead child - carry the bytes or create the path.** Three shapes answered ENOENT/EACCES and each killed the chromium child handed it (686 in 120 s). (a) An `O_WRONLY` file living only in the sender's writable layer: `snapshot_via_readonly_reopen` now reads it through a temporary `O_RDONLY` handle and restores the SENDER's flags on the spec. (b) EVERY `T|` byte snapshot failed - `rebuild_snapshot_file` created its carrier under `/dev/shm`, which this rootfs lacks; it now delegates to `install_shm_file`. (c) A carried DIRECTORY fd (`F|65536|...`, `O_DIRECTORY`) names a path the receiver cannot see: `mkdir_chain` now runs on ENOENT **and EACCES**, and creates **0777** - under `root_guard` a 0700 dir is root-owned, so an unprivileged receiver was refused the reopen it had JUST created (`chain=dddd created=1 reopened=false`). **BOTH WAYS on ONE BINARY (`LITEBOX_FILE_CARRY_FIX_OFF=1`), 120 s: OFF `carry_fail=1042`, 686 deaths, `init_sandbox=163`, 2.5 MB log; ON `carry_fail=6` (all `/proc/<dead pid>/{statm,status}` = a CORRECT ENOENT), 3 deaths, `init_sandbox=1`, 50 KB log.** **`probe28`: in one process an existing dir opens with `O_DIRECTORY`, anything missing is ENOENT(2), never EACCES.**
 - **`7d5c9be7` LINUX DESTROYS A PID NAMESPACE WHEN ITS INIT EXITS, WHATEVER IS STILL UNREAPED IN IT** (`pidns.rs` `PidNamespaceTable::{create,init_exited}`, `process.rs` `do_clone`/`prepare_for_exit`). The zygote forks every renderer/utility into its own `CLONE_NEWPID` namespace and reaps a child only when the browser asks, so each init stayed a zombie holding its slot: `in_use=256 sealed=256` after ~62 s, then `create` returned `None` -> **EAGAIN**. `create(parent, reclaim_dead)` reclaims dead slots and retries once; `init_exited(ns)` runs when `ns != INITIAL_NS && ns_pid == 1`. **BOTH WAYS (`LITEBOX_PIDNS_RECLAIM_OFF=1`): OFF `zygote_fail=1`, `init_sandbox=80`, 1 `Exception(3)`; ON `zygote_fail=0`, `init_sandbox=196`, 0 exceptions, 640 namespaces destroyed with their init.** **`2f6ff32240` fixed a DIFFERENT `Zygote could not fork` (EPERM) - get the errno before re-deriving.**
 - **`6985804e` A CARRIED FD MUST PRESENT THE ACCESS MODE `fcntl(F_GETFL)` REPORTS** (`file.rs`: `carriable_shm_for_raw_fd` uses `regular_file_getfl`). A `/proc/self/fd/N` reopen of an unnamed file is a `dup`, so the descriptor KEEPS `O_RDWR` in its open flags and its read-only-ness lives ONLY in `ReopenedAccess`; the `S|` carry spec read the RAW flags, so every Mojo `ScopedFDPair` arrived with BOTH halves `O_RDWR` and `PlatformSharedMemoryRegion::Take()` failed -> `IMMEDIATE_CRASH` -> GPU respawn loop. **BOTH WAYS (`LITEBOX_SHM_CARRY_GETFL_OFF=1`): OFF 20/20 `accmode=2`, `init_sandbox=1`, 30 KB; ON 5670 `accmode=0` of 6409, that rip NEVER appears, `init_sandbox=82`.** **`diag-shmcarry`'s `accmode` histogram IS the discriminator.**
-- **EVERY GUEST PROCESS MUST BE IN THE FORK-FAMILY REGISTRY OR `/proc/<pid>` IS ENOENT** (`process.rs` `reinit_as_native_fork_child`; `signal/xproc.rs` `xproc_preregister_child`, `xproc_register_local`, `reclaim_dead_hosts`): a platform with no cross-process signal delivery reports host pid `0`, and BOTH registration sites were gated on a NONZERO host, so `SharedProcessTable` was EMPTY on the Linux host and `pid_is_known()` was false for everything -- `/proc/<pid>/{stat,task,status}` answered ENOENT in the browser for renderers that were plainly alive (pid 82 logs `Created context:` in the same second as `/proc/82/stat errno=2`). Register under host `0` = "host unknown", which `reclaim_dead_hosts` now leaves alone; `xproc_slot` is still published only for a REAL host pid, so signal delivery is untouched. **BOTH WAYS by `LITEBOX_PROC_PID_TABLE_LEGACY=1` on ONE binary: fix on = `register_new=16`, `proc_task_miss=0`, `proc_stat_miss=0`; legacy = `register_new=0`, `proc_task_miss=10`, `proc_stat_miss=14`.** **NOT THE PAGE-LOAD BLOCKER: `dump_dom_lines=0` and `gpu_sandbox_warn=1` on BOTH arms.**
 - **`a3c3bb17` `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL)` ANSWERS EFAULT, NOT EACCES** (`seccomp.rs` `sys_prctl_set_seccomp`): Linux copies `sock_fprog` out of userspace BEFORE it checks `no_new_privs`. **Chromium's `KernelSupportsSeccompBPF()` probe reads exactly that errno as "this kernel has seccomp-bpf"** → the renderer takes its own unsupported-sandbox `IMMEDIATE_CRASH`. **BOTH WAYS by tr6/tr7**: before, renderers 72/73/74 died `Signal(5)` at t=26 s; after, `result=Err(EFAULT)` for every tid and **0 fatal signals**.
 - **`2f6ff32240` `clone(CLONE_NEWPID|SIGCHLD)` NEEDS NO `CAP_SYS_ADMIN`** (`process.rs`): the zygote forks with arg0 **`0x20000011`** and NO `CLONE_NEWUSER` from an unprivileged uid, so the clone answered EPERM. **`zygote_fail` 110 -> 1.** **BOTH WAYS by `probe20`**: before, `clone(SIGCHLD|CLONE_NEWPID)` is the ONLY variant answering EPERM; after `pid=4 ... code=7`; NEWNS/NEWNET/NEWUTS/NEWIPC/NEWCGROUP and `unshare(CLONE_NEWPID)` still EPERM.
 - **CHROMIUM'S UNREACHABLE PADDING IS `IMMEDIATE_CRASH()` = `int3; ud2`** (`cc 0f 0b`). int3 is TRAP-class so the reported rip is the NEXT byte: **one crash rip yields BOTH `Exception(3)` and `Exception(6)`**. So "the rip is in padding" means a NORETURN call returned OR a CHECK fired. Slice with `dd` + `objdump -D -b binary -m i386:x86-64 --adjust-vma=<vaddr>` (seconds, vs minutes on the 327 MB binary).
@@ -150,6 +139,11 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
    `create_shared_kernel_state` PANICS there; an `attach` costs 0 (1 create / 503 attach). Make `create`
    idempotent by slot, only if creates exceed 2. **The LINUX arena is already RECYCLED.**
 
+## How to run and drive it (full prose: `docs/HARNESS-LESSONS.md`)
+Full prose in `docs/HARNESS-LESSONS.md` (verbatim: `-07q`); nothing in it applies to the Linux container. Transferable: sweep runners before a run, never two runs at once; a gate is a SNAPSHOT; `.err` SIZE = run health; bound every wait (~20 s); `rc=137` at the END is the harness cap; a guest `python3` must be run `-u`; **a probe that cannot fail is not evidence**; **prove BOTH WAYS**.
+
+**Linux chromium harness: `/tmp/lbx/chrdom*.sh <tag> <secs>`** - `chrdom.sh` (never passes `--dump-dom`), `chrdom2.sh` (adds it), `chrdom3.sh` (no `--virtual-time-budget`), `chrdom5.sh` (`--headless=new`). They print `dump_dom_lines`, the `exception=Exception(n)` histogram, `zygote_fail`, `init_sandbox`; `rc=124` = the `timeout` cap. **Guest chromium is 154.0.8037.57 - use `chrdom5.sh`.**
+
 ## Standing lessons and hard constraints (mechanism: `docs/HARNESS-LESSONS.md`)
 
 - **`litebox::sync::RwLock::try_read`/`try_write` FAIL WHEN A WRITER IS MERELY QUEUED** (`litebox/src/sync/rwlock.rs`): ONE thread parked in a blocking `descriptor_table_mut()` makes every `try_descriptor_table()` fail forever and the per-tick socket sweep a silent no-op in that process. Dead-holder recovery needs the owner thread DEAD; a parked one is never recovered.
@@ -160,6 +154,14 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 - **Host memory: check host RAM FIRST.** gm's browser (2.2 GB PER INSTANCE), the `queue.mjs` chrome storm and `bun` - **none of these is mine to kill. When free RAM is short there is nothing safe to reclaim - wait.**
 - **A process's writes are invisible to everyone until it is REAPED, not when it closes**; a fork child's writes reach the parent only on `wait4`. Cross-process fork carries pipes/regular files/eventfds/pty/unix sockets + INET + `MAP_SHARED`, drops pty fds and non-INET cloexec fds; slots (6) gate the spawn, fail open after 8 s.
 - Logs: verbosity from `LITEBOX_LOG`, not `RUST_LOG`; **`debug!` fields take `&str`, not an owned `String`**. **Timestamps are PER-PROCESS UPTIME; `.err` lines carry ANSI escapes.** **The `tag=`/`dtag=` fields DO NOT identify a host process.** Socket census is `local_port:state:remote_port`; a listening slot is `0:L:0`, so the census CANNOT prove a port is armed. **`LITEBOX_*` env flags are read from the HOST env by `platform.env_flag`.**
+
+## Guest stack: chromium + selkies (full recipe in the `-06f` appendix, verbatim in `-07m`)
+Windows/webtop recipe, verbatim in the `-06f` appendix and `-07q`. Two chromium failure modes that
+must not be merged: (a) `Crashing due to FD ownership violation:` + `No usable sandbox!` = the
+`CanCreateProcessInNewUserNS()` probe; (b) rc=133 (SIGTRAP) with NO sandbox line = crashpad. The
+proof is CDP from inside the guest PLUS the host browser; judge a frame only after ~60 s of STREAM
+time. Selkies binds `--port=` and needs `--enable-basic-auth=false`; it EXITS when its last client
+leaves, so a published port going `000` is the APP LEAVING.
 
 ## Closed - do not re-attempt without a genuinely new approach
 
@@ -176,15 +178,14 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 
 Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/`19`/`20`; "selkies forks a child holding the descriptor table"; "a busy port goes deaf" (41/41); "an attached published host client deafens the port to the guest" (37/37).** **CLOSED: `eb16abf`, `150e6e0`, chrF14 window loss, apps10 `BadMatch`, chrF24-27, grey/`NO_PNG`, xproc44, the 23-arm app census.**
 
-- **`LITEBOX_PIDNS_RECLAIM_OFF` IS NOT THE DISCRIMINATOR for `dump_dom_lines`** (A/B, 80 s/arm, one
-  binary): `on` = rc=124, 91785 B, `dump_dom_lines=0`, `seccomp_renderers=4`, `execve_total=5`,
-  `exit_group=8`, `zygote_fail=0`; `off` = rc=124, 116016 B, every one of those IDENTICAL. So
-  `7d5c9be7` (pid-namespace slot reclaim) is not the cause of "no page ever loads".
 ## Docs and tooling map
-Archives under `docs/` (`-07q`...`-09-03`); `docs/HARNESS-LESSONS.md` =
-harness prose, `docs/LINUX-TEST-SUITE.md` = Linux-container notes. gm `codesearch`
-(INVARIANT 4: never grep/find): `literal` is EXHAUSTIVE, `dual` a ranked SAMPLE - never
-conclude "absent" from it; scope with `path`/`glob`; **dual SILENTLY IGNORES `path`**.
-Spool fallback: fields are FLAT (`query`/`mode`/`path`/`output`/`cwd`/`session_id`), never
-nested under `body`; write `in/<verb>/<session>-<N>.txt` atomically, read
-`out/<verb>-<session>-<N>.json`.
+Archives under `docs/`: `-08a` newest ... `-09-03` oldest (`-05b` S10 = runner/OCI + child
+exit, `-06f` = the closed/appendix); `docs/HARNESS-LESSONS.md` = harness prose,
+`docs/LINUX-TEST-SUITE.md` = Linux-container notes. `.wfgy/` is git-IGNORED (gm DOES scan it
+when you pass `path`). gm `codesearch` (INVARIANT 4: never grep/find): `literal` is
+exhaustive, `dual` a ranked SAMPLE - never conclude "absent" from it; scope with `path`/`glob`
+(unscoped literal caps at 40 matches); **dual mode SILENTLY IGNORES `path`**. gm DOES scan a
+git-ignored dir when you pass `path`; a huge log is skipped by a 16 MiB ceiling, not binary
+sniffing - `fs_read` pages it. Spool fallback: fields are FLAT
+(`query`/`mode`/`path`/`output`/`cwd`/`session_id`), never nested under `body`; write
+`in/<verb>/<session>-<N>.txt` atomically (temp file + `mv`), read `out/<verb>-<session>-<N>.json`.

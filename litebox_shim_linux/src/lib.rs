@@ -2399,12 +2399,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         crate::diag::init_strace_summary(|| {
             self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY")
         });
+        crate::diag::init_rip_hist(|| self.global.platform.env_flag("LITEBOX_RIP_HIST"));
+        crate::diag::init_spin_stack(|| {
+            self.global.platform.env_value("LITEBOX_SPIN_STACK")
+        });
+        crate::diag::init_parked(|| self.global.platform.env_flag("LITEBOX_PARKED"));
+        crate::diag::init_path_marker(|| {
+            self.global.platform.env_value("LITEBOX_DIAG_PATH_MARKER")
+        });
         let timed = crate::diag::strace_summary_enabled();
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.reinterpret_as_unsigned() as usize;
         let start = timed.then(|| self.global.platform.now());
+        // Where is this syscall being made FROM? Sampled (1 in 64) and only while the strace
+        // summary is on, so a thread spinning at 16.5k syscalls/s costs 258 histogram inserts
+        // per second rather than 16.5k. See `diag::record_syscall_rip`.
+        #[cfg(target_arch = "x86_64")]
+        let (syscall_rip, syscall_rsp) = (ctx.rip, ctx.rsp);
         litebox::fs::set_effective_identity(self.creds().fsuid, self.creds().fsgid);
         // A write to `/proc/self/uid_map` is a credentials change, so the fs layer hands it to the
         // shim, which needs to know WHOSE syscall is running to answer it. Published for this
@@ -2520,7 +2533,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
+        // "What is this thread parked in?" -- recorded BEFORE the dispatch, so a syscall that
+        // never returns still shows up (see `diag`'s parked section for why the existing
+        // exit-time instruments cannot answer this).
+        let parked = crate::diag::parked_enabled();
+        let now_ms = if parked {
+            crate::diag::now_ms(self.global.platform)
+        } else {
+            0
+        };
+        if parked {
+            let host_pid = self.global.platform.current_host_pid() as i32;
+            crate::diag::inflight_enter(
+                core::ptr::addr_of!(*self) as u64,
+                host_pid,
+                syscall_number,
+                [
+                    ctx.syscall_arg(0) as u64,
+                    ctx.syscall_arg(1) as u64,
+                    ctx.syscall_arg(2) as u64,
+                    ctx.syscall_arg(3) as u64,
+                ],
+                self.pid.get(),
+                self.tid.get(),
+                &comm_bytes,
+                now_ms,
+            );
+        }
+        if crate::diag::path_marker_on() {
+            // Path-taking syscalls: arg0 for the plain forms, arg1 for the `*at` forms and
+            // `statx`. Both are offered; a non-pointer (a dirfd, AT_FDCWD) is rejected by the
+            // range check inside.
+            #[cfg(target_arch = "x86_64")]
+            if matches!(
+                syscall_number,
+                2 | 4 | 6 | 21 | 59 | 80 | 257 | 258 | 262 | 263 | 264 | 269 | 332
+            ) {
+                for a in [0usize, 1usize] {
+                    crate::diag::check_path_marker(
+                        self.global.platform,
+                        syscall_number,
+                        ctx.syscall_arg(a) as usize & 0x0000_ffff_ffff_ffff,
+                        self.pid.get(),
+                        self.tid.get(),
+                    );
+                }
+            }
+        }
+
         let result = self.do_syscall(ctx);
+
+        if parked {
+            let host_pid = self.global.platform.current_host_pid() as i32;
+            crate::diag::inflight_exit(core::ptr::addr_of!(*self) as u64);
+            crate::diag::clear_thread_note(core::ptr::addr_of!(*self) as u64);
+        }
 
         if is_target {
             crate::diag::emit_timeline_line(
@@ -2547,6 +2614,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 err_debug,
             );
         }
+        #[cfg(target_arch = "x86_64")]
+        crate::diag::record_syscall_rip(
+            syscall_number,
+            syscall_rip as u64,
+            // The trampoline is entered by a `call`, so `[rsp]` is the guest instruction right
+            // after the original `syscall` -- the call site as the binary knows it. Read
+            // directly: guest memory is this process's memory (see the `is_syscall_trap`
+            // byte read in the platform layer, which does the same).
+            unsafe { core::ptr::read(ctx.rsp as *const u64) },
+            self.pid.get(),
+            self.tid.get(),
+            core::str::from_utf8(&comm_bytes).unwrap_or(""),
+        );
+        if parked {
+            crate::diag::maybe_dump_inflight(self.global.platform, now_ms);
+        }
+        #[cfg(target_arch = "x86_64")]
+        crate::diag::maybe_dump_rip_histogram(self.global.platform);
+        #[cfg(target_arch = "x86_64")]
+        crate::diag::maybe_dump_spin_stack(self.global.platform, syscall_number, syscall_rsp);
+        #[cfg(target_arch = "x86_64")]
+        crate::diag::dump_guest_mappings_once(self.global.platform, || {
+            self.process()
+                .pm()
+                .mappings()
+                .into_iter()
+                .map(|(r, flags)| alloc::format!("{r:?} {flags:?}"))
+                .collect()
+        });
 
         let return_value = match result {
             Ok(v) => v,

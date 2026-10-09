@@ -4909,8 +4909,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .insert(child_tid, gate.clone());
             gate
         });
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "fork:pre-locks");
         let result = self.global.with_shimwide_locks_held(
-            || unsafe { self.global.platform.native_fork() },
+            || {
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "fork:in-fork");
+                let r = unsafe { self.global.platform.native_fork() };
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "fork:post-fork");
+                r
+            },
             |forked| *forked == Some(0),
         );
         match result {
@@ -5049,6 +5055,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let old_pid = self.pid.get();
         let old_process = self.process();
+        // A native `fork()` child is a separate HOST process: its `ProcSelfTable` row lives in
+        // its own copy of memory, so nothing in the parent's view names it and `/proc/<pid>`
+        // (hence `/proc/<pid>/task`) answered ENOENT in the parent for a process that was
+        // plainly alive. The fork-family registry is in the shared arena, so registering here
+        // makes this pid resolvable from every host process of the family.
+        self.xproc_preregister_child(
+            new_pid,
+            old_process.pgid.load(core::sync::atomic::Ordering::Relaxed),
+        );
 
         // The old (pre-`fork()`, now COW-identical in this process's own memory) `PageManager`'s
         // bookkeeping describes memory this process ALREADY has, at these exact addresses --
@@ -5070,6 +5085,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // own PERSPECTIVE (parasite/PIE injection is an OUTSIDE-looking-in tool, not something
         // the process being reconstructed does to itself). `new_adopting_existing_memory` is
         // sized to what this case actually needs.
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-pm");
         let old_pm = old_process.pm();
         let regions = old_pm.tracked_regions();
         let (_, brk) = old_pm.tracked_region_summary();
@@ -5084,6 +5100,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             core::iter::empty(),
         );
 
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-signals");
         let shared_pending = Arc::new(Mutex::new(super::signal::PendingSignals::new()));
         let new_signals = self
             .signals
@@ -5139,11 +5156,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Give this child its own `/proc/self` entry, copied from the parent's, exactly as
         // `do_clone`'s thread-based path does for ITS new `Task` -- BEFORE overwriting `pid`
         // below, since `inherit` is keyed by the OLD pid.
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-procinfo");
         self.global.proc_self_info.write().inherit(old_pid, new_pid);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-identity");
 
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-pidset");
         self.ppid.set(old_pid);
         self.pid.set(new_pid);
         self.tid.set(new_pid);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:post-pidset");
         // The parent allocated this child's chain of per-namespace pids in the shared namespace
         // table BEFORE the `fork()` ran (see `do_clone`), so this process adopts those numbers
         // rather than allocating again -- allocating here would add a second row per level for
@@ -5158,17 +5179,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process()
             .sid
             .store(old_process.sid.load(Ordering::Relaxed), Ordering::Relaxed);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-registry");
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-registry");
         self.global.registry_insert(new_pid, self.process());
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:post-registry");
         // A forked child starts attached to no pty of its own -- see this field's own doc
         // comment ("`None` for every ordinary (non-`--pty-mode`) process"); the PARENT's
         // session-daemon attachment, if any, is host-side bookkeeping about THAT process, not
         // something a freshly forked child inherits.
         self.attached_pty_id.set(None);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-guestpid");
         self.global.platform.set_process_guest_pid(new_pid);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-liveviews");
         self.install_proc_live_views();
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:post-liveviews");
         // A forked child that never `execve`s keeps its parent's `comm`/`cmdline`, so the
         // inherited row above is exactly what other host processes must see it as.
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:pre-xproc-publish");
         self.xproc_publish_identity(new_pid, old_pid);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "child:done");
     }
 
     /// Points this process's `/proc/self/{task,fd}` views at ITS OWN thread list and fd table.
@@ -5270,6 +5299,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         args: &litebox_common_linux::CloneArgs,
         clone3: bool,
     ) -> Result<usize, Errno> {
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:start");
         const MAX_SIGNAL_NUMBER: u64 = 64;
 
         let litebox_common_linux::CloneArgs {
@@ -5568,6 +5598,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `CLONE_NEWPID` creates one, whose first task is pid 1 there (and gets a pid in every
         // ancestor too, which is what lets the parent still `wait4` for it).
         let child_ns_id = if flags.contains(CloneFlags::NEWPID) {
+            crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:pidns-create");
             // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (dead namespace slots are
             // never recycled) so one binary proves both sides of the leak, see
             // `PidNamespaceTable::create`.
@@ -5673,6 +5704,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // clones stay in-process, where `make_fs`/`make_files` hand out the parent's own `Arc`.
             let shares_with_parent =
                 flags.contains(CloneFlags::FS) || flags.contains(CloneFlags::FILES);
+            if !shares_with_parent {
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:pre-xproc");
+            }
             if !shares_with_parent
                 && let Some(handle) = self.try_cross_process_fork(
                     ctx,
@@ -5697,10 +5731,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     return Ok(0);
                 }
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-register");
                 self.process()
                     .register_cross_process_child(child_tid, handle);
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-xproc");
                 self.xproc_child_spawned(child_tid, handle);
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-notifier");
                 self.arm_cross_process_exit_notifier(child_tid, handle, cross_process_exit_signal);
+                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-return");
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
@@ -6633,9 +6671,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .children
                 .lock()
                 .push((child_tid, thread.process.clone()));
-            if let Some(host) = core::num::NonZeroU32::new(self.global.platform.current_host_pid())
+            // `/proc/<pid>` resolves a pid only through the fork-family registry (`pid_is_known`),
+            // so every guest process has to be in it. A platform with no cross-process signal
+            // delivery reports host pid 0, and the `NonZeroU32` here used to skip registration
+            // entirely -- leaving `/proc/<pid>` (and `/proc/<pid>/task`) ENOENT for every process
+            // this host process does not itself run. Register with host 0 = "host unknown",
+            // which `SharedProcessTable::reclaim_dead_hosts` leaves alone.
+            if !self
+                .global
+                .platform
+                .env_flag("LITEBOX_PROC_PID_TABLE_LEGACY")
             {
-                self.xproc_register_local(child_tid, &thread.process, host.get(), false);
+                let host = self.global.platform.current_host_pid();
+                self.xproc_register_local(child_tid, &thread.process, host, false);
             }
 
             // `fs_base` was already computed above (before the cross-process branch), fixing up

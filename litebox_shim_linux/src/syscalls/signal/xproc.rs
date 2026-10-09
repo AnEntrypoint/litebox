@@ -305,6 +305,10 @@ impl SharedProcessTable {
             let slot = &self.slots[index as usize];
             slot.host_pid.store(host_pid, Ordering::Release);
             slot.owns_host.store(owns_host, Ordering::Release);
+            litebox_util_log::warn!(
+                pid:% = pid, host:% = host_pid, idx:% = index, used:% = self.used_slots();
+                "DIAG proc-table register existing"
+            );
             return Some(index);
         }
         for attempt in 0..2 {
@@ -329,6 +333,10 @@ impl SharedProcessTable {
                     slot.pending.store(0, Ordering::Relaxed);
                     slot.owns_host.store(owns_host, Ordering::Relaxed);
                     slot.pid.store(pid, Ordering::Release);
+                    litebox_util_log::warn!(
+                        pid:% = pid, host:% = host_pid, idx:% = i, used:% = self.used_slots();
+                        "DIAG proc-table register new"
+                    );
                     return Some(i as u32);
                 }
             }
@@ -336,13 +344,27 @@ impl SharedProcessTable {
                 self.reclaim_dead_hosts(&host_alive);
             }
         }
+        litebox_util_log::warn!(
+            pid:% = pid, host:% = host_pid, used:% = self.used_slots();
+            "DIAG proc-table register FAILED no free slot"
+        );
         None
+    }
+
+    fn used_slots(&self) -> usize {
+        self.members().count()
     }
 
     fn reclaim_dead_hosts(&self, host_alive: &impl Fn(u32) -> bool) {
         for (i, slot) in self.slots.iter().enumerate() {
             let pid = slot.pid.load(Ordering::Acquire);
-            if pid > 0 && !host_alive(slot.host_pid.load(Ordering::Acquire)) {
+            // A slot registered with host 0 ("no cross-process signal delivery on this platform")
+            // carries no host to test: reclaiming it would drop a live process from `/proc/<pid>`.
+            // It is released by `unregister` when that process exits, like any other.
+            if pid > 0
+                && slot.host_pid.load(Ordering::Acquire) != 0
+                && !host_alive(slot.host_pid.load(Ordering::Acquire))
+            {
                 let reclaimed =
                     slot.pid
                         .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire);
@@ -381,6 +403,10 @@ impl SharedProcessTable {
             let _ = slot
                 .pid
                 .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire);
+            litebox_util_log::warn!(
+                pid:% = pid, idx:% = index, used:% = self.used_slots();
+                "DIAG proc-table unregister"
+            );
         }
     }
 
@@ -576,19 +602,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(pgid) = self.global.process_table.pgid(index, pid) {
             process.pgid.store(pgid, Ordering::Relaxed);
         }
-        process.xproc_slot.store(index, Ordering::Release);
-        let mut local = self.global.xproc_local.lock();
-        local.retain(|_, p| p.strong_count() > 0);
-        local.insert(pid, Arc::downgrade(process));
+        // Only a real host pid gets a slot: the slot is what routes `kill()` through the
+        // cross-process `pending` bitmask and the wake listener, and host 0 means this platform
+        // has neither. Publishing the slot for such a process would post signals into a bitmask
+        // nobody drains, so registration here is for `/proc/<pid>` visibility only.
+        if host != 0 {
+            process.xproc_slot.store(index, Ordering::Release);
+            let mut local = self.global.xproc_local.lock();
+            local.retain(|_, p| p.strong_count() > 0);
+            local.insert(pid, Arc::downgrade(process));
+        }
     }
 
     /// Registers a forked child that is still being set up: its host is provisionally this host
     /// process, so signals posted before it is running wait in its slot.
     pub(crate) fn xproc_preregister_child(&self, child_pid: i32, pgid: i32) {
-        let Some(host) = self.xproc_host() else {
-            return;
-        };
         let platform = self.global.platform;
+        // A platform with no cross-process signal delivery reports no host pid, and this used to
+        // return here -- so no guest process was ever in the registry and `/proc/<pid>` answered
+        // ENOENT for every process this host process does not itself run. Register under host 0
+        // ("host unknown") instead; `reclaim_dead_hosts` leaves such a slot alone.
+        let host = match self.xproc_host() {
+            Some(h) => h,
+            None if platform.env_flag("LITEBOX_PROC_PID_TABLE_LEGACY") => return,
+            None => 0,
+        };
         let _ = self
             .global
             .process_table

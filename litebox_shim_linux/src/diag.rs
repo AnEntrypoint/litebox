@@ -114,6 +114,492 @@ pub fn record_syscall(syscall_number: usize, duration_ns: u64, err_debug: Option
     }
 }
 
+/// Sampled `(syscall number, guest rip)` histogram: WHICH CALL SITE makes each syscall.
+///
+/// Built for "the browser main thread burns 100% CPU on ~16.5k syscalls/s, 85% of them
+/// `clock_gettime` at one fixed `rip`". `LITEBOX_STRACE_SUMMARY`'s per-syscall table names the
+/// syscall but not its caller, and a count alone cannot tell "one site looping" from "a million
+/// sites each called once". Sampling every [`RIP_SAMPLE_EVERY`]-th dispatch keeps the per-syscall
+/// cost at one relaxed atomic increment even at 16.5k/s, and a loop collapses to a single row with
+/// an enormous count -- which is exactly the shape being looked for.
+const RIP_SAMPLE_EVERY: u64 = 64;
+
+/// How many SAMPLES (not dispatches) accumulate between periodic dumps: 2048 samples x 64 = one
+/// dump per ~131k syscalls, i.e. roughly every 8 s on a thread doing 16.5k/s. Periodic because
+/// the exit-time dump only fires when the bootstrap process *exits*, and the run being diagnosed
+/// is killed by the harness's `timeout -s KILL` precisely because it never finishes.
+const RIP_DUMP_EVERY_SAMPLES: u64 = 512;
+
+struct RipHit {
+    count: u64,
+    /// Return address the trampoline pushed: the guest instruction after the original `syscall`.
+    caller: u64,
+    pid: i32,
+    tid: i32,
+    comm: String,
+}
+
+static RIP_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static RIP_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RIP_DUMP_DUE: AtomicBool = AtomicBool::new(false);
+static RIP_HISTOGRAM: spin::Mutex<BTreeMap<(usize, u64), RipHit>> =
+    spin::Mutex::new(BTreeMap::new());
+static RIP_ENABLED: AtomicBool = AtomicBool::new(false);
+static RIP_INIT: AtomicBool = AtomicBool::new(false);
+
+/// One-shot latch for `LITEBOX_RIP_HIST` (the periodic dump), same shape as
+/// [`init_strace_summary`].
+pub fn init_rip_hist(enabled: impl FnOnce() -> bool) {
+    if RIP_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    RIP_ENABLED.store(enabled(), Ordering::Release);
+    RIP_INIT.store(true, Ordering::Release);
+}
+
+fn rip_hist_enabled() -> bool {
+    RIP_ENABLED.load(Ordering::Acquire)
+}
+
+/// Record the call site of one syscall dispatch. `rip` is the guest instruction pointer the
+/// syscall was made from, which for a rewritten `syscall` is the trampoline, NOT the guest
+/// function that made the call -- so `caller` is the return address that same trampoline pushed
+/// (`[rsp]`), i.e. the instruction after the original `syscall`. Both are recorded because the
+/// trampoline alone identifies the call site to litebox but not to anyone holding the binary.
+pub fn record_syscall_rip(
+    syscall_number: usize,
+    rip: u64,
+    caller: u64,
+    pid: i32,
+    tid: i32,
+    comm: &str,
+) {
+    if !rip_hist_enabled() && !strace_summary_enabled() {
+        return;
+    }
+    if RIP_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) % RIP_SAMPLE_EVERY != 0 {
+        return;
+    }
+    // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
+    // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    let mut guard = RIP_HISTOGRAM.lock();
+    let hit = guard.entry((syscall_number, rip)).or_insert(RipHit {
+        count: 0,
+        caller,
+        pid,
+        tid,
+        comm: comm.to_string(),
+    });
+    hit.count += 1;
+    // `fetch_add` returns the PREVIOUS value, so 0 would trip the modulo on the very first
+    // sample and dump a one-row table before anything has happened. Add 1 first.
+    if (RIP_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1) % RIP_DUMP_EVERY_SAMPLES == 0 {
+        RIP_DUMP_DUE.store(true, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "Where is every guest thread parked?" (`LITEBOX_PARKED=1`)
+//
+// Built for the Linux-host chromium blocker where the whole session goes quiet: every host
+// thread sits in `futex_do_wait`, `LITEBOX_STRACE_SUMMARY` only prints at bootstrap exit (which
+// a harness `timeout -s KILL` prevents), and the rip histogram only ever sees syscalls that
+// RETURN -- so a thread that entered a syscall and never came back is invisible to every
+// existing instrument. This keeps a `(pid, tid) -> in-flight syscall` map, and dumps the rows
+// that have been in flight longer than [`PARKED_MIN_MS`] on the first dispatch that happens at
+// least [`PARKED_DUMP_EVERY_MS`] after the previous dump. It is driven by dispatches because
+// this crate has no timer thread, and a fully quiet guest still produces one occasionally.
+// ---------------------------------------------------------------------------
+
+/// Below this, a syscall is just slow, not parked.
+const PARKED_MIN_MS: u64 = 2000;
+const PARKED_DUMP_EVERY_MS: u64 = 5000;
+
+struct Inflight {
+    host_pid: i32,
+    guest_pid: i32,
+    sysno: usize,
+    args: [u64; 4],
+    started_ms: u64,
+    comm: [u8; 16],
+}
+
+/// Keyed by the ADDRESS OF THE `Task`, never by a guest pid/tid: `reinit_as_native_fork_child`
+/// rewrites `self.tid` in the middle of the `clone` syscall, so a tid-keyed entry inserted on
+/// entry can never be removed on exit -- it would sit there forever and read as "a thread parked
+/// in `clone` for the whole run", which is exactly the false conclusion this instrument produced
+/// once already. The `Task` address is the one identity a thread keeps across that rewrite.
+static INFLIGHT: spin::Mutex<BTreeMap<u64, Inflight>> = spin::Mutex::new(BTreeMap::new());
+static INFLIGHT_ENABLED: AtomicBool = AtomicBool::new(false);
+static INFLIGHT_INIT: AtomicBool = AtomicBool::new(false);
+static INFLIGHT_LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn init_parked(enabled: impl FnOnce() -> bool) {
+    if INFLIGHT_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    INFLIGHT_ENABLED.store(enabled(), Ordering::Release);
+    INFLIGHT_INIT.store(true, Ordering::Release);
+}
+
+pub fn parked_enabled() -> bool {
+    INFLIGHT_ENABLED.load(Ordering::Acquire)
+}
+
+/// Monotonic-ish wall clock in milliseconds, from the platform's SYSTEM clock (not its monotonic
+/// `Instant`) so it needs no per-platform epoch stored in a `static` -- a generic `Instant`
+/// cannot live in one, and this module has no `Platform` type parameter.
+pub fn now_ms<Platform: litebox::platform::TimeProvider>(platform: &Platform) -> u64 {
+    let t = platform.current_time();
+    let d = match litebox::platform::SystemTime::duration_since(
+        &t,
+        &<Platform::SystemTime as litebox::platform::SystemTime>::UNIX_EPOCH,
+    ) {
+        Ok(d) | Err(d) => d,
+    };
+    d.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// A coarse "what step is this thread on" tag, set by the syscall implementations themselves and
+/// printed alongside their row. `clone` needs it: a thread parked in `clone` could be waiting for
+/// an admission slot, for one of the shim-wide locks `fork()` is taken under, or inside `fork()`
+/// itself, and those have completely different fixes.
+static THREAD_NOTES: spin::Mutex<BTreeMap<u64, &'static str>> = spin::Mutex::new(BTreeMap::new());
+
+pub fn set_thread_note(task: u64, note: &'static str) {
+    if !parked_enabled() {
+        return;
+    }
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    THREAD_NOTES.lock().insert(task, note);
+}
+
+pub fn clear_thread_note(task: u64) {
+    if !parked_enabled() {
+        return;
+    }
+    THREAD_NOTES.lock().remove(&task);
+}
+
+/// `&'static str` is `Copy`, so the value (not a borrow of the map) is what comes out and no
+/// guard outlives this call.
+pub fn thread_note(task: u64) -> Option<&'static str> {
+    if !parked_enabled() {
+        return None;
+    }
+    THREAD_NOTES.lock().get(&task).copied()
+}
+
+pub fn inflight_enter(
+    task: u64,
+    host_pid: i32,
+    sysno: usize,
+    args: [u64; 4],
+    pid: i32,
+    tid: i32,
+    comm: &[u8],
+    now_ms: u64,
+) {
+    if !parked_enabled() {
+        return;
+    }
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    let mut c = [0u8; 16];
+    let n = comm.len().min(16);
+    c[..n].copy_from_slice(&comm[..n]);
+    INFLIGHT.lock().insert(
+        task,
+        Inflight {
+            host_pid,
+            guest_pid: pid,
+            sysno,
+            args,
+            started_ms: now_ms,
+            comm: c,
+        },
+    );
+}
+
+pub fn inflight_exit(task: u64) {
+    if !parked_enabled() {
+        return;
+    }
+    INFLIGHT.lock().remove(&task);
+}
+
+pub fn maybe_dump_inflight<Platform: litebox::platform::TimeProvider>(
+    platform: &Platform,
+    now_ms: u64,
+) where
+    Platform: litebox::platform::StdioProvider,
+{
+    if !parked_enabled() {
+        return;
+    }
+    let last = INFLIGHT_LAST_DUMP_MS.load(Ordering::Acquire);
+    if now_ms.saturating_sub(last) < PARKED_DUMP_EVERY_MS {
+        return;
+    }
+    INFLIGHT_LAST_DUMP_MS.store(now_ms, Ordering::Release);
+    let guard = INFLIGHT.lock();
+    let mut rows: Vec<(u64, &Inflight)> = guard
+        .iter()
+        .filter(|(_, f)| now_ms.saturating_sub(f.started_ms) >= PARKED_MIN_MS)
+        .map(|(k, f)| (*k, f))
+        .collect();
+    rows.sort_by(|a, b| a.1.started_ms.cmp(&b.1.started_ms));
+    emit_timeline_line(
+        platform,
+        &alloc::format!(
+            "[diag-parked] {} thread(s) parked >= {PARKED_MIN_MS} ms (of {} in flight)",
+            rows.len(),
+            guard.len()
+        ),
+    );
+    for (task, f) in rows.iter().take(40) {
+        let end = f.comm.iter().position(|&b| b == 0).unwrap_or(16);
+        emit_timeline_line(
+            platform,
+            &alloc::format!(
+                "[diag-parked] parked_ms={} host_pid={} pid={} tid={} note={} syscall={}({}) a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                now_ms.saturating_sub(f.started_ms),
+                f.host_pid,
+                f.guest_pid,
+                alloc::string::String::from_utf8_lossy(&f.comm[..end]),
+                thread_note(*task).unwrap_or("-"),
+                syscall_name(f.sysno),
+                f.sysno,
+                f.args[0],
+                f.args[1],
+                f.args[2],
+                f.args[3],
+            ),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "Did anything ever open/see this path?" (`LITEBOX_DIAG_PATH_MARKER=<substring>`)
+//
+// A yes/no the log could not otherwise answer: chromium under litebox names its target URL
+// nowhere in its own output, so "did the renderer ever reach `file:///page.html`" was unknown.
+// Matched against the path argument of every path-taking syscall, guest-side, at dispatch.
+// ---------------------------------------------------------------------------
+
+static PATH_MARKER: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static PATH_MARKER_ON: AtomicBool = AtomicBool::new(false);
+static PATH_MARKER_INIT: AtomicBool = AtomicBool::new(false);
+static PATH_MARKER_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// One relaxed atomic load, checked on every dispatch; the string compare only happens for the
+/// handful of path-taking syscall numbers the caller filters on.
+pub fn path_marker_on() -> bool {
+    PATH_MARKER_ON.load(Ordering::Acquire)
+}
+
+pub fn init_path_marker(value: impl FnOnce() -> Option<String>) {
+    if PATH_MARKER_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let v = value()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    PATH_MARKER_ON.store(v.is_some(), Ordering::Release);
+    *PATH_MARKER.lock() = v;
+    PATH_MARKER_INIT.store(true, Ordering::Release);
+}
+
+/// `path` is the NUL-terminated guest string at `ptr`.
+///
+/// Read ONE BYTE AT A TIME and stopped at the first NUL: guest memory is this process's memory,
+/// but a bulk `from_raw_parts(ptr, 512)` can run off the end of the mapping the string lives in
+/// and fault inside the shim, which would kill every guest in the process. Byte-wise reading can
+/// only ever touch bytes the string itself occupies.
+const PATH_MARKER_MAX_SCAN: usize = 4096;
+/// Bound on emitted lines, not on matches counted.
+const PATH_MARKER_MAX_HITS: u64 = 2000;
+
+pub fn check_path_marker<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    syscall_number: usize,
+    ptr: usize,
+    pid: i32,
+    tid: i32,
+) {
+    if !PATH_MARKER_ON.load(Ordering::Acquire) {
+        return;
+    }
+    // AT_FDCWD (-100) and friends are passed where a path pointer would be; a negative or
+    // kernel-range value is never a guest string.
+    // AT_FDCWD (-100) and friends are passed where a path pointer would be, and a raw `as usize`
+    // of a negative i32 lands at 0x0000_ffff_ffff_ff9c -- inside the 48-bit range but outside
+    // every guest user mapping. Only the canonical user half is a plausible string address.
+    if !(0x1000..0x0000_8000_0000_0000).contains(&ptr) {
+        return;
+    }
+    let guard = PATH_MARKER.lock();
+    let marker = match guard.as_ref() {
+        None => return,
+        Some(m) => m,
+    };
+    let mut buf: [u8; 256] = [0; 256];
+    let mut len = 0;
+    // SAFETY: `ptr` is a guest user address; every byte up to the terminating NUL is part of a
+    // string the guest itself just handed to this syscall, so it is mapped.
+    while len < buf.len().min(PATH_MARKER_MAX_SCAN) {
+        let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        buf[len] = b;
+        len += 1;
+    }
+    let s = match core::str::from_utf8(&buf[..len]) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if !s.contains(marker.as_str()) {
+        return;
+    }
+    drop(guard);
+    let n = PATH_MARKER_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > PATH_MARKER_MAX_HITS {
+        return;
+    }
+    emit_timeline_line(
+        platform,
+        &alloc::format!(
+            "[diag-path] hit#{n} pid={pid} tid={tid} syscall={}({}) path={s}",
+            syscall_name(syscall_number),
+            syscall_number,
+        ),
+    );
+}
+
+/// Dumps the guest stack of one busy syscall site, so the FUNCTION THAT OWNS THE LOOP -- not just
+/// the syscall it makes -- can be named. `LITEBOX_SPIN_STACK=<syscall number>`: every
+/// [`SPIN_STACK_EVERY`]-th dispatch of that syscall prints 0x180 bytes from `rsp` as qwords, which
+/// for a `-fstack-protector` leaf like `base::TimeTicks::Now()` (push rbp; sub $0x20) puts the
+/// return address at [rsp], the saved rbp at [rsp+0x20] and ITS caller's return address at
+/// [rsp+0x28] -- enough to walk the rbp chain by hand from the log.
+const SPIN_STACK_EVERY: u64 = 8192;
+
+static SPIN_STACK_SYSCALL: AtomicU64 = AtomicU64::new(u64::MAX);
+static SPIN_STACK_INIT: AtomicBool = AtomicBool::new(false);
+static SPIN_STACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn init_spin_stack(value: impl FnOnce() -> Option<String>) {
+    if SPIN_STACK_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let v = value()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    SPIN_STACK_SYSCALL.store(v, Ordering::Release);
+    SPIN_STACK_INIT.store(true, Ordering::Release);
+}
+
+pub fn maybe_dump_spin_stack<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    syscall_number: usize,
+    rsp: usize,
+) {
+    if SPIN_STACK_SYSCALL.load(Ordering::Acquire) != syscall_number as u64 {
+        return;
+    }
+    if SPIN_STACK_COUNT.fetch_add(1, Ordering::Relaxed) % SPIN_STACK_EVERY != 0 {
+        return;
+    }
+    // Guest memory is this process's memory (see the `is_syscall_trap` byte read in the platform
+    // layer and the `rip` byte dump in `lib.rs`, which do the same).
+    let words = unsafe { core::slice::from_raw_parts(rsp as *const u64, 0x180 / 8) };
+    let mut line = alloc::format!("[diag-spin-stack] sysno={syscall_number} rsp={rsp:#x}");
+    for (i, w) in words.iter().enumerate() {
+        if i % 8 == 0 {
+            emit_timeline_line(platform, &line);
+            line = alloc::format!("[diag-spin-stack]   +{:#x}:", i * 8);
+        }
+        line.push_str(&alloc::format!(" {w:#x}"));
+    }
+    emit_timeline_line(platform, &line);
+}
+
+/// Emits the guest's mapping list ONCE, so a `caller=` address from the histogram can be turned
+/// into a file offset (`caller - range_start`) and then into a symbol in the guest binary.
+/// Without this the histogram names a syscall and an address but not the module holding it.
+pub fn dump_guest_mappings_once<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    lines: impl FnOnce() -> Vec<String>,
+) {
+    if !rip_hist_enabled() {
+        return;
+    }
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    for line in lines() {
+        emit_timeline_line(platform, &alloc::format!("[diag-maps] {line}"));
+    }
+}
+
+/// Emits the accumulated call-site histogram and clears it, when a periodic dump has come due.
+/// Called from the syscall dispatch path; a no-op (one relaxed atomic load) otherwise.
+pub fn maybe_dump_rip_histogram<Platform: litebox::platform::StdioProvider>(platform: &Platform) {
+    if !rip_hist_enabled() {
+        return;
+    }
+    if !RIP_DUMP_DUE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let mut guard = RIP_HISTOGRAM.lock();
+    let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
+    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    emit_timeline_line(platform, "[diag-rip-hist] busiest syscall call sites since last dump:");
+    for ((num, rip), hit) in rows.iter().take(20) {
+        emit_timeline_line(
+            platform,
+            &alloc::format!(
+                "[diag-rip-hist] count={count} syscall={name}({num}) rip={rip:#x} caller={caller:#x} pid={pid} tid={tid} comm={comm}",
+                count = hit.count,
+                name = syscall_name(*num),
+                rip = rip,
+                caller = hit.caller,
+                pid = hit.pid,
+                tid = hit.tid,
+                comm = hit.comm,
+            ),
+        );
+    }
+    guard.clear();
+}
+
+/// The sampled call-site histogram, busiest site first, for the exit-time dump.
+pub fn print_rip_histogram(mut eprint: impl FnMut(&str)) {
+    if !strace_summary_enabled() {
+        return;
+    }
+    let guard = RIP_HISTOGRAM.lock();
+    if guard.is_empty() {
+        return;
+    }
+    eprint("\n=== LITEBOX_STRACE_SUMMARY: syscall call sites (1-in-64 sampled rip histogram) ===\n");
+    let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
+    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    for ((num, rip), hit) in rows.iter().take(60) {
+        eprint(&alloc::format!(
+            "count={count} syscall={name}({num}) rip={rip:#x} pid={pid} tid={tid} comm={comm}\n",
+            count = hit.count,
+            name = syscall_name(*num),
+            rip = rip,
+            pid = hit.pid,
+            tid = hit.tid,
+            comm = hit.comm,
+        ));
+    }
+}
+
 /// Record a raw syscall number that `SyscallRequest::try_from_raw` could not resolve at all.
 pub fn record_unresolved_syscall(syscall_number: usize, pid: i32, comm: &str) {
     // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
@@ -348,6 +834,12 @@ pub fn is_ipc_timeline_syscall(number: usize) -> bool {
                 | "shutdown"
                 | "clone"
                 | "clone3"
+                // Who is waiting for WHOM, and does the wait ever come back? A guest thread
+                // parked in `wait4` for a child that will never be reported is invisible
+                // everywhere else: it makes no further syscalls, so the parked instrument's
+                // own rows are all it ever leaves behind.
+                | "wait4"
+                | "waitid"
         )
 }
 
@@ -587,6 +1079,8 @@ pub fn print_strace_summary(mut eprint: impl FnMut(&str)) {
             pid = hit.first_pid,
         ));
     }
+
+    print_rip_histogram(eprint);
 }
 
 // ---------------------------------------------------------------------------------------------
