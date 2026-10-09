@@ -101,7 +101,9 @@ is a HOST process: a panic, an abort or an OOM ends the whole run, not one guest
 - **`--single-process` LOADS THE PAGE (sp1, 30 s)**: `--dump-dom` printed `<!DOCTYPE html>` + `<html>`
   (log-sp1.txt:4723) where EVERY multi-process run printed `dump_dom_lines=0`. **So the
   `base::TimeTicks::Now()` spin lives in a CROSS-PROCESS HANDOFF, not in the browser's own work.**
-  Next: `chrshot.sh` with `--single-process`, then bisect which handoff.
+  **BUT `--headless=old --screenshot --single-process` does NOT finish** (`chrshot.sh sp2 90`):
+  rc=124, no `shot.png`, 68 KB log. So single-process unblocks `--dump-dom` and NOT `--screenshot`;
+  `--headless=new --screenshot --single-process` and bisecting the handoff are the next two probes.
 
 - **`3df6d8dc` THE CPU-TIME CLOCKS ANSWER CPU TIME, NOT WALL TIME** (`process.rs` `gettime_as_duration`,
   `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`, via a new default-`None`
