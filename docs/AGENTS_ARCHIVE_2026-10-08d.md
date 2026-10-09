@@ -1,4 +1,4 @@
-# litebox - current state (2026-10-08e; recompact of `-08d`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08d.md`)
+# litebox - current state (2026-10-08d; recompact of `-08c`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08c.md`)
 
 `process.rs`/`file.rs`/`unix.rs`/`epoll.rs`/`mm.rs` = `litebox_shim_linux/src/syscalls/<x>`; `platform/lib.rs` = `litebox_platform_windows_userland/src/lib.rs`; `fork.rs` = `.../process_fork.rs`; **`net.rs` = `litebox/src/net/mod.rs` (NOT `syscalls/net.rs`); `platform/net.rs` = `litebox_platform_windows_userland/src/net.rs`**. This file wins; mechanism prose and verbatim pre-edit text live in `docs/AGENTS_ARCHIVE_*` and `docs/HARNESS-LESSONS.md`.
 
@@ -10,10 +10,6 @@
   `gpu_sandbox_warn=1` on BOTH arms. **THE BROWSER MAIN THREAD BURNS ~16.5k syscalls/s (85%
   `clock_gettime` at one fixed `rip` + `ppoll(timeout=0ns)`) AND NEVER ISSUES A NAVIGATION** - that
   loop is what to map next (`file_off = vaddr - base`, recompute the exec `PT_LOAD` base per run).
-  **THE MAIN THREAD (tid == pid) MAKES NO `ppoll` AFTER t~16 s** (`sys_ppoll` throttled log,
-  `file.rs`): its last ppolls are 0ns/16ms/868ms on fd 11 (eventfd) + fd 13 (pipe); from ~17 s
-  on the only ppolls are tid 17/25/30 on sockets with 5 s timeouts and `ready_count=0` (idle).
-  It is never parked >=2 s in any syscall, so whatever it does after 16 s never blocks.
 - **GOAL (sandboxed chromium - its OWN sandbox, no `--no-sandbox` - visible in a HOST BROWSER):
   MET `4281283`; RE-PROVEN by chrF35 (`9cd6327`+): DevTools 200 at t=15 s, CDP `vis:"visible"`/
   `rs:"complete"`, `Page.captureScreenshot` 800x600 blue=99.78%, NO `No usable sandbox` in stderr.**
@@ -172,16 +168,14 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 (b) **"the guest FS base moves, so `%fs:0x28` misreads"** - `probe24`: 200k main + 100k pthread + 200k canary frames: **0 changes**. **`diag-fsbase` (`litebox_shim_linux/src/lib.rs:2419`) is UNRELIABLE**: it reads the HOST `.tbss` slot while the platform SWAPS fs/gs, so its "moved" lines are an artifact.
 (c) **"seccomp traps abort's syscalls"** - all 511 `PR_SET_SECCOMP` calls are `prog=0x0` probes -> EFAULT, **ZERO** `delivering SIGSYS` lines.
 (d) **"per-pid `/proc` is missing"** - `probe22`: `/proc/<pid>/{stat,status,comm,task/<tid>/status}` and `ls /proc` are correct for a live fork child; the ENOENTs are children that ALREADY exited.
-  (e) "the frame is corrupt / rsp is wrong" - `rsp = rbp-0x260` is exactly right (`push rbp` + 5
-  pushes = 0x30, then `sub $0x238`); all 5 backtrace return addresses are preceded by a `call`.
-  (f) "litebox hooks __stack_chk_fail" - codesearch finds no such hook.
+(e) **"the frame is corrupt / `rsp` is wrong"** - `rsp = rbp-0x260` is exactly right; all 5 backtrace return addresses are each preceded by a `call`. (f) **"litebox hooks `__stack_chk_fail`"** - codesearch finds no such hook.
+(h) **"the guest clock is frozen"** - `probe29`: `CLOCK_MONOTONIC` advances 300,113,415 ns over a 300 ms `nanosleep`, `gettimeofday` +200,109 us over `usleep(200ms)`, 2000 calls give **2000 distinct values** in 757 us. The 14k `clock_gettime`/s are NOT the CPU burn.
+(i) **"chromium is merely slow"** - 300 s `--headless=new --dump-dom` (`log-newhl300`): identical 20 KB log, silent after t=15 s, `rc=124`, `dump_dom_lines=0`. A STALL, not slowness.
+(j) **"a carried directory fd fails because the path is missing"** - `chain=dddd` yet the reopen answered EACCES; `created=1` and the retry STILL got EACCES. It is the MODE (0700 under `root_guard`), not existence.
+(k) **`--headless=old` is meaningless here**: guest chromium is **154.0.8037.57**, old headless removed after 132. **`chrdom.sh` still passes `--headless=old` and never passed `--dump-dom` (chrdom2/3/4/5 do).**
+
 Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/`19`/`20`; "selkies forks a child holding the descriptor table"; "a busy port goes deaf" (41/41); "an attached published host client deafens the port to the guest" (37/37).** **CLOSED: `eb16abf`, `150e6e0`, chrF14 window loss, apps10 `BadMatch`, chrF24-27, grey/`NO_PNG`, xproc44, the 23-arm app census.**
 
-- **REFUTED: "the ppoll timeout is not honoured" and "a clock is frozen"** (guest probe30 with a
-  NATIVE control, both green): `ppoll` on an empty pipe ret=0 at 1000.2ms/300.1ms (asked 1000/300);
-  `epoll_wait` 1000/300 -> 0 at 1000.1/300.2ms; `ppoll(NULL)` blocks 400.1ms until a write; an
-  already-ready fd returns 1 at 0.0ms; ALL EIGHT clock ids (0,1,2,3,4,5,6,7) advance over a 300ms
-  sleep, REALTIME/MONOTONIC magnitudes 0.300s. litebox == native on every row.
 - **`LITEBOX_PIDNS_RECLAIM_OFF` IS NOT THE DISCRIMINATOR for `dump_dom_lines`** (A/B, 80 s/arm, one
   binary): `on` = rc=124, 91785 B, `dump_dom_lines=0`, `seccomp_renderers=4`, `execve_total=5`,
   `exit_group=8`, `zygote_fail=0`; `off` = rc=124, 116016 B, every one of those IDENTICAL. So

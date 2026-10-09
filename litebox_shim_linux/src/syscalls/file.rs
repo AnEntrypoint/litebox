@@ -9789,6 +9789,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .collect::<alloc::vec::Vec<_>>();
             "sys_ppoll: returning"
         );
+        // Throttled (<=1 line per 250 ms per process): the `debug!`s above are the right level for
+        // an ordinary main loop, but a guest thread spinning `ppoll` at ~16k/s drowns every other
+        // line in the run, and THIS one answers "did the wait sleep, and what came back" for the
+        // thread that never sleeps.
+        {
+            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let now = crate::diag::now_ms(self.global.platform);
+            let prev = LAST.load(core::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 250
+                && LAST
+                    .compare_exchange(
+                        prev,
+                        now,
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                litebox_util_log::warn!(
+                    tid:% = self.tid.get(),
+                    pid:% = self.pid.get(),
+                    timeout:? = timeout,
+                    ready_count:% = ready_count,
+                    revents:? = set
+                        .revents_with_fds()
+                        .map(|(fd, e)| {
+                            let kind = super::epoll::EpollDescriptor::try_from(
+                                &self.files.borrow(),
+                                fd.reinterpret_as_unsigned() as usize,
+                            )
+                            .map_or("none", |d| d.kind());
+                            (fd, kind, e.bits())
+                        })
+                        .collect::<alloc::vec::Vec<_>>();
+                    "sys_ppoll: returning (throttled)"
+                );
+            }
+        }
         Ok(ready_count)
     }
 
