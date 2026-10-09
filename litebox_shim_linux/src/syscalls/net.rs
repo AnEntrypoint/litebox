@@ -2301,6 +2301,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?
                 .into_vec()
         };
+        let diag_iovlen = msg.msg_iovlen;
+        litebox_util_log::debug!(
+            sockfd:% = sockfd, controllen:% = control.len(), iovlen:% = diag_iovlen;
+            "diag-sendmsg"
+        );
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -2650,6 +2655,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let msg_iovlen = msg.msg_iovlen;
         let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
+        litebox_util_log::debug!(
+            sockfd:% = sockfd, iovlen:% = msg_iovlen, controllen:% = msg_controllen;
+            "diag-recvmsg"
+        );
 
         if msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);

@@ -1408,7 +1408,7 @@ where
             }
             let mut vmem = self.vmem.write();
             let Some(range) = PageRange::new(r.start, r.end) else {
-                unreachable!()
+                return Err(VmemUnmapError::UnAligned);
             };
             unsafe { vmem.remove_mapping(range) }?;
         }
