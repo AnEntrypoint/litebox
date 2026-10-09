@@ -1,4 +1,4 @@
-# litebox - current state (2026-10-08j; recompact of `-08i`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08i.md`)
+# litebox - current state (2026-10-08i; recompact of `-08h`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08h.md`)
 
 `process.rs`/`file.rs`/`unix.rs`/`epoll.rs`/`mm.rs` = `litebox_shim_linux/src/syscalls/<x>`; `platform/lib.rs` = `litebox_platform_windows_userland/src/lib.rs`; `fork.rs` = `.../process_fork.rs`; **`net.rs` = `litebox/src/net/mod.rs` (NOT `syscalls/net.rs`); `platform/net.rs` = `litebox_platform_windows_userland/src/net.rs`**. This file wins; mechanism prose and verbatim pre-edit text live in `docs/AGENTS_ARCHIVE_*` and `docs/HARNESS-LESSONS.md`.
 
@@ -18,10 +18,7 @@
   `syscall`, in CHROMIUM. **The spinning frame is `base::TimeTicks::Now()` (file `0xaab9370`):
   `clock_gettime(CLOCK_MONOTONIC,&ts)` then `tv_sec*1e6 + tv_nsec/1000`.** Outward: `0xaa60010` <-
   `0xaa99750` <- `0xaa89440` <- `0xaa7d9b0`/`0xaa7da80`; `0xa9b51d0` is a shared leaf.
-  **NOT a glibc spin.** The binary is STRIPPED (no `.symtab`), so frames are named by shape only.
-  **The back edge is a SELF-CALL: `0xaa7daf9: call 0xaa7d9b0`, guarded by `test %al,%al` after
-  `call 0xaa89440`** - a `while (DoWork())` pump, not a time comparison; `TimeTicks::Now()` is reached
-  through a FUNCTION POINTER loaded from `0x1373a350`, not by a direct call. The earlier "other pids spin, the browser is silent" reading was an
+  **NOT a glibc spin.** The binary is STRIPPED (no `.symtab`), so frames are named by shape only. The earlier "other pids spin, the browser is silent" reading was an
   instrument bug: one process-global throttle budget, then a `(ms << 32) | pid` pack that OVERFLOWS
   (ms ~1.8e12 needs 73 bits) so it never throttled. **NO NATIVE CONTROL is obtainable here: only the
   bare binary was extracted (no `icudtl.dat`/`.pak`), and a native run dies `rc=133` on ICU data.**
@@ -98,10 +95,6 @@ is a HOST process: a panic, an abort or an OOM ends the whole run, not one guest
   is RED on **209 pre-existing hunks in ~30 untouched files**.
 
 ## Fixed, newest first (RULE + key `file:line` + the repro that proved it)
-- **`--single-process` LOADS THE PAGE (sp1, 30 s)**: `--dump-dom` printed `<!DOCTYPE html>` + `<html>`
-  (log-sp1.txt:4723) where EVERY multi-process run printed `dump_dom_lines=0`. **So the
-  `base::TimeTicks::Now()` spin lives in a CROSS-PROCESS HANDOFF, not in the browser's own work.**
-  Next: `chrshot.sh` with `--single-process`, then bisect which handoff.
 
 - **`3df6d8dc` THE CPU-TIME CLOCKS ANSWER CPU TIME, NOT WALL TIME** (`process.rs` `gettime_as_duration`,
   `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`, via a new default-`None`
@@ -142,7 +135,28 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 - **`7028ef5` TWO HOST PROCESSES WRITING ONE FILE CONVERGE THROUGH THE SHARED WRITE STORE.** `LITEBOX_SHARED_WRITE_PREFIXES` shares any host-named path on top of `SPILLED_PREFIXES`; `sync_spilled_fd` pulls the store's bytes in before EVERY read/write; `install_spilled_content` asks for bytes BEFORE truncating. **BOTH WAYS: `lockapp1 contend` `spillx1` `len=2000 A=1000 B=1000` vs `len=1000 B=0`.**
 - **`722d8c0` A GUEST STARTS WITH ITS IMAGE'S OWN `Env`, AS `docker run` DOES.** `oci.rs` records `config.Env`; `LITEBOX_IMAGE_ENV_OFF=1` restores the empty env. **BOTH WAYS by exeprobe3: ON `ENV_PATH='/lsiopy/bin:...'`; OFF `ENV_PATH=None`.**
 - **`08b1856` A GUEST-REACHABLE LENGTH OVERFLOW ANSWERS AN ERRNO, NEVER A PANIC.** `sys_madvise`/`sys_mprotect` round with `checked_next_multiple_of`. **mmapx1: `madvise(len=2^64-1)` = `rc=-1 errno=22`.**
-- **`67b198f` A POSIX RECORD LOCK EXCLUDES ACROSS HOST PROCESSES.** `SharedRecordLockTable` (256 rows, arena, keyed `(dev,path)`, dead holders reclaimed by host-pid liveness); `LITEBOX_RECORD_LOCK_SHARED_OFF=1` restores the old path. **BOTH WAYS: reclock1 `CONTEND_FIRST=errno=11`/`WAIT_ELAPSED_MS=3873`; reclock1off `OK`/`0`.**## Open, in rough priority order
+- **`67b198f` A POSIX RECORD LOCK EXCLUDES ACROSS HOST PROCESSES.** `SharedRecordLockTable` (256 rows, arena, keyed `(dev,path)`, dead holders reclaimed by host-pid liveness); `LITEBOX_RECORD_LOCK_SHARED_OFF=1` restores the old path. **BOTH WAYS: reclock1 `CONTEND_FIRST=errno=11`/`WAIT_ELAPSED_MS=3873`; reclock1off `OK`/`0`.**
+- **`7efefc5`** see Where things stand; it instruments the inbound path: **`diag-pump`** (+`-write`/`-read`) with `state`/`recv_queue`/`send_queue`/`to_real`/`to_guest`/`real_eof`/`fin_sent`. **`SocketSet` has NO `len()`** - `.iter().count()`. **`00d0c3c` A CROSS-PROCESS FORK CHILD EXPORTS WHAT IT CHANGED, NOT ITS WHOLE LAYER** - a PATCH: identical entries withheld, growth as a TAIL, else BLOCK RANGES; kind in ustar `gname`. **An unmarked payload still replaces the file.**
+- **`340fd98` AND OLDER** (mechanism prose verbatim in `-07q`/`-08a`): `340fd98` a `MADV_DONTFORK` range is
+  withheld from a cross-process fork child; `9b0823f` a connect verdict names the port it dialled;
+  `3b0fcfe` a verdict carries `state=`/`closed_here=`/`slots=`/`sockets=` - a non-timeout closure is NOT
+  proof an RST arrived; `150e6e0` an SCM_RIGHTS carry that posts no fd mail gives its hold back;
+  `eb16abf`/`04e9961` SUPERSEDED by `57b87eb` (only ONE process polls the IP interface); `ca78f75` the
+  accept queue belongs to the ENDPOINT, not the process; `889351a` an INET socket is nameable for
+  SCM_RIGHTS (`N|`), EPOLL STAYS REFUSED ON PURPOSE; `0e45b67`/`884079f`/`daaff53` a cloexec unix socket,
+  an epoll set and a bound-but-unconnected AF_UNIX cross a cross-process fork - re-apply cloexec in the
+  child (STILL REFUSED: connect-in-progress, bound/connected DATAGRAM); `2b622b4` a shared connection's
+  side may never lose a LIVE holder; `f7d7aaa` a host-side refusal is a log line, never an `assert!`;
+  `a3aca20` a fork-family socket's rx is pulled by its reader, never pushed by the tick - **the shared
+  socket buffer pool is what a desktop runs out of** (`MAX_DATA_SLOTS` 512, `TooManySockets` IS `EMFILE`);
+  `39616f4`/`2df5677` accept-queue teardown/re-arm; `37c2374`/`7c1d987`/`7c638ca`/`a2ac697` mapping
+  qualifiers travel with the VMA (`VM_PRIVATE_FILE_COW` bit 11 -> `PAGE_*_WRITECOPY`; a `PROT_NONE` file
+  mapping is a RESERVATION that still carries the bytes). **Older, binding**: FD_CLOEXEC is about `execve()`,
+  not `fork()`; `a629714` a fork child SHARES `MAP_SHARED` - validate every segment BEFORE reserving;
+  `f260226` `flock(2)` keyed `(dev,path)`; `16f3e76` no path holding `net_lock` may block; `b012910` never
+  refill a chunk no longer `PAGE_NOACCESS`.
+
+## Open, in rough priority order
 
 1. **LINUX CHROMIUM: 3 RENDERERS START AND SURVIVE, BUT NO PAGE EVER LOADS** (fork failure and carried-fd deaths are FIXED). After t≈15 s the browser goes SILENT (300 s run: same 20 KB log, `rc=124`) while its MAIN thread burns a full CPU: **~16.5k syscalls/s, 85% `clock_gettime` at ONE fixed `rip`, interleaved with `ppoll(timeout=0ns)`**; `dump_dom_lines=0`, no crash, no child deaths. **Next: instrument from inside the shim** - `ptrace` is BLOCKED here (gdb: "Inappropriate ioctl for device").
 2. **CLOSED - NO LIVE SERVER'S PORT GOES DEAF** (`57b87eb`, chrF34; chrF35's "8081 went deaf" WAS HOST
@@ -188,10 +202,8 @@ Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`.
   green; both could have failed). 200,000 tight-loop reads: **0 decreases** (native 0; smallest step
   1623 ns vs 1092 ns, so not frozen). A fork child that sleeps 300 ms answers **0.501 s** while the
   parent answers **0.802 s** at +600 ms - the SAME origin to ~1 ms (per-process would be ~0.3 s). So the
-  `base::TimeTicks::Now()` deadline spin is NOT a clock bug. **The `execve`d case is now TESTED TOO
-  (probe34)**: a fork+`execve`d child that sleeps 300 ms answers 0.594 s while the parent answers
-  0.903 s at +732 ms - 309 ms apart, exactly what the timeline requires (a per-process origin would be
-  ~0.3 s against 0.903 s). Native agrees (child 663068176183419 vs parent 663068480673383).
+  `base::TimeTicks::Now()` deadline spin is NOT a clock bug. **A freshly `execve`d process is UNTESTED**
+  (the probe's inline `-c` script had a SyntaxError on both sides).
 
 - **REFUTED: "the ppoll timeout is not honoured" / "a clock is frozen"** (probe30, native control green): `ppoll` on an empty pipe ret=0 at 1000.2ms/300.1ms (asked 1000/300);
   `epoll_wait` 1000/300 -> 0 at 1000.1/300.2ms; `ppoll(NULL)` blocks 400.1ms until a write; an
