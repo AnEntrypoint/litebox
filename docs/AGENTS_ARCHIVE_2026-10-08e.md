@@ -1,4 +1,4 @@
-# litebox - current state (2026-10-08f; recompact of `-08e`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08e.md`)
+# litebox - current state (2026-10-08e; recompact of `-08d`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08d.md`)
 
 `process.rs`/`file.rs`/`unix.rs`/`epoll.rs`/`mm.rs` = `litebox_shim_linux/src/syscalls/<x>`; `platform/lib.rs` = `litebox_platform_windows_userland/src/lib.rs`; `fork.rs` = `.../process_fork.rs`; **`net.rs` = `litebox/src/net/mod.rs` (NOT `syscalls/net.rs`); `platform/net.rs` = `litebox_platform_windows_userland/src/net.rs`**. This file wins; mechanism prose and verbatim pre-edit text live in `docs/AGENTS_ARCHIVE_*` and `docs/HARNESS-LESSONS.md`.
 
@@ -14,11 +14,6 @@
   `file.rs`): its last ppolls are 0ns/16ms/868ms on fd 11 (eventfd) + fd 13 (pipe); from ~17 s
   on the only ppolls are tid 17/25/30 on sockets with 5 s timeouts and `ready_count=0` (idle).
   It is never parked >=2 s in any syscall, so whatever it does after 16 s never blocks.
-  **`LITEBOX_DIAG_MAINTHREAD=1` (throttled, main thread = tid==pid) shows the spin is `clock_gettime`
-  (228) and it is on MANY processes' main threads, not the browser's alone**: pids 12, 33, 44, 53, 72
-  all sit in `clock_gettime` (the browser's own main thread only shows brk/mmap/mprotect/access).
-  NO native control is obtainable here: only the bare binary was extracted (no `icudtl.dat`/`.pak`),
-  and a native run dies `rc=133` at `Invalid file descriptor to ICU data received`.
 - **GOAL (sandboxed chromium - its OWN sandbox, no `--no-sandbox` - visible in a HOST BROWSER):
   MET `4281283`; RE-PROVEN by chrF35 (`9cd6327`+): DevTools 200 at t=15 s, CDP `vis:"visible"`/
   `rs:"complete"`, `Page.captureScreenshot` 800x600 blue=99.78%, NO `No usable sandbox` in stderr.**
@@ -143,14 +138,15 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
    MEMORY - chrF36: 27/27 host probes `200 786`, row never retired; xproc41/42: busy 41/41, deaf = live
    owner that never accepts -> refuses at backlog 8 and RECOVERS, vs orphaned -> ~25 ms PERMANENTLY).
    **RULE: `selkpid=none` is a ps ARTIFACT; `slots=none` = no socket on that port at that instant.**
-3. **CLOSED - chromium's kills are guest-side**: `Exception(14)`/`0x15` = an instruction fetch of a PRESENT
-   non-executable page (`rip` in a `VM_*` range with NO `VM_EXEC`); `Exception(3)`/Signal(5) with
-   `cc 0f 0b` at `[rdi]` = chromium's OWN `IMMEDIATE_CRASH`, and it KEPT PAINTING. **A 0-BYTE UNIX READ
-   MEANS `peer_gone()`, NOT A CLOSED PEER** (`unix.rs`). `--database=PATH` is REQUIRED. (Prose in `-07q`.)
+3. **CLOSED - chromium's kills are guest-side**: `Exception(14)`/`error_code=0x15` = an instruction fetch of
+   a PRESENT non-executable page (`rip` in a `VM_*` range with NO `VM_EXEC`, `rax == rip`: it jumped to
+   DATA); `Exception(3)`/Signal(5) with `cc 0f 0b` at `[rdi]` = chromium's OWN `IMMEDIATE_CRASH`, and it
+   KEPT PAINTING; `mprotect(PROT_EXEC)` DOES LAND. **A 0-BYTE UNIX READ MEANS `peer_gone()`, NOT A CLOSED
+   PEER** (`unix.rs`). `--initial-client-fd=FD`; `--database=PATH` is REQUIRED. (Prose in `-07q`.)
 4. **BYTE STORE: CLOSED FOR BOTH REAL CONSUMERS, FOR RENAME, AND FOR THE NON-APPEND `pwrite` SHAPE**
    (numbers under `7028ef5`/`8f33179`, all BOTH WAYS). **What is left is architectural**:
-   `install_spilled_content` is a whole-file `O_TRUNC` replace on first publish; `self.locked(..)` is held
-   across `platform.spill_write`; and `FileX { data: Cow<'static,[u8]> }`
+   `install_spilled_content` is a whole-file `O_TRUNC` replace on first publish, `self.locked(..)` is held
+   across `platform.spill_write` (host IO under a spin lock), and `FileX { data: Cow<'static,[u8]> }`
    (`litebox/src/fs/in_mem.rs:1530`) is PER-PROCESS - bytes cross only at fork spawn/exit EXCEPT through
    `SharedFileSpill` (`file_spill.rs`). Also open: AF_UNIX exhaustion is silent (256 slots, keys >108
    bytes); `timerfd`/`signalfd` uncarriable; **cross-process-fork state NOT restored**.
@@ -161,24 +157,25 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 ## Standing lessons and hard constraints (mechanism: `docs/HARNESS-LESSONS.md`)
 
 - **`litebox::sync::RwLock::try_read`/`try_write` FAIL WHEN A WRITER IS MERELY QUEUED** (`litebox/src/sync/rwlock.rs`): ONE thread parked in a blocking `descriptor_table_mut()` makes every `try_descriptor_table()` fail forever and the per-tick socket sweep a silent no-op in that process. Dead-holder recovery needs the owner thread DEAD; a parked one is never recovered.
-- **THE CROSS-PROCESS FORK'S COPY PLAN IS GRANULE-WIDENED AND MERGED** (`process.rs`: `GRANULE = 0x1_0000`; a group base MUST stay granule-aligned or Windows answers 87). **NOTHING IN `litebox/src/mm` ZEROES A FRESH PAGE**. **`vma_layout()` zips `ranges`/`flags`/`executable`/`is_file_backed` POSITIONALLY - filter ALL or NONE.**
+- **THE CROSS-PROCESS FORK'S COPY PLAN IS GRANULE-WIDENED AND MERGED** (`process.rs`: `GRANULE = 0x1_0000`; a group base MUST stay granule-aligned or Windows answers 87). **NOTHING IN `litebox/src/mm` ZEROES A FRESH PAGE** - the guarantee is MAP_FRESH. **`vma_layout()` zips `ranges`/`flags`/`executable`/`is_file_backed` POSITIONALLY - filter ALL or NONE.**
 - **A GUEST PACKET TO `127.0.0.0/8` OR TO `GUEST_IP_ADDR` IS LOOPED IN-PROCESS** (`phy.rs:166`): a guest's `127.0.0.1:<port>` NEVER reaches the host's published listener. **`data_granted` = CAPACITY granted, `data_used` = slots in use**.
 - Guest-reachable code returns an errno, never a panic (the host process IS the whole session). Refusal errno is contract: EPERM degrades, EINVAL/ENOSYS fails hard. `LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check. Never subtract timestamps across a parent and a fork-child log.
-- **A `TypedFd` index is valid only against the `Descriptors` that inserted it, and only for its own subsystem.** **A `SharedUnixAddrPresenceTable`-shaped table needs every write path mirrored, and no per-tick sweep may DROP another process's object.** **A backlog slot is reachable by NOTHING but `accept`.** **`(dev,ino)` is cross-process-stable for IMAGE files ONLY** - key shared registries on `(dev,path)`. **`LITEBOX_*` env flags come from the HOST env via `platform.env_flag`.**
-- **Host memory: check host RAM FIRST.** gm's browser (2.2 GB PER INSTANCE), the `queue.mjs` chrome storm and `bun` - **none is mine to kill. When free RAM is short there is nothing safe to reclaim - wait.**
-- **A process's writes are invisible to everyone until it is REAPED, not when it closes**; a fork child's writes reach the parent only on `wait4`. Cross-process fork carries pipes/regular files/eventfds/pty/unix sockets + INET + `MAP_SHARED`, drops pty fds and non-INET cloexec fds; slots (6) gate the spawn, fail open after 8s.
-- Logs: verbosity from `LITEBOX_LOG`, not `RUST_LOG`; **`debug!` fields take `&str`, not an owned `String`**. **Timestamps are PER-PROCESS UPTIME; `.err` lines carry ANSI escapes.** **The `tag=`/`dtag=` fields DO NOT identify a host process.** Socket census is `local_port:state:remote_port`; a listening slot is `0:L:0`, so the census CANNOT prove a port is armed.
+- **A `TypedFd` index is valid only against the `Descriptors` that inserted it, and only for its own subsystem.** **A `SharedUnixAddrPresenceTable`-shaped table needs every write path mirrored, and no per-tick sweep may DROP another process's object.** **A backlog slot of a listening port is reachable by NOTHING but `accept`.** **`(dev,ino)` is cross-process-stable for IMAGE files ONLY** - key shared registries on `(dev,path)`.
+- **Host memory: check host RAM FIRST.** gm's browser (2.2 GB PER INSTANCE), the `queue.mjs` chrome storm and `bun` - **none of these is mine to kill. When free RAM is short there is nothing safe to reclaim - wait.**
+- **A process's writes are invisible to everyone until it is REAPED, not when it closes**; a fork child's writes reach the parent only on `wait4`. Cross-process fork carries pipes/regular files/eventfds/pty/unix sockets + INET + `MAP_SHARED`, drops pty fds and non-INET cloexec fds; slots (6) gate the spawn, fail open after 8 s.
+- Logs: verbosity from `LITEBOX_LOG`, not `RUST_LOG`; **`debug!` fields take `&str`, not an owned `String`**. **Timestamps are PER-PROCESS UPTIME; `.err` lines carry ANSI escapes.** **The `tag=`/`dtag=` fields DO NOT identify a host process.** Socket census is `local_port:state:remote_port`; a listening slot is `0:L:0`, so the census CANNOT prove a port is armed. **`LITEBOX_*` env flags are read from the HOST env by `platform.env_flag`.**
 
 ## Closed - do not re-attempt without a genuinely new approach
 
 **REFUTED ON THE LINUX HOST (chromium), each by a probe that could have failed - do not re-open without a NEW reproduction:**
-(a) **"abort/SIGABRT is broken"** - `probe18`/`19`: `abort`/`raise`/`tgkill`/`tkill`/`kill(self,SIGABRT)` and a real `-fstack-protector-all` smash ALL die on Signal(6).
-(b) **"the guest FS base moves, so `%fs:0x28` misreads"** - `probe24`: 200k main + 100k pthread + 200k canary frames: **0 changes**. **`diag-fsbase` (`lib.rs:2419`) is UNRELIABLE**: it reads the HOST `.tbss` slot while the platform SWAPS fs/gs.
+(a) **"abort/SIGABRT is broken"** - `probe18`/`19`: `abort`/`raise`/`tgkill`/`tkill`/`kill(self,SIGABRT)` and a real `-fstack-protector-all` smash ALL die on Signal(6); `smash` prints `*** stack smashing detected ***`.
+(b) **"the guest FS base moves, so `%fs:0x28` misreads"** - `probe24`: 200k main + 100k pthread + 200k canary frames: **0 changes**. **`diag-fsbase` (`litebox_shim_linux/src/lib.rs:2419`) is UNRELIABLE**: it reads the HOST `.tbss` slot while the platform SWAPS fs/gs, so its "moved" lines are an artifact.
 (c) **"seccomp traps abort's syscalls"** - all 511 `PR_SET_SECCOMP` calls are `prog=0x0` probes -> EFAULT, **ZERO** `delivering SIGSYS` lines.
-(d) **"per-pid `/proc` is missing"** - `probe22`: `/proc/<pid>/{stat,status,comm,task/...}` and `ls /proc` are correct for a live fork child; the ENOENTs are children that ALREADY exited.
-  (e) "the frame is corrupt" - `rsp = rbp-0x260` is exactly right; all 5 return addrs are preceded by
-  a `call`. (f) "litebox hooks __stack_chk_fail" - codesearch finds no such hook.
-Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/`19`/`20`; "a busy port goes deaf" (41/41); "an attached host client deafens the port" (37/37).** **CLOSED: `eb16abf`, `150e6e0`, chrF14 window loss, apps10 `BadMatch`, chrF24-27, grey/`NO_PNG`, xproc44, the 23-arm app census.**
+(d) **"per-pid `/proc` is missing"** - `probe22`: `/proc/<pid>/{stat,status,comm,task/<tid>/status}` and `ls /proc` are correct for a live fork child; the ENOENTs are children that ALREADY exited.
+  (e) "the frame is corrupt / rsp is wrong" - `rsp = rbp-0x260` is exactly right (`push rbp` + 5
+  pushes = 0x30, then `sub $0x238`); all 5 backtrace return addresses are preceded by a `call`.
+  (f) "litebox hooks __stack_chk_fail" - codesearch finds no such hook.
+Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/`19`/`20`; "selkies forks a child holding the descriptor table"; "a busy port goes deaf" (41/41); "an attached published host client deafens the port to the guest" (37/37).** **CLOSED: `eb16abf`, `150e6e0`, chrF14 window loss, apps10 `BadMatch`, chrF24-27, grey/`NO_PNG`, xproc44, the 23-arm app census.**
 
 - **REFUTED: "the ppoll timeout is not honoured" and "a clock is frozen"** (guest probe30 with a
   NATIVE control, both green): `ppoll` on an empty pipe ret=0 at 1000.2ms/300.1ms (asked 1000/300);
@@ -190,8 +187,8 @@ Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/
   `exit_group=8`, `zygote_fail=0`; `off` = rc=124, 116016 B, every one of those IDENTICAL. So
   `7d5c9be7` (pid-namespace slot reclaim) is not the cause of "no page ever loads".
 ## Docs and tooling map
-Archives under `docs/` (`-07q`...`-09-03`); `docs/HARNESS-LESSONS.md` = harness prose,
-`docs/LINUX-TEST-SUITE.md` = Linux notes. gm `codesearch`
+Archives under `docs/` (`-07q`...`-09-03`); `docs/HARNESS-LESSONS.md` =
+harness prose, `docs/LINUX-TEST-SUITE.md` = Linux-container notes. gm `codesearch`
 (INVARIANT 4: never grep/find): `literal` is EXHAUSTIVE, `dual` a ranked SAMPLE - never
 conclude "absent" from it; scope with `path`/`glob`; **dual SILENTLY IGNORES `path`**.
 Spool fallback: fields are FLAT (`query`/`mode`/`path`/`output`/`cwd`/`session_id`), never

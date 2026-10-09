@@ -247,6 +247,18 @@ pub fn parked_enabled() -> bool {
     INFLIGHT_ENABLED.load(Ordering::Acquire)
 }
 
+/// Whether the "what is the MAIN thread doing" instrument is on (`LITEBOX_DIAG_MAINTHREAD=1`).
+/// The main thread is the one whose tid equals its pid; a thread that leaves its message pump
+/// and spins is invisible to every exit-time instrument, because it never parks and never
+/// finishes the syscall the instruments would attribute to it.
+static MAINTHREAD_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn set_mainthread_enabled(v: bool) {
+    MAINTHREAD_ENABLED.store(v, core::sync::atomic::Ordering::Release);
+}
+pub fn mainthread_enabled() -> bool {
+    MAINTHREAD_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Monotonic-ish wall clock in milliseconds, from the platform's SYSTEM clock (not its monotonic
 /// `Instant`) so it needs no per-platform epoch stored in a `static` -- a generic `Instant`
 /// cannot live in one, and this module has no `Platform` type parameter.

@@ -2404,6 +2404,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.platform.env_value("LITEBOX_SPIN_STACK")
         });
         crate::diag::init_parked(|| self.global.platform.env_flag("LITEBOX_PARKED"));
+        crate::diag::set_mainthread_enabled(
+            self.global.platform.env_flag("LITEBOX_DIAG_MAINTHREAD"),
+        );
         crate::diag::init_path_marker(|| {
             self.global.platform.env_value("LITEBOX_DIAG_PATH_MARKER")
         });
@@ -2533,6 +2536,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
+        // "What is the main thread DOING?" -- one line per <=250 ms, main thread (tid == pid)
+        // only. A thread that has LEFT its message pump and is spinning makes ~16k syscalls/s and
+        // parks in none of them, so every exit-time instrument (strace summary, parked dump)
+        // shows nothing for it. Throttled because the point is the SHAPE of the loop, not a trace.
+        if crate::diag::mainthread_enabled() && self.tid.get() == self.pid.get() {
+            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let now = crate::diag::now_ms(self.global.platform);
+            let prev = LAST.load(core::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 250
+                && LAST
+                    .compare_exchange(
+                        prev,
+                        now,
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                crate::diag::emit_timeline_line(
+                    self.global.platform,
+                    &alloc::format!(
+                        "[diag-mainthread] pid={} tid={} syscall={} num={}",
+                        self.pid.get(),
+                        self.tid.get(),
+                        crate::diag::syscall_name_pub(syscall_number),
+                        syscall_number,
+                    ),
+                );
+            }
+        }
         // "What is this thread parked in?" -- recorded BEFORE the dispatch, so a syscall that
         // never returns still shows up (see `diag`'s parked section for why the existing
         // exit-time instruments cannot answer this).
