@@ -1,22 +1,28 @@
-# litebox - current state (2026-10-08g; recompact of `-08f`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08f.md`)
+# litebox - current state (2026-10-08f; recompact of `-08e`, verbatim in `docs/AGENTS_ARCHIVE_2026-10-08e.md`)
 
 `process.rs`/`file.rs`/`unix.rs`/`epoll.rs`/`mm.rs` = `litebox_shim_linux/src/syscalls/<x>`; `platform/lib.rs` = `litebox_platform_windows_userland/src/lib.rs`; `fork.rs` = `.../process_fork.rs`; **`net.rs` = `litebox/src/net/mod.rs` (NOT `syscalls/net.rs`); `platform/net.rs` = `litebox_platform_windows_userland/src/net.rs`**. This file wins; mechanism prose and verbatim pre-edit text live in `docs/AGENTS_ARCHIVE_*` and `docs/HARNESS-LESSONS.md`.
 
 ## Where things stand
 
-- **LINUX-HOST CHROMIUM: THE FORK FAILURE AND THE CARRIED-FD DEATHS ARE FIXED (`7d5c9be7`, `dd94fef9`); 3 RENDERERS NOW START AND STAY ALIVE, BUT NO PAGE EVER LOADS (`dump_dom_lines=0`).** After t~15 s the browser goes silent (`rc=124`) while its MAIN THREAD burns a full CPU: **~16.5k syscalls/s, 85% `clock_gettime` at one fixed `rip` + `ppoll(timeout=0ns)`.** `cargo test --release -p litebox_shim_linux --lib` = **221 passed; 0 failed; 1 ignored**.
-  **THE BROWSER MAIN THREAD ITSELF IS THE SPINNER** (`LITEBOX_DIAG_MAINTHREAD=1` + `LITEBOX_RIP_HIST=1`,
-  cg1, 45 s): `diag-rip-hist count=349 syscall=clock_gettime(228) rip=0x7fffcf9c9f2e
-  caller=0x2621aaba39e pid=1858146 tid=1858146 comm=chromium`. **`rip` is the vDSO, NOT chromium -
-  which is why mapping it never named anything; the caller is `[rsp]`, one frame up, and still needs
-  the run's PIE load bias to map.** The earlier "other pids spin, the browser is silent" reading was an
-  instrument bug: one process-global throttle budget, then a `(ms << 32) | pid` pack that OVERFLOWS
-  (ms ~1.8e12 needs 73 bits) so it never throttled. **NO NATIVE CONTROL is obtainable here: only the
-  bare binary was extracted (no `icudtl.dat`/`.pak`), and a native run dies `rc=133` on ICU data.**
-  **`/proc/<pid>` ENOENT IS FIXED AND CHANGES NOTHING**: `register_new=16`, `proc_task_miss=0`,
-  `proc_stat_miss=0`, yet `dump_dom_lines=0` on BOTH arms. **THE MAIN THREAD (tid == pid) MAKES NO
-  `ppoll` AFTER t~16 s** (`sys_ppoll` throttled log, `file.rs`): its last ppolls are 0ns/16ms/868ms on
-  fd 11 (eventfd) + fd 13 (pipe); from ~17 s only other threads ppoll sockets with 5 s timeouts.
+- **LINUX-HOST CHROMIUM: THE FORK FAILURE AND THE CARRIED-FD DEATHS ARE FIXED (`7d5c9be7`, `dd94fef9`); 3 RENDERERS NOW START AND STAY ALIVE, BUT NO PAGE EVER LOADS (`dump_dom_lines=0`).** The `Zygote could not fork` was **EAGAIN** (namespace slots held by zombie inits), the 686-deaths/120 s child loop was the carried-fd rebuilds - both fixed BOTH WAYS on one binary. Now: `carry_fail=6` (all `/proc/<already-exited pid>/{statm,status}`, a CORRECT ENOENT), `init_sandbox=1`, `zygote_fail=0`, 3x `Activated seccomp-bpf sandbox for process type: renderer`, NO renderer death. **What still blocks it: after t≈15 s the browser goes SILENT (300 s run: same 20 KB, `rc=124`) while its MAIN thread burns a full CPU at ~16.5k syscalls/s (85% `clock_gettime`, ONE fixed `rip`) interleaved with `ppoll(timeout=0ns)`.** The guest clock is NOT the cause (refuted below). `cargo test --release -p litebox_shim_linux --lib` = **221 passed; 0 failed; 1 ignored**.
+  **`/proc/<pid>` ENOENT IS FIXED AND CHANGES NOTHING** (Fixed, newest first): `register_new=16`,
+  `proc_task_miss=0`/`proc_stat_miss=0`, yet `Navigate=0`, `WebContents=0`, `dump_dom_lines=0` and
+  `gpu_sandbox_warn=1` on BOTH arms. **THE BROWSER MAIN THREAD BURNS ~16.5k syscalls/s (85%
+  `clock_gettime` at one fixed `rip` + `ppoll(timeout=0ns)`) AND NEVER ISSUES A NAVIGATION** - that
+  loop is what to map next (`file_off = vaddr - base`, recompute the exec `PT_LOAD` base per run).
+  **THE MAIN THREAD (tid == pid) MAKES NO `ppoll` AFTER t~16 s** (`sys_ppoll` throttled log,
+  `file.rs`): its last ppolls are 0ns/16ms/868ms on fd 11 (eventfd) + fd 13 (pipe); from ~17 s
+  on the only ppolls are tid 17/25/30 on sockets with 5 s timeouts and `ready_count=0` (idle).
+  It is never parked >=2 s in any syscall, so whatever it does after 16 s never blocks.
+  **`LITEBOX_DIAG_MAINTHREAD=1` (throttled, main thread = tid==pid) shows the spin is `clock_gettime`
+  (228) and it is on MANY processes' main threads, not the browser's alone**: pids 12, 33, 44, 53, 72
+  all sit in `clock_gettime` (the browser's own main thread only shows brk/mmap/mprotect/access).
+  NO native control is obtainable here: only the bare binary was extracted (no `icudtl.dat`/`.pak`),
+  and a native run dies `rc=133` at `Invalid file descriptor to ICU data received`.
+- **GOAL (sandboxed chromium - its OWN sandbox, no `--no-sandbox` - visible in a HOST BROWSER):
+  MET `4281283`; RE-PROVEN by chrF35 (`9cd6327`+): DevTools 200 at t=15 s, CDP `vis:"visible"`/
+  `rs:"complete"`, `Page.captureScreenshot` 800x600 blue=99.78%, NO `No usable sandbox` in stderr.**
+  Decode such a PNG with PowerShell `System.Drawing`+`GetPixel` (`Read` returns NOTHING).
 - **ONE SHARED ACCEPT QUEUE PER PORT (`57b87eb`, PROVEN by chrF34): a listening port's backlog is
   `Network::listen_queues` - ONE row per port in the arena, maintained by ANY process's tick - not
   `TcpServerSpecific::socket_set_handles` inside ONE process's descriptor entry** (a parked
@@ -87,21 +93,10 @@ is a HOST process: a panic, an abort or an OOM ends the whole run, not one guest
 
 ## Fixed, newest first (RULE + key `file:line` + the repro that proved it)
 
-- **`3df6d8dc` THE CPU-TIME CLOCKS ANSWER CPU TIME, NOT WALL TIME** (`process.rs` `gettime_as_duration`,
-  `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`, via a new default-`None`
-  `TimeProvider::cpu_time()` in `litebox/src/platform/mod.rs`, implemented on the Linux platform with
-  host `clock_gettime(CLOCK_{PROCESS,THREAD}_CPUTIME_ID)`): their epoch is "when this process/thread
-  started running", so a deadline built on one means "wake me after I have burned N of CPU" - and the
-  old wall-time answer handed back ~1e18 ns, a deadline in the far future that never arrives.
-  **BOTH WAYS by probe31 (native control green: 0.000046/0.000048 s):** litebox 0.000083/0.000065 s vs
-  `LITEBOX_CPU_TIME_CLOCKS_OFF=1` 0.300142/0.301093 s. **A `LITEBOX_*` kill switch is read from the HOST
-  env (`platform.env_flag`), so `--env` to the guest does NOT set it.** `dump_dom_lines` stayed 0 - a real
-  fidelity bug, but not the page-load blocker.
-
 - **`dd94fef9` A CARRIED FD MUST BE REBUILDABLE IN THE RECEIVER, NOT MERELY NAMED** (`file.rs` `carriable_file_spec_for_raw_fd` / `rebuild_carried_fd`). **RULE: a spec the receiver cannot open is a dead child - carry the bytes or create the path.** Three shapes answered ENOENT/EACCES and each killed the chromium child handed it (686 in 120 s). (a) An `O_WRONLY` file living only in the sender's writable layer: `snapshot_via_readonly_reopen` now reads it through a temporary `O_RDONLY` handle and restores the SENDER's flags on the spec. (b) EVERY `T|` byte snapshot failed - `rebuild_snapshot_file` created its carrier under `/dev/shm`, which this rootfs lacks; it now delegates to `install_shm_file`. (c) A carried DIRECTORY fd (`F|65536|...`, `O_DIRECTORY`) names a path the receiver cannot see: `mkdir_chain` now runs on ENOENT **and EACCES**, and creates **0777** - under `root_guard` a 0700 dir is root-owned, so an unprivileged receiver was refused the reopen it had JUST created (`chain=dddd created=1 reopened=false`). **BOTH WAYS on ONE BINARY (`LITEBOX_FILE_CARRY_FIX_OFF=1`), 120 s: OFF `carry_fail=1042`, 686 deaths, `init_sandbox=163`, 2.5 MB log; ON `carry_fail=6` (all `/proc/<dead pid>/{statm,status}` = a CORRECT ENOENT), 3 deaths, `init_sandbox=1`, 50 KB log.** **`probe28`: in one process an existing dir opens with `O_DIRECTORY`, anything missing is ENOENT(2), never EACCES.**
 - **`7d5c9be7` LINUX DESTROYS A PID NAMESPACE WHEN ITS INIT EXITS, WHATEVER IS STILL UNREAPED IN IT** (`pidns.rs` `PidNamespaceTable::{create,init_exited}`, `process.rs` `do_clone`/`prepare_for_exit`). The zygote forks every renderer/utility into its own `CLONE_NEWPID` namespace and reaps a child only when the browser asks, so each init stayed a zombie holding its slot: `in_use=256 sealed=256` after ~62 s, then `create` returned `None` -> **EAGAIN**. `create(parent, reclaim_dead)` reclaims dead slots and retries once; `init_exited(ns)` runs when `ns != INITIAL_NS && ns_pid == 1`. **BOTH WAYS (`LITEBOX_PIDNS_RECLAIM_OFF=1`): OFF `zygote_fail=1`, `init_sandbox=80`, 1 `Exception(3)`; ON `zygote_fail=0`, `init_sandbox=196`, 0 exceptions, 640 namespaces destroyed with their init.** **`2f6ff32240` fixed a DIFFERENT `Zygote could not fork` (EPERM) - get the errno before re-deriving.**
 - **`6985804e` A CARRIED FD MUST PRESENT THE ACCESS MODE `fcntl(F_GETFL)` REPORTS** (`file.rs`: `carriable_shm_for_raw_fd` uses `regular_file_getfl`). A `/proc/self/fd/N` reopen of an unnamed file is a `dup`, so the descriptor KEEPS `O_RDWR` in its open flags and its read-only-ness lives ONLY in `ReopenedAccess`; the `S|` carry spec read the RAW flags, so every Mojo `ScopedFDPair` arrived with BOTH halves `O_RDWR` and `PlatformSharedMemoryRegion::Take()` failed -> `IMMEDIATE_CRASH` -> GPU respawn loop. **BOTH WAYS (`LITEBOX_SHM_CARRY_GETFL_OFF=1`): OFF 20/20 `accmode=2`, `init_sandbox=1`, 30 KB; ON 5670 `accmode=0` of 6409, that rip NEVER appears, `init_sandbox=82`.** **`diag-shmcarry`'s `accmode` histogram IS the discriminator.**
-- **EVERY GUEST PROCESS MUST BE IN THE FORK-FAMILY REGISTRY OR `/proc/<pid>` IS ENOENT** (`process.rs` `reinit_as_native_fork_child`; `signal/xproc.rs` `xproc_preregister_child`, `xproc_register_local`, `reclaim_dead_hosts`): a platform with no cross-process signal delivery reports host pid `0`, and BOTH registration sites were gated on a NONZERO host, so `SharedProcessTable` was EMPTY on the Linux host and `pid_is_known()` was false for everything -- `/proc/<pid>/{stat,task,status}` answered ENOENT in the browser for renderers that were plainly alive (pid 82 logs `Created context:` in the same second as `/proc/82/stat errno=2`). Register under host `0` = "host unknown", which `reclaim_dead_hosts` now leaves alone; `xproc_slot` is still published only for a REAL host pid, so signal delivery is untouched. **BOTH WAYS by `LITEBOX_PROC_PID_TABLE_LEGACY=1`: on = `register_new=16`, `proc_task_miss=0`, `proc_stat_miss=0`; legacy = `register_new=0`, `proc_task_miss=10`, `proc_stat_miss=14`.** **NOT THE PAGE-LOAD BLOCKER: `dump_dom_lines=0` on BOTH arms.**
+- **EVERY GUEST PROCESS MUST BE IN THE FORK-FAMILY REGISTRY OR `/proc/<pid>` IS ENOENT** (`process.rs` `reinit_as_native_fork_child`; `signal/xproc.rs` `xproc_preregister_child`, `xproc_register_local`, `reclaim_dead_hosts`): a platform with no cross-process signal delivery reports host pid `0`, and BOTH registration sites were gated on a NONZERO host, so `SharedProcessTable` was EMPTY on the Linux host and `pid_is_known()` was false for everything -- `/proc/<pid>/{stat,task,status}` answered ENOENT in the browser for renderers that were plainly alive (pid 82 logs `Created context:` in the same second as `/proc/82/stat errno=2`). Register under host `0` = "host unknown", which `reclaim_dead_hosts` now leaves alone; `xproc_slot` is still published only for a REAL host pid, so signal delivery is untouched. **BOTH WAYS by `LITEBOX_PROC_PID_TABLE_LEGACY=1` on ONE binary: fix on = `register_new=16`, `proc_task_miss=0`, `proc_stat_miss=0`; legacy = `register_new=0`, `proc_task_miss=10`, `proc_stat_miss=14`.** **NOT THE PAGE-LOAD BLOCKER: `dump_dom_lines=0` and `gpu_sandbox_warn=1` on BOTH arms.**
 - **`a3c3bb17` `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL)` ANSWERS EFAULT, NOT EACCES** (`seccomp.rs` `sys_prctl_set_seccomp`): Linux copies `sock_fprog` out of userspace BEFORE it checks `no_new_privs`. **Chromium's `KernelSupportsSeccompBPF()` probe reads exactly that errno as "this kernel has seccomp-bpf"** → the renderer takes its own unsupported-sandbox `IMMEDIATE_CRASH`. **BOTH WAYS by tr6/tr7**: before, renderers 72/73/74 died `Signal(5)` at t=26 s; after, `result=Err(EFAULT)` for every tid and **0 fatal signals**.
 - **`2f6ff32240` `clone(CLONE_NEWPID|SIGCHLD)` NEEDS NO `CAP_SYS_ADMIN`** (`process.rs`): the zygote forks with arg0 **`0x20000011`** and NO `CLONE_NEWUSER` from an unprivileged uid, so the clone answered EPERM. **`zygote_fail` 110 -> 1.** **BOTH WAYS by `probe20`**: before, `clone(SIGCHLD|CLONE_NEWPID)` is the ONLY variant answering EPERM; after `pid=4 ... code=7`; NEWNS/NEWNET/NEWUTS/NEWIPC/NEWCGROUP and `unshare(CLONE_NEWPID)` still EPERM.
 - **CHROMIUM'S UNREACHABLE PADDING IS `IMMEDIATE_CRASH()` = `int3; ud2`** (`cc 0f 0b`). int3 is TRAP-class so the reported rip is the NEXT byte: **one crash rip yields BOTH `Exception(3)` and `Exception(6)`**. So "the rip is in padding" means a NORETURN call returned OR a CHECK fired. Slice with `dd` + `objdump -D -b binary -m i386:x86-64 --adjust-vma=<vaddr>` (seconds, vs minutes on the 327 MB binary).
@@ -149,13 +144,13 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
    owner that never accepts -> refuses at backlog 8 and RECOVERS, vs orphaned -> ~25 ms PERMANENTLY).
    **RULE: `selkpid=none` is a ps ARTIFACT; `slots=none` = no socket on that port at that instant.**
 3. **CLOSED - chromium's kills are guest-side**: `Exception(14)`/`0x15` = an instruction fetch of a PRESENT
-   non-executable page (`rip` in a `VM_*` range with NO `VM_EXEC`); `Exception(3)`/Signal(5) with `cc 0f 0b`
-   at `[rdi]` = chromium's OWN `IMMEDIATE_CRASH`, and it KEPT PAINTING. **A 0-BYTE UNIX READ MEANS
-   `peer_gone()`, NOT A CLOSED PEER** (`unix.rs`). (Prose in `-07q`.)
+   non-executable page (`rip` in a `VM_*` range with NO `VM_EXEC`); `Exception(3)`/Signal(5) with
+   `cc 0f 0b` at `[rdi]` = chromium's OWN `IMMEDIATE_CRASH`, and it KEPT PAINTING. **A 0-BYTE UNIX READ
+   MEANS `peer_gone()`, NOT A CLOSED PEER** (`unix.rs`). `--database=PATH` is REQUIRED. (Prose in `-07q`.)
 4. **BYTE STORE: CLOSED FOR BOTH REAL CONSUMERS, FOR RENAME, AND FOR THE NON-APPEND `pwrite` SHAPE**
    (numbers under `7028ef5`/`8f33179`, all BOTH WAYS). **What is left is architectural**:
-   `install_spilled_content` is a whole-file `O_TRUNC` replace on first publish; `self.locked(..)` is
-   held across `platform.spill_write`; and `FileX { data: Cow<'static,[u8]> }`
+   `install_spilled_content` is a whole-file `O_TRUNC` replace on first publish; `self.locked(..)` is held
+   across `platform.spill_write`; and `FileX { data: Cow<'static,[u8]> }`
    (`litebox/src/fs/in_mem.rs:1530`) is PER-PROCESS - bytes cross only at fork spawn/exit EXCEPT through
    `SharedFileSpill` (`file_spill.rs`). Also open: AF_UNIX exhaustion is silent (256 slots, keys >108
    bytes); `timerfd`/`signalfd` uncarriable; **cross-process-fork state NOT restored**.
@@ -165,7 +160,7 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 
 ## Standing lessons and hard constraints (mechanism: `docs/HARNESS-LESSONS.md`)
 
-- **`litebox::sync::RwLock::try_read`/`try_write` FAIL WHEN A WRITER IS MERELY QUEUED** (`litebox/src/sync/rwlock.rs`): ONE thread parked in a blocking `descriptor_table_mut()` makes every `try_descriptor_table()` fail forever and the per-tick socket sweep a no-op in that process. Dead-holder recovery needs the owner thread DEAD; a parked one is never recovered.
+- **`litebox::sync::RwLock::try_read`/`try_write` FAIL WHEN A WRITER IS MERELY QUEUED** (`litebox/src/sync/rwlock.rs`): ONE thread parked in a blocking `descriptor_table_mut()` makes every `try_descriptor_table()` fail forever and the per-tick socket sweep a silent no-op in that process. Dead-holder recovery needs the owner thread DEAD; a parked one is never recovered.
 - **THE CROSS-PROCESS FORK'S COPY PLAN IS GRANULE-WIDENED AND MERGED** (`process.rs`: `GRANULE = 0x1_0000`; a group base MUST stay granule-aligned or Windows answers 87). **NOTHING IN `litebox/src/mm` ZEROES A FRESH PAGE**. **`vma_layout()` zips `ranges`/`flags`/`executable`/`is_file_backed` POSITIONALLY - filter ALL or NONE.**
 - **A GUEST PACKET TO `127.0.0.0/8` OR TO `GUEST_IP_ADDR` IS LOOPED IN-PROCESS** (`phy.rs:166`): a guest's `127.0.0.1:<port>` NEVER reaches the host's published listener. **`data_granted` = CAPACITY granted, `data_used` = slots in use**.
 - Guest-reachable code returns an errno, never a panic (the host process IS the whole session). Refusal errno is contract: EPERM degrades, EINVAL/ENOSYS fails hard. `LITEBOX_DUMP_FRAMES=1` is the only trustworthy `--gui` visual check. Never subtract timestamps across a parent and a fork-child log.
@@ -185,17 +180,20 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
   a `call`. (f) "litebox hooks __stack_chk_fail" - codesearch finds no such hook.
 Verbatim in `docs/AGENTS_ARCHIVE_2026-10-07k.md`. **REFUTED for 8081: `xproc18`/`19`/`20`; "a busy port goes deaf" (41/41); "an attached host client deafens the port" (37/37).** **CLOSED: `eb16abf`, `150e6e0`, chrF14 window loss, apps10 `BadMatch`, chrF24-27, grey/`NO_PNG`, xproc44, the 23-arm app census.**
 
-- **REFUTED: "the ppoll timeout is not honoured" / "a clock is frozen"** (probe30, native control green): `ppoll` on an empty pipe ret=0 at 1000.2ms/300.1ms (asked 1000/300);
+- **REFUTED: "the ppoll timeout is not honoured" and "a clock is frozen"** (guest probe30 with a
+  NATIVE control, both green): `ppoll` on an empty pipe ret=0 at 1000.2ms/300.1ms (asked 1000/300);
   `epoll_wait` 1000/300 -> 0 at 1000.1/300.2ms; `ppoll(NULL)` blocks 400.1ms until a write; an
   already-ready fd returns 1 at 0.0ms; ALL EIGHT clock ids (0,1,2,3,4,5,6,7) advance over a 300ms
   sleep, REALTIME/MONOTONIC magnitudes 0.300s. litebox == native on every row.
-- **`LITEBOX_PIDNS_RECLAIM_OFF` IS NOT THE DISCRIMINATOR** (A/B, 80 s/arm): `on` = 91785 B, `off` =
-  116016 B, but `dump_dom_lines=0`, `seccomp_renderers=4`, `execve_total=5`, `exit_group=8`,
-  `zygote_fail=0` IDENTICAL. So `7d5c9be7` is not the cause of "no page ever loads".
+- **`LITEBOX_PIDNS_RECLAIM_OFF` IS NOT THE DISCRIMINATOR for `dump_dom_lines`** (A/B, 80 s/arm, one
+  binary): `on` = rc=124, 91785 B, `dump_dom_lines=0`, `seccomp_renderers=4`, `execve_total=5`,
+  `exit_group=8`, `zygote_fail=0`; `off` = rc=124, 116016 B, every one of those IDENTICAL. So
+  `7d5c9be7` (pid-namespace slot reclaim) is not the cause of "no page ever loads".
 ## Docs and tooling map
 Archives under `docs/` (`-07q`...`-09-03`); `docs/HARNESS-LESSONS.md` = harness prose,
 `docs/LINUX-TEST-SUITE.md` = Linux notes. gm `codesearch`
 (INVARIANT 4: never grep/find): `literal` is EXHAUSTIVE, `dual` a ranked SAMPLE - never
 conclude "absent" from it; scope with `path`/`glob`; **dual SILENTLY IGNORES `path`**.
-Spool fallback: fields are FLAT (`query`/`mode`/`path`/`output`/`cwd`/`session_id`),
-never nested under `body`; `in/<verb>/<N>.txt` written atomically, `out/<verb>-<N>.json`.
+Spool fallback: fields are FLAT (`query`/`mode`/`path`/`output`/`cwd`/`session_id`), never
+nested under `body`; write `in/<verb>/<session>-<N>.txt` atomically, read
+`out/<verb>-<session>-<N>.json`.
