@@ -2540,21 +2540,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // only. A thread that has LEFT its message pump and is spinning makes ~16k syscalls/s and
         // parks in none of them, so every exit-time instrument (strace summary, parked dump)
         // shows nothing for it. Throttled because the point is the SHAPE of the loop, not a trace.
-        if crate::diag::mainthread_enabled() && self.tid.get() == self.pid.get() {
-            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let now = crate::diag::now_ms(self.global.platform);
-            let prev = LAST.load(core::sync::atomic::Ordering::Relaxed);
-            if now.saturating_sub(prev) >= 250
-                && LAST
-                    .compare_exchange(
-                        prev,
-                        now,
-                        core::sync::atomic::Ordering::Relaxed,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
-                crate::diag::emit_timeline_line(
+        if crate::diag::mainthread_enabled()
+            && self.tid.get() == self.pid.get()
+            && crate::diag::mainthread_should_emit(
+                self.pid.get(),
+                crate::diag::now_ms(self.global.platform),
+            )
+        {
+            crate::diag::emit_timeline_line(
                     self.global.platform,
                     &alloc::format!(
                         "[diag-mainthread] pid={} tid={} syscall={} num={}",
@@ -2564,7 +2557,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         syscall_number,
                     ),
                 );
-            }
         }
         // "What is this thread parked in?" -- recorded BEFORE the dispatch, so a syscall that
         // never returns still shows up (see `diag`'s parked section for why the existing

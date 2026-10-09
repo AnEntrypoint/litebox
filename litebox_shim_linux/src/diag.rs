@@ -259,6 +259,52 @@ pub fn mainthread_enabled() -> bool {
     MAINTHREAD_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// One throttle slot PER PID for [`mainthread_should_emit`].
+/// A single process-global `static` shares ONE 250 ms budget across every guest main thread in
+/// the host process, so one busy thread starves the others and "silent" becomes
+/// indistinguishable from "unsampled" -- which is exactly the question this instrument exists
+/// to answer. Each slot packs `(last_ms << 32) | pid`; 0 means free.
+const MAINTHREAD_SLOTS: usize = 64;
+static MAINTHREAD_LAST: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAINTHREAD_SLOTS];
+const MAINTHREAD_THROTTLE_MS: u64 = 250;
+
+/// Rate-limit one main-thread line for `pid` to [`MAINTHREAD_THROTTLE_MS`], per pid.
+pub fn mainthread_should_emit(pid: i32, now_ms: u64) -> bool {
+    let key = pid as u32 as u64;
+    let packed = |ms: u64| (ms << 32) | key;
+    for slot in &MAINTHREAD_LAST {
+        let cur = slot.load(core::sync::atomic::Ordering::Relaxed);
+        if cur != 0 && cur as u32 as u64 == key {
+            return now_ms.saturating_sub(cur >> 32) >= MAINTHREAD_THROTTLE_MS
+                && slot
+                    .compare_exchange(
+                        cur,
+                        packed(now_ms),
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok();
+        }
+    }
+    // Unseen pid: claim the first free slot and emit. The first sighting of a main thread is
+    // worth one line even at t=0.
+    for slot in &MAINTHREAD_LAST {
+        if slot
+            .compare_exchange(
+                0,
+                packed(now_ms),
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Monotonic-ish wall clock in milliseconds, from the platform's SYSTEM clock (not its monotonic
 /// `Instant`) so it needs no per-platform epoch stored in a `static` -- a generic `Instant`
 /// cannot live in one, and this module has no `Platform` type parameter.

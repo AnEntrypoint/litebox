@@ -2618,6 +2618,23 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         }
     }
 
+    fn cpu_time(&self) -> Option<(core::time::Duration, core::time::Duration)> {
+        fn read(id: libc::clockid_t) -> Option<core::time::Duration> {
+            let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+            if unsafe { libc::clock_gettime(id, t.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let t = unsafe { t.assume_init() };
+            Some(core::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+        }
+        // The guest runs on this host process's own threads, so the host process's CPU time is
+        // the guest's, up to the other guest processes sharing this host process.
+        Some((
+            read(libc::CLOCK_PROCESS_CPUTIME_ID)?,
+            read(libc::CLOCK_THREAD_CPUTIME_ID)?,
+        ))
+    }
+
     fn current_time(&self) -> Self::SystemTime {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };

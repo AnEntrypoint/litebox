@@ -588,6 +588,17 @@ pub trait TimeProvider {
     fn now(&self) -> Self::Instant;
     /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
+    /// Returns the CPU time consumed so far by the current host process and by the calling host
+    /// thread, in that order, or `None` if this platform cannot measure them.
+    ///
+    /// This backs a guest `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` / `CLOCK_THREAD_CPUTIME_ID`.
+    /// Those two are NOT wall clocks: a caller that turns one into a deadline is asking "wake me
+    /// after I have burned N of CPU", and answering with wall time hands back a value ~1e18 ns
+    /// from the epoch, so the deadline lands in the far future and the loop never returns.
+    /// Default `None` keeps every platform that does not implement this on its old behaviour.
+    fn cpu_time(&self) -> Option<(core::time::Duration, core::time::Duration)> {
+        None
+    }
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.

@@ -7246,16 +7246,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             litebox_common_linux::ClockId::ProcessCputimeId
             | litebox_common_linux::ClockId::ThreadCputimeId => {
-                // CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID - litebox does not
-                // track genuine per-process/per-thread CPU-time-consumed accounting.
-                // Approximate with monotonic wall-clock time: callers (e.g. V8/abseil)
-                // generally require a valid, monotonically-increasing, non-EINVAL value
-                // for coarse profiling/scheduling decisions rather than exact CPU
-                // accounting.
-                self.global
+                // CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID -- CPU time CONSUMED, not
+                // wall time. These are the only two clocks whose epoch is "when this process /
+                // thread started running", so a caller that turns one into a deadline means
+                // "wake me after I have burned N of CPU". Answering with monotonic wall time
+                // handed back ~1e18 ns, so such a deadline landed in the far future and the
+                // caller's wait loop never terminated. `LITEBOX_CPU_TIME_CLOCKS_OFF=1`
+                // restores the wall-time approximation.
+                let cpu = if self
+                    .global
                     .platform
-                    .now()
-                    .duration_since(&self.global.boot_time)
+                    .env_flag("LITEBOX_CPU_TIME_CLOCKS_OFF")
+                {
+                    None
+                } else {
+                    self.global.platform.cpu_time()
+                };
+                match cpu {
+                    Some((process_cpu, thread_cpu)) => {
+                        if core::matches!(
+                            clockid,
+                            litebox_common_linux::ClockId::ThreadCputimeId
+                        ) {
+                            thread_cpu
+                        } else {
+                            process_cpu
+                        }
+                    }
+                    None => self
+                        .global
+                        .platform
+                        .now()
+                        .duration_since(&self.global.boot_time),
+                }
             }
             _ => {
                 log_unsupported!("gettime for {clockid:?}");
