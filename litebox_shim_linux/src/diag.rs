@@ -299,6 +299,47 @@ pub fn mainthread_should_emit(pid: i32, now_ms: u64) -> bool {
     false
 }
 
+/// The same throttle for the stack dump, slower because one dump is 64 qwords.
+static MAINTHREAD_STACK_MS: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAINTHREAD_SLOTS];
+static MAINTHREAD_STACK_PID: [core::sync::atomic::AtomicU32; MAINTHREAD_SLOTS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAINTHREAD_SLOTS];
+const MAINTHREAD_STACK_EVERY_MS: u64 = 2000;
+
+pub fn mainthread_should_dump_stack(pid: i32, now_ms: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let key = pid as u32;
+    for i in 0..MAINTHREAD_SLOTS {
+        if MAINTHREAD_STACK_PID[i].load(Relaxed) != key {
+            continue;
+        }
+        let prev = MAINTHREAD_STACK_MS[i].load(Relaxed);
+        return now_ms.saturating_sub(prev) >= MAINTHREAD_STACK_EVERY_MS
+            && MAINTHREAD_STACK_MS[i]
+                .compare_exchange(prev, now_ms, Relaxed, Relaxed)
+                .is_ok();
+    }
+    for i in 0..MAINTHREAD_SLOTS {
+        if MAINTHREAD_STACK_PID[i]
+            .compare_exchange(0, key, Relaxed, Relaxed)
+            .is_ok()
+        {
+            MAINTHREAD_STACK_MS[i].store(now_ms, Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// One-shot latch for the guest VMA table dump. Printed once per run because every address the
+/// stack dump yields is meaningless without the mapping it lands in: a qword in a 327 MB range
+/// is the chromium binary, one in a ~2 MB range is libc, and neither can be turned into a file
+/// offset without the mapping's own bias.
+static VMA_DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn claim_vma_dump() -> bool {
+    !VMA_DUMPED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// Monotonic-ish wall clock in milliseconds, from the platform's SYSTEM clock (not its monotonic
 /// `Instant`) so it needs no per-platform epoch stored in a `static` -- a generic `Instant`
 /// cannot live in one, and this module has no `Platform` type parameter.

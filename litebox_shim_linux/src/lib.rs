@@ -2557,6 +2557,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         syscall_number,
                     ),
                 );
+            // `clock_gettime` is the syscall the main thread spins on, and its `rip` is the
+            // vDSO -- so the interesting address is NOT rip but what the stack holds: `[rsp]`
+            // returns into the vDSO's caller (glibc), and the frames above that are the
+            // chromium function that is actually looping. Dump 512 bytes above rsp as qwords
+            // plus the process's VMA table, so every candidate qword can be mapped to a file
+            // offset with its OWN mapping's bias instead of a constant remembered from a
+            // different run.
+            #[cfg(target_arch = "x86_64")]
+            if syscall_number == 228
+                && crate::diag::mainthread_should_dump_stack(
+                    self.pid.get(),
+                    crate::diag::now_ms(self.global.platform),
+                )
+            {
+                if crate::diag::claim_vma_dump() {
+                    for (r, flags) in self.process().pm().mappings() {
+                        crate::diag::emit_timeline_line(
+                            self.global.platform,
+                            &alloc::format!(
+                                "[diag-vmatab] pid={} start={:#x} end={:#x} flags={:?}",
+                                self.pid.get(),
+                                r.start,
+                                r.end,
+                                flags
+                            ),
+                        );
+                    }
+                }
+                let sp = ctx.rsp as usize;
+                let qwords = unsafe { core::slice::from_raw_parts(sp as *const u64, 64) };
+                let mut line = alloc::format!(
+                    "[diag-mainstack] pid={} tid={} rsp={:#x} n={}",
+                    self.pid.get(),
+                    self.tid.get(),
+                    sp,
+                    qwords.len()
+                );
+                for w in qwords {
+                    use core::fmt::Write;
+                    let _ = write!(line, " {:#x}", w);
+                }
+                crate::diag::emit_timeline_line(self.global.platform, &line);
+            }
         }
         // "What is this thread parked in?" -- recorded BEFORE the dispatch, so a syscall that
         // never returns still shows up (see `diag`'s parked section for why the existing
