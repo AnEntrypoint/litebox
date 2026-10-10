@@ -50,3 +50,23 @@ Rules:
 - Gate each arm on **1-minute load < 4 and `MemAvailable` > 2 GB**, polling. The 5-minute average stays
   high long after the orphans are gone; it is not the signal.
 - `nice -n 19` on everything, and **one runner at a time** via `mkdir /tmp/lbx/.runner-lock`.
+
+## A `LITEBOX_*_OFF` SWITCH IS PRESENCE-CHECKED — `=0` MEANS OFF (measured 2026-10-10)
+
+`env_flag` is `var_os(name).is_some_and(|v| !v.is_empty())`
+(`litebox_platform_linux_userland/src/lib.rs:3618-3620`). **ANY non-empty value means the flag is
+set, so `LITEBOX_X_OFF=0` turns the fix OFF, not on.** Every call site is `!env_flag(...)`, so the
+"fix enabled" arm is the one where the variable is **UNSET**.
+
+How this bit: uz7 (`/proc` fixes meant to be ON) and uz6 (`LITEBOX_PROC_FD_CARRY_FIX_OFF=1`)
+came back **identical** — 8 failures each. `diag-procary` (`file.rs:10787`) appears **0 times** in
+`log-uz4/uz6/uz7.txt`, so the fallback branch never fired in any of them. Two arms with the same
+number prove nothing when neither arm actually differed.
+
+**RULE: ON arm = variable unset or empty. OFF arm = `=1`. Never `=0`.** Before trusting any
+BOTH-WAYS pair, confirm the discriminator actually fired: grep the log for its `diag-*` /
+`warn!` line and require it to be present in one arm and absent (or different) in the other.
+
+Second candidate whenever two arms match: **a stale binary.** Record the binary's md5 and build
+time with each arm so "the change was not in the binary" is distinguishable from "the change did
+nothing".
