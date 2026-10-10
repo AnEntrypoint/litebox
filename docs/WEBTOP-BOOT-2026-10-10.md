@@ -415,6 +415,55 @@ So **the desktop paints its own background and a panel bar with icon content**, 
 whole 240 s hold (`rc=0`, 0 icon assertions). Chromium's own grab is unchanged: `md5=b5fa14cbec08`,
 1024x744, `distinct=1`, uniform (206,206,206).
 
+### Rung 5 (chromium on a bare `xfwm4`, no session) — `r5a` WEDGES, and it wedges with a 300-process guest census
+
+Isolating chromium from the desktop: `Xvfb` + `xfwm4 --compositor=off` + `xclock` + chromium, no
+`xfce4-session`. The rung-2 census reports **315 guest processes, 303 of them
+`/usr/bin/xfwm4 --display :0 --replace --compositor=off`** with pids 44…631 (step 2), and after
+`shot rung2` the guest stops producing output entirely (out file frozen 7 min, killed at 10 min).
+
+The storm is **guest-side bookkeeping, not host forks**: the host held only 19 `lbxrun` processes
+and load 1.3-2.0 the whole time, so those ~300 entries are not 300 host processes. They are also
+not threads of a healthy run — `r4d`, where the same `xfwm4` (pid 6) lived through the whole run,
+counted 14 / 29 / 47 / 81. So whatever the entries are, they appear only when our `xfwm4` runs
+without the session behind it.
+
+Unresolved, and worth one short run (30 s settle, no hold) to see whether the storm predates
+chromium: **it is not known whether the wedge causes the storm or the storm causes the wedge.**
+Either way, rung 5 is not yet a usable isolation, so the chromium question went back to rung 4 with
+different chromium flags instead.
+
+### `r4g` (`--enable-unsafe-swiftshader`) WEDGES at rung 3 — no verdict, and the wedge is not new
+
+Adding `--enable-unsafe-swiftshader` to the chromium flags did not get far enough to be measured:
+the guest's stdout froze after `shot rung3` for 10 minutes (host load 34-38 the whole time) and the
+run had to be killed. **Only 2 frames exist: `md5=cc81d3e05725` `distinct=2` (the bare weave) and
+`md5=eb31b729dacd` `distinct=10`** — so `xfdesktop` had not even painted the background yet, let
+alone chromium. **No chromium `xwd -id` grab was produced, so swiftshader is untested here.**
+
+`r5a` wedged the same way (one frame, md5 `cc81d3e05725`, stdout stopping 165 B after the chromium
+spawn line). Both are null results, not evidence.
+
+### The ~500-process guest census is litebox-internal, not 500 host forks
+
+Census sizes: `r4c` 18/33/51/65, `r4d` 14/29/47/81, **`r4f` 12/499/513/515**, `r4g` 299/505. The
+extra entries all carry one parent's argv (`/usr/bin/xfwm4 --display :0 --replace
+--compositor=off`, pids 30,32,34…~630 step 2) and appear only after the glycin loaders landed.
+
+Measured at rung 3 of `r4g`: **guest census 505, host `lbxrun` processes 14.** Five hundred
+processes cannot hide in fourteen, so these are **litebox-internal process objects**, not host
+forks. Two explanations remain, and they are distinguishable:
+
+* a guest-pid allocator that hands out a fresh pid per `clone()` — including the
+  `CLONE_FS|CLONE_FILES` ones that stay in-process — and never reuses (`r4c`/`r4d`, which used the
+  same driver without the glycin loaders, stayed at 65/81, so whatever clones these are, the
+  loaders are what triggers them);
+* real forks that exit and are never reaped, leaving `/proc` entries behind.
+
+`rootfs-webtop13.tar` ships a census that prints `ppid` and the `/proc/<pid>/stat` state for every
+entry, plus a `procs by (ppid,state)` tally — state `Z` means unreaped, anything else means live
+guest objects. That one run answers it; until then the count is recorded as an observation only.
+
 ### The 2nd-connect hang is NOT the data plane (measured, both ways) — superseded above
 
 `CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
