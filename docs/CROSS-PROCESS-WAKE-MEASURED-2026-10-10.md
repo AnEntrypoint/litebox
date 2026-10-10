@@ -42,11 +42,11 @@ backlog and `try_connect` builds an in-process (`Local`) endpoint whose channels
 shared-arena resident and already wake fine. Only a descriptor that must be *rebuilt* in the
 receiver (`file.rs:10636`) becomes `Shared`, which is exactly the chromium/Mojo shape.
 
-**Second, independent finding: with a socket timeout the 15 ms is in the POLL path.** CPython polls
-before `recv` whenever `settimeout` is set, and `PollSet::wait`'s bounded repoll (`epoll.rs:405-418`,
-`SHARED_UNIX_POLL_INTERVAL` = 15 ms) never consults the wake word. So `probe73` with
-`settimeout(60)` measures **15.927 ms mean even with the fix ON**. Real apps (Xvfb, dbus-daemon,
-chromium) all `epoll_wait` before reading — extending the word to the poll path is the follow-up.
+**Second finding, now closed: with a socket timeout the 15 ms is in the POLL path.** CPython waits
+for readiness before `recv` whenever `settimeout` is set, and neither `PollSet::wait`'s bounded
+repoll (`epoll.rs`) nor `EpollFile::wait`'s consulted the wake word. `probe73` with `settimeout(60)`
+measured **15.927 ms mean even with the fix ON**, and every real consumer (Xvfb, dbus-daemon,
+chromium's Mojo) waits for readiness before reading. See the next section.
 
 ## BOTH WAYS (`probe73.py`, blocking sockets)
 
@@ -69,6 +69,40 @@ path: ON 0.247/0.216 ms and 4.93 MB/s vs OFF 16.101/15.315 ms and 0.134 MB/s (65
 The switch discriminates on both: `parked` appears only in ON.
 Harness `/tmp/lbx/xwrun.sh`, probes `/tmp/lbx/probe7{0,1,2,3}.py`.
 
+## The poll path (`epoll.rs`), commit `6f58c5ff`
+
+Same switch. `unix.rs` gains `UnixStream::shared_wake()`, `UnixSocket::shared_wake()` and
+`unix_fd_shared_wake(global, &TypedFd)` — the last so a path that sees only a descriptor (poll,
+`ppoll`, `select`, `epoll_wait`) can reach its connection's word. `epoll.rs` gains
+`park_on_unix_wake_words(words, seen, budget)`: words cannot be waited on together (no multi-futex
+wait here), so each gets a share of the budget and the whole set is re-checked between shares — a
+bump on ANY word is noticed within one share. **Bounded by construction**: the budget is always a
+real finite duration and there is deliberately no unbounded variant.
+
+`PollSet::wait` and `EpollFile::wait` then snapshot every word **before** scanning (a bump racing
+the scan reads as already changed, so no wake is lost), shrink their own condvar park from 15 ms to
+`POLL_WORD_CONDVAR_SLICE` = 200 µs — that park can only ever be interrupted in-process, and an
+in-process event still interrupts it immediately — and park on the words for the remainder. The word
+park is capped at `POLL_WORD_PARK_SLICE` = 2 ms, **not** at the full interval: a raw futex wait
+cannot be interrupted by this process's own `Waker`, so capping it keeps an event on an in-process
+member of the same set at ~2 ms instead of making it wait out a whole interval. An empty word set —
+a datagram, a same-process (`Local`) socket, or the switch OFF — is exactly today's path.
+
+### BOTH WAYS (`probe74.py` = `probe73.py` + `settimeout`, the poll-then-read shape)
+
+Release binary, md5 `2220690e50d3ea9042a32bd158389d06` (logs `log-p5on.txt` / `log-p5off.txt`),
+40 × 1-byte round trips then 64 KiB in 4096-byte writes, both arms rc=0, `hostprocs=0` after:
+
+| arm | RTT median | RTT mean | RTT min | throughput | log bytes | `diag-xwake` |
+|---|---|---|---|---|---|---|
+| ON (switch unset) | **0.308 ms** | 0.343 ms | 0.306 | **6.88 MB/s** | 1,962 | `parked ... timeout_ms=2` |
+| OFF (`=1`) | 15.173 ms | 17.447 ms | 15.151 | 0.142 MB/s | 2,807 | 1 line (bump from `free()`), **no `parked`** |
+
+**49× lower median RTT, 48× more throughput.** Before this commit the same probe measured 15.927 ms
+with the fix ON; the untuned first cut of it (500 µs condvar slice, 15 ms word park) measured
+0.732 ms / 2.96 MB/s at md5 `b837ad0e2796dcc0d446bbbad223281d`, so the tuning is worth ~2.4× and
+the cap is what buys it. Harness `/tmp/lbx/xwrun.sh`, probes `/tmp/lbx/probe7{3,4}.py`.
+
 ## Arena arithmetic (`SHARED_UNIX_CONN_BUF`)
 
 `SHARED_UNIX_CONN_CAPACITY` = 4096 slots, 2 rings/slot, arena region is power-of-two sized.
@@ -87,5 +121,7 @@ itself removes the 15 ms from each one. Do the wake first.
 
 ## Repro
 
-    cd /tmp/lbx && PROBE=probe73.py SECS=180 bash /tmp/lbx/xwrun.sh c2on
+    cd /tmp/lbx && PROBE=probe73.py SECS=180 bash /tmp/lbx/xwrun.sh c2on          # blocking recv
+    cd /tmp/lbx && PROBE=probe74.py SECS=200 bash /tmp/lbx/xwrun.sh p5on          # poll-then-read
+    cd /tmp/lbx && PROBE=probe74.py SECS=200 bash /tmp/lbx/xwrun.sh p5off LITEBOX_UNIX_CROSS_WAKE_OFF=1
     cd /tmp/lbx && PROBE=probe73.py SECS=180 bash /tmp/lbx/xwrun.sh c2off LITEBOX_UNIX_CROSS_WAKE_OFF=1
