@@ -116,6 +116,84 @@ fine. Note the timestamp: it is ~50 s after xfwm4 was spawned, so it did not fai
 **stalled and then gave up** — the shape of a connection that never completes, i.e. the
 cross-process wake gap (`docs/CROSS-PROCESS-WAKE-2026-10-10.md`), not a missing library.
 
+Repeated as `r2b` (rc=0, out 15,749,107 B, 5 frames, 4 distinct): xclock paints identically
+(frames 3-5, 220-225 distinct colours) and `xfwm4` fails identically
+(`20:28:14.456: cannot open display: :0`). Two failures in a row rules out "flaky 1-in-6".
+
+### The blocker: the **second** connection to a guest AF_UNIX listener does not complete
+
+`CONN_PROBE=N` opens N sequential X connections, one fresh process each, and times them (`cp1`,
+6 iterations, 40 s timeout each):
+
+```
+connprobe 0 elapsed=0.08 rc 0
+connprobe 1 elapsed=40.02 FAILED TimeoutExpired   <-- the 2nd connection, never completed
+connprobe 2 elapsed=0.06 rc 0
+connprobe 3 elapsed=0.16 rc 0
+connprobe 4 elapsed=0.16 rc 0
+connprobe 5 elapsed=0.17 rc 0
+```
+
+Three independent runs put the hang at the **same place**:
+
+| run | 1st client | 2nd client | 3rd+ |
+|---|---|---|---|
+| `r1`  | `xdpyinfo` 0.1 s | `xwininfo` **timed out at 20 s** | ok |
+| `r2`  | `xdpyinfo` ok | `xfwm4` **stalled ~50 s, gave up** | `xclock` ok |
+| `r2b` | `xdpyinfo` ok | `xfwm4` **stalled ~22 s, gave up** | `xclock` ok |
+| `cp1` | probe 0 0.08 s | probe 1 **40 s timeout** | probes 2-5 ~0.15 s |
+
+### Rung 3 — `+ xfce4-session` (`r3`, rc=0, out 25,196,597 B, err 10,308 B)
+
+Run on the 20:30 binary (cross-wake fix in). Two things changed at once:
+
+* **`xfwm4` connected.** No `cannot open display` this time, and the tree gained xfwm4's offscreen
+  helper window:
+
+  ```
+  Root window id: 0x42
+      2 children:
+      0x40000c "xclock": ("xclock" "XClock")  200x200+40+40  +40+40
+         1 child:
+         0x40000d (has no name): ()  200x200+0+0  +41+41
+      0x600001 (has no name): ()  10x10+-20+-20  +-20+-20
+  ```
+
+  So a window manager process runs inside litebox and stays up. It did not manage `xclock`
+  (no reparenting frame), and xclock is still unframed.
+
+* **`xfce4-session` exited rc=1**, and the cause is my rootfs, not litebox: the archive is written
+  `--owner=0 --group=0`, so `/root` (0700) and `/run/user/0` are **root-owned** inside the guest
+  while the guest runs as **uid 1000**:
+
+  ```
+  dbus[15]: Unable to set up transient service directory: XDG_RUNTIME_DIR "/run/user/0" is owned by uid 0, not our uid 1000
+  Unable to create /root/.dbus
+  Unable to create /root/.dbus/session-bus
+  ```
+
+  (same root cause as fontconfig's `No writable cache directories`). Fix: the driver now creates
+  and exports `HOME=/tmp/home`, `XDG_RUNTIME_DIR=/tmp/xdg`, `XDG_{CONFIG,CACHE,DATA}_HOME` under
+  it — `/tmp` is world-writable and demonstrably so, since Xvfb creates `/tmp/.X0-lock` and
+  `/tmp/.X11-unix/X0` in it.
+
+### The 2nd-connect hang is NOT the data plane (measured, both ways)
+
+`CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
+
+```
+connprobe 0 elapsed=0.06 rc 0
+connprobe 1 elapsed=40.02 FAILED TimeoutExpired   <-- unchanged
+connprobe 2 elapsed=0.06 rc 0
+...
+```
+
+Identical to `cp1`/`cp2` on the pre-fix binary, so `10fa53cd` does not touch this — as its author
+said. The rendezvous has a **15 s** bound (`SHARED_UNIX_CROSS_CONNECT_TIMEOUT`, `unix.rs:4111`) and
+returns `ECONNREFUSED` on expiry, so a stall *inside* it could not present as a 40 s hang that
+never returns; the stall must be elsewhere. `SOCK_PROBE=N` was added to time the three phases of a
+raw AF_UNIX connect (connect / write / read) separately, which the `xdpyinfo` probe cannot split.
+
 ### Litebox finding so far (not yet fixed): a tar's mode bits above 0777 are dropped
 
 The archive entry for `tmp/` is `drwxrwxrwt` (01777); the guest reports `0o777` (`[boot] chmod
