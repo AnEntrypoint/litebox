@@ -274,6 +274,48 @@ dlopened xfce4 module (117 libs); the SVG pixbuf loader from `librsvg2-common` (
 `apt-get download` — the package is simply not installed on this host) plus a `loaders.cache`;
 `/usr/share/mime`; and `gtk-update-icon-cache` on all three icon themes.
 
+### Rung 4 — chromium inside the desktop, multi-process, no `--no-sandbox` (`r4a`)
+
+`rc=124` (hit `SECS=900` during the hold), out 12,612,862 B, err 9,067 B. **45 guest processes**, and
+the guest's own `/proc` census is the artifact — this is a desktop, not one binary:
+
+```
+73 /usr/bin/xfce4-session          30,47 xfconfd            21,44 dbus-launch
+63 xfce4-panel                     52 xfsettingsd           74 xfdesktop
+38 xfwm4                           71 .../panel/migrate     37 iceauth
+78/79/85 /usr/lib/chromium/chromium                 <- browser processes
+80/81/82 chrome_crashpad_handler
+86/87/91/92/116 chromium --type=zygote              <- BOTH zygotes
+119 /proc/self/exe --type=utility --utility-sub-type=network.mojom.NetworkService
+```
+
+`xfce4-session` no longer aborts (the icon/`iceauth` pass fixed it) and chromium runs
+**multi-process with two zygotes, no `--no-sandbox`**, inside the guest display.
+
+`xwininfo -root -tree` at rung 4 — **21 root children**, including
+
+```
+0x1c00001 "chromium": ("chromium" "Chromium")       <- chromium has a window on :0
+0x1600001 "xfdesktop": ("xfdesktop" "Xfdesktop")
+0x1800001 "xfsettingsd"   0x1200001 "xfce4-panel"   0x1400001 "migrate"
+0xe00001  "xfce4-session" 0x200001 "xfwm4"
+0x2018fc  210x234+40+40   16 children  <- xfwm4's frame around xclock
+```
+
+Frames: 4 captured, 3 with content, **231 distinct colours**. What painted:
+
+* **the root is now solid black** (737,989 of 786,432 px) where the bare server showed the weave
+  (589,824 black + 196,608 white) — that is `xfdesktop` setting the root background, i.e. the
+  desktop component did real work on the display;
+* **xclock inside its xfwm4 frame** — every non-weave colour lies inside bbox (40,40)-(249,273),
+  exactly the 210x234 frame.
+
+What had not painted when the capture was taken: `xfce4-panel` and chromium both show only their
+10x10+10+10 group-leader stubs, and no panel bar or browser content appears in the frame. Chromium
+had 15 s here; the other track measures ~19.7 s to first DOM. Honest reading: **the desktop and a
+multi-process chromium are up inside litebox and own X windows; whether they paint is not yet
+proven.** Re-run with a 60 s settle and a 240 s hold.
+
 ### The 2nd-connect hang is NOT the data plane (measured, both ways) — superseded above
 
 `CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
