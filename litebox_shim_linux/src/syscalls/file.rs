@@ -10832,11 +10832,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let retried = substituted.as_ref().and_then(|p| {
                             self.sys_openat(AT_FDCWD, p.as_str(), flags, Mode::empty()).ok()
                         });
+                        // Whether the receiver's view of this path differs from the donor's, or
+                        // whether the leaf itself is what is missing: opening the PARENT directory
+                        // answers it. Both answers are real -- the renderer is chrooted by layer-1,
+                        // so an absolute path that names a file in one process can name nothing in
+                        // another -- and it is the difference between "reopen by another key" and
+                        // "this path is not reachable here at all".
+                        let (parent, _) = path.rsplit_once('/').unwrap_or(("/", ""));
+                        let parent_err = match self.sys_openat(
+                            AT_FDCWD,
+                            parent,
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        ) {
+                            Ok(raw) => {
+                                let _ = self.sys_close(i32::try_from(raw).unwrap_or(-1));
+                                None
+                            }
+                            Err(parent_err) => Some(parent_err),
+                        };
                         litebox_util_log::warn!(
                             spec:% = spec, path:% = path, first_err:? = e,
                             substituted:% = substituted.as_deref().unwrap_or("none"),
-                            reopened:% = retried.is_some();
-                            "diag-procary: carried /proc/<pid> fd could not be reopened here"
+                            reopened:% = retried.is_some(), parent:% = parent,
+                            parent_err:? = parent_err;
+                            "diag-procary: carried fd could not be reopened here"
                         );
                         match retried.or_else(|| self.degraded_carried_file(flags, cloexec)) {
                             Some(raw) => raw,
