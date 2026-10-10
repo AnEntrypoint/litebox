@@ -57,6 +57,30 @@ Rules:
   high long after the orphans are gone; it is not the signal.
 - `nice -n 19` on everything, and **one runner at a time** via `mkdir /tmp/lbx/.runner-lock`.
 
+## A SUBCLASS REACHING 0 DOES NOT CLEAR THE CLASS (measured 2026-10-10)
+
+I declared "fd-rebuild is nearly cleared as causal" because `a5e8e289` took the **`/proc`** carried-fd
+rebuild failures from 8 -> 0 on a measured both-ways pair, and the run was still `rc=124` with
+`dump_dom_lines=0`. That inference was **wrong**: fd-rebuild was causal.
+
+`3291ce69` (an unopenable carried path installs a **placeholder**, so `missing_fds` stays 0) closed the
+*other* subclass - one font path - and the DOM **dumped**:
+
+| arm | rebuild failures | DOM |
+|---|---|---|
+| degrade ON (uz12) | 0 | **dumped**, `<title>litebox chromium</title>` + 4 divs, 19.67 s |
+| degrade OFF (uz13) | 2 (both the font) | **zero `<html>` in 1.93 MB** |
+
+Same binary, md5 `1221a7b51002407446c3fd`. With the `/proc` subclass at 0 and the font subclass at 2,
+two children were still dying of `MSG_CTRUNC`; only 0 **in total** was decisive.
+
+**RULE: when a fix is one member of a class of failures, the discriminator is the CLASS TOTAL, not the
+subclass the fix addressed.** "My subclass went to 0 and it still hangs" is evidence about that
+subclass only - it is not evidence that the class is exhausted. Before demoting a mechanism, count
+every remaining member by name; here the remaining two were logged on every prior run and I read past
+them because they were fonts and "a font cannot matter". True - **its content could not. The hole it
+left in the SCM_RIGHTS array could.**
+
 ## A `LITEBOX_*_OFF` SWITCH IS PRESENCE-CHECKED — `=0` MEANS OFF (measured 2026-10-10)
 
 `env_flag` is `var_os(name).is_some_and(|v| !v.is_empty())`
