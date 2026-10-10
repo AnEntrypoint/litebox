@@ -3487,6 +3487,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some((entry.name.clone()?, entry.size, flags))
     }
 
+    /// Carrier-file names [`Self::install_shm_file`] tries before it gives up on placing one. A
+    /// name can already be taken (see that function), so one name is not enough, but a name that
+    /// stays taken is a real failure and must not spin forever.
+    const CARRIER_NAME_ATTEMPTS: usize = 64;
+
     /// Builds a descriptor for the named shared object `name` in this process and returns its raw
     /// fd. The backing file is an anonymous `/dev/shm` file (created then unlinked, exactly what
     /// `memfd_create` does here) sized to `size` without allocating a new object, and its registry
@@ -3508,18 +3513,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // child's Mojo channel (96 dead children a run, each logging "Terminating current process
         // after 15 seconds with no connection"). Same reasoning -- and the same root-level
         // placement -- as `sys_memfd_create`'s `/.memfd:{id}`.
-        let path = alloc::format!(
-            "/.litebox-carried-{}-{}",
-            self.global.platform.current_host_pid(),
-            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        );
-        // 2026-10-08: every failure below used to be flattened to one errno, so "a Mojo buffer
-        // failed to cross into the child" named neither the STEP nor the real error. `install_shm_file`
-        // is 5 steps deep (named object -> carrier create -> truncate -> reopen -> registry) and the
-        // one observed failure was EEXIST from somewhere in them; name the step and keep the errno.
-        let stage_log = |stage: &str, e: Errno| {
+        let stage_log = |stage: &str, path: &str, e: Errno| {
             litebox_util_log::warn!(
-                stage:% = stage, name:% = name, size:% = size, path:% = path.as_str(),
+                stage:% = stage, name:% = name, size:% = size, path:% = path,
                 errno:% = format_args!("{:?}", e),
                 host_pid:% = self.global.platform.current_host_pid();
                 "diag-shmcarry: install_shm_file failed"
@@ -3530,14 +3526,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .global
             .platform
             .create_named_shared_memory(name, size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE))
-            .map_err(|_| stage_log("create_named_shared_memory", Errno::ENOMEM))?;
+            .map_err(|_| stage_log("create_named_shared_memory", "", Errno::ENOMEM))?;
         // Creating and unlinking that name is the kernel's own bookkeeping, never subject to the
         // caller's permissions on `/`, exactly as in `sys_memfd_create`.
         let _root = litebox::fs::ident::root_guard();
         let create_flags = OFlags::RDWR | OFlags::CREAT | OFlags::EXCL | OFlags::CLOEXEC;
-        let creator = self
-            .sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR)
-            .map_err(|e| stage_log("carrier_create_openat", e))?;
+        // `current_host_pid()` reads 0 for EVERY process on the Linux host and the counter is
+        // process-local, so two processes of one fork family issue the SAME carrier name -- a fork
+        // child that inherited a name its own counter is about to re-issue hits `O_EXCL`'s EEXIST,
+        // the carried memfd is dropped, `recvmsg` raises `MSG_CTRUNC` for it, and Mojo reads that
+        // as a closed channel (`socket_utils_posix.cc`: `return missing_fds ? 0 : result;`), which
+        // is a renderer that activates its seccomp sandbox and then `_exit(0)`. Take the next name
+        // instead. `LITEBOX_SHM_CARRIER_RETRY_OFF=1` restores the single-name behaviour.
+        let retry = !self.global.platform.env_flag("LITEBOX_SHM_CARRIER_RETRY_OFF");
+        let mut path = alloc::string::String::new();
+        let mut creator = None;
+        for _ in 0..Self::CARRIER_NAME_ATTEMPTS {
+            path = alloc::format!(
+                "/.litebox-carried-{}-{}",
+                self.global.platform.current_host_pid(),
+                MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            );
+            match self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR) {
+                Ok(fd) => {
+                    creator = Some(fd);
+                    break;
+                }
+                Err(e @ Errno::EEXIST) if retry => {}
+                Err(e) => return Err(stage_log("carrier_create_openat", path.as_str(), e)),
+            }
+        }
+        let creator = creator
+            .ok_or_else(|| stage_log("carrier_create_openat", path.as_str(), Errno::EEXIST))?;
         let key = {
             let files = self.files.borrow();
             files
@@ -3569,10 +3589,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen_flags, Mode::empty());
         let _ = self.sys_close(i32::try_from(creator).map_err(|_| Errno::EINVAL)?);
         let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
-        let raw = raw.map_err(|e| stage_log("carrier_reopen_openat", e))?;
+        let raw = raw.map_err(|e| stage_log("carrier_reopen_openat", path.as_str(), e))?;
         let key = key.ok_or_else(|| {
             let _ = i32::try_from(raw).map(|fd| self.sys_close(fd));
-            stage_log("carrier_truncate_or_status", Errno::EBADF)
+            stage_log("carrier_truncate_or_status", path.as_str(), Errno::EBADF)
         })?;
         // 2026-10-08: the success counterpart of the `diag-shmcarry` failure lines above -- without
         // a count of the carries that DO land, "one EEXIST" cannot be told apart from "every Mojo
@@ -8769,7 +8789,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let proxy = self.global.get_proxy(fd)?;
                         Ok(proxy.pending_rx_bytes())
                     },
-                    |_unix| Err(Errno::EINVAL),
+                    |_unix| {
+                        // Linux's `FIONREAD` (`SIOCINQ`) reports the bytes queued for a receive on
+                        // a unix socket too: `unix_ioctl` only refuses it for a *listening* inet
+                        // socket. EINVAL here made a guest that polls its Mojo channel for how
+                        // much is pending conclude the descriptor was not a socket at all.
+                        if self
+                            .global
+                            .platform
+                            .env_flag("LITEBOX_UNIX_RECV_FIDELITY_OFF")
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        Ok(_unix
+                            .readable_bytes()
+                            .ok_or(Errno::EINVAL)?)
+                    },
                 )?;
                 out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
                     .ok_or(Errno::EFAULT)?;

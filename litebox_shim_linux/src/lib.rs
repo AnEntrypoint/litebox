@@ -928,6 +928,16 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             slot:? = slot;
             "shared kernel state: branch taken"
         );
+        // `LITEBOX_DIAG_STUCK_SECS=<secs>`: the per-thread "which syscall am I in" record must be
+        // allocated by the ONE process that creates the kernel state, since it is the only point
+        // every `fork()` descendant inherits both the mapping and the published pointer.
+        crate::diag::init_stuck(|| platform.env_value("LITEBOX_DIAG_STUCK_SECS"));
+        if attached.is_none() {
+            crate::diag::allocate_stuck_table(platform);
+            // A fork family in which EVERY thread is parked has no dispatch to hang a dump on, so
+            // the creator arms the ticker that prints the shared table from a host thread instead.
+            crate::diag::spawn_stuck_ticker(platform);
+        }
         let inner = attached.unwrap_or_else(|| {
                 let mut net = Network::new(&self.litebox);
                 net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
@@ -976,6 +986,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
                         drm: syscalls::drm::DrmSubsystem::new(),
                         evdev: syscalls::evdev::EvdevSubsystem::new(),
+                        shared_futex_wake: syscalls::process::SharedFutexWake::new(),
                     },
                 )
             });
@@ -985,6 +996,17 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // `build()` too) because the fs module stores them as plain function pointers.
         litebox::fs::ident::set_id_map_write_fn(syscalls::process::apply_id_map_write);
         litebox::fs::ident::set_id_map_read_fn(syscalls::process::read_id_map_file);
+        // From the HOST env, like every other `LITEBOX_*` switch: `LITEBOX_PROC_USERNS_MAPS_OFF=1`
+        // restores the older, less faithful answers (`/proc/<pid>/uid_map` ENOENT, and `EBADF`
+        // instead of `EPERM` for a refused write). A guest `--env` cannot set it.
+        litebox::fs::ident::set_id_map_linux_semantics(
+            !self.platform.env_flag("LITEBOX_PROC_USERNS_MAPS_OFF"),
+        );
+        // `LITEBOX_SHARED_FUTEX_WAKE_OFF=1` restores the older behaviour in which a futex requested
+        // without `FUTEX_PRIVATE_FLAG` is served entirely by this process's own `FutexManager`.
+        syscalls::process::set_shared_futex_wake(
+            !self.platform.env_flag("LITEBOX_SHARED_FUTEX_WAKE_OFF"),
+        );
         // Same shape, for `/proc/<pid>`: whether a pid exists is a fact only the process model
         // owns, and under `LITEBOX_PROCESS_FORK=1` the pid may be running in a DIFFERENT host
         // process than the one asking. `proc_self_info` is per host process, so it cannot answer
@@ -998,6 +1020,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // a one-process system; without the second, every foreign pid is nameless.
         litebox::fs::procfs::set_pid_list_fn(syscalls::signal::xproc::live_pids);
         litebox::fs::procfs::set_pid_identity_fn(syscalls::signal::xproc::pid_identity);
+        // `LITEBOX_PROC_PID_LENIENT_OFF=1` restores the older answer, `ENOENT` for a pid that no
+        // source here can name.
+        litebox::fs::procfs::set_pid_lenient(
+            !self.platform.env_flag("LITEBOX_PROC_PID_LENIENT_OFF"),
+        );
         LinuxShim(GlobalStateHandle {
             inner,
             litebox: my_litebox,
@@ -2404,6 +2431,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.platform.env_value("LITEBOX_SPIN_STACK")
         });
         crate::diag::init_parked(|| self.global.platform.env_flag("LITEBOX_PARKED"));
+        crate::diag::init_stuck(|| self.global.platform.env_value("LITEBOX_DIAG_STUCK_SECS"));
         crate::diag::set_mainthread_enabled(
             self.global.platform.env_flag("LITEBOX_DIAG_MAINTHREAD"),
         );
@@ -2605,7 +2633,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // never returns still shows up (see `diag`'s parked section for why the existing
         // exit-time instruments cannot answer this).
         let parked = crate::diag::parked_enabled();
-        let now_ms = if parked {
+        let stuck = crate::diag::stuck_enabled();
+        let now_ms = if parked || stuck {
             crate::diag::now_ms(self.global.platform)
         } else {
             0
@@ -2615,6 +2644,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             crate::diag::inflight_enter(
                 core::ptr::addr_of!(*self) as u64,
                 host_pid,
+                syscall_number,
+                [
+                    ctx.syscall_arg(0) as u64,
+                    ctx.syscall_arg(1) as u64,
+                    ctx.syscall_arg(2) as u64,
+                    ctx.syscall_arg(3) as u64,
+                ],
+                self.pid.get(),
+                self.tid.get(),
+                &comm_bytes,
+                now_ms,
+            );
+        }
+        if stuck {
+            crate::diag::stuck_enter(
+                self.global.platform.current_host_pid() as i32,
+                core::ptr::addr_of!(*self) as u64,
                 syscall_number,
                 [
                     ctx.syscall_arg(0) as u64,
@@ -2655,6 +2701,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let host_pid = self.global.platform.current_host_pid() as i32;
             crate::diag::inflight_exit(core::ptr::addr_of!(*self) as u64);
             crate::diag::clear_thread_note(core::ptr::addr_of!(*self) as u64);
+        }
+        if stuck {
+            crate::diag::stuck_exit(self.pid.get(), self.tid.get(), now_ms);
         }
 
         if is_target {
@@ -2697,6 +2746,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         if parked {
             crate::diag::maybe_dump_inflight(self.global.platform, now_ms);
+        }
+        if stuck {
+            crate::diag::maybe_dump_stuck(now_ms);
         }
         #[cfg(target_arch = "x86_64")]
         crate::diag::maybe_dump_rip_histogram(self.global.platform);
@@ -4644,6 +4696,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// (see `Task::sys_memfd_create`) -- guarantees two concurrent calls never collide on the
     /// same path even with an identical (or empty) guest-supplied name.
     next_memfd_id: core::sync::atomic::AtomicU64,
+    /// Cross-process wake channel for futexes requested without `FUTEX_PRIVATE_FLAG`; see
+    /// `syscalls::process::SharedFutexWake`'s own doc comment. A plain, pointer-free field of this
+    /// same struct, so it rides on `GlobalState`'s own arena sharing for free, exactly like
+    /// `record_lock_pollee`.
+    shared_futex_wake: syscalls::process::SharedFutexWake<Platform>,
     /// The one virtual DRM/KMS device's state (`/dev/dri/card0`). Shim-wide, not per-process,
     /// since real DRM device state (allocated buffers, current mode/framebuffer) is genuinely
     /// global -- any process holding a fd to the card sees the same connector/CRTC/buffers, just

@@ -382,6 +382,32 @@ fn pid_known(pid: i32) -> bool {
     f(pid)
 }
 
+/// Whether `/proc/<pid>` resolves for a pid that NONE of [`ProcSelfTable`], [`caller_pid`] or
+/// [`pid_known`] can name. The shim sets this from `LITEBOX_PROC_PID_LENIENT_OFF`.
+///
+/// A pid absent from every source here is not evidence that no process has it: a pid that crossed
+/// one process boundary too many (a renderer forked from a zygote that was itself forked) can be
+/// missing from this host process's row table and from the cross-process registry at once while
+/// being plainly alive. Answering `ENOENT` there is not a neutral "unknown" -- a carried
+/// `/proc/<pid>/{statm,status}` fd then fails to rebuild in the receiver, `recvmsg` reports
+/// `MSG_CTRUNC`, and Mojo folds that into a zero-length read and terminates the child
+/// (`socket_utils_posix.cc`: `return missing_fds ? 0 : result;`). Real Linux never fails to
+/// install a donated fd, which is why the kernel has no such failure mode to copy: a pid-only
+/// shell is strictly closer to it than `ENOENT` is.
+static PID_LENIENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Registers whether `/proc/<pid>` resolves for a pid no source here can name; see [`PID_LENIENT`].
+pub fn set_pid_lenient(on: bool) {
+    PID_LENIENT.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A pid no source here can name is served as a [`ProcSelfInfo`] shell when this is on. pids are
+/// positive by definition, so `0` and anything the caller made up as a negative number stay
+/// `ENOENT`.
+fn pid_lenient(pid: i32) -> bool {
+    pid > 0 && PID_LENIENT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Everyone [`pid_known`] can name, for `/proc`'s own directory listing.
 ///
 /// [`pid_known`] alone cannot produce that listing: "does this one pid exist" is the wrong
@@ -530,7 +556,7 @@ where
         if self.proc_self_info.read().get(pid).is_some() {
             return true;
         }
-        self.caller_pid() == Some(pid) || pid_known(pid)
+        self.caller_pid() == Some(pid) || pid_known(pid) || pid_lenient(pid)
     }
 
     /// The [`ProcSelfInfo`] `/proc/<pid>/*` renders from: this host process's own row when there
@@ -540,7 +566,7 @@ where
         if let Some(info) = self.proc_self_info.read().get(pid).cloned() {
             return Some(info);
         }
-        if self.caller_pid() != Some(pid) && !pid_known(pid) {
+        if self.caller_pid() != Some(pid) && !pid_known(pid) && !pid_lenient(pid) {
             return None;
         }
         // A pid running in another host process: no row here, so everything that comes from the
@@ -575,6 +601,28 @@ where
         } else {
             tids
         }
+    }
+    /// Applies a write to one of the id-map control files served as `/proc/<own-pid>/...`; see
+    /// [`ProcSelf::write`], which does the same thing for the `/proc/self` spellings of the same
+    /// three files.
+    fn write_id_map_file(
+        &self,
+        id_map: crate::fs::ident::IdMapFile,
+        buf: &[u8],
+    ) -> Result<usize, WriteError> {
+        crate::fs::ident::write_id_map_file(id_map, buf)
+            .map(|()| buf.len())
+            .map_err(|errno| match errno {
+                // `WriteError` carries no errno, so a refusal can only take one of the shapes this
+                // enum has: `PermissionDenied` is `EPERM`/`EACCES`, and a malformed map (`EINVAL`)
+                // is `Io`. With `LITEBOX_PROC_USERNS_MAPS_OFF=1` every refusal collapses to
+                // `NotForWriting` (`EBADF`), the older, less faithful answer.
+                1 | 13 if crate::fs::ident::id_map_linux_semantics() => {
+                    WriteError::PermissionDenied
+                }
+                1 | 13 => WriteError::NotForWriting,
+                _ => WriteError::Io,
+            })
     }
 }
 
@@ -645,6 +693,15 @@ enum ProcPidEntry {
     OomAdj,
     Environ,
     Statm,
+    /// `/proc/<pid>/uid_map`. Served for the CALLER's own pid only, and only while
+    /// [`crate::fs::ident::id_map_linux_semantics`] is on: another process's map is its own
+    /// credentials, which this table does not carry, so naming it there would answer with the
+    /// reader's map under a pid that is not the reader's.
+    UidMap,
+    /// `/proc/<pid>/gid_map`; see [`Self::UidMap`].
+    GidMap,
+    /// `/proc/<pid>/setgroups`; see [`Self::UidMap`].
+    Setgroups,
 }
 
 impl ProcPidEntry {
@@ -657,10 +714,24 @@ impl ProcPidEntry {
         ("oom_adj", ProcPidEntry::OomAdj),
         ("environ", ProcPidEntry::Environ),
         ("statm", ProcPidEntry::Statm),
+        ("uid_map", ProcPidEntry::UidMap),
+        ("gid_map", ProcPidEntry::GidMap),
+        ("setgroups", ProcPidEntry::Setgroups),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)
+    }
+
+    /// The id-map control file this entry is, if any: those three are the only writable entries
+    /// here, and their contents come from the CALLER's credentials, not from `pid`'s row.
+    fn as_id_map_file(self) -> Option<crate::fs::ident::IdMapFile> {
+        match self {
+            Self::UidMap => Some(crate::fs::ident::IdMapFile::UidMap),
+            Self::GidMap => Some(crate::fs::ident::IdMapFile::GidMap),
+            Self::Setgroups => Some(crate::fs::ident::IdMapFile::Setgroups),
+            _ => None,
+        }
     }
 }
 
@@ -764,8 +835,14 @@ where
                     continue;
                 }
                 ProcfsDirHandle::PidTask(pid) => {
+                    // Same reason as [`pid_lenient`]: a thread id this process cannot enumerate is
+                    // not a thread that does not exist, and Chromium opens
+                    // `/proc/<pid>/task/<tid>/status` for tids only the owning process can list.
                     let known = parse_pid_component(component)
-                        .is_some_and(|tid| self.task_ids(pid).contains(&tid));
+                        .is_some_and(|tid| self.task_ids(pid).contains(&tid))
+                        || parse_pid_component(component).is_some_and(|tid| {
+                            tid > 0 && pid_lenient(pid)
+                        });
                     if !known {
                         return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                     }
@@ -856,6 +933,22 @@ where
             ProcfsDirHandle::Pid(pid) => {
                 let entry = ProcPidEntry::from_name(name)
                     .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                // The id-map control files are the caller's own credentials, so they exist under
+                // `/proc/<pid>` only for the caller's own pid -- see `ProcPidEntry::UidMap`.
+                if let Some(id_map) = entry.as_id_map_file() {
+                    if !crate::fs::ident::id_map_linux_semantics()
+                        || self.caller_pid() != Some(pid)
+                    {
+                        return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
+                    }
+                    return Ok(Permissioned {
+                        item: FileHandle::from_typed::<Self>(ProcfsFileHandle {
+                            kind: ProcfsFileKind::Pid(pid, entry),
+                            content: crate::fs::ident::read_id_map_file(id_map),
+                        }),
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                }
                 // The process may have exited between the `readdir` that found this pid and this
                 // `open` -- real Linux reports the same ENOENT for that race. A pid this host
                 // process has no row for still resolves when it is the caller's own or the shim
@@ -871,6 +964,13 @@ where
                     ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj => b"0\n".to_vec(),
                     ProcPidEntry::Environ => info.environ.clone(),
                     ProcPidEntry::Statm => format_statm(&info),
+                    // These three are answered and returned above -- `as_id_map_file` is `Some`
+                    // for exactly them -- so this arm only keeps the match exhaustive. Answering
+                    // ENOENT rather than panicking is the safer shape for a branch that cannot be
+                    // reached: a guest-visible path must never abort the host process.
+                    ProcPidEntry::UidMap | ProcPidEntry::GidMap | ProcPidEntry::Setgroups => {
+                        return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+                    }
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
             }
@@ -932,9 +1032,17 @@ where
                 }));
                 Ok(entries)
             }
-            ProcfsDirHandle::Pid(_) => {
+            ProcfsDirHandle::Pid(pid) => {
                 let mut entries: Vec<DirEntry> = ProcPidEntry::ALL
                     .iter()
+                    // The id-map control files are listed only where `open_file_at` will serve
+                    // them: a name `readdir` offers and `open` then ENOENTs is a directory that
+                    // lies about its own contents.
+                    .filter(|(_, e)| {
+                        e.as_id_map_file().is_none()
+                            || (crate::fs::ident::id_map_linux_semantics()
+                                && self.caller_pid() == Some(pid))
+                    })
                     .map(|(n, _)| DirEntry {
                         name: String::from(*n),
                         file_type: FileType::RegularFile,
@@ -989,21 +1097,38 @@ where
     }
 
     fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        let handle = h.get_typed::<Self>();
         // The OOM-killer knobs are accepted and ignored: nothing here ever OOM-kills, and the
         // callers (Chromium's zygote host) only log a failure to set them.
-        match h.get_typed::<Self>().kind {
+        match handle.kind {
             ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj) => {
                 Ok(buf.len())
+            }
+            // A `/proc/<own-pid>/{uid_map,gid_map,setgroups}` write is the same operation as the
+            // `/proc/self` one: it remaps the CALLER's ids.
+            ProcfsFileKind::Pid(pid, entry) if entry.as_id_map_file().is_some() => {
+                let Some(id_map) = entry.as_id_map_file() else {
+                    return Err(WriteError::NotForWriting);
+                };
+                if self.caller_pid() != Some(pid) {
+                    return Err(WriteError::PermissionDenied);
+                }
+                self.write_id_map_file(id_map, buf)
             }
             _ => Err(WriteError::NotForWriting),
         }
     }
-
     /// The OOM-killer knobs are the only writable entries here, and their write is
     /// accepted-and-ignored rather than stored: copying one into an upper layer would fabricate a
-    /// file that answers every later read with whatever was last written to it.
+    /// file that answers every later read with whatever was last written to it. The id-map control
+    /// files are the exception -- a write to one remaps the calling process's ids, so it has to
+    /// reach this backend.
     fn services_own_writes(&self, path: &str) -> bool {
-        path.ends_with("/oom_score_adj") || path.ends_with("/oom_adj")
+        path.ends_with("/oom_score_adj")
+            || path.ends_with("/oom_adj")
+            || path.ends_with("/uid_map")
+            || path.ends_with("/gid_map")
+            || path.ends_with("/setgroups")
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -1041,10 +1166,13 @@ where
         Ok(FileStatus {
             nlink: 1,
             file_type: FileType::RegularFile,
+            // Real Linux's id-map control files are owner-writable, so a guest that checks `W_OK`
+            // before writing has to see that here too.
             mode: if matches!(
                 h.kind,
                 ProcfsFileKind::Pid(_, ProcPidEntry::OomScoreAdj | ProcPidEntry::OomAdj)
-            ) {
+            ) || matches!(h.kind, ProcfsFileKind::Pid(_, entry) if entry.as_id_map_file().is_some())
+            {
                 Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
             } else {
                 Mode::RUSR | Mode::RGRP | Mode::ROTH
@@ -1782,9 +1910,14 @@ where
         crate::fs::ident::write_id_map_file(id_map, buf)
             .map(|()| buf.len())
             .map_err(|errno| match errno {
-                // `WriteError` carries no errno, so a refusal can only take the shape every other
-                // fs refusal takes (`NotForWriting`, rendered as `EBADF`, as `nine_p`'s own errno
-                // conversion does for `EPERM`/`EACCES`); a malformed map (`EINVAL`) is `Io`.
+                // `WriteError` carries no errno, so a refusal can only take one of the shapes this
+                // enum has: `PermissionDenied` is the `EPERM`/`EACCES` Linux answers for a write
+                // outside a user namespace, and a malformed map (`EINVAL`) is `Io`. With
+                // `LITEBOX_PROC_USERNS_MAPS_OFF=1` every refusal collapses to `NotForWriting`
+                // (`EBADF`), the older, less faithful answer.
+                1 | 13 if crate::fs::ident::id_map_linux_semantics() => {
+                    WriteError::PermissionDenied
+                }
                 1 | 13 => WriteError::NotForWriting,
                 _ => WriteError::Io,
             })
