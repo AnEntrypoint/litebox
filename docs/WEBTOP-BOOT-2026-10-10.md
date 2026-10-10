@@ -120,6 +120,31 @@ Repeated as `r2b` (rc=0, out 15,749,107 B, 5 frames, 4 distinct): xclock paints 
 (frames 3-5, 220-225 distinct colours) and `xfwm4` fails identically
 (`20:28:14.456: cannot open display: :0`). Two failures in a row rules out "flaky 1-in-6".
 
+### Rung 2 with `-noreset` (`r2c`, rc=0) — the hang is gone, `xfwm4` dies on a missing data file
+
+`CONN_PROBE=6`, same binary, only the flag added:
+
+```
+connprobe 0..5 elapsed=0.06/0.06/0.07/0.06/0.07/0.06 rc 0 bytes 2365   (was: probe 1 = 40 s FAILED)
+```
+
+`xfwm4` no longer reports `cannot open display` — it connects, creates its offscreen window
+(`0x400001 10x10+-20+-20`, same as `r3`) and then dies:
+
+```
+(xfwm4:12): dbind-WARNING: AT-SPI: Error retrieving accessibility bus address: ... Spawn.ExecFailed
+(xfwm4:12): xfwm4-WARNING **: 20:58:49.156: Missing defaults file
+[boot] DIED /usr/bin/xfwm4 pid 12 rc 1
+```
+
+**Another rootfs gap, not litebox**: `dpkg -L xfwm4` puts that file at `/usr/share/xfwm4/defaults`
+(1,679 B) and the archive did not contain `/usr/share/xfwm4` at all. Added; a diff of every host path
+under `/usr/share/{xfce4,xfwm4,dbus-1,themes/Default*,themes/Greybird,icons/default}` and `/etc/xdg`
+against the archive then reports **972 checked, 0 missing**, so the desktop data is now complete.
+
+`xclock` still paints and still repaints (2 frames, both distinct, 217 colours, black 589,824 ->
+560,611 = the 40,000 px window over the weave).
+
 ### The "2nd connection" blocker was **Xvfb's own server reset** — a launch flag, not litebox
 
 `SOCK_PROBE=N` times the three phases of a raw AF_UNIX connect (no libX11 in the way). `sp2`
