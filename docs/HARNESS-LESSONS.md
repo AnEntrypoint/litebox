@@ -47,6 +47,12 @@ Rules:
 - Sweep by the **private** name: `pkill -KILL -f 'lbxrun'` (the `/tmp/lbx/lbxrun` symlink). Never
   `pkill -f litebox_runner` - that matches the runner path inside *other* agents' argv and kills their
   in-flight work. Sweep at the START and END of every script.
+- **`pgrep -f lbxrun` COUNTS THE SHELL THAT IS RUNNING IT.** A one-liner containing the pattern
+  matches itself (and its `bash -c` wrapper), so a bare `pgrep -c -f lbxrun` reported "14 orphans"
+  when the machine had **zero**. Use `pgrep -x lbxrun` (match `comm`) or the bracket trick
+  `pgrep -f '[l]bxrun'`, and confirm with `ps -o pid,ppid,etimes -p <pid>` before acting: a real
+  orphan has `ppid` 1 and a large `etimes`. **A false-positive census is as dangerous as a missed
+  one** - it invites a `pkill` that lands on another track's live run.
 - Gate each arm on **1-minute load < 4 and `MemAvailable` > 2 GB**, polling. The 5-minute average stays
   high long after the orphans are gone; it is not the signal.
 - `nice -n 19` on everything, and **one runner at a time** via `mkdir /tmp/lbx/.runner-lock`.
