@@ -316,6 +316,85 @@ had 15 s here; the other track measures ~19.7 s to first DOM. Honest reading: **
 multi-process chromium are up inside litebox and own X windows; whether they paint is not yet
 proven.** Re-run with a 60 s settle and a 240 s hold.
 
+### Rung 4 with a 60 s settle and a 240 s hold (`r4c`, rc=0) — chromium has a real, managed 1023x767 window, and the screen still reads black
+
+`rc=0`, out 44,115,119 B, err 17,071 B, 14 root frames of 3,148,907 B each, **65 guest processes** at
+the final census. The run ended on its own (`SECS=1500`), so nothing here is a truncated arm.
+
+**The 10x10 "chromium" of `r4a` was a group leader, not the window.** The final tree has 18 root
+children, and among them:
+
+```
+0x201d5a (has no name): ()  1023x767+5+5  +5+5          <- xfwm4's frame, 16 children
+    0xe00003 "litebox chromium - Chromium": ("chromium-browser (/tmp/home/udd)" "Chromium-browser")  1023x767+0+0  +5+5
+0x1200001 "chromium": ("chromium" "Chromium")  10x10+10+10        <- the group leader stub
+```
+
+`0xe00003` is **full screen, reparented into an xfwm4 frame with titlebar buttons and corner
+handles, and titled `litebox chromium - Chromium`** — the title is `page.html`'s `<title>`, so
+chromium navigated the document and set its window title from the DOM. Multi-process, no
+`--no-sandbox`, inside webtop, inside litebox. **`r4a`'s "chromium showed only a 10x10 stub" was a
+settle-time artifact: the window needs ~60 s to be mapped and managed.**
+
+**But every frame from #3 on is 786,432 black pixels, `distinct=1`** — and xclock vanishes with
+them (frame 2 has 38,253 white px of clock face, frame 3 has none). Two independent clients do not
+both stop painting; something covers the screen. The trees name it: `0x201974` goes from
+`10x49+0+0` (tree 1, before the session) to **`1023x767+0+0`** (trees 2 and 3), full screen, and it
+stacks **above** chromium's window, which was mapped later — only a redirected/overlay window can do
+that. The log lines up: `(xfwm4:52) Could not find a screen to manage, exiting`, then
+`(xfwm4:6) Another compositing manager is running on screen 0`. The session's `xfwm4` took
+`_NET_WM_CM_Sn`, created the composite overlay, exited, and left a fullscreen overlay mapped with
+nobody painting into it; the selection stays owned, so nobody can take it back.
+
+So the display is not broken — it is **covered by a compositing overlay**, and with windows
+redirected, both `xwd -root` and `xwd -id` read that overlay. Two changes, both ours:
+
+* `xfwm4 --display :0 --replace --compositor=off` for the instance boot.py spawns;
+* xfconf seeded **before** `xfce4-session` starts, since the session spawns its own unflagged
+  `xfwm4`: `$XDG_CONFIG_HOME/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml` with
+  `use_compositing` = false;
+* and the capture that separates *covered* from *unpainted*: `xwd -id <window>` grabs on the
+  biggest windows (chromium, xclock, the fullscreen one), not just `-root`.
+
+### With compositing off (`r4d`, rc=0, out 76,390,799 B) — the overlay is gone, and chromium's window is still empty
+
+`xfwm4 --display :0 --replace --compositor=off` for the instance boot.py spawns, plus
+`xfconf seeded /tmp/home/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml bytes 207` before
+`xfce4-session` starts (`use_compositing` = false), plus `xwd -id` grabs on the biggest windows.
+31 frames; 65 guest processes; the run ends on its own.
+
+**The black overlay is gone.** Frames 3-31 read `distinct=3`: **777,497 px of (206,206,206)** — a
+flat grey field with the 1 px black edge windows xfwm4 puts at the screen borders
+(`0x200035 1x768+-1+0`, `0x200037 1024x1+0+-1`) — plus 6,701 black and 2,234 white. No frame is
+all-black any more.
+
+**But the two `xwd -id` grabs settle the question the coordinator asked, against the covering
+theory:**
+
+| grab | size | result |
+|---|---|---|
+| `0xe00002 "litebox chromium - Chromium"` (chromium's window) | 1019x763 | `md5=ef53401dd535`, `distinct=1`, **uniform (206,206,206)** |
+| `0x201c43` (the unnamed fullscreen window) | 1019x763 | **the same md5** — byte-identical to chromium's |
+| `0x80000c "xclock"` | 200x200 | `distinct=1`, **uniform black** |
+
+Chromium's grab is byte-identical to the fullscreen window behind it, so the pixels in
+chromium's region are still the ones painted underneath — **chromium's window is mapped
+fullscreen and has never drawn**, and everything below it (xclock, panel) is hidden behind that
+undrawn region. A window that is mapped but unpainted leaves the framebuffer showing what was
+there before, which is why the whole screen is one flat grey. So: not a compositing overlay, not
+stacking — **multi-process chromium maps a correctly managed 1023x767 window and never
+composites into it.** (`--single-process` is the configuration that did paint here:
+`docs/VISIBILITY-PROVEN-2026-10-10.md`, 2400 distinct colours.) Per-window grabs are what
+settled it; root grabs alone could not.
+
+Run 4 (`r4e`, rc=11, out 3,156,212 B) is the loader fix landing in the wrong place: moving
+`loaders.cache` from `.../2.10.0/loaders/` to `.../2.10.0/` (where gdk-pixbuf's compiled-in
+default looks) did **not** stop `(xfce4-session pid 32 rc 134)` on
+`gtkiconhelper.c:495 ... Failed to load .../image-missing.svg: No image loaders are configured.
+Used config: Config { image_loader: {}, image_editor: {} }`. That empty config is **glycin**, not
+gdk-pixbuf: the rootfs ships `libglycin-2.so.0` but none of `/usr/libexec/glycin-loaders/2+/`
+or `/usr/share/glycin-loaders/2+/conf.d/`, so GTK has no loader process to spawn.
+
 ### The 2nd-connect hang is NOT the data plane (measured, both ways) — superseded above
 
 `CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
