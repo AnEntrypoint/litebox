@@ -496,3 +496,40 @@ so `S_ISUID`/`S_ISGID`/`S_ISVTX` are silently lost on this platform only. `Mode`
 sticky inside the guest (harmless for a single-user desktop, but a setuid-root binary unpacked
 from a tar would lose its bit). Not yet fixed because the desktop does not need it to boot;
 recorded as the first candidate litebox fix.
+
+## The guest census is the 512-slot process table, and on Linux nothing ever frees a slot
+
+Measured at rung 3 of `r4g`: **guest census 505, host `lbxrun` processes 14.** Not ~500 host
+forks, and not a pid allocator that hands out a fresh number per `clone()` — the third
+possibility:
+
+* `ls /proc`'s numeric entries come from `live_pids()` (`litebox_shim_linux/src/syscalls/signal/xproc.rs:472`)
+  = `SharedProcessTable::members()`, a **fixed array of `SHARED_PROCESS_CAPACITY = 512` slots**
+  (`xproc.rs:38`). So 512 is the ceiling on what `/proc` can ever list, and 505 is 98.6 % of it.
+* A slot is freed in exactly three places and **all three are dead on this platform**:
+  1. `Task::xproc_unregister` (`xproc.rs:670`) began `if self.xproc_host().is_none() { return; }`,
+     and `xproc_host()` is `None` whenever `current_host_pid()` is `0` — which is the **default
+     trait impl** (`litebox/src/platform/mod.rs:1305-1308`, "or `0` when the platform has no
+     cross-process signal delivery") that `litebox_platform_linux_userland` never overrides.
+  2. `reclaim_dead_hosts` (`xproc.rs:358`) **skips `host_pid == 0` by design** ("carries no host to
+     test: reclaiming it would drop a live process").
+  3. `xproc_alive_or_release` (`xproc.rs:803`) is only reached from `xproc_send*`, which also
+     return `ESRCH` before it when `xproc_host()` is `None`.
+* Therefore the table is **APPEND-ONLY for the whole run**: every pid ever minted stays listed in
+  `/proc` after it exits. A guest pid on this path IS the real host pid of a real `fork()`
+  (`reinit_as_native_fork_child`, `process.rs:5043-5049`: "A real pid from a real `fork()` is
+  always > 0 here"), and host pids are handed out monotonically, so the count is **processes
+  created since boot, not processes alive** — ~505 over a 900 s xfce4 + chromium run is
+  unremarkable. That also explains the observed pid spacing and why the census only appeared once
+  the run got far enough to spawn that many.
+* When it fills: `register` logs `DIAG proc-table register FAILED no free slot` (`xproc.rs:347`)
+  and returns `None`; `xproc_preregister_child` ignores the failure, so from that point every new
+  process has no `/proc/<pid>` at all (`pid_is_known()` false → ENOENT) and no registry row.
+  **The webtop logs carry no `DIAG` lines whatsoever** (checked `log-r4*.txt`, `log-r5*.txt`,
+  `log-hl1.txt`: 0 occurrences), so none of this could be read off `log-r4f.txt`.
+* Fix applied (written 23:40, **not built and not measured** — hl2 held the box, and building
+  while an arm runs is forbidden): drop the `xproc_host()` guard from `xproc_unregister`. All
+  four call sites (`process.rs:3145`, `:3294`, `:3462`, `:3545`) are **post-reap** — the child has
+  already exited and been waited for — so freeing the slot there is Linux's own semantics, and it
+  is what makes a dead pid disappear from `/proc`. On a platform with real host identity
+  (`current_host_pid() != 0`) the guard was a no-op, so nothing changes there.
