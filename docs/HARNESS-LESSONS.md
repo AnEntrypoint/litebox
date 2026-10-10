@@ -27,3 +27,26 @@ AGENTS.md keeps only the rules needed on every run; this file keeps the mechanis
 - **A file another process holds is reported as "not found or empty".** `agentplug/crates/agentplug-host/src/imports.rs:455` does `fs::read_to_string(&full)` with `Err(_) => 0`, which conflates locked, empty and non-UTF8 into one message. Reproduced live against `.wfgy/.livepeek.chrF37.err.tmp` with runners up.
 - **The MCP HTTP fallback is already automatic.** 8787 listening, `/health` ok, `ensure-http` is idempotent ("reusing", "supervisor already-running") behind an autostart VBS + a 1-minute schtask.
 - Guest-probe trivia kept here: ctypes prototypes - a `[c_long]+[c_ulong]*6` prototype needs SEVEN args; `c_char_p` cannot go in a `c_ulong` slot.
+
+## `timeout` DOES NOT KILL THE RUNNER'S FORK CHILDREN (measured 2026-10-10)
+
+`has_native_fork()` is unconditionally `true` (`litebox_platform_linux_userland/src/lib.rs:3447`), so every
+guest `clone()` without `CLONE_FS`/`CLONE_FILES` becomes a **real host `fork()`**. `timeout -s KILL <n>`
+kills only the parent it spawned; **those children survive as orphans and are reaped by nobody.**
+
+Measured: `uz4`+`uz5` left **18 orphaned `lbxrun` processes**, load average went to **25 / 92 / 109** on
+4 CPUs and `MemAvailable` fell to 2.5 GB. This is the freeze class the user warned about.
+
+**Orphans are worse than slow: they forge a result.** A starved arm produced the *same* zeros as a fixed
+one - `install_shm_file failed=0`, `rebuilding a carried SCM_RIGHTS fd failed=0`, `exit_group(0)=0` -
+because it never reached the renderers (24 KB of log, 9 guest pids). **0 is not evidence unless the arm
+actually ran.** Always record guest pid count and log size alongside the failure counters.
+
+Rules:
+
+- Sweep by the **private** name: `pkill -KILL -f 'lbxrun'` (the `/tmp/lbx/lbxrun` symlink). Never
+  `pkill -f litebox_runner` - that matches the runner path inside *other* agents' argv and kills their
+  in-flight work. Sweep at the START and END of every script.
+- Gate each arm on **1-minute load < 4 and `MemAvailable` > 2 GB**, polling. The 5-minute average stays
+  high long after the orphans are gone; it is not the signal.
+- `nice -n 19` on everything, and **one runner at a time** via `mkdir /tmp/lbx/.runner-lock`.
