@@ -10731,6 +10731,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         );
                         retried?
                     }
+                    Err(e)
+                        if matches!(e, Errno::ENOENT | Errno::EACCES)
+                            && !self
+                                .global
+                                .platform
+                                .env_flag("LITEBOX_PROC_FD_CARRY_FIX_OFF") =>
+                    {
+                        // A `/proc/<pid>/<file>` fd names a PROCESS, not a filesystem object, and
+                        // `pid` is the sender's: this process's `/proc` cannot resolve it (a pid
+                        // that crossed one process boundary too many is in none of the tables
+                        // here), so the reopen answers ENOENT, `recvmsg` reports `MSG_CTRUNC`, and
+                        // Mojo folds that into a zero-length read and terminates the child
+                        // (`socket_utils_posix.cc`: `return missing_fds ? 0 : result;`). Real Linux
+                        // never fails to install a donated fd, so there is no kernel behaviour to
+                        // copy; the one copy of this file the receiver CAN name is its own, which
+                        // is what `/proc/self` means, and an fd nobody can install is strictly
+                        // worse than one naming this process.
+                        let own = path
+                            .strip_prefix("/proc/")
+                            .filter(|rest| !rest.starts_with("self/"))
+                            .and_then(|rest| rest.split_once('/'))
+                            .map(|(_, file)| file)
+                            .filter(|file| !file.is_empty());
+                        match own {
+                            Some(file) => self.sys_openat(
+                                AT_FDCWD,
+                                alloc::format!("/proc/self/{file}").as_str(),
+                                flags,
+                                Mode::empty(),
+                            )?,
+                            None => return Err(e),
+                        }
+                    }
                     Err(e) => return Err(e),
                 };
                 if offset != 0 {
