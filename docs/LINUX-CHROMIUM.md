@@ -88,7 +88,42 @@ bug class in this repo ("Guest-reachable code returns an errno, never a panic �
 the whole session"). Suspects: a shared arena `Region` that is absent for a path that is
 shared-write but NOT in `SPILLED_PREFIXES`, or an extent computed from an unregistered prefix.
 
+## 2026-10-10 — THE HANG IS CHROMIUM'S LAYER-1 NAMESPACE SANDBOX (proved); layer-2 is NOT causal
+
+- **`--no-sandbox` is the only thing that makes multi-process work** (`bisect.sh b1`: rc=0, DOM=2).
+- **`--disable-namespace-sandbox` with NO `--no-sandbox` reproduces the NATIVE failure verbatim**:
+  `zygote_host_impl_linux.cc:129] No usable sandbox!` rc=1. So under litebox layer-1 IS the
+  namespace sandbox and it is REQUIRED. `--disable-seccomp-filter-sandbox` alone = rc=124, the
+  identical hang, so **layer-2 is not the blocker**. Both together = the same rc=1.
+- `zygote_host_impl_linux.cc:115-129`: the namespace branch wins on
+  `!kDisableNamespaceSandbox && Credentials::CanCreateProcessInNewUserNS()`; otherwise the SUID
+  branch (`chrome-sandbox`, not shipped by Debian's chromium package here); otherwise `LOG(FATAL)`.
+  **There is no `capget` probe on this path.**
+- **`zygote_main_linux.cc:202` — "ZygoteMain: initializing 0 fork delegates", which we DO see under
+  `--v=1` — is logged BEFORE `EnterLayerOneSandbox` at :209.** It proves the zygote started, not
+  that the sandbox finished. Everything after it is unobserved.
+- Layer-1 for 154.0.8037.92 (verified against `refs/tags/154.0.8037.92`; **no mount, no pivot_root,
+  no setresuid**): `NamespaceSandbox::LaunchProcess` clones `CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET`
+  and the child, async-signal-safe, writes `setgroups`="deny", then `uid_map`, then `gid_map`. The
+  zygote then does `unshare(CLONE_NEWUSER)` + `SetGidAndUidMaps` (gid then uid),
+  `DropFileSystemAccess`, and **`ChrootToSafeEmptyDir()` = `clone(CLONE_FS|CLONE_VM|CLONE_VFORK|
+  CLONE_SETTLS|SIGCHLD)` whose child runs `chroot("/proc/self/fdinfo/"); chdir("/"); _exit(0)` while
+  the PARENT is suspended in `waitpid` (`credentials.cc:52-62`)** — the ONE step that can hang with
+  no log; every other failure is a `RAW_CHECK`/`CHECK` and crashes.
+- Measured litebox vs native (probe51/52/53/54): `unshare(CLONE_NEWUSER)`=0 and euid becomes 65534
+  (that is correct Linux); `uid_map`/`gid_map` **WRITE = EBADF(9)** (native outside a userns: EPERM);
+  `setgroups` write = OK; `mount` = ENOSYS (chromium does not mount — ignore it); `capget` =
+  `(0xffffffff, 0xffffffff, 0)` for an unprivileged guest vs native `(0,0,0)`; `chroot` is allowed at
+  euid 65534 and refused at 1000.
+- **Python cannot arbitrate `CLONE_VM`** — native segfaults too — so a static C repro of
+  `ChrootToSafeEmptyDir` is the arbiter; treat any Python `clone` result as invalid.
+
 ## REFUTED — do not re-open without a NEW reproduction
+
+- **chroot leaks across processes** (would have explained the browser's `/proc/self/fdinfo/`
+  prefixes). probe54: a child that `unshare(CLONE_NEWUSER)`s AND successfully chroots leaves its
+  parent and later siblings able to open real paths. `chroot` is correctly per-process; those
+  prefixes are chromium's own chrooted processes.
 
 - **`/proc/self/fdinfo/<fd>` is a litebox gap.** `probe36.py` / `probe37.py`: `/proc/self/fdinfo`
   lists the fd AND returns `pos:` content for a regular file, a `/proc` file, a pipe and a socket,

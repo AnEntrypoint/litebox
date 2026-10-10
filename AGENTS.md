@@ -146,7 +146,23 @@ Mechanism prose for every sha is in `docs/AGENTS_ARCHIVE_*` (newest `-08b` ... `
 - **`08b1856` A GUEST-REACHABLE LENGTH OVERFLOW ANSWERS AN ERRNO, NEVER A PANIC.** `sys_madvise`/`sys_mprotect` round with `checked_next_multiple_of`. **mmapx1: `madvise(len=2^64-1)` = `rc=-1 errno=22`.**
 - **`67b198f` A POSIX RECORD LOCK EXCLUDES ACROSS HOST PROCESSES.** `SharedRecordLockTable` (256 rows, arena, keyed `(dev,path)`, dead holders reclaimed by host-pid liveness); `LITEBOX_RECORD_LOCK_SHARED_OFF=1` restores the old path. **BOTH WAYS: reclock1 `CONTEND_FIRST=errno=11`/`WAIT_ELAPSED_MS=3873`; reclock1off `OK`/`0`.**## Open, in rough priority order
 
-1. **LINUX CHROMIUM: 3 RENDERERS START AND SURVIVE, BUT NO PAGE EVER LOADS** (fork failure and carried-fd deaths are FIXED). After t≈15 s the browser goes SILENT (300 s run: same 20 KB log, `rc=124`) while its MAIN thread burns a full CPU: **~16.5k syscalls/s, 85% `clock_gettime` at ONE fixed `rip`, interleaved with `ppoll(timeout=0ns)`**; `dump_dom_lines=0`, no crash, no child deaths. **Next: instrument from inside the shim** - `ptrace` is BLOCKED here (gdb: "Inappropriate ioctl for device").
+1. **LINUX CHROMIUM: `--single-process` WITHOUT `--no-sandbox` LOADS THE PAGE (f1: rc=0, DOM=2);
+   MULTI-PROCESS WITHOUT IT HANGS — AND THE HANG IS ALL OF CHROMIUM'S LAYER-1, NOT THE ZYGOTE.**
+   Proved: `--disable-namespace-sandbox` (no `--no-sandbox`) prints native's own
+   `zygote_host_impl_linux.cc:129] No usable sandbox!` rc=1, so layer-1 IS the namespace sandbox
+   here and is REQUIRED; `--disable-seccomp-filter-sandbox` alone = the same rc=124 hang, so
+   layer-2 is NOT causal. `zygote_main_linux.cc:202` ("ZygoteMain: initializing N fork delegates",
+   which we DO see under `--v=1`) logs BEFORE `EnterLayerOneSandbox` at :209, and the
+   `CLONE_FS|CLONE_VM|CLONE_VFORK` chroot child is seen completing (`clone ... vforked=true` then
+   `exit_group pid=11 status=0`, `process.rs:5745`), so **`ChrootToSafeEmptyDir` works and the
+   zygote survives** — do not re-blame the zygote. Chromium 154 layer-1 has NO mount/pivot_root/
+   setresuid; it is `clone(NEWUSER|NEWPID|NEWNET)` + write `setgroups`="deny", `uid_map`, `gid_map`,
+   then `unshare(CLONE_NEWUSER)` + maps, `DropFileSystemAccess`, the vfork chroot, `SetCapabilities`.
+   Remaining measured gaps: `uid_map`/`gid_map` WRITE = **EBADF(9)** (`setgroups` write = OK),
+   `capget` = `(0xffffffff,0xffffffff,0)` vs native `(0,0,0)`, `mount` = ENOSYS (chromium does not
+   mount — ignore), `chroot` allowed at euid 65534 / refused at 1000. **REFUTED: chroot leaks
+   between processes** (probe54). Python cannot arbitrate `CLONE_VM` (native segfaults too) — only a
+   static C repro can. Detail: `docs/LINUX-CHROMIUM.md` §2026-10-10.
 2. **CLOSED - NO LIVE SERVER'S PORT GOES DEAF** (`57b87eb`, chrF34; chrF35's "8081 went deaf" WAS HOST
    MEMORY - chrF36: 27/27 host probes `200 786`, row never retired; xproc41/42: busy 41/41, deaf = live
    owner that never accepts -> refuses at backlog 8 and RECOVERS, vs orphaned -> ~25 ms PERMANENTLY).
