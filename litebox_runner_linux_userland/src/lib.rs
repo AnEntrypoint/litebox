@@ -837,7 +837,10 @@ fn import_writable_layer(
             .into_owned();
         let path = alloc::format!("/{header_path}");
         let mode_bits = entry.header().mode().unwrap_or(0o644);
-        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);
+        // `0o7777`, not `0o777`: a tar's high mode bits are real (setuid/setgid/sticky), `Mode`
+        // defines `SVTX`, and the Windows runner already masks `& 0o7777` — truncating here alone
+        // silently dropped e.g. `/tmp`'s sticky bit on this platform only.
+        let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o7777);
 
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
