@@ -395,6 +395,26 @@ Used config: Config { image_loader: {}, image_editor: {} }`. That empty config i
 gdk-pixbuf: the rootfs ships `libglycin-2.so.0` but none of `/usr/libexec/glycin-loaders/2+/`
 or `/usr/share/glycin-loaders/2+/conf.d/`, so GTK has no loader process to spawn.
 
+### The icon loader is **glycin** (`r4f`, rc=0, out 76,149,005 B) — and with it the panel paints
+
+Packaging `/usr/libexec/glycin-loaders/2+/{glycin-svg,glycin-image-rs}` and
+`/usr/share/glycin-loaders/2+/conf.d/{glycin-svg,glycin-image-rs}.conf` into the archive (their ldd
+closure, 36.3 MB, was already there — only 8.3 MB was new) removes **every** `gtkiconhelper.c:495`
+assertion: `grep -c gtkiconhelper` on the guest's stderr is **0**, where `r4d` had them and `r4e`
+lost `xfce4-session` to one (`rc 134`).
+
+The pixels follow. Root frames go from `distinct=3` (`r4d`) to **`distinct=202`**, and the
+non-background pixels sit in **one 21-row band, y 0..20, x 0..1016** — the panel bar:
+
+```
+non-grey bbox: x 0..1016  y 0..20      rows with the most: 9, 13, 8, 10, 12, 11, 14
+1,500 non-(206,206,206) px inside the bar, colours (133,133,133), (201,201,201), ...
+```
+
+So **the desktop paints its own background and a panel bar with icon content**, and it survives the
+whole 240 s hold (`rc=0`, 0 icon assertions). Chromium's own grab is unchanged: `md5=b5fa14cbec08`,
+1024x744, `distinct=1`, uniform (206,206,206).
+
 ### The 2nd-connect hang is NOT the data plane (measured, both ways) — superseded above
 
 `CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
