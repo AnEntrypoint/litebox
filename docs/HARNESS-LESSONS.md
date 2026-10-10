@@ -58,15 +58,16 @@ Rules:
 set, so `LITEBOX_X_OFF=0` turns the fix OFF, not on.** Every call site is `!env_flag(...)`, so the
 "fix enabled" arm is the one where the variable is **UNSET**.
 
-How this bit: uz7 (`/proc` fixes meant to be ON) and uz6 (`LITEBOX_PROC_FD_CARRY_FIX_OFF=1`)
-came back **identical** — 8 failures each. `diag-procary` (`file.rs:10787`) appears **0 times** in
-`log-uz4/uz6/uz7.txt`, so the fallback branch never fired in any of them. Two arms with the same
-number prove nothing when neither arm actually differed.
+**RULE: ON arm = variable unset or empty. OFF arm = `=1`. Never `=0`.**
 
-**RULE: ON arm = variable unset or empty. OFF arm = `=1`. Never `=0`.** Before trusting any
-BOTH-WAYS pair, confirm the discriminator actually fired: grep the log for its `diag-*` /
-`warn!` line and require it to be present in one arm and absent (or different) in the other.
+**A `diag-*` count only means something if the binary that ran contained that `warn!`.** I once
+read `diag-procary` = 0 in `log-uz4/uz6/uz7.txt` as proof the `/proc` fallback branch never
+fired. It was not: that `warn!` was added *after* those runs, so 0 was the expected count either
+way. **Check when the diagnostic was added before drawing any conclusion from its absence.**
+(For the record, that uz6/uz7 pair had used the correct convention — OFF `=1`, ON unset — so it
+was a legitimate A/B whose identical result stayed unexplained until the binary was verified.)
 
-Second candidate whenever two arms match: **a stale binary.** Record the binary's md5 and build
-time with each arm so "the change was not in the binary" is distinguishable from "the change did
-nothing".
+Two ways a BOTH-WAYS pair comes back identical, both seen here: **a stale binary** (record the md5
+and build time per arm), and **a concurrent `cargo check`/build stealing the box** — uz8 and uz9
+were voided that way (20 KB log / 11 pids, and 0 pids), the same mistake that earlier forged a
+result from 18 orphaned runners. Never build or type-check while an arm is running.
