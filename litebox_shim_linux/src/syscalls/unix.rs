@@ -22,7 +22,7 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
-    platform::SharedKernelStateProvider as _,
+    platform::{RawMutex as _, SharedKernelStateProvider as _},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
@@ -954,6 +954,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// platform's wake is one auto-reset event per host process.
     fn poke_peer(&self) {
         let platform = self.platform();
+        // The real wake on a Linux host: `wake_signal_listener` below is `false` there and
+        // `current_host_pid()` is `0`, so it can never name a process to wake. This word is a
+        // host futex on shared-arena memory, so it reaches a waiter in another host process
+        // directly. Gated like the wait side, so the switch actually discriminates.
+        if !platform.env_flag("LITEBOX_UNIX_CROSS_WAKE_OFF") {
+            self.slot_ref().wake.bump();
+        }
         self.slot_ref()
             .for_each_holder_host(!self.is_client, |host| {
                 platform.wake_signal_listener(host);
@@ -1415,6 +1422,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 })
             }
         }
+    }
+
+    /// The cross-process wake word for this endpoint's slot, when it has one: what a blocking
+    /// `sendto`/`recvfrom` parks on instead of idling out [`SHARED_UNIX_POLL_INTERVAL`].
+    ///
+    /// `None` for an unpromoted `Local` pair (both ends in this process, woken by the ordinary
+    /// channel `Pollee`) and for `LITEBOX_UNIX_CROSS_WAKE_OFF`.
+    fn shared_wake(&self) -> Option<SharedWakeHandle<Platform, FS>> {
+        let (global, slot) = match &self.transport {
+            ConnTransport::Shared { global, slot, .. } => (global.clone(), *slot),
+            ConnTransport::Local { link, .. } => {
+                let slot = link.slot.load(Ordering::Acquire);
+                if slot == u32::MAX {
+                    return None;
+                }
+                (link.global.get()?.clone(), slot)
+            }
+        };
+        if global
+            .platform
+            .env_flag("LITEBOX_UNIX_CROSS_WAKE_OFF")
+        {
+            return None;
+        }
+        Some(SharedWakeHandle { global, slot })
     }
 
     fn self_read_shutdown(&self) -> bool {
@@ -2453,7 +2485,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             fds,
             fd_specs,
         });
-        let res = wait_on_events_polling(
+        // Owned, so the connection's own state lock is NOT held across the park below.
+        let wake = self.with_state_ref(|state| {
+            state.connected().and_then(|conn| conn.shared_wake())
+        });
+        let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
             Events::OUT,
@@ -2482,6 +2518,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     }
                 })
             },
+            wake.as_ref().map(|w| w as &dyn SharedWake),
         )
         .map_err(Errno::from);
         // A message the loop never posted -- `SO_SNDTIMEO` expired, or the connection was gone
@@ -2503,7 +2540,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
-        let res = wait_on_events_polling(
+        // Owned, so the connection's own state lock is NOT held across the park below (the peer's
+        // write needs that lock, and holding it here would deadlock the very wake we wait for).
+        let wake = self.with_state_ref(|state| {
+            state.connected().and_then(|conn| conn.shared_wake())
+        });
+        let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
             Events::IN,
@@ -2531,6 +2573,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     Ok(n)
                 })
             },
+            wake.as_ref().map(|w| w as &dyn SharedWake),
         )
         .map_err(Errno::from);
         match res {
@@ -3928,6 +3971,123 @@ fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
 //   established fallback philosophy for exactly this situation (`RawMutex::
 //   poll_until_value_changes`'s doc comment: "Correct by construction ... at the cost of
 //   latency/CPU while polling, never loses a wakeup").
+// - **A wake word exists now, but only for the data plane.** Linux hosts get no signal-listener
+//   wake at all (`Platform::wake_signal_listener` is `false` and `current_host_pid()` is `0`), so
+//   `sendto`/`recvfrom` on a `Shared` connection instead park on that slot's [`SharedWakeWord`]
+//   -- a real host futex on a shared-arena word, so a peer's write in another host process wakes
+//   the waiter immediately. The repoll stays as the bounded backstop. `accept`/`connect` still
+//   poll: their rendezvous is [`SharedUnixConnectQueue`], not a ring, so it has no word to bump.
+//   Switch: `LITEBOX_UNIX_CROSS_WAKE_OFF` (read from the HOST env, so `--env` does not set it).
+/// A cross-process wake word: a host-futex-backed counter that any process in the fork family can
+/// bump and that any process can sleep on with a bounded timeout.
+///
+/// This is the wake primitive that was missing. `poke_peer` routes through
+/// `Platform::wake_signal_listener`, which is `false` on Linux, and every Linux host-identity
+/// oracle is a constant (`current_host_pid()` is `0`), so nothing on this host can even NAME the
+/// process to wake -- which is why every blocking cross-process AF_UNIX operation here degrades to
+/// re-polling at [`SHARED_UNIX_POLL_INTERVAL`]. The shared kernel arena is
+/// `MAP_SHARED|MAP_ANONYMOUS`, so a `Platform::RawMutex` placed in it is a word the REAL host
+/// kernel futex-wakes across host processes -- the one wake primitive this host actually has, and
+/// far cheaper in arena than growing every ring (see [`SHARED_UNIX_CONN_BUF`]).
+///
+/// Used purely as a futex word: never locked, only `underlying_atomic`, `wake_all` and
+/// `block_or_timeout` are ever called on it.
+pub(crate) struct SharedWakeWord<Platform: ShimPlatform> {
+    word: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Waiters parked on `word` right now, so a bump with nobody sleeping costs one atomic
+    /// instead of a `FUTEX_WAKE` syscall. This count is only ever an optimization: a waiter
+    /// compares the WORD, never this count, so a bump that missed a racing increment still shows
+    /// up as `EAGAIN` from `block_or_timeout` rather than as a lost wake.
+    waiters: AtomicU32,
+}
+
+impl<Platform: ShimPlatform> SharedWakeWord<Platform> {
+    fn new() -> Self {
+        Self {
+            word: <<Platform as litebox::platform::RawMutexProvider>::RawMutex as litebox::platform::RawMutex>::INIT,
+            waiters: AtomicU32::new(0),
+        }
+    }
+
+    /// The value a waiter must snapshot BEFORE checking whatever it is waiting for, so a bump
+    /// racing that check is seen as "already changed" instead of being lost.
+    fn seq(&self) -> u32 {
+        self.word.underlying_atomic().load(Ordering::Acquire)
+    }
+
+    fn bump(&self) {
+        self.word.underlying_atomic().fetch_add(1, Ordering::AcqRel);
+        // Sampled: this fires on every cross-process AF_UNIX byte transfer, so an unconditional
+        // line would be the whole log. Its presence at all is what proves the ON arm is live --
+        // see the coordinator's rule that a `diag-*` count only means something when the binary
+        // that ran actually contained the line.
+        if BUMPED.fetch_add(1, Ordering::Relaxed) % XWAKE_LOG_STRIDE == 0 {
+            litebox_util_log::warn!(
+                bumps:% = BUMPED.load(Ordering::Relaxed), waiters:% = self.waiters.load(Ordering::Acquire);
+                "[diag-xwake] unix shared conn: bumped the cross-process wake word"
+            );
+        }
+        if self.waiters.load(Ordering::Acquire) != 0 {
+            self.word.wake_all();
+        }
+    }
+
+    /// Bounded park: returns as soon as any host process bumps this word, and no later than
+    /// `timeout` regardless. Deliberately never without a timeout -- an unbounded park is the
+    /// worst bug class in this codebase (`wait.rs` `condvar.block` -> `FUTEX_WAIT` with
+    /// `timeout=None`), and a missed wake must degrade to today's repoll, never to a hang.
+    fn wait_changed(&self, seen: u32, timeout: Duration) {
+        if timeout.is_zero() {
+            return;
+        }
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        if PARKED.fetch_add(1, Ordering::Relaxed) % XWAKE_LOG_STRIDE == 0 {
+            litebox_util_log::warn!(
+                parks:% = PARKED.load(Ordering::Relaxed),
+                timeout_ms:% = timeout.as_millis() as u64;
+                "[diag-xwake] unix shared conn: parked on the cross-process wake word"
+            );
+        }
+        let _ = self.word.block_or_timeout(seen, timeout);
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// [`SharedWakeWord`] behind a trait object, so
+/// [`wait_on_events_polling_woken`] needs no extra generic parameters.
+pub(crate) trait SharedWake {
+    fn wake_seq(&self) -> u32;
+    fn wake_wait_changed(&self, seen: u32, timeout: Duration);
+}
+
+/// Cross-process wake words bumped / parked on since this process started, and the sampling
+/// stride for the two `[diag-xwake]` lines they gate. Both are `static` (per host process, not
+/// shared) because they are diagnostics only.
+static BUMPED: AtomicU32 = AtomicU32::new(0);
+static PARKED: AtomicU32 = AtomicU32::new(0);
+const XWAKE_LOG_STRIDE: u32 = 4096;
+
+/// An OWNED handle to one shared connection slot's wake word, so a blocking `sendto`/`recvfrom`
+/// can hold it across a wait without borrowing the connection's own state lock for the duration
+/// (holding that lock across a park would deadlock the peer's write).
+pub(crate) struct SharedWakeHandle<Platform: ShimPlatform, FS: ShimFS> {
+    global: GlobalStateHandle<Platform, FS>,
+    slot: u32,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> SharedWake for SharedWakeHandle<Platform, FS> {
+    fn wake_seq(&self) -> u32 {
+        self.global.unix_shared_conn_table.wake_word(self.slot).seq()
+    }
+
+    fn wake_wait_changed(&self, seen: u32, timeout: Duration) {
+        self.global
+            .unix_shared_conn_table
+            .wake_word(self.slot)
+            .wait_changed(seen, timeout);
+    }
+}
+
 pub(crate) const SHARED_UNIX_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
 /// Upper bound on how long [`UnixStream::connect_cross_process`] waits for a listener in a
@@ -3968,11 +4128,48 @@ pub(crate) fn wait_on_events_polling<Platform, R, E>(
     cx: &WaitContext<'_, Platform>,
     nonblock: bool,
     events: Events,
+    register_observer: impl FnMut(
+        Weak<dyn litebox::event::observer::Observer<Events>>,
+        Events,
+    ) -> Result<(), E>,
+    try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+) -> Result<R, TryOpError<E>>
+where
+    Platform: ShimPlatform,
+{
+    wait_on_events_polling_woken(
+        cx,
+        nonblock,
+        events,
+        register_observer,
+        try_op,
+        None::<&dyn SharedWake>,
+    )
+}
+
+/// [`wait_on_events_polling`] plus a real cross-process wake.
+///
+/// `wake` is the shared-arena futex word this operation's counterpart bumps when it changes the
+/// state being waited on (see [`SharedWakeWord`]). With one, the bounded synthetic repoll tick is
+/// no longer spent idling in this process's own `Pollee` -- where a peer in ANOTHER host process
+/// can never reach us -- but parked on that word, so the peer's bump returns from here
+/// immediately. The tick is still the hard upper bound, so a missed wake degrades to exactly
+/// today's behaviour (one repoll) instead of to a hang.
+///
+/// The snapshot is taken BEFORE the attempt below, and the park that follows still runs `try_op`
+/// and still picks up an in-process event (its timeout is narrowed to zero, which polls rather
+/// than idles -- it never skips either check). A bump landing between the snapshot and the park
+/// therefore shows up as "already changed" and the wait returns at once: no wake can be lost.
+pub(crate) fn wait_on_events_polling_woken<Platform, R, E>(
+    cx: &WaitContext<'_, Platform>,
+    nonblock: bool,
+    events: Events,
     mut register_observer: impl FnMut(
         Weak<dyn litebox::event::observer::Observer<Events>>,
         Events,
     ) -> Result<(), E>,
     mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+    wake: Option<&dyn SharedWake>,
 ) -> Result<R, TryOpError<E>>
 where
     Platform: ShimPlatform,
@@ -4003,15 +4200,30 @@ where
             None => SHARED_UNIX_POLL_INTERVAL,
             Some(d) => d.min(SHARED_UNIX_POLL_INTERVAL),
         };
-        let bounded = cx.with_timeout(this_iter_timeout);
+        // Snapshot BEFORE the attempt below: a bump racing it is then "already changed" to the
+        // bounded wait, so it can never be lost.
+        let seen = wake.map(|w| w.wake_seq());
+        // With a wake word the idle park is what the word replaces, so narrow this one to a poll:
+        // `wait_on_events` still runs `try_op` and still collects an in-process event on the way
+        // through, it just never sits out the whole tick waiting for something that cannot arrive.
+        let this_iter_park = if wake.is_some() {
+            core::time::Duration::ZERO
+        } else {
+            this_iter_timeout
+        };
+        let bounded = cx.with_timeout(this_iter_park);
         first_attempt = false;
         match bounded.wait_on_events(nonblock, events, &mut register_observer, &mut try_op) {
             Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut))
                 if !has_real_deadline || remaining.is_some_and(|d| d > this_iter_timeout) =>
             {
                 // This was one of our own synthetic sub-wait ticks, not a real caller deadline
-                // (either there IS no real deadline, or it's still further away than this tick) --
-                // loop around and re-check for a cross-process change.
+                // (either there IS no real deadline, or it's still further away than this tick).
+                // Spend the tick on the shared wake word instead of looping straight back: a peer
+                // in another host process bumps it the moment it changes what we are waiting for.
+                if let (Some(w), Some(seen)) = (wake, seen) {
+                    w.wake_wait_changed(seen, this_iter_timeout);
+                }
                 continue;
             }
             other => return other,
@@ -4468,6 +4680,13 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     /// other than the one that connected, and the receiver must see the sender).
     last_writer_c2s: [AtomicU32; 3],
     last_writer_s2c: [AtomicU32; 3],
+    /// Cross-process wake word for this slot's data plane: bumped by either side whenever it
+    /// changes what the other side could be waiting for (bytes written, bytes consumed, EOF).
+    /// One word per slot, not one per ring: the two directions' waiters are this connection's two
+    /// ends and nothing else, so the only cost of sharing it is an occasional spurious re-check,
+    /// and it costs 12 bytes a slot instead of doubling the per-ring bookkeeping. See
+    /// [`SharedWakeWord`].
+    wake: SharedWakeWord<Platform>,
 }
 
 /// Distinct host processes that can hold one side of a shared connection at once. A cross-process
@@ -4699,6 +4918,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             framed: AtomicBool::new(false),
             last_writer_c2s: [const { AtomicU32::new(0) }; 3],
             last_writer_s2c: [const { AtomicU32::new(0) }; 3],
+            wake: SharedWakeWord::new(),
         }
     }
 
@@ -5067,6 +5287,11 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         &self.slots[idx as usize]
     }
 
+    /// This slot's cross-process wake word (`SharedWakeWord`).
+    fn wake_word(&self, idx: u32) -> &SharedWakeWord<Platform> {
+        &self.slots[idx as usize].wake
+    }
+
     /// Releases a slot back to the pool. Best-effort, idempotent: only the LAST of the two
     /// endpoints to drop actually frees it (guarded by each `ConnTransport::Shared` handle's own
     /// `Drop`, which only calls this after marking itself gone -- see that `Drop` impl).
@@ -5075,6 +5300,7 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         slot.client_to_server.reset();
         slot.server_to_client.reset();
         slot.state.store(CONN_SLOT_EMPTY, Ordering::Release);
+        slot.wake.bump();
     }
 }
 
