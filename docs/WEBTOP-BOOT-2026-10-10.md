@@ -66,4 +66,68 @@ frames to PNG with a colour histogram. Validated against a native `xwd -root` ca
 
 ## 3. Results
 
-_(filled in below as each rung is measured)_
+Every rung is one command (`RUNG=<n> HOLD=<secs> SECS=<secs> [CONN_PROBE=<n>] bash /tmp/lbx/wtrun.sh
+<tag>`), which runs exactly:
+
+```
+nice -n 19 timeout -s KILL <SECS> /tmp/lbx/lbxrun --unstable \
+  --env LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib64:/lib:/opt/lib \
+  --env HOME=/root --env RUNG=<n> --env HOLD=<secs> \
+  --env DISP=:0 --env SHOT_EVERY=25 --env CONN_PROBE=<n> \
+  --program-from-tar --initial-files /tmp/lbx/rootfs-webtop.tar \
+  /usr/bin/python3 -u /tmp/boot.py
+```
+
+### Rung 1 — `Xvfb :0` alone: **PASSES** (`r1b`, rc=0, out 12,600,595 B, err 576 B)
+
+`/tmp/.X11-unix/X0` appears; `xdpyinfo` rc=0 reports `X.Org version: 21.1.21`, 22 extensions,
+maximum request size 16,777,212; `xwininfo -root -tree` shows root `0x42` with 0 children. Four
+`xwd -root` captures, each **3,148,907 bytes — byte-identical in size to the native healthy-Xvfb
+reference**. Decoded: 1024x768 depth 24 bpp 4, `distinct=2`, 589,824 black + 196,608 white =
+786,432 px, and the ASCII dump is X's classic diagonal root weave.
+
+**A real X server is running inside litebox, on a guest AF_UNIX socket, serving real X clients.**
+
+The first attempt (`r1`, rc=2) failed and it was **my rootfs bug, not litebox**: the archive shipped
+`tmp/.X11-unix` as `0755 root-owned` while the guest runs as **uid 1000**, so Xvfb's `bind()` got
+EACCES — `_XSERVTransSocketCreateListener: failed to bind listener`. Fixed by shipping 01777.
+
+### Rung 2 — `+ xfwm4`, with `xclock` as a probe client: **client works, WM does not**
+(`r2`, rc=0, out 18,898,059 B, err 5,762 B, 6 frames)
+
+`xclock -update 1 -geometry 200x200+40+40` — a real Xaw/Xt client — opened the display, mapped a
+window and **repainted continuously**:
+
+* frames 3-6 differ from the bare-root frames 1-2 and from each other (**5 distinct of 6**);
+  black 589,824 -> 560,588 and white 196,608 -> 224,639, i.e. ~30,000 px replaced inside a
+  200x200 area (the weave was already 25 % white, so +28,031 white is exactly a 40,000 px window
+  painted over it);
+* the changed bounding box is **(40,40)-(242,242)** — the requested `200x200+40+40` plus a 2 px
+  border;
+* between two captures 25 s apart, 904-1,005 px change **inside** that window, and the diff is
+  hand-shaped (a vertical and a diagonal line) — the clock hands moved.
+
+That is the liveness artifact: a moving, repainting X client rendered entirely inside litebox.
+
+**But `xfwm4` (Gtk) did not manage it**: `(xfwm4:6): Gtk-WARNING **: 20:15:05.475: cannot open
+display: :0`, and no title bar appears on the xclock window. The window manager is the one piece
+of rung 2 that fails, and it is Gtk — xlib clients (`xdpyinfo`, `xwininfo`, `xclock`) all connect
+fine. Note the timestamp: it is ~50 s after xfwm4 was spawned, so it did not fail immediately, it
+**stalled and then gave up** — the shape of a connection that never completes, i.e. the
+cross-process wake gap (`docs/CROSS-PROCESS-WAKE-2026-10-10.md`), not a missing library.
+
+### Litebox finding so far (not yet fixed): a tar's mode bits above 0777 are dropped
+
+The archive entry for `tmp/` is `drwxrwxrwt` (01777); the guest reports `0o777` (`[boot] chmod
+FAILED /tmp ... mode is 0o777`). Cause:
+
+* `litebox_runner_linux_userland/src/lib.rs:840`
+  `let mode = litebox::fs::Mode::from_bits_truncate(mode_bits & 0o777);`
+* the same code in the Windows runner uses **`& 0o7777`**
+  (`litebox_runner_linux_on_windows_userland/src/lib.rs:3064`)
+
+so `S_ISUID`/`S_ISGID`/`S_ISVTX` are silently lost on this platform only. `Mode` does define
+`SVTX` (`litebox/src/fs/mod.rs:280`), so only the mask is wrong. Consequence here: `/tmp` is not
+sticky inside the guest (harmless for a single-user desktop, but a setuid-root binary unpacked
+from a tar would lose its bit). Not yet fixed because the desktop does not need it to boot;
+recorded as the first candidate litebox fix.
