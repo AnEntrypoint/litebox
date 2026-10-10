@@ -3067,7 +3067,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        let object_name = alloc::format!(
+        let requested_name = alloc::format!(
             "Local\\litebox_memfd_{}_{}",
             self.global.platform.current_host_pid(),
             MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -3075,9 +3075,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (handle, object_name) = match self
             .global
             .platform
-            .create_named_shared_memory(&object_name, page_aligned_size)
+            .create_named_shared_memory(&requested_name, page_aligned_size)
         {
-            Ok(handle) => (handle, Some(object_name)),
+            Ok(handle) => (handle, Some(requested_name)),
             Err(_) => {
                 let handle = self
                     .global
@@ -3094,6 +3094,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 (handle, self.global.platform.shared_memory_token_for(handle))
             }
         };
+        litebox_util_log::warn!(
+            name:% = object_name.as_deref().unwrap_or("-"), size:% = page_aligned_size,
+            handle:? = handle, host_pid:% = self.global.platform.current_host_pid();
+            "diag-memfd: named shared object created"
+        );
         if !carry_bytes.is_empty()
             && let Some(new_len) = litebox::mm::linux::NonZeroPageSize::new(page_aligned_size)
         {
@@ -3620,7 +3625,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Floor for the buffer a snapshot reads into, so a file that reports `size == 0` because its
     /// bytes are generated on read still carries them.
-    const SNAPSHOT_MIN_BYTES: usize = 4096;
+    const SNAPSHOT_MIN_BYTES: usize = 65536;
 
     /// Whether `raw_fd` is a regular file whose bytes could still travel as a
     /// [`Self::snapshot_nameless_file_for_carry`] snapshot.
@@ -3700,8 +3705,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         // generated on read, so a buffer sized from `size` alone would carry
                         // nothing back. Oversizing is safe: `read` reports how much it filled.
                         let mut buf = alloc::vec![0u8; status.size.max(Self::SNAPSHOT_MIN_BYTES)];
+                        let capacity = buf.len();
                         let n = files.fs.read(fd, &mut buf, Some(0)).ok()?;
                         buf.truncate(n);
+                        // A generated file has no size to size the buffer from, so a full buffer
+                        // means its content was longer than the floor and the tail is lost.
+                        if status.size == 0 && n == capacity {
+                            litebox_util_log::warn!(
+                                bytes:% = n;
+                                "diag-snap: snapshot of a size-0 file filled the buffer and may be truncated"
+                            );
+                        }
                         Some((flags.bits(), buf))
                     },
                     |_| None,
@@ -3742,6 +3756,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         let name = name.ok_or("shared object has no cross-process identity")?;
+        litebox_util_log::warn!(
+            name:% = name.as_str(), size:% = aligned, handle:? = handle,
+            host_pid:% = self.global.platform.current_host_pid();
+            "diag-memfd: snapshot object created"
+        );
         let length = litebox::mm::linux::NonZeroPageSize::new(aligned)
             .ok_or("snapshot size is not a whole number of pages")?;
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
