@@ -235,7 +235,46 @@ Run on the 20:30 binary (cross-wake fix in). Two things changed at once:
   it — `/tmp` is world-writable and demonstrably so, since Xvfb creates `/tmp/.X0-lock` and
   `/tmp/.X11-unix/X0` in it.
 
-### The 2nd-connect hang is NOT the data plane (measured, both ways)
+### Rung 3 with `-noreset` + the HOME fix (`r3b`, rc=0, out 15,753,287 B, err 6,144 B)
+
+**The window manager now genuinely manages.** `xwininfo -root -tree` after rung 2:
+
+```
+0x2018fb (has no name): 210x234+40+40        <- xfwm4's FRAME around xclock
+    16 children:
+    0x80000c "xclock" 200x200+5+29           <- the client, inset by the frame
+    0x20190a..0x201906  21x29 x5             <- the five title-bar buttons
+    0x201903  194x29  (title bar)
+    0x2018fd/0x2018fc  5x189  (left/right border)
+    0x2018fe  178x5   (bottom border)
+    0x201900/0x2018ff 16x16   (corners)
+0x200035..0x200038  1x768 / 1024x1 at the screen edges   <- xfwm4's own edge windows
+```
+
+That is a real WM decoration built by `xfwm4` inside litebox: frame, title bar, five buttons, four
+borders, two corners — `xclock` requested `200x200+40+40` and now sits inside a `210x234` frame. It
+was unframed in every earlier run.
+
+**`xfce4-session` then starts the desktop and aborts.** It spawned `xfwm4` (pid 48),
+`xfsettingsd` (52), `xfce4-panel` (59), `migrate` (67) and died **rc=134 (SIGABRT)**. Two rootfs
+gaps, no litebox involvement:
+
+1. **The donor image ships gdk-pixbuf 2.44.5 with no loaders at all** —
+   `gdk-pixbuf-query-loaders` lists zero modules and there is no `libpixbufloader*.so` anywhere on
+   the host. So every icon load fails, GTK falls back to `image-missing.svg`, that fails too, and
+   `gtkiconhelper.c:495` asserts: `Failed to load
+   /usr/share/icons/Adwaita/scalable/status/image-missing.svg: Unrecognized image file`, alongside
+   libwnck's `xutils.c:1510: assertion failed: (base)`.
+2. **`/usr/bin/iceauth` was never packaged**, so `xfce4-session`'s ICE setup fails
+   (`sh: 1: /usr/bin/iceauth: not found`) and `xfsettingsd`/`xfce4-panel` are then
+   `ICE connection ... rejected`. `libsystray.so` also wanted `libdbusmenu-gtk3.so.4`.
+
+Fixed as one packaging pass (`/tmp/lbx/mkwebtop-add.sh`): `iceauth`; the `ldd` closure of every
+dlopened xfce4 module (117 libs); the SVG pixbuf loader from `librsvg2-common` (fetched with
+`apt-get download` — the package is simply not installed on this host) plus a `loaders.cache`;
+`/usr/share/mime`; and `gtk-update-icon-cache` on all three icon themes.
+
+### The 2nd-connect hang is NOT the data plane (measured, both ways) — superseded above
 
 `CONN_PROBE=6` re-run on the 20:30 binary with the cross-wake fix **on** (`cp3`, switch unset):
 
