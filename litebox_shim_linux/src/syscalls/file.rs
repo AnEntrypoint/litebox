@@ -3618,6 +3618,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// eligibility check and the snapshot itself can never drift apart on what size still travels.
     const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+    /// Floor for the buffer a snapshot reads into, so a file that reports `size == 0` because its
+    /// bytes are generated on read still carries them.
+    const SNAPSHOT_MIN_BYTES: usize = 4096;
+
     /// Whether `raw_fd` is a regular file whose bytes could still travel as a
     /// [`Self::snapshot_nameless_file_for_carry`] snapshot.
     ///
@@ -3692,7 +3696,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             return None;
                         }
                         let flags = files.fs.open_flags(fd)?;
-                        let mut buf = alloc::vec![0u8; status.size];
+                        // A `/proc/<pid>/<file>` reports `size == 0` because its bytes are
+                        // generated on read, so a buffer sized from `size` alone would carry
+                        // nothing back. Oversizing is safe: `read` reports how much it filled.
+                        let mut buf = alloc::vec![0u8; status.size.max(Self::SNAPSHOT_MIN_BYTES)];
                         let n = files.fs.read(fd, &mut buf, Some(0)).ok()?;
                         buf.truncate(n);
                         Some((flags.bits(), buf))
@@ -10282,7 +10289,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
     ) -> Option<alloc::string::String> {
         let (path, flags, offset) = self.carriable_file_for_raw_fd(raw_fd)?;
-        if self.path_only_in_own_writable_layer(&path) {
+        if self.path_only_in_own_writable_layer(&path)
+            || (Self::path_names_another_process(&path)
+                && !self
+                    .global
+                    .platform
+                    .env_flag("LITEBOX_PROC_FD_CARRY_SNAPSHOT_OFF"))
+        {
             match self.snapshot_nameless_file_stage(raw_fd) {
                 Ok(spec) => return Some(spec),
                 Err(reason) => {
@@ -10313,6 +10326,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
         Some(alloc::format!("F|{flags}|{offset}|{path}"))
+    }
+
+    /// Whether `path` is `/proc/<pid>/<file>` for a numeric `<pid>` other than `self`.
+    ///
+    /// Such a path names a PROCESS, not a filesystem object: the bytes are generated per reader,
+    /// and `<pid>` is the sender's numbering, which a receiving host process cannot resolve (a pid
+    /// that crossed one process boundary too many is in none of the tables there). Linux never has
+    /// this problem because the kernel installs a donated fd without reopening anything.
+    fn path_names_another_process(path: &str) -> bool {
+        path.strip_prefix("/proc/")
+            .filter(|rest| !rest.starts_with("self/"))
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(pid, _)| !pid.is_empty())
     }
 
     /// Whether `path` resolves only inside this process's own writable layer, so that another
@@ -10754,13 +10780,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .and_then(|rest| rest.split_once('/'))
                             .map(|(_, file)| file)
                             .filter(|file| !file.is_empty());
-                        match own {
-                            Some(file) => self.sys_openat(
-                                AT_FDCWD,
-                                alloc::format!("/proc/self/{file}").as_str(),
-                                flags,
-                                Mode::empty(),
-                            )?,
+                        let substituted = own.map(|file| alloc::format!("/proc/self/{file}"));
+                        let retried = substituted.as_ref().and_then(|p| {
+                            self.sys_openat(AT_FDCWD, p.as_str(), flags, Mode::empty()).ok()
+                        });
+                        litebox_util_log::warn!(
+                            spec:% = spec, path:% = path, first_err:? = e,
+                            substituted:% = substituted.as_deref().unwrap_or("none"),
+                            reopened:% = retried.is_some();
+                            "diag-procary: carried /proc/<pid> fd could not be reopened here"
+                        );
+                        match retried {
+                            Some(raw) => raw,
                             None => return Err(e),
                         }
                     }
