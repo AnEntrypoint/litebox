@@ -120,7 +120,40 @@ Repeated as `r2b` (rc=0, out 15,749,107 B, 5 frames, 4 distinct): xclock paints 
 (frames 3-5, 220-225 distinct colours) and `xfwm4` fails identically
 (`20:28:14.456: cannot open display: :0`). Two failures in a row rules out "flaky 1-in-6".
 
-### The blocker: the **second** connection to a guest AF_UNIX listener does not complete
+### The "2nd connection" blocker was **Xvfb's own server reset** — a launch flag, not litebox
+
+`SOCK_PROBE=N` times the three phases of a raw AF_UNIX connect (no libX11 in the way). `sp2`
+(`SOCK_PROBE=4`, default flags) and `sp3` (identical but `XVFB_FLAGS="... -noreset"`) differ only in
+that one flag:
+
+| | probe 0 | probe 1 | probe 2 | probe 3 | after |
+|---|---|---|---|---|---|
+| **`sp2`** default flags | `n=8` | `n=0` (EOF) | `ENOENT` | `ENOENT` | `xdpyinfo` 60 s timeout, `xwd` "unable to open display" |
+| **`sp3`** `+ -noreset` | `n=8` | `n=8` | `n=8` | `n=8` | `xdpyinfo` rc=0, `xwd` 3,148,907 B |
+
+`sp3` logged, per probe, `postprobe <i> exists True dir ['X0'] xvfb_rc None` — the listener file and
+Xvfb both survive all six connections. In `sp2` the socket file was **gone** two probes later and
+never came back within 60 s.
+
+Cause: **an Xserver resets when the last client disconnects unless `-noreset`** — it drops every
+connection, unlinks `/tmp/.X11-unix/X0` and re-binds. Each probe client connects, reads its 8-byte
+setup reply and closes, so probe 0's close pulls the display out from under probe 1. That is the
+whole shape of the earlier table: `xdpyinfo` (1st client, closes) → `xwininfo`/`xfwm4` (2nd client,
+arrives into the reset) → stall, then the 3rd onward are fine because the reset has finished.
+
+So `xfwm4`'s `cannot open display: :0` and the 40 s `connprobe 1` are **not** the cross-process wake
+gap and **not** a litebox defect. Three corrections follow:
+
+* the fix is a flag we choose — `-noreset` is what every real Xvfb deployment passes;
+* a real desktop never triggers it anyway (xfwm4/xfdesktop stay connected for the life of the
+  session), so it would not have blocked the delivered configuration;
+* `10fa53cd` is exonerated by a better experiment than the one that indicted it, and the same
+  applies to my own "rank-1 unbounded park" theory — neither was ever in this path.
+
+**Still unexplained (a real litebox question, corner case):** after a reset the listener never came
+back for the rest of `sp2` (60 s+), and Xvfb printed no fatal error. Re-binding `/tmp/.X11-unix/X0`
+after an unlink may not work in litebox. Worth one probe (spaced-out connects, no `-noreset`), but
+it cannot block the desktop.
 
 `CONN_PROBE=N` opens N sequential X connections, one fresh process each, and times them (`cp1`,
 6 iterations, 40 s timeout each):
