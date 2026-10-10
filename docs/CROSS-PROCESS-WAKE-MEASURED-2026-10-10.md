@@ -103,7 +103,7 @@ with the fix ON; the untuned first cut of it (500 µs condvar slice, 15 ms word 
 0.732 ms / 2.96 MB/s at md5 `b837ad0e2796dcc0d446bbbad223281d`, so the tuning is worth ~2.4× and
 the cap is what buys it. Harness `/tmp/lbx/xwrun.sh`, probes `/tmp/lbx/probe7{3,4}.py`.
 
-## Real-app arm: the webtop's own `xwd -root` capture is NOT ring-bound
+## Real-app arm: INCONCLUSIVE — do not read it as "not ring-bound"
 
 Same binary (md5 `2220690e50d3ea9042a32bd158389d06`), rung 4 of the webtop boot (`rootfs-webtop7.tar`),
 timing every `xwd -root` capture from inside the guest (`/tmp/lbx/rung4wrap.py` wraps `boot.py`'s
@@ -115,15 +115,24 @@ timing every `xwd -root` capture from inside the guest (`/tmp/lbx/rung4wrap.py` 
 | ON (switch unset) | 7 | 0.174, 0.160, 0.233, 0.202, 0.202, 0.210, 0.337 | **0.202 s** | **168** | 6 | 0 |
 | OFF (`=1`) | 7 | 0.373, 0.208, 0.231, 0.210, 0.198, 0.210, 0.203 | **0.210 s** | 0 | 7 | 0 |
 
-**Identical.** Both arms also ran the whole desktop to a clean exit (`rc=0`, ~22 MB of guest stdout
-each). The poll path really did park on the word in the ON arm (168 parks) — it just was not on this
-capture's critical path, which is the whole point: **Xvfb↔`xwd` is a `Local` connection.** `sys_connect`
-resolves the shared-arena address table and builds an in-process endpoint whose channels are already
-arena-resident, so client↔server X11 traffic never touches `SharedByteRing` at all.
+Identical — **and that pair proves nothing about the ring.** Decoding the frames: #1 is the root weave,
+#2 is xfdesktop's black root with 48,432 non-black px (xclock in its 210x234 xfwm4 frame), and **#3–#7
+are byte-identical to each other (md5 `9683542e57ab`, all black)**. The screen was dead from #3 on — a
+compositing overlay (`0x201974`, 10x49 → 1023x767) mapped fullscreen right after the session's xfwm4
+logged `Could not find a screen to manage, exiting`, painted by nobody. So there was never any live
+pixel traffic to time, and `xwd -root` gets its pixels through MIT-SHM (SysV `shmget` — Xvfb passes no
+fds), so those 3.1 MB need not cross a socket at all. Two arms matching here is exactly what you get
+from a dead screen under either switch.
 
-So a slow `xwd` capture on this track is **not** the ring, and `SHARED_UNIX_CONN_BUF` is not its
-lever — look at host contention (45 guest processes and a spinning chromium on 4 CPUs) instead. The
-wake still matters where the ring IS used: chromium's Mojo, where the fd is rebuilt in the receiver.
+What the arm DOES establish: in a real 45-process desktop boot the poll path genuinely parks on the
+word (**168 parks ON vs 0 OFF**), and the boot is stable with the fix ON — both arms ran the whole
+desktop and exited rc=0 with ~22 MB of guest stdout.
+
+**The X11/ring question stays open.** Do not spend more runs on this shape until the webtop track
+re-runs with compositing off and the frames are actually live; and do not use this pair to argue for
+or against `SHARED_UNIX_CONN_BUF`. The static expectation is still that Xvfb↔`xwd` is `Local`
+(`sys_connect` resolves the shared-arena address table into an in-process endpoint), but that is a
+code reading, not a measurement.
 
 ## Arena arithmetic (`SHARED_UNIX_CONN_BUF`)
 
