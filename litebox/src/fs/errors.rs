@@ -63,6 +63,10 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    /// The file IS writable but this caller may not write it -- `/proc/self/uid_map` outside a user
+    /// namespace owes the caller `EPERM`, and [`Self::NotForWriting`] can only render `EBADF`.
+    #[error("operation not permitted")]
+    PermissionDenied,
     #[error("the file would be larger than this store can back")]
     FileTooLarge,
     #[error("I/O error")]

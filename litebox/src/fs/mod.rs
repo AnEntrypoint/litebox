@@ -500,7 +500,7 @@ pub mod clock {
 /// system objects themselves are shared. The shim updates it whenever a task's credentials change.
 pub mod ident {
     use super::UserInfo;
-    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     static USER: AtomicU32 = AtomicU32::new(u32::MAX);
     static GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -539,6 +539,23 @@ pub mod ident {
         UidMap,
         GidMap,
         Setgroups,
+    }
+
+    /// Whether the id-map control files are served with Linux's own semantics: a `/proc/<pid>/`
+    /// copy of each for the CALLER's own pid, and `EPERM` for a refused write instead of `EBADF`.
+    /// Off until the shim turns it on, so a consumer that never registers the callbacks below sees
+    /// neither; the shim clears it when the host env sets `LITEBOX_PROC_USERNS_MAPS_OFF=1`.
+    static ID_MAP_LINUX_SEMANTICS: AtomicBool = AtomicBool::new(false);
+
+    /// Turns [`ID_MAP_LINUX_SEMANTICS`] on or off.
+    pub fn set_id_map_linux_semantics(enabled: bool) {
+        ID_MAP_LINUX_SEMANTICS.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether [`ID_MAP_LINUX_SEMANTICS`] is on.
+    #[must_use]
+    pub fn id_map_linux_semantics() -> bool {
+        ID_MAP_LINUX_SEMANTICS.load(Ordering::Relaxed)
     }
 
     static ID_MAP_WRITE_FN: AtomicUsize = AtomicUsize::new(0);

@@ -1958,6 +1958,16 @@ pub trait SystemInfoProvider {
         None
     }
 
+    /// Spawns a host thread that calls `tick(now_epoch_ms)` every `interval_ms`.
+    ///
+    /// For a diagnostic that must report a state which PREVENTS it from ever being called: a
+    /// per-thread "which syscall am I parked in" table is only useful when the answer is "parked",
+    /// and a parked thread by definition never reaches the dispatch-exit hook that would print it --
+    /// when every thread of the whole fork family is parked, nothing is left to print anything. A
+    /// platform thread is the only clock source this code has. Default: no-op, so every existing
+    /// platform keeps its prior behavior.
+    fn spawn_diag_ticker(&self, _interval_ms: u64, _tick: fn(u64)) {}
+
     fn spill_available(&self) -> bool {
         false
     }

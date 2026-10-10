@@ -138,13 +138,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         let Some(data_ptr) = data else { return Ok(()) };
+        // Linux addresses a target process by pid: 0 means the caller, and anything that is not a
+        // live process is `ESRCH`. Only this task's own ids are resolvable here, so every other
+        // pid answers `ESRCH` rather than silently reporting the caller's sets.
+        let own = [self.guest_pid(), self.guest_tid()];
+        if hdr.pid != 0 && !own.iter().any(|p| u32::try_from(*p) == Ok(hdr.pid)) {
+            return Err(Errno::ESRCH);
+        }
         let c = self.creds();
+        // `LITEBOX_CAPS_FIDELITY_OFF` restores the pre-fidelity answer: the tracked sets verbatim,
+        // which handed an unprivileged guest whatever `cap_eff` happened to hold.
+        let (eff, perm, inh) = if self.global.platform.env_flag("LITEBOX_CAPS_FIDELITY_OFF") {
+            (c.cap_eff, c.cap_perm, c.cap_inh)
+        } else {
+            c.reported_capability_sets()
+        };
         for i in 0..words {
             let shift = 32 * i;
             let cap = litebox_common_linux::CapData {
-                effective: (c.cap_eff >> shift) as u32,
-                permitted: (c.cap_perm >> shift) as u32,
-                inheritable: (c.cap_inh >> shift) as u32,
+                effective: (eff >> shift) as u32,
+                permitted: (perm >> shift) as u32,
+                inheritable: (inh >> shift) as u32,
             };
             data_ptr
                 .write_at_offset::<Platform>(i as isize, cap)
@@ -178,6 +192,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             inh |= u64::from(d.inheritable) << shift;
         }
         let mut c = (*self.creds()).clone();
+        // Linux requires `CAP_SETPCAP` for any real change to the caller's own sets, so an
+        // unprivileged caller may only perform the all-zero no-op -- which happens to be exactly
+        // the `capset` a sandbox uses to drop capabilities, so refusing that no-op would break the
+        // drop itself rather than the privilege escalation.
+        //
+        // Measured on the host as uid 1000: `capset` of all zeros answers 0, `capset` asking for
+        // any bit answers `EPERM`.
+        if !self.global.platform.env_flag("LITEBOX_CAPS_FIDELITY_OFF")
+            && !c.holds_full_capabilities()
+            && (eff != 0 || perm != 0 || inh != 0)
+        {
+            return Err(Errno::EPERM);
+        }
         if perm & !c.cap_perm != 0 || eff & !perm != 0 || inh & !(c.cap_perm | c.cap_inh) != 0 {
             return Err(Errno::EPERM);
         }

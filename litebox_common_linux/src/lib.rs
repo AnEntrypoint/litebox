@@ -2413,6 +2413,10 @@ pub enum SocketOption {
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
+    /// `SO_RCVLOWAT`: minimum bytes a blocking receive waits for. Linux accepts get and set on
+    /// `AF_UNIX` (and every other family); the default is 1. `MSG_WAITALL` overrides it -- see
+    /// `sock_rcvlowat()`, where the receive target is `waitall ? len : min(rcvlowat, len)`.
+    RCVLOWAT = 18,
     /// `SO_PROTOCOL`: the protocol the socket was created with, read-only. Linux reports
     /// `sk->sk_protocol`, which is 0 (`IPPROTO_IP`) for `AF_UNIX` -- unix sockets have no
     /// protocol -- and e.g. `IPPROTO_TCP`/`IPPROTO_UDP` for an inet socket.

@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
@@ -1436,6 +1436,35 @@ impl Credentials {
         self.cap_eff & bit != 0 || (self.uid_map.is_none() && self.euid == 0)
     }
 
+    /// Whether this task is privileged WHERE CAPABILITIES ARE DECIDED: root in the initial
+    /// namespace, or the owner of a user namespace -- which `unshare(CLONE_NEWUSER)` and
+    /// `clone(CLONE_NEWUSER)` mark by installing a `uid_map`, and which then holds every
+    /// capability inside that namespace however the ids end up mapped.
+    ///
+    /// This is the single rule behind both `capget(2)`'s answer and `prctl(PR_CAPBSET_READ)`'s.
+    /// It has to be a rule about the namespace and not just about `cap_eff`: a sandbox that reads
+    /// back a capability takes a privileged path this shim cannot honour, so an unprivileged guest
+    /// must read back NONE -- which is what stops Chromium's `Credentials::HasCapability`
+    /// (`CAP_SYS_ADMIN`) from choosing the path that wedges it without `--no-sandbox`.
+    pub(crate) fn holds_full_capabilities(&self) -> bool {
+        self.uid_map.is_some() || self.euid == 0
+    }
+
+    /// The three sets `capget(2)` reports for this task: the tracked ones when
+    /// [`Self::holds_full_capabilities`], none at all otherwise.
+    ///
+    /// `cap_eff`/`cap_perm`/`cap_inh` already follow every uid transition (`fixup_caps`), every
+    /// `capset(2)` and every `CLONE_NEWUSER`, so for a privileged task this hands them straight
+    /// back; the point of routing the report through here is that a task with no privilege reads
+    /// zero even if some path left a stale bit behind.
+    pub(crate) fn reported_capability_sets(&self) -> (u64, u64, u64) {
+        if self.holds_full_capabilities() {
+            (self.cap_eff, self.cap_perm, self.cap_inh)
+        } else {
+            (0, 0, 0)
+        }
+    }
+
     /// Whether the caller may map ids other than its own; see [`Self::setuid_in_parent_ns`].
     fn can_map_arbitrary_ids(&self) -> bool {
         self.setuid_in_parent_ns
@@ -1595,15 +1624,19 @@ impl Credentials {
                 return Err(Errno::EINVAL);
             }
         }
+        // An id handed to `setresuid` is an id INSIDE this namespace; what the task keeps is the
+        // kernel id it maps to. Storing the inner id instead made `setresuid(0,0,0)` -- the call a
+        // sandbox makes right after mapping 0 to its own outer id -- leave `getuid()` reporting
+        // `OVERFLOW_ID`: the stored 0 had no mapping from `outer`, so it read back as `nobody`.
         if ruid != u32::MAX {
-            self.uid = ruid;
+            self.uid = Self::kernel_id(&self.uid_map, ruid).unwrap_or(OVERFLOW_ID);
         }
         if euid != u32::MAX {
-            self.euid = euid;
-            self.fsuid = euid;
+            self.euid = Self::kernel_id(&self.uid_map, euid).unwrap_or(OVERFLOW_ID);
+            self.fsuid = self.euid;
         }
         if suid != u32::MAX {
-            self.suid = suid;
+            self.suid = Self::kernel_id(&self.uid_map, suid).unwrap_or(OVERFLOW_ID);
         }
         Ok(())
     }
@@ -1620,15 +1653,16 @@ impl Credentials {
                 return Err(Errno::EINVAL);
             }
         }
+        // See `set_res_uid`: the stored id is the kernel one, not the inner one.
         if rgid != u32::MAX {
-            self.gid = rgid;
+            self.gid = Self::kernel_id(&self.gid_map, rgid).unwrap_or(OVERFLOW_ID);
         }
         if egid != u32::MAX {
-            self.egid = egid;
-            self.fsgid = egid;
+            self.egid = Self::kernel_id(&self.gid_map, egid).unwrap_or(OVERFLOW_ID);
+            self.fsgid = self.egid;
         }
         if sgid != u32::MAX {
-            self.sgid = sgid;
+            self.sgid = Self::kernel_id(&self.gid_map, sgid).unwrap_or(OVERFLOW_ID);
         }
         Ok(())
     }
@@ -1780,8 +1814,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     return Err(Errno::EINVAL);
                 }
-                // The bounding set is the kernel default: every capability.
-                Ok(1)
+                // `LITEBOX_CAPS_FIDELITY_OFF` restores the old answer: 1 for every capability.
+                if self.global.platform.env_flag("LITEBOX_CAPS_FIDELITY_OFF") {
+                    return Ok(1);
+                }
+                // The bounding set follows the same rule as `capget(2)` (see
+                // `Credentials::holds_full_capabilities`): a guest with no privilege must not read
+                // a capability back, or a sandbox takes the privileged path.
+                //
+                // Measured natively on this host, uid 1000 AND uid 0 both read
+                // `PR_CAPBSET_READ(CAP_SYS_ADMIN)` == 0 and `PR_CAPBSET_READ(CAP_CHOWN)` == 1 --
+                // the real bounding set is a property of the container, not of the euid, so this
+                // is the euid rule the sandbox needs, not a copy of this host's set.
+                Ok(usize::from(self.creds().holds_full_capabilities()))
             }
             PrctlArg::SetNoNewPrivs(value) => {
                 if value != 1 {
@@ -8199,30 +8244,109 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+/// Wake channel for futexes requested WITHOUT `FUTEX_PRIVATE_FLAG`, i.e. the ones whose waker may
+/// be running in a different host process.
+///
+/// `FutexManager` is per-process by construction (see its own doc comment and
+/// `GlobalStateHandle::futex_manager`), so a `FUTEX_WAKE` issued in one host process never reaches a
+/// `FUTEX_WAIT` parked in another, and `FutexManager::wait` has neither a timeout nor a repoll. The
+/// waiter instead registers a `Pollee` observer here -- arena-allocated, so a waker in another
+/// process calls `on_events` on the same object -- and the waker bumps `epoch` before notifying, so
+/// a waiter that is woken but whose word has not actually changed goes back to sleep instead of
+/// returning early.
+pub(crate) struct SharedFutexWake<Platform: ShimPlatform> {
+    epoch: core::sync::atomic::AtomicU64,
+    pollee: litebox::event::polling::Pollee<Platform>,
+}
+
+impl<Platform: ShimPlatform> SharedFutexWake<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: core::sync::atomic::AtomicU64::new(0),
+            pollee: litebox::event::polling::Pollee::new(),
+        }
+    }
+
+    pub(crate) fn bump(&self) {
+        self.epoch
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.pollee.notify_observers(litebox::event::Events::IN);
+    }
+}
+
+static SHARED_FUTEX_WAKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_shared_futex_wake(enabled: bool) {
+    SHARED_FUTEX_WAKE.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Whether a futex op must be served through [`SharedFutexWake`]: a futex requested without
+    /// `FUTEX_PRIVATE_FLAG` names a word a thread in ANOTHER host process may wake, and this
+    /// process's own `FutexManager` can neither register nor wake such a thread.
+    fn futex_is_cross_process(&self, flags: litebox_common_linux::FutexFlags) -> bool {
+        if flags.contains(litebox_common_linux::FutexFlags::PRIVATE)
+            || !self.global.platform.has_native_fork()
+        {
+            return false;
+        }
+        let enabled = SHARED_FUTEX_WAKE.load(core::sync::atomic::Ordering::Relaxed);
+        litebox_util_log::debug!(
+            tid:% = self.tid.get(),
+            shared_wake:% = enabled;
+            "futex: non-private futex op"
+        );
+        enabled
+    }
+
+    /// Parks on [`SharedFutexWake`] instead of this process's `FutexManager`. `Ok(true)` means the
+    /// wait ended because a wake reached it; `Ok(false)` means the word already differed from `val`
+    /// when the wait began, which Linux reports as `EAGAIN`.
+    fn shared_futex_wait(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        addr: UserPtrMut<u32>,
+        val: u32,
+    ) -> Result<bool, Errno> {
+        use core::sync::atomic::Ordering;
+        use litebox::event::polling::TryOpError;
+        let slot = &self.global.shared_futex_wake;
+        let mut seen = None;
+        slot.pollee
+            .wait(cx, false, litebox::event::Events::IN, || {
+                let epoch = slot.epoch.load(Ordering::Acquire);
+                let bumped = match seen {
+                    None => {
+                        seen = Some(epoch);
+                        false
+                    }
+                    Some(s) if s != epoch => {
+                        seen = Some(epoch);
+                        true
+                    }
+                    Some(_) => return Err(TryOpError::TryAgain),
+                };
+                core::sync::atomic::fence(Ordering::SeqCst);
+                match addr.read_at_offset::<Platform>(0) {
+                    None => Err(TryOpError::Other(Errno::EFAULT)),
+                    Some(v) if v != val => Ok(bumped),
+                    Some(_) if bumped => Ok(true),
+                    Some(_) => Err(TryOpError::TryAgain),
+                }
+            })
+            .map_err(|e| match e {
+                TryOpError::TryAgain => Errno::EAGAIN,
+                TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut) => Errno::ETIMEDOUT,
+                TryOpError::WaitError(_) => Errno::EINTR,
+                TryOpError::Other(e) => e,
+            })
+    }
+
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        /// A futex without `FUTEX_PRIVATE_FLAG` asks for cross-PROCESS semantics. Every guest
-        /// thread here lives in one host process sharing one address space, so a "shared" futex
-        /// word is reachable at the same address by every waiter anyway -- treating it as private
-        /// is CORRECT here, not an approximation, and the wait/wake pairing behaves identically.
-        ///
-        /// Logged at debug rather than through `log_unsupported!`: this is not an unimplemented
-        /// feature and it dominated the unsupported-feature census (20 hits per XFCE run,
-        /// the largest single entry) purely as noise, competing for attention with real gaps.
-        macro_rules! warn_shared_futex {
-            ($flag:ident) => {
-                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    litebox_util_log::debug!(
-                        "futex: shared futex treated as private (correct in a single address space)"
-                    );
-                }
-            };
-        }
-
         let res = match arg {
             FutexArgs::Wake { addr, flags, count } => {
-                warn_shared_futex!(flags);
+                let shared = self.futex_is_cross_process(flags);
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
@@ -8236,6 +8360,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // appears, that points at a genuinely dropped/misdirected wake rather than benign
                 // wake-on-unlock noise.
                 let current_value = addr.read_at_offset::<Platform>(0);
+                if shared {
+                    self.global.shared_futex_wake.bump();
+                }
                 let woken = self.global.futex_manager.wake(
                     addr.to_platform_ptr::<Platform>(),
                     count,
@@ -8258,7 +8385,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 val,
                 timeout,
             } => {
-                warn_shared_futex!(flags);
+                let shared = self.futex_is_cross_process(flags);
                 let timeout = timeout.read::<Platform>()?;
                 // Lost-wakeup investigation (sub-session 37): log the word's value right before
                 // blocking too (mirrors the WAKE side's own `current_value` log added alongside
@@ -8289,6 +8416,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         "futex: WAIT on CONTENDED lock"
                     );
                 }
+                if shared {
+                    return match self
+                        .shared_futex_wait(&self.wait_cx().with_timeout(timeout), addr, val)?
+                    {
+                        true => Ok(0),
+                        false => Err(Errno::EAGAIN),
+                    };
+                }
                 let res = self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
                     addr.to_platform_ptr::<Platform>(),
@@ -8311,7 +8446,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 timeout,
                 bitmask,
             } => {
-                warn_shared_futex!(flags);
                 let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
@@ -8323,6 +8457,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     None
                 };
+                let shared = self.futex_is_cross_process(flags);
+                if shared {
+                    return match self
+                        .shared_futex_wait(&self.wait_cx().with_deadline(deadline), addr, val)?
+                    {
+                        true => Ok(0),
+                        false => Err(Errno::EAGAIN),
+                    };
+                }
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_deadline(deadline),
                     addr.to_platform_ptr::<Platform>(),
@@ -8338,7 +8481,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 requeue_count,
                 addr2,
             } => {
-                warn_shared_futex!(flags);
+                let shared = self.futex_is_cross_process(flags);
+                if shared {
+                    self.global.shared_futex_wake.bump();
+                }
                 let woken = self.global.futex_manager.requeue(
                     addr.to_platform_ptr::<Platform>(),
                     wake_count,
@@ -8365,7 +8511,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 addr2,
                 expected_value,
             } => {
-                warn_shared_futex!(flags);
+                let shared = self.futex_is_cross_process(flags);
+                if shared {
+                    self.global.shared_futex_wake.bump();
+                }
                 let woken = self.global.futex_manager.requeue(
                     addr.to_platform_ptr::<Platform>(),
                     wake_count,
@@ -8408,7 +8557,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags,
                 timeout,
             } => {
-                warn_shared_futex!(flags);
                 // `FUTEX_LOCK_PI`'s timeout is ABSOLUTE, like every futex op except plain WAIT.
                 let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
                     let clock_id =
@@ -8421,6 +8569,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     None
                 };
+                let shared = self.futex_is_cross_process(flags);
                 let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 loop {
                     let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -8449,6 +8598,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if futex_compare_exchange::<Platform>(addr, current, contended)?.is_err() {
                         continue;
                     }
+                    if shared {
+                        match self.shared_futex_wait(
+                            &self.wait_cx().with_deadline(deadline),
+                            addr,
+                            contended,
+                        ) {
+                            Ok(_) | Err(Errno::EAGAIN) => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
                     // A value mismatch means the word already moved on between our store and the
                     // wait; re-read and retry rather than reporting a spurious failure.
                     match self.global.futex_manager.wait(
@@ -8466,7 +8625,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             FutexArgs::TrylockPi { addr, flags } => {
-                warn_shared_futex!(flags);
+                self.futex_is_cross_process(flags);
                 let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != 0 {
@@ -8485,7 +8644,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             FutexArgs::UnlockPi { addr, flags } => {
-                warn_shared_futex!(flags);
+                let shared = self.futex_is_cross_process(flags);
                 let me = self.tid.get() as u32 & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != me {
@@ -8511,6 +8670,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
                 if current & FUTEX_WAITERS != 0 {
+                    if shared {
+                        self.global.shared_futex_wake.bump();
+                    }
                     let one = core::num::NonZeroU32::new(1).unwrap();
                     let _ = self.global.futex_manager.wake(
                         addr.to_platform_ptr::<Platform>(),

@@ -294,6 +294,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             litebox::fs::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::WriteError::PermissionDenied => Errno::EPERM,
             litebox::fs::errors::WriteError::FileTooLarge => Errno::EFBIG,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => Errno::EIO,

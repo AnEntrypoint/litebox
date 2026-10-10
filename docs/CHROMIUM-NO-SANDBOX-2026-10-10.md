@@ -160,3 +160,83 @@ rebuilt eventfd (`file.rs:10739-10748`, `E|` → `sys_eventfd2`) and the 15 ms U
 
 **Corrected pairing** for §1: the three exits are pid **78 → 14.668 s (Δ 0.378)**,
 **82 → 14.935 s (Δ 0.609)**, **72 → 15.230 s (Δ 0.997)**, not 72/78/82 in order.
+
+## 9. `[diag-stuck]` — which syscall every thread of the whole fork family is parked in, with args
+
+New instrument (2026-10-10), diagnostic only — no syscall's guest-visible behaviour changes. Host env
+`LITEBOX_DIAG_STUCK_SECS=<secs>` (unset = off, unparseable = 10). Artifacts: `log-dg2.txt` (60 s),
+`log-dg3.txt` (240 s), both `--disable-seccomp-filter-sandbox`, `probe61-nopkill.sh` (a copy of
+`probe61.sh` with the leading cross-agent `pkill` removed — another agent's harness killed dg2 at
+t≈60 s with SIGKILL, rc=137).
+
+**How it works.** `LITEBOX_PARKED`'s `INFLIGHT` map is a process-private `static` and its dump hangs off
+dispatch exit, so a thread parked forever is invisible to every other process AND never reaches the
+hook. The new record is a 512-slot array of plain atomics placed in the cross-process shared kernel
+arena by `LinuxShimBuilder::build`'s create branch (`platform.shared_kernel_arena_alloc_bytes`, the
+same primitive `SharedRecordLockTable` uses), keyed by guest `(pid, tid)` — the only key unique across
+the fork family (`current_host_pid()` is 0 here; a `Task` address collides between processes). Slots
+are written at syscall entry/exit in `handle_syscall_request` (number, 4 arg words, start time, comm,
+plus a per-thread 8-entry syscall-mix histogram and a `since_last` rate so a thread that SPINS rather
+than parks is still visible). The dump is driven by a **host ticker thread**
+(`SystemInfoProvider::spawn_diag_ticker`, 1 s, default no-op on other platforms) armed once by the
+creator — without it a family where every thread is parked produces nothing at all, which is exactly
+the state being investigated. Chosen over "dump from every process" because the ticker needs no
+dispatch; the table is shared, so one ticker prints the whole family.
+
+### 9.1 Answer: the surviving renderer is parked in a blocking `recvmsg` on fd 3
+
+`log-dg3.txt`, 240 s. Guest pids: 2 3 4 5 8 9 10 11 12 32 43 52 72 78 83, plus the bootstrap 2187029.
+`--type=` execve'd: 9 and 10 (zygotes), 43 (`--type=utility`); everything else is a zygote fork.
+
+| guest pid | threads | parked in | args | since |
+|---|---|---|---|---|
+| **12** | **1** | **`recvmsg(47)`** | `a0=0x3` (fd 3) `a1=0x7fffffeec9d0` `a2=0x0` (BLOCKING, no `MSG_DONTWAIT`) | t≈22 s → end of run |
+| 9 (zygote) | 1 | `ppoll(271)` | `nfds=1`, `tmo=NULL` (infinite) | t≈4 s |
+| 10 (zygote) | 1 | `waitid(247)` | `idtype=0` (P_ALL), `id=0` | t≈4 s |
+| 2187029 tid 13 | — | `wait4(61)` | `pid=10`, options 0 | t≈4 s |
+| 32 (GPU: ANGLE-GC, VizCompositorTh) | many | `futex(202)` `0x189` | idle worker waits | t≈5 s |
+| 43 (`--type=utility`) | many | `epoll_wait`/`futex` | idle | t≈22 s |
+| 52 | many | `futex`/`epoll_wait` | idle | t≈83 s |
+| 2187029 **main thread** | — | **NOT parked** | spin: 23,603 syscalls in one window, mix `access=7115`; host thread state R, 72.8 % CPU | whole run |
+
+**pid 12 is the renderer.** It is a zygote fork (no `execve`), has exactly ONE guest thread, and never
+creates `Chrome_ChildIOThread` — it is stuck on the Mojo bootstrap read itself, in the blocking
+`recvmsg` on fd 3, and never returns. Its host thread does not sleep: in the shorter run `log-dg2.txt`
+the same shape (`recvmsg(47)` on fd 10, blocking) had `ps` state **R**, `wchan=-`. So a blocking
+`recvmsg` with no data spins in userspace instead of parking — `sys_recvmsg` is
+`litebox_shim_linux/src/syscalls/net.rs:2647`; consistent with "there is no real cross-process wake in
+this codebase" (`epoll.rs:423-440`). **Reported, not fixed.**
+
+### 9.2 The renderer 0-exit is NOT seccomp-dependent
+
+With `--disable-seccomp-filter-sandbox` the renderers **still exit 0**, with the same signature as §1:
+
+| pid | registered | `exit_group` status 0 | Δ | `comm` at exit |
+|---|---|---|---|---|
+| 83 | 21.046 s | 21.105 s | **0.059 s** | `chrome_ChildIOT` |
+| 78 | 21.004 s | 21.486 s | 0.482 s | `chrome_ChildIOT` |
+| 72 | 20.891 s | 22.028 s | 1.137 s | `chrome_ChildIOT` |
+
+Three forks, 59/482/1137 ms, same `Chrome_ChildIOThread` comm at exit, no signal, no `Check failed`.
+So §8's `TerminateSelfOnDisconnect` (0-byte `recvmsg`) fires with seccomp disabled too; the earlier
+reading "with `--disable-seccomp-filter-sandbox` the renderers do not exit" does not hold. What differs
+is only that one of the four (pid 12) never reaches the read that returns 0 — it never returns at all.
+
+### 9.3 Side observation: the shim's clock ran ~1.57× wall in the syscall-heavy run
+
+`log-dg3.txt` timestamps reach 376.9 s and `stuck_ms` reaches 374,671 for a thread created at ~2.8 s,
+in a run that `timeout -s KILL 240` ended (rc=124, ps sampler's last sample t=238). The light run
+`log-dg2.txt` matched wall (57.4 s at a 60 s kill). The difference correlates with syscall volume
+(23,603 syscalls in one window vs a nearly idle family), so the suspicion is that
+`TimeProvider::current_time()` advances with syscall/tick activity rather than purely with wall time.
+Not reproducible from these logs alone (per-process uptime is the log's clock too), and it does not
+change any parked-syscall or argument reading above. If it holds, every guest timeout is distorted —
+worth one probe: guest `clock_gettime(CLOCK_MONOTONIC)` deltas against wall inside a tight syscall loop.
+
+### 9.4 Instrument caveats
+
+- The dump is emitted by the ticker **and** at dispatch exit, and each fork child inherits its own
+  throttle value, so rows repeat (~161 dumps in dg3). Harmless, just noisy.
+- Durations are in the shim's clock (see 9.3); the parked syscall, its arguments and the fd are not
+  affected.
+- `note=-` everywhere: `set_thread_note` is gated on `LITEBOX_PARKED`, which was off in these runs.

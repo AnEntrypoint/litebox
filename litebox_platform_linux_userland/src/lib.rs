@@ -3623,6 +3623,26 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         std::env::var(name).ok().filter(|v| !v.is_empty())
     }
 
+    fn spawn_diag_ticker(&self, interval_ms: u64, tick: fn(u64)) {
+        // One per process: `env_value`-gated diagnostics are latched once and never re-armed.
+        static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let interval = std::time::Duration::from_millis(interval_ms.max(1));
+        let built = std::thread::Builder::new()
+            .name("lbx-diag-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                tick(now);
+            });
+        drop(built);
+    }
+
     fn get_vdso_address(&self) -> Option<usize> {
         // Enabling VDSO on x86 causes glibc to not set a restorer in signal
         // handlers, which we do not currently support. Disable VDSO for

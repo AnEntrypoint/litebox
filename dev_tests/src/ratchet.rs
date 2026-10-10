@@ -61,7 +61,14 @@ fn ratchet_globals() -> Result<()> {
             // one each. These are the process-wide tables the shim shares across host processes,
             // which is exactly what a `static` is for; counted by line-count against the
             // heuristic below.
-            ("litebox/", 45),
+            // 46 rather than 45 for `ID_MAP_LINUX_SEMANTICS`, the `AtomicBool` the fs layer reads
+            // to decide whether `/proc/<pid>/{uid_map,gid_map,setgroups}` exist for the caller's
+            // own pid and whether a refused write answers `EPERM` instead of `EBADF`. It sits with
+            // the other id-map settings in `fs/mod.rs`, which the fs layer's `procfs.rs` reaches
+            // through plain function pointers because the shim owns the credentials -- a `static`
+            // for the same reason the neighbouring ones are. The shim clears it from
+            // `LITEBOX_PROC_USERNS_MAPS_OFF=1`.
+            ("litebox/", 46),
             ("litebox_platform_linux_kernel/", 6),
             // 9 rather than 5: AARCH64_SCRATCH_PTR/AARCH64_HOST_ONLY_SCRATCH/
             // AARCH64_GUEST_ALT_STACK_BASES were introduced by the aarch64 userland port

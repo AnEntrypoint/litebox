@@ -883,6 +883,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             );
             return true;
         }
+        if self.platform().env_flag("LITEBOX_UNIX_PEER_GONE_STRICT") {
+            // STRICT: a 0-byte read is returned only when the peer really is closed.
+            //
+            // The only EXACT evidence of that is `read_ring.is_shutdown()` above -- the peer's
+            // `shutdown(SHUT_WR)`, or its last holder being released, both of which shut this
+            // ring's write side. Everything else is the liveness heuristic: it exists because a
+            // host process can die without ever releasing its hold, and without it the reader
+            // would block forever on a peer that no longer exists. It cannot be made exact --
+            // `is_process_alive` is the only oracle -- so what changes here is:
+            //
+            //   * the heuristic no longer shuts the ring down. That was the irreversible part:
+            //     once this ring is shut, every later write by the peer fails and every later
+            //     read reports EOF, so one wrong liveness answer killed the channel forever.
+            //     Now a wrong answer costs one retry -- `SharedView::recv` re-reads first, so
+            //     bytes the peer queues later are still delivered.
+            //   * the verdict must be SETTLED (see `side_gone_settled`): the first sweep that
+            //     finds only dead holders is not reported as EOF.
+            //   * a non-empty ring is proof the peer is writing, so it is never "gone".
+            match self
+                .slot_ref()
+                .side_gone_settled(!self.is_client, self.platform())
+            {
+                Some(true) if read_ring.is_empty() => {
+                    litebox_util_log::__private::tracing::event!(
+                        target: "litebox_diag::unix_conn_teardown",
+                        litebox_util_log::__private::tracing::Level::DEBUG,
+                        slot = %self.slot,
+                        is_client = %self.is_client,
+                        host_pid = %self.platform().current_host_pid(),
+                        "DIAG unix shared conn: peer_gone strict, settled and ring empty \
+                         (ring left open)"
+                    );
+                    return true;
+                }
+                _ => return false,
+            }
+        }
         if self.slot_ref().side_gone(!self.is_client, self.platform()) {
             litebox_util_log::__private::tracing::event!(
                 target: "litebox_diag::unix_conn_teardown",
@@ -942,7 +979,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             "DIAG unix shared conn: release_holder"
         );
         let slot_ref = self.slot_ref();
-        slot_ref.release(self.is_client, host);
+        slot_ref.release(self.is_client, host, self.platform());
         if slot_ref.side_gone(self.is_client, self.platform()) {
             // 118th-pass investigation: root-causing a session-client death cascade (AGENTS.md
             // "Where things stand") to a genuine EOF on each client's own unix-domain connection
@@ -1018,7 +1055,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
         {
             UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
+            diag_slot_line(
+                self.platform(),
+                "write-refused",
+                self.slot,
+                self.is_client,
+                alloc::format!("len={} fds={}", msg.data.len(), n_donated).as_str(),
+            );
             return Err((msg, Errno::EPIPE));
+        }
+        let extra = alloc::format!("len={} fds={}", msg.data.len(), n_donated);
+        if self.platform().env_flag("LITEBOX_DIAG_UNIXZERO")
+            && DIAG_SLOT_WRITES_EMITTED.fetch_add(1, Ordering::Relaxed) < DIAG_SLOT_WRITE_LINES
+        {
+            diag_slot_line(self.platform(), "write", self.slot, self.is_client, extra.as_str());
         }
         if self.slot_ref().framed.load(Ordering::Acquire) {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
@@ -1058,6 +1108,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         Ok(msg.data.len())
     }
 
+    /// Why a read on this endpoint is about to answer EOF, logged under
+    /// `LITEBOX_DIAG_UNIXZERO` so a 0-byte AF_UNIX stream read can be attributed to one of the
+    /// distinct causes that produce it (`read_ring` shut down, or the peer side having no live
+    /// holder) instead of being inferred from the fact alone. Prefix `[diag-unixzero]`.
+    fn log_zero_read(
+        &self,
+        read_ring: &SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>,
+        peer_gone: bool,
+        peek: bool,
+    ) {
+        if !self.platform().env_flag("LITEBOX_DIAG_UNIXZERO") {
+            return;
+        }
+        let peer = !self.is_client;
+        let slot_ref = self.slot_ref();
+        litebox_util_log::warn!(
+            slot:% = self.slot,
+            is_client:% = self.is_client,
+            me:% = self.platform().current_host_pid(),
+            peek:% = peek,
+            peer_gone:% = peer_gone,
+            ring_shutdown:% = read_ring.is_shutdown(),
+            ring_empty:% = read_ring.is_empty(),
+            peer_ever_held:% = slot_ref.side_ever_held[conn_side(peer)].load(Ordering::Acquire),
+            holders:% = slot_ref.holder_dump().as_str();
+            "[diag-unixzero] AF_UNIX stream shared-slot read answering EOF"
+        );
+    }
+
     /// Reads bytes (or, on a record-framed slot, exactly one record). Never carries `SCM_RIGHTS`
     /// fds -- the sending side refuses them up front.
     fn recv(
@@ -1080,7 +1159,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             if let Some(n) = peeked {
                 return Ok((n, Vec::new()));
             }
-            if self.peer_gone() && read_ring.is_empty() {
+            let peer_gone = self.peer_gone();
+            if peer_gone && read_ring.is_empty() {
+                self.log_zero_read(read_ring, peer_gone, peek);
                 return Err(TryOpError::Other(Errno::ESHUTDOWN));
             }
             return Err(TryOpError::TryAgain);
@@ -1100,7 +1181,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             self.poke_peer();
             return Ok((n, specs.into_iter().map(AnyDupFd::Carried).collect()));
         }
-        if self.peer_gone() && read_ring.is_empty() {
+        let peer_gone = self.peer_gone();
+        if peer_gone && read_ring.is_empty() {
+            self.log_zero_read(read_ring, peer_gone, peek);
             return Err(TryOpError::Other(Errno::ESHUTDOWN));
         }
         Err(TryOpError::TryAgain)
@@ -1343,6 +1426,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
     }
 
+    /// Bytes a receive would return right now -- what Linux's `FIONREAD`/`SIOCINQ` reports for a
+    /// unix socket. A promoted local pair can hold bytes in BOTH places (its own channel, which
+    /// is drained first, and the slot's ring), so the two are summed rather than either one taken
+    /// as the answer.
+    fn readable_bytes(&self) -> usize {
+        let mut n = 0;
+        if let ConnTransport::Local { recv_channel, .. } = &self.transport {
+            n += recv_channel.fold_queued(0usize, |acc, m| acc + m.data.len());
+        }
+        if let Some(view) = self.shared_view() {
+            let (read_ring, _) = view.rings();
+            n += read_ring.readable_bytes();
+        }
+        n
+    }
+
     /// Moves this connection onto a [`SharedUnixConnTable`] slot so a cross-process fork child
     /// can hold this end too, and returns `(slot, is_client)`.
     ///
@@ -1400,6 +1499,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             let slot_ref = table.get(slot);
             slot_ref.framed.store(framed, Ordering::Release);
             let me = global.platform.current_host_pid();
+            diag_slot_line(
+                global.platform,
+                "promote-new",
+                slot,
+                is_client,
+                alloc::format!("bytes={bytes} msgs={messages} framed={framed}").as_str(),
+            );
             slot_ref.hold(is_client, me, global.platform);
             if recv_channel.is_peer_shutdown() {
                 // The other end already closed: its side counts as gone from the start.
@@ -1411,6 +1517,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             link.slot.store(slot, Ordering::Release);
             slot
         } else {
+            diag_slot_line(
+                global.platform,
+                "promote-existing",
+                existing,
+                is_client,
+                alloc::format!("bytes={bytes} msgs={messages}").as_str(),
+            );
             let view = SharedView {
                 global,
                 slot: existing,
@@ -1536,6 +1649,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         result
     }
 
+    /// The platform this endpoint's global state was built with, when it has one (an unpromoted
+    /// local pair has no global until it is promoted).
+    fn diag_platform(&self) -> Option<&Platform> {
+        match &self.transport {
+            ConnTransport::Shared { global, .. } => Some(global.platform),
+            ConnTransport::Local { link, .. } => link.global.get().map(|g| g.platform),
+        }
+    }
+
+    /// [`Self::log_zero_read`]'s counterpart for an endpoint whose transport is still its own local
+    /// channel: EOF there means that channel's peer shut its write side, which no shared-slot
+    /// bookkeeping records. Same `LITEBOX_DIAG_UNIXZERO` gate and `[diag-unixzero]` prefix.
+    fn log_local_zero_read(&self, peek: bool) {
+        let Some(platform) = self.diag_platform() else {
+            return;
+        };
+        if !platform.env_flag("LITEBOX_DIAG_UNIXZERO") {
+            return;
+        }
+        let ConnTransport::Local {
+            recv_channel,
+            connected_send_channel,
+            is_client,
+            ..
+        } = &self.transport
+        else {
+            return;
+        };
+        litebox_util_log::warn!(
+            me:% = platform.current_host_pid(),
+            is_client:% = *is_client,
+            peek:% = peek,
+            recv_empty:% = recv_channel.is_empty(),
+            peer_write_shutdown:% = recv_channel.is_peer_shutdown(),
+            self_write_shutdown:% = connected_send_channel.is_shutdown();
+            "[diag-unixzero] AF_UNIX stream local-channel read answering EOF"
+        );
+    }
+
     /// Reads up to `buf.len()` bytes, same message-boundary-spanning behavior as before, plus any
     /// `SCM_RIGHTS` fds attached to a message this call reads the FIRST byte of (a message whose
     /// `data` is already partially drained by an earlier call had its fds delivered on that
@@ -1611,6 +1763,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                     }
                     return match e {
                         Errno::EAGAIN => Err(TryOpError::TryAgain),
+                        Errno::ESHUTDOWN => {
+                            self.log_local_zero_read(peek);
+                            Err(TryOpError::Other(Errno::ESHUTDOWN))
+                        }
                         other => Err(TryOpError::Other(other)),
                     };
                 }
@@ -1835,6 +1991,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 }
             }
         });
+    }
+
+    /// Bytes queued for a receive right now -- what Linux's `FIONREAD` (`SIOCINQ`) reports.
+    /// `None` for a listening socket, the one case Linux answers `EINVAL` for (measured: a bound,
+    /// listening `AF_UNIX` stream socket fails `FIONREAD` with errno 22).
+    fn readable_bytes(&self) -> Option<usize> {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Listen(_) => None,
+            UnixStreamState::Connected(conn) => Some(conn.readable_bytes()),
+            UnixStreamState::Init(_) | UnixStreamState::Connecting(_) => Some(0),
+        })
     }
 
     fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
@@ -2673,6 +2840,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
+    /// Bytes queued for a receive right now -- what Linux's `FIONREAD` (`SIOCINQ`) reports.
+    fn readable_bytes(&self) -> usize {
+        self.inner
+            .read()
+            .recv_channel
+            .as_ref()
+            .map_or(0, |ch| ch.fold_queued(0usize, |acc, m| acc + m.data.len()))
+    }
+
     fn new() -> Self {
         Self {
             inner: RwLock::new(UnixDatagramInner {
@@ -2945,6 +3121,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         Some(Self::new_with_inner(inner, flags))
     }
 
+    /// Bytes queued for a receive right now: what Linux's `FIONREAD` (`SIOCINQ`) reports for a
+    /// unix socket, and what `ioctl(fd, FIONREAD)` must answer instead of `EINVAL`. `None` is the
+    /// one case Linux really does answer `EINVAL` for: a listening socket (measured: errno 22 on
+    /// a bound, listening `AF_UNIX` stream socket, while an unconnected one answers 0).
+    pub(super) fn readable_bytes(&self) -> Option<usize> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.readable_bytes(),
+            UnixSocketInner::Datagram(datagram) => Some(datagram.readable_bytes()),
+        }
+    }
+
     pub(super) fn bind(
         &self,
         task: &Task<Platform, FS>,
@@ -3127,7 +3314,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let supported_flags = ReceiveFlags::DONTWAIT
             | ReceiveFlags::TRUNC
             | ReceiveFlags::CMSG_CLOEXEC
-            | ReceiveFlags::PEEK;
+            | ReceiveFlags::PEEK
+            | ReceiveFlags::WAITALL;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -3136,34 +3324,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
         let peek = flags.contains(ReceiveFlags::PEEK);
         let timeout = self.options.lock().recv_timeout;
-        let ret = match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
-            }
-            UnixSocketInner::Datagram(datagram) => {
-                let mut sender = None;
-                datagram
-                    .recvfrom(
-                        cx,
-                        timeout,
-                        buf,
-                        is_nonblocking,
-                        peek,
-                        source_addr,
-                        Some(&mut sender),
-                    )
-                    .map(|n| {
-                        if let Some(cred) = sender {
-                            datagram.note_last_sender(cred);
-                        }
-                        (n, Vec::new())
-                    })
-            }
+        // How many bytes this receive holds out for, as Linux's `sock_rcvlowat()` computes it:
+        // `waitall ? len : min(SO_RCVLOWAT, len)`. `SO_RCVLOWAT` defaults to 1, so at the default
+        // this is "return as soon as any byte is there" -- exactly what one recvfrom already does.
+        // `MSG_WAITALL` is ignored on `SOCK_DGRAM` (Linux returns one datagram per receive), and
+        // `MSG_PEEK` cannot loop (it would hand back the same bytes again).
+        let is_datagram = matches!(&self.inner, UnixSocketInner::Datagram(_));
+        let target = if flags.contains(ReceiveFlags::WAITALL) && !peek && !is_datagram {
+            buf.len()
+        } else {
+            self.options.lock().recv_lowat().min(buf.len())
         };
-        match ret {
-            Err(Errno::ESHUTDOWN) => Ok((0, Vec::new())),
-            other => other,
+
+        let mut source = source_addr;
+        let mut total = 0usize;
+        let mut carried: AnyDupFds<Platform, FS> = Vec::new();
+        while total < target {
+            let ret = match &self.inner {
+                UnixSocketInner::Stream(stream) => {
+                    stream.recvfrom(cx, timeout, &mut buf[total..], is_nonblocking, peek, if total == 0 { source.take() } else { None })
+                }
+                UnixSocketInner::Datagram(datagram) => {
+                    let mut sender = None;
+                    datagram
+                        .recvfrom(
+                            cx,
+                            timeout,
+                            &mut buf[total..],
+                            is_nonblocking,
+                            peek,
+                            if total == 0 { source.take() } else { None },
+                            Some(&mut sender),
+                        )
+                        .map(|n| {
+                            if let Some(cred) = sender {
+                                datagram.note_last_sender(cred);
+                            }
+                            (n, Vec::new())
+                        })
+                }
+            };
+            match ret {
+                // A closed/non-existent peer: Linux returns the bytes already copied, and only
+                // reports EOF (0) on a read that copied nothing.
+                Err(Errno::ESHUTDOWN) if total == 0 => return Ok((0, Vec::new())),
+                // `EAGAIN`, a `SO_RCVTIMEO` expiry, or any other error after a partial read: Linux
+                // hands back what was copied. Nothing copied: the error is the answer.
+                Err(_) if total > 0 => return Ok((total, carried)),
+                Err(e) => return Err(e),
+                // No progress: stop, so an empty-but-open socket can never spin here.
+                Ok((0, _)) => break,
+                Ok((n, mut fds)) => {
+                    total += n;
+                    carried.append(&mut fds);
+                    // A descriptor-bearing message ends the read: Linux never spans `SCM_RIGHTS`
+                    // across two receives, and the ring stops at that boundary anyway.
+                    if !carried.is_empty() {
+                        break;
+                    }
+                    // `MSG_PEEK` leaves the bytes queued, so a second pass can never make progress.
+                    if peek {
+                        break;
+                    }
+                }
+            }
         }
+        Ok((total, carried))
     }
 
     pub(super) fn get_local_addr(&self) -> UnixSocketAddr {
@@ -3248,6 +3474,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
                     self.options.lock().broadcast = val != 0;
                 }
+                (SocketOption::RCVLOWAT, SocketOptionValue::U32(val)) => {
+                    self.options.lock().recv_lowat = val;
+                }
                 _ => unreachable!(),
             }
             Ok(())
@@ -3295,6 +3524,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     Ok(())
                 }
                 SocketOption::PRIORITY | SocketOption::REUSEPORT => Ok(()),
+                // `setsockopt_common` handles this one; the arm is here so that a future change
+                // there can never turn a plain set into the `unreachable!()` above.
+                SocketOption::RCVLOWAT => {
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    self.options.lock().recv_lowat = val;
+                    Ok(())
+                }
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -3318,6 +3554,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             }
             SocketOption::BROADCAST => {
                 SocketOptionValue::U32(u32::from(self.options.lock().broadcast))
+            }
+            SocketOption::RCVLOWAT => {
+                SocketOptionValue::U32(u32::try_from(self.options.lock().recv_lowat()).unwrap_or(u32::MAX))
             }
             _ => unreachable!(),
         }) {
@@ -3362,6 +3601,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PASSCRED => u32::from(self.options.lock().passcred),
                 SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
+                SocketOption::RCVLOWAT => {
+                    u32::try_from(self.options.lock().recv_lowat()).unwrap_or(u32::MAX)
+                }
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| -> Result<Ucred, Errno> {
@@ -4100,6 +4342,11 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
         cursor.write_pos == cursor.read_pos
     }
 
+    /// Bytes queued for the reader right now -- what Linux's `FIONREAD` (`SIOCINQ`) reports.
+    pub(crate) fn readable_bytes(&self) -> usize {
+        RING_BYTES - self.free_space()
+    }
+
     pub(crate) fn free_space(&self) -> usize {
         let cursor = self.cursor.lock();
         RING_BYTES - cursor.write_pos.wrapping_sub(cursor.read_pos)
@@ -4207,6 +4454,12 @@ struct SharedConnSlot<Platform: ShimPlatform> {
     /// is gone -- or its host process died without dropping it.
     holder_hosts: [[AtomicU32; CONN_HOLDER_HOSTS]; 2],
     holder_counts: [[AtomicU32; CONN_HOLDER_HOSTS]; 2],
+    /// Holders this slot could NOT record because every `holder_hosts` row was taken -- a live
+    /// endpoint that is invisible to `side_gone`. Counted only under
+    /// `LITEBOX_UNIX_PEER_GONE_STRICT`, which consults it and refuses to call a side gone while
+    /// any untracked holder remains: an unseen live holder declared gone is a spurious EOF, and
+    /// the only cost of refusing is that teardown waits for a real `release_holder`.
+    untracked_holders: [AtomicU32; 2],
     side_ever_held: [AtomicBool; 2],
     /// The rings carry length-prefixed records (a promoted `SOCK_SEQPACKET` connection).
     framed: AtomicBool,
@@ -4275,6 +4528,14 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
                 return;
             }
         }
+        // Registering FAILED, but this endpoint is alive and holds the side: it must not be
+        // possible for `side_gone` to look at this slot later, see no live holder, and hand the
+        // peer an EOF for a connection that is open. Under `LITEBOX_UNIX_PEER_GONE_STRICT` the
+        // uncounted holder is recorded instead of dropped, and `side_gone` refuses to call the
+        // side gone while any remains.
+        if platform.env_flag("LITEBOX_UNIX_PEER_GONE_STRICT") {
+            self.untracked_holders[side].fetch_add(1, Ordering::AcqRel);
+        }
         litebox_util_log::warn!(
             host:% = host, is_client:% = is_client;
             "shared unix connection: more host processes hold one side than tracked; this \
@@ -4282,16 +4543,25 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         );
     }
 
-    fn release(&self, is_client: bool, host: u32) {
+    /// Drops one hold of `is_client`'s side by `host`. Returns `false` when no recorded holder
+    /// matched -- the release of an uncounted holder, which `hold` counted in
+    /// `untracked_holders` instead (see that field).
+    fn release(&self, is_client: bool, host: u32, platform: &Platform) -> bool {
         let side = conn_side(is_client);
         for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
             if h.load(Ordering::Acquire) == host
                 && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
             {
-                return;
+                return true;
             }
         }
+        if platform.env_flag("LITEBOX_UNIX_PEER_GONE_STRICT") {
+            self.untracked_holders[side]
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .ok();
+        }
+        false
     }
 
     fn holder_dump(&self) -> alloc::string::String {
@@ -4309,14 +4579,27 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         out
     }
 
-    /// The side was held and no live host process holds it any more.
-    fn side_gone(&self, is_client: bool, platform: &Platform) -> bool {
+    /// One liveness sweep of `is_client`'s side: `(any live holder found, a dead holder's count
+    /// was retired by THIS call)`.
+    ///
+    /// The sweep is lazy -- any host thread can run it at any moment by reading this connection --
+    /// and its only oracle for "is that host process still alive" is `platform.is_process_alive`.
+    fn side_liveness(&self, is_client: bool, platform: &Platform) -> (bool, bool) {
         let side = conn_side(is_client);
         if !self.side_ever_held[side].load(Ordering::Acquire) {
-            return false;
+            // Never held: the peer simply has not attached yet, which is not "gone".
+            return (true, false);
+        }
+        // A holder `hold()` could not record is a LIVE holder this bookkeeping cannot see, so the
+        // side is not gone whatever the counts say -- see `untracked_holders`.
+        if platform.env_flag("LITEBOX_UNIX_PEER_GONE_STRICT")
+            && self.untracked_holders[side].load(Ordering::Acquire) > 0
+        {
+            return (true, false);
         }
         let me = platform.current_host_pid();
         let mut any = false;
+        let mut retired = false;
         for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
             if c.load(Ordering::Acquire) == 0 {
                 continue;
@@ -4341,9 +4624,34 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
                     "DIAG unix shared conn: side_gone() declared a holder host dead on a lazy read-time check"
                 );
                 c.store(0, Ordering::Release);
+                retired = true;
             }
         }
-        !any
+        (any, retired)
+    }
+
+    /// The side was held and no live host process holds it any more.
+    fn side_gone(&self, is_client: bool, platform: &Platform) -> bool {
+        !self.side_liveness(is_client, platform).0
+    }
+
+    /// [`Self::side_gone`] with the verdict SETTLED: `None` when this very call had to retire a
+    /// dead holder's count, i.e. the first moment the side looks unheld.
+    ///
+    /// One sweep is not proof. It runs on a read of this connection by any thread, asks one
+    /// oracle, and its answer decides an IRREVERSIBLE thing -- the peer's next read returns 0,
+    /// which is how Mojo decides "the channel is closed". Requiring the second sweep (which the
+    /// read loop performs anyway, at `SHARED_UNIX_POLL_INTERVAL`, and which then finds the counts
+    /// already zero) means a single wrong answer degrades to "try again", not to a dead channel.
+    fn side_gone_settled(&self, is_client: bool, platform: &Platform) -> Option<bool> {
+        let (any, retired) = self.side_liveness(is_client, platform);
+        if any {
+            return Some(false);
+        }
+        if retired {
+            return None;
+        }
+        Some(true)
     }
 
     /// Calls `f` with every distinct host process currently holding `is_client`'s side.
@@ -4367,6 +4675,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             for c in &self.holder_counts[side] {
                 c.store(0, Ordering::Release);
             }
+            self.untracked_holders[side].store(0, Ordering::Release);
             self.side_ever_held[side].store(false, Ordering::Release);
         }
         self.framed.store(false, Ordering::Release);
@@ -4385,6 +4694,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             server_gid: AtomicU32::new(0),
             holder_hosts: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(0))),
             holder_counts: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(0))),
+            untracked_holders: [AtomicU32::new(0), AtomicU32::new(0)],
             side_ever_held: [AtomicBool::new(false), AtomicBool::new(false)],
             framed: AtomicBool::new(false),
             last_writer_c2s: [const { AtomicU32::new(0) }; 3],
@@ -5106,6 +5416,36 @@ fn decode_unix_addr(s: &str) -> Option<UnixSocketAddr> {
     }
 }
 
+/// One line of the `LITEBOX_DIAG_UNIXZERO` slot-identity trace: which [`SharedUnixConnTable`]
+/// slot a cross-process AF_UNIX endpoint is bound to at each point it can change or be observed.
+/// A write into one slot and a read from another is the difference this makes visible.
+fn diag_slot_line<Platform: ShimPlatform>(
+    platform: &Platform,
+    event: &str,
+    slot: u32,
+    is_client: bool,
+    extra: &str,
+) {
+    if !platform.env_flag("LITEBOX_DIAG_UNIXZERO") {
+        return;
+    }
+    litebox_util_log::warn!(
+        event:% = event,
+        slot:% = slot,
+        is_client:% = is_client,
+        me:% = platform.current_host_pid(),
+        extra:% = extra;
+        "[diag-unixslot] cross-process AF_UNIX connection slot identity"
+    );
+}
+
+/// Lines `diag_slot_line` may emit for `event == "write"`: every message on every shared
+/// connection would otherwise dominate the log and change the timing being measured. Promote,
+/// adopt and EOF are rare enough to stay unbounded.
+const DIAG_SLOT_WRITE_LINES: usize = 3000;
+static DIAG_SLOT_WRITES_EMITTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// What the parent must undo if the fork that a [`UnixSocket::fork_carry`] was made for does not
 /// happen: the connection holder it counted, or the listener presence it advertised, on the
 /// child's behalf.
@@ -5306,7 +5646,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
         let slot_ref = global.unix_shared_conn_table.get(*slot);
         slot_ref.hold(*is_client, child_host, global.platform);
-        slot_ref.release(*is_client, *host);
+        slot_ref.release(*is_client, *host, global.platform);
         litebox_util_log::__private::tracing::event!(
             target: "litebox_diag::unix_conn_teardown",
             litebox_util_log::__private::tracing::Level::DEBUG,
@@ -5527,6 +5867,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     if slot as usize >= SHARED_UNIX_CONN_CAPACITY {
                         return None;
                     }
+                    diag_slot_line(
+                        task.global.platform,
+                        "adopt",
+                        slot,
+                        is_client,
+                        alloc::format!("parent_host={parent_host} local={local_addr:?}").as_str(),
+                    );
                     let conn = UnixConnectedStream::new_shared(
                         task.global.clone(),
                         slot,
@@ -5558,7 +5905,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     task.global
                         .unix_shared_conn_table
                         .get(slot)
-                        .release(is_client, release_host);
+                        .release(is_client, release_host, task.global.platform);
                     litebox_util_log::__private::tracing::event!(
                         target: "litebox_diag::unix_conn_teardown",
                         litebox_util_log::__private::tracing::Level::DEBUG,

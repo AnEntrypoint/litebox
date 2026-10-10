@@ -13,7 +13,9 @@
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 /// Per-syscall accounting, keyed by raw syscall number.
 #[derive(Default)]
@@ -469,6 +471,335 @@ pub fn maybe_dump_inflight<Platform: litebox::platform::TimeProvider>(
                 f.args[3],
             ),
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "Which syscall is each guest thread parked in?" (`LITEBOX_DIAG_STUCK_SECS=<secs>`)
+//
+// `LITEBOX_PARKED`'s `INFLIGHT` map is a process-private `static`, and its dump hangs off the
+// DISPATCH-EXIT hook -- so a native-`fork()` child that enters one syscall and never returns
+// (a chromium renderer) can neither be seen by another process nor ever reach the hook itself.
+// This keeps the same record in the cross-process SHARED kernel arena, allocated once from
+// `LinuxShimBuilder::build`'s create branch exactly as `SharedRecordLockTable` is, so the mapping
+// is inherited by every `fork()` descendant at the same address and ANY process still dispatching
+// prints the whole family's rows. Every field is a plain atomic: the dump takes no lock, so it
+// still runs while some other thread sits on one.
+// ---------------------------------------------------------------------------
+
+const STUCK_SLOTS: usize = 512;
+/// Linear-probe depth when claiming or finding a slot.
+const STUCK_PROBE: usize = 8;
+/// Used when `LITEBOX_DIAG_STUCK_SECS` is set to something unparseable.
+const STUCK_DEFAULT_SECS: u64 = 10;
+/// Distinct syscall numbers a slot's mix histogram keeps.
+const STUCK_MIX: usize = 8;
+/// `mix_sysno` marker for an unused histogram entry (a real syscall number is never `u32::MAX`).
+const STUCK_MIX_FREE: u32 = u32::MAX;
+
+#[repr(C)]
+struct StuckSlot {
+    /// Slot key: a guest `(pid, tid)` pair is unique across the whole fork family, unlike a `Task`
+    /// address (a `Task` lives in process-private memory, so two processes' tasks collide) or a
+    /// host pid (`current_host_pid` is 0 on a platform with no cross-process signal delivery,
+    /// including this one). `key_pid == 0` marks a free slot.
+    key_pid: AtomicI32,
+    key_tid: AtomicI32,
+    active: AtomicU32,
+    sysno: AtomicU32,
+    host: AtomicU32,
+    /// The `Task` address, kept only so the dump can look up this thread's note.
+    task: AtomicU64,
+    args: [AtomicU64; 4],
+    started_ms: AtomicU64,
+    exit_ms: AtomicU64,
+    completed: AtomicU64,
+    /// `completed` as of the previous dump, so the dump can report a RATE and not just a total.
+    seen_completed: AtomicU64,
+    mix_sysno: [AtomicU32; STUCK_MIX],
+    mix_count: [AtomicU64; STUCK_MIX],
+    comm: [AtomicU64; 2],
+}
+
+static STUCK_BASE: AtomicUsize = AtomicUsize::new(0);
+static STUCK_SECS: AtomicU64 = AtomicU64::new(0);
+static STUCK_INIT: AtomicBool = AtomicBool::new(false);
+static STUCK_LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One-shot latch for `LITEBOX_DIAG_STUCK_SECS`. Unset leaves it at 0 = off, so a run that does
+/// not ask for this costs one relaxed load per dispatch and nothing else.
+pub fn init_stuck(secs: impl FnOnce() -> Option<String>) {
+    if STUCK_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let v = secs()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(STUCK_DEFAULT_SECS);
+    STUCK_SECS.store(v, Ordering::Release);
+    STUCK_INIT.store(true, Ordering::Release);
+}
+
+pub fn stuck_enabled() -> bool {
+    STUCK_SECS.load(Ordering::Acquire) != 0 && STUCK_BASE.load(Ordering::Acquire) != 0
+}
+
+/// Places the slot array in the shared arena. Called from `LinuxShimBuilder::build`, which is the
+/// only place that runs once per fork family; the pointer it publishes lives in a `static`, so a
+/// `fork()` child inherits the VALUE while the pages behind it stay shared.
+pub fn allocate_stuck_table<Platform: litebox::platform::SharedKernelStateProvider>(
+    platform: &Platform,
+) {
+    if STUCK_SECS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let layout = core::alloc::Layout::new::<[StuckSlot; STUCK_SLOTS]>();
+    // `None` (arena exhausted) leaves `STUCK_BASE` at 0, which disables the whole instrument
+    // rather than aborting the host process the whole guest session lives in.
+    if let Some(ptr) = platform.shared_kernel_arena_alloc_bytes(layout) {
+        STUCK_BASE.store(ptr.as_ptr() as usize, Ordering::Release);
+    }
+}
+
+/// Arms the host thread that dumps the shared table on a clock instead of on a dispatch, so a fork
+/// family in which every thread is parked at once is still observable. One second, so the
+/// `LITEBOX_DIAG_STUCK_SECS` window is what throttles the output.
+pub fn spawn_stuck_ticker<Platform: litebox::platform::SystemInfoProvider>(platform: &Platform) {
+    if stuck_enabled() {
+        platform.spawn_diag_ticker(1000, maybe_dump_stuck);
+    }
+}
+
+fn stuck_base() -> Option<*const StuckSlot> {
+    let p = STUCK_BASE.load(Ordering::Acquire);
+    (p != 0).then_some(p as *const StuckSlot)
+}
+
+fn stuck_slot_at(base: *const StuckSlot, index: usize) -> &'static StuckSlot {
+    // SAFETY: `base` is the shared arena allocation made by `allocate_stuck_table`, sized
+    // `[StuckSlot; STUCK_SLOTS]`, and every process in the family maps it at this address.
+    unsafe { &*base.add(index) }
+}
+
+/// Finds this thread's slot, claiming a free one when `claim`. See [`StuckSlot::key_pid`] for why
+/// the key is `(pid, tid)`.
+fn stuck_slot(pid: i32, tid: i32, claim: bool) -> Option<(&'static StuckSlot, bool)> {
+    let base = stuck_base()?;
+    let h = (pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (tid as u64).wrapping_mul(0x85EB);
+    let start = h as usize % STUCK_SLOTS;
+    for i in 0..STUCK_PROBE {
+        let s = stuck_slot_at(base, (start + i) % STUCK_SLOTS);
+        if s.key_pid.load(Ordering::Acquire) == pid && s.key_tid.load(Ordering::Acquire) == tid {
+            return Some((s, false));
+        }
+    }
+    if !claim {
+        return None;
+    }
+    for i in 0..STUCK_PROBE {
+        let s = stuck_slot_at(base, (start + i) % STUCK_SLOTS);
+        if s.key_pid.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+        // Published before `key_pid` turns nonzero, so a reader that matches the pid never
+        // compares against a `key_tid` that is still being written.
+        s.key_tid.store(tid, Ordering::Relaxed);
+        if s
+            .key_pid
+            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for k in 0..STUCK_MIX {
+                s.mix_sysno[k].store(STUCK_MIX_FREE, Ordering::Relaxed);
+            }
+            return Some((s, true));
+        }
+    }
+    None
+}
+
+pub fn stuck_enter(
+    host: i32,
+    task: u64,
+    sysno: usize,
+    args: [u64; 4],
+    pid: i32,
+    tid: i32,
+    comm: &[u8],
+    now_ms: u64,
+) {
+    if !stuck_enabled() {
+        return;
+    }
+    let Some((s, _claimed)) = stuck_slot(pid, tid, true) else {
+        return;
+    };
+    s.host.store(host as u32, Ordering::Relaxed);
+    s.task.store(task, Ordering::Relaxed);
+    s.sysno.store(sysno as u32, Ordering::Relaxed);
+    for (dst, src) in s.args.iter().zip(args) {
+        dst.store(src, Ordering::Relaxed);
+    }
+    let mut c = [0u8; 16];
+    let n = comm.len().min(16);
+    c[..n].copy_from_slice(&comm[..n]);
+    s.comm[0].store(u64::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])), Ordering::Relaxed);
+    s.comm[1].store(u64::from_ne_bytes(c[8..].try_into().unwrap_or([0; 8])), Ordering::Relaxed);
+    s.started_ms.store(now_ms, Ordering::Relaxed);
+    // Last: a reader that sees `active == 1` sees every field above already written.
+    s.active.store(1, Ordering::Release);
+}
+
+pub fn stuck_exit(pid: i32, tid: i32, now_ms: u64) {
+    if !stuck_enabled() {
+        return;
+    }
+    // No slot is claimed here: `clone` rewrites `self.tid` mid-syscall, so the child's exit looks
+    // up a key the entry never inserted and would only leak a second row.
+    let Some((s, _claimed)) = stuck_slot(pid, tid, false) else {
+        return;
+    };
+    s.exit_ms.store(now_ms, Ordering::Relaxed);
+    s.completed.fetch_add(1, Ordering::Relaxed);
+    let sysno = s.sysno.load(Ordering::Relaxed);
+    let mut placed = false;
+    for k in 0..STUCK_MIX {
+        if s.mix_sysno[k].load(Ordering::Relaxed) == sysno {
+            s.mix_count[k].fetch_add(1, Ordering::Relaxed);
+            placed = true;
+            break;
+        }
+    }
+    if !placed {
+        for k in 0..STUCK_MIX {
+            if s.mix_sysno[k]
+                .compare_exchange(STUCK_MIX_FREE, sysno, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                s.mix_count[k].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+    s.active.store(0, Ordering::Release);
+}
+
+fn stuck_comm(s: &StuckSlot) -> String {
+    let mut c = [0u8; 16];
+    c[..8].copy_from_slice(&s.comm[0].load(Ordering::Relaxed).to_ne_bytes());
+    c[8..].copy_from_slice(&s.comm[1].load(Ordering::Relaxed).to_ne_bytes());
+    let end = c.iter().position(|&b| b == 0).unwrap_or(16);
+    String::from_utf8_lossy(&c[..end]).into_owned()
+}
+
+fn stuck_mix(s: &StuckSlot) -> String {
+    let mut pairs: Vec<(u64, u32)> = Vec::new();
+    for k in 0..STUCK_MIX {
+        let n = s.mix_sysno[k].load(Ordering::Relaxed);
+        if n != STUCK_MIX_FREE {
+            pairs.push((s.mix_count[k].load(Ordering::Relaxed), n));
+        }
+    }
+    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = String::new();
+    for (count, n) in pairs {
+        use core::fmt::Write as _;
+        let _ = write!(
+            out,
+            " {}={}",
+            syscall_name(n as usize),
+            count
+        );
+    }
+    out
+}
+
+/// Dumps one line per guest thread whose CURRENT syscall has been in flight for at least
+/// `LITEBOX_DIAG_STUCK_SECS`, plus the busiest threads by syscalls completed since the previous
+/// dump -- a spinning thread never parks, so a parked-only dump cannot see it at all.
+pub fn maybe_dump_stuck(now_ms: u64) {
+    if !stuck_enabled() {
+        return;
+    }
+    let window_ms = STUCK_SECS.load(Ordering::Acquire).saturating_mul(1000);
+    let last = STUCK_LAST_DUMP_MS.load(Ordering::Acquire);
+    if now_ms.saturating_sub(last) < window_ms {
+        return;
+    }
+    STUCK_LAST_DUMP_MS.store(now_ms, Ordering::Release);
+    let Some(base) = stuck_base() else {
+        return;
+    };
+    let mut parked: Vec<(u64, usize)> = Vec::new();
+    let mut hot: Vec<(u64, usize)> = Vec::new();
+    let mut pids: Vec<i32> = Vec::new();
+    let mut in_flight = 0usize;
+    for i in 0..STUCK_SLOTS {
+        let s = stuck_slot_at(base, i);
+        let pid = s.key_pid.load(Ordering::Acquire);
+        if pid == 0 {
+            continue;
+        }
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+        let done = s.completed.load(Ordering::Relaxed);
+        let since = done.saturating_sub(s.seen_completed.swap(done, Ordering::Relaxed));
+        if since > 0 {
+            hot.push((since, i));
+        }
+        if s.active.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        in_flight += 1;
+        let dur = now_ms.saturating_sub(s.started_ms.load(Ordering::Relaxed));
+        if dur >= window_ms {
+            parked.push((dur, i));
+        }
+    }
+    let header = alloc::format!(
+        "[diag-stuck] window_ms={} parked={} in_flight={} busy={} guest_pids={}",
+        window_ms,
+        parked.len(),
+        in_flight,
+        hot.len(),
+        pids.len(),
+    );
+    litebox_util_log::warn!(stuck:% = header.as_str(); "[diag-stuck]");
+    parked.sort_by(|a, b| b.0.cmp(&a.0));
+    for (dur, i) in parked.iter().take(40) {
+        let s = stuck_slot_at(base, *i);
+        let sysno = s.sysno.load(Ordering::Relaxed) as usize;
+        let line = alloc::format!(
+            "stuck_ms={} pid={} tid={} comm={} syscall={}({}) a0={:#x} a1={:#x} a2={:#x} note={}",
+            dur,
+            s.key_pid.load(Ordering::Relaxed),
+            s.key_tid.load(Ordering::Relaxed),
+            stuck_comm(s),
+            syscall_name(sysno),
+            sysno,
+            s.args[0].load(Ordering::Relaxed),
+            s.args[1].load(Ordering::Relaxed),
+            s.args[2].load(Ordering::Relaxed),
+            thread_note(s.task.load(Ordering::Relaxed)).unwrap_or("-"),
+        );
+        litebox_util_log::warn!(stuck:% = line.as_str(); "[diag-stuck]");
+    }
+    hot.sort_by(|a, b| b.0.cmp(&a.0));
+    for (since, i) in hot.iter().take(8) {
+        let s = stuck_slot_at(base, *i);
+        let line = alloc::format!(
+            "since_last={} pid={} tid={} comm={} last={}({}) idle_ms={} total={} mix:{}",
+            since,
+            s.key_pid.load(Ordering::Relaxed),
+            s.key_tid.load(Ordering::Relaxed),
+            stuck_comm(s),
+            syscall_name(s.sysno.load(Ordering::Relaxed) as usize),
+            s.sysno.load(Ordering::Relaxed),
+            now_ms.saturating_sub(s.exit_ms.load(Ordering::Relaxed)),
+            s.completed.load(Ordering::Relaxed),
+            stuck_mix(s),
+        );
+        litebox_util_log::warn!(hot:% = line.as_str(); "[diag-hot]");
     }
 }
 

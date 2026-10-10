@@ -352,6 +352,18 @@ pub(super) struct SocketOptions {
     pub(super) v6_only: bool,
     /// `SO_PASSCRED` (unix sockets): deliver `SCM_CREDENTIALS` with received data.
     pub(super) passcred: bool,
+    /// `SO_RCVLOWAT`: minimum bytes a blocking receive waits for before it returns. Linux's
+    /// default is 1, which is what `0` here means (the struct is `Default`), so reads of this
+    /// field go through [`Self::recv_lowat`]. `MSG_WAITALL` overrides it: `sock_rcvlowat()` is
+    /// `waitall ? len : min(rcvlowat, len)`.
+    pub(super) recv_lowat: u32,
+}
+
+impl SocketOptions {
+    /// The effective `SO_RCVLOWAT`, never below Linux's own default of 1.
+    pub(super) fn recv_lowat(&self) -> usize {
+        usize::try_from(self.recv_lowat).unwrap_or(0).max(1)
+    }
 }
 
 #[derive(Clone)]
@@ -514,7 +526,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     };
                     set_option(sopt, SocketOptionValue::Timeout(timeout))
                 }
-                SocketOption::REUSEADDR | SocketOption::BROADCAST | SocketOption::KEEPALIVE => {
+                SocketOption::REUSEADDR
+                | SocketOption::BROADCAST
+                | SocketOption::KEEPALIVE
+                | SocketOption::RCVLOWAT => {
                     let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
                     set_option(sopt, SocketOptionValue::U32(val))
                 }
@@ -570,6 +585,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                             litebox::net::TcpOptionData::KEEPALIVE(None)
                         });
                         opt.keep_alive = keep_alive;
+                    }
+                    (SocketOption::RCVLOWAT, SocketOptionValue::U32(val)) => {
+                        opt.recv_lowat = val;
                     }
                     _ => unreachable!(),
                 }
@@ -660,6 +678,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 // `SO_DOMAIN`/`SO_PROTOCOL` are read-only on Linux (they report what `socket()`
                 // was called with); `setsockopt` on them falls through to `ENOPROTOOPT`.
                 SocketOption::DOMAIN | SocketOption::PROTOCOL => return Err(Errno::ENOPROTOOPT),
+                // Handled by `setsockopt_common`; the arm is here so a future change there cannot
+                // turn a plain `SO_RCVLOWAT` set into the `unreachable!()` above.
+                SocketOption::RCVLOWAT => {
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    self.with_socket_options_mut(fd, |opt| opt.recv_lowat = val)?;
+                    return Ok(());
+                }
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -770,7 +795,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     );
                     super::write_to_user::<_, Platform>(tv, optval, len)
                 }
-                SocketOption::REUSEADDR | SocketOption::KEEPALIVE | SocketOption::BROADCAST => {
+                SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST
+                | SocketOption::RCVLOWAT => {
                     let SocketOptionValue::U32(val) = get_option(sopt) else {
                         unreachable!()
                     };
@@ -798,6 +826,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
             SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
             SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
+            SocketOption::RCVLOWAT => {
+                SocketOptionValue::U32(u32::try_from(options.recv_lowat()).unwrap_or(u32::MAX))
+            }
             _ => unreachable!(),
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
@@ -822,7 +853,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
                 | SocketOption::KEEPALIVE
-                | SocketOption::BROADCAST => {
+                | SocketOption::BROADCAST
+                | SocketOption::RCVLOWAT => {
                     unreachable!()
                 }
                 SocketOption::ERROR => {
@@ -2506,11 +2538,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 raw_fd.trunc(),
                 |fd| {
                     let mut addr = None;
+                    // The inet ring honours PEEK but has no wait-for-full support, so WAITALL is
+                    // dropped here rather than silently short-reading a caller that asked Linux
+                    // for the full amount.
                     let size = self.global.receive(
                         &self.wait_cx(),
                         fd,
                         &mut buf.borrow_mut(),
-                        flags,
+                        flags.difference(ReceiveFlags::WAITALL),
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
@@ -2569,11 +2604,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 raw_fd.trunc(),
                 |fd| {
                     let mut addr = None;
+                    // The inet ring honours PEEK but has no wait-for-full support, so WAITALL is
+                    // dropped here rather than silently short-reading a caller that asked Linux
+                    // for the full amount.
                     let size = self.global.receive(
                         &self.wait_cx(),
                         fd,
                         &mut buf.borrow_mut(),
-                        flags,
+                        flags.difference(ReceiveFlags::WAITALL),
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
@@ -2625,8 +2663,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // CMSG_CLOEXEC is honored: do_recvmsg sets FD_CLOEXEC on every SCM_RIGHTS fd it delivers
         // when this flag is present (see AnyDupFd::insert_into's own cloexec parameter).
-        let supported_flags =
+        //
+        // `MSG_PEEK`/`MSG_WAITALL` are accepted: Linux accepts both on `AF_UNIX` stream and
+        // seqpacket sockets (and on inet ones), and `unix.rs` already implemented PEEK. EINVAL
+        // here made Mojo's IPC channel reject the very flags it uses. `do_recvfrom_with_fds`
+        // drops WAITALL again for an inet socket, whose ring has no wait-for-full support.
+        let mut supported_flags =
             ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
+        if !self
+            .global
+            .platform
+            .env_flag("LITEBOX_UNIX_RECV_FIDELITY_OFF")
+        {
+            supported_flags |= ReceiveFlags::PEEK | ReceiveFlags::WAITALL;
+        }
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
