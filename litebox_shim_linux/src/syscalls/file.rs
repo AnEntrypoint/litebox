@@ -10360,6 +10360,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .is_some_and(|(pid, _)| !pid.is_empty())
     }
 
+    /// A private, empty file to stand in for a carried fd this process cannot reopen, so `recvmsg`
+    /// still has something to install in that slot.
+    ///
+    /// An fd nobody can install costs the receiver its entire Mojo channel: `recvmsg` reports
+    /// `MSG_CTRUNC` and Mojo folds that into a zero-length read and terminates the child. Measured
+    /// one-to-one -- uz10's two `/usr/share/fonts/...` failures, uz11's eight `/proc/<pid>/...`
+    /// ones, each followed by one `exit_group(status=0)` within 3 ms. A degraded fd is strictly
+    /// better than a dead child, and there is no kernel behaviour to copy because Linux never fails
+    /// to install a donated fd.
+    fn degraded_carried_file(&self, flags: OFlags, cloexec: bool) -> Option<u32> {
+        if self
+            .global
+            .platform
+            .env_flag("LITEBOX_FD_CARRY_DEGRADE_OFF")
+        {
+            return None;
+        }
+        let handle = self.global.platform.create_shared_memory(PAGE_SIZE).ok()?;
+        let token = self.global.platform.shared_memory_token_for(handle)?;
+        let raw = self
+            .install_shm_file(&token, PAGE_SIZE, flags.bits(), cloexec)
+            .ok()?;
+        litebox_util_log::warn!(
+            fd:% = raw, flags:% = flags.bits();
+            "diag-fcarry: carried fd installed as a degraded private file"
+        );
+        Some(u32::try_from(raw).ok()?)
+    }
+
     /// Whether `path` resolves only inside this process's own writable layer, so that another
     /// host process reopening it would not find these bytes.
     ///
@@ -10809,7 +10838,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             reopened:% = retried.is_some();
                             "diag-procary: carried /proc/<pid> fd could not be reopened here"
                         );
-                        match retried {
+                        match retried.or_else(|| self.degraded_carried_file(flags, cloexec)) {
                             Some(raw) => raw,
                             None => return Err(e),
                         }
