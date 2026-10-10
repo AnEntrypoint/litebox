@@ -2036,6 +2036,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         })
     }
 
+    /// The cross-process wake word backing this endpoint, when it has one: what a `poll`/`select`/
+    /// `epoll_wait` caller parks on instead of idling out [`SHARED_UNIX_POLL_INTERVAL`].
+    ///
+    /// `None` for a socket that is not connected over the shared transport and for
+    /// `LITEBOX_UNIX_CROSS_WAKE_OFF`.
+    pub(crate) fn shared_wake(&self) -> Option<SharedWakeHandle<Platform, FS>> {
+        self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()))
+    }
+
     fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
         Self {
             state: litebox::sync::RwLock::new(Some(state)),
@@ -3132,6 +3141,19 @@ enum UnixSocketInner<Platform: ShimPlatform, FS: ShimFS> {
     Stream(UnixStream<Platform, FS>),
     Datagram(UnixDatagram<Platform, FS>),
 }
+/// Resolves a descriptor to the cross-process wake word behind it, for the poll paths
+/// (`poll`/`ppoll`/`epoll_wait`), which see only a `TypedFd` and not a connection.
+///
+/// `None` for a datagram socket, a socket that is not on the shared transport, an fd this
+/// process can no longer resolve, and `LITEBOX_UNIX_CROSS_WAKE_OFF`.
+pub(crate) fn unix_fd_shared_wake<Platform: ShimPlatform, FS: ShimFS>(
+    global: &GlobalStateHandle<Platform, FS>,
+    fd: &litebox::fd::TypedFd<UnixSocketSubsystem<Platform, FS>>,
+) -> Option<SharedWakeHandle<Platform, FS>> {
+    let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+    handle.with_entry(|entry: &UnixSocket<Platform, FS>| entry.shared_wake())
+}
+
 pub(crate) struct UnixSocket<Platform: ShimPlatform, FS: ShimFS> {
     inner: UnixSocketInner<Platform, FS>,
     status: AtomicU32,
@@ -3139,6 +3161,15 @@ pub(crate) struct UnixSocket<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
+    /// The cross-process wake word behind this descriptor, when it has one. Lets a poll path
+    /// (which sees only a `TypedFd`, not a connection) park on the peer's real write.
+    pub(crate) fn shared_wake(&self) -> Option<SharedWakeHandle<Platform, FS>> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.shared_wake(),
+            UnixSocketInner::Datagram(_) => None,
+        }
+    }
+
     fn new_with_inner(inner: UnixSocketInner<Platform, FS>, flags: SockFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));

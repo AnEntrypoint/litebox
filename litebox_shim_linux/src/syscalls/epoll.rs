@@ -21,7 +21,85 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 
 use super::file::FilesState;
-use crate::{GlobalStateHandle, ShimFS, ShimPlatform};
+use crate::{
+    GlobalStateHandle, ShimFS, ShimPlatform,
+    syscalls::unix::{SharedWake as _, SharedWakeHandle, unix_fd_shared_wake},
+};
+
+/// How long a poll iteration parks on its own LOCAL condvar -- the ordinary in-process `Observer`
+/// wake path -- when the poll set also carries at least one cross-process AF_UNIX wake word.
+///
+/// Kept short so the loop moves on to parking on those words quickly (that is the point: a peer
+/// in another process can never reach this process's condvar). A real in-process event still
+/// interrupts this park immediately, so shortening it does not delay anything in-process.
+const POLL_WORD_CONDVAR_SLICE: core::time::Duration = core::time::Duration::from_micros(200);
+
+/// Upper bound on ONE park on a cross-process wake word, well under the repoll interval.
+///
+/// A park on a word is a raw futex wait, which this process's OWN `Waker` cannot interrupt -- so an
+/// event on an in-process member of the same set (a pipe, an eventfd, a same-process AF_UNIX peer)
+/// would otherwise wait out a full repoll interval before the next scan noticed it. Bounding the
+/// park keeps that at ~2ms, while still being long enough that the park -- not the scan -- is what
+/// an idle waiter spends its time in.
+const POLL_WORD_PARK_SLICE: core::time::Duration = core::time::Duration::from_millis(2);
+
+/// Smallest slice one word gets in [`park_on_unix_wake_words`], so a poll set holding many
+/// cross-process sockets still re-checks the whole set often enough to notice any one of them.
+const POLL_WORD_MIN_SLICE: core::time::Duration = core::time::Duration::from_millis(1);
+
+/// Parks until any of `words` has moved away from its `seen` snapshot, or `budget` elapses --
+/// whichever comes first.
+///
+/// `budget` is always a real, finite duration (callers derive it from `STDIN_REPOLL_INTERVAL` or
+/// from the caller's own remaining deadline), so this is bounded by construction: a missed or
+/// absent wake degrades to today's repoll cadence, never to a hang. There is deliberately no
+/// unbounded variant -- an unbounded park is the worst bug class in this codebase
+/// (`wait.rs`'s `condvar.block` -> `FUTEX_WAIT` with `timeout=None`).
+///
+/// `[SharedWakeWord]`s cannot be waited on together (no multi-futex wait in this codebase), so
+/// each word gets a share of the budget and the whole set is re-checked between shares: a bump on
+/// ANY word is then noticed within one share. The snapshot is taken by the CALLER before it scans,
+/// so a bump racing that scan reads as "already changed" here rather than being lost.
+fn park_on_unix_wake_words<Platform: ShimPlatform, FS: ShimFS>(
+    words: &[SharedWakeHandle<Platform, FS>],
+    seen: &[u32],
+    budget: core::time::Duration,
+) {
+    if words.is_empty() || seen.len() < words.len() {
+        return;
+    }
+    let mut remaining = budget;
+    let mut next = 0usize;
+    while !remaining.is_zero() {
+        if words
+            .iter()
+            .enumerate()
+            .any(|(i, word)| word.wake_seq() != seen[i])
+        {
+            return;
+        }
+        let share = core::cmp::max(remaining / words.len() as u32, POLL_WORD_MIN_SLICE)
+            .min(remaining);
+        words[next % words.len()].wake_wait_changed(seen[next % words.len()], share);
+        remaining = remaining.saturating_sub(share);
+        next += 1;
+    }
+}
+
+/// Collects the cross-process wake words of a poll/epoll set's AF_UNIX members, in a stable order,
+/// so the path can park on them instead of idling out a repoll tick.
+fn unix_wake_words<Platform: ShimPlatform, FS: ShimFS>(
+    global: &GlobalStateHandle<Platform, FS>,
+    descs: impl IntoIterator<Item = EpollDescriptor<Platform, FS>>,
+) -> alloc::vec::Vec<SharedWakeHandle<Platform, FS>> {
+    descs
+        .into_iter()
+        .filter_map(|desc| match desc {
+            EpollDescriptor::Unix(fd) => unix_fd_shared_wake(global, &fd),
+            _ => None,
+        })
+        .collect()
+}
 
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform, FS: ShimFS>(
     core::marker::PhantomData<(Platform, FS)>,
@@ -372,6 +450,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // consumer with this usage pattern, not just weston, mirroring the stdin fix's shape.
             let has_bounded_repoll_interest =
                 self.has_unready_stdin_or_armed_timerfd_interest(global);
+            // Cross-process AF_UNIX interests: their wake words let the bounded repoll below park
+            // on the peer's real write instead of idling the interval out in this process's own
+            // condvar (see `PollSet::wait`'s matching comment). Collected (Weak upgraded) before
+            // resolving anything, so the interest lock is not held across the descriptor table.
+            let descs: alloc::vec::Vec<_> = self
+                .interests
+                .lock()
+                .values()
+                .filter_map(|entry| entry.desc.upgrade())
+                .collect();
+            let wake_words = unix_wake_words(global, descs);
+            let seen: alloc::vec::Vec<u32> = wake_words.iter().map(|w| w.wake_seq()).collect();
             // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
             // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
             // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
@@ -385,10 +475,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 has_bounded_repoll_interest:% = has_bounded_repoll_interest;
                 "DIAG EpollFile::wait: loop iteration"
             );
-            let iteration_cx = if has_bounded_repoll_interest {
-                cx.with_timeout(STDIN_REPOLL_INTERVAL)
-            } else {
-                cx.with_timeout(None)
+            let iteration_cx = match (has_bounded_repoll_interest, wake_words.is_empty()) {
+                // A wake word is in hand: this park can only ever be interrupted by an IN-process
+                // event, so keep it short and spend the rest of the interval parked on the words
+                // (see `PollSet::wait`'s matching comment).
+                (true, false) => cx.with_timeout(POLL_WORD_CONDVAR_SLICE),
+                (true, true) => cx.with_timeout(STDIN_REPOLL_INTERVAL),
+                (false, _) => cx.with_timeout(None),
             };
             match self
                 .ready
@@ -411,6 +504,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                     // Only the bounded repoll interval elapsed, not the caller's own deadline (if
                     // any): re-poll and loop back around.
                     self.repoll_stdin_and_timerfd_interests(global, diag_tid, diag_epfd);
+                    // Park on the peers' own writes for what is left of the repoll interval,
+                    // instead of idling it out in this process's condvar where a peer in another
+                    // host process can never reach us. Bounded by the caller's remaining deadline
+                    // too, so a real timeout still fires on schedule, and by
+                    // `POLL_WORD_PARK_SLICE` so an in-process event still gets noticed promptly.
+                    let budget = cx
+                        .remaining_timeout()
+                        .unwrap_or(POLL_WORD_PARK_SLICE)
+                        .min(POLL_WORD_PARK_SLICE);
+                    park_on_unix_wake_words(&wake_words, &seen, budget);
                 }
                 Err(TryOpError::WaitError(e)) => return Err(e),
             }
@@ -1237,6 +1340,22 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                             ))
                     })
         });
+        // Cross-process AF_UNIX members of this set: their wake words turn the repoll tick below
+        // from "idle 15ms and look again" into "park until the peer process actually writes". A
+        // `Shared`-transport connection's peer lives in another host process, which can never
+        // reach this process's own condvar -- so without this, every cross-process byte costs a
+        // full repoll interval of latency (`unix.rs`'s own blocking `recvfrom` path already parks
+        // here; this is the poll-then-read shape every real consumer actually uses: Xvfb,
+        // dbus-daemon and chromium's Mojo all wait on readiness before reading).
+        let wake_words = unix_wake_words(
+            global,
+            self.entries.iter().filter_map(|entry| {
+                if entry.fd < 0 {
+                    return None;
+                }
+                EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize).ok()
+            }),
+        );
         let mut register = true;
         if !has_unwakeable_fd {
             // Fast/common path: no stdin/evdev fd in the set at all, so wait exactly as before -- a
@@ -1245,6 +1364,10 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
             return cx.wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())));
         }
         loop {
+            // Snapshot the wake words BEFORE the scan below: a peer's bump racing that scan then
+            // reads as "already changed" to the park at the bottom of this iteration, so no wake
+            // can be lost between looking and sleeping.
+            let seen: alloc::vec::Vec<u32> = wake_words.iter().map(|w| w.wake_seq()).collect();
             // At least one entry is a stdin or evdev fd, neither of which ever registers a real
             // wakeup observer inside `scan_once` (see its doc comment): there is no OS-level async
             // notification this codebase's `Waker`/`Observer` machinery can hook into for "new
@@ -1254,8 +1377,19 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
             // sleeping on a condvar that would otherwise never be signaled. `with_timeout` composes
             // with (takes the min of) any caller-supplied deadline, so the caller's real timeout
             // still fires on schedule instead of being silently overridden.
+            //
+            // With a cross-process wake word in hand that bound shrinks to
+            // `POLL_WORD_CONDVAR_SLICE`: this park can only ever be interrupted by an IN-process
+            // event, so spending the full repoll interval in it is pure latency for anything a
+            // peer process writes. The words are parked on right below, and the repoll interval
+            // bounds that park in turn.
+            let iteration_bound = if wake_words.is_empty() {
+                STDIN_REPOLL_INTERVAL
+            } else {
+                POLL_WORD_CONDVAR_SLICE
+            };
             match cx
-                .with_timeout(STDIN_REPOLL_INTERVAL)
+                .with_timeout(iteration_bound)
                 .wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())))
             {
                 Ok(()) => return Ok(()),
@@ -1268,6 +1402,15 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                         return Err(WaitError::TimedOut);
                     }
                     register = false;
+                    // Park on the peers' own writes for the rest of what would otherwise have been
+                    // the repoll interval, instead of idling it out here. Bounded by the caller's
+                    // remaining deadline too, so a real timeout still fires on schedule, and by
+                    // `POLL_WORD_PARK_SLICE` so an in-process event still gets noticed promptly.
+                    let budget = cx
+                        .remaining_timeout()
+                        .unwrap_or(POLL_WORD_PARK_SLICE)
+                        .min(POLL_WORD_PARK_SLICE);
+                    park_on_unix_wake_words(&wake_words, &seen, budget);
                 }
                 Err(e) => return Err(e),
             }
