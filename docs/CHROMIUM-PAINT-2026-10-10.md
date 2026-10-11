@@ -89,6 +89,20 @@ Launcher `/tmp/lbx/wtrun-hl.sh` (a copy of `wtrun.sh` with the program line swap
 
 ## 6. Runs so far
 
+- **hl1** (3 headless phases: plain, `+ --enable-unsafe-swiftshader`, `+ --no-sandbox`) — **no PNG in
+  160.9 s in ANY phase**, rc=None. Native control for the same command line: **1 s, rc=0, 11,602 B
+  PNG**. So the sandbox is excluded (phase c fails too) and software compositing is not the problem
+  natively.
+- **hl2** — **REFUTES the `/dev/shm` hypothesis AND invalidates hl1's reading.** Two phases, both
+  `--headless=old --dump-dom --screenshot`, differing only by `--disable-dev-shm-usage`:
+  `shm` (default) and `tmp` (`--disable-dev-shm-usage`). **Both identical: `elapsed 311.2 rc=None
+  dom_at=None, dom bytes=0, png FAILED`.** `/dev/shm exists=True writable=True` in the guest.
+  **Old headless does not merely fail to composite inside litebox — it never loads the page at all
+  (dom=0), with or without dev-shm.** So hl1's "no PNG" was never a compositor measurement; the
+  break with `--headless=old` is upstream of first paint entirely. Any paint measurement must use
+  `--headless=new` (the only headless mode that has ever completed a load here: DOM at 19.67 s).
+  Second consequence: the native control used `--disable-dev-shm-usage`, so "litebox's per-process
+  `/tmp` breaks cross-process shm" cannot be what separates them either.
 - **r5a** (rung 5: `xfwm4` + chromium, no session) — NULL RESULT: `out-r5a.txt` holds exactly one
   frame (`md5=cc81d3e05725`, distinct=2 = the bare root weave, captured at t≈25 s before chromium
   could map) and its stdout stops 165 B after `[boot] spawn /usr/lib/chromium/chromium ...` — no
@@ -98,3 +112,22 @@ Launcher `/tmp/lbx/wtrun-hl.sh` (a copy of `wtrun.sh` with the program line swap
   processes and 1-min load ~37-44 while it ran. SwiftShader rasterizing 1024x768 in software on 4
   `nice -n 19` CPUs starves the guest driver, so a stalled run here is not evidence of a hang in
   litebox — it is the starvation the orphan lesson warns about.
+
+## 7. Harness loss and the rebuilt probe (2026-10-11)
+
+`/tmp/lbx` (the runner copy, `wtrun*.sh`, `boot.py`, every rootfs tarball, and `hl*.py`) was **gone**
+after the container was recreated at 10:52 on 2026-10-11 — `/tmp` now holds another session's
+selkies/gmweb files. The webtop rootfs seed (`rootfs-x11.tar`) does not survive anywhere on disk, so
+rung 4 cannot be re-run until it is rebuilt from the recipe in `docs/WEBTOP-BOOT-2026-10-10.md` §1.
+
+Rebuilt for the headless questions, which need no X:
+- `scratchpad/lbx/mkmin.sh` builds `minroot.tar` (≈600 MB): host chromium 154.0.8037.92 + its ldd
+  closure, dash/coreutils/base64, `/usr/lib/chromium` resources, fonts, `/opt/lib` (the host's
+  `libudev` is a FAKE stub that must be shipped as `libudev.so.1` → `libudev.so.1.0.0-fake`), and
+  `page.html`. Owners 0:0 with `--numeric-owner`; `/tmp`, `/tmp/home`, `/tmp/xdg` are 1777.
+- `scratchpad/lbx/probe.sh` runs ONE headless mode inside litebox and reports the DOM and PNG as they
+  appear (chromium does not exit after `--dump-dom`, so it is killed at the first PNG or 240 s).
+- `scratchpad/lbx/run.sh <tag> <secs> <mode> [flags]` is the gated launcher (one runner at a time,
+  lock `/tmp/lbx/.runner-lock`, `pgrep -x lbxrun`, load < 4, MemAvailable > 2 GB).
+
+Smoke test: `chromium --version` inside litebox → `Chromium 154.0.8037.92`, rc=0.
