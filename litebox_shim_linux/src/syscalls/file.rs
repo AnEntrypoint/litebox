@@ -3067,32 +3067,46 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        let requested_name = alloc::format!(
-            "Local\\litebox_memfd_{}_{}",
-            self.global.platform.current_host_pid(),
-            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        );
-        let (handle, object_name) = match self
-            .global
-            .platform
-            .create_named_shared_memory(&requested_name, page_aligned_size)
-        {
-            Ok(handle) => (handle, Some(requested_name)),
-            Err(_) => {
-                let handle = self
-                    .global
-                    .platform
-                    .create_shared_memory(page_aligned_size)
-                    .map_err(|_| Errno::ENOMEM)?;
-                // The named table is spent (128 slots, never freed -- see
-                // `create_named_shared_memory`). The object still exists; it just has no NAME. Ask
-                // the platform whether its handle is itself a cross-process identity and use that
-                // in place of a name, so the memfd is still carryable. Without this the object was
-                // uncarryable and the whole `sendmsg(SCM_RIGHTS)` was refused, which killed the
-                // receiving child (`cs4`: 8 refused fds, all `size=131072`, all
-                // `memfd=registered-but-unnamed`).
-                (handle, self.global.platform.shared_memory_token_for(handle))
+        let (handle, object_name) = if self.global.platform.env_flag("LITEBOX_MEMFD_TOKEN_OFF") {
+            let requested_name = alloc::format!(
+                "Local\\litebox_memfd_{}_{}",
+                self.global.platform.current_host_pid(),
+                MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            );
+            match self
+                .global
+                .platform
+                .create_named_shared_memory(&requested_name, page_aligned_size)
+            {
+                Ok(handle) => (handle, Some(requested_name)),
+                Err(_) => {
+                    let handle = self
+                        .global
+                        .platform
+                        .create_shared_memory(page_aligned_size)
+                        .map_err(|_| Errno::ENOMEM)?;
+                    // The named table is spent (128 slots, never freed -- see
+                    // `create_named_shared_memory`). The object still exists; it just has no NAME.
+                    // Ask the platform whether its handle is itself a cross-process identity and
+                    // use that in place of a name, so the memfd is still carryable. Without this
+                    // the object was uncarryable and the whole `sendmsg(SCM_RIGHTS)` was refused,
+                    // which killed the receiving child (`cs4`: 8 refused fds, all `size=131072`,
+                    // all `memfd=registered-but-unnamed`).
+                    (handle, self.global.platform.shared_memory_token_for(handle))
+                }
             }
+        } else {
+            // A counter-derived name is unique only inside one process: a fork child starts from
+            // the same counter value as its parent, so two siblings' fresh objects get the SAME
+            // name and `create_named_shared_memory` hands back the existing segment. A pool handle
+            // is unique by construction (`pool_segment(0, ..)` reserves a fresh offset under
+            // `pool_lock` and takes no `pool_table` slot), so it is the identity instead.
+            let handle = self
+                .global
+                .platform
+                .create_shared_memory(page_aligned_size)
+                .map_err(|_| Errno::ENOMEM)?;
+            (handle, self.global.platform.shared_memory_token_for(handle))
         };
         litebox_util_log::warn!(
             name:% = object_name.as_deref().unwrap_or("-"), size:% = page_aligned_size,
@@ -3732,29 +3746,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .flatten()
                 .ok_or("not-a-snapshottable-file")?
         };
-        let name = alloc::format!(
-            "Local\\litebox_snap_{}_{}",
-            self.global.platform.current_host_pid(),
-            MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        );
         let aligned = bytes.len().next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
-        // Same name-or-token shape as `resize_memfd_shared_backing`: a spent name table must not
-        // cost the sender its ability to carry this file at all.
-        let (handle, name) = match self
-            .global
-            .platform
-            .create_named_shared_memory(&name, aligned)
-        {
-            Ok(h) => (h, Some(name)),
-            Err(_) => {
-                let h = self
-                    .global
-                    .platform
-                    .create_shared_memory(aligned)
-                    .map_err(|_| "create_shared_memory failed")?;
-                (h, self.global.platform.shared_memory_token_for(h))
+        // Same identity choice as `resize_memfd_shared_backing`: a pool handle token, not a
+        // counter-derived name (see the comment there), unless `LITEBOX_MEMFD_TOKEN_OFF` is set.
+        let (handle, name) = if self.global.platform.env_flag("LITEBOX_MEMFD_TOKEN_OFF") {
+            let name = alloc::format!(
+                "Local\\litebox_snap_{}_{}",
+                self.global.platform.current_host_pid(),
+                MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            );
+            // A spent name table must not cost the sender its ability to carry this file at all.
+            match self
+                .global
+                .platform
+                .create_named_shared_memory(&name, aligned)
+            {
+                Ok(h) => (h, Some(name)),
+                Err(_) => {
+                    let h = self
+                        .global
+                        .platform
+                        .create_shared_memory(aligned)
+                        .map_err(|_| "create_shared_memory failed")?;
+                    (h, self.global.platform.shared_memory_token_for(h))
+                }
             }
+        } else {
+            let h = self
+                .global
+                .platform
+                .create_shared_memory(aligned)
+                .map_err(|_| "create_shared_memory failed")?;
+            (h, self.global.platform.shared_memory_token_for(h))
         };
+        // Still needed: a non-pool fallback handle (pool spent or shared heap off) has no token.
         let name = name.ok_or("shared object has no cross-process identity")?;
         litebox_util_log::warn!(
             name:% = name.as_str(), size:% = aligned, handle:? = handle,
