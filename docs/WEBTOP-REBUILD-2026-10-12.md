@@ -135,3 +135,6 @@ separate chromium process; the GPU process is folded into the browser.
 - Run `ig3` (9 captures): same, 632-773 colours, stable. Evidence: `docs/evidence/webtop-chromium-paint-in-process-gpu.png`.
 - Run `ingpu2`: stalled after one capture in the guest (a reliability problem, not a paint failure).
 - Process count is NOT a discriminator: the single-process run also reached 27-33 live runner processes.
+
+Repeat tally for `--disable-gpu --in-process-gpu` (full 150 s hold): painted in `ingpu`, `ig3`, `ig5`;
+stalled in the guest before any capture in `ingpu2`, `ig4`. The paint result is consistent when it completes.
