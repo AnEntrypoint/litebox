@@ -138,3 +138,8 @@ separate chromium process; the GPU process is folded into the browser.
 
 Repeat tally for `--disable-gpu --in-process-gpu` (full 150 s hold): painted in `ingpu`, `ig3`, `ig5`;
 stalled in the guest before any capture in `ingpu2`, `ig4`. The paint result is consistent when it completes.
+
+Stall tally (`--disable-gpu --in-process-gpu`, full 150 s hold): 7 of 9 full runs painted and completed
+(`ingpu`, `ig3`, `ig5`, `st1`-`st4`). The 2 stalls (`ingpu2`, `ig4`) stopped in the guest before any capture.
+The four `st*` runs had `LITEBOX_DIAG_STUCK_SECS=45` and produced no stuck-thread records, so the stall
+trigger is still unidentified. Reliability is 7/9, not yet "perfect".
